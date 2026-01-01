@@ -18,9 +18,9 @@ import { resetCircuitBreaker } from './circuit-breaker.js';
 import { beginGracefulDrain, shutdownContainers } from './container-runner.js';
 import { stopDeliveryPolls } from './delivery.js';
 import { stopHostSweep } from './host-sweep.js';
+import { stopHostModules } from './host-lifecycle.js';
 import { stopCliServer } from './cli/socket-server.js';
 import { teardownChannelAdapters } from './channels/channel-registry.js';
-import { getShutdownCallbacks } from './response-registry.js';
 import { log } from './log.js';
 
 type ShutdownPhase = 'none' | 'draining' | 'final';
@@ -45,13 +45,7 @@ export async function initiateShutdown(drainTimeoutMs: number, source: string): 
   if (phase === 'final') return; // already tearing down
   phase = 'draining';
   log.info('Shutdown initiated', { source, drainTimeoutMs });
-  for (const cb of getShutdownCallbacks()) {
-    try {
-      await cb();
-    } catch (err) {
-      log.error('Shutdown callback threw', { err });
-    }
-  }
+  await stopHostModules();
 
   // Drain: capacity → 0 (no fresh work), wait for in-flight turns to finish up
   // to the budget, then force-stop the rest.

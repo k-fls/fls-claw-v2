@@ -6,8 +6,8 @@ description: Add Telegram channel integration via Chat SDK.
 # Add Telegram Channel
 
 Adds Telegram bot support via the Chat SDK bridge. NanoClaw doesn't ship
-channels in trunk — this skill copies the Telegram adapter, its
-formatting/pairing helpers, and their tests in from the `channels` branch. The
+channels in trunk — this skill copies the Telegram adapter, its pairing helper,
+and their tests in from the `channels` branch. The
 `pair-telegram` setup step is maintained in trunk, so it is not copied here.
 
 The mechanical steps under **Apply** carry `nc:` directive fences: an agent
@@ -19,16 +19,14 @@ safe to re-run; anything a parser can't apply falls back to the prose beside it.
 
 ### 1. Copy the adapter, helpers, and tests
 
-Fetch the `channels` branch and copy the Telegram adapter, its pairing and
-markdown-sanitize helpers (with their tests), and the registration test into
-place (overwrite — the branch is canonical):
+Fetch the `channels` branch and copy the Telegram adapter, its pairing helper
+(with its test), and the registration test into place (overwrite — the branch
+is canonical):
 
 ```nc:copy from-branch:channels
 src/channels/telegram.ts
 src/channels/telegram-pairing.ts
 src/channels/telegram-pairing.test.ts
-src/channels/telegram-markdown-sanitize.ts
-src/channels/telegram-markdown-sanitize.test.ts
 src/channels/telegram-registration.test.ts
 ```
 
@@ -129,7 +127,7 @@ matches them. Open the bot first so you're on the right screen when the code
 appears. Tell the user:
 
 ```nc:operator
-Open @{{bot_username}} (https://t.me/{{bot_username}}) in Telegram now and keep it on screen — a 4-digit pairing code is about to appear in this terminal. When it does, send just those 4 digits to the bot as a message (in a group chat with Group Privacy on, prefix them with @{{bot_username}}). A wrong guess is rejected and a fresh code is issued automatically.
+Open @{{bot_username}} (https://telegram.me/{{bot_username}}) in Telegram now and keep it on screen — a 4-digit pairing code is about to appear in this terminal. When it does, send just those 4 digits to the bot as a message (in a group chat with Group Privacy on, prefix them with @{{bot_username}}). A wrong guess is rejected and a fresh code is issued automatically.
 ```
 
 Run the pairing handshake. It prints the code, streams "waiting…" and wrong-code
