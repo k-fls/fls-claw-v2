@@ -24,6 +24,7 @@ vi.mock('./config.js', async () => {
 // + reconcileContainerCapacity are the container-queue admission-control hooks the
 // sweep calls each tick; stub them so the SLA path runs to the kill decision.
 vi.mock('./container-runner.js', () => ({
+  getContainerStartedAtMs: vi.fn(() => Date.now()),
   isContainerRunning: vi.fn().mockReturnValue(false),
   wakeContainer: vi.fn().mockResolvedValue(true),
   killContainer: vi.fn(),

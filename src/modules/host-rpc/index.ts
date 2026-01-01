@@ -19,7 +19,7 @@
  *
  * The shutdown hook stops the server cleanly.
  */
-import { onShutdown } from '../../response-registry.js';
+import { onHostShutdown } from '../../host-lifecycle.js';
 import { stopHostRpcServer } from './server.js';
 
 export type { HostRpcRequest, HostRpcHandler, ScopedHostRpcHandler } from './types.js';
@@ -27,6 +27,6 @@ export { registerHostRpc, registerScopedHostRpc, matchHostRpc, listHostRpcHandle
 export { startHostRpcServer, stopHostRpcServer, getHostRpcAddress } from './server.js';
 export { hostRpcPort, DEFAULT_HOST_RPC_PORT } from './port.js';
 
-onShutdown(async () => {
+onHostShutdown(async () => {
   await stopHostRpcServer();
 });
