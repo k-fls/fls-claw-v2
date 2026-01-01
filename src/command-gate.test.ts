@@ -7,20 +7,6 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 import { initTestDb, closeDb, runMigrations, getDb, createAgentGroup } from './db/index.js';
 import { grantRole } from './modules/permissions/db/user-roles.js';
-
-function ensureUser(id: string): void {
-  getDb()
-    .prepare(`INSERT OR IGNORE INTO users (id, kind, display_name, created_at) VALUES (?, 'human', ?, ?)`)
-    .run(id, id, now());
-}
-
-function ensureAgentGroup(id: string): void {
-  try {
-    createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: now() });
-  } catch {
-    // already exists
-  }
-}
 import {
   gateCommand,
   isAdmin,
@@ -39,6 +25,20 @@ function jsonChat(text: string): string {
   return JSON.stringify({ text });
 }
 
+function ensureUser(id: string): void {
+  getDb()
+    .prepare(`INSERT OR IGNORE INTO users (id, kind, display_name, created_at) VALUES (?, 'human', ?, ?)`)
+    .run(id, id, now());
+}
+
+function ensureAgentGroup(id: string): void {
+  try {
+    createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: now() });
+  } catch {
+    // already exists
+  }
+}
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -47,6 +47,8 @@ beforeEach(() => {
   const db = initTestDb();
   runMigrations(db);
   _resetHostCommandsForTesting();
+  ensureAgentGroup('ag-1');
+  ensureAgentGroup('ag-2');
 });
 
 afterEach(() => {
@@ -495,5 +497,42 @@ describe('built-in /help handler', () => {
       expect(runHelp('a1d-help-glob', 'user-1')).toMatch(/^Unknown command:/);
       expect(runHelp('a1d-help-glob', 'global')).toBe('/a1d-help-glob — global-admin-only command');
     });
+  });
+});
+
+describe('gateCommand — filtered commands', () => {
+  it('drops /start before it reaches the container', () => {
+    expect(gateCommand('/start', 'telegram:1', 'ag-1')).toEqual({ action: 'filter' });
+  });
+
+  it('drops /start regardless of sender', () => {
+    expect(gateCommand('/start', null, 'ag-1')).toEqual({ action: 'filter' });
+  });
+});
+
+describe('gateCommand — mention-prefixed slash commands', () => {
+  it('classifies a mention-prefixed filtered command when mentionPrefixEnd is set', () => {
+    const content = JSON.stringify({ text: '@U0AKKG67T7X /login', mentionPrefixEnd: 13 });
+    expect(gateCommand(content, 'slack:U1', 'ag-1')).toEqual({ action: 'filter' });
+  });
+
+  it('without the annotation, the mention-prefixed command falls through (the bug)', () => {
+    const content = JSON.stringify({ text: '@U0AKKG67T7X /login' });
+    expect(gateCommand(content, 'slack:U1', 'ag-1')).toEqual({ action: 'pass' });
+  });
+
+  it('still classifies a plain (DM-style) filtered command with no mention', () => {
+    const content = JSON.stringify({ text: '/login' });
+    expect(gateCommand(content, 'slack:U1', 'ag-1')).toEqual({ action: 'filter' });
+  });
+
+  it('passes ordinary chatter through', () => {
+    const content = JSON.stringify({ text: '@U0AKKG67T7X how are you?', mentionPrefixEnd: 13 });
+    expect(gateCommand(content, 'slack:U1', 'ag-1')).toEqual({ action: 'pass' });
+  });
+
+  it('ignores an out-of-range mentionPrefixEnd rather than throwing', () => {
+    const content = JSON.stringify({ text: '/login', mentionPrefixEnd: 999 });
+    expect(gateCommand(content, 'slack:U1', 'ag-1')).toEqual({ action: 'filter' });
   });
 });

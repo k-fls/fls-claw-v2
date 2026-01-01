@@ -8,15 +8,15 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // the `isMain` second arg to validateMount / validateAdditionalMounts.
 // v2 derives readonly purely from the mount request + the allowed root.
 
-const { mockExistsSync, mockReadFileSync, mockRealpathSync } = vi.hoisted(() => ({
-  mockExistsSync: vi.fn() as ReturnType<typeof vi.fn>,
+const { mockStatSync, mockReadFileSync, mockRealpathSync } = vi.hoisted(() => ({
+  mockStatSync: vi.fn() as ReturnType<typeof vi.fn>,
   mockReadFileSync: vi.fn() as ReturnType<typeof vi.fn>,
   mockRealpathSync: vi.fn() as ReturnType<typeof vi.fn>,
 }));
 
 vi.mock('fs', () => ({
   default: {
-    existsSync: mockExistsSync,
+    statSync: mockStatSync,
     readFileSync: mockReadFileSync,
     realpathSync: mockRealpathSync,
   },
@@ -59,7 +59,7 @@ const VALID_ALLOWLIST = {
 /** Set up mocks so loadMountAllowlist returns a valid allowlist. */
 function setupValidAllowlist(overrides?: Record<string, unknown>) {
   const allowlist = { ...VALID_ALLOWLIST, ...overrides };
-  mockExistsSync.mockImplementation((p: string) => p === ALLOWLIST_PATH);
+  mockStatSync.mockReturnValue({ mtimeMs: 1 });
   mockReadFileSync.mockImplementation((p: string) => {
     if (p === ALLOWLIST_PATH) return JSON.stringify(allowlist);
     throw new Error(`Unexpected readFileSync: ${p}`);
@@ -80,20 +80,20 @@ describe('mount-security', () => {
 
   describe('loadMountAllowlist', () => {
     it('returns null when allowlist file does not exist', async () => {
-      mockExistsSync.mockReturnValue(false);
+      mockStatSync.mockImplementation(() => { throw new Error('ENOENT'); });
       const { loadMountAllowlist } = await import('./index.js');
       expect(loadMountAllowlist()).toBeNull();
     });
 
     it('returns null when file contains invalid JSON', async () => {
-      mockExistsSync.mockReturnValue(true);
+      mockStatSync.mockReturnValue({ mtimeMs: 1 });
       mockReadFileSync.mockReturnValue('not json {{{');
       const { loadMountAllowlist } = await import('./index.js');
       expect(loadMountAllowlist()).toBeNull();
     });
 
     it('returns null when allowedRoots is not an array', async () => {
-      mockExistsSync.mockReturnValue(true);
+      mockStatSync.mockReturnValue({ mtimeMs: 1 });
       mockReadFileSync.mockReturnValue(
         JSON.stringify({
           allowedRoots: 'not-array',
@@ -105,7 +105,7 @@ describe('mount-security', () => {
     });
 
     it('returns null when blockedPatterns is not an array', async () => {
-      mockExistsSync.mockReturnValue(true);
+      mockStatSync.mockReturnValue({ mtimeMs: 1 });
       mockReadFileSync.mockReturnValue(
         JSON.stringify({
           allowedRoots: [],
@@ -117,7 +117,7 @@ describe('mount-security', () => {
     });
 
     it('merges default blocked patterns with user patterns', async () => {
-      mockExistsSync.mockReturnValue(true);
+      mockStatSync.mockReturnValue({ mtimeMs: 1 });
       mockReadFileSync.mockReturnValue(
         JSON.stringify({
           allowedRoots: [],
@@ -141,7 +141,7 @@ describe('mount-security', () => {
     });
 
     it('deduplicates when user pattern overlaps with defaults', async () => {
-      mockExistsSync.mockReturnValue(true);
+      mockStatSync.mockReturnValue({ mtimeMs: 1 });
       mockReadFileSync.mockReturnValue(
         JSON.stringify({
           allowedRoots: [],
@@ -155,7 +155,7 @@ describe('mount-security', () => {
     });
 
     it('caches result — second call does not re-read file', async () => {
-      mockExistsSync.mockReturnValue(true);
+      mockStatSync.mockReturnValue({ mtimeMs: 1 });
       mockReadFileSync.mockReturnValue(
         JSON.stringify({
           allowedRoots: [],
@@ -170,22 +170,12 @@ describe('mount-security', () => {
     });
 
     it('re-checks when file not found — not cached as error', async () => {
-      mockExistsSync.mockReturnValue(false);
+      mockStatSync.mockImplementation(() => { throw new Error('ENOENT'); });
       const { loadMountAllowlist } = await import('./index.js');
       loadMountAllowlist();
       loadMountAllowlist();
-      // existsSync called twice because file-not-found is not cached
-      expect(mockExistsSync).toHaveBeenCalledTimes(2);
-    });
-
-    it('caches a structural (parse) error — does not re-read after a bad parse', async () => {
-      mockExistsSync.mockReturnValue(true);
-      mockReadFileSync.mockReturnValue('not json {{{');
-      const { loadMountAllowlist } = await import('./index.js');
-      expect(loadMountAllowlist()).toBeNull();
-      expect(loadMountAllowlist()).toBeNull();
-      // parse error is permanently cached → file read only once
-      expect(mockReadFileSync).toHaveBeenCalledTimes(1);
+      // statSync called twice because file-not-found is not cached
+      expect(mockStatSync).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -193,7 +183,7 @@ describe('mount-security', () => {
 
   describe('validateMount', () => {
     it('rejects when no allowlist is configured', async () => {
-      mockExistsSync.mockReturnValue(false);
+      mockStatSync.mockImplementation(() => { throw new Error('ENOENT'); });
       const { validateMount } = await import('./index.js');
       const result = validateMount({ hostPath: '/some/path' });
       expect(result.allowed).toBe(false);
@@ -460,6 +450,80 @@ describe('mount-security', () => {
       expect(Array.isArray(template.allowedRoots)).toBe(true);
       expect(Array.isArray(template.blockedPatterns)).toBe(true);
       expect(template.allowedRoots.length).toBeGreaterThan(0);
+    });
+  });
+
+  // ── loadMountAllowlist — normalizeRoot ─────────────────────────────
+
+  describe('loadMountAllowlist — normalizeRoot', () => {
+    it('translates per-root readOnly:false into a read-write grant', async () => {
+      mockStatSync.mockReturnValue({ mtimeMs: 1 });
+      mockReadFileSync.mockReturnValue(
+        JSON.stringify({
+          allowedRoots: [{ path: '/allowed/rw', readOnly: false }],
+          blockedPatterns: [],
+        }),
+      );
+      mockRealpathSync.mockImplementation((p: string) => p);
+      const { loadMountAllowlist } = await import('./index.js');
+      const allowlist = loadMountAllowlist();
+      expect(allowlist).not.toBeNull();
+      expect(allowlist!.allowedRoots[0].allowReadWrite).toBe(true);
+    });
+
+    it('keeps readOnly:true as a read-only grant', async () => {
+      mockStatSync.mockReturnValue({ mtimeMs: 1 });
+      mockReadFileSync.mockReturnValue(
+        JSON.stringify({
+          allowedRoots: [{ path: '/allowed/rw', readOnly: true }],
+          blockedPatterns: [],
+        }),
+      );
+      const { loadMountAllowlist } = await import('./index.js');
+      const allowlist = loadMountAllowlist();
+      expect(allowlist!.allowedRoots[0].allowReadWrite).toBe(false);
+    });
+
+    it('tolerates an unknown top-level nonMainReadOnly key', async () => {
+      mockStatSync.mockReturnValue({ mtimeMs: 1 });
+      mockReadFileSync.mockReturnValue(
+        JSON.stringify({
+          allowedRoots: [{ path: '/allowed/rw', allowReadWrite: true }],
+          blockedPatterns: [],
+          nonMainReadOnly: true,
+        }),
+      );
+      const { loadMountAllowlist } = await import('./index.js');
+      const allowlist = loadMountAllowlist();
+      expect(allowlist).not.toBeNull();
+      expect(allowlist!.allowedRoots).toHaveLength(1);
+      expect(allowlist!.allowedRoots[0].allowReadWrite).toBe(true);
+    });
+
+    it('picks up a fixed file without a restart (parse errors are not cached)', async () => {
+      // First call with bad JSON: returns null and does NOT cache the error.
+      mockStatSync.mockReturnValue({ mtimeMs: 1 });
+      mockReadFileSync.mockReturnValue('not valid json {');
+      const { loadMountAllowlist } = await import('./index.js');
+      expect(loadMountAllowlist()).toBeNull();
+
+      // Fix the file (different mtime) — recovers on the very next call, no restart.
+      mockStatSync.mockReturnValue({ mtimeMs: 2 });
+      mockReadFileSync.mockReturnValue(
+        JSON.stringify({
+          allowedRoots: [{ path: '/allowed/rw', allowReadWrite: true }],
+          blockedPatterns: [],
+        }),
+      );
+      const allowlist = loadMountAllowlist();
+      expect(allowlist).not.toBeNull();
+      expect(allowlist!.allowedRoots).toHaveLength(1);
+    });
+
+    it('returns null when the allowlist file is missing', async () => {
+      mockStatSync.mockImplementation(() => { throw new Error('ENOENT'); });
+      const { loadMountAllowlist } = await import('./index.js');
+      expect(loadMountAllowlist()).toBeNull();
     });
   });
 });

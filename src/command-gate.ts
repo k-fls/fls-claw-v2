@@ -23,6 +23,7 @@ import {
   type BeginInteractionOptions,
   type HostInteractionKey,
 } from './host-interactions.js';
+import { hasAdminPrivilege, isOwner, isGlobalAdmin } from './modules/permissions/db/user-roles.js';
 
 export type GateResult =
   | { action: 'pass' }
@@ -30,7 +31,7 @@ export type GateResult =
   | { action: 'deny'; command: string }
   | { action: 'handle'; command: string; handler: HostCommandHandler };
 
-const FILTERED_COMMANDS = new Set(['/login', '/logout', '/doctor', '/config', '/remote-control']);
+const FILTERED_COMMANDS = new Set(['/login', '/logout', '/doctor', '/config', '/remote-control', '/start']);
 const ADMIN_COMMANDS = new Set(['/clear', '/compact', '/context', '/cost', '/files', '/upload-trace']);
 
 /**
@@ -204,6 +205,28 @@ export interface ParsedSlashCommand {
 }
 
 /**
+ * Unwrap the text used for slash-command classification from an inbound
+ * `content` payload. Chat adapters stamp `{ "text": "..." }`; a raw string
+ * is also accepted.
+ *
+ * When the channel layer marked a leading bot-mention (`mentionPrefixEnd`),
+ * the text is read FROM that offset — in a group channel a user must
+ * @-mention the bot, and the mention prefix would otherwise prevent slash
+ * classification.
+ */
+function classifiableText(content: string): string {
+  try {
+    const parsed = JSON.parse(content);
+    let text = typeof parsed.text === 'string' ? parsed.text : '';
+    const end = typeof parsed.mentionPrefixEnd === 'number' ? parsed.mentionPrefixEnd : 0;
+    if (end > 0 && end <= text.length) text = text.slice(end);
+    return text.trim();
+  } catch {
+    return content.trim();
+  }
+}
+
+/**
  * Extract the slash-command word and arguments from a message `content`
  * payload. Mirrors the JSON-text unwrap used elsewhere: chat adapters
  * stamp `{"text": "..."}`; raw strings are also accepted. Returns `null`
@@ -212,13 +235,7 @@ export interface ParsedSlashCommand {
  * No quoting / escape parsing — `args` is a plain whitespace split.
  */
 export function parseSlashCommand(content: string): ParsedSlashCommand | null {
-  let text: string;
-  try {
-    const parsed = JSON.parse(content);
-    text = (parsed.text || '').trim();
-  } catch {
-    text = content.trim();
-  }
+  const text = classifiableText(content);
 
   if (!text.startsWith('/')) return null;
 
@@ -298,29 +315,10 @@ export function gateCommand(content: string, userId: string | null, agentGroupId
 export function isAdmin(userId: string | null, agentGroupId?: string | null): boolean {
   if (!userId) return false;
   if (!hasTable(getDb(), 'user_roles')) return true; // no permissions module = allow all
-  const db = getDb();
   if (agentGroupId == null) {
-    const row = db
-      .prepare(
-        `SELECT 1 FROM user_roles
-         WHERE user_id = ?
-           AND (role = 'owner' OR role = 'admin')
-           AND agent_group_id IS NULL
-         LIMIT 1`,
-      )
-      .get(userId);
-    return row != null;
+    return isOwner(userId) || isGlobalAdmin(userId);
   }
-  const row = db
-    .prepare(
-      `SELECT 1 FROM user_roles
-       WHERE user_id = ?
-         AND (role = 'owner' OR role = 'admin')
-         AND (agent_group_id IS NULL OR agent_group_id = ?)
-       LIMIT 1`,
-    )
-    .get(userId, agentGroupId);
-  return row != null;
+  return hasAdminPrivilege(userId, agentGroupId);
 }
 
 /**
