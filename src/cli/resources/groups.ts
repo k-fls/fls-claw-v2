@@ -84,7 +84,8 @@ registerResource({
         }
         const folder = args.folder as string;
         if (!folder) throw new Error('--folder is required');
-        const name = (args.name as string) ?? folder;
+        const name = args.name as string;
+        if (!name) throw new Error('--name is required');
         const existing = getAgentGroupByFolder(folder);
         if (existing) {
           initGroupFilesystem(existing);
