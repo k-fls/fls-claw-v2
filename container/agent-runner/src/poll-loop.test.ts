@@ -584,50 +584,86 @@ describe('task-run turn wiring (real processQuery)', () => {
     expect(getUndeliveredMessages().filter((m) => m.kind === 'chat')).toHaveLength(0);
   });
 
-  it('logs and conditionally nudges a second task run in the same open query', async () => {
-    const pushes: string[] = [];
+  it(
+    'logs and conditionally nudges a second task run in the same open query',
+    async () => {
+      const pushes: string[] = [];
 
-    async function* events(): AsyncGenerator<ProviderEvent> {
-      yield { type: 'init', continuation: 's1' };
-      // Turn 1 uses the legacy wrong door and consumes its one correction.
-      yield { type: 'result', text: '<message to="local-cli">fire one result</message>' };
-      yield { type: 'result', text: 'first delivery decision handled' };
+      // In bun 1.3's full test suite, setInterval callbacks do not fire while
+      // for-await is parked on an async generator, but setTimeout callbacks do.
+      // (Root cause: bun does not yield to setInterval macrotasks during
+      // generator suspension; this is reproducible — the prior while-loop
+      // approach ran 3s with real setTimeout working but the interval silent.)
+      //
+      // Fix: replace the global setInterval/clearInterval with a manual fake
+      // that fires on demand.  setTimeout is left real so the generator's
+      // 500ms await below genuinely yields to the event loop (letting the
+      // interval IIFE's microtask chain complete before we continue).
+      const fakeTimers = new Map<number, () => void>();
+      let nextFakeId = 100_000;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const realSetInterval = (globalThis as any).setInterval as typeof setInterval;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const realClearInterval = (globalThis as any).clearInterval as typeof clearInterval;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (globalThis as any).setInterval = (cb: () => void): number => {
+        const id = nextFakeId++;
+        fakeTimers.set(id, cb);
+        return id;
+      };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (globalThis as any).clearInterval = (id: number): void => {
+        fakeTimers.delete(id);
+      };
 
-      // A SECOND task run lands while the query is open — the follow-up poller
-      // pushes it and must reset the per-turn correction state.
-      insertMessage('t2', 'task', { prompt: 'fire two' });
-      const deadline = Date.now() + 5000;
-      while (!pushes.some((p) => p.includes('fire two')) && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 50));
+      async function* events(): AsyncGenerator<ProviderEvent> {
+        yield { type: 'init', continuation: 's1' };
+        // Turn 1 uses the legacy wrong door and consumes its one correction.
+        yield { type: 'result', text: '<message to="local-cli">fire one result</message>' };
+        yield { type: 'result', text: 'first delivery decision handled' };
+
+        // A second task arrives.  Fire the fake poll interval synchronously so
+        // the IIFE resets taskBlockNudged and calls query.push, then yield via
+        // a real setTimeout so the IIFE's async chain completes before the
+        // generator resumes and yields the next result event.
+        insertMessage('t2', 'task', { prompt: 'fire two' });
+        for (const cb of fakeTimers.values()) cb();
+        await new Promise<void>((r) => setTimeout(r, 500));
+
+        // Turn 2 repeats the mistake.  Gets a second independent nudge only
+        // if the follow-up path reset taskBlockNudged.
+        yield { type: 'result', text: '<message to="local-cli">fire two result</message>' };
+        yield { type: 'result', text: 'second delivery decision handled' };
       }
 
-      // Turn 2 repeats the mistake. This receives a second independent nudge
-      // only if the follow-up path reset taskBlockNudged.
-      yield { type: 'result', text: '<message to="local-cli">fire two result</message>' };
-      yield { type: 'result', text: 'second delivery decision handled' };
-    }
+      const query: AgentQuery = {
+        push: (m: string) => { pushes.push(m); },
+        end: () => {},
+        events: events(),
+        abort: () => {},
+      };
 
-    const query: AgentQuery = {
-      push: (m: string) => {
-        pushes.push(m);
-      },
-      end: () => {},
-      events: events(),
-      abort: () => {},
-    };
+      try {
+        await processQuery(query, TASK_ROUTING, ['t1'], 'claude', undefined, 'prompt', undefined);
+      } finally {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (globalThis as any).setInterval = realSetInterval;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (globalThis as any).clearInterval = realClearInterval;
+      }
 
-    await processQuery(query, TASK_ROUTING, ['t1'], 'claude', undefined, 'prompt', undefined);
+      const nudges = pushes.filter((p) => p.includes('If and only if'));
+      expect(nudges).toHaveLength(2);
+      expect(nudges[0]).toContain('fire one result');
+      expect(nudges[1]).toContain('fire two result');
 
-    const nudges = pushes.filter((p) => p.includes('If and only if'));
-    expect(nudges).toHaveLength(2);
-    expect(nudges[0]).toContain('fire one result');
-    expect(nudges[1]).toContain('fire two result');
-
-    const logs = taskLogRows().map((l) => l.text);
-    expect(logs).toHaveLength(2);
-    expect(logs[0]).toContain('[undelivered → local-cli] fire one result');
-    expect(logs[1]).toContain('[undelivered → local-cli] fire two result');
-    expect(logs).not.toContain('first delivery decision handled');
-    expect(logs).not.toContain('second delivery decision handled');
-  });
+      const logs = taskLogRows().map((l) => l.text);
+      expect(logs).toHaveLength(2);
+      expect(logs[0]).toContain('[undelivered → local-cli] fire one result');
+      expect(logs[1]).toContain('[undelivered → local-cli] fire two result');
+      expect(logs).not.toContain('first delivery decision handled');
+      expect(logs).not.toContain('second delivery decision handled');
+    },
+    12000,
+  );
 });
