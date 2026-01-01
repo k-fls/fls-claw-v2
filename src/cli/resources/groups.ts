@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 
 import type { AdditionalMountConfig, McpServerConfig } from '../../container-config.js';
+import { DEFAULT_AGENT_PROVIDER } from '../../config.js';
 import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
 import { createAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
@@ -75,7 +76,7 @@ registerResource({
       description:
         'Create (or return the existing) agent group with its container config. Idempotent on --folder. ' +
         'With --template <ref>, stamp from a local template under templates/ (MCP servers + instructions ' +
-        '+ skills). Use --folder <slug> and --name <display name>.',
+        '+ skills + paused recurring tasks). Use --folder <slug> and --name <display name>.',
       handler: async (args) => {
         if (args.template) {
           return createAgentFromTemplate(String(args.template), {
@@ -94,10 +95,12 @@ registerResource({
         const id = `ag-${randomUUID()}`;
         const group: AgentGroup = { id, name, folder, agent_provider: null, created_at: new Date().toISOString() };
         // Atomic: insert group + container_configs together so a half-created
-        // (unspawnable) group can never be left behind (#4).
+        // (unspawnable) group can never be left behind (#4). Stamp the instance
+        // default provider here; initGroupFilesystem's ensureContainerConfig
+        // is INSERT OR IGNORE and will be a no-op on this already-stamped row.
         getDb().transaction(() => {
           createAgentGroup(group);
-          ensureContainerConfig(id);
+          ensureContainerConfig(id, DEFAULT_AGENT_PROVIDER);
         })();
         initGroupFilesystem(group);
         return getAgentGroupByFolder(folder);

@@ -87,7 +87,8 @@ describe('tasks CLI resource', () => {
 
     expect(resp.ok).toBe(true);
     if (!resp.ok) return;
-    const created = resp.data as { series_id: string; session_id: string };
+    const created = resp.data as { series_id: string; session_id: string; status: string };
+    expect(created.status).toBe('pending');
     expect(created.session_id).not.toBe('chat-1');
 
     // The task lands in its own isolated per-series session, not the chat session.
