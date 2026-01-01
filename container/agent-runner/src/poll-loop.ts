@@ -8,6 +8,7 @@ import {
 } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
+import { applyPreTaskScripts as applyPreTaskScriptsFollowUp } from './scheduling/task-script.js';
 import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
 import {
   clearCurrentInReplyTo,
@@ -458,8 +459,7 @@ export async function processQuery(
         let keep = newMessages;
         let skipped: Array<{ id: string; reason: string }> = [];
         // MODULE-HOOK:scheduling-pre-task-followup:start
-        const { applyPreTaskScripts } = await import('./scheduling/task-script.js');
-        const preTask = await applyPreTaskScripts(newMessages);
+        const preTask = await applyPreTaskScriptsFollowUp(newMessages);
         keep = preTask.keep;
         skipped = preTask.skipped;
         if (skipped.length > 0) {

@@ -586,6 +586,9 @@ describe('task-run turn wiring (real processQuery)', () => {
 
   it('logs and conditionally nudges a second task run in the same open query', async () => {
     const pushes: string[] = [];
+    // Shared flag: generator polls this to know when to stop its activity loop
+    // and yield the remaining events.
+    let continueFlag = false;
 
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 's1' };
@@ -595,10 +598,14 @@ describe('task-run turn wiring (real processQuery)', () => {
 
       // A SECOND task run lands while the query is open — the follow-up poller
       // pushes it and must reset the per-turn correction state.
-      insertMessage('t2', 'task', { prompt: 'fire two' });
-      const deadline = Date.now() + 5000;
-      while (!pushes.some((p) => p.includes('fire two')) && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 50));
+      // Yield activity events in a loop instead of awaiting a single pending
+      // Promise: each setTimeout(10ms) fires as its own macrotask, creating
+      // interleaving opportunities for the follow-up poll's setInterval to fire.
+      // Awaiting a single pending Promise blocks the for-await/setInterval
+      // interaction in Bun 1.x.
+      while (!continueFlag) {
+        yield { type: 'activity' };
+        await new Promise((r) => setTimeout(r, 10));
       }
 
       // Turn 2 repeats the mistake. This receives a second independent nudge
@@ -616,7 +623,24 @@ describe('task-run turn wiring (real processQuery)', () => {
       abort: () => {},
     };
 
-    await processQuery(query, TASK_ROUTING, ['t1'], 'claude', undefined, 'prompt', undefined);
+    const queryPromise = processQuery(query, TASK_ROUTING, ['t1'], 'claude', undefined, 'prompt', undefined);
+
+    // Give processQuery time to consume the 3 initial events and enter the loop.
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Insert t2 while the query is open (generator looping on activity events).
+    insertMessage('t2', 'task', { prompt: 'fire two' });
+
+    // Poll until the follow-up poller (~500ms interval) pushes t2.
+    const deadline = Date.now() + 3000;
+    while (!pushes.some((p) => p.includes('fire two')) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(pushes.some((p) => p.includes('fire two'))).toBe(true);
+
+    // Signal the generator to exit the activity loop and yield the remaining events.
+    continueFlag = true;
+    await queryPromise;
 
     const nudges = pushes.filter((p) => p.includes('If and only if'));
     expect(nudges).toHaveLength(2);
