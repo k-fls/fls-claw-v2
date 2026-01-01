@@ -18,12 +18,12 @@
 // registers its handlers at import time.
 import './approvals/index.js';
 import './interactive/index.js';
-import './scheduling/index.js';
 // container-bootstrap before container-env: container-env imports
 // isEnvNameReserved from the container-bootstrap reserved-env registry.
 import './container-bootstrap/index.js';
 import './host-rpc/index.js';
 import './container-env/index.js';
+
 import './permissions/index.js';
 import './agent-to-agent/index.js';
 import './self-mod/index.js';
