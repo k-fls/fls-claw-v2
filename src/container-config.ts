@@ -336,7 +336,7 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
 /**
  * Materialize `container.json` from the DB. Called at spawn time so the
  * container always sees fresh config. Returns the `ContainerConfig` for
- * use by the caller (buildMounts, buildContainerArgs, etc.).
+ * use by the caller (buildMounts, composeSessionSpec, etc.).
  */
 export function materializeContainerJson(agentGroupId: string): ContainerConfig {
   const group = getAgentGroup(agentGroupId);

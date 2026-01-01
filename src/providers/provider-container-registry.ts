@@ -20,6 +20,14 @@ export interface VolumeMount {
   hostPath: string;
   containerPath: string;
   readonly: boolean;
+  /**
+   * Which pinning rule this mount is subject to (see `src/drivers/types.ts`).
+   * Optional here because provider contributions are vetted by their in-tree
+   * registration; composition classes those as `allowlisted-extra`.
+   */
+  mountClass?: import('../drivers/types.js').MountClass;
+  /** Agent group this mount is pinned to, for `group-state`. */
+  scope?: string;
 }
 
 export interface ProviderContainerContext {

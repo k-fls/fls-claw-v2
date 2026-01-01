@@ -19,6 +19,8 @@ import {
   updateContainerConfigScalars,
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
+import { getSessionDriver } from '../../drivers/index.js';
+import { assertValidGroupFolder, groupFolderExistsOnDisk } from '../../group-folder.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { createAgentFromTemplate } from '../../templates/create-agent.js';
 import {
@@ -156,12 +158,27 @@ registerResource({
         }
         const folder = args.folder as string;
         if (!folder) throw new Error('--folder is required');
+        // The template path validates through createAgentFromTemplate; the bare
+        // path used to validate nowhere, minting folders the runtime label
+        // grammar refuses at every spawn.
+        assertValidGroupFolder(folder);
         const name = args.name as string;
         if (!name) throw new Error('--name is required');
         const existing = getAgentGroupByFolder(folder);
         if (existing) {
           initGroupFilesystem(existing);
           return existing;
+        }
+        // Fresh-create branch only: a folder on disk with no claiming DB row
+        // is deleted-group residue (delete never removes groups/<folder>/) or
+        // an operator-placed dir — minting a new id over it would silently
+        // re-scope the old group's data under a new identity.
+        if (groupFolderExistsOnDisk(folder)) {
+          throw new Error(
+            `group folder 'groups/${folder}' already exists on disk but no agent group claims it — ` +
+              `deleting a group never removes its folder, and creating a new group over it would silently ` +
+              `adopt the old group's data under a new identity. Move or remove the folder, or pick a different --folder.`,
+          );
         }
         const id = `ag-${randomUUID()}`;
         const group: AgentGroup = { id, name, folder, agent_provider: null, created_at: new Date().toISOString() };
@@ -187,7 +204,8 @@ registerResource({
       description:
         'Delete an agent group and its dependent rows (sessions, destinations, approvals, role grants, ' +
         'memberships, channel wirings). FK-ordered cascade in a single transaction. ' +
-        'Use --id <group-id>. Out of scope: killing running containers, on-disk cleanup of groups/<folder>/ and data/v2-sessions/<group-id>/.',
+        'Use --id <group-id>. Out of scope: killing running containers, on-disk cleanup of groups/<folder>/ and data/v2-sessions/<group-id>/. ' +
+        'The leftover groups/<folder>/ blocks re-creating a group under the same folder name until it is moved or removed.',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -281,6 +299,19 @@ registerResource({
         const id = (args.id as string) || (ctx.caller === 'agent' ? ctx.agentGroupId : undefined);
         if (!id) throw new Error('--id is required');
         if (args.rebuild) {
+          // Refuse the WHOLE command in the payload (this command exits 0 even
+          // on a nonexistent group id) and restart nothing: the operator asked
+          // for rebuild-then-restart, and restarting after silently skipping
+          // the rebuild would report success for a rebuild that never happened.
+          if (!getSessionDriver().capabilities().imageBuild) {
+            return {
+              restarted: 0,
+              rebuilt: false,
+              error:
+                "the session runtime does not declare the 'imageBuild' capability; " +
+                '--rebuild cannot run here — image changes must be built and imported out of band',
+            };
+          }
           await buildAgentGroupImage(id);
         }
         const message = args.message as string | undefined;
