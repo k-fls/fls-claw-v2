@@ -30,7 +30,7 @@ export type GateResult =
   | { action: 'deny'; command: string }
   | { action: 'handle'; command: string; handler: HostCommandHandler };
 
-const FILTERED_COMMANDS = new Set(['/login', '/logout', '/doctor', '/config', '/remote-control']);
+const FILTERED_COMMANDS = new Set(['/login', '/logout', '/doctor', '/config', '/remote-control', '/start']);
 const ADMIN_COMMANDS = new Set(['/clear', '/compact', '/context', '/cost', '/files', '/upload-trace']);
 
 /**
@@ -312,13 +312,10 @@ export function gateCommand(content: string, userId: string | null, agentGroupId
  *   Use this form for messaging-group-scoped commands where there's
  *   no canonical agent.
  *
- * Returns false for null userId. If the permissions module isn't
- * installed (no `user_roles` table), returns true — same allow-all
- * degradation as the rest of the host.
+ * Returns false for null userId.
  */
 export function isAdmin(userId: string | null, agentGroupId?: string | null): boolean {
   if (!userId) return false;
-  if (!hasTable(getDb(), 'user_roles')) return true; // no permissions module = allow all
   const db = getDb();
   if (agentGroupId == null) {
     const row = db

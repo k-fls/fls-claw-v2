@@ -1,9 +1,9 @@
 import { randomUUID } from 'crypto';
 
-import type { McpServerConfig } from '../../container-config.js';
+import type { AdditionalMountConfig, McpServerConfig } from '../../container-config.js';
 import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
-import { createAgentGroup } from '../../db/agent-groups.js';
+import { createAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
 import { getDb, hasTable } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
@@ -13,7 +13,9 @@ import {
   updateContainerConfigScalars,
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
-import type { ContainerConfigRow } from '../../types.js';
+import { initGroupFilesystem } from '../../group-init.js';
+import { createAgentFromTemplate } from '../../templates/create-agent.js';
+import type { AgentGroup, ContainerConfigRow } from '../../types.js';
 import { registerResource } from '../crud.js';
 
 /** Deserialize JSON columns for display. */
@@ -62,46 +64,43 @@ registerResource({
     },
     { name: 'created_at', type: 'string', description: 'Auto-set.', generated: true },
   ],
-  // `create` and `delete` are intentionally not in `operations`:
-  //  - the generic single-table CREATE inserts only the agent_groups row and
-  //    never the matching container_configs row, leaving the group unspawnable
-  //    (see #4). The handler below mirrors the non-CLI creation paths
-  //    (group-init.ts, commands/agent-runtime.ts) by calling
-  //    ensureContainerConfig() after the insert.
-  //  - the generic single-table DELETE violates FK constraints (see #2525).
-  // Both are provided as `customOperations` below.
+  // `create` and `delete` are custom (below): create needs a `--template`
+  // branch, and the generic create inserts a bare agent_groups row but never
+  // the container_config a working group needs; the generic single-table
+  // DELETE violates FK constraints (#2525).
   operations: { list: 'open', get: 'open', update: 'approval' },
   customOperations: {
     create: {
       access: 'approval',
       description:
-        'Create a new agent group and its container config. Use --name <name> --folder <folder>. ' +
-        'Provisions the matching container_configs row so the group is spawnable (mirrors group-init).',
+        'Create (or return the existing) agent group with its container config. Idempotent on --folder. ' +
+        'With --template <ref>, stamp from a local template under templates/ (MCP servers + instructions ' +
+        '+ skills). Use --folder <slug> and --name <display name>.',
       handler: async (args) => {
-        const name = args.name as string;
-        if (!name) throw new Error('--name is required');
+        if (args.template) {
+          return createAgentFromTemplate(String(args.template), {
+            name: args.name ? String(args.name) : undefined,
+          });
+        }
         const folder = args.folder as string;
         if (!folder) throw new Error('--folder is required');
-
-        const id = randomUUID();
-        const created_at = new Date().toISOString();
-
-        const group = {
-          id,
-          name,
-          folder,
-          agent_provider: (args.agent_provider as string | undefined) ?? null,
-          created_at,
-        };
-
-        // Atomic: insert the group and ensure its container config together so
-        // a half-created (unspawnable) group can never be left behind.
+        const name = args.name as string;
+        if (!name) throw new Error('--name is required');
+        const existing = getAgentGroupByFolder(folder);
+        if (existing) {
+          initGroupFilesystem(existing);
+          return existing;
+        }
+        const id = `ag-${randomUUID()}`;
+        const group: AgentGroup = { id, name, folder, agent_provider: null, created_at: new Date().toISOString() };
+        // Atomic: insert group + container_configs together so a half-created
+        // (unspawnable) group can never be left behind (#4).
         getDb().transaction(() => {
           createAgentGroup(group);
           ensureContainerConfig(id);
         })();
-
-        return { ...group, container_config: 'ensured' };
+        initGroupFilesystem(group);
+        return getAgentGroupByFolder(folder);
       },
     },
     delete: {
@@ -408,6 +407,58 @@ registerResource({
           removed: { apt: apt || null, npm: npm || null },
           note: 'Image rebuild required for package changes to take effect.',
         };
+      },
+    },
+    'config add-mount': {
+      access: 'approval',
+      hostOnly: true,
+      description:
+        "Mount a host directory into a group's containers. OPERATOR-ONLY — never runnable from " +
+        'inside a container (mounting host paths is a filesystem-access boundary). Requires ' +
+        '`ncl groups restart` to take effect. Use --id <group-id> --host <host-path> --container <container-path> [--ro].',
+      handler: async (args) => {
+        const id = args.id as string;
+        if (!id) throw new Error('--id is required');
+        const hostPath = (args.host ?? args['host-path']) as string | undefined;
+        const containerPath = (args.container ?? args['container-path']) as string | undefined;
+        if (!hostPath || !containerPath) throw new Error('Provide --host <host-path> and --container <container-path>');
+
+        const row = getContainerConfig(id);
+        if (!row) throw new Error(`No container config for group: ${id}`);
+
+        const mount: AdditionalMountConfig = {
+          hostPath,
+          containerPath,
+          ...(args.ro || args.readonly ? { readonly: true } : {}),
+        };
+        const existing = JSON.parse(row.additional_mounts) as AdditionalMountConfig[];
+        if (!existing.some((m) => m.hostPath === hostPath && m.containerPath === containerPath)) {
+          existing.push(mount);
+          updateContainerConfigJson(id, 'additional_mounts', existing);
+        }
+        return { added: mount, note: `Run \`ncl groups restart --id ${id}\` for the mount to take effect.` };
+      },
+    },
+    'config remove-mount': {
+      access: 'approval',
+      hostOnly: true,
+      description:
+        'Remove a host mount from a group. OPERATOR-ONLY. Requires `ncl groups restart` to take effect. ' +
+        'Use --id <group-id> --host <host-path> --container <container-path>.',
+      handler: async (args) => {
+        const id = args.id as string;
+        if (!id) throw new Error('--id is required');
+        const hostPath = (args.host ?? args['host-path']) as string | undefined;
+        const containerPath = (args.container ?? args['container-path']) as string | undefined;
+        if (!hostPath || !containerPath) throw new Error('Provide --host <host-path> and --container <container-path>');
+
+        const row = getContainerConfig(id);
+        if (!row) throw new Error(`No container config for group: ${id}`);
+
+        const existing = JSON.parse(row.additional_mounts) as AdditionalMountConfig[];
+        const filtered = existing.filter((m) => !(m.hostPath === hostPath && m.containerPath === containerPath));
+        updateContainerConfigJson(id, 'additional_mounts', filtered);
+        return { removed: { hostPath, containerPath }, note: `Run \`ncl groups restart --id ${id}\` to apply.` };
       },
     },
   },
