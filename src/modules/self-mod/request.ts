@@ -19,41 +19,47 @@ import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import { notifyAgent, requestApproval } from '../approvals/index.js';
 
-export async function handleInstallPackages(content: Record<string, unknown>, session: Session): Promise<void> {
+const APT_RE = /^[a-z0-9][a-z0-9._+-]*$/;
+const NPM_RE = /^(@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
+const MAX_PACKAGES = 20;
+
+export function validateInstallPackages(content: Record<string, unknown>, session: Session): boolean {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
     notifyAgent(session, 'install_packages failed: agent group not found.');
-    return;
+    return false;
   }
-
   const apt = (content.apt as string[]) || [];
   const npm = (content.npm as string[]) || [];
-  const reason = (content.reason as string) || '';
-
-  const APT_RE = /^[a-z0-9][a-z0-9._+-]*$/;
-  const NPM_RE = /^(@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
-  const MAX_PACKAGES = 20;
   if (apt.length + npm.length === 0) {
     notifyAgent(session, 'install_packages failed: at least one apt or npm package is required.');
-    return;
+    return false;
   }
   if (apt.length + npm.length > MAX_PACKAGES) {
     notifyAgent(session, `install_packages failed: max ${MAX_PACKAGES} packages per request.`);
-    return;
+    return false;
   }
   const invalidApt = apt.find((p) => !APT_RE.test(p));
   if (invalidApt) {
     notifyAgent(session, `install_packages failed: invalid apt package name "${invalidApt}".`);
     log.warn('install_packages: invalid apt package rejected', { pkg: invalidApt });
-    return;
+    return false;
   }
   const invalidNpm = npm.find((p) => !NPM_RE.test(p));
   if (invalidNpm) {
     notifyAgent(session, `install_packages failed: invalid npm package name "${invalidNpm}".`);
     log.warn('install_packages: invalid npm package rejected', { pkg: invalidNpm });
-    return;
+    return false;
   }
+  return true;
+}
 
+export async function requestInstallPackagesHold(content: Record<string, unknown>, session: Session): Promise<void> {
+  const agentGroup = getAgentGroup(session.agent_group_id);
+  if (!agentGroup) return;
+  const apt = (content.apt as string[]) || [];
+  const npm = (content.npm as string[]) || [];
+  const reason = (content.reason as string) || '';
   const packageList = [...apt.map((p) => `apt: ${p}`), ...npm.map((p) => `npm: ${p}`)].join(', ');
   await requestApproval({
     session,
@@ -63,6 +69,11 @@ export async function handleInstallPackages(content: Record<string, unknown>, se
     title: 'Install Packages Request',
     question: `Agent "${agentGroup.name}" is attempting to install a package + rebuild container:\n${packageList}${reason ? `\nReason: ${reason}` : ''}`,
   });
+}
+
+export async function handleInstallPackages(content: Record<string, unknown>, session: Session): Promise<void> {
+  if (!validateInstallPackages(content, session)) return;
+  await requestInstallPackagesHold(content, session);
 }
 
 /** True if `value` is an array of strings. */
@@ -117,45 +128,7 @@ export function escapeInvisibles(s: string): string {
   });
 }
 
-export async function handleAddMcpServer(content: Record<string, unknown>, session: Session): Promise<void> {
-  const agentGroup = getAgentGroup(session.agent_group_id);
-  if (!agentGroup) {
-    notifyAgent(session, 'add_mcp_server failed: agent group not found.');
-    return;
-  }
-  const serverName = content.name as string;
-  const command = content.command as string;
-  if (typeof serverName !== 'string' || !serverName || typeof command !== 'string' || !command) {
-    notifyAgent(session, 'add_mcp_server failed: name and command are required.');
-    return;
-  }
-  if (content.args !== undefined && !isStringArray(content.args)) {
-    notifyAgent(session, 'add_mcp_server failed: args must be an array of strings.');
-    return;
-  }
-  if (content.env !== undefined && !isStringRecord(content.env)) {
-    notifyAgent(session, 'add_mcp_server failed: env must be a map of string keys to string values.');
-    return;
-  }
-
-  const args = (content.args as string[] | undefined) || [];
-  const env = (content.env as Record<string, string> | undefined) || {};
-
-  if (args.length > MAX_MCP_ARGS) {
-    notifyAgent(session, `add_mcp_server failed: max ${MAX_MCP_ARGS} args per server.`);
-    return;
-  }
-  if (Object.keys(env).length > MAX_MCP_ENV_VARS) {
-    notifyAgent(session, `add_mcp_server failed: max ${MAX_MCP_ENV_VARS} env vars per server.`);
-    return;
-  }
-  if (Buffer.byteLength(JSON.stringify({ name: serverName, command, args, env }), 'utf8') > MCP_PAYLOAD_MAX_BYTES) {
-    notifyAgent(session, `add_mcp_server failed: payload exceeds ${MCP_PAYLOAD_MAX_BYTES} bytes.`);
-    return;
-  }
-
-  // Card-only view: secret-shaped values render as redaction placeholders;
-  // the payload below keeps the verbatim values.
+function buildMcpQuestion(agentName: string, serverName: string, command: string, args: string[], env: Record<string, string>): string {
   const displayArgs = args.map((a) => (SECRET_VALUE_RE.test(a) ? redactSecret(a) : a));
   const displayEnv = Object.fromEntries(
     Object.entries(env).map(([k, v]) => [
@@ -163,27 +136,74 @@ export async function handleAddMcpServer(content: Record<string, unknown>, sessi
       SECRET_ENV_KEY_RE.test(k) || SECRET_VALUE_RE.test(v) ? redactSecret(v) : v,
     ]),
   );
-
-  // JSON-encode each field (exact boundaries, embedded newlines render as
-  // visible \n escapes), escape invisibles/backticks, and wrap the payload
-  // in a code fence — no payload content can add lines to the card, spoof
-  // another field, or break out of the fence.
-  const question =
-    `Agent "${agentGroup.name}" is attempting to add a new MCP server:\n` +
+  return (
+    `Agent "${agentName}" is attempting to add a new MCP server:\n` +
     '```\n' +
     `name: ${escapeInvisibles(JSON.stringify(serverName))}\n` +
     `command: ${escapeInvisibles(JSON.stringify(command))}\n` +
     `args: ${escapeInvisibles(JSON.stringify(displayArgs))}\n` +
     `env: ${escapeInvisibles(JSON.stringify(displayEnv))}\n` +
-    '```';
+    '```'
+  );
+}
+
+export function validateAddMcpServer(content: Record<string, unknown>, session: Session): boolean {
+  const agentGroup = getAgentGroup(session.agent_group_id);
+  if (!agentGroup) {
+    notifyAgent(session, 'add_mcp_server failed: agent group not found.');
+    return false;
+  }
+  const serverName = content.name as string;
+  const command = content.command as string;
+  if (typeof serverName !== 'string' || !serverName || typeof command !== 'string' || !command) {
+    notifyAgent(session, 'add_mcp_server failed: name and command are required.');
+    return false;
+  }
+  if (content.args !== undefined && !isStringArray(content.args)) {
+    notifyAgent(session, 'add_mcp_server failed: args must be an array of strings.');
+    return false;
+  }
+  if (content.env !== undefined && !isStringRecord(content.env)) {
+    notifyAgent(session, 'add_mcp_server failed: env must be a map of string keys to string values.');
+    return false;
+  }
+  const args = (content.args as string[] | undefined) || [];
+  const env = (content.env as Record<string, string> | undefined) || {};
+  if (args.length > MAX_MCP_ARGS) {
+    notifyAgent(session, `add_mcp_server failed: max ${MAX_MCP_ARGS} args per server.`);
+    return false;
+  }
+  if (Object.keys(env).length > MAX_MCP_ENV_VARS) {
+    notifyAgent(session, `add_mcp_server failed: max ${MAX_MCP_ENV_VARS} env vars per server.`);
+    return false;
+  }
+  if (Buffer.byteLength(JSON.stringify({ name: serverName, command, args, env }), 'utf8') > MCP_PAYLOAD_MAX_BYTES) {
+    notifyAgent(session, `add_mcp_server failed: payload exceeds ${MCP_PAYLOAD_MAX_BYTES} bytes.`);
+    return false;
+  }
+  // JSON-encode each field (exact boundaries, embedded newlines render as
+  // visible \n escapes), escape invisibles/backticks, and wrap the payload
+  // in a code fence — no payload content can add lines to the card, spoof
+  // another field, or break out of the fence.
+  const question = buildMcpQuestion(agentGroup.name, serverName, command, args, env);
   if (Buffer.byteLength(question, 'utf8') > MCP_APPROVAL_CARD_MAX_BYTES) {
     notifyAgent(
       session,
       `add_mcp_server failed: rendered approval card exceeds ${MCP_APPROVAL_CARD_MAX_BYTES} bytes — trim args/env.`,
     );
-    return;
+    return false;
   }
+  return true;
+}
 
+export async function requestAddMcpServerHold(content: Record<string, unknown>, session: Session): Promise<void> {
+  const agentGroup = getAgentGroup(session.agent_group_id);
+  if (!agentGroup) return;
+  const serverName = content.name as string;
+  const command = content.command as string;
+  const args = (content.args as string[] | undefined) || [];
+  const env = (content.env as Record<string, string> | undefined) || {};
+  const question = buildMcpQuestion(agentGroup.name, serverName, command, args, env);
   await requestApproval({
     session,
     agentName: agentGroup.name,
@@ -192,4 +212,9 @@ export async function handleAddMcpServer(content: Record<string, unknown>, sessi
     title: 'Add MCP Request',
     question,
   });
+}
+
+export async function handleAddMcpServer(content: Record<string, unknown>, session: Session): Promise<void> {
+  if (!validateAddMcpServer(content, session)) return;
+  await requestAddMcpServerHold(content, session);
 }

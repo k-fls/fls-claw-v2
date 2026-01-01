@@ -9,6 +9,7 @@
 import { randomUUID } from 'crypto';
 
 import { getDb } from '../db/connection.js';
+import { renderVerbHelp } from './help-render.js';
 import { register } from './registry.js';
 import type { CallerContext } from './frame.js';
 
@@ -40,6 +41,9 @@ export interface CustomOperation {
   access: Access;
   description: string;
   args?: ColumnDef[];
+  examples?: string[];
+  hostOnly?: boolean;
+  formatHuman?: (rows: unknown) => string;
   handler: (args: Record<string, unknown>, ctx: CallerContext) => Promise<unknown>;
 }
 
@@ -77,6 +81,9 @@ export interface ResourceDef {
    * container_configs row).
    */
   afterCreate?: (created: Record<string, unknown>) => void | Promise<void>;
+  naturalKey?: string[];
+  resolveDefaults?: (values: Record<string, unknown>) => void | Promise<void>;
+  preUpdate?: (updates: Record<string, unknown>, current: Record<string, unknown>) => void | Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +145,7 @@ function genericCreate(def: ResourceDef) {
   return async (args: Record<string, unknown>) => {
     const values: Record<string, unknown> = {};
 
+    // Pass 1: generated fields + explicit args + required checks.
     for (const col of def.columns) {
       if (col.generated) {
         if (col.name === def.idColumn) {
@@ -156,7 +164,16 @@ function genericCreate(def: ResourceDef) {
         values[col.name] = col.type === 'number' ? Number(v) : v;
       } else if (col.required) {
         throw new Error(`--${col.name.replace(/_/g, '-')} is required`);
-      } else if (col.default !== undefined) {
+      }
+    }
+
+    // Pass 2: resolveDefaults hook — runs after explicit args, before static defaults.
+    if (def.resolveDefaults) await def.resolveDefaults(values);
+
+    // Pass 3: static defaults for columns still unset.
+    for (const col of def.columns) {
+      if (col.generated || values[col.name] !== undefined) continue;
+      if (col.default !== undefined) {
         values[col.name] = col.default;
       } else if (col.defaultFrom !== undefined && values[col.defaultFrom] !== undefined) {
         values[col.name] = values[col.defaultFrom];
@@ -195,6 +212,15 @@ function genericUpdate(def: ResourceDef) {
       );
     }
 
+    if (def.preUpdate) {
+      const cols = visibleColumns(def).join(', ');
+      const current = getDb()
+        .prepare(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`)
+        .get(id) as Record<string, unknown> | undefined;
+      if (!current) throw new Error(`${def.name} not found: ${id}`);
+      await def.preUpdate(updates, current);
+    }
+
     const setClause = Object.keys(updates)
       .map((k) => `${k} = @${k}`)
       .join(', ');
@@ -227,6 +253,62 @@ function normalizeArgs(raw: Record<string, unknown>): Record<string, unknown> {
   for (const [k, v] of Object.entries(raw)) {
     out[k.replace(/-/g, '_')] = v;
   }
+  return out;
+}
+
+const DISPATCH_INJECTED_KEYS = new Set(['id', 'agent_group_id', 'group']);
+
+export function validateArgs(defs: ColumnDef[], args: Record<string, unknown>): Record<string, unknown> {
+  const knownNames = new Set(defs.map((d) => d.name));
+  const out: Record<string, unknown> = {};
+
+  for (const [k, v] of Object.entries(args)) {
+    if (DISPATCH_INJECTED_KEYS.has(k)) {
+      out[k] = v;
+    } else if (!knownNames.has(k)) {
+      throw new Error(`unknown flag --${k.replace(/_/g, '-')}`);
+    }
+  }
+
+  for (const def of defs) {
+    const raw = args[def.name];
+    if (raw === undefined) {
+      if (def.required) throw new Error(`--${def.name.replace(/_/g, '-')} is required`);
+      if (def.default !== undefined) out[def.name] = def.default;
+      continue;
+    }
+    if (typeof raw === 'boolean') {
+      if (def.type !== 'boolean') throw new Error(`--${def.name.replace(/_/g, '-')} requires a value`);
+      out[def.name] = raw;
+      continue;
+    }
+    switch (def.type) {
+      case 'number': {
+        const n = Number(raw);
+        if (isNaN(n)) throw new Error(`--${def.name.replace(/_/g, '-')} must be a number`);
+        out[def.name] = n;
+        break;
+      }
+      case 'boolean':
+        out[def.name] = raw === 'true' || raw === '1';
+        break;
+      case 'json':
+        try {
+          out[def.name] = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        } catch {
+          throw new Error(`--${def.name.replace(/_/g, '-')} must be valid JSON`);
+        }
+        break;
+      default: {
+        const s = String(raw);
+        if (def.enum && !def.enum.includes(s)) {
+          throw new Error(`--${def.name.replace(/_/g, '-')} must be one of: ${def.enum.join(', ')}`);
+        }
+        out[def.name] = s;
+      }
+    }
+  }
+
   return out;
 }
 
@@ -297,12 +379,23 @@ export function registerResource(def: ResourceDef): void {
   // Custom operations
   if (def.customOperations) {
     for (const [verb, op] of Object.entries(def.customOperations)) {
+      const opArgs = op.args;
       register({
         name: `${def.plural}-${verb.replace(/ /g, '-')}`,
         description: op.description,
         access: op.access,
         resource: def.plural,
-        parseArgs: (raw) => normalizeArgs(raw),
+        parseArgs: opArgs
+          ? (raw) => {
+              const normalized = normalizeArgs(raw);
+              try {
+                return validateArgs(opArgs, normalized);
+              } catch (e) {
+                const usageBlock = renderVerbHelp(def, verb) ?? '';
+                throw new Error(`${(e as Error).message}\n\n${usageBlock}`);
+              }
+            }
+          : (raw) => normalizeArgs(raw),
         handler: async (args, ctx) => op.handler(args as Record<string, unknown>, ctx),
       });
     }
