@@ -16,7 +16,7 @@ import {
   registerChannelAdapter,
   teardownChannelAdapters,
 } from '../../channels/channel-registry.js';
-import { closeDb, getDb, initTestDb } from '../../db/connection.js';
+import { closeDb, getDb, initSqliteTestDb } from '../../db/connection.js';
 import { sqliteRaw } from '../../db/drivers/sqlite.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { runMigrations } from '../../db/migrations/index.js';
@@ -61,7 +61,7 @@ async function startRegisteredAdapters(): Promise<void> {
 
 beforeEach(async () => {
   vi.clearAllMocks();
-  const db = await initTestDb();
+  const db = await initSqliteTestDb();
   await runMigrations(db);
 });
 

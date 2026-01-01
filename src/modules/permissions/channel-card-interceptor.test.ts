@@ -13,8 +13,7 @@
 import fs from 'fs';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
-import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
-import { sqliteRaw } from '../../db/drivers/sqlite.js';
+import { initTestDb, closeDb, getDb, runMigrations } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import type { InboundEvent } from '../../channels/adapter.js';
@@ -40,14 +39,12 @@ vi.mock('../../delivery.js', () => ({
 vi.mock('./user-dm.js', () => ({
   ensureUserDm: vi.fn(async (userId: string) => {
     const { getDb } = await import('../../db/connection.js');
-    const { sqliteRaw } = await import('../../db/drivers/sqlite.js');
-    const row = sqliteRaw(getDb())
-      .prepare(
-        `SELECT mg.* FROM messaging_groups mg
+    const row = await getDb().get(
+      `SELECT mg.* FROM messaging_groups mg
            JOIN user_dms ud ON ud.messaging_group_id = mg.id
           WHERE ud.user_id = ?`,
-      )
-      .get(userId);
+      userId,
+    );
     return row;
   }),
 }));
@@ -88,10 +85,13 @@ beforeEach(async () => {
     unknown_sender_policy: 'public',
     created_at: now(),
   });
-  const { getDb } = await import('../../db/connection.js');
-  sqliteRaw(getDb())
-    .prepare(`INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at) VALUES (?, ?, ?, ?)`)
-    .run('telegram:owner', 'telegram', 'mg-dm-owner', now());
+  await getDb().run(
+    `INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at) VALUES (?, ?, ?, ?)`,
+    'telegram:owner',
+    'telegram',
+    'mg-dm-owner',
+    now(),
+  );
 
   deliverMock.mockClear();
 });
@@ -133,8 +133,7 @@ function mention(mg: MessagingGroup): InboundEvent {
 }
 
 async function pendingCount(): Promise<number> {
-  const { getDb } = await import('../../db/connection.js');
-  return (sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }).c;
+  return (await getDb().get<{ c: number }>('SELECT COUNT(*) AS c FROM pending_channel_approvals'))!.c;
 }
 
 describe('channel-card interceptor seam', () => {

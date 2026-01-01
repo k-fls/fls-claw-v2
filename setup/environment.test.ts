@@ -33,13 +33,13 @@ describe('detectRegisteredGroups', () => {
 
   it('returns false when no registration state exists', async () => {
     const { detectRegisteredGroups } = await import('./environment.js');
-    expect(detectRegisteredGroups(tempDir)).toBe(false);
+    expect(await detectRegisteredGroups(tempDir)).toBe(false);
   });
 
   it('detects pre-migration registered_groups.json', async () => {
     const { detectRegisteredGroups } = await import('./environment.js');
     fs.writeFileSync(path.join(tempDir, 'data', 'registered_groups.json'), '[]');
-    expect(detectRegisteredGroups(tempDir)).toBe(true);
+    expect(await detectRegisteredGroups(tempDir)).toBe(true);
   });
 
   it('returns false for an empty v2 central DB', async () => {
@@ -55,7 +55,7 @@ describe('detectRegisteredGroups', () => {
     `);
     db.close();
 
-    expect(detectRegisteredGroups(tempDir)).toBe(false);
+    expect(await detectRegisteredGroups(tempDir)).toBe(false);
   });
 
   it('detects wired agent groups in the v2 central DB', async () => {
@@ -77,7 +77,7 @@ describe('detectRegisteredGroups', () => {
     );
     db.close();
 
-    expect(detectRegisteredGroups(tempDir)).toBe(true);
+    expect(await detectRegisteredGroups(tempDir)).toBe(true);
   });
 });
 

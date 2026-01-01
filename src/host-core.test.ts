@@ -29,7 +29,6 @@ import {
   clearOutbox,
 } from './session-manager.js';
 import { getSession, findSession } from './db/sessions.js';
-import { sqliteRaw } from './db/drivers/sqlite.js';
 import type { InboundEvent } from './channels/adapter.js';
 
 // Mock container runner to prevent actual Docker spawning
@@ -923,7 +922,7 @@ describe('router — per-wiring thread policy', () => {
   });
 
   it('wiring threads=0 nulls the event-derived thread for session and delivery', async () => {
-    sqliteRaw(getDb()).prepare("UPDATE messaging_group_agents SET threads = 0 WHERE id = 'mga-tp'").run();
+    await getDb().run("UPDATE messaging_group_agents SET threads = 0 WHERE id = 'mga-tp'");
 
     await withThreadedAdapter(async () => {
       const { routeInbound } = await import('./router.js');
@@ -945,7 +944,7 @@ describe('router — per-wiring thread policy', () => {
   });
 
   it('wiring threads=0 never strips replyTo (operator intent)', async () => {
-    sqliteRaw(getDb()).prepare("UPDATE messaging_group_agents SET threads = 0 WHERE id = 'mga-tp'").run();
+    await getDb().run("UPDATE messaging_group_agents SET threads = 0 WHERE id = 'mga-tp'");
 
     await withThreadedAdapter(async () => {
       const { routeInbound } = await import('./router.js');
@@ -1352,17 +1351,19 @@ describe('agent-to-agent routing', () => {
     });
 
     // Wire bidirectional A2A destinations (table created by runMigrations)
-    const db = sqliteRaw(getDb());
-    db.prepare(
+    const db = getDb();
+    await db.run(
       `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
        VALUES ('ag-pa', 'researcher', 'agent', 'ag-researcher', ?)
        ON CONFLICT (agent_group_id, local_name) DO NOTHING`,
-    ).run(now());
-    db.prepare(
+      now(),
+    );
+    await db.run(
       `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
        VALUES ('ag-researcher', 'pa', 'agent', 'ag-pa', ?)
        ON CONFLICT (agent_group_id, local_name) DO NOTHING`,
-    ).run(now());
+      now(),
+    );
   });
 
   it('A2A outbound lands in a session for the target agent', async () => {

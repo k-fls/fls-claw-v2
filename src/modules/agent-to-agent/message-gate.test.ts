@@ -9,7 +9,6 @@ import { getMessagePolicy, removeMessagePolicy, setMessagePolicy } from './db/ag
 import { applyA2aMessageGate } from './message-gate.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
 import { getDb } from '../../db/connection.js';
-import { sqliteRaw } from '../../db/drivers/sqlite.js';
 import { createPendingApproval, createSession, deletePendingApproval, getPendingApproval } from '../../db/sessions.js';
 import { requestApproval } from '../approvals/index.js';
 import { initSessionFolder, inboundDbPath } from '../../session-manager.js';
@@ -40,8 +39,8 @@ function now(): string {
   return new Date().toISOString();
 }
 
-function policyCount(): number {
-  return (sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS n FROM agent_message_policies').get() as { n: number }).n;
+async function policyCount(): Promise<number> {
+  return (await getDb().get<{ n: number }>('SELECT COUNT(*) AS n FROM agent_message_policies'))!.n;
 }
 
 function readInbound(agentGroupId: string, sessionId: string) {
@@ -131,12 +130,12 @@ describe('agent message policies', () => {
       to_agent_group_id: B,
       approver: 'telegram:sam',
     });
-    expect(policyCount()).toBe(1);
+    expect(await policyCount()).toBe(1);
 
     // Upsert updates the approver without inserting a duplicate row.
     await setMessagePolicy(A, B, 'telegram:dana', now());
     expect((await getMessagePolicy(A, B))!.approver).toBe('telegram:dana');
-    expect(policyCount()).toBe(1);
+    expect(await policyCount()).toBe(1);
 
     expect(await removeMessagePolicy(A, B)).toBe(true);
     expect(await getMessagePolicy(A, B)).toBeUndefined();

@@ -17,7 +17,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
-import { initTestDb, closeDb, getDb } from './connection.js';
+import { initSqliteTestDb, closeDb, getDb } from './connection.js';
 import { sqliteRaw } from './drivers/sqlite.js';
 import { runMigrations, migrations, type Migration } from './migrations/index.js';
 import {
@@ -49,7 +49,7 @@ afterEach(async () => {
 
 describe('migration 016 — fresh DB', () => {
   beforeEach(async () => {
-    const db = await initTestDb();
+    const db = await initSqliteTestDb();
     await runMigrations(db);
   });
 
@@ -91,7 +91,7 @@ describe('migration 016 — fresh DB', () => {
 
 describe('migration 016 — wired legacy DB upgrade (the FK recreate arm)', () => {
   it('recreates messaging_groups under FK children without violations and backfills instance', async () => {
-    const db = await initTestDb();
+    const db = await initSqliteTestDb();
     // Bring the DB to the pre-016 schema.
     await runMigrations(
       db,
@@ -149,7 +149,7 @@ describe('migration 016 — wired legacy DB upgrade (the FK recreate arm)', () =
   });
 
   it('tolerates pre-existing FK orphans: the migration still applies (no boot crash-loop)', async () => {
-    const db = await initTestDb();
+    const db = await initSqliteTestDb();
     await runMigrations(
       db,
       migrations.filter((m) => m.name !== 'messaging-group-instance'),
@@ -183,7 +183,7 @@ describe('migration 016 — wired legacy DB upgrade (the FK recreate arm)', () =
   });
 
   it('still rejects a migration that ITSELF introduces FK violations', async () => {
-    const db = await initTestDb();
+    const db = await initSqliteTestDb();
     await runMigrations(db);
 
     const rogue: Migration = {
@@ -210,7 +210,7 @@ describe('migration 016 — wired legacy DB upgrade (the FK recreate arm)', () =
   });
 
   it('is idempotent — re-running the full barrel is a no-op', async () => {
-    const db = await initTestDb();
+    const db = await initSqliteTestDb();
     await runMigrations(db);
     await createMessagingGroup(mg({ id: 'mg-keep', instance: 'slack-tester' }));
     await expect(runMigrations(db)).resolves.toBeUndefined();
@@ -223,7 +223,7 @@ describe('migration 016 — wired legacy DB upgrade (the FK recreate arm)', () =
 
 describe('lookup asymmetry — inbound exact-only vs outbound default-first', () => {
   beforeEach(async () => {
-    const db = await initTestDb();
+    const db = await initSqliteTestDb();
     await runMigrations(db);
     // The named instance ('alpha-tester') sorts lexically BEFORE the
     // channel type ('slack') and is inserted first — so both rowid order

@@ -2,19 +2,17 @@
  * Step: verify — End-to-end health check of the full installation.
  * Replaces 09-verify.sh
  *
- * Uses better-sqlite3 directly (no sqlite3 CLI), platform-aware service checks.
+ * Uses the configured central-DB driver and platform-aware service checks.
  */
 import { execSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import Database from 'better-sqlite3';
-
-import { CENTRAL_DB_PATH } from '../src/config.js';
 import { readEnvFile } from '../src/env.js';
 import { log } from '../src/log.js';
 import { getLaunchdLabel, getSystemdUnit } from '../src/install-slug.js';
+import { inspectCentralDb } from './central-db-inspection.js';
 import { inspectAgentImage, readImageSource } from './lib/registry-state.js';
 import { getPlatform, getServiceManager, hasSystemd, isRoot } from './platform.js';
 import { emitStatus } from './status.js';
@@ -182,41 +180,7 @@ export async function run(_args: string[]): Promise<void> {
   //    plus how many agent groups pin an image of their own (reported in step 7).
   //    The two counts get their own try/catch: they read different tables, and a
   //    partially migrated DB must not hide one behind the other's failure.
-  let registeredGroups = 0;
-  let derivedGroups = 0;
-  const dbPath = CENTRAL_DB_PATH;
-  if (fs.existsSync(dbPath)) {
-    let db: Database.Database | null = null;
-    try {
-      db = new Database(dbPath, { readonly: true });
-    } catch {
-      // Unreadable (permissions, or mid-migration) — leave both counts at 0
-      // rather than failing the health check on a transient condition.
-    }
-    if (db) {
-      try {
-        // Count agent groups that have at least one messaging group wired
-        const row = db
-          .prepare(
-            `SELECT COUNT(DISTINCT ag.id) as count FROM agent_groups ag
-             JOIN messaging_group_agents mga ON mga.agent_group_id = ag.id`,
-          )
-          .get() as { count: number };
-        registeredGroups = row.count;
-      } catch {
-        // Table might not exist (DB not migrated yet)
-      }
-      try {
-        const row = db.prepare('SELECT COUNT(*) as count FROM container_configs WHERE image_tag IS NOT NULL').get() as {
-          count: number;
-        };
-        derivedGroups = row.count;
-      } catch {
-        // Same: container_configs arrives with the migrations
-      }
-      db.close();
-    }
-  }
+  const { registeredGroups, derivedGroups } = await inspectCentralDb(projectRoot);
 
   // 6. Check mount allowlist
   let mountAllowlist = 'missing';

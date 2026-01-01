@@ -236,7 +236,7 @@ async function main(): Promise<void> {
   }
   // Existing installs do not get an unsolicited first-agent picker, but an
   // explicit --template-path is always honoured.
-  if (!isResume && (process.env.NANOCLAW_TEMPLATE_PATH?.trim() || !detectRegisteredGroups(process.cwd()))) {
+  if (!isResume && (process.env.NANOCLAW_TEMPLATE_PATH?.trim() || !(await detectRegisteredGroups(process.cwd())))) {
     await runTemplateSetup(savedPickBridged);
   }
 
@@ -532,13 +532,13 @@ async function main(): Promise<void> {
   async function resolveDisplayName(): Promise<string> {
     if (displayName) return displayName;
     const preset = process.env.NANOCLAW_DISPLAY_NAME?.trim();
-    const existing = detectExistingDisplayName(process.cwd());
+    const existing = await detectExistingDisplayName(process.cwd());
     const fallback = process.env.USER?.trim() || 'Operator';
     displayName = preset || existing || (await askDisplayName(fallback));
     return displayName;
   }
 
-  if (!skip.has('cli-agent') && detectRegisteredGroups(process.cwd())) {
+  if (!skip.has('cli-agent') && (await detectRegisteredGroups(process.cwd()))) {
     skip.add('cli-agent');
     skip.add('first-chat');
   }

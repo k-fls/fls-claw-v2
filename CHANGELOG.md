@@ -12,6 +12,7 @@ All notable changes to NanoClaw will be documented in this file.
 - **An unknown `NANOCLAW_RUNTIME_DRIVER` aborts startup** (new variable — installs that never set it are unaffected), and drivers that cannot rebuild images in place deny `install_packages` and `--rebuild` at request time instead of failing later.
 - **New NanoClaw installs now use OneCLI gateway 1.41.0.** Existing 1.36.0 gateways remain compatible because NanoClaw does not depend on any 1.41-only behavior. See [the OneCLI upgrade guide](docs/onecli-upgrades.md) to upgrade an existing gateway.
 - [BREAKING] **Central database access is now asynchronous behind `DbDriver`.** SQLite remains the default and existing `data/v2.db` files are unchanged, but custom source and installed channel/provider extensions must await central reads and writes and adopt the retyped host seams. **Migration:** follow [the central database async migration guide](docs/central-db-async-migration.md) to find affected calls, preserve transaction boundaries, update extensions, verify SQLite behavior, or roll back.
+- **Central DB composition and migrations are backend-ready.** A one-slot driver registry keeps backend selection in `src/db/compose.ts`; `pnpm run migrate` is the explicit schema-change path, host validation can fail closed without DDL, and a shared conformance suite pins transaction, parameter, ordering, and timestamp behavior. SQLite remains the installed default.
 
 ## [2.2.0] - 2026-08-13
 

@@ -1,5 +1,4 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { sqliteRaw } from '../db/drivers/sqlite.js';
 
 // `groups.ts`'s postCreate calls `initGroupFilesystem`, which touches the
 // real filesystem (groups/<folder>, data/v2-sessions/<id>/.claude-shared).
@@ -87,7 +86,7 @@ registerResource({
 });
 
 beforeEach(async () => {
-  const db = await initTestDb();
+  const db = await initTestDb({ fresh: true });
   await runMigrations(db);
   ensureContainerConfigSpy.mockClear();
   writeDestinationsSpy.mockClear();
@@ -103,13 +102,11 @@ beforeEach(async () => {
 });
 
 describe('genericList portable filters and ordering', () => {
-  beforeEach(() => {
-    const insert = sqliteRaw(getDb()).prepare(
-      'INSERT INTO listtest_rows (id, enabled, score, payload, created_at) VALUES (?, ?, ?, ?, ?)',
-    );
-    insert.run('b', 1, 2, '{"kind":"match"}', '2026-08-17T10:00:00.000Z');
-    insert.run('a', 1, 2, '{"kind":"match"}', '2026-08-17T10:00:00.000Z');
-    insert.run('c', 0, 3, '{"kind":"other"}', '2026-08-17T11:00:00.000Z');
+  beforeEach(async () => {
+    const sql = 'INSERT INTO listtest_rows (id, enabled, score, payload, created_at) VALUES (?, ?, ?, ?, ?)';
+    await getDb().run(sql, 'b', 1, 2, '{"kind":"match"}', '2026-08-17T10:00:00.000Z');
+    await getDb().run(sql, 'a', 1, 2, '{"kind":"match"}', '2026-08-17T10:00:00.000Z');
+    await getDb().run(sql, 'c', 0, 3, '{"kind":"other"}', '2026-08-17T11:00:00.000Z');
   });
 
   it('coerces boolean, number, and JSON filters by column type', async () => {
@@ -292,7 +289,7 @@ describe('genericCreate resolveDefaults hook (two-pass create)', () => {
 
   it('a hook throw rejects the create and nothing is inserted', async () => {
     await expect(lookup('hooktests-create')!.handler({ kind: 'boom' }, hostCtx)).rejects.toThrow('hook rejected');
-    const count = sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS n FROM hooktest_rows').get() as { n: number };
-    expect(count.n).toBe(0);
+    const count = await getDb().get<{ n: number }>('SELECT COUNT(*) AS n FROM hooktest_rows');
+    expect(count!.n).toBe(0);
   });
 });
