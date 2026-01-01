@@ -23,6 +23,7 @@ import {
   type BeginInteractionOptions,
   type HostInteractionKey,
 } from './host-interactions.js';
+import { hasAdminPrivilege, isOwner, isGlobalAdmin } from './modules/permissions/db/user-roles.js';
 
 export type GateResult =
   | { action: 'pass' }
@@ -30,7 +31,7 @@ export type GateResult =
   | { action: 'deny'; command: string }
   | { action: 'handle'; command: string; handler: HostCommandHandler };
 
-const FILTERED_COMMANDS = new Set(['/login', '/logout', '/doctor', '/config', '/remote-control']);
+const FILTERED_COMMANDS = new Set(['/start', '/login', '/logout', '/doctor', '/config', '/remote-control']);
 const ADMIN_COMMANDS = new Set(['/clear', '/compact', '/context', '/cost', '/files', '/upload-trace']);
 
 /**
@@ -215,7 +216,10 @@ export function parseSlashCommand(content: string): ParsedSlashCommand | null {
   let text: string;
   try {
     const parsed = JSON.parse(content);
-    text = (parsed.text || '').trim();
+    text = typeof parsed.text === 'string' ? parsed.text : '';
+    const end = typeof parsed.mentionPrefixEnd === 'number' ? parsed.mentionPrefixEnd : 0;
+    if (end > 0 && end <= text.length) text = text.slice(end);
+    text = text.trim();
   } catch {
     text = content.trim();
   }
@@ -297,30 +301,9 @@ export function gateCommand(content: string, userId: string | null, agentGroupId
  */
 export function isAdmin(userId: string | null, agentGroupId?: string | null): boolean {
   if (!userId) return false;
-  if (!hasTable(getDb(), 'user_roles')) return true; // no permissions module = allow all
-  const db = getDb();
-  if (agentGroupId == null) {
-    const row = db
-      .prepare(
-        `SELECT 1 FROM user_roles
-         WHERE user_id = ?
-           AND (role = 'owner' OR role = 'admin')
-           AND agent_group_id IS NULL
-         LIMIT 1`,
-      )
-      .get(userId);
-    return row != null;
-  }
-  const row = db
-    .prepare(
-      `SELECT 1 FROM user_roles
-       WHERE user_id = ?
-         AND (role = 'owner' OR role = 'admin')
-         AND (agent_group_id IS NULL OR agent_group_id = ?)
-       LIMIT 1`,
-    )
-    .get(userId, agentGroupId);
-  return row != null;
+  if (!hasTable(getDb(), 'user_roles')) return true;
+  if (!agentGroupId) return isOwner(userId) || isGlobalAdmin(userId);
+  return hasAdminPrivilege(userId, agentGroupId);
 }
 
 /**
