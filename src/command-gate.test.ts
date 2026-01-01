@@ -39,6 +39,7 @@ function jsonChat(text: string): string {
   return JSON.stringify({ text });
 }
 
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -495,5 +496,42 @@ describe('built-in /help handler', () => {
       expect(runHelp('a1d-help-glob', 'user-1')).toMatch(/^Unknown command:/);
       expect(runHelp('a1d-help-glob', 'global')).toBe('/a1d-help-glob — global-admin-only command');
     });
+  }); // close role-aware-visibility
+}); // close built-in /help handler
+
+describe('gateCommand — filtered commands', () => {
+  it('drops /start before it reaches the container', () => {
+    expect(gateCommand('/start', 'telegram:1', 'ag-1')).toEqual({ action: 'filter' });
+  });
+
+  it('drops /start regardless of sender', () => {
+    expect(gateCommand('/start', null, 'ag-1')).toEqual({ action: 'filter' });
+  });
+});
+
+describe('gateCommand — mention-prefixed slash commands', () => {
+  it('classifies a mention-prefixed filtered command when mentionPrefixEnd is set', () => {
+    const content = JSON.stringify({ text: '@U0AKKG67T7X /login', mentionPrefixEnd: 13 });
+    expect(gateCommand(content, 'slack:U1', 'ag-1')).toEqual({ action: 'filter' });
+  });
+
+  it('without the annotation, the mention-prefixed command falls through (the bug)', () => {
+    const content = JSON.stringify({ text: '@U0AKKG67T7X /login' });
+    expect(gateCommand(content, 'slack:U1', 'ag-1')).toEqual({ action: 'pass' });
+  });
+
+  it('still classifies a plain (DM-style) filtered command with no mention', () => {
+    const content = JSON.stringify({ text: '/login' });
+    expect(gateCommand(content, 'slack:U1', 'ag-1')).toEqual({ action: 'filter' });
+  });
+
+  it('passes ordinary chatter through', () => {
+    const content = JSON.stringify({ text: '@U0AKKG67T7X how are you?', mentionPrefixEnd: 13 });
+    expect(gateCommand(content, 'slack:U1', 'ag-1')).toEqual({ action: 'pass' });
+  });
+
+  it('ignores an out-of-range mentionPrefixEnd rather than throwing', () => {
+    const content = JSON.stringify({ text: '/login', mentionPrefixEnd: 999 });
+    expect(gateCommand(content, 'slack:U1', 'ag-1')).toEqual({ action: 'filter' });
   });
 });
