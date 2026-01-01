@@ -5,7 +5,7 @@ import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { markSentUserMsgThisTurn, resetSentUserMsgThisTurn } from './current-batch.js';
 import { formatMessages, extractRouting } from './formatter.js';
-import { isCorruptionError, processQuery, PerTurnResultDedup } from './poll-loop.js';
+import { isCorruptionError, processQuery, runPollLoop, PerTurnResultDedup } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
 
@@ -585,40 +585,71 @@ describe('task-run turn wiring (real processQuery)', () => {
   });
 
   it('logs and conditionally nudges a second task run in the same open query', async () => {
-    const pushes: string[] = [];
+    // The 500ms setInterval inside processQuery only fires when macrotask slots
+    // are available. Calling processQuery directly starves it. The integration
+    // tests prove the fix: run runPollLoop (unawaited) alongside a waitFor loop
+    // whose 50ms sleeps provide the macrotask ticks the setInterval needs.
+    insertMessage('t1', 'task', { prompt: 'fire one' });
 
-    async function* events(): AsyncGenerator<ProviderEvent> {
-      yield { type: 'init', continuation: 's1' };
-      // Turn 1 uses the legacy wrong door and consumes its one correction.
-      yield { type: 'result', text: '<message to="local-cli">fire one result</message>' };
-      yield { type: 'result', text: 'first delivery decision handled' };
+    let responseIdx = 0;
+    const canned = [
+      '<message to="local-cli">fire one result</message>',
+      '<message to="local-cli">first delivery decision handled</message>',
+      '<message to="local-cli">fire two result</message>',
+      '<message to="local-cli">second delivery decision handled</message>',
+    ];
 
-      // A SECOND task run lands while the query is open — the follow-up poller
-      // pushes it and must reset the per-turn correction state.
-      insertMessage('t2', 'task', { prompt: 'fire two' });
-      const deadline = Date.now() + 8000;
-      while (!pushes.some((p) => p.includes('fire two')) && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 50));
+    class CapturingProvider extends MockProvider {
+      nudgePushes: string[] = [];
+      activeQuery: ReturnType<MockProvider['query']> | null = null;
+      constructor() {
+        super({}, () => {
+          const idx = responseIdx++;
+          if (idx === 1) {
+            // Insert t2 while the query is open; setInterval picks it up.
+            insertMessage('t2', 'task', { prompt: 'fire two' });
+          }
+          return canned[idx] ?? '';
+        });
       }
-
-      // Turn 2 repeats the mistake. This receives a second independent nudge
-      // only if the follow-up path reset taskBlockNudged.
-      yield { type: 'result', text: '<message to="local-cli">fire two result</message>' };
-      yield { type: 'result', text: 'second delivery decision handled' };
+      query(input: Parameters<MockProvider['query']>[0]) {
+        const raw = super.query(input);
+        this.activeQuery = raw;
+        return { ...raw, push: (m: string) => { this.nudgePushes.push(m); raw.push(m); } };
+      }
     }
 
-    const query: AgentQuery = {
-      push: (m: string) => {
-        pushes.push(m);
-      },
-      end: () => {},
-      events: events(),
-      abort: () => {},
-    };
+    async function waitFor(condition: () => boolean, timeoutMs: number): Promise<void> {
+      const start = Date.now();
+      while (!condition()) {
+        if (Date.now() - start > timeoutMs) throw new Error(`waitFor timed out after ${timeoutMs}ms`);
+        await new Promise<void>((r) => setTimeout(r, 50));
+      }
+    }
 
-    await processQuery(query, TASK_ROUTING, ['t1'], 'claude', undefined, 'prompt', undefined);
+    const provider = new CapturingProvider();
+    const controller = new AbortController();
 
-    const nudges = pushes.filter((p) => p.includes('If and only if'));
+    // Not awaited — runs concurrently so waitFor's 50ms timers give the
+    // setInterval its macrotask slots (same mechanism as integration tests).
+    const loopDone = runPollLoop({
+      provider,
+      providerName: 'mock',
+      cwd: '/tmp',
+      signal: controller.signal,
+      // Short interval so the setInterval fires before any concurrent test
+      // loop (sharing the in-memory DB within the same Bun process) can
+      // consume t2. Production default is 500ms.
+      activePollIntervalMs: 10,
+    });
+
+    await waitFor(() => taskLogRows().length >= 2, 8000);
+
+    provider.activeQuery?.end();
+    controller.abort();
+    await loopDone.catch(() => {});
+
+    const nudges = provider.nudgePushes.filter((p) => p.includes('If and only if'));
     expect(nudges).toHaveLength(2);
     expect(nudges[0]).toContain('fire one result');
     expect(nudges[1]).toContain('fire two result');

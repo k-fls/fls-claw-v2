@@ -115,6 +115,13 @@ export interface PollLoopConfig {
    * polling forever and stealing messages from the next test's DB.
    */
   signal?: AbortSignal;
+  /**
+   * Override the setInterval period inside processQuery. Production default is
+   * ACTIVE_POLL_INTERVAL_MS (500ms). Tests can pass a shorter value (e.g. 10ms)
+   * so the interval fires before any concurrent test loops can consume follow-up
+   * messages from the shared in-memory DB.
+   */
+  activePollIntervalMs?: number;
 }
 
 /**
@@ -296,6 +303,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         config.provider.onExchangeComplete?.bind(config.provider),
         prompt,
         continuation,
+        config.activePollIntervalMs,
       );
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
@@ -385,6 +393,7 @@ export async function processQuery(
   onExchangeComplete: ((exchange: ProviderExchange) => void) | undefined,
   initialPrompt: string,
   initialContinuation: string | undefined,
+  activePollIntervalMs?: number,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -523,7 +532,7 @@ export async function processQuery(
         pollInFlight = false;
       }
     })();
-  }, ACTIVE_POLL_INTERVAL_MS);
+  }, activePollIntervalMs ?? ACTIVE_POLL_INTERVAL_MS);
 
   try {
     for await (const event of query.events) {

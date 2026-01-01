@@ -78,10 +78,7 @@ describe('groups CLI create provisions a container_configs row (#4)', () => {
   });
 
   it('errors when required fields are missing', async () => {
-    const resp = await dispatch(
-      { id: 'req-create-bad', command: 'groups-create', args: { folder: 'orphan' } },
-      { caller: 'host' },
-    );
+    const resp = await dispatch({ id: 'req-create-bad', command: 'groups-create', args: {} }, { caller: 'host' });
     expect(resp.ok).toBe(false);
   });
 });
