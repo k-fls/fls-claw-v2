@@ -55,7 +55,12 @@ describe('runChannelSkill adapter (Option A)', () => {
       // the secrets + handle a human would supply; the skill resolves platform_id.
       // Values are valid-shaped for the prompts' validate: regexes — validate-at-bind
       // now enforces them on `inputs` too (they used to bypass validation).
-      inputs: { connection: 'webhook', bot_token: 'xoxb-x', signing_secret: '0123456789abcdef', owner_handle: 'U12345678' },
+      inputs: {
+        connection: 'webhook',
+        bot_token: 'xoxb-x',
+        signing_secret: '0123456789abcdef',
+        owner_handle: 'U12345678',
+      },
       wire: (a) => {
         wired.push(a);
         return true;
@@ -155,9 +160,7 @@ describe('runChannelSkill adapter (Option A)', () => {
   // from the document so the test can't drift from what ships.
   it('Teams have_creds probe: either credential key present answers yes', () => {
     const md = readFileSync(join(process.cwd(), '.claude/skills/add-teams/SKILL.md'), 'utf8');
-    const probe = parseDirectives(md).find(
-      (d) => d.kind === 'run' && d.attrs.capture === 'have_creds',
-    );
+    const probe = parseDirectives(md).find((d) => d.kind === 'run' && d.attrs.capture === 'have_creds');
     expect(probe).toBeDefined();
     const cmd = probe!.body.join('\n');
 
@@ -190,8 +193,7 @@ describe('runChannelSkill adapter (Option A)', () => {
     writeFileSync(join(root, '.env'), '');
     writeFileSync(join(root, 'package.json'), '{"name":"scratch"}');
 
-    const INSTALL_LINK =
-      'https://teams.microsoft.com/l/app/tapp-123?installAppPackage=true&appTenantId=tenant-1';
+    const INSTALL_LINK = 'https://teams.microsoft.com/l/app/tapp-123?installAppPackage=true&appTenantId=tenant-1';
     const log: string[] = [];
     const opened: string[] = [];
     const steps: string[] = [];
@@ -222,7 +224,12 @@ describe('runChannelSkill adapter (Option A)', () => {
         }
         // owner identity from the CLI session (status --json fence, plain exec)
         if (c.includes('status --json')) {
-          return JSON.stringify({ loggedIn: true, username: 'dan@acme.example', tenantId: 'tenant-1', userObjectId: 'aad-owner-1' });
+          return JSON.stringify({
+            loggedIn: true,
+            username: 'dan@acme.example',
+            tenantId: 'tenant-1',
+            userObjectId: 'aad-owner-1',
+          });
         }
         if (c.includes('login.microsoftonline.com')) return 'eyJfake.bot.token';
         // /members is a sub-path of /v3/conversations — match it FIRST
@@ -411,7 +418,6 @@ describe('runChannelSkill adapter (Option A)', () => {
     expect(fullyApplied(res)).toBe(true);
   });
 
-
   // The resolved leg of wireIfResolved, driven with a minimal fixture skill
   // (the real teams document needs a streaming exec runChannelSkill doesn't
   // expose): when the skill binds owner_handle + platform_id, the adapter asks
@@ -564,7 +570,12 @@ describe('backGate (first-prompt back-to-channel-selection)', () => {
       resolveRemote: () => 'origin',
       agentName: 'Nano',
       role: 'owner',
-      inputs: { connection: 'webhook', bot_token: 'xoxb-x', signing_secret: '0123456789abcdef', owner_handle: 'U12345678' },
+      inputs: {
+        connection: 'webhook',
+        bot_token: 'xoxb-x',
+        signing_secret: '0123456789abcdef',
+        owner_handle: 'U12345678',
+      },
       wire: (a) => {
         wired.push(a);
         return true;

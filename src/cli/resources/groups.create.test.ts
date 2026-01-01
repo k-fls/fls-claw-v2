@@ -26,7 +26,11 @@ vi.mock('../../container-runner.js', () => ({
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-cli-groups-create' };
+  return {
+    ...actual,
+    DATA_DIR: '/tmp/nanoclaw-test-cli-groups-create',
+    GROUPS_DIR: '/tmp/nanoclaw-test-cli-groups-create/groups',
+  };
 });
 
 const TEST_DIR = '/tmp/nanoclaw-test-cli-groups-create';
@@ -36,25 +40,21 @@ import { dispatch } from '../dispatch.js';
 // Side-effect import: registers the `groups-*` commands (including create).
 import './groups.js';
 
-function count(sql: string, ...params: unknown[]): number {
-  return (
-    getDb()
-      .prepare(sql)
-      .get(...params) as { c: number }
-  ).c;
+async function count(sql: string, ...params: unknown[]): Promise<number> {
+  return ((await getDb().get<{ c: number }>(sql, ...params))!).c;
 }
 
 describe('groups CLI create provisions a container_configs row (#4)', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
-    fs.mkdirSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR + '/groups', { recursive: true });
 
-    const db = initTestDb();
-    runMigrations(db);
+    const db = await initTestDb();
+    await runMigrations(db);
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 
@@ -71,10 +71,10 @@ describe('groups CLI create provisions a container_configs row (#4)', () => {
     expect(id.length).toBeGreaterThan(0);
 
     // The agent_groups row exists.
-    expect(count('SELECT COUNT(*) AS c FROM agent_groups WHERE id = ?', id)).toBe(1);
+    expect(await count('SELECT COUNT(*) AS c FROM agent_groups WHERE id = ?', id)).toBe(1);
 
     // The container_configs row must exist — without it the group is unspawnable.
-    expect(count('SELECT COUNT(*) AS c FROM container_configs WHERE agent_group_id = ?', id)).toBe(1);
+    expect(await count('SELECT COUNT(*) AS c FROM container_configs WHERE agent_group_id = ?', id)).toBe(1);
   });
 
   it('errors when required fields are missing', async () => {
@@ -93,6 +93,6 @@ describe('groups CLI create provisions a container_configs row (#4)', () => {
       { caller: 'host' },
     );
     expect(resp.ok).toBe(false);
-    expect(count('SELECT COUNT(*) AS c FROM agent_groups WHERE folder = ?', 'orphan')).toBe(0);
+    expect(await count('SELECT COUNT(*) AS c FROM agent_groups WHERE folder = ?', 'orphan')).toBe(0);
   });
 });

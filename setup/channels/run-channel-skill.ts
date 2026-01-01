@@ -123,13 +123,21 @@ async function initFirstAgent(args: WireArgs): Promise<boolean> {
     'init-first-agent',
     'pnpm',
     [
-      'exec', 'tsx', 'scripts/init-first-agent.ts',
-      '--channel', args.channel,
-      '--user-id', args.userId,
-      '--platform-id', args.platformId,
-      '--display-name', args.displayName,
-      '--agent-name', args.agentName,
-      '--role', args.role,
+      'exec',
+      'tsx',
+      'scripts/init-first-agent.ts',
+      '--channel',
+      args.channel,
+      '--user-id',
+      args.userId,
+      '--platform-id',
+      args.platformId,
+      '--display-name',
+      args.displayName,
+      '--agent-name',
+      args.agentName,
+      '--role',
+      args.role,
       ...(args.agentGroupId ? ['--agent-group-id', args.agentGroupId] : []),
       ...(args.engagePattern ? ['--engage-pattern', args.engagePattern] : []),
     ],
@@ -193,8 +201,8 @@ export async function runChannelSkill(
   // prompts past the skill run (only a fresh create resolves the wire inputs;
   // a drop-through re-run asks nothing).
   const askLater = overrides.wireIfResolved;
-  let agentName = askLater ? '' : overrides.agentName ?? (await resolveAgentName());
-  let role = askLater ? undefined : overrides.role ?? (await askOperatorRole(channel));
+  let agentName = askLater ? '' : (overrides.agentName ?? (await resolveAgentName()));
+  let role = askLater ? undefined : (overrides.role ?? (await askOperatorRole(channel)));
 
   // Channel-specific: install adapter, collect credentials, resolve the wire
   // inputs. The whole channel-specific procedure lives in the SKILL.md.
@@ -235,7 +243,10 @@ export async function runChannelSkill(
       writeFileSync(rawLog, res.agentTasks.map((t) => `## ${t.kind} (line ${t.line})\n${t.reason}\n`).join('\n'));
     }
     for (const t of res.agentTasks) {
-      const lines = t.reason.split('\n').map((l) => l.trim()).filter(Boolean);
+      const lines = t.reason
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean);
       const more = lines.length > 1 ? ` (+${lines.length - 1} more lines in ${rawLog})` : '';
       p.log.warn(`Needs an agent (${t.kind}): ${lines[0] ?? t.reason}${more}`);
     }
@@ -298,7 +309,11 @@ export async function runChannelSkill(
     engagePattern: res.vars.engage_pattern || undefined,
   });
   if (!ok) {
-    await failWith('init-first-agent', `Couldn't finish connecting ${agentName}.`, 'You can retry later with `/init-first-agent`.');
+    await failWith(
+      'init-first-agent',
+      `Couldn't finish connecting ${agentName}.`,
+      'You can retry later with `/init-first-agent`.',
+    );
   }
   // This wire is the seam that consumes the template pick: only now has the
   // pick done its job. Clearing earlier (at stamp time) orphans the agent on

@@ -92,7 +92,9 @@ export interface PrompterContext {
  * against the prompt's declared `validate:`/`flags:` (the engine's
  * validate-at-bind is the programmatic backstop, not the UX).
  */
-export function clackResolveInput(ctx: PrompterContext = {}): (name: string, meta: InputMeta) => Promise<string | undefined> {
+export function clackResolveInput(
+  ctx: PrompterContext = {},
+): (name: string, meta: InputMeta) => Promise<string | undefined> {
   // The `?` help-escape is only meaningful at a real terminal: it hands the
   // operator off to an interactive Claude session (stdio inherited). In a
   // headless / non-TTY run nobody can type `?` into a clack prompt anyway, and
@@ -234,7 +236,8 @@ async function reuseFromEnv(
     // stale credential that no longer matches the declared shape is never
     // offered — prompting fresh beats a loud validate-at-bind dead-end.
     const shape = promptShape.get(v);
-    if (shape?.validate && !new RegExp(shape.validate, shape.flags).test(normalizeValue(existing, shape.normalize))) continue;
+    if (shape?.validate && !new RegExp(shape.validate, shape.flags).test(normalizeValue(existing, shape.normalize)))
+      continue;
     if (await confirm(`Found an existing ${key} (${maskValue(existing)}). Use it?`)) reuse[v] = existing;
   }
   return reuse;
@@ -274,14 +277,22 @@ export function hostExec(projectRoot: string, rawLog?: string): (cmd: string) =>
       });
       let out = '';
       let err = '';
-      child.stdout.on('data', (c: Buffer) => { out += c.toString('utf8'); });
-      child.stderr.on('data', (c: Buffer) => { err += c.toString('utf8'); });
+      child.stdout.on('data', (c: Buffer) => {
+        out += c.toString('utf8');
+      });
+      child.stderr.on('data', (c: Buffer) => {
+        err += c.toString('utf8');
+      });
       child.on('error', reject);
       child.on('close', (code) => {
         tee(cmd, out, err);
         if (code === 0) return resolve(out);
         const stderr = err.trim();
-        const head = stderr.split('\n').map((l) => l.trim()).find(Boolean) ?? 'command failed';
+        const head =
+          stderr
+            .split('\n')
+            .map((l) => l.trim())
+            .find(Boolean) ?? 'command failed';
         reject(new Error(`exit ${code ?? '?'}: ${head}${stderr ? `\n${stderr}` : ''}`));
       });
     });
@@ -325,8 +336,15 @@ export function hostExecStream(projectRoot: string): (cmd: string) => Promise<St
         while ((idx = buf.indexOf('\n')) !== -1) {
           const line = buf.slice(0, idx);
           buf = buf.slice(idx + 1);
-          if (/^=== NANOCLAW SETUP: \S+ ===/.test(line)) { current = { fields: {} }; continue; }
-          if (line.startsWith('=== END ===')) { if (current) blocks.push(current); current = null; continue; }
+          if (/^=== NANOCLAW SETUP: \S+ ===/.test(line)) {
+            current = { fields: {} };
+            continue;
+          }
+          if (line.startsWith('=== END ===')) {
+            if (current) blocks.push(current);
+            current = null;
+            continue;
+          }
           if (current) {
             const c = line.indexOf(':');
             if (c > 0) current.fields[line.slice(0, c).trim()] = line.slice(c + 1).trim();

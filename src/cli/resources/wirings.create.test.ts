@@ -37,34 +37,31 @@ function now(): string {
   return new Date().toISOString();
 }
 
-function count(sql: string, ...params: unknown[]): number {
-  return (
-    getDb()
-      .prepare(sql)
-      .get(...params) as { c: number }
-  ).c;
+async function count(sql: string, ...params: unknown[]): Promise<number> {
+  return ((await getDb().get<{ c: number }>(sql, ...params))!).c;
 }
 
 describe('wirings CLI create auto-creates agent_destinations row (#5)', () => {
   const GID = 'ag-handler';
   const MGID = 'mg-chat-1';
 
-  beforeEach(() => {
+  beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
 
-    const db = initTestDb();
-    runMigrations(db);
+    const db = await initTestDb();
+    await runMigrations(db);
 
-    createAgentGroup({ id: GID, name: 'handler', folder: 'handler', agent_provider: null, created_at: now() });
-    db.prepare(
+    await createAgentGroup({ id: GID, name: 'handler', folder: 'handler', agent_provider: null, created_at: now() });
+    await db.run(
       `INSERT INTO messaging_groups (id, channel_type, platform_id, instance, name, is_group, unknown_sender_policy, created_at)
        VALUES (?, 'telegram', 'tg-1', 'telegram', 'chat', 1, 'strict', ?)`,
-    ).run(MGID, now());
+      MGID, now(),
+    );
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 
@@ -81,14 +78,13 @@ describe('wirings CLI create auto-creates agent_destinations row (#5)', () => {
     expect(resp.ok).toBe(true);
 
     // The wiring row exists.
-    expect(count('SELECT COUNT(*) AS c FROM messaging_group_agents WHERE messaging_group_id = ? AND agent_group_id = ?', MGID, GID)).toBe(1);
+    expect(await count('SELECT COUNT(*) AS c FROM messaging_group_agents WHERE messaging_group_id = ? AND agent_group_id = ?', MGID, GID)).toBe(1);
 
     // …and the matching channel destination was auto-created.
-    const dest = getDb()
-      .prepare(
-        'SELECT target_type, target_id FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ?',
-      )
-      .get(GID, 'channel', MGID) as { target_type: string; target_id: string } | undefined;
+    const dest = await getDb().get<{ target_type: string; target_id: string }>(
+      'SELECT target_type, target_id FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ?',
+      GID, 'channel', MGID,
+    );
     expect(dest).toBeDefined();
     expect(dest).toMatchObject({ target_type: 'channel', target_id: MGID });
   });
@@ -106,7 +102,7 @@ describe('wirings CLI create auto-creates agent_destinations row (#5)', () => {
     );
 
     expect(
-      count('SELECT COUNT(*) AS c FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ?', GID, 'channel', MGID),
+      await count('SELECT COUNT(*) AS c FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ?', GID, 'channel', MGID),
     ).toBe(1);
   });
 });
