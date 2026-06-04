@@ -516,8 +516,18 @@ registerChannelAdapter('whatsapp', {
         },
       });
 
-      // Request pairing code if phone number is set and not yet registered
-      if (phoneNumber && !state.creds.registered) {
+      // Request pairing code only when there's no paired account yet.
+      //
+      // We can't use `state.creds.registered` here: Baileys 7.x doesn't
+      // reliably flip that flag back to `true` after the post-pair stream
+      // restart (statusCode 515). An already-paired socket would then see
+      // `registered=false` and request a *new* pairing code 3s after the
+      // restart, which the WhatsApp server rejects with 401 and the adapter
+      // wipes the auth directory — re-pair from scratch every restart.
+      //
+      // `state.creds.me` is set as part of the QR / pairing-code handshake
+      // and is the authoritative "this socket has an account" signal.
+      if (phoneNumber && !state.creds.me) {
         setTimeout(async () => {
           try {
             const code = await sock.requestPairingCode(phoneNumber);
@@ -567,12 +577,12 @@ registerChannelAdapter('whatsapp', {
                 });
               }, RECONNECT_DELAY_MS);
             });
-          } else {
+          } else if (reason === DisconnectReason.loggedOut) {
+            // Server-side logout (account unlinked, 401, etc.). Clear auth so
+            // the next start prompts for a fresh pair — stale creds would
+            // 401 again and risk WhatsApp's "can't link new devices now"
+            // cooldown.
             log.info('WhatsApp logged out');
-            // Delete auth credentials immediately. Keeping stale credentials
-            // causes the next service restart to attempt authentication with an
-            // invalidated session, producing a second 401 that can trigger
-            // WhatsApp's re-link cooldown ("can't link new devices now").
             try {
               fs.rmSync(authDir, { recursive: true, force: true });
               fs.mkdirSync(authDir, { recursive: true });
@@ -582,6 +592,18 @@ registerChannelAdapter('whatsapp', {
             }
             if (rejectFirstOpen) {
               rejectFirstOpen(new Error('WhatsApp logged out'));
+              rejectFirstOpen = undefined;
+              resolveFirstOpen = undefined;
+            }
+          } else {
+            // Clean shutdown (shuttingDown=true) or a non-loggedOut disconnect
+            // that won't auto-reconnect. KEEP AUTH — the next process boot
+            // must be able to restore the session. Wiping here turned every
+            // `systemctl restart` into a forced re-pair, which is catastrophic
+            // when the bot phone is not in reach.
+            log.info('WhatsApp adapter stopped (auth preserved)');
+            if (rejectFirstOpen) {
+              rejectFirstOpen(new Error('WhatsApp adapter shutdown'));
               rejectFirstOpen = undefined;
               resolveFirstOpen = undefined;
             }
