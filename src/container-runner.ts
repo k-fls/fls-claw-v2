@@ -41,6 +41,15 @@ import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { initGroupFilesystem } from './group-init.js';
+import {
+  defaultLaunchShape,
+  type ExitReason,
+  fireContainerExited,
+  fireContainerStarted,
+  fireSpawnPre,
+  resolveLaunchMode,
+  type MergedSpawnPre,
+} from './modules/container-bootstrap/index.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
@@ -79,6 +88,13 @@ interface ActiveContainer {
 const activeContainers = new Map<string, ActiveContainer>();
 
 /**
+ * Sessions whose container was killed via `killContainer` — checked then
+ * cleared by the exit handler so it can pass `reason: 'killed'` to
+ * `fireContainerExited` instead of `'normal'`.
+ */
+const killedSessions = new Set<string>();
+
+/**
  * In-flight wake promises, keyed by session id. Deduplicates concurrent
  * `wakeContainer` calls while the first spawn is still mid-setup (async
  * buildContainerArgs, OneCLI gateway apply, etc.) — otherwise a second
@@ -87,6 +103,31 @@ const activeContainers = new Map<string, ActiveContainer>();
  * racy double-replies.
  */
 const wakePromises = new Map<string, Promise<boolean>>();
+
+/**
+ * Prepare a per-group persistent home directory backing `/home/node`.
+ *
+ * Subdirectories (app config / caches like `.config/gh/`, `.aws/`, `.npm/`)
+ * survive across runs so tool state isn't lost between sessions. Top-level
+ * flat files in `~/` are removed on every launch to prevent dotfile injection
+ * (`.bashrc`, `.profile`, `.bash_profile`) from carrying between sessions —
+ * this wipe is the security boundary, not incidental cleanup. Nested files
+ * (e.g. `.config/gh/hosts.yml`) are untouched.
+ *
+ * Returns the absolute dir so the caller can mount it.
+ */
+export function prepareGroupHomeDir(homeDir: string): string {
+  fs.mkdirSync(homeDir, { recursive: true });
+  for (const entry of fs.readdirSync(homeDir)) {
+    const full = path.join(homeDir, entry);
+    try {
+      if (fs.statSync(full).isFile()) fs.unlinkSync(full);
+    } catch {
+      /* race with container shutdown, ignore */
+    }
+  }
+  return homeDir;
+}
 
 /**
  * `docker stop -t` takes integer seconds; config carries `GRACEFUL_STOP_MS`
@@ -120,6 +161,7 @@ const queue = new ContainerQueue({
   candidates: () => {
     const out: EvictionCandidate[] = [];
     for (const [sessionId, e] of activeContainers) {
+      if (killedSessions.has(sessionId)) continue; // already being stopped
       out.push({
         sessionId,
         heartbeatMtimeMs: e.heartbeatMtimeMs,
@@ -304,21 +346,71 @@ async function spawnContainer(session: Session): Promise<void> {
     hostEnv: process.env,
   });
 
-  const mounts = buildMounts(agentGroup, session, containerConfig, contribution, groupContribution);
+  // Container-bootstrap lifecycle pipeline. `fireSpawnPre` aggregates
+  // observer contributions (IP allocation today, future cred broker / ssh
+  // passwd shim) into mounts/env/args/cleanups + a needsRootEntrypoint flag.
+  // A throwing observer is wrapped in FatalSpawnError by the registry; the
+  // throw propagates without local handling because no cleanups have been
+  // collected yet at that point.
+  const spawnPre: MergedSpawnPre = fireSpawnPre({ agentGroup, session });
+
+  const mounts = buildMounts(agentGroup, session, containerConfig, contribution, groupContribution, spawnPre);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
   const agentIdentifier = agentGroup.id;
-  const args = await buildContainerArgs(
-    mounts,
-    containerName,
-    agentGroup,
-    containerConfig,
-    provider,
-    contribution,
-    groupContribution,
-    agentIdentifier,
-  );
+
+  const launchMode = resolveLaunchMode(spawnPre.needsRootEntrypoint);
+
+  // Per-spawn exit guard. The spec says `onContainerExited` fires exactly
+  // once per session; Node can occasionally emit both `close` and `error`
+  // on the same ChildProcess, and the pre-spawn args-build failure path
+  // also fires the hook. A single flag shared by every exit site enforces
+  // the spec at the call site (paired with the cleanup-level once-shim
+  // inside fireSpawnPre, which enforces the cleanup-idempotency contract
+  // independently — different invariants, different layers).
+  let exited = false;
+  const fireExitOnce = (exitCode: number | null, reason: ExitReason): boolean => {
+    if (exited) return false;
+    exited = true;
+    activeContainers.delete(session.id);
+    markContainerStopped(session.id);
+    stopTypingRefresh(session.id);
+    killedSessions.delete(session.id);
+    fireContainerExited(
+      { agentGroup, session, containerName, exitCode, reason },
+      spawnPre.cleanups,
+    );
+    // Release the slot + clear any eviction mark, then hand it to waiting
+    // sessions (FIFO drain). Runs after activeContainers.delete so occupancy
+    // already reflects the freed slot. Also covers the pre-spawn error path
+    // (fired at the buildContainerArgs catch), where it releases the reserve
+    // for a spawn that never produced a live container.
+    queue.onExit(session.id);
+    return true;
+  };
+
+  let args: string[];
+  try {
+    args = await buildContainerArgs(
+      mounts,
+      containerName,
+      agentGroup,
+      containerConfig,
+      provider,
+      contribution,
+      groupContribution,
+      agentIdentifier,
+      spawnPre,
+      launchMode,
+    );
+  } catch (err) {
+    // Spawn failed before the process is alive: still run cleanups +
+    // fire the exited hook with reason='spawn-error' so observers can
+    // release any handles they allocated.
+    fireExitOnce(null, 'spawn-error');
+    throw err;
+  }
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
 
@@ -341,6 +433,7 @@ async function spawnContainer(session: Session): Promise<void> {
   // in occupancy via activeCount), so drop the reserve to avoid double-counting.
   queue.releaseReserve(session.id);
   markContainerRunning(session.id);
+  fireContainerStarted({ agentGroup, session, containerName });
 
   // Log stderr
   container.stderr?.on('data', (data) => {
@@ -358,22 +451,17 @@ async function spawnContainer(session: Session): Promise<void> {
   // on a wall-clock timer.
 
   container.on('close', (code) => {
-    activeContainers.delete(session.id);
-    // Release the slot + clear any eviction mark, then hand it to waiting
-    // sessions (FIFO drain). Runs after activeContainers.delete so occupancy
-    // already reflects the freed slot.
-    queue.onExit(session.id);
-    markContainerStopped(session.id);
-    stopTypingRefresh(session.id);
-    log.info('Container exited', { sessionId: session.id, code, containerName });
+    // `killedSessions` is consumed by `fireExitOnce` (clears it) so peek before.
+    const reason: ExitReason = killedSessions.has(session.id) ? 'killed' : 'normal';
+    if (fireExitOnce(code, reason)) {
+      log.info('Container exited', { sessionId: session.id, code, containerName, reason });
+    }
   });
 
   container.on('error', (err) => {
-    activeContainers.delete(session.id);
-    queue.onExit(session.id);
-    markContainerStopped(session.id);
-    stopTypingRefresh(session.id);
-    log.error('Container spawn error', { sessionId: session.id, err });
+    if (fireExitOnce(null, 'spawn-error')) {
+      log.error('Container spawn error', { sessionId: session.id, err });
+    }
   });
 }
 
@@ -397,6 +485,7 @@ export function killContainer(
     entry.process.once('close', onExit);
   }
 
+  killedSessions.add(sessionId);
   log.info('Killing container', { sessionId, reason, containerName: entry.containerName, graceSeconds });
   if (graceSeconds > 1) {
     // Graceful: don't block the event loop; SIGTERM handler winds the turn down.
@@ -456,9 +545,8 @@ function buildMounts(
   containerConfig: import('./container-config.js').ContainerConfig,
   providerContribution: ProviderContainerContribution,
   groupContribution: AgentGroupContribution,
+  spawnPre: MergedSpawnPre,
 ): VolumeMount[] {
-  const projectRoot = process.cwd();
-
   // Per-group filesystem state lives forever after first creation. Init is
   // idempotent: it only writes paths that don't already exist, so this call
   // is a no-op for groups that have spawned before.
@@ -511,26 +599,21 @@ function buildMounts(
     mounts.push({ hostPath: globalDir, containerPath: '/workspace/global', readonly: true });
   }
 
-  // Shared CLAUDE.md — read-only, imported by the composed entry point via
-  // the `.claude-shared.md` symlink inside the group dir.
-  const sharedClaudeMd = path.join(process.cwd(), 'container', 'CLAUDE.md');
-  if (fs.existsSync(sharedClaudeMd)) {
-    mounts.push({ hostPath: sharedClaudeMd, containerPath: '/app/CLAUDE.md', readonly: true });
-  }
+  // Snapshot-derived bootstrap mounts: entrypoint.sh, /app/src, /app/skills,
+  // /app/CLAUDE.md — all read-only. Owned by container-bootstrap so the
+  // launch shape is independent of `process.cwd()` after host boot.
+  mounts.push(...defaultLaunchShape().mounts);
+
+  // Per-group persistent home directory at /home/node. The .claude mount below
+  // nests on top of this and lives in a separate host dir, so the file-wipe in
+  // `prepareGroupHomeDir` never touches it; agent-written ~/.env-vars
+  // (regenerated each launch) is correctly cleared as a top-level file.
+  const groupHomeDir = prepareGroupHomeDir(path.join(DATA_DIR, 'v2-sessions', agentGroup.id, 'home'));
+  mounts.push({ hostPath: groupHomeDir, containerPath: '/home/node', readonly: false });
 
   // Per-group .claude-shared at /home/node/.claude (Claude state, settings,
-  // skill symlinks)
+  // skill symlinks). Nested on top of the persistent /home/node mount above.
   mounts.push({ hostPath: claudeDir, containerPath: '/home/node/.claude', readonly: false });
-
-  // Shared agent-runner source — read-only, same code for all groups.
-  const agentRunnerSrc = path.join(projectRoot, 'container', 'agent-runner', 'src');
-  mounts.push({ hostPath: agentRunnerSrc, containerPath: '/app/src', readonly: true });
-
-  // Shared skills — read-only, symlinks in .claude-shared/skills/ point here.
-  const skillsSrc = path.join(projectRoot, 'container', 'skills');
-  if (fs.existsSync(skillsSrc)) {
-    mounts.push({ hostPath: skillsSrc, containerPath: '/app/skills', readonly: true });
-  }
 
   // Additional mounts from container config
   if (containerConfig.additionalMounts && containerConfig.additionalMounts.length > 0) {
@@ -549,6 +632,11 @@ function buildMounts(
   // static container.json additionalMounts above.
   if (groupContribution.mounts) {
     mounts.push(...groupContribution.mounts);
+  }
+
+  // Container-bootstrap onSpawnPre observer mounts (future cred broker, etc.).
+  if (spawnPre.mounts.length > 0) {
+    mounts.push(...spawnPre.mounts);
   }
 
   return mounts;
@@ -624,9 +712,18 @@ async function buildContainerArgs(
   provider: string,
   providerContribution: ProviderContainerContribution,
   groupContribution: AgentGroupContribution,
-  agentIdentifier?: string,
+  agentIdentifier: string | undefined,
+  spawnPre: MergedSpawnPre,
+  launchMode: import('./modules/container-bootstrap/index.js').LaunchMode,
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
+
+  // Container-bootstrap onSpawnPre args (e.g. --network nanoclaw --ip 10.0.0.5
+  // from the IP observer). Must precede the image arg; appended later would
+  // be parsed as part of the command.
+  if (spawnPre.args.length > 0) {
+    args.push(...spawnPre.args);
+  }
 
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
@@ -644,6 +741,12 @@ async function buildContainerArgs(
     for (const [key, value] of Object.entries(groupContribution.env)) {
       args.push('-e', `${key}=${value}`);
     }
+  }
+
+  // Container-bootstrap onSpawnPre env (future cred broker proxy hostname,
+  // ssh passwd shim flag, etc.).
+  for (const [key, value] of Object.entries(spawnPre.env)) {
+    args.push('-e', `${key}=${value}`);
   }
 
   // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls
@@ -669,12 +772,18 @@ async function buildContainerArgs(
     args.push(...hostGatewayArgs());
   }
 
-  // User mapping
-  const hostUid = process.getuid?.();
-  const hostGid = process.getgid?.();
-  if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
-    args.push('--user', `${hostUid}:${hostGid}`);
+  // Privilege mode. rootless → --user UID:GID. root-drop → no --user, but
+  // HOST_UID/HOST_GID env so the entrypoint's setpriv block drops cleanly
+  // before exec-ing bun.
+  if (launchMode.kind === 'rootless' && launchMode.userArg) {
+    args.push('--user', launchMode.userArg);
     args.push('-e', 'HOME=/home/node');
+  } else if (launchMode.kind === 'root-drop') {
+    args.push('-e', `HOST_UID=${launchMode.envVars.HOST_UID}`);
+    args.push('-e', `HOST_GID=${launchMode.envVars.HOST_GID}`);
+    args.push('-e', 'HOME=/home/node');
+  } else {
+    // HOME only needs explicit setting when we remap to a foreign UID
   }
 
   // Volume mounts
@@ -686,14 +795,11 @@ async function buildContainerArgs(
     }
   }
 
-  // Override entrypoint: run v2 entry point directly via Bun (no tsc, no stdin).
-  args.push('--entrypoint', 'bash');
-
-  // Use per-agent-group image if one has been built, otherwise base image
+  // Use per-agent-group image if one has been built, otherwise base image.
+  // The image's baked-in ENTRYPOINT runs — `container/entrypoint.sh` mounted
+  // from the snapshot owns the bun exec; no --entrypoint override here.
   const imageTag = containerConfig.imageTag || CONTAINER_IMAGE;
   args.push(imageTag);
-
-  args.push('-c', 'exec bun run /app/src/index.ts');
 
   return args;
 }
