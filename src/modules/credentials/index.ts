@@ -79,6 +79,8 @@ export type {
   ReauthContext,
   UxExt,
   RuntimeUpdaterExt,
+  ContributionInput,
+  ProviderResult,
 } from './providers/types.js';
 
 export { defaultManifestBuilder, noManifestSideEffect } from './providers/defaults.js';

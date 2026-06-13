@@ -16,7 +16,7 @@
  * `SubstitutingProvider.substitutes` property (existing rails).
  */
 import type { InteractionOrigin } from '../../../host-interactions.js';
-import type { VolumeMount } from '../../../providers/provider-container-registry.js';
+import type { VolumeMount, ProviderContainerContribution } from '../../../providers/provider-container-registry.js';
 import type { CredentialScope, GroupScope } from '../types.js';
 
 // ── Extension mechanism ─────────────────────────────────────────────────────
@@ -99,6 +99,38 @@ export interface RuntimeTapConfig {
   model?: string;
 }
 export const AGENT_RUNTIME = defineExtension<AgentRuntimeExt>('agentRuntime');
+
+/**
+ * Input to provider-contribution resolution (`resolveProviderContribution`,
+ * container-runner). The resolver builds this once — including resolving the
+ * provider's AGENT_RUNTIME extension — then capability helpers (agent-runtime
+ * contribution → mitm-proxy, cli-version → runtime-updater) read it and set
+ * their own field on the result. Carrying everything here keeps each helper a
+ * pure `(input) => value`, so they compose without co-editing the resolver.
+ */
+export interface ContributionInput {
+  provider: string;
+  /** Raw `session.agent_provider` (the `provider[:version]` identity), for updater to parse. */
+  agentProvider: string | null | undefined;
+  /** Per-group configured CLI version (`ContainerConfig.providerVersion`), for updater. */
+  providerVersion: string | undefined;
+  agentGroupId: string;
+  groupScope: GroupScope;
+  sessionDir: string;
+  hostEnv: NodeJS.ProcessEnv;
+  /** Opaque per-runtime config dict (`ContainerConfig.runtimeConfig`). */
+  runtimeConfig: unknown;
+  /** The provider's agent-runtime extension, resolved by the resolver (or undefined). */
+  runtime: AgentRuntimeExt | undefined;
+}
+
+/** Result of provider-contribution resolution. */
+export interface ProviderResult {
+  provider: string;
+  contribution: ProviderContainerContribution;
+  /** Concrete fetched CLI version this spawn mounts, or null = image-baked. */
+  cliVersion: string | null;
+}
 
 // ── Per-container state ──────────────────────────────────────────
 

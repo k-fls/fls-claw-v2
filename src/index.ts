@@ -19,6 +19,7 @@ import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, st
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { routeInbound } from './router.js';
 import { shutdownContainers } from './container-runner.js';
+import { registerClaudeCredentialProvider } from './providers/claude-credential.js';
 import { log } from './log.js';
 import { enforceUpgradeTripwire } from './upgrade-state.js';
 
@@ -82,6 +83,12 @@ async function main(): Promise<void> {
   const db = initDb(dbPath);
   runMigrations(db);
   log.info('Central DB ready', { path: dbPath });
+
+  // Native-path credential providers. Registered explicitly (not via the
+  // modules barrel) so unit tests don't arm the spawn-time validator
+  // unexpectedly. Baseline here is the non-mitm claude runtime; mitm-proxy and
+  // runtime-updater modify the provider file in place.
+  registerClaudeCredentialProvider();
 
   // 1b. Backfill container_configs from legacy container.json files.
   // Idempotent — skips groups that already have a config row.

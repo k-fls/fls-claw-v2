@@ -53,6 +53,8 @@ import {
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
+import { getCredentialProvider, AGENT_RUNTIME, asGroupScope } from './modules/credentials/index.js';
+import type { ContributionInput, ProviderResult } from './modules/credentials/index.js';
 // Provider host-side config barrel — each provider that needs host-side
 // container setup self-registers on import.
 import './providers/index.js';
@@ -526,17 +528,42 @@ function resolveProviderContribution(
   session: Session,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
-): { provider: string; contribution: ProviderContainerContribution } {
+): ProviderResult {
   const provider = resolveProviderName(session.agent_provider, containerConfig.provider);
-  const fn = getProviderContainerConfig(provider);
-  const contribution = fn
-    ? fn({
-        sessionDir: sessionDir(agentGroup.id, session.id),
-        agentGroupId: agentGroup.id,
-        hostEnv: process.env,
-      })
-    : {};
-  return { provider, contribution };
+  const input: ContributionInput = {
+    provider,
+    agentProvider: session.agent_provider,
+    providerVersion: containerConfig.providerVersion,
+    agentGroupId: agentGroup.id,
+    groupScope: asGroupScope(agentGroup.folder),
+    sessionDir: sessionDir(agentGroup.id, session.id),
+    hostEnv: process.env,
+    runtimeConfig: containerConfig.runtimeConfig ?? {},
+    runtime: getCredentialProvider(provider)?.getExtension?.(AGENT_RUNTIME),
+  };
+
+  // Generic AGENT_RUNTIME dispatch (credentials owns the contract): a provider's
+  // runtime extension wins over the legacy provider-container registry. Capability
+  // layers extend the result below via additive lines (updater → version-mount +
+  // cliVersion), so this resolver stays agnostic to which extensions exist.
+  let contribution: ProviderContainerContribution;
+  if (input.runtime) {
+    contribution = input.runtime.containerContribution({
+      agentGroupId: input.agentGroupId,
+      groupScope: input.groupScope,
+      sessionDir: input.sessionDir,
+      hostEnv: input.hostEnv,
+      runtimeConfig: input.runtime.parseRuntimeConfig(input.runtimeConfig),
+    });
+  } else {
+    const fn = getProviderContainerConfig(provider);
+    contribution = fn
+      ? fn({ sessionDir: input.sessionDir, agentGroupId: input.agentGroupId, hostEnv: input.hostEnv })
+      : {};
+  }
+
+  const out: ProviderResult = { provider, contribution, cliVersion: null };
+  return out;
 }
 
 function buildMounts(

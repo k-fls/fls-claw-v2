@@ -43,6 +43,20 @@ export interface ContainerConfig {
   maxMessagesPerPrompt?: number;
   model?: string;
   effort?: string;
+  /**
+   * Selected agent-runtime CLI version, parsed from the `provider` identity
+   * string's `:version` suffix (e.g. `claude:2.1.154` → `2.1.154`). Undefined
+   * for a bare provider. The runtime-updater resolves it to a host-installed
+   * CLI mount at spawn. Shared config field (the resolver builds the
+   * ContributionInput from it); updater reads it.
+   */
+  providerVersion?: string;
+  /**
+   * Per-group agent-runtime configuration — an opaque-to-the-framework config
+   * dict (hence `unknown` values). The runtime's `AGENT_RUNTIME` extension
+   * validates it via `parseRuntimeConfig`; the framework only stores/forwards.
+   */
+  runtimeConfig?: Record<string, unknown>;
 }
 
 /** Build a `ContainerConfig` from a DB row + agent group identity. */
