@@ -34,7 +34,7 @@ describe('decideStuckAction', () => {
     ).toEqual({ action: 'ok' });
   });
 
-  it('returns kill-ceiling when heartbeat older than 30 min', () => {
+  it('returns kill-ceiling when heartbeat older than the idle backstop', () => {
     const heartbeatMtimeMs = BASE - ABSOLUTE_CEILING_MS - 1_000;
     const res = decideStuckAction({
       now: BASE,

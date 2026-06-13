@@ -31,13 +31,33 @@ import { buildSystemPromptAddendum } from './destinations.js';
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
-import { runPollLoop } from './poll-loop.js';
+import { runPollLoop, requestGracefulStop } from './poll-loop.js';
 
 function log(msg: string): void {
   console.error(`[agent-runner] ${msg}`);
 }
 
 const CWD = '/workspace/agent';
+
+// Graceful stop on `docker stop` (SIGTERM) / SIGINT. We abort any in-flight
+// turn so the loop ends it cleanly (marks the batch complete, lets the SDK
+// flush) instead of being torn mid-write; the loop then unwinds and `main`
+// resolves, exiting the process (see below). The host's `docker stop -t`
+// deadline is the single source of truth for how long this may take — when it
+// elapses Docker sends SIGKILL, so no container-side timer is needed. A second
+// signal forces an immediate exit.
+let stopping = false;
+function handleStopSignal(sig: string): void {
+  if (stopping) {
+    log(`${sig} again — forcing exit`);
+    process.exit(0);
+  }
+  stopping = true;
+  log(`${sig} received — graceful stop`);
+  requestGracefulStop();
+}
+process.on('SIGTERM', () => handleStopSignal('SIGTERM'));
+process.on('SIGINT', () => handleStopSignal('SIGINT'));
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -103,7 +123,15 @@ async function main(): Promise<void> {
   });
 }
 
-main().catch((err) => {
-  log(`Fatal error: ${err instanceof Error ? err.message : String(err)}`);
-  process.exit(1);
-});
+main()
+  .then(() => {
+    // runPollLoop only returns on a graceful stop (the loop is otherwise
+    // infinite). Exit cleanly rather than waiting for lingering handles (e.g.
+    // an SDK subprocess) — Docker's SIGKILL would otherwise reap us.
+    log('Poll loop ended — exiting');
+    process.exit(0);
+  })
+  .catch((err) => {
+    log(`Fatal error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  });

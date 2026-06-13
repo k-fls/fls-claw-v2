@@ -14,15 +14,26 @@ import {
   CONTAINER_IMAGE_BASE,
   CONTAINER_INSTALL_LABEL,
   DATA_DIR,
+  GRACEFUL_STOP_MS,
   GROUPS_DIR,
+  IDLE_BEFORE_EVICT,
+  MAX_CONCURRENT_CONTAINERS,
   ONECLI_API_KEY,
   ONECLI_URL,
   TIMEZONE,
 } from './config.js';
+import { ContainerQueue, type EvictionCandidate } from './container-queue.js';
+import { getSession } from './db/sessions.js';
 import { materializeContainerJson } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { updateContainerConfigScalars, updateContainerConfigJson } from './db/container-configs.js';
-import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
+import {
+  CONTAINER_RUNTIME_BIN,
+  hostGatewayArgs,
+  readonlyMountArgs,
+  stopContainer,
+  stopContainerGraceful,
+} from './container-runtime.js';
 import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from './egress-lockdown.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -50,8 +61,20 @@ import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
-/** Active containers tracked by session ID. */
-const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
+/**
+ * Active containers tracked by session ID. `spawnedAt` + the liveness fields
+ * (`heartbeatMtimeMs`, `hasOutstandingClaim`, stamped by the host sweep each
+ * tick via `recordContainerLiveness`) feed the queue's demand-driven eviction
+ * decision without any wake-path DB/FS I/O.
+ */
+interface ActiveContainer {
+  process: ChildProcess;
+  containerName: string;
+  spawnedAt: number;
+  heartbeatMtimeMs: number;
+  hasOutstandingClaim: boolean;
+}
+const activeContainers = new Map<string, ActiveContainer>();
 
 /**
  * In-flight wake promises, keyed by session id. Deduplicates concurrent
@@ -62,6 +85,94 @@ const activeContainers = new Map<string, { process: ChildProcess; containerName:
  * racy double-replies.
  */
 const wakePromises = new Map<string, Promise<boolean>>();
+
+/**
+ * `docker stop -t` takes integer seconds; config carries `GRACEFUL_STOP_MS`
+ * (ms, uniform with the other timing knobs). Convert once, here at the runtime
+ * boundary. Used for graceful eviction + shutdown stops only — stuck kills use
+ * the fast 1s path.
+ */
+const GRACEFUL_STOP_SECONDS = Math.ceil(GRACEFUL_STOP_MS / 1000);
+
+/**
+ * Global admission queue: enforces `MAX_CONCURRENT_CONTAINERS` and evicts the
+ * oldest-idle warm container under demand pressure. Side effects (spawn, evict)
+ * are the real container-runner ops; the queue owns only the reserve / waiting
+ * / evicting bookkeeping. See `container-queue.ts`.
+ */
+const queue = new ContainerQueue({
+  cap: MAX_CONCURRENT_CONTAINERS,
+  idleBeforeEvictMs: IDLE_BEFORE_EVICT,
+  now: () => Date.now(),
+  activeCount: () => activeContainers.size,
+  isActive: (id) => activeContainers.has(id),
+  canSpawn: (id) => {
+    const s = getSession(id);
+    return !!s && s.status === 'active';
+  },
+  spawn: (id) => {
+    const s = getSession(id);
+    if (s) void beginSpawn(s);
+  },
+  evict: (id) => killContainer(id, 'evicted', undefined, GRACEFUL_STOP_SECONDS),
+  candidates: () => {
+    const out: EvictionCandidate[] = [];
+    for (const [sessionId, e] of activeContainers) {
+      out.push({
+        sessionId,
+        heartbeatMtimeMs: e.heartbeatMtimeMs,
+        hasOutstandingClaim: e.hasOutstandingClaim,
+        spawnedAt: e.spawnedAt,
+      });
+    }
+    return out;
+  },
+});
+
+/**
+ * Stamp per-session liveness (heartbeat mtime + outstanding-claim flag) onto
+ * the active-container entry. Called by the host sweep each tick — it already
+ * reads both — so eviction candidate selection needs no wake-path I/O. The
+ * stamp is at most one sweep interval stale, well inside the IDLE_BEFORE_EVICT
+ * window.
+ */
+export function recordContainerLiveness(
+  sessionId: string,
+  heartbeatMtimeMs: number,
+  hasOutstandingClaim: boolean,
+): void {
+  const e = activeContainers.get(sessionId);
+  if (!e) return;
+  e.heartbeatMtimeMs = heartbeatMtimeMs;
+  e.hasOutstandingClaim = hasOutstandingClaim;
+}
+
+/**
+ * Graceful container teardown on host shutdown (D-c). Latches the queue shut
+ * (no new spawns/drains), then stops every live container *in parallel* with a
+ * grace window — each container's SIGTERM handler aborts its turn and flushes
+ * before SIGKILL. SIGKILL-fallback per container on stop error. Containers are
+ * DB-durable, so even a hard kill just resets the message to pending for the
+ * next boot — the grace makes that the exception, not the rule.
+ */
+export async function shutdownContainers(): Promise<void> {
+  queue.setShuttingDown();
+  const entries = [...activeContainers.values()];
+  if (entries.length === 0) return;
+  log.info('Stopping containers on shutdown', { count: entries.length, graceSeconds: GRACEFUL_STOP_SECONDS });
+  await Promise.allSettled(
+    entries.map((e) =>
+      stopContainerGraceful(e.containerName, GRACEFUL_STOP_SECONDS).catch((err) => {
+        log.warn('Graceful stop failed on shutdown; SIGKILL fallback', { containerName: e.containerName, err });
+        try {
+          e.process.kill('SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }),
+    ),
+  );
+}
 
 export function getActiveContainerCount(): number {
   return activeContainers.size;
@@ -93,6 +204,32 @@ export function wakeContainer(session: Session): Promise<boolean> {
     log.debug('Container wake already in-flight — joining existing promise', { sessionId: session.id });
     return existing;
   }
+  // Admission control (cap + demand-driven eviction). Synchronous, so two
+  // concurrent wakes can't both pass the cap (v1 P1). On 'deferred' the inbound
+  // row stays pending; the queue re-wakes this session when a slot frees
+  // (drain) and the sweep is the backstop. Treated like a retryable failure
+  // (returns false, no throw, no user notification).
+  if (queue.admit(session.id) === 'deferred') {
+    log.debug('Wake deferred — at concurrency cap', {
+      sessionId: session.id,
+      occupancy: queue.occupancy(),
+      cap: MAX_CONCURRENT_CONTAINERS,
+    });
+    return Promise.resolve(false);
+  }
+  return beginSpawn(session);
+}
+
+/**
+ * Drive a spawn whose slot has already been reserved (via `queue.admit` in
+ * `wakeContainer`, or directly by `queue` during drain). Owns the wake-promise
+ * dedup + the reserve release: the reserve is freed at the active handoff
+ * inside `spawnContainer`, but if the spawn returns/throws *before* a live
+ * container is registered (e.g. the `!agentGroup` early-return at the top of
+ * `spawnContainer`, which never reaches `fireExitOnce`), this `finally` is the
+ * leak-proof release (v2 risk R9).
+ */
+function beginSpawn(session: Session): Promise<boolean> {
   const promise = spawnContainer(session)
     .then(() => true)
     .catch((err) => {
@@ -101,6 +238,11 @@ export function wakeContainer(session: Session): Promise<boolean> {
     })
     .finally(() => {
       wakePromises.delete(session.id);
+      // If the spawn never handed off to a live container, free the reserved
+      // slot AND service waiters — the freed slot must not sit idle until the
+      // next exit/sweep. (A successful handoff already dropped the reserve at
+      // activeContainers.set, so has() is true here and we skip.)
+      if (!activeContainers.has(session.id)) queue.releaseReserveAndDrain(session.id);
     });
   wakePromises.set(session.id, promise);
   return promise;
@@ -157,7 +299,16 @@ async function spawnContainer(session: Session): Promise<void> {
 
   const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
-  activeContainers.set(session.id, { process: container, containerName });
+  activeContainers.set(session.id, {
+    process: container,
+    containerName,
+    spawnedAt: Date.now(),
+    heartbeatMtimeMs: 0,
+    hasOutstandingClaim: false,
+  });
+  // Reserve→active handoff: the slot is now owned by activeContainers (counted
+  // in occupancy via activeCount), so drop the reserve to avoid double-counting.
+  queue.releaseReserve(session.id);
   markContainerRunning(session.id);
 
   // Log stderr
@@ -177,6 +328,10 @@ async function spawnContainer(session: Session): Promise<void> {
 
   container.on('close', (code) => {
     activeContainers.delete(session.id);
+    // Release the slot + clear any eviction mark, then hand it to waiting
+    // sessions (FIFO drain). Runs after activeContainers.delete so occupancy
+    // already reflects the freed slot.
+    queue.onExit(session.id);
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
     log.info('Container exited', { sessionId: session.id, code, containerName });
@@ -184,14 +339,26 @@ async function spawnContainer(session: Session): Promise<void> {
 
   container.on('error', (err) => {
     activeContainers.delete(session.id);
+    queue.onExit(session.id);
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
     log.error('Container spawn error', { sessionId: session.id, err });
   });
 }
 
-/** Kill a container for a session. */
-export function killContainer(sessionId: string, reason: string, onExit?: () => void): void {
+/**
+ * Kill a container for a session. `graceSeconds > 1` takes the *graceful*
+ * non-blocking path (async `docker stop -t N`): the container's SIGTERM handler
+ * aborts its turn and flushes before SIGKILL — used for demand eviction. The
+ * default 1s path is synchronous and immediate, for stuck-container kills
+ * (ceiling / claim-stuck) where graceful wind-down can't work anyway.
+ */
+export function killContainer(
+  sessionId: string,
+  reason: string,
+  onExit?: () => void,
+  graceSeconds = 1,
+): void {
   const entry = activeContainers.get(sessionId);
   if (!entry) return;
 
@@ -199,9 +366,21 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
     entry.process.once('close', onExit);
   }
 
-  log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
+  log.info('Killing container', { sessionId, reason, containerName: entry.containerName, graceSeconds });
+  if (graceSeconds > 1) {
+    // Graceful: don't block the event loop; SIGTERM handler winds the turn down.
+    stopContainerGraceful(entry.containerName, graceSeconds).catch((err) => {
+      log.warn('Graceful docker stop failed; SIGKILL fallback', { sessionId, err });
+      try {
+        entry.process.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    });
+    return;
+  }
   try {
-    stopContainer(entry.containerName);
+    stopContainer(entry.containerName, graceSeconds);
   } catch {
     entry.process.kill('SIGKILL');
   }

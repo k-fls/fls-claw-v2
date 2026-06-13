@@ -66,7 +66,39 @@ export interface PollLoopConfig {
 }
 
 /**
- * Main poll loop. Runs indefinitely until the process is killed.
+ * Graceful-stop state. The host stops a container with `docker stop -t N`
+ * (SIGTERM, then SIGKILL after N seconds). A SIGTERM handler (wired in
+ * index.ts) calls `requestGracefulStop`, which aborts any in-flight query and
+ * trips the loop to exit at the next safe point — so a turn ends cleanly (rows
+ * marked, transcript flushed by the SDK's own abort) instead of being torn by
+ * the SIGKILL. An idle container (no active query) just exits the loop. This is
+ * the v2 equivalent of the fork's `_close` sentinel; it works for any provider
+ * because it rides the provider-agnostic `AgentQuery.abort()`.
+ */
+let currentQuery: AgentQuery | null = null;
+let stopRequested = false;
+
+export function requestGracefulStop(): void {
+  stopRequested = true;
+  // End the in-flight turn (provider-specific: Claude ends the SDK stream,
+  // codex/opencode issue their own interrupt/abort). No-op when idle.
+  try {
+    currentQuery?.abort();
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Test seam — reset module state between cases. */
+export function _resetGracefulStopForTesting(): void {
+  currentQuery = null;
+  stopRequested = false;
+}
+
+/**
+ * Main poll loop. Runs until the process is killed OR a graceful stop is
+ * requested (SIGTERM → requestGracefulStop → loop unwinds, marking the current
+ * batch complete before returning).
  *
  * 1. Poll messages_in for pending rows
  * 2. Format into prompt, call provider.query()
@@ -106,7 +138,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
   let pollCount = 0;
   let isFirstPoll = true;
-  while (true) {
+  while (!stopRequested) {
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
     const messages = getPendingMessages(isFirstPoll).filter((m) => m.kind !== 'system');
     isFirstPoll = false;
@@ -231,6 +263,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Publish the batch's in_reply_to so MCP tools (send_message, send_file)
     // can stamp it on outbound rows — needed for a2a return-path routing.
     setCurrentInReplyTo(routing.inReplyTo);
+    currentQuery = query; // expose to the SIGTERM handler for graceful abort
     try {
       const result = await processQuery(query, routing, processingIds, config.providerName);
       if (result.continuation && result.continuation !== continuation) {
@@ -261,13 +294,16 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       });
     } finally {
       clearCurrentInReplyTo();
+      currentQuery = null;
     }
 
     // Ensure completed even if processQuery ended without a result event
-    // (e.g. stream closed unexpectedly).
+    // (e.g. stream closed unexpectedly, or a graceful abort ended the stream).
     markCompleted(processingIds);
     log(`Completed ${ids.length} message(s)`);
   }
+
+  if (stopRequested) log('Graceful stop — poll loop exiting');
 }
 
 /**
