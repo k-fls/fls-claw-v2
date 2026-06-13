@@ -24,6 +24,7 @@ import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
+import { isOutboundPaused, onAnyInteractionRelease } from './host-interactions.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { Session } from './types.js';
 
@@ -92,6 +93,62 @@ export function onDeliveryAdapterReady(cb: AdapterReadyCallback): void {
   }
 }
 
+/**
+ * Send a chat reply straight to the channel adapter, bypassing
+ * `messages_out` and the polling loop. Used by host-side reply paths
+ * (host commands, host interactions, gate denials) that should NOT
+ * persist content in the per-session DBs and should NOT incur the
+ * 1s/60s poll latency.
+ *
+ * Fire-and-forget: returns void synchronously. On adapter failure,
+ * retries up to MAX_DELIVERY_ATTEMPTS with a short backoff (matching
+ * the queue path's 3-attempt budget; the backoff is tighter since
+ * we're not waiting for the next poll tick). Final failure is logged
+ * — there's nowhere to mark-failed since the message never landed in
+ * messages_out.
+ */
+export function deliverDirect(channelType: string, platformId: string, threadId: string | null, text: string): void {
+  const adapter = deliveryAdapter;
+  if (!adapter) {
+    log.warn('deliverDirect: no delivery adapter configured — dropping reply', {
+      channelType,
+      platformId,
+    });
+    return;
+  }
+  const content = JSON.stringify({ text });
+  void (async () => {
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= MAX_DELIVERY_ATTEMPTS; attempt++) {
+      try {
+        await adapter.deliver(channelType, platformId, threadId, 'chat', content);
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < MAX_DELIVERY_ATTEMPTS) {
+          log.warn('deliverDirect: adapter delivery failed, will retry', {
+            channelType,
+            platformId,
+            attempt,
+            maxAttempts: MAX_DELIVERY_ATTEMPTS,
+            err,
+          });
+          await new Promise((res) => setTimeout(res, DIRECT_RETRY_BACKOFF_MS[attempt - 1]));
+        }
+      }
+    }
+    log.error('deliverDirect: adapter delivery failed permanently, giving up', {
+      channelType,
+      platformId,
+      attempts: MAX_DELIVERY_ATTEMPTS,
+      err: lastErr,
+    });
+  })();
+}
+
+/** Backoff between successive deliverDirect retry attempts (ms). */
+const DIRECT_RETRY_BACKOFF_MS = [100, 400] as const;
+
 export function setDeliveryAdapter(adapter: ChannelDeliveryAdapter): void {
   deliveryAdapter = adapter;
   // Forward to the typing module so it can fire setTyping on its own
@@ -109,6 +166,12 @@ export function startActiveDeliveryPoll(): void {
   if (activePolling) return;
   activePolling = true;
   pollActive();
+  // Kick a poll immediately whenever any host interaction releases, so
+  // paused rows drain without waiting up to a full poll interval.
+  onAnyInteractionRelease(() => {
+    if (!activePolling) return;
+    void pollActiveOnce().catch((err) => log.error('Resume-on-release poll error', { err }));
+  });
 }
 
 /** Start the sweep poll loop (~60s). */
@@ -120,17 +183,19 @@ export function startSweepDeliveryPoll(): void {
 
 async function pollActive(): Promise<void> {
   if (!activePolling) return;
-
   try {
-    const sessions = getRunningSessions();
-    for (const session of sessions) {
-      await deliverSessionMessages(session);
-    }
+    await pollActiveOnce();
   } catch (err) {
     log.error('Active delivery poll error', { err });
   }
-
   setTimeout(pollActive, ACTIVE_POLL_MS);
+}
+
+async function pollActiveOnce(): Promise<void> {
+  const sessions = getRunningSessions();
+  for (const session of sessions) {
+    await deliverSessionMessages(session);
+  }
 }
 
 async function pollSweep(): Promise<void> {
@@ -184,10 +249,21 @@ async function drainSession(session: Session): Promise<void> {
     const undelivered = allDue.filter((m) => !delivered.has(m.id));
     if (undelivered.length === 0) return;
 
+    // Outbound suppression: if a host interaction is active for the row's
+    // (channel_type, platform_id, thread_id), leave the row in messages_out
+    // (not delivered, not marked failed). It will retry on the next poll;
+    // an interaction release fires onAnyInteractionRelease and kicks a
+    // poll immediately. Host-side replies (commands / interactions /
+    // denials) never enter messages_out — they take deliverDirect — so
+    // everything in `undelivered` here is container traffic and the
+    // pause predicate has no exemptions.
+    const deliverable = undelivered.filter((m) => !isOutboundPaused(m.channel_type, m.platform_id, m.thread_id));
+    if (deliverable.length === 0) return;
+
     // Ensure platform_message_id column exists (migration for existing sessions)
     migrateDeliveredTable(inDb);
 
-    for (const msg of undelivered) {
+    for (const msg of deliverable) {
       try {
         const platformMsgId = await deliverMessage(msg, session, inDb);
         markDelivered(inDb, msg.id, platformMsgId ?? null);
@@ -238,8 +314,8 @@ async function deliverMessage(
     platform_id: string | null;
     channel_type: string | null;
     thread_id: string | null;
-    content: string;
     in_reply_to: string | null;
+    content: string;
   },
   session: Session,
   inDb: Database.Database,

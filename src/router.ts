@@ -18,7 +18,8 @@
  * for policy refusals.
  */
 import { getChannelAdapter } from './channels/channel-registry.js';
-import { gateCommand } from './command-gate.js';
+import { gateCommand, dispatchHostCommand, classifyAtMessagingGroup } from './command-gate.js';
+import { deliverToActiveInteraction, type HostInteractionKey } from './host-interactions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
 import {
@@ -29,7 +30,8 @@ import {
 import { findSessionForAgent } from './db/sessions.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
-import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
+import { resolveSession, writeSessionMessage } from './session-manager.js';
+import { deliverDirect } from './delivery.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from './types.js';
@@ -109,20 +111,6 @@ export function setSenderScopeGate(fn: SenderScopeGateFn): void {
 }
 
 /**
- * Message-interceptor hook. Runs at the very top of routeInbound, before
- * messaging-group resolution. When the interceptor returns true the message
- * is consumed and routing stops. Used by the permissions module to capture
- * free-text replies during multi-step approval flows (e.g. agent naming).
- */
-export type MessageInterceptorFn = (event: InboundEvent) => Promise<boolean>;
-
-let messageInterceptor: MessageInterceptorFn | null = null;
-
-export function setMessageInterceptor(fn: MessageInterceptorFn): void {
-  messageInterceptor = fn;
-}
-
-/**
  * Channel-registration hook. Runs when the router sees a mention/DM on a
  * messaging group that has no wirings AND hasn't been denied. The hook is
  * expected to escalate to an owner (card, etc.) and arrange for future
@@ -156,10 +144,6 @@ function safeParseContent(raw: string): { text?: string; sender?: string; sender
  * Creates messaging group + session if they don't exist yet.
  */
 export async function routeInbound(event: InboundEvent): Promise<void> {
-  // Pre-route interceptor — lets modules consume messages before any routing
-  // (e.g. free-text replies during multi-step approval flows).
-  if (messageInterceptor && (await messageInterceptor(event))) return;
-
   // 0. Apply the adapter's thread policy. Non-threaded adapters (Telegram,
   //    WhatsApp, iMessage, email) collapse threads to the channel.
   const adapter = getChannelAdapter(event.channelType);
@@ -254,6 +238,87 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   // 3. Fetch wired agents in full (we already know the count is > 0; now
   //    we need their actual rows for fan-out).
   const agents = getMessagingGroupAgents(mg.id);
+
+  // 3a. Host interaction dispatch (pre-classifier). A host command that
+  //     called ctx.beginInteraction() owns the user's next inbounds on
+  //     `(channelType, platformId, threadId, userId)` until it
+  //     finishes / cancels / times out. Runs BEFORE both classifier
+  //     paths so an in-flight flow consumes even slash commands the
+  //     user types mid-flow. Adapter button responses arrive via
+  //     onAction, not as chat inbounds, so they bypass this entirely.
+  if (userId != null && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {
+    const key: HostInteractionKey = {
+      channelType: event.channelType,
+      platformId: event.platformId,
+      threadId: event.threadId,
+      userId,
+    };
+    const consumed = await deliverToActiveInteraction(key, event.message.content, event.message.kind);
+    if (consumed) {
+      log.info('Message routed to host interaction', { messagingGroupId: mg.id, userId });
+      return;
+    }
+  }
+
+  // 3b. Channel- and host-scoped command dispatch (pre-fanout).
+  //     FILTERED commands and host commands registered with scope ∈
+  //     {channel, host} are not per-agent — detect and act once at the
+  //     messaging-group level. 'agent'-scope host commands fall through
+  //     to the per-agent fan-out below, where they dispatch per
+  //     engaging agent. ADMIN_COMMANDS denial is also per-agent.
+  if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
+    const mgGate = classifyAtMessagingGroup(event.message.content, userId);
+    if (mgGate.action === 'filter') {
+      log.debug('Filtered command dropped by gate', { messagingGroupId: mg.id });
+      return;
+    }
+    if (mgGate.action === 'handle' || mgGate.action === 'deny') {
+      // Resolve an anchor session from the first wired agent. Outbound
+      // is just a queue feeding the channel adapter; any wired agent's
+      // session works as the queue location.
+      const anchor = agents[0];
+      const anchorGroup = getAgentGroup(anchor.agent_group_id);
+      if (!anchorGroup) {
+        log.warn('Host command anchor agent group missing — dropping', {
+          messagingGroupId: mg.id,
+          agentGroupId: anchor.agent_group_id,
+        });
+        return;
+      }
+      let effectiveSessionMode = anchor.session_mode;
+      if (adapter?.supportsThreads && effectiveSessionMode !== 'agent-shared' && mg.is_group !== 0) {
+        effectiveSessionMode = 'per-thread';
+      }
+      const { session } = resolveSession(anchor.agent_group_id, mg.id, event.threadId, effectiveSessionMode);
+      const deliveryAddr = event.replyTo ?? {
+        channelType: event.channelType,
+        platformId: event.platformId,
+        threadId: event.threadId,
+      };
+
+      if (mgGate.action === 'deny') {
+        deliverDirect(
+          deliveryAddr.channelType,
+          deliveryAddr.platformId,
+          deliveryAddr.threadId,
+          `Permission denied: ${mgGate.command} requires admin access.`,
+        );
+        log.info('Host command denied (anonymous)', { command: mgGate.command, messagingGroupId: mg.id });
+        return;
+      }
+
+      await dispatchHostCommand(mgGate, {
+        content: event.message.content,
+        userId,
+        messagingGroupId: mg.id,
+        sessionId: session.id,
+        anchorAgentGroupId: anchor.agent_group_id,
+        scope: mgGate.scope,
+        reply: deliveryAddr,
+      });
+      return;
+    }
+  }
 
   // 4. Fan-out: evaluate each wired agent independently against engage_mode,
   //    sender_scope, and access gate. An agent that engages gets its own
@@ -424,25 +489,43 @@ async function deliverToAgent(
     threadId: event.threadId,
   };
 
-  // Command gate: classify slash commands before they reach the container.
-  // Filtered commands are dropped silently. Denied admin commands get a
-  // permission-denied response written directly to messages_out.
-  if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
+  // Per-agent command gate. After this point we know we're talking to a
+  // specific engaged (or accumulating) agent.
+  //   - 'handle': 'agent'-scope host command. Dispatch against this
+  //     agent; do not write inbound, do not wake.
+  //   - 'deny':   ADMIN_COMMANDS denial (admin scope is per-agent).
+  //   - 'filter': caught pre-fanout. Defensive only.
+  //   - 'pass':   normal delivery.
+  // 'channel' / 'host' scope host commands were already dispatched
+  // pre-fanout; gateCommand returns 'pass' for them here.
+  if (wake && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {
     const gate = gateCommand(event.message.content, userId, agent.agent_group_id);
     if (gate.action === 'filter') {
-      log.debug('Filtered command dropped by gate', { agentGroupId: agent.agent_group_id });
+      log.debug('Filtered command (defensive — should have been caught pre-fanout)', {
+        agentGroupId: agent.agent_group_id,
+      });
       return;
     }
     if (gate.action === 'deny') {
-      writeOutboundDirect(session.agent_group_id, session.id, {
-        id: `deny-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        kind: 'chat',
-        platformId: deliveryAddr.platformId,
-        channelType: deliveryAddr.channelType,
-        threadId: deliveryAddr.threadId,
-        content: JSON.stringify({ text: `Permission denied: ${gate.command} requires admin access.` }),
-      });
+      deliverDirect(
+        deliveryAddr.channelType,
+        deliveryAddr.platformId,
+        deliveryAddr.threadId,
+        `Permission denied: ${gate.command} requires admin access.`,
+      );
       log.info('Admin command denied by gate', { command: gate.command, userId, agentGroupId: agent.agent_group_id });
+      return;
+    }
+    if (gate.action === 'handle') {
+      await dispatchHostCommand(gate, {
+        content: event.message.content,
+        userId,
+        messagingGroupId: mg.id,
+        sessionId: session.id,
+        anchorAgentGroupId: agent.agent_group_id,
+        scope: 'agent',
+        reply: deliveryAddr,
+      });
       return;
     }
   }
