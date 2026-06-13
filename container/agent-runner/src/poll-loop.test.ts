@@ -4,11 +4,18 @@ import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
-import { isCorruptionError } from './poll-loop.js';
+import {
+  isCorruptionError,
+  runPollLoop,
+  requestGracefulStop,
+  _resetGracefulStopForTesting,
+} from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
+import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 
 beforeEach(() => {
   initTestSessionDb();
+  _resetGracefulStopForTesting();
 });
 
 afterEach(() => {
@@ -376,6 +383,93 @@ describe('end-to-end with mock provider', () => {
     expect(outMessages).toHaveLength(1);
     expect(JSON.parse(outMessages[0].content).text).toBe('The answer is 4');
     expect(outMessages[0].in_reply_to).toBe('m1');
+  });
+});
+
+describe('graceful stop (SIGTERM soft stop)', () => {
+  function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+    return Promise.race([
+      p,
+      new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`timeout: ${label}`)), ms)),
+    ]);
+  }
+  async function waitFor(pred: () => boolean, ms = 2000): Promise<void> {
+    const start = Date.now();
+    while (!pred()) {
+      if (Date.now() - start > ms) throw new Error('waitFor timed out');
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
+
+  /** Provider whose turn stays open after the result (like a warm Claude turn
+   *  awaiting follow-ups) until end()/abort() — lets us prove abort-on-stop. */
+  function openTurnProvider(): { provider: AgentProvider; rec: { started: boolean; aborted: boolean } } {
+    const rec = { started: false, aborted: false };
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(): AgentQuery {
+        rec.started = true;
+        let aborted = false;
+        let release: (() => void) | null = null;
+        const events: AsyncIterable<ProviderEvent> = {
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'init', continuation: 'sess-graceful' };
+            yield { type: 'result', text: 'reply' };
+            while (!aborted) {
+              await new Promise<void>((r) => {
+                release = r;
+              });
+            }
+          },
+        };
+        return {
+          push() {},
+          end() {
+            aborted = true;
+            release?.();
+          },
+          abort() {
+            aborted = true;
+            rec.aborted = true;
+            release?.();
+          },
+          events,
+        };
+      },
+    };
+    return { provider, rec };
+  }
+
+  it('exits the poll loop cleanly when idle (no in-flight query)', async () => {
+    const { provider } = openTurnProvider();
+    const loop = runPollLoop({ provider, providerName: 'mock', cwd: '/tmp', systemContext: {} });
+    // No pending messages → loop is idle-polling. Request stop mid-idle.
+    await new Promise((r) => setTimeout(r, 30));
+    requestGracefulStop();
+    await withTimeout(loop, 3000, 'idle graceful exit'); // resolves, does not hang
+  });
+
+  it('aborts an in-flight turn and marks the batch complete before exiting', async () => {
+    insertMessage('g1', 'chat', { sender: 'User', text: 'hello' });
+    const { provider, rec } = openTurnProvider();
+    const loop = runPollLoop({ provider, providerName: 'mock', cwd: '/tmp', systemContext: {} });
+
+    // Wait until the turn is active (query created → currentQuery set).
+    await waitFor(() => rec.started);
+
+    requestGracefulStop();
+    await withTimeout(loop, 3000, 'in-flight graceful exit');
+
+    // The active query was aborted (not torn), and the claimed message was
+    // marked complete (processing_ack='completed' in outbound.db) by the loop's
+    // finally before it returned — not left dangling as 'processing'.
+    expect(rec.aborted).toBe(true);
+    const ack = getOutboundDb().prepare("SELECT status FROM processing_ack WHERE message_id = 'g1'").get() as {
+      status: string;
+    };
+    expect(ack?.status).toBe('completed');
+    expect(getPendingMessages()).toHaveLength(0);
   });
 });
 

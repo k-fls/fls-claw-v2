@@ -2,7 +2,7 @@
  * Container runtime abstraction for NanoClaw.
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
  */
-import { execSync } from 'child_process';
+import { exec, execSync } from 'child_process';
 import os from 'os';
 
 import { CONTAINER_INSTALL_LABEL } from './config.js';
@@ -25,12 +25,40 @@ export function readonlyMountArgs(hostPath: string, containerPath: string): stri
   return ['-v', `${hostPath}:${containerPath}:ro`];
 }
 
-/** Stop a container by name. Uses execFileSync to avoid shell injection. */
-export function stopContainer(name: string): void {
+function assertValidContainerName(name: string): void {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name)) {
     throw new Error(`Invalid container name: ${name}`);
   }
-  execSync(`${CONTAINER_RUNTIME_BIN} stop -t 1 ${name}`, { stdio: 'pipe' });
+}
+
+/**
+ * Stop a container by name, synchronously. `docker stop -t <grace>` sends
+ * SIGTERM, waits up to `graceSeconds`, then SIGKILL. Default 1s is the fast
+ * path for genuinely-stuck containers (they won't honor a graceful abort
+ * anyway). Synchronous — blocks the event loop up to `graceSeconds`, so use
+ * `stopContainerGraceful` (async) for any grace > 1s.
+ */
+export function stopContainer(name: string, graceSeconds = 1): void {
+  assertValidContainerName(name);
+  execSync(`${CONTAINER_RUNTIME_BIN} stop -t ${graceSeconds} ${name}`, { stdio: 'pipe' });
+}
+
+/**
+ * Async, non-blocking `docker stop -t <grace>` — for graceful eviction /
+ * shutdown, where Docker waits up to `graceSeconds` for the container's SIGTERM
+ * handler to wind down the current turn (abort the in-flight query, mark rows
+ * complete, flush the transcript) before SIGKILL. Resolves when `docker stop`
+ * returns; rejects on error so the caller can SIGKILL-fallback.
+ */
+export function stopContainerGraceful(name: string, graceSeconds: number): Promise<void> {
+  assertValidContainerName(name);
+  return new Promise((resolve, reject) => {
+    exec(
+      `${CONTAINER_RUNTIME_BIN} stop -t ${graceSeconds} ${name}`,
+      { timeout: (graceSeconds + 5) * 1000 },
+      (err) => (err ? reject(err) : resolve()),
+    );
+  });
 }
 
 /** Ensure the container runtime is running, starting it if needed. */

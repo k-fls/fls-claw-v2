@@ -38,6 +38,20 @@ export const ONECLI_API_KEY = process.env.ONECLI_API_KEY || envConfig.ONECLI_API
 export const MAX_MESSAGES_PER_PROMPT = Math.max(1, parseInt(process.env.MAX_MESSAGES_PER_PROMPT || '10', 10) || 10);
 export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min default — how long to keep container alive after last result
 export const MAX_CONCURRENT_CONTAINERS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5);
+// Demand-driven eviction (group-queue port). A warm (idle) container holds a
+// concurrency slot; under cap pressure the oldest-idle one is evicted to make
+// room. IDLE_BEFORE_EVICT protects a freshly-idle container from preemption;
+// EVICTION_TIMEOUT is the no-demand backstop (the sweep reaps a heartbeat-stale,
+// claim-free container after this even with no pressure). See
+// docs/fls/migration-analysis/d-queue-concurrency-risks.md.
+export const IDLE_BEFORE_EVICT = parseInt(process.env.IDLE_BEFORE_EVICT || '600000', 10); // 10min protection window
+export const EVICTION_TIMEOUT = parseInt(process.env.EVICTION_TIMEOUT || '14400000', 10); // 4h idle backstop
+// Grace window (ms, like the knobs above) for a graceful container stop —
+// eviction + host shutdown. Docker sends SIGTERM, waits this long for the
+// agent-runner to abort its in-flight turn + flush, then SIGKILL. Converted to
+// integer seconds at the single `docker stop -t` boundary. Stuck-container
+// kills ignore this and use the fast 1s path.
+export const GRACEFUL_STOP_MS = Math.max(2000, parseInt(process.env.GRACEFUL_STOP_MS || '10000', 10) || 10000);
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

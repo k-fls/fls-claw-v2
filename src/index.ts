@@ -16,6 +16,7 @@ import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runti
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { routeInbound } from './router.js';
+import { shutdownContainers } from './container-runner.js';
 import { log } from './log.js';
 import { enforceUpgradeTripwire } from './upgrade-state.js';
 
@@ -197,6 +198,10 @@ async function shutdown(signal: string): Promise<void> {
   }
   stopDeliveryPolls();
   stopHostSweep();
+  // Best-effort kill of live containers (latches the admission queue shut so
+  // nothing respawns mid-teardown). Containers are DB-durable; a kill mid-turn
+  // resets the message to pending for the next boot.
+  await shutdownContainers();
   await stopCliServer();
   try {
     await teardownChannelAdapters();

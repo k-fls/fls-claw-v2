@@ -45,7 +45,8 @@ import {
 } from './db/session-db.js';
 import { log } from './log.js';
 import { openInboundDb, openOutboundDb, openOutboundDbRw, inboundDbPath, heartbeatPath } from './session-manager.js';
-import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
+import { isContainerRunning, killContainer, recordContainerLiveness, wakeContainer } from './container-runner.js';
+import { EVICTION_TIMEOUT } from './config.js';
 import type { Session } from './types.js';
 
 /**
@@ -60,10 +61,14 @@ export function parseSqliteUtc(s: string): number {
 }
 
 const SWEEP_INTERVAL_MS = 60_000;
-// Absolute idle ceiling for a running container. If the heartbeat file hasn't
-// been touched in this long, the container is either stuck or doing genuinely
-// nothing — kill and restart on the next inbound.
-export const ABSOLUTE_CEILING_MS = 30 * 60 * 1000;
+// Idle backstop for a running container. If the heartbeat file hasn't been
+// touched in this long (and no message is claimed — that's the separate
+// claim-stuck path), the container is genuinely idle and gets reaped even with
+// no demand pressure. The *common* idle case is handled earlier and faster by
+// demand-driven eviction (container-queue.ts); this is just the no-demand
+// backstop, so it's the long EVICTION_TIMEOUT (4h), not a short flat reap —
+// warm containers stay warm for fast follow-ups. (D-b; group-queue port.)
+export const ABSOLUTE_CEILING_MS = EVICTION_TIMEOUT;
 // Stuck tolerance window applied per 'processing' claim — "did we see any
 // signs of life since this message was claimed?"
 export const CLAIM_STUCK_MS = 60 * 1000;
@@ -242,11 +247,19 @@ function enforceRunningContainerSla(
   session: Session,
   agentGroupId: string,
 ): void {
+  const hbMtimeMs = heartbeatMtimeMs(agentGroupId, session.id);
+  const claims = getProcessingClaims(outDb);
+
+  // Feed the admission queue's eviction selector: idle = heartbeat-stale, and
+  // a claim means mid-turn (not evictable). At most one sweep-interval stale,
+  // well inside the IDLE_BEFORE_EVICT protection window.
+  recordContainerLiveness(session.id, hbMtimeMs, claims.length > 0);
+
   const decision = decideStuckAction({
     now: Date.now(),
-    heartbeatMtimeMs: heartbeatMtimeMs(agentGroupId, session.id),
+    heartbeatMtimeMs: hbMtimeMs,
     containerState: getContainerState(outDb),
-    claims: getProcessingClaims(outDb),
+    claims,
   });
 
   if (decision.action === 'ok') return;
