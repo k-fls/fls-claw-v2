@@ -62,6 +62,10 @@ import './modules/index.js';
 // CLI command barrel — populates the `ncl` registry before the CLI server
 // accepts connections.
 import './cli/commands/index.js';
+
+// Top-level host commands. Side-effect registration.
+import './commands/agent-runtime.js'; // /agent-runtime (F2)
+import { startRuntimeUpdaters, stopRuntimeUpdaters } from './modules/runtime-updater/index.js';
 import './cli/delivery-action.js';
 import { startCliServer, stopCliServer } from './cli/socket-server.js';
 
@@ -105,6 +109,11 @@ async function main(): Promise<void> {
   // Snapshot the container/ tree so in-flight containers don't see mid-run
   // host edits. Must precede router/sweep/delivery — they can wake containers.
   initSnapshot();
+
+  // Runtime-CLI auto-update schedulers (F2). Fire-and-forget: a configured
+  // cadence may trigger a multi-minute `npm install`, which must not block boot.
+  // No-op for providers with no configured cadence (the common case).
+  void startRuntimeUpdaters();
 
   // 2b. Host-RPC server — containers reach it over the bridge network.
   // Started after the network exists so the bind is meaningful.
@@ -214,6 +223,7 @@ async function shutdown(signal: string): Promise<void> {
       log.error('Shutdown callback threw', { err });
     }
   }
+  stopRuntimeUpdaters();
   stopDeliveryPolls();
   stopHostSweep();
   // Best-effort kill of live containers (latches the admission queue shut so

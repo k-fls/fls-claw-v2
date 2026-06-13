@@ -26,7 +26,9 @@ import {
 } from './config.js';
 import { ContainerQueue, type EvictionCandidate } from './container-queue.js';
 import { getSession } from './db/sessions.js';
-import { materializeContainerJson } from './container-config.js';
+import { materializeContainerJson, resolveProviderName } from './container-config.js';
+// Re-exported for back-compat: `resolveProviderName` moved to container-config.
+export { resolveProviderName };
 import { getContainerConfig } from './db/container-configs.js';
 import { updateContainerConfigScalars, updateContainerConfigJson } from './db/container-configs.js';
 import {
@@ -63,6 +65,7 @@ import {
   type ProviderContainerContribution,
   type VolumeMount,
 } from './providers/provider-container-registry.js';
+import { markCliVersionInUse, releaseCliVersionInUse } from './modules/runtime-updater/index.js';
 import {
   heartbeatPath,
   markContainerRunning,
@@ -336,7 +339,7 @@ async function spawnContainer(session: Session): Promise<void> {
   // Resolve the effective provider + any host-side contribution it declares
   // (extra mounts, env passthrough). Computed once and threaded through both
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
-  const { provider, contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
+  const { provider, contribution, cliVersion } = resolveProviderContribution(session, agentGroup, containerConfig);
 
   // Per-agent-group dynamic contributions. Callbacks run sync; any throw
   // is wrapped in FatalSpawnError by the registry and propagates up to
@@ -376,6 +379,7 @@ async function spawnContainer(session: Session): Promise<void> {
     if (exited) return false;
     exited = true;
     activeContainers.delete(session.id);
+    releaseCliVersionInUse(session.id);
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
     killedSessions.delete(session.id);
@@ -391,6 +395,15 @@ async function spawnContainer(session: Session): Promise<void> {
     queue.onExit(session.id);
     return true;
   };
+
+  // Record the concrete CLI version as in-use BEFORE the first await that
+  // precedes the actual mount (buildContainerArgs / spawn). This closes the
+  // TOCTOU window against a concurrent `/agent-runtime remove`: once committed
+  // to mounting a version, it's marked, so canRemoveVersion refuses it. Release
+  // is handled by fireExitOnce (wired above) on every exit/spawn-error path.
+  // (A `latest` selection resolved earlier and then deleted before this point
+  // simply re-resolves to a still-present version — no broken mount.)
+  if (cliVersion) markCliVersionInUse(session.id, provider, cliVersion);
 
   let args: string[];
   try {
@@ -508,22 +521,6 @@ export function killContainer(
   }
 }
 
-/**
- * Resolve the provider name for a session:
- *
- *   sessions.agent_provider
- *     → container_configs.provider
- *     → 'claude'
- *
- * Pure so the precedence can be unit-tested without a DB or filesystem.
- */
-export function resolveProviderName(
-  sessionProvider: string | null | undefined,
-  containerConfigProvider: string | null | undefined,
-): string {
-  return (sessionProvider || containerConfigProvider || 'claude').toLowerCase();
-}
-
 function resolveProviderContribution(
   session: Session,
   agentGroup: AgentGroup,
@@ -547,7 +544,9 @@ function resolveProviderContribution(
   // credential substitutes, runtime-updater's CLI-version mount, …). Capability
   // layers add a call to that merge, so this resolver stays agnostic. Here we
   // split the spawn-facing env/mounts from the host-only `cliVersion` (in-use
-  // bookkeeping) — the one place that split lives.
+  // bookkeeping) — the one place that split lives. The runtime-updater
+  // contributor derives its version selection from `agentProvider` /
+  // `providerVersion` and reports the concrete `cliVersion` it mounted.
   if (input.runtime) {
     const { env, mounts, cliVersion } = input.runtime.containerContribution({
       agentGroupId: input.agentGroupId,

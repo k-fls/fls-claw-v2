@@ -45,22 +45,83 @@ export interface ContainerConfig {
   effort?: string;
   /**
    * Selected agent-runtime CLI version, parsed from the `provider` identity
-   * string's `:version` suffix (e.g. `claude:2.1.154` → `2.1.154`). Undefined
-   * for a bare provider. The runtime-updater resolves it to a host-installed
-   * CLI mount at spawn. Shared config field (the resolver builds the
-   * ContributionInput from it); updater reads it.
+   * string's `:version` suffix (e.g. `claude:2.1.154` → `2.1.154`,
+   * `claude:latest` → `latest`). Undefined for a bare provider (→ default =
+   * latest). The runtime resolves it to a host-installed CLI mount at spawn;
+   * a group admin sets it via `/agent-runtime select`. See F2.
    */
   providerVersion?: string;
   /**
-   * Per-group agent-runtime configuration — an opaque-to-the-framework config
-   * dict (hence `unknown` values). The runtime's `AGENT_RUNTIME` extension
-   * validates it via `parseRuntimeConfig`; the framework only stores/forwards.
+   * Per-group agent-runtime configuration — a config dict whose
+   * per-runtime *shape* is opaque to the framework (hence `unknown` values).
+   * Authored like the other per-group settings (provider/model/packages) and,
+   * once wired, persisted in `container_configs` + materialized here. The
+   * runtime's `AGENT_RUNTIME` extension validates it via `parseRuntimeConfig`;
+   * the framework only stores and forwards it. `{}`/`undefined` for `claude`
+   * and other runtimes with no per-group choice; e.g. OpenCode would carry
+   * `{ providers: ["anthropic", "deepseek"], ... }`. DB persistence lands with
+   * the first runtime that needs it; until then this is unset.
    */
   runtimeConfig?: Record<string, unknown>;
 }
 
+/** A parsed agent-runtime identity string: provider id + optional CLI version. */
+export interface ProviderSpec {
+  /** Provider id, lowercased (e.g. 'claude'). */
+  id: string;
+  /** Selected CLI version (`2.1.154` | `latest`), or undefined for the default. */
+  version?: string;
+}
+
+/**
+ * Parse an agent-runtime identity string `id[:version]` (e.g. `claude:2.1.154`,
+ * `claude:latest`, `claude`) into its parts. The id is lowercased; an empty or
+ * missing version is dropped (→ default = latest).
+ */
+export function parseProviderSpec(raw: string): ProviderSpec {
+  const idx = raw.indexOf(':');
+  if (idx === -1) return { id: raw.toLowerCase() };
+  const version = raw.slice(idx + 1).trim();
+  const id = raw.slice(0, idx).toLowerCase();
+  return version ? { id, version } : { id };
+}
+
+/**
+ * Resolve the provider id + version for a session:
+ *
+ *   sessions.agent_provider
+ *     → container_configs.provider
+ *     → 'claude'
+ *
+ * The winning identity string defines BOTH id and `:version` (a session
+ * override replaces the group's selection wholesale). Pure so the precedence
+ * can be unit-tested without a DB or filesystem.
+ */
+export function resolveProviderSpec(
+  sessionProvider: string | null | undefined,
+  containerConfigProvider: string | null | undefined,
+): ProviderSpec {
+  return parseProviderSpec(sessionProvider || containerConfigProvider || 'claude');
+}
+
+/**
+ * Resolve just the provider id (version suffix stripped). Lives here (not in
+ * container-runner) so callers that only need the name — e.g. the wake-time
+ * credential gate — don't pull in the container-spawn module.
+ */
+export function resolveProviderName(
+  sessionProvider: string | null | undefined,
+  containerConfigProvider: string | null | undefined,
+): string {
+  return resolveProviderSpec(sessionProvider, containerConfigProvider).id;
+}
+
 /** Build a `ContainerConfig` from a DB row + agent group identity. */
 export function configFromDb(row: ContainerConfigRow, group: AgentGroup): ContainerConfig {
+  // `provider` may carry a `:version` suffix (e.g. `claude:2.1.154`). Split it:
+  // the bare id stays in `provider` (container.json / container-side / id
+  // lookups expect the id), the version surfaces separately.
+  const spec = row.provider ? parseProviderSpec(row.provider) : undefined;
   return {
     mcpServers: JSON.parse(row.mcp_servers) as Record<string, McpServerConfig>,
     packages: {
@@ -70,7 +131,8 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     imageTag: row.image_tag ?? undefined,
     additionalMounts: JSON.parse(row.additional_mounts) as AdditionalMountConfig[],
     skills: JSON.parse(row.skills) as string[] | 'all',
-    provider: row.provider ?? undefined,
+    provider: spec?.id,
+    providerVersion: spec?.version,
     groupName: group.name,
     assistantName: row.assistant_name ?? group.name,
     agentGroupId: group.id,

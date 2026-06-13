@@ -1,23 +1,19 @@
 /**
- * Claude credential provider — baseline (credentials layer).
+ * Claude credential provider — runtime-updater layer.
  *
- * Founds the claude credential-provider registration plus a **non-mitm**
- * container contribution: a custom Anthropic-compatible endpoint is wired via
- * env (`ANTHROPIC_BASE_URL` + a placeholder bearer that the credential proxy
- * rewrites on the wire); the standard api.anthropic.com path needs nothing here.
+ * Baseline (credentials) founds the registration + a non-mitm env contribution
+ * (`baseUrlContributor`). runtime-updater adds the CLI version system as an
+ * ADDITIVE contributor (`runtimeCliMount`) plus the RUNTIME_UPDATER extension —
+ * it does NOT rewrite the base body. mitm-proxy separately adds its own
+ * credential-substitute contributor + extensions. Each layer is one extra call
+ * in the `containerContribution` merge, so sibling branches compose cleanly.
  *
- * Capability layers EXTEND this provider ADDITIVELY — they do not rewrite the
- * bodies here. Each is a pure `ContainerContributor` added as one call to the
- * `containerContribution` merge, plus its own extension, so sibling branches
- * merge cleanly:
- *   - mitm-proxy: a contributor minting token-engine substitutes; +
- *     `ext.set(ACQUIRE/REAUTH/CONTAINER_FEEDBACK, …)` + the `substitutes` spec.
- *   - runtime-updater: a contributor mounting the selected CLI version (reads
- *     `ctx.agentProvider` / `ctx.providerVersion`, reports the concrete
- *     `cliVersion`); + `ext.set(RUNTIME_UPDATER, …)`.
  * `mergeContributions` folds the calls: env keys union (later wins), mounts
  * concatenate, first non-null cliVersion wins.
  */
+import fs from 'fs';
+import path from 'path';
+
 import {
   registerCredentialProvider,
   mergeContributions,
@@ -25,10 +21,13 @@ import {
   noManifestSideEffect,
   ExtensionBag,
   AGENT_RUNTIME,
+  RUNTIME_UPDATER,
   type AgentRuntimeExt,
   type ContainerContributor,
   type CredentialProvider,
 } from '../modules/credentials/index.js';
+import { RuntimeCliUpdater, resolveSelectedVersion } from '../modules/runtime-updater/index.js';
+import { parseProviderSpec } from '../container-config.js';
 import { readEnvFile } from '../env.js';
 
 const PROVIDER_ID = 'claude';
@@ -80,6 +79,46 @@ const baseUrlContributor: ContainerContributor = () => {
   return { env };
 };
 
+const claudeRuntimeUpdater = new RuntimeCliUpdater({
+  providerId: PROVIDER_ID,
+  label: 'Claude Code',
+  packageName: '@anthropic-ai/claude-code',
+});
+
+const CLI_MOUNT_DIR = '/opt/runtime-cli/claude';
+const CLI_ENTRY = `${CLI_MOUNT_DIR}/node_modules/.bin/claude`;
+const CLI_BAKED_PATH = '/pnpm/claude';
+
+/**
+ * runtime-updater container contribution: mount the selected CLI version. The
+ * selection rides the provider identity's `:version` suffix (session override
+ * replaces the group's wholesale), so it's derived here from `ctx.agentProvider`
+ * / `ctx.providerVersion`. Empty slice when no version is active (default /
+ * 'latest' with nothing fetched). When active, adds two RO mounts — the package
+ * dir at CLI_MOUNT_DIR and a wrapper over /pnpm/claude that execs the mounted bin
+ * shim, so the updated binary is the single source of truth for both the SDK and
+ * any direct caller — and reports the concrete `cliVersion` so the caller can
+ * record this spawn as holding it (deletion safety).
+ */
+const runtimeCliMount: ContainerContributor = (ctx) => {
+  const selection = ctx.agentProvider ? parseProviderSpec(ctx.agentProvider).version : ctx.providerVersion;
+  const version = resolveSelectedVersion(claudeRuntimeUpdater, selection);
+  const dir = version ? claudeRuntimeUpdater.installedDir(version) : null;
+  if (!version || !dir) return {};
+
+  const wrapperPath = path.join(ctx.sessionDir, '.claude-cli', 'claude');
+  fs.mkdirSync(path.dirname(wrapperPath), { recursive: true });
+  fs.writeFileSync(wrapperPath, `#!/bin/sh\nexec ${CLI_ENTRY} "$@"\n`, { mode: 0o755 });
+
+  return {
+    mounts: [
+      { hostPath: dir, containerPath: CLI_MOUNT_DIR, readonly: true },
+      { hostPath: wrapperPath, containerPath: CLI_BAKED_PATH, readonly: true },
+    ],
+    cliVersion: version,
+  };
+};
+
 const agentRuntime: AgentRuntimeExt = {
   // Merge the set of contributor calls into the container shape. A capability
   // layer adds one call to this list (it does not rewrite the body); object in,
@@ -87,8 +126,8 @@ const agentRuntime: AgentRuntimeExt = {
   containerContribution: (ctx) =>
     mergeContributions([
       baseUrlContributor(ctx),
-      // mitm-proxy adds:      credentialSubstitutes(ctx),
-      // runtime-updater adds: runtimeCliMount(ctx),
+      runtimeCliMount(ctx),
+      // mitm-proxy adds: credentialSubstitutes(ctx),
     ]),
   // Claude is only required when the runtime actually talks to Anthropic. A
   // group repointed at a custom endpoint (e.g. Ollama via ANTHROPIC_BASE_URL)
@@ -105,7 +144,7 @@ const agentRuntime: AgentRuntimeExt = {
 };
 
 export function registerClaudeCredentialProvider(): void {
-  const ext = new ExtensionBag().set(AGENT_RUNTIME, agentRuntime);
+  const ext = new ExtensionBag().set(AGENT_RUNTIME, agentRuntime).set(RUNTIME_UPDATER, claudeRuntimeUpdater);
   const provider: CredentialProvider = {
     id: PROVIDER_ID,
     buildManifest: defaultManifestBuilder(PROVIDER_ID),
