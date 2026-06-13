@@ -89,6 +89,25 @@ export class BeginInteractionConflictError extends Error {
   }
 }
 
+/**
+ * The full parameter set `beginInteraction` needs, bundled so a non-command
+ * caller can open an interaction without a `HostCommandContext` — e.g. a
+ * credential provider reacting to a missing credential at wake time. The
+ * slash-command path keeps using `HostCommandContext.beginInteraction`.
+ */
+export interface InteractionOrigin {
+  key: HostInteractionKey;
+  agentGroupId: string | null;
+  messagingGroupId: string;
+  replyAddr: DeliveryAddress;
+  writeReply: (text: string) => void;
+}
+
+/** Begin an interaction from a bundled {@link InteractionOrigin}. */
+export function beginInteractionOn(origin: InteractionOrigin, opts: BeginInteractionOptions): void {
+  beginInteraction(origin.key, origin.agentGroupId, origin.messagingGroupId, origin.replyAddr, origin.writeReply, opts);
+}
+
 // ── Internals ──
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
