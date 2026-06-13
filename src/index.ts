@@ -13,6 +13,7 @@ import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { ensureContainerNetwork, initSnapshot } from './modules/container-bootstrap/index.js';
+import { startHostRpcServer } from './modules/host-rpc/index.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
@@ -97,6 +98,10 @@ async function main(): Promise<void> {
   // Snapshot the container/ tree so in-flight containers don't see mid-run
   // host edits. Must precede router/sweep/delivery — they can wake containers.
   initSnapshot();
+
+  // 2b. Host-RPC server — containers reach it over the bridge network.
+  // Started after the network exists so the bind is meaningful.
+  await startHostRpcServer();
 
   // 3. Channel adapters
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
