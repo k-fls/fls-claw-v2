@@ -9,6 +9,8 @@ import path from 'path';
 
 import { OneCLI } from '@onecli-sh/sdk';
 
+import { type AgentGroupContribution, invokeAgentGroupContributions } from './agent-group-contributions.js';
+import { FatalSpawnError, isSpawnPoisoned, markSpawnPoisoned } from './spawn-failure.js';
 import {
   CONTAINER_IMAGE,
   CONTAINER_IMAGE_BASE,
@@ -77,16 +79,30 @@ export function isContainerRunning(sessionId: string): boolean {
  *
  * The container runs the v2 agent-runner which polls the session DB.
  *
- * Contract: never throws. Returns `true` on successful spawn, `false` on
- * transient spawn failure (e.g. OneCLI gateway unreachable). Callers don't
- * need to wrap — the inbound row stays pending and host-sweep retries on
- * its next tick. Callers that care (e.g. the router's typing indicator)
- * can branch on the boolean.
+ * Contract:
+ *   - returns `true` on successful spawn;
+ *   - returns `false` on **retryable** failure (e.g. OneCLI gateway
+ *     unreachable) — the inbound row stays pending and host-sweep wakes
+ *     again on its next tick, no user notification;
+ *   - returns `false` (without spawning) when the session is currently
+ *     marked spawn-poisoned by a prior non-retryable failure;
+ *   - **throws `FatalSpawnError`** on a non-retryable failure (e.g. a
+ *     registered agent-group contribution rejected the spawn). The
+ *     session is also marked poisoned so subsequent wakes are no-ops
+ *     until something clears the flag (the router clears it when the
+ *     user sends another inbound). Callers that hold channel context
+ *     (the router) should catch `FatalSpawnError` and report it to the
+ *     user via `deliverDirect`; callers that don't (host-sweep,
+ *     notifyAgent's internal wake) should `.catch()` and log only.
  */
 export function wakeContainer(session: Session): Promise<boolean> {
   if (activeContainers.has(session.id)) {
     log.debug('Container already running', { sessionId: session.id });
     return Promise.resolve(true);
+  }
+  if (isSpawnPoisoned(session.id)) {
+    log.debug('Container spawn poisoned — skipping wake', { sessionId: session.id });
+    return Promise.resolve(false);
   }
   const existing = wakePromises.get(session.id);
   if (existing) {
@@ -96,7 +112,11 @@ export function wakeContainer(session: Session): Promise<boolean> {
   const promise = spawnContainer(session)
     .then(() => true)
     .catch((err) => {
-      log.warn('wakeContainer failed — host-sweep will retry', { sessionId: session.id, err });
+      log.error('wakeContainer: spawn failed', { sessionId: session.id, err });
+      if (err instanceof FatalSpawnError) {
+        markSpawnPoisoned(session.id);
+        throw err;
+      }
       return false;
     })
     .finally(() => {
@@ -132,7 +152,17 @@ async function spawnContainer(session: Session): Promise<void> {
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
   const { provider, contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
 
-  const mounts = buildMounts(agentGroup, session, containerConfig, contribution);
+  // Per-agent-group dynamic contributions. Callbacks run sync; any throw
+  // is wrapped in FatalSpawnError by the registry and propagates up to
+  // wakeContainer's catch, where it marks the session poisoned and
+  // re-throws so the caller (router) can notify the user.
+  const groupContribution: AgentGroupContribution = invokeAgentGroupContributions({
+    agentGroup,
+    session,
+    hostEnv: process.env,
+  });
+
+  const mounts = buildMounts(agentGroup, session, containerConfig, contribution, groupContribution);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
@@ -144,6 +174,7 @@ async function spawnContainer(session: Session): Promise<void> {
     containerConfig,
     provider,
     contribution,
+    groupContribution,
     agentIdentifier,
   );
 
@@ -245,6 +276,7 @@ function buildMounts(
   session: Session,
   containerConfig: import('./container-config.js').ContainerConfig,
   providerContribution: ProviderContainerContribution,
+  groupContribution: AgentGroupContribution,
 ): VolumeMount[] {
   const projectRoot = process.cwd();
 
@@ -332,6 +364,14 @@ function buildMounts(
     mounts.push(...providerContribution.mounts);
   }
 
+  // Agent-group dynamic contributions (e.g. group-oauth proxy CA cert,
+  // ssh-auth socket mount). Validation already happened inside the
+  // contribution callback's domain; mount-security only governs the
+  // static container.json additionalMounts above.
+  if (groupContribution.mounts) {
+    mounts.push(...groupContribution.mounts);
+  }
+
   return mounts;
 }
 
@@ -404,6 +444,7 @@ async function buildContainerArgs(
   containerConfig: import('./container-config.js').ContainerConfig,
   provider: string,
   providerContribution: ProviderContainerContribution,
+  groupContribution: AgentGroupContribution,
   agentIdentifier?: string,
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
@@ -415,6 +456,13 @@ async function buildContainerArgs(
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
     for (const [key, value] of Object.entries(providerContribution.env)) {
+      args.push('-e', `${key}=${value}`);
+    }
+  }
+
+  // Agent-group dynamic env (e.g. group-oauth proxy URLs / cert paths).
+  if (groupContribution.env) {
+    for (const [key, value] of Object.entries(groupContribution.env)) {
       args.push('-e', `${key}=${value}`);
     }
   }
