@@ -30,6 +30,8 @@ import type { Server as NetServer } from 'net';
 import { lookupContainerIP } from '../container-bootstrap/index.js';
 import { getAllCredentialProviders, getCredentialProvider } from '../credentials/providers/registry.js';
 
+import { type CredentialBroker, getCredentialBrokers } from './broker-registry.js';
+import { getBrokerRouting, hasAnyBrokerRouting } from './broker-routing.js';
 import { isMultiLabelHost } from './domain.js';
 import { logger } from './logger.js';
 import { createMitmContext, type MitmContext } from './mitm-ca.js';
@@ -171,6 +173,18 @@ export interface CredentialProxyOptions {
 function normalizeIP(raw: string): string {
   if (raw.startsWith('::ffff:')) return raw.slice(7);
   return raw;
+}
+
+/**
+ * Match a host against an overtake host-pattern target: exact, or a
+ * registrable-suffix (`stripe.com` matches `api.stripe.com`). Both lowercased.
+ * (Provider-id overtake targets are matched separately, against the request's
+ * native rule provenance.)
+ */
+function hostMatchesPattern(host: string, target: string): boolean {
+  const h = host.toLowerCase();
+  const t = target.toLowerCase();
+  return h === t || h.endsWith(`.${t}`);
 }
 
 type HeaderMap = Record<string, string | number | string[] | undefined>;
@@ -441,7 +455,28 @@ export class CredentialProxy {
         res.end('Internal error');
         return;
       }
-      const rule = this.findMatchingRule(meta.targetHost, req.url || '/', meta.sourceIP);
+      const urlPath = req.url || '/';
+
+      // Broker tier first: a delegated broker overtakes the native provider
+      // (covered space) and handles the catch-all (uncovered space). When a
+      // broker is routed it is the terminal owner — fail closed on error, never
+      // silently fall through to native/pipe (spec §3b).
+      const broker = this.resolveBrokerRoute(meta.sourceIP, meta.targetHost, urlPath);
+      if (broker) {
+        meta.checkExclusion?.(null); // broker traffic isn't a credential-provider match
+        broker
+          .tryForward(req, res, meta.targetHost, meta.targetPort, meta.scope, meta.sourceIP)
+          .catch((err: unknown) => {
+            logger.error({ err, brokerId: broker.id, host: meta.targetHost }, 'broker tryForward failed — fail closed');
+            if (!res.headersSent) {
+              res.writeHead(502);
+              res.end('Bad Gateway');
+            }
+          });
+        return;
+      }
+
+      const rule = this.findMatchingRule(meta.targetHost, urlPath, meta.sourceIP);
 
       // Resolve tap exclusion: tell the tap callback which provider matched
       meta.checkExclusion?.(rule?.providerId ?? null);
@@ -722,12 +757,59 @@ export class CredentialProxy {
    */
   shouldIntercept(targetHost: string, ip?: string): boolean {
     const host = targetHost.toLowerCase();
-    if (CredentialProxy.findAnchorRulesIn(this.anchorRules, host)) return true;
-    if (ip) {
-      const cm = this.containerRules.get(normalizeIP(ip));
-      if (CredentialProxy.findAnchorRulesIn(cm, host)) return true;
+    const providerCovered =
+      !!CredentialProxy.findAnchorRulesIn(this.anchorRules, host) ||
+      (ip ? !!CredentialProxy.findAnchorRulesIn(this.containerRules.get(normalizeIP(ip)), host) : false);
+    if (providerCovered) return true;
+    // Not provider-covered: a delegated broker may still want this host —
+    // catch-all (uncovered space), or an overtake host-pattern. (An overtake
+    // by provider-id would already be providerCovered above.)
+    if (ip && this.brokerInterceptsHost(host, ip)) return true;
+    return false;
+  }
+
+  /**
+   * Host-level broker interception (no path yet — CONNECT/transparent time).
+   * Only consulted when no provider covers the host, so any catch-all broker
+   * claims it, as does an overtake **host-pattern** match.
+   */
+  private brokerInterceptsHost(host: string, ip: string): boolean {
+    const routed = getBrokerRouting(normalizeIP(ip));
+    for (const r of routed) {
+      if (r.catchAll) return true;
+      if (r.overtake.some((t) => hostMatchesPattern(host, t))) return true;
     }
     return false;
+  }
+
+  /**
+   * Resolve which broker (if any) should handle a request, path-aware. Used by
+   * the dispatcher; a broker route overtakes the native provider. Precedence:
+   * brokers in registry (priority) order; for each, its routing snapshot entry
+   * matches when an overtake target matches (a provider-id the request's native
+   * rule belongs to, or a host pattern) OR catch-all applies to an uncovered
+   * request. Returns null when no broker is routed (the common case — cheap
+   * `hasAnyBrokerRouting` gate first).
+   */
+  resolveBrokerRoute(ip: string, host: string, urlPath: string): CredentialBroker | null {
+    if (!hasAnyBrokerRouting()) return null;
+    const routed = getBrokerRouting(normalizeIP(ip));
+    if (routed.length === 0) return null;
+
+    const lcHost = host.toLowerCase();
+    const nativeRule = this.findMatchingRule(host, urlPath, ip);
+    const providerCovered = nativeRule !== null;
+
+    for (const broker of getCredentialBrokers()) {
+      const entry = routed.find((r) => r.brokerId === broker.id);
+      if (!entry) continue;
+      const overtakes = entry.overtake.some(
+        (t) => (nativeRule !== null && nativeRule.providerId === t) || hostMatchesPattern(lcHost, t),
+      );
+      if (overtakes) return broker;
+      if (entry.catchAll && !providerCovered) return broker;
+    }
+    return null;
   }
 
   /**

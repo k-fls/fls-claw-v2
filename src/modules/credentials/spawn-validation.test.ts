@@ -66,6 +66,30 @@ describe('validateRuntimeCredentials', () => {
     expect((err as Error).message).not.toContain('anthropic'); // bound → not listed
   });
 
+  it('does not hard-fail a missing required provider that a broker supplies (C3)', () => {
+    expect(() =>
+      validateRuntimeCredentials({
+        providerName: 'claude',
+        runtimeConfigRaw: {},
+        getRuntime: () => fakeRuntime([{ id: 'claude', required: true }]),
+        hasProvider: () => false, // not bound natively
+        brokerSupplies: (id) => id === 'claude', // but the broker overtakes it
+      }),
+    ).not.toThrow();
+  });
+
+  it('still fails when neither native nor a broker supplies a required provider', () => {
+    expect(() =>
+      validateRuntimeCredentials({
+        providerName: 'claude',
+        runtimeConfigRaw: {},
+        getRuntime: () => fakeRuntime([{ id: 'claude', required: true }]),
+        hasProvider: () => false,
+        brokerSupplies: (id) => id === 'something-else',
+      }),
+    ).toThrow(FatalSpawnError);
+  });
+
   it('ignores optional (required:false) providers that are missing', () => {
     expect(() =>
       validateRuntimeCredentials({

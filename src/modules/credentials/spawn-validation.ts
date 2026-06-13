@@ -11,6 +11,7 @@
  * Dormant until a provider declares an `AGENT_RUNTIME` extension: providers
  * without one make this a no-op, so it never regresses spawns.
  */
+import { effectiveRouting, listEnabledBrokerIds } from '../../db/broker-config.js';
 import { FatalSpawnError } from '../../spawn-failure.js';
 import { registerContainerLifecycleObserver, type SpawnPreContext } from '../container-bootstrap/index.js';
 
@@ -33,14 +34,23 @@ export function validateRuntimeCredentials(opts: {
   runtimeConfigRaw: unknown;
   getRuntime: (providerName: string) => AgentRuntimeExt | undefined;
   hasProvider: (credentialProviderId: string) => boolean;
+  /**
+   * Whether a credential broker supplies this provider for the group (C3). A
+   * required provider missing from the native has-set must NOT hard-fail when
+   * a broker overtakes it — the broker supplies the credential at request time,
+   * a real miss then surfaces as a 401. Defaults to never (no broker), so the
+   * dormant/native case is unchanged.
+   */
+  brokerSupplies?: (credentialProviderId: string) => boolean;
 }): void {
   const runtime = opts.getRuntime(opts.providerName);
   if (!runtime) return;
 
+  const brokerSupplies = opts.brokerSupplies ?? (() => false);
   const runtimeConfig = runtime.parseRuntimeConfig(opts.runtimeConfigRaw);
   const missing = runtime
     .requiredCredentialProviders(runtimeConfig)
-    .filter((r) => r.required && !opts.hasProvider(r.id))
+    .filter((r) => r.required && !opts.hasProvider(r.id) && !brokerSupplies(r.id))
     .map((r) => r.id);
 
   if (missing.length > 0) {
@@ -68,6 +78,20 @@ function boundProviderIds(folder: string): Set<string> {
   return new Set(listProviderIds(asCredentialScope(folder)));
 }
 
+/**
+ * Does any enabled broker overtake `providerId` for this group (folder)?
+ * Pre-spawn there is no container IP yet, so this resolves by folder via
+ * `effectiveRouting` (the per-group merged routing). Catch-all is irrelevant
+ * here — a required *provider* is covered space, only an explicit overtake of
+ * its id means the broker supplies it.
+ */
+function brokerSuppliesProvider(folder: string, providerId: string): boolean {
+  for (const brokerId of listEnabledBrokerIds()) {
+    if (effectiveRouting(brokerId, folder).overtake.includes(providerId)) return true;
+  }
+  return false;
+}
+
 registerContainerLifecycleObserver('provider-runtime-validation', {
   onSpawnPre(ctx: SpawnPreContext) {
     // Compute the (FS-backed) has-set lazily and once — skipped entirely in the
@@ -78,6 +102,7 @@ registerContainerLifecycleObserver('provider-runtime-validation', {
       runtimeConfigRaw: ctx.containerConfig.runtimeConfig ?? {},
       getRuntime: runtimeFor,
       hasProvider: (id) => (cached ??= boundProviderIds(ctx.agentGroup.folder)).has(id),
+      brokerSupplies: (id) => brokerSuppliesProvider(ctx.agentGroup.folder, id),
     });
   },
 });

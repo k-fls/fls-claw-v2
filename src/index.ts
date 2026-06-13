@@ -71,6 +71,8 @@ import { startCliServer } from './cli/socket-server.js';
 // so unit tests don't arm the spawn-time validator unexpectedly.
 import { registerClaudeCredentialProvider } from './providers/claude-credential.js';
 import { registerGithubCredentialProvider } from './providers/github-credential.js';
+import { registerOneCliBroker } from './providers/onecli-broker.js';
+import { registerOneCliCredentialProvider } from './providers/onecli-credential.js';
 import {
   CredentialProxy,
   setProxyInstance,
@@ -124,6 +126,11 @@ async function main(): Promise<void> {
   initTokenEngine((scope) => getOrCreateResolverForAgentGroup(scope));
   registerClaudeCredentialProvider();
   registerGithubCredentialProvider();
+  // C3 OneCLI-as-broker: the agent-identifier credential (grantable) + the
+  // broker (registered only when OneCLI is configured; per-container network
+  // work stays demand-gated to routed containers). See specs/onecli-broker.md.
+  registerOneCliCredentialProvider();
+  registerOneCliBroker();
   const credentialProxy = new CredentialProxy();
   // Bind all interfaces, not just loopback: containers reach the proxy via
   // host.docker.internal (the host-gateway IP), so a 127.0.0.1-only bind is

@@ -49,7 +49,7 @@ For ad-hoc queries from skills or scripts, use the in-tree wrapper rather than t
 | `src/delivery.ts` | Polls `outbound.db`, delivers via adapter, handles system actions (schedule, approvals, etc.) |
 | `src/host-sweep.ts` | 60s sweep: `processing_ack` sync, stale detection, due-message wake, recurrence |
 | `src/session-manager.ts` | Resolves sessions; opens `inbound.db` / `outbound.db`; manages heartbeat path |
-| `src/container-runner.ts` | Spawns per-agent-group Docker containers with session DB + outbox mounts, OneCLI `ensureAgent` |
+| `src/container-runner.ts` | Spawns per-agent-group Docker containers with session DB + outbox mounts. (Egress is owned by the MITM proxy; OneCLI is a credential broker behind it — `src/providers/onecli-broker.ts` — provisioned at IP-allocate, not here.) |
 | `src/container-runtime.ts` | Runtime selection (Docker vs Apple containers), orphan cleanup |
 | `src/modules/permissions/access.ts` | `canAccessAgentGroup` — owner / global admin / scoped admin / member resolution against `user_roles` + `agent_group_members` |
 | `src/modules/approvals/primitive.ts` | `pickApprover`, `pickApprovalDelivery`, `requestApproval`, approval-handler registry |
@@ -136,7 +136,9 @@ Key files: `src/container-restart.ts`, `src/container-runner.ts` (`killContainer
 
 ## Secrets / Credentials / OneCLI
 
-API keys, OAuth tokens, and auth credentials are managed by the OneCLI gateway. Secrets are injected into per-agent containers at request time — none are passed in env vars or through chat context. The container agent sees this via the `onecli-gateway` container skill (`container/skills/onecli-gateway/SKILL.md`), which teaches it how the proxy works, how to handle auth errors, and to never ask for raw credentials. Host-side wiring: `src/onecli-approvals.ts`, `ensureAgent()` in `container-runner.ts`. Run `onecli --help`.
+API keys, OAuth tokens, and auth credentials are managed by the OneCLI gateway. Secrets are injected into per-agent containers at request time — none are passed in env vars or through chat context. The container agent sees this via the `onecli-gateway` container skill (`container/skills/onecli-gateway/SKILL.md`), which teaches it how the proxy works, how to handle auth errors, and to never ask for raw credentials. Run `onecli --help`.
+
+**On `module/onecli-broker` (C3):** the MITM credential proxy owns container egress; OneCLI is demoted to a credential **broker** behind it. The host-side OneCLI client is a single shared accessor (`src/onecli-client.ts`) used by the broker (`src/providers/onecli-broker.ts` — `ensureAgent` + per-request forward, provisioned at IP-allocate, demand-gated per `broker_config` routing) and the approval bridge (`src/modules/approvals/onecli-approvals.ts`). Container-runner no longer wires OneCLI. Routing is managed via `ncl brokers`. See `docs/fls/specs/onecli-broker.md`.
 
 ### Secret modes
 

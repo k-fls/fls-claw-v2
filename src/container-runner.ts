@@ -7,8 +7,6 @@ import { ChildProcess, execSync, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-import { OneCLI } from '@onecli-sh/sdk';
-
 import { type AgentGroupContribution, invokeAgentGroupContributions } from './agent-group-contributions.js';
 import { FatalSpawnError, isSpawnPoisoned, markSpawnPoisoned } from './spawn-failure.js';
 import {
@@ -21,8 +19,6 @@ import {
   IDLE_BEFORE_EVICT,
   MAX_CONCURRENT_CONTAINERS,
   MAX_DRAIN_TIMEOUT_MS,
-  ONECLI_API_KEY,
-  ONECLI_URL,
   TIMEZONE,
 } from './config.js';
 import { ContainerQueue, type EvictionCandidate } from './container-queue.js';
@@ -79,8 +75,6 @@ import {
   writeSessionRouting,
 } from './session-manager.js';
 import type { AgentGroup, Session } from './types.js';
-
-const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
 /**
  * Active containers tracked by session ID. `spawnedAt` + the liveness fields
@@ -441,9 +435,6 @@ async function spawnContainer(session: Session): Promise<void> {
 
   const mounts = buildMounts(agentGroup, session, containerConfig, contribution, groupContribution, spawnPre);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
-  // OneCLI agent identifier is always the agent group id — stable across
-  // sessions and reversible via getAgentGroup() for approval routing.
-  const agentIdentifier = agentGroup.id;
 
   const launchMode = resolveLaunchMode(spawnPre.needsRootEntrypoint);
 
@@ -482,7 +473,6 @@ async function spawnContainer(session: Session): Promise<void> {
       provider,
       contribution,
       groupContribution,
-      agentIdentifier,
       spawnPre,
       launchMode,
     );
@@ -836,7 +826,6 @@ async function buildContainerArgs(
   provider: string,
   providerContribution: ProviderContainerContribution,
   groupContribution: AgentGroupContribution,
-  agentIdentifier: string | undefined,
   spawnPre: MergedSpawnPre,
   launchMode: import('./modules/container-bootstrap/index.js').LaunchMode,
 ): Promise<string[]> {
@@ -879,32 +868,15 @@ async function buildContainerArgs(
   // injected. See src/modules/sync-actions/.
   args.push('-e', `NANOCLAW_HOST_RPC_PORT=${hostRpcPort()}`);
 
-  // Egress. When the native MITM credential proxy is live it owns egress (the
-  // mitm lifecycle observer already injected HTTP_PROXY + CA into the spawn
-  // args), so skip the OneCLI gateway — it would otherwise fight the proxy for
-  // HTTPS_PROXY.
-  //
-  // Without the proxy, OneCLI is the credential path: injects HTTPS_PROXY +
-  // certs so container API calls route through the agent vault. Treated as a
-  // transient hard failure — if we can't wire the gateway we don't spawn; the
-  // caller leaves the inbound pending and the next sweep tick retries.
-  //
-  // Egress lockdown (when enabled) is orthogonal: its in-container firewall +
-  // managed-bridge flags are contributed by the egress observer via fireSpawnPre,
-  // not here. The host route (added just below) stays open either way so
-  // host-rpc / the credential broker remain reachable.
-  if (hasProxyInstance()) {
-    log.info('Native credential proxy active — skipping OneCLI gateway', { containerName });
-  } else {
-    if (agentIdentifier) {
-      await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
-    }
-    const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
-    if (!onecliApplied) {
-      throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
-    }
-    log.info('OneCLI gateway applied', { containerName });
-  }
+  // Egress is owned by the always-on MITM credential proxy — the mitm lifecycle
+  // observer already injected HTTP_PROXY + CA into the spawn args above. OneCLI
+  // is no longer wired here: it is demoted to a credential **broker** behind the
+  // proxy (C3), which provisions its per-group agent (`ensureAgent`) at
+  // IP-allocate, demand-gated to delegated groups, and forwards per request.
+  // The old "OneCLI gateway owns egress + applyContainerConfig" path is gone:
+  // the proxy is unconditional at boot (a failed start aborts boot, never a
+  // running host without it), so it was dead + would re-collide on HTTPS_PROXY.
+  // See docs/fls/specs/onecli-broker.md.
 
   // Host gateway
   args.push(...hostGatewayArgs());

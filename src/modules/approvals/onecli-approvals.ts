@@ -17,10 +17,9 @@
  * Startup sweep edits any leftover cards from a previous process to
  * "Expired (host restarted)" and drops the rows.
  */
-import { OneCLI, type ApprovalRequest, type ManualApprovalHandle } from '@onecli-sh/sdk';
+import { type ApprovalRequest, type ManualApprovalHandle } from '@onecli-sh/sdk';
 
 import { pickApprovalDelivery, pickApprover } from './primitive.js';
-import { ONECLI_API_KEY, ONECLI_URL } from '../../config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import {
   createPendingApproval,
@@ -30,13 +29,12 @@ import {
 } from '../../db/sessions.js';
 import type { ChannelDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
+import { getOneCli } from '../../onecli-client.js';
 import type { PendingApproval } from '../../types.js';
 
 export const ONECLI_ACTION = 'onecli_credential';
 
 type Decision = 'approve' | 'deny';
-
-const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
 interface PendingState {
   resolve: (decision: Decision) => void;
@@ -89,7 +87,7 @@ export function startOneCLIApprovalHandler(deliveryAdapter: ChannelDeliveryAdapt
   // Sweep any rows left over from a previous process.
   sweepStaleApprovals().catch((err) => log.error('OneCLI approval sweep failed', { err }));
 
-  handle = onecli.configureManualApproval(async (request: ApprovalRequest): Promise<Decision> => {
+  handle = getOneCli().configureManualApproval(async (request: ApprovalRequest): Promise<Decision> => {
     try {
       return await handleRequest(request);
     } catch (err) {

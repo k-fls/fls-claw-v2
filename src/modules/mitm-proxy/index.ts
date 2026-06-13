@@ -57,6 +57,15 @@ export { proxyPipe, proxyBuffered, setProxyResponseHook, setUpstreamAgent } from
 export { createMitmContext, getMitmCaCertPath, parseSni } from './mitm-ca.js';
 export type { MitmContext } from './mitm-ca.js';
 
+// Credential broker registry (the OneCLI-as-broker tier — C3)
+export {
+  registerCredentialBroker,
+  getCredentialBroker,
+  getCredentialBrokers,
+  hasCredentialBrokers,
+} from './broker-registry.js';
+export type { CredentialBroker, BrokerForward } from './broker-registry.js';
+
 // Token substitute engine + singleton
 export {
   TokenSubstituteEngine,

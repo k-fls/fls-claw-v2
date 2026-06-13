@@ -33,6 +33,7 @@ import {
   onRelease,
 } from '../container-bootstrap/index.js';
 
+import { dropBrokerRouting, snapshotBrokerRouting } from './broker-routing.js';
 import { getProxy, hasProxyInstance } from './credential-proxy.js';
 import { getMitmCaCertPath } from './mitm-ca.js';
 import { loadGroupProvidersForContainer } from './oauth/index.js';
@@ -151,6 +152,10 @@ registerContainerLifecycleObserver('mitm-proxy', {
 onAllocate((ip, scope) => {
   if (hasProxyInstance()) {
     loadGroupProvidersForContainer(asGroupScope(scope), ip, getProxy());
+    // Snapshot this container's effective broker routing (demand-gated) and
+    // fire each routed broker's per-container setup. Only meaningful when the
+    // proxy owns egress — the broker is consulted in the proxy dispatch.
+    snapshotBrokerRouting(ip, scope);
   }
 });
 
@@ -158,4 +163,5 @@ onRelease((ip) => {
   if (hasProxyInstance()) {
     getProxy().unregisterContainerIP(ip);
   }
+  dropBrokerRouting(ip);
 });
