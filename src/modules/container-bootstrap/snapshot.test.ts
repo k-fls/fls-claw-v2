@@ -37,6 +37,7 @@ beforeEach(() => {
   fs.writeFileSync(path.join(sandboxRoot, 'container', 'entrypoint.sh'), '#!/bin/sh\n');
   fs.mkdirSync(path.join(sandboxRoot, 'container', 'agent-runner', 'src'), { recursive: true });
   fs.writeFileSync(path.join(sandboxRoot, 'container', 'agent-runner', 'src', 'index.ts'), 'export {};\n');
+  fs.writeFileSync(path.join(sandboxRoot, 'container', 'agent-runner', 'src', 'auth-runner.ts'), 'export {};\n');
   fs.mkdirSync(path.join(sandboxRoot, 'container', 'agent-runner', 'node_modules', 'junk'), { recursive: true });
   fs.writeFileSync(path.join(sandboxRoot, 'container', 'agent-runner', 'node_modules', 'junk', 'big'), 'x');
   process.chdir(sandboxRoot);

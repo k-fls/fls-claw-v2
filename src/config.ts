@@ -19,6 +19,10 @@ const HOME_DIR = process.env.HOME || os.homedir();
 // Mount security: allowlist stored OUTSIDE project root, never mounted into containers
 export const MOUNT_ALLOWLIST_PATH = path.join(HOME_DIR, '.config', 'nanoclaw', 'mount-allowlist.json');
 export const SENDER_ALLOWLIST_PATH = path.join(HOME_DIR, '.config', 'nanoclaw', 'sender-allowlist.json');
+// Auth-provider discovery override directory. Baseline JSONs ship in-tree at
+// `src/modules/mitm-proxy/oauth/discovery/`; per-install overrides
+// (typically written by the discovery refresh) live here.
+export const AUTH_DISCOVERY_DIR = path.join(HOME_DIR, '.config', 'nanoclaw', 'auth-discovery');
 export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
 export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
@@ -52,6 +56,13 @@ export const EVICTION_TIMEOUT = parseInt(process.env.EVICTION_TIMEOUT || '144000
 // integer seconds at the single `docker stop -t` boundary. Stuck-container
 // kills ignore this and use the fast 1s path.
 export const GRACEFUL_STOP_MS = Math.max(2000, parseInt(process.env.GRACEFUL_STOP_MS || '10000', 10) || 10000);
+
+// MITM credential proxy (substitution mode). Host bind port.
+// Default `0` — let the OS assign an ephemeral port. Set
+// `CREDENTIAL_PROXY_PORT` only if you need a fixed port (e.g. for an
+// external firewall rule). The actual bound port is observable via
+// `CredentialProxy.getBoundPort()`.
+export const CREDENTIAL_PROXY_PORT = parseInt(process.env.CREDENTIAL_PROXY_PORT || '0', 10);
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

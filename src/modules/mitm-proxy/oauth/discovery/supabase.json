@@ -1,0 +1,14 @@
+{
+  "issuer": "https://api.supabase.com",
+  "authorization_endpoint": "https://api.supabase.com/v1/oauth/authorize",
+  "token_endpoint": "https://api.supabase.com/v1/oauth/token",
+  "api_base_url": "https://api.supabase.com/v1",
+  "_source": "manually researched from official docs (supabase.com/docs/guides/integrations/build-a-supabase-oauth-integration)",
+  "_note": "This is for the Supabase Management API OAuth2 flow, which grants access to manage Supabase projects on behalf of a user. Confidential clients authenticate via HTTP Basic header (base64 client_id:client_secret). Public clients send only client_id in the request body. Separately, Supabase Auth (per-project) can act as an OAuth 2.1 / OIDC server for end-user authentication at https://{project_ref}.supabase.co, but that is a different system.",
+  "_supabase_auth_per_project": {
+    "authorization_endpoint": "https://{project_ref}.supabase.co/auth/v1/authorize",
+    "token_endpoint": "https://{project_ref}.supabase.co/auth/v1/token",
+    "_note": "Per-project Supabase Auth OAuth 2.1 server (public beta as of Nov 2025). This makes YOUR app an OAuth provider using Supabase Auth."
+  },
+  "_well_known_url": false
+}

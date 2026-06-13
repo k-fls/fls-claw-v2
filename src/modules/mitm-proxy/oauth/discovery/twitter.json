@@ -1,0 +1,11 @@
+{
+  "issuer": "https://x.com",
+  "authorization_endpoint": "https://x.com/i/oauth2/authorize",
+  "token_endpoint": "https://api.x.com/2/oauth2/token",
+  "revocation_endpoint": "https://api.x.com/2/oauth2/revoke",
+  "userinfo_endpoint": "https://api.x.com/2/users/me",
+  "api_base_url": "https://api.x.com/2",
+  "_source": "manually researched from official docs",
+  "_note": "OAuth 2.0 Authorization Code Flow with PKCE only. Requires users.read and tweet.read scopes for /users/me. Legacy domain twitter.com/i/oauth2/authorize also works for authorization.",
+  "_well_known_url": false
+}

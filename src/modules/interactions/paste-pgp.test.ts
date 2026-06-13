@@ -5,18 +5,27 @@
  * internal behavior — we exercise it by re-delivering and asserting
  * the slot stayed open (action=ask) until valid input arrives.
  */
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('../crypto/gpg.js', () => ({
   gpgDecryptAt: vi.fn(),
   isPgpMessage: vi.fn((s: string) => s.includes('-----BEGIN PGP MESSAGE-----')),
   normalizeArmoredBlock: vi.fn((s: string) => s.trim()),
 }));
+vi.mock('../../log.js', () => ({
+  log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
+}));
 
 import { gpgDecryptAt, isPgpMessage, normalizeArmoredBlock } from '../crypto/gpg.js';
 import type { HostCommandContext } from '../../command-gate.js';
-import type { BeginInteractionOptions, HostInteractionContext } from '../../host-interactions.js';
-import { pastePgp } from './paste-pgp.js';
+import {
+  deliverToActiveInteraction,
+  _resetHostInteractionsForTesting,
+  type BeginInteractionOptions,
+  type HostInteractionContext,
+  type InteractionOrigin,
+} from '../../host-interactions.js';
+import { pastePgp, pastePgpOn } from './paste-pgp.js';
 
 interface Bundle {
   ctx: HostCommandContext;
@@ -177,5 +186,48 @@ describe('pastePgp', () => {
 
     await bundle.deliver(ARMORED);
     expect(await promise).toEqual({ text: 'long-enough', reason: 'submitted' });
+  });
+});
+
+// pastePgpOn drives the REAL beginInteraction slot (non-command entry); crypto
+// is still mocked so we control decrypt without real keys.
+describe('pastePgpOn (non-command origin)', () => {
+  const key = { channelType: 'cli', platformId: 'local', threadId: null, userId: 'cli:op' };
+  let replies: string[];
+  function origin(): InteractionOrigin {
+    return {
+      key,
+      agentGroupId: 'ag',
+      messagingGroupId: 'mg',
+      replyAddr: { channelType: 'cli', platformId: 'local', threadId: null },
+      writeReply: (t) => replies.push(t),
+    };
+  }
+  const send = (text: string) => deliverToActiveInteraction(key, JSON.stringify({ text }), 'chat');
+
+  beforeEach(() => {
+    replies = [];
+    _resetHostInteractionsForTesting();
+  });
+  afterEach(() => _resetHostInteractionsForTesting());
+
+  it('rejects a non-PGP paste WITHOUT decrypting, then accepts an encrypted block', async () => {
+    vi.mocked(gpgDecryptAt).mockReturnValue('sk-ant-api03-ok');
+    const p = pastePgpOn(origin(), { prompt: 'encrypt + paste', gpgHome: '/tmp/h', validate: () => null });
+    expect(replies).toContain('encrypt + paste');
+
+    await send('sk-ant-api03-PLAINTEXTleak'); // not a PGP block
+    expect(vi.mocked(gpgDecryptAt)).not.toHaveBeenCalled(); // never even attempted to decrypt
+    expect(replies.at(-1)).toMatch(/PGP-encrypted/);
+
+    await send(ARMORED);
+    expect(vi.mocked(gpgDecryptAt)).toHaveBeenCalledWith('/tmp/h', ARMORED);
+    expect(await p).toEqual({ text: 'sk-ant-api03-ok', reason: 'submitted' });
+  });
+
+  it('resolves cancelled on a cancel keyword', async () => {
+    const p = pastePgpOn(origin(), { prompt: 'p', gpgHome: '/tmp/h' });
+    await send('cancel');
+    expect(await p).toEqual({ text: null, reason: 'cancelled' });
   });
 });

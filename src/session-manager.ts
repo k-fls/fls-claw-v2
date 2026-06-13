@@ -10,7 +10,7 @@
  *   3. One writer per file — DELETE-mode journal-unlink isn't atomic across
  *      the mount; concurrent writers corrupt the DB.
  */
-import type Database from 'better-sqlite3';
+import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 
@@ -376,8 +376,11 @@ export function openOutboundDbRw(agentGroupId: string, sessionId: string): Datab
 
 /**
  * Write a message directly to a session's outbound DB so the host delivery
- * loop picks it up. Used by the command gate to send denial responses
- * without waking a container.
+ * loop picks it up. Used by the command gate to send denial responses and
+ * host-command replies without waking a container.
+ *
+ * Opens a writable connection (the standard `openOutboundDb` is read-only —
+ * meant for the delivery loop polling messages_out).
  */
 export function writeOutboundDirect(
   agentGroupId: string,
@@ -391,7 +394,9 @@ export function writeOutboundDirect(
     content: string;
   },
 ): void {
-  const db = openOutboundDb(agentGroupId, sessionId);
+  const db = new Database(outboundDbPath(agentGroupId, sessionId));
+  db.pragma('journal_mode = DELETE');
+  db.pragma('busy_timeout = 5000');
   try {
     db.prepare(
       `INSERT OR IGNORE INTO messages_out (id, seq, timestamp, kind, platform_id, channel_type, thread_id, content)

@@ -1,0 +1,18 @@
+{
+  "issuer": "https://{tenant}.auth0.com/",
+  "authorization_endpoint": "https://{tenant}.auth0.com/authorize",
+  "token_endpoint": "https://{tenant}.auth0.com/oauth/token",
+  "device_authorization_endpoint": "https://{tenant}.auth0.com/oauth/device/code",
+  "userinfo_endpoint": "https://{tenant}.auth0.com/userinfo",
+  "revocation_endpoint": "https://{tenant}.auth0.com/oauth/revoke",
+  "jwks_uri": "https://{tenant}.auth0.com/.well-known/jwks.json",
+  "registration_endpoint": "https://{tenant}.auth0.com/oidc/register",
+  "_well_known_url": "https://{tenant}.auth0.com/.well-known/openid-configuration",
+  "_source": "templated from real OIDC discovery doc (see auth0-oidc.json)",
+  "_note": "{tenant} is the Auth0 tenant name. Regional tenants use {tenant}.{region}.auth0.com (e.g. myco.eu.auth0.com, myco.au.auth0.com). Custom domains are also supported (e.g. auth.mycompany.com).",
+  "_host_patterns": [
+    "{tenant}.auth0.com",
+    "{tenant}.{region}.auth0.com",
+    "{custom_domain}"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "issuer": "https://connect.stripe.com",
+  "authorization_endpoint": "https://connect.stripe.com/oauth/authorize",
+  "token_endpoint": "https://connect.stripe.com/oauth/token",
+  "revocation_endpoint": "https://connect.stripe.com/oauth/deauthorize",
+  "api_base_url": "https://api.stripe.com/v1",
+  "_source": "manually researched from official docs (docs.stripe.com/connect/oauth-reference)",
+  "_note": "Stripe Connect OAuth2. Used for connecting Stripe accounts to platforms. Token endpoint handles both authorization_code exchange and refresh_token grants. The deauthorize endpoint revokes platform access to a connected account. The API key mode (live vs test) must match the mode used during authorization.",
+  "_well_known_url": false
+}

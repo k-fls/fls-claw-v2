@@ -16,6 +16,7 @@ import { getMessagingGroupByPlatform } from './db/messaging-groups.js';
 import {
   getDueOutboundMessages,
   getDeliveredIds,
+  isDelivered,
   markDelivered,
   markDeliveryFailed,
   migrateDeliveredTable,
@@ -244,9 +245,12 @@ async function drainSession(session: Session): Promise<void> {
     const allDue = getDueOutboundMessages(outDb);
     if (allDue.length === 0) return;
 
-    // Filter out already-delivered messages using inbound.db's delivered table
+    // Filter out already-delivered messages using inbound.db's delivered table,
+    // and sync-action requests (kind=system, content.sync) — those are processed
+    // exclusively by the sync-action wakeup (host-rpc /action), never the poll,
+    // so the wakeup is their sole processor (exactly-once).
     const delivered = getDeliveredIds(inDb);
-    const undelivered = allDue.filter((m) => !delivered.has(m.id));
+    const undelivered = allDue.filter((m) => !delivered.has(m.id) && !isSyncActionRequest(m));
     if (undelivered.length === 0) return;
 
     // Outbound suppression: if a host interaction is active for the row's
@@ -264,6 +268,13 @@ async function drainSession(session: Session): Promise<void> {
     migrateDeliveredTable(inDb);
 
     for (const msg of deliverable) {
+      // Re-check both predicates per row: a system action handled earlier in
+      // this same batch may have begun a host interaction that pauses the
+      // address, or consumed rows outright (the reauth dispatcher does both
+      // to the container's "Error: …" line) — the batch-start snapshots
+      // wouldn't see either.
+      if (isOutboundPaused(msg.channel_type, msg.platform_id, msg.thread_id)) continue;
+      if (isDelivered(inDb, msg.id)) continue;
       try {
         const platformMsgId = await deliverMessage(msg, session, inDb);
         markDelivered(inDb, msg.id, platformMsgId ?? null);
@@ -314,8 +325,8 @@ async function deliverMessage(
     platform_id: string | null;
     channel_type: string | null;
     thread_id: string | null;
-    in_reply_to: string | null;
     content: string;
+    in_reply_to: string | null;
   },
   session: Session,
   inDb: Database.Database,
@@ -463,11 +474,38 @@ async function deliverMessage(
  * Default when no handler registered and the switch doesn't match: log
  * "Unknown system action" and return.
  */
+/**
+ * A sync-action request is an outbound `kind='system'` row whose action
+ * `content` carries `sync: true`. The delivery poll skips these (it would
+ * otherwise async-dispatch them); they are processed only by the sync-action
+ * wakeup, by explicit row id. The container sets this flag when writing the
+ * request (the container is a separate package, so it hardcodes the literal).
+ */
+export const SYNC_ACTION_FLAG = 'sync';
+
+function isSyncActionRequest(msg: { kind: string; content: string }): boolean {
+  if (msg.kind !== 'system') return false;
+  try {
+    return (JSON.parse(msg.content) as Record<string, unknown>)[SYNC_ACTION_FLAG] === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Action handlers may return a value. The async delivery-poll path ignores the
+ * return (fire-and-forget); the synchronous sync-action wakeup
+ * (`dispatchSyncAction`, see `src/modules/sync-actions/`) surfaces it as the
+ * result handed back to the container. Sync vs async is purely transport — the
+ * container can already trigger any action async via `messages_out`, so every
+ * action is callable synchronously too; response-bearing ones simply return a
+ * value, fire-and-forget ones return nothing.
+ */
 export type DeliveryActionHandler = (
   content: Record<string, unknown>,
   session: Session,
   inDb: Database.Database,
-) => Promise<void>;
+) => Promise<unknown>;
 
 const actionHandlers = new Map<string, DeliveryActionHandler>();
 
@@ -476,6 +514,23 @@ export function registerDeliveryAction(action: string, handler: DeliveryActionHa
     log.warn('Delivery action handler overwritten', { action });
   }
   actionHandlers.set(action, handler);
+}
+
+/**
+ * Dispatch a registered action and return its result. Called by the
+ * sync-action wakeup after reading the sync-marked request row from
+ * outbound.db — the same handler the async poll runs via `handleSystemAction`.
+ * Throws only if the action is unknown.
+ */
+export async function dispatchSyncAction(
+  action: string,
+  content: Record<string, unknown>,
+  session: Session,
+  inDb: Database.Database,
+): Promise<unknown> {
+  const handler = actionHandlers.get(action);
+  if (!handler) throw new Error(`unknown action: ${action}`);
+  return handler(content, session, inDb);
 }
 
 /**

@@ -1,0 +1,16 @@
+{
+  "issuer": "https://{org}.okta.com",
+  "authorization_endpoint": "https://{org}.okta.com/oauth2/v1/authorize",
+  "token_endpoint": "https://{org}.okta.com/oauth2/v1/token",
+  "userinfo_endpoint": "https://{org}.okta.com/oauth2/v1/userinfo",
+  "revocation_endpoint": "https://{org}.okta.com/oauth2/v1/revoke",
+  "introspection_endpoint": "https://{org}.okta.com/oauth2/v1/introspect",
+  "jwks_uri": "https://{org}.okta.com/oauth2/v1/keys",
+  "end_session_endpoint": "https://{org}.okta.com/oauth2/v1/logout",
+  "registration_endpoint": "https://{org}.okta.com/oauth2/v1/clients",
+  "device_authorization_endpoint": "https://{org}.okta.com/oauth2/v1/device/authorize",
+  "_well_known_url": "https://{org}.okta.com/.well-known/openid-configuration",
+  "_well_known_url_custom_as": "https://{org}.okta.com/oauth2/{authServerId}/.well-known/openid-configuration",
+  "_source": "manually researched from official docs (developer.okta.com/docs/reference/api/oidc/)",
+  "_note": "Per-tenant Okta OIDC endpoints. Replace {org} with the Okta org subdomain (e.g. dev-123456). These are the Org Authorization Server endpoints (v1 path). For a Custom Authorization Server, use https://{org}.okta.com/oauth2/{authServerId}/v1/* instead. The 'default' custom authorization server uses 'default' as the authServerId. Custom domains may replace {org}.okta.com with your own domain. See also okta-base.json for the login.okta.com global endpoints."
+}

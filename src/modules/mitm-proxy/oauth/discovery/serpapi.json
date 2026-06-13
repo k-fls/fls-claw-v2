@@ -1,0 +1,7 @@
+{
+  "api_base_url": "https://serpapi.com/search",
+  "_source": "manually researched from official docs (serpapi.com/search-api)",
+  "_note": "SerpApi scrapes search engine results (Google, Bing, Yahoo, etc.). Authentication is API-key only via query parameter 'api_key'. No header-based auth, no OAuth2. Same key for /search, /locations.json, /account.json.",
+  "_auth_method": "api_key",
+  "_env_vars": { "SERPAPI_KEY": "api_key" }
+}

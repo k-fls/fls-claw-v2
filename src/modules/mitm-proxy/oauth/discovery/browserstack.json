@@ -1,0 +1,21 @@
+{
+  "api_base_url": "https://api.browserstack.com",
+  "_api_hosts": [
+    "api-cloud.browserstack.com",
+    "hub-cloud.browserstack.com",
+    "hub.browserstack.com"
+  ],
+  "_source": "manually researched from official docs (browserstack.com/docs/automate/api-reference, browserstack.com/docs/app-automate/api-reference)",
+  "_note": "BrowserStack uses HTTP Basic auth: Authorization: Basic base64(username:access_key). Composite credential 'access_key' stores 'username:access_key' joined by ':'. Substitute preserves the ':' (delimiter in _token_format), so it can be sliced into the two official env vars. Proxy decodes Basic, swaps the inner substitute for the real composite, re-encodes.",
+  "_auth_method": "basic",
+  "_auth_header_format": "Authorization: Basic base64({username}:{access_key})",
+  "_credential_format": {
+    "access_key": { "encode": "base64", "sep": ":" }
+  },
+  "_env_vars": {
+    "BROWSERSTACK_USERNAME": "access_key[0]",
+    "BROWSERSTACK_ACCESS_KEY": "access_key[1]"
+  },
+  "_token_format": { "prefixLen": 4, "suffixLen": 4, "delimiters": "-._~:" },
+  "_well_known_url": false
+}

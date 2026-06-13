@@ -6,6 +6,8 @@ import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
 import {
   isCorruptionError,
+  writeContainerFeedback,
+  reportClassifiedError,
   runPollLoop,
   requestGracefulStop,
   _resetGracefulStopForTesting,
@@ -470,6 +472,84 @@ describe('graceful stop (SIGTERM soft stop)', () => {
     };
     expect(ack?.status).toBe('completed');
     expect(getPendingMessages()).toHaveLength(0);
+  });
+});
+
+describe('container feedback (cross-boundary classification)', () => {
+  function fakeProvider(classify?: (err: unknown) => string | undefined): AgentProvider {
+    return {
+      supportsNativeSlashCommands: false,
+      query: () => {
+        throw new Error('not used in this test');
+      },
+      isSessionInvalid: () => false,
+      classifyError: classify,
+    };
+  }
+
+  it('writeContainerFeedback writes a system feedback.container row that round-trips', () => {
+    writeContainerFeedback({
+      providerName: 'claude',
+      classification: 'auth-invalid',
+      message: 'API Error: 401 ...',
+      retryable: false,
+    });
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].kind).toBe('system');
+    // System feedback rows carry no channel routing — they are host-internal.
+    expect(out[0].platform_id).toBeNull();
+    expect(out[0].channel_type).toBeNull();
+
+    const content = JSON.parse(out[0].content);
+    expect(content.action).toBe('feedback.container');
+    expect(content.provider).toBe('claude');
+    expect(content.classification).toBe('auth-invalid');
+    expect(content.message).toBe('API Error: 401 ...');
+    expect(content.retryable).toBe(false);
+  });
+
+  it('preserves a retryable=true classification (yielded-event shape, e.g. quota)', () => {
+    writeContainerFeedback({
+      providerName: 'claude',
+      classification: 'quota',
+      message: 'Rate limit',
+      retryable: true,
+    });
+    const content = JSON.parse(getUndeliveredMessages()[0].content);
+    expect(content.classification).toBe('quota');
+    expect(content.retryable).toBe(true);
+  });
+
+  it('reportClassifiedError emits a feedback row when the provider classifies', () => {
+    const provider = fakeProvider(() => 'auth-invalid');
+    const result = reportClassifiedError(provider, 'claude', new Error('API Error: 401 {…}'));
+
+    expect(result).toBe('auth-invalid');
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    const content = JSON.parse(out[0].content);
+    expect(content.action).toBe('feedback.container');
+    expect(content.classification).toBe('auth-invalid');
+    // Throw path is never auto-retryable: an auth failure needs intervention.
+    expect(content.retryable).toBe(false);
+  });
+
+  it('reportClassifiedError writes nothing when the error is unclassified', () => {
+    const provider = fakeProvider(() => undefined);
+    const result = reportClassifiedError(provider, 'claude', new Error('ECONNRESET'));
+
+    expect(result).toBeUndefined();
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('reportClassifiedError writes nothing when the provider has no classifier', () => {
+    const provider = fakeProvider(undefined); // classifyError omitted
+    const result = reportClassifiedError(provider, 'codex', new Error('boom'));
+
+    expect(result).toBeUndefined();
+    expect(getUndeliveredMessages()).toHaveLength(0);
   });
 });
 

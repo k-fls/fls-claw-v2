@@ -1,0 +1,11 @@
+{
+  "issuer": "https://account.box.com",
+  "authorization_endpoint": "https://account.box.com/api/oauth2/authorize",
+  "token_endpoint": "https://api.box.com/oauth2/token",
+  "revocation_endpoint": "https://api.box.com/oauth2/revoke",
+  "userinfo_endpoint": "https://api.box.com/2.0/users/me",
+  "api_base_url": "https://api.box.com/2.0",
+  "_source": "manually researched from official docs",
+  "_note": "Standard OAuth2 authorization code flow. Access tokens are short-lived; refresh tokens are provided.",
+  "_well_known_url": false
+}

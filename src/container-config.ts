@@ -101,3 +101,15 @@ export function materializeContainerJson(agentGroupId: string): ContainerConfig 
 
   return config;
 }
+
+/**
+ * Resolve the effective provider name (lowercased), session override winning
+ * over the group config, default `claude`. Lives here (not container-runner) so
+ * credential-layer consumers can use it without importing the spawner.
+ */
+export function resolveProviderName(
+  sessionProvider: string | null | undefined,
+  containerConfigProvider: string | null | undefined,
+): string {
+  return (sessionProvider || containerConfigProvider || 'claude').toLowerCase();
+}

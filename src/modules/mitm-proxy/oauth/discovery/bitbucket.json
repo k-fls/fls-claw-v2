@@ -1,0 +1,10 @@
+{
+  "issuer": "https://bitbucket.org",
+  "authorization_endpoint": "https://bitbucket.org/site/oauth2/authorize",
+  "token_endpoint": "https://bitbucket.org/site/oauth2/access_token",
+  "userinfo_endpoint": "https://api.bitbucket.org/2.0/user",
+  "api_base_url": "https://api.bitbucket.org/2.0",
+  "_source": "manually researched from official docs (developer.atlassian.com/cloud/bitbucket/oauth-2/)",
+  "_note": "Bitbucket Cloud OAuth2. Supports authorization_code, implicit, and client_credentials grant types. Resource Owner Password Credentials grant is no longer supported. Token endpoint also handles refresh tokens. User endpoint returns the authenticated user's profile.",
+  "_well_known_url": false
+}

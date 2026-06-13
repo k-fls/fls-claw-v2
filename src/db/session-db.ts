@@ -265,6 +265,12 @@ export function getDueOutboundMessages(db: Database.Database): OutboundMessage[]
     .all() as OutboundMessage[];
 }
 
+/** Single outbound row by id (read-only). Used by the sync-action wakeup to
+ * fetch the request row the container pointed at. */
+export function getOutboundMessageById(db: Database.Database, id: string): OutboundMessage | undefined {
+  return db.prepare('SELECT * FROM messages_out WHERE id = ?').get(id) as OutboundMessage | undefined;
+}
+
 // ---------------------------------------------------------------------------
 // delivered
 // ---------------------------------------------------------------------------
@@ -275,6 +281,11 @@ export function getDeliveredIds(db: Database.Database): Set<string> {
       (r) => r.message_out_id,
     ),
   );
+}
+
+/** Live single-row check — for re-validation inside a delivery batch after a handler may have consumed rows. */
+export function isDelivered(db: Database.Database, messageOutId: string): boolean {
+  return db.prepare('SELECT 1 FROM delivered WHERE message_out_id = ?').get(messageOutId) !== undefined;
 }
 
 export function markDelivered(db: Database.Database, messageOutId: string, platformMessageId: string | null): void {

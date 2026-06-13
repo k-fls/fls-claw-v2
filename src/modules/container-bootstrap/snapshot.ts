@@ -55,7 +55,11 @@ export function initSnapshot(): void {
   // an opaque container-side failure (image's fail-loud stub for entrypoint,
   // or `bun: cannot find /app/src/index.ts` in agent stderr that the host
   // never sees since logs are lost on `--rm`). Catch it at boot.
-  const required = ['entrypoint.sh', path.join('agent-runner', 'src', 'index.ts')];
+  const required = [
+    'entrypoint.sh',
+    path.join('agent-runner', 'src', 'index.ts'),
+    path.join('agent-runner', 'src', 'auth-runner.ts'),
+  ];
   for (const rel of required) {
     const full = path.join(snapshotRoot(), rel);
     if (!fs.existsSync(full)) {

@@ -1,0 +1,10 @@
+{
+  "issuer": "https://linear.app",
+  "authorization_endpoint": "https://linear.app/oauth/authorize",
+  "token_endpoint": "https://api.linear.app/oauth/token",
+  "revocation_endpoint": "https://api.linear.app/oauth/revoke",
+  "api_base_url": "https://api.linear.app/graphql",
+  "_source": "manually researched from official docs",
+  "_note": "GraphQL API only (no REST). Supports client_credentials grant for server-to-server. Add actor=app param to authorize URL for app-actor tokens. No standard userinfo endpoint; query the GraphQL API for viewer info.",
+  "_well_known_url": false
+}

@@ -1,0 +1,7 @@
+{
+  "authorization_endpoint": "https://vercel.com/oauth/authorize",
+  "token_endpoint": "https://api.vercel.com/v2/oauth/access_token",
+  "api_base_url": "https://api.vercel.com",
+  "_source": "https://vercel.com/docs/sign-in-with-vercel/authorization-server-api",
+  "_note": "Token endpoint from official Vercel docs uses /v2/oauth/access_token. The OIDC discovery doc (vercel.json) reports /login/oauth/token instead. Both may be valid — the OIDC doc came from vercel.com's own server."
+}

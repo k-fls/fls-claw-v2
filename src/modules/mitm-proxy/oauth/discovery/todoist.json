@@ -1,0 +1,13 @@
+{
+  "issuer": "https://todoist.com",
+  "authorization_endpoint": "https://todoist.com/oauth/authorize",
+  "token_endpoint": "https://todoist.com/oauth/access_token",
+  "revocation_endpoint": "https://api.todoist.com/api/v1/revoke",
+  "api_base_url": "https://api.todoist.com/api",
+  "_env_vars": {
+    "TODOIST_API_TOKEN": "oauth"
+  },
+  "_source": "manually researched from official docs (developer.todoist.com/guides/#authorization)",
+  "_note": "Todoist OAuth2. Authorization code grant only (no device flow). Scopes are comma-separated: task:add, data:read, data:read_write, data:delete, project:delete, backups:read. Token endpoint returns JSON with access_token and token_type. Tokens are 40-character hex strings. No refresh tokens — access tokens are long-lived until revoked.",
+  "_well_known_url": false
+}

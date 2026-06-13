@@ -15,7 +15,12 @@
  * import`, `/ssh add`, etc.) interpret the returned text themselves.
  */
 import type { HostCommandContext } from '../../command-gate.js';
-import type { HostInteractionContext } from '../../host-interactions.js';
+import {
+  beginInteractionOn,
+  type HostInteractionContext,
+  type HostInteractionHandler,
+  type InteractionOrigin,
+} from '../../host-interactions.js';
 
 export interface PastePlainOptions {
   ctx: HostCommandContext;
@@ -51,31 +56,60 @@ export function extractInboundText(raw: string): string {
   return raw;
 }
 
+/** Shared turn handler: cancel → resolve, validate-fail → re-prompt, else accept. */
+function buildPasteHandler(
+  cancelSet: Set<string>,
+  validate: ((text: string) => string | null) | undefined,
+  resolve: (r: PasteResult) => void,
+): HostInteractionHandler {
+  return (hctx: HostInteractionContext): void => {
+    const text = extractInboundText(hctx.inboundContent);
+    const trimmed = text.trim();
+    if (cancelSet.has(trimmed.toLowerCase())) {
+      hctx.finish();
+      resolve({ text: null, reason: 'cancelled' });
+      return;
+    }
+    if (validate) {
+      const err = validate(text);
+      if (err != null) {
+        hctx.ask(err);
+        return;
+      }
+    }
+    hctx.finish();
+    resolve({ text, reason: 'submitted' });
+  };
+}
+
 export function pastePlain(opts: PastePlainOptions): Promise<PasteResult> {
   const cancelSet = new Set((opts.cancelKeywords ?? DEFAULT_CANCEL_KEYWORDS).map((k) => k.trim().toLowerCase()));
 
   return new Promise<PasteResult>((resolve) => {
-    const handler = (hctx: HostInteractionContext): void => {
-      const text = extractInboundText(hctx.inboundContent);
-      const trimmed = text.trim();
-      if (cancelSet.has(trimmed.toLowerCase())) {
-        hctx.finish();
-        resolve({ text: null, reason: 'cancelled' });
-        return;
-      }
-      if (opts.validate) {
-        const err = opts.validate(text);
-        if (err != null) {
-          hctx.ask(err);
-          return;
-        }
-      }
-      hctx.finish();
-      resolve({ text, reason: 'submitted' });
-    };
-
     opts.ctx.beginInteraction({
-      handler,
+      handler: buildPasteHandler(cancelSet, opts.validate, resolve),
+      initialPrompt: opts.prompt,
+      timeoutMs: opts.timeoutMs,
+      onTimeout: () => resolve({ text: null, reason: 'timeout' }),
+    });
+  });
+}
+
+/** Options for {@link pastePlainOn} — `pastePlain`'s minus the command `ctx`. */
+export type PastePlainOnOptions = Omit<PastePlainOptions, 'ctx'>;
+
+/**
+ * Like {@link pastePlain}, but driven from a raw {@link InteractionOrigin}
+ * instead of a `HostCommandContext` — the non-command entry point a credential
+ * provider uses to capture free-form text (e.g. an OAuth code pasted back by
+ * the user) outside the slash-command path. Like `pastePgpOn` for plain text.
+ */
+export function pastePlainOn(origin: InteractionOrigin, opts: PastePlainOnOptions): Promise<PasteResult> {
+  const cancelSet = new Set((opts.cancelKeywords ?? DEFAULT_CANCEL_KEYWORDS).map((k) => k.trim().toLowerCase()));
+
+  return new Promise<PasteResult>((resolve) => {
+    beginInteractionOn(origin, {
+      handler: buildPasteHandler(cancelSet, opts.validate, resolve),
       initialPrompt: opts.prompt,
       timeoutMs: opts.timeoutMs,
       onTimeout: () => resolve({ text: null, reason: 'timeout' }),

@@ -12,7 +12,8 @@ import {
   type CredentialProvider,
 } from './registry.js';
 import { asCredentialScope } from '../types.js';
-import { AGENT_RUNTIME, CONTAINER_FEEDBACK, ExtensionBag, REAUTH, type AgentRuntimeExt } from './types.js';
+import { AGENT_RUNTIME, CONTAINER_FEEDBACK, ExtensionBag, type AgentRuntimeExt } from './types.js';
+import { REAUTH } from '../reauth.js';
 
 function cred(id: string, getExtension?: CredentialProvider['getExtension']): CredentialProvider {
   return {

@@ -185,31 +185,8 @@ export interface ProducerExt {
 }
 export const PRODUCER = defineExtension<ProducerExt>('producer');
 
-/** Context handed to a provider's reauth driver when a credential goes stale. */
-export interface ReauthContext {
-  /** Interaction origin to prompt the user on. */
-  origin: InteractionOrigin;
-  /**
-   * Scope to store the replacement credential under. Write/store is
-   * own-scope only, hence `CredentialScope`.
-   */
-  credentialScope: CredentialScope;
-  /** The container classifier's tag that triggered this, e.g. 'auth-invalid'. */
-  classification: string;
-  /** Sanitized, length-capped human-readable reason (the container error). */
-  reason: string;
-}
-
-/**
- * Interactive re-authentication. Resolves `true` iff a replacement
- * credential was stored; `false` on cancel / timeout / decline. The provider
- * owns the whole UX behind `reauth()`. The mid-session dispatcher that drives
- * it lands with its consumer module (downstream); only the contract lives here.
- */
-export interface ReauthExt {
-  reauth(ctx: ReauthContext): Promise<boolean>;
-}
-export const REAUTH = defineExtension<ReauthExt>('reauth');
+// REAUTH lives with its consumer: ../reauth.ts (the mid-session reauth
+// dispatcher) — same placement rule as ACQUIRE in credential-acquisition.ts.
 
 /** `/auth` status custom rendering. Body not yet implemented. */
 export interface UxExt {

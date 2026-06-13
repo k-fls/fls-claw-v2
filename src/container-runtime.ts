@@ -53,10 +53,8 @@ export function stopContainer(name: string, graceSeconds = 1): void {
 export function stopContainerGraceful(name: string, graceSeconds: number): Promise<void> {
   assertValidContainerName(name);
   return new Promise((resolve, reject) => {
-    exec(
-      `${CONTAINER_RUNTIME_BIN} stop -t ${graceSeconds} ${name}`,
-      { timeout: (graceSeconds + 5) * 1000 },
-      (err) => (err ? reject(err) : resolve()),
+    exec(`${CONTAINER_RUNTIME_BIN} stop -t ${graceSeconds} ${name}`, { timeout: (graceSeconds + 5) * 1000 }, (err) =>
+      err ? reject(err) : resolve(),
     );
   });
 }

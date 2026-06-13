@@ -51,6 +51,64 @@ function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/**
+ * Cross the container→host boundary with a structured error classification.
+ * Writes a `kind:'system'` outbound row whose content carries
+ * `action:'feedback.container'` plus the provider's classification tag. The
+ * host's `feedback.container` dispatcher (not yet implemented) reads
+ * `classification` to drive reauth / back-off / surface decisions.
+ *
+ * Until that dispatcher is registered, the host's `handleSystemAction` logs the
+ * row as an unknown action and drops it — so this is safe to emit now. On the
+ * throw path the human-visible `kind:'chat'` "Error:" line is still written
+ * separately, so an auth failure is never silent in the interim; the dispatcher
+ * will suppress that redundant line once it lands.
+ */
+export function writeContainerFeedback(opts: {
+  providerName: string;
+  classification: string;
+  message: string;
+  retryable: boolean;
+}): void {
+  writeMessageOut({
+    id: generateId(),
+    kind: 'system',
+    content: JSON.stringify({
+      action: 'feedback.container',
+      provider: opts.providerName,
+      classification: opts.classification,
+      message: opts.message,
+      retryable: opts.retryable,
+    }),
+  });
+}
+
+/**
+ * Classify a thrown query error via the provider and, when recognized, forward
+ * it to the host as a `feedback.container` row. Returns the classification (or
+ * `undefined` if the provider didn't recognize the error / has no classifier).
+ *
+ * `retryable` is false because a classified error reaching the throw path was
+ * not auto-recovered: stale-session is the only locally retryable case and the
+ * poll-loop clears it separately, so anything classified here (e.g. an auth
+ * 401) needs host intervention rather than a blind retry.
+ */
+export function reportClassifiedError(
+  provider: AgentProvider,
+  providerName: string,
+  err: unknown,
+): string | undefined {
+  const classification = provider.classifyError?.(err);
+  if (!classification) return undefined;
+  writeContainerFeedback({
+    providerName,
+    classification,
+    message: err instanceof Error ? err.message : String(err),
+    retryable: false,
+  });
+  return classification;
+}
+
 export interface PollLoopConfig {
   provider: AgentProvider;
   /**
@@ -283,6 +341,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         clearContinuation(config.providerName);
       }
 
+      // Forward a structured classification to the host when the provider
+      // recognizes the error (e.g. an auth 401). This is the signal the host's
+      // reauth dispatcher consumes; the user-facing chat error below stays so
+      // the failure isn't silent until that dispatcher lands.
+      reportClassifiedError(config.provider, config.providerName, err);
+
       // Write error response so the user knows something went wrong
       writeMessageOut({
         id: generateId(),
@@ -503,6 +567,33 @@ async function processQuery(
                 `Please re-send your response with the correct wrapping.</system>`,
             );
           }
+        }
+      } else if (event.type === 'error' && event.classification) {
+        // A structured error surfaced mid-stream (e.g. rate_limit_event →
+        // 'quota', or a yielded auth classification). Forward it to the
+        // host the same way as the throw path; uses the event's own retryable
+        // flag since the provider set it. The stream may continue afterwards.
+        writeContainerFeedback({
+          providerName,
+          classification: event.classification,
+          message: event.message,
+          retryable: event.retryable,
+        });
+        // Auth-classified errors end the turn in practice (the SDK's "result"
+        // is the failure text, which lands in scratchpad — nothing reaches the
+        // user). Mirror the throw path's user-facing line so the failure is
+        // never silent; the host reauth dispatcher holds + consumes this row
+        // when it starts an interactive reauth instead. Other classifications
+        // (e.g. 'quota' rate-limit events) are mid-stream noise — skip.
+        if (event.classification.startsWith('auth')) {
+          writeMessageOut({
+            id: generateId(),
+            kind: 'chat',
+            platform_id: routing.platformId,
+            channel_type: routing.channelType,
+            thread_id: routing.threadId,
+            content: JSON.stringify({ text: `Error: ${event.message}` }),
+          });
         }
       }
     }

@@ -26,7 +26,9 @@ import {
 } from './config.js';
 import { ContainerQueue, type EvictionCandidate } from './container-queue.js';
 import { getSession } from './db/sessions.js';
-import { materializeContainerJson } from './container-config.js';
+import { materializeContainerJson, resolveProviderName } from './container-config.js';
+// Re-exported for back-compat: `resolveProviderName` lives in container-config.
+export { resolveProviderName };
 import { getContainerConfig } from './db/container-configs.js';
 import { updateContainerConfigScalars, updateContainerConfigJson } from './db/container-configs.js';
 import {
@@ -51,10 +53,15 @@ import {
   type MergedSpawnPre,
 } from './modules/container-bootstrap/index.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
+import { hostRpcPort } from './modules/host-rpc/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
 import { getCredentialProvider, AGENT_RUNTIME, asGroupScope } from './modules/credentials/index.js';
 import type { ContributionInput, ProviderResult } from './modules/credentials/index.js';
+// Import from the leaf module, not the mitm-proxy barrel: the barrel re-exports
+// proxy-tap-logger, which reads DATA_DIR at module-eval time, and that eager
+// read trips a TDZ in tests that mock config.DATA_DIR via a getter.
+import { hasProxyInstance } from './modules/mitm-proxy/credential-proxy.js';
 // Provider host-side config barrel — each provider that needs host-side
 // container setup self-registers on import.
 import './providers/index.js';
@@ -91,7 +98,7 @@ const activeContainers = new Map<string, ActiveContainer>();
 
 /**
  * Sessions whose container was killed via `killContainer` — checked then
- * cleared by the exit handler so it can pass `reason: 'killed'` to
+ * cleared by the close handler so it can pass `reason: 'killed'` to
  * `fireContainerExited` instead of `'normal'`.
  */
 const killedSessions = new Set<string>();
@@ -105,31 +112,6 @@ const killedSessions = new Set<string>();
  * racy double-replies.
  */
 const wakePromises = new Map<string, Promise<boolean>>();
-
-/**
- * Prepare a per-group persistent home directory backing `/home/node`.
- *
- * Subdirectories (app config / caches like `.config/gh/`, `.aws/`, `.npm/`)
- * survive across runs so tool state isn't lost between sessions. Top-level
- * flat files in `~/` are removed on every launch to prevent dotfile injection
- * (`.bashrc`, `.profile`, `.bash_profile`) from carrying between sessions —
- * this wipe is the security boundary, not incidental cleanup. Nested files
- * (e.g. `.config/gh/hosts.yml`) are untouched.
- *
- * Returns the absolute dir so the caller can mount it.
- */
-export function prepareGroupHomeDir(homeDir: string): string {
-  fs.mkdirSync(homeDir, { recursive: true });
-  for (const entry of fs.readdirSync(homeDir)) {
-    const full = path.join(homeDir, entry);
-    try {
-      if (fs.statSync(full).isFile()) fs.unlinkSync(full);
-    } catch {
-      /* race with container shutdown, ignore */
-    }
-  }
-  return homeDir;
-}
 
 /**
  * `docker stop -t` takes integer seconds; config carries `GRACEFUL_STOP_MS`
@@ -220,12 +202,46 @@ export async function shutdownContainers(): Promise<void> {
   );
 }
 
+/**
+ * Prepare a per-group persistent home directory backing `/home/node`.
+ *
+ * Subdirectories (app config / caches like `.config/gh/`, `.aws/`, `.npm/`)
+ * survive across runs so tool state isn't lost between sessions. Top-level
+ * flat files in `~/` are removed on every launch to prevent dotfile injection
+ * (`.bashrc`, `.profile`, `.bash_profile`) from carrying between sessions —
+ * this wipe is the security boundary, not incidental cleanup. Nested files
+ * (e.g. `.config/gh/hosts.yml`) are untouched.
+ *
+ * Returns the absolute dir so the caller can mount it.
+ */
+export function prepareGroupHomeDir(homeDir: string): string {
+  fs.mkdirSync(homeDir, { recursive: true });
+  for (const entry of fs.readdirSync(homeDir)) {
+    const full = path.join(homeDir, entry);
+    try {
+      if (fs.statSync(full).isFile()) fs.unlinkSync(full);
+    } catch {
+      /* race with container shutdown, ignore */
+    }
+  }
+  return homeDir;
+}
+
 export function getActiveContainerCount(): number {
   return activeContainers.size;
 }
 
 export function isContainerRunning(sessionId: string): boolean {
   return activeContainers.has(sessionId);
+}
+
+/**
+ * Docker container name for a running session, or null if no container is
+ * active for it. Used by the interactive OAuth flow to `docker exec` a
+ * captured auth code into the container's localhost callback.
+ */
+export function getContainerName(sessionId: string): string | null {
+  return activeContainers.get(sessionId)?.containerName ?? null;
 }
 
 /**
@@ -354,7 +370,7 @@ async function spawnContainer(session: Session): Promise<void> {
   // A throwing observer is wrapped in FatalSpawnError by the registry; the
   // throw propagates without local handling because no cleanups have been
   // collected yet at that point.
-  const spawnPre: MergedSpawnPre = fireSpawnPre({ agentGroup, session });
+  const spawnPre: MergedSpawnPre = fireSpawnPre({ agentGroup, session, providerName: provider, containerConfig });
 
   const mounts = buildMounts(agentGroup, session, containerConfig, contribution, groupContribution, spawnPre);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
@@ -379,10 +395,7 @@ async function spawnContainer(session: Session): Promise<void> {
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
     killedSessions.delete(session.id);
-    fireContainerExited(
-      { agentGroup, session, containerName, exitCode, reason },
-      spawnPre.cleanups,
-    );
+    fireContainerExited({ agentGroup, session, containerName, exitCode, reason }, spawnPre.cleanups);
     // Release the slot + clear any eviction mark, then hand it to waiting
     // sessions (FIFO drain). Runs after activeContainers.delete so occupancy
     // already reflects the freed slot. Also covers the pre-spawn error path
@@ -474,20 +487,15 @@ async function spawnContainer(session: Session): Promise<void> {
  * default 1s path is synchronous and immediate, for stuck-container kills
  * (ceiling / claim-stuck) where graceful wind-down can't work anyway.
  */
-export function killContainer(
-  sessionId: string,
-  reason: string,
-  onExit?: () => void,
-  graceSeconds = 1,
-): void {
+export function killContainer(sessionId: string, reason: string, onExit?: () => void, graceSeconds = 1): void {
   const entry = activeContainers.get(sessionId);
   if (!entry) return;
 
+  killedSessions.add(sessionId);
   if (onExit) {
     entry.process.once('close', onExit);
   }
 
-  killedSessions.add(sessionId);
   log.info('Killing container', { sessionId, reason, containerName: entry.containerName, graceSeconds });
   if (graceSeconds > 1) {
     // Graceful: don't block the event loop; SIGTERM handler winds the turn down.
@@ -517,12 +525,6 @@ export function killContainer(
  *
  * Pure so the precedence can be unit-tested without a DB or filesystem.
  */
-export function resolveProviderName(
-  sessionProvider: string | null | undefined,
-  containerConfigProvider: string | null | undefined,
-): string {
-  return (sessionProvider || containerConfigProvider || 'claude').toLowerCase();
-}
 
 function resolveProviderContribution(
   session: Session,
@@ -735,6 +737,28 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
   }
 }
 
+/**
+ * Opening flags shared by every spawned container. Exported for unit-test
+ * coverage of the security baseline (no-new-privileges is required for the
+ * root-drop entrypoint's setpriv to be a real boundary; the test asserts it
+ * is present unconditionally).
+ */
+export function baseRunArgs(containerName: string): string[] {
+  return [
+    'run',
+    '--rm',
+    '--name',
+    containerName,
+    '--label',
+    CONTAINER_INSTALL_LABEL,
+    // Prevent privilege regain via setuid binaries. Required for the root-
+    // drop launch path (where the entrypoint setpriv-drops before exec-ing
+    // bun) to be a real security boundary, not a soft suggestion. Cheap
+    // defense-in-depth for rootless too.
+    '--security-opt=no-new-privileges',
+  ];
+}
+
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
@@ -747,7 +771,7 @@ async function buildContainerArgs(
   spawnPre: MergedSpawnPre,
   launchMode: import('./modules/container-bootstrap/index.js').LaunchMode,
 ): Promise<string[]> {
-  const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
+  const args: string[] = baseRunArgs(containerName);
 
   // Container-bootstrap onSpawnPre args (e.g. --network nanoclaw --ip 10.0.0.5
   // from the IP observer). Must precede the image arg; appended later would
@@ -780,36 +804,47 @@ async function buildContainerArgs(
     args.push('-e', `${key}=${value}`);
   }
 
-  // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls
-  // are routed through the agent vault for credential injection. Treated as
-  // a transient hard failure: if we can't wire the gateway, we don't spawn.
-  // The caller (router or host-sweep) catches the throw, leaves the inbound
-  // message pending, and the next sweep tick retries.
-  if (agentIdentifier) {
-    await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
-  }
-  const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
-  if (!onecliApplied) {
-    throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
-  }
-  log.info('OneCLI gateway applied', { containerName });
+  // Sync-action / host-rpc wiring: the container reaches the host-rpc server at
+  // host.docker.internal:$NANOCLAW_HOST_RPC_PORT. The caller's session is
+  // resolved host-side from its IP (the IP registry), so no session id is
+  // injected. See src/modules/sync-actions/.
+  args.push('-e', `NANOCLAW_HOST_RPC_PORT=${hostRpcPort()}`);
 
-  // Egress lockdown when enabled — throws if it can't be established, aborting
-  // the spawn rather than running with open egress. Otherwise the host gateway.
-  if (ensureEgressNetwork()) {
-    args.push(...egressNetworkArgs());
-    log.info('Egress lockdown active', { containerName, network: EGRESS_NETWORK });
+  // Egress. When the native MITM credential proxy is live it owns egress (the
+  // mitm lifecycle observer already injected HTTP_PROXY + CA into the spawn
+  // args), so skip the OneCLI gateway — it would otherwise fight the proxy for
+  // HTTPS_PROXY.
+  //
+  // Without the proxy, OneCLI is the credential path: injects HTTPS_PROXY +
+  // certs so container API calls route through the agent vault. Treated as a
+  // transient hard failure — if we can't wire the gateway we don't spawn; the
+  // caller leaves the inbound pending and the next sweep tick retries.
+  if (hasProxyInstance()) {
+    log.info('Native credential proxy active — skipping OneCLI gateway', { containerName });
   } else {
-    args.push(...hostGatewayArgs());
+    if (agentIdentifier) {
+      await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
+    }
+    const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
+    if (!onecliApplied) {
+      throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
+    }
+    log.info('OneCLI gateway applied', { containerName });
   }
 
-  // Privilege mode. rootless → --user UID:GID. root-drop → no --user, but
-  // HOST_UID/HOST_GID env so the entrypoint's setpriv block drops cleanly
-  // before exec-ing bun.
+  // Host gateway
+  args.push(...hostGatewayArgs());
+
+  // Privilege mode. rootless → --user UID:GID. root-drop → --user 0:0 to
+  // override the image's USER node directive (the entrypoint needs root
+  // to run iptables / update-ca-certificates / setpriv), then HOST_UID/
+  // HOST_GID env tells the entrypoint who to setpriv-drop to before
+  // exec-ing bun.
   if (launchMode.kind === 'rootless' && launchMode.userArg) {
     args.push('--user', launchMode.userArg);
     args.push('-e', 'HOME=/home/node');
   } else if (launchMode.kind === 'root-drop') {
+    args.push('--user', '0:0');
     args.push('-e', `HOST_UID=${launchMode.envVars.HOST_UID}`);
     args.push('-e', `HOST_GID=${launchMode.envVars.HOST_GID}`);
     args.push('-e', 'HOME=/home/node');

@@ -92,15 +92,6 @@ import { wakeContainer } from '../../container-runner.js';
 // Skip predicates
 // ---------------------------------------------------------------------------
 
-function dockerAvailable(): boolean {
-  try {
-    execSync('docker info', { stdio: 'pipe', timeout: 5000 });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function imageAvailable(tag: string): boolean {
   try {
     execSync(`docker image inspect ${tag}`, { stdio: 'pipe', timeout: 5000 });
@@ -110,13 +101,12 @@ function imageAvailable(tag: string): boolean {
   }
 }
 
-const HAVE_DOCKER = dockerAvailable();
-const HAVE_IMAGE = HAVE_DOCKER && imageAvailable(CONTAINER_IMAGE);
+const HAVE_IMAGE = imageAvailable(CONTAINER_IMAGE);
 // Skip only when there's nothing to test against — no Docker, or no image at
 // all. A built-but-wrong-shape image (e.g. a stale v1 build missing bun)
 // will exit 127 inside the container and trip the `expect(exitCode).toBe(0)`
 // assertion — no need for a separate pre-flight probe.
-const RUN_E2E = HAVE_DOCKER && HAVE_IMAGE;
+const RUN_E2E = HAVE_IMAGE;
 
 // ---------------------------------------------------------------------------
 // Probe — overwrites the snapshot's agent-runner index.ts and reports the

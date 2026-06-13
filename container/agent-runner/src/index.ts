@@ -27,6 +27,7 @@ import { fileURLToPath } from 'url';
 
 import { loadConfig } from './config.js';
 import { buildSystemPromptAddendum } from './destinations.js';
+import { ensureEnvVarsFile } from './env-vars.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
@@ -64,6 +65,10 @@ async function main(): Promise<void> {
   const providerName = config.provider.toLowerCase() as ProviderName;
 
   log(`Starting v2 agent-runner (provider: ${providerName})`);
+
+  // Ensure the BASH_ENV file exists before any Bash tool call (created as the
+  // agent uid). get_credential's --envVar appends export lines here.
+  ensureEnvVarsFile();
 
   // Runtime-generated system-prompt addendum: agent identity (name) plus
   // the live destinations map. Everything else (capabilities, per-module

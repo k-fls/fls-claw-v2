@@ -1,0 +1,10 @@
+{
+  "issuer": "https://webflow.com",
+  "authorization_endpoint": "https://webflow.com/oauth/authorize",
+  "token_endpoint": "https://api.webflow.com/oauth/access_token",
+  "revocation_endpoint": "https://webflow.com/oauth/revoke_authorization",
+  "api_base_url": "https://api.webflow.com/v2",
+  "_source": "manually researched from official docs (developers.webflow.com/data/reference/oauth-app)",
+  "_note": "Webflow OAuth2. Authorization codes are valid for 15 minutes. Supports authorization_code grant type. The revocation endpoint revokes an app's authorization for a specific user.",
+  "_well_known_url": false
+}

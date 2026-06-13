@@ -60,7 +60,6 @@ export {
   CONTAINER_FEEDBACK,
   MITM_FEEDBACK,
   PRODUCER,
-  REAUTH,
   UX,
   RUNTIME_UPDATER,
 } from './providers/types.js';
@@ -75,8 +74,6 @@ export type {
   FeedbackAction,
   MitmFeedbackExt,
   ProducerExt,
-  ReauthExt,
-  ReauthContext,
   UxExt,
   RuntimeUpdaterExt,
   ContributionInput,
@@ -92,6 +89,10 @@ export type {
   ContainerContributionCtx,
   ContainerContributionResult,
 } from './providers/contributions.js';
+
+// ── Reauth (mid-session) ────────────────────────────────────────────────────
+export { REAUTH } from './reauth.js';
+export type { ReauthExt, ReauthContext } from './reauth.js';
 
 export { defaultManifestBuilder, noManifestSideEffect } from './providers/defaults.js';
 
@@ -180,3 +181,19 @@ registerHostCommand('/creds', handleCredsCommand, {
   access: 'group-admin',
   help: CREDS_HELP,
 });
+
+// Side-effect: registers the spawn-time credential-provider validation
+// observer. Dormant until a provider declares an AGENT_RUNTIME extension.
+import './spawn-validation.js';
+
+// Side-effect: registers the `feedback.container` delivery action (the
+// mid-session reauth dispatcher). Dormant until a provider declares a
+// CONTAINER_FEEDBACK extension.
+import './reauth-dispatcher.js';
+export { requestReauth, sanitizeReason, _resetReauthDispatcherForTests } from './reauth-dispatcher.js';
+
+// Side-effect: registers the `/auth/*` host-rpc handler (the browser-auth
+// container↔user bridge). Dormant until a provider opens an auth episode.
+import './auth-bridge.js';
+export { startAuthEpisode, _resetAuthBridgeForTests } from './auth-bridge.js';
+export type { AuthEpisodeHandle, AuthCodeResult } from './auth-bridge.js';

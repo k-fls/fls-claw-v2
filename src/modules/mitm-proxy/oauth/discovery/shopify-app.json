@@ -1,0 +1,10 @@
+{
+  "authorization_endpoint": "https://{shop}.myshopify.com/admin/oauth/authorize",
+  "token_endpoint": "https://{shop}.myshopify.com/admin/oauth/access_token",
+  "api_base_url": "https://{shop}.myshopify.com/admin/api/{api_version}",
+  "_source": "manually researched from official docs (shopify.dev/docs/apps/build/authentication-authorization)",
+  "_note": "Per-shop app OAuth. {shop} is the store name. {api_version} is e.g. 2024-01. The accounts.shopify.com OIDC (see shopify.json) is Shopify's centralized identity provider for merchant login. This file covers the per-shop app installation OAuth flow which uses different endpoints on {shop}.myshopify.com.",
+  "_host_patterns": [
+    "{shop}.myshopify.com"
+  ]
+}

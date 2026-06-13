@@ -1,0 +1,9 @@
+{
+  "issuer": "https://airtable.com",
+  "authorization_endpoint": "https://airtable.com/oauth2/v1/authorize",
+  "token_endpoint": "https://airtable.com/oauth2/v1/token",
+  "api_base_url": "https://api.airtable.com/v0",
+  "_source": "manually researched from official docs (airtable.com/developers/web/api/oauth-reference and airtable.com/developers/web/guides/oauth-integrations)",
+  "_note": "Airtable OAuth2 uses PKCE (code_challenge / code_verifier). Refresh tokens expire after 60 days of inactivity. When refreshing, Airtable issues a new refresh token and invalidates the previous one -- always persist the new refresh_token. No dedicated token revocation endpoint appears to be publicly documented. Alternative auth: Personal Access Tokens (PATs) created in the Airtable UI.",
+  "_well_known_url": false
+}

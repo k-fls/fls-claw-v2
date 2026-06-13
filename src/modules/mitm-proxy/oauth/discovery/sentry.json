@@ -1,0 +1,15 @@
+{
+  "issuer": "https://sentry.io",
+  "authorization_endpoint": "https://sentry.io/oauth/authorize/",
+  "token_endpoint": "https://sentry.io/oauth/token/",
+  "api_base_url": "https://sentry.io/api/0/",
+  "_source": "manually researched from official docs",
+  "_docs": "https://docs.sentry.io/api/auth/",
+  "_note": "For self-hosted Sentry, replace sentry.io with your instance hostname. Access tokens expire after 30 days. Supports PKCE (S256). Also supports device authorization flow via https://sentry.io/oauth/device/code/. Authorization code grant type.",
+  "_self_hosted": {
+    "authorization_endpoint": "https://{sentry_host}/oauth/authorize/",
+    "token_endpoint": "https://{sentry_host}/oauth/token/",
+    "api_base_url": "https://{sentry_host}/api/0/"
+  },
+  "_well_known_url": false
+}

@@ -1,0 +1,10 @@
+{
+  "issuer": "https://id.heroku.com",
+  "authorization_endpoint": "https://id.heroku.com/oauth/authorize",
+  "token_endpoint": "https://id.heroku.com/oauth/token",
+  "userinfo_endpoint": "https://api.heroku.com/account",
+  "api_base_url": "https://api.heroku.com",
+  "_source": "manually researched from official docs",
+  "_note": "No standard revocation endpoint; revoke via DELETE https://api.heroku.com/oauth/authorizations/{authorization_id}. Access tokens are prefixed with HRKU-. API requests require Accept: application/vnd.heroku+json; version=3 header.",
+  "_well_known_url": false
+}

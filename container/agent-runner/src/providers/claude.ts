@@ -328,6 +328,70 @@ const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WIN
  */
 const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not found/i;
 
+// ── Auth-error classification ──
+//
+// Ported from v1's classifyAuthError
+// (docs/fls/v1-group-oauth-snapshot/src/auth/providers/claude.ts). v1 matched
+// the proxy's streaming-text output with an anchored `^…$` regex; here we
+// classify the *thrown* SDK error, whose `.message` may be wrapped by the SDK
+// or the CLI subprocess, so the structured matcher is intentionally unanchored.
+// Both the status-code path (401/403 with a well-formed Anthropic error body)
+// and the SDK synthetic-phrase path collapse to one tag — 'auth-invalid' — the
+// only honest signal the container can produce: the credential proxy already
+// attempts silent OAuth refresh on the wire before any 401 reaches the
+// container, so whatever surfaces here needs host-side reauth, not a refresh.
+
+/**
+ * Anthropic API error frame. The remainder after the status code is NOT
+ * required to be JSON: observed live (claude-code 2.1.x), the same 401
+ * surfaces in several textual shapes — `API Error: 401 {"type":"error",…}`,
+ * `API Error: 401 Invalid bearer token`, `API Error: 401 Invalid
+ * authentication credentials` — so the status code alone decides.
+ */
+const API_ERROR_RE = /API Error:\s*(\d{3})\b/;
+
+/** HTTP statuses that mean the credential must be replaced (reauth path). */
+const AUTH_STATUS_CODES = new Set([401, 403]);
+
+/**
+ * SDK synthetic auth phrases — messages that carry no `API Error:` frame at
+ * all, e.g. "Invalid API key · Fix external API key".
+ */
+const SDK_AUTH_PHRASES = ['invalid api key', 'authentication_failed', 'fix external api key', 'invalid bearer token'];
+
+/**
+ * Map a Claude error to a host-facing classification tag, or `undefined` when
+ * it is not a recognized auth failure (the poll-loop omits `classification` in
+ * that case). See the block comment above for why every recognized case maps
+ * to 'auth-invalid'.
+ */
+export function classifyClaudeError(err: unknown): string | undefined {
+  const raw = (err instanceof Error ? err.message : String(err)).trim();
+
+  const m = API_ERROR_RE.exec(raw);
+  if (m && AUTH_STATUS_CODES.has(parseInt(m[1], 10))) return 'auth-invalid';
+
+  const lower = raw.toLowerCase();
+  if (SDK_AUTH_PHRASES.some((p) => lower.includes(p))) return 'auth-invalid';
+
+  return undefined;
+}
+
+/**
+ * Classify an SDK *result message* by its structured error fields only.
+ * `is_error` / `api_error_status` are set by the SDK, not the model — result
+ * TEXT is model output and must never drive classification (an agent answer
+ * that merely quotes "API Error: 401" would otherwise be swallowed and
+ * trigger a bogus reauth). Live-verified (2026-06-10): a genuine 401 arrives
+ * as `subtype=success, is_error=true, api_error_status=401`.
+ */
+export function classifyResultMessage(r: { is_error?: boolean; api_error_status?: number | null }): string | undefined {
+  if (r.is_error === true && r.api_error_status != null && AUTH_STATUS_CODES.has(r.api_error_status)) {
+    return 'auth-invalid';
+  }
+  return undefined;
+}
+
 export class ClaudeProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = true;
 
@@ -353,6 +417,10 @@ export class ClaudeProvider implements AgentProvider {
   isSessionInvalid(err: unknown): boolean {
     const msg = err instanceof Error ? err.message : String(err);
     return STALE_SESSION_RE.test(msg);
+  }
+
+  classifyError(err: unknown): string | undefined {
+    return classifyClaudeError(err);
   }
 
   maybeRotateContinuation(continuation: string): string | null {
@@ -440,8 +508,29 @@ export class ClaudeProvider implements AgentProvider {
         if (message.type === 'system' && message.subtype === 'init') {
           yield { type: 'init', continuation: message.session_id };
         } else if (message.type === 'result') {
-          const text = 'result' in message ? (message as { result?: string }).result ?? null : null;
-          yield { type: 'result', text };
+          const r = message as { result?: string; subtype?: string; is_error?: boolean; api_error_status?: number | null };
+          const text = r.result ?? null;
+          // Structured error markers — SDK-set, the model cannot forge them.
+          log(`Result message: subtype=${r.subtype} is_error=${r.is_error} api_error_status=${r.api_error_status ?? 'null'}`);
+          // The SDK reports some auth failures as a *normal* result message —
+          // no throw, no error event (observed live: a 401 arrived as
+          // subtype=success, is_error=true, api_error_status=401, with the
+          // failure prose in `result`). Classification is decided ONLY by the
+          // structured fields — never by result text, which is model output
+          // and therefore spoofable (v1's guard drew the same trust line:
+          // protocol-set error fields are trusted; agent text is not). The
+          // text is used purely as the human-readable message. On
+          // classification the failure text is NOT yielded as the result:
+          // dispatching it would land in scratchpad and trigger the "response
+          // not wrapped" nudge, burning another doomed turn against the dead
+          // credential. A null result still ends the turn.
+          const classification = classifyResultMessage(r);
+          if (classification) {
+            yield { type: 'error', message: text ?? `API error ${r.api_error_status}`, retryable: false, classification };
+            yield { type: 'result', text: null };
+          } else {
+            yield { type: 'result', text };
+          }
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {

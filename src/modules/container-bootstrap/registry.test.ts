@@ -16,6 +16,8 @@ vi.mock('../../log.js', () => ({
 const mkCtx = (): SpawnPreContext => ({
   agentGroup: { id: 'ag-1', folder: 'ag-1', name: 'ag', agent_provider: null } as unknown as AgentGroup,
   session: { id: 'sess-1', agent_group_id: 'ag-1' } as unknown as Session,
+  providerName: 'mock',
+  containerConfig: { mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: [] },
 });
 
 const mkLifeCtx = (): LifecycleContext => ({ ...mkCtx(), containerName: 'c1' });

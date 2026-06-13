@@ -1,0 +1,21 @@
+{
+  "authorization_endpoint": "https://app.{site}/oauth2/v1/authorize",
+  "token_endpoint": "https://api.{site}/oauth2/v1/token",
+  "revocation_endpoint": "https://api.{site}/oauth2/v1/revoke",
+  "api_base_url": "https://api.{site}",
+  "_source": "manually researched from official docs",
+  "_docs": "https://docs.datadoghq.com/developers/authorization/oauth2_endpoints/",
+  "_note": "{site} is the Datadog site domain. The authorize endpoint uses 'app.' prefix while token/revoke use 'api.' prefix. Access tokens have a 1-hour TTL. PKCE (S256) is supported.",
+  "_host_patterns": [
+    "app.{site}",
+    "api.{site}"
+  ],
+  "_known_sites": [
+    "datadoghq.com",
+    "us3.datadoghq.com",
+    "us5.datadoghq.com",
+    "datadoghq.eu",
+    "ap1.datadoghq.com",
+    "ddog-gov.com"
+  ]
+}

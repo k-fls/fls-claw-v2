@@ -1,0 +1,20 @@
+{
+  "authorization_endpoint": "https://wise.com/oauth/authorize/",
+  "token_endpoint": "https://api.wise.com/oauth/token",
+  "api_base_url": "https://api.wise.com",
+  "_source": "manually researched from official docs",
+  "_docs": "https://docs.wise.com/guides/developer/auth-and-security",
+  "_note": "Wise uses OAuth2 authorization_code grant. Access tokens valid for 12 hours, refresh tokens for 20 years. Production also offers mTLS endpoint at api-mtls.transferwise.com. Supports client_credentials, authorization_code, registration_code, and refresh_token grant types.",
+  "_sandbox": {
+    "authorization_endpoint": "https://wise-sandbox.com/oauth/authorize/",
+    "token_endpoint": "https://api.wise-sandbox.com/oauth/token",
+    "api_base_url": "https://api.wise-sandbox.com",
+    "api_base_url_mtls": "https://api-mtls.wise-sandbox.com"
+  },
+  "_production": {
+    "authorization_endpoint": "https://wise.com/oauth/authorize/",
+    "token_endpoint": "https://api.wise.com/oauth/token",
+    "api_base_url": "https://api.wise.com",
+    "api_base_url_mtls": "https://api-mtls.transferwise.com"
+  }
+}

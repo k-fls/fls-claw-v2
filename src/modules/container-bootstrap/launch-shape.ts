@@ -21,6 +21,7 @@ export interface LaunchShape {
  *   - snapshot `agent-runner/src` → `/app/src`
  *   - snapshot `skills` → `/app/skills`
  *   - snapshot `CLAUDE.md` → `/app/CLAUDE.md` (if present)
+ *   - snapshot `shims/xdg-open` → `/usr/local/bin/xdg-open` + `/usr/bin/xdg-open` (if present)
  */
 export function defaultLaunchShape(): LaunchShape {
   const mounts: VolumeMount[] = [];
@@ -28,6 +29,17 @@ export function defaultLaunchShape(): LaunchShape {
   const entrypoint = snapshotPath('entrypoint.sh');
   if (fs.existsSync(entrypoint)) {
     mounts.push({ hostPath: entrypoint, containerPath: '/app/entrypoint.sh', readonly: true });
+  }
+
+  // OAuth browser-launch interceptor. Mounted at BOTH the PATH location and
+  // the absolute /usr/bin path (v1 parity) — some tools `xdg-open` via PATH,
+  // others invoke /usr/bin/xdg-open directly. Relays known OAuth authorize
+  // URLs to the host (see `mitm-proxy/browser-open-action.ts`); harmless if a
+  // tool never calls it.
+  const xdgOpen = snapshotPath('shims/xdg-open');
+  if (fs.existsSync(xdgOpen)) {
+    mounts.push({ hostPath: xdgOpen, containerPath: '/usr/local/bin/xdg-open', readonly: true });
+    mounts.push({ hostPath: xdgOpen, containerPath: '/usr/bin/xdg-open', readonly: true });
   }
 
   const agentRunnerSrc = snapshotPath('agent-runner/src');

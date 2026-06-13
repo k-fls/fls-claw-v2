@@ -33,6 +33,8 @@ import { log } from './log.js';
 import { resolveSession, writeSessionMessage } from './session-manager.js';
 import { deliverDirect } from './delivery.js';
 import { wakeContainer } from './container-runner.js';
+import { maybeBeginCredentialAcquisition } from './credential-acquisition.js';
+import { clearSpawnPoison, FatalSpawnError } from './spawn-failure.js';
 import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
@@ -576,11 +578,42 @@ async function deliverToAgent(
     startTypingRefresh(session.id, session.agent_group_id, event.channelType, event.platformId, event.threadId);
     const freshSession = getSession(session.id);
     if (freshSession) {
-      const woke = await wakeContainer(freshSession);
-      // wakeContainer never throws — it returns false on transient spawn
-      // failure (host-sweep retries). Stop the typing indicator we just
-      // started so it doesn't leak; the inbound row stays pending.
-      if (!woke) stopTypingRefresh(freshSession.id);
+      // A new inbound from the user is the "I've seen the prior error, try
+      // again" signal — drop any spawn-poison flag from a previous fatal
+      // failure so this attempt gets a fresh shot.
+      clearSpawnPoison(freshSession.id);
+      // Wake-time credential gate: the inbound was already persisted above; if
+      // the runtime needs a credential the group lacks and the provider can
+      // acquire it interactively, prompt the user instead of spawning. The
+      // pending message is processed on the post-acquire re-wake. (The
+      // onSpawnPre spawn validator is the backstop for non-interactive wakes.)
+      if (maybeBeginCredentialAcquisition({ agentGroup, session: freshSession, deliveryAddr, userId })) {
+        stopTypingRefresh(freshSession.id);
+        return;
+      }
+      try {
+        const woke = await wakeContainer(freshSession);
+        // Retryable failure: wakeContainer returned false. Stop the typing
+        // indicator we just started so it doesn't leak; the inbound row
+        // stays pending and host-sweep retries.
+        if (!woke) stopTypingRefresh(freshSession.id);
+      } catch (err) {
+        // Non-retryable: wakeContainer threw FatalSpawnError. Surface the
+        // error to the originating user via the same channel address the
+        // inbound came from. Inbound row stays pending; sweep will skip
+        // it because the session is now poisoned.
+        stopTypingRefresh(freshSession.id);
+        if (err instanceof FatalSpawnError) {
+          deliverDirect(
+            deliveryAddr.channelType,
+            deliveryAddr.platformId,
+            deliveryAddr.threadId,
+            `Container spawn aborted: ${err.message}`,
+          );
+        } else {
+          log.error('wakeContainer rejected with unexpected error', { sessionId: freshSession.id, err });
+        }
+      }
     }
   }
 }

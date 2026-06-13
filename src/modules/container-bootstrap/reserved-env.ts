@@ -2,14 +2,15 @@
  * Reserved container env-var registry.
  *
  * Single source of truth for "which env-var names is the host
- * already injecting into containers." Consumed by per-group custom-env
- * validation (and any future runtime-override path) to reject overrides
- * that would silently shadow a host-controlled var.
+ * already injecting into containers." Consumed by the mitm-proxy
+ * substitute endpoint (and any future runtime-substitute path) to
+ * reject `?envVar=NAME` overrides that would silently shadow a
+ * host-controlled var.
  *
  * Each contributor of `-e` flags reserves the names it injects, at
  * module load:
  *
- *   reserveEnvName('SOME_HOST_VAR', 'some-contributor');
+ *   reserveEnvName('HTTP_PROXY', 'mitm-proxy');
  *
  * The container-runner registers its own statics
  * (`TZ`, `HOME`, `HOST_UID`, `HOST_GID`) below.

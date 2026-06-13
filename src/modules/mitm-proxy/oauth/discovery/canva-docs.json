@@ -1,0 +1,9 @@
+{
+  "authorization_endpoint": "https://www.canva.com/api/oauth/authorize",
+  "token_endpoint": "https://api.canva.com/rest/v1/oauth/token",
+  "introspection_endpoint": "https://api.canva.com/rest/v1/oauth/introspect",
+  "revocation_endpoint": "https://api.canva.com/rest/v1/oauth/revoke",
+  "api_base_url": "https://api.canva.com/rest/v1",
+  "_source": "https://www.canva.dev/docs/connect/api-reference/authentication/generate-access-token/",
+  "_note": "Token endpoint from official Canva Connect API docs uses /rest/v1/ path prefix. The OIDC discovery doc (canva.json) reports /auth/v1/ instead. Both may be valid. PKCE (S256) required. Access tokens valid for 4 hours."
+}

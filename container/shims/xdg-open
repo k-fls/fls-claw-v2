@@ -1,0 +1,28 @@
+#!/bin/sh
+# xdg-open shim — intercepts OAuth browser launches inside the agent container.
+#
+# A CLI/library that wants the user to authorize calls `xdg-open <authUrl>` to
+# pop a browser. There's no browser in the container, and the URL is meant for
+# the *operator's* browser — so we don't see that request on the wire. This
+# shim asks the host (over host-rpc) whether the URL is a known OAuth authorize
+# endpoint:
+#   - known  → the host surfaces the URL to the operator in chat and relays the
+#              resulting code back into this container's localhost callback;
+#              we exit 0 so the calling tool believes a browser opened.
+#   - unknown → fall through to a real xdg-open if the image has one, else exit
+#               1 (a container legitimately has no browser).
+#
+# Bind-mounted over /usr/local/bin/xdg-open at spawn (see launch-shape.ts).
+# NANOCLAW_HOST_RPC_PORT is always injected by the host at spawn; if it were
+# somehow unset the curl just fails (empty result) and we fall through.
+RESULT=$(curl -sf -X POST \
+  "http://host.docker.internal:${NANOCLAW_HOST_RPC_PORT}/oauth/browser-open" \
+  -H "Content-Type: application/json" \
+  -d "{\"url\":\"$1\"}" 2>/dev/null)
+EXIT_CODE=$(echo "$RESULT" | sed -n 's/.*"exit_code":\([0-9]*\).*/\1/p')
+if [ -n "$EXIT_CODE" ]; then
+  exit "$EXIT_CODE"
+fi
+# Pass-through: not a known OAuth URL. Try the real binary if the image has one.
+[ -x /usr/bin/xdg-open.real ] && exec /usr/bin/xdg-open.real "$1"
+exit 1

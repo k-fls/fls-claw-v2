@@ -1,0 +1,12 @@
+{
+  "issuer": "https://app.hubspot.com",
+  "authorization_endpoint": "https://app.hubspot.com/oauth/authorize",
+  "token_endpoint": "https://api.hubapi.com/oauth/v1/token",
+  "response_types_supported": [
+    "code"
+  ],
+  "code_challenge_methods_supported": [
+    "S256"
+  ],
+  "_well_known_url": false
+}

@@ -15,7 +15,12 @@
  * lands in `messages_in`.
  */
 import type { HostCommandContext } from '../../command-gate.js';
-import type { HostInteractionContext } from '../../host-interactions.js';
+import {
+  beginInteractionOn,
+  type HostInteractionContext,
+  type HostInteractionHandler,
+  type InteractionOrigin,
+} from '../../host-interactions.js';
 import { gpgDecryptAt, isPgpMessage, normalizeArmoredBlock } from '../crypto/gpg.js';
 import { log } from '../../log.js';
 import { extractInboundText } from './paste-plain.js';
@@ -44,54 +49,87 @@ export interface PastePgpResult {
 
 const DEFAULT_CANCEL_KEYWORDS = ['cancel', '/cancel', 'stop'];
 
+/**
+ * Shared turn handler: cancel → resolve; non-PGP / decrypt-fail / validate-fail
+ * → re-prompt (slot stays open); valid decrypted cleartext → accept.
+ */
+function buildPgpHandler(
+  cancelSet: Set<string>,
+  gpgHome: string,
+  validate: ((plaintext: string) => string | null) | undefined,
+  resolve: (r: PastePgpResult) => void,
+): HostInteractionHandler {
+  return (hctx: HostInteractionContext): void => {
+    const raw = extractInboundText(hctx.inboundContent);
+    const trimmed = raw.trim();
+
+    if (cancelSet.has(trimmed.toLowerCase())) {
+      hctx.finish();
+      resolve({ text: null, reason: 'cancelled' });
+      return;
+    }
+
+    if (!isPgpMessage(raw)) {
+      hctx.ask(
+        "That doesn't look like a PGP-encrypted message (missing the BEGIN/END headers). " +
+          'Paste the encrypted block, or type "cancel".',
+      );
+      return;
+    }
+
+    const normalized = normalizeArmoredBlock(raw);
+
+    let cleartext: string;
+    try {
+      cleartext = gpgDecryptAt(gpgHome, normalized);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn('pastePgp decrypt failed — re-prompting', { gpgHome, err: msg });
+      hctx.ask(`PGP decrypt failed: ${msg}. Paste the encrypted block again, or type "cancel".`);
+      return;
+    }
+
+    if (validate) {
+      const verr = validate(cleartext);
+      if (verr != null) {
+        hctx.ask(`${verr} Paste the encrypted block again, or type "cancel".`);
+        return;
+      }
+    }
+
+    hctx.finish();
+    resolve({ text: cleartext, reason: 'submitted' });
+  };
+}
+
 export function pastePgp(opts: PastePgpOptions): Promise<PastePgpResult> {
   const cancelSet = new Set((opts.cancelKeywords ?? DEFAULT_CANCEL_KEYWORDS).map((k) => k.trim().toLowerCase()));
 
   return new Promise<PastePgpResult>((resolve) => {
-    const handler = (hctx: HostInteractionContext): void => {
-      const raw = extractInboundText(hctx.inboundContent);
-      const trimmed = raw.trim();
-
-      if (cancelSet.has(trimmed.toLowerCase())) {
-        hctx.finish();
-        resolve({ text: null, reason: 'cancelled' });
-        return;
-      }
-
-      if (!isPgpMessage(raw)) {
-        hctx.ask(
-          "That doesn't look like a PGP-encrypted message (missing the BEGIN/END headers). " +
-            'Paste the encrypted block, or type "cancel".',
-        );
-        return;
-      }
-
-      const normalized = normalizeArmoredBlock(raw);
-
-      let cleartext: string;
-      try {
-        cleartext = gpgDecryptAt(opts.gpgHome, normalized);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        log.warn('pastePgp decrypt failed — re-prompting', { gpgHome: opts.gpgHome, err: msg });
-        hctx.ask(`PGP decrypt failed: ${msg}. Paste the encrypted block again, or type "cancel".`);
-        return;
-      }
-
-      if (opts.validate) {
-        const verr = opts.validate(cleartext);
-        if (verr != null) {
-          hctx.ask(`${verr} Paste the encrypted block again, or type "cancel".`);
-          return;
-        }
-      }
-
-      hctx.finish();
-      resolve({ text: cleartext, reason: 'submitted' });
-    };
-
     opts.ctx.beginInteraction({
-      handler,
+      handler: buildPgpHandler(cancelSet, opts.gpgHome, opts.validate, resolve),
+      initialPrompt: opts.prompt,
+      timeoutMs: opts.timeoutMs,
+      onTimeout: () => resolve({ text: null, reason: 'timeout' }),
+    });
+  });
+}
+
+/** Options for {@link pastePgpOn} — `pastePgp`'s minus the command `ctx`. */
+export type PastePgpOnOptions = Omit<PastePgpOptions, 'ctx'>;
+
+/**
+ * Like {@link pastePgp}, but driven from a raw {@link InteractionOrigin}
+ * instead of a `HostCommandContext` — the non-command entry point a credential
+ * provider uses to request a **GPG-encrypted** secret at wake time (the
+ * plaintext never travels through chat).
+ */
+export function pastePgpOn(origin: InteractionOrigin, opts: PastePgpOnOptions): Promise<PastePgpResult> {
+  const cancelSet = new Set((opts.cancelKeywords ?? DEFAULT_CANCEL_KEYWORDS).map((k) => k.trim().toLowerCase()));
+
+  return new Promise<PastePgpResult>((resolve) => {
+    beginInteractionOn(origin, {
+      handler: buildPgpHandler(cancelSet, opts.gpgHome, opts.validate, resolve),
       initialPrompt: opts.prompt,
       timeoutMs: opts.timeoutMs,
       onTimeout: () => resolve({ text: null, reason: 'timeout' }),

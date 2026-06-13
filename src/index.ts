@@ -12,14 +12,13 @@ import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
+import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { ensureContainerNetwork, initSnapshot } from './modules/container-bootstrap/index.js';
 import { startHostRpcServer } from './modules/host-rpc/index.js';
-import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { routeInbound } from './router.js';
 import { shutdownContainers } from './container-runner.js';
-import { registerClaudeCredentialProvider } from './providers/claude-credential.js';
 import { log } from './log.js';
 import { enforceUpgradeTripwire } from './upgrade-state.js';
 
@@ -62,8 +61,27 @@ import './modules/index.js';
 // CLI command barrel — populates the `ncl` registry before the CLI server
 // accepts connections.
 import './cli/commands/index.js';
+
+// Top-level host commands. Side-effect registration.
+import './commands/stop.js'; // /stop (B1a)
 import './cli/delivery-action.js';
 import { startCliServer, stopCliServer } from './cli/socket-server.js';
+
+// Native-path credential providers (this branch runs the MITM proxy as the
+// credential path). Registered explicitly at boot (not via the modules barrel)
+// so unit tests don't arm the spawn-time validator unexpectedly.
+import { registerClaudeCredentialProvider } from './providers/claude-credential.js';
+import { registerGithubCredentialProvider } from './providers/github-credential.js';
+import {
+  CredentialProxy,
+  setProxyInstance,
+  initTokenEngine,
+  initOAuthModule,
+  oauthInteractive,
+  dockerExecDeliver,
+} from './modules/mitm-proxy/index.js';
+import { getOrCreateResolverForAgentGroup } from './modules/credentials/index.js';
+import { CREDENTIAL_PROXY_PORT } from './config.js';
 
 import type { ChannelAdapter, ChannelSetup } from './channels/adapter.js';
 import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from './channels/channel-registry.js';
@@ -84,12 +102,6 @@ async function main(): Promise<void> {
   runMigrations(db);
   log.info('Central DB ready', { path: dbPath });
 
-  // Native-path credential providers. Registered explicitly (not via the
-  // modules barrel) so unit tests don't arm the spawn-time validator
-  // unexpectedly. Baseline here is the non-mitm claude runtime; mitm-proxy and
-  // runtime-updater modify the provider file in place.
-  registerClaudeCredentialProvider();
-
   // 1b. Backfill container_configs from legacy container.json files.
   // Idempotent — skips groups that already have a config row.
   backfillContainerConfigs();
@@ -99,12 +111,32 @@ async function main(): Promise<void> {
 
   // 2. Container runtime
   ensureContainerRuntimeRunning();
-  cleanupOrphans();
-
   ensureContainerNetwork();
   // Snapshot the container/ tree so in-flight containers don't see mid-run
   // host edits. Must precede router/sweep/delivery — they can wake containers.
   initSnapshot();
+  cleanupOrphans();
+
+  // Native credential proxy. Order matters: init the token engine, register the
+  // Claude provider (its substitution facet reads the engine), then start the
+  // proxy (whose rebuildIndex picks up the registered provider's swap rules),
+  // publish the instance (the lifecycle observer then routes every container's
+  // egress through it), and init the OAuth module for the discovery providers.
+  initTokenEngine((scope) => getOrCreateResolverForAgentGroup(scope));
+  registerClaudeCredentialProvider();
+  registerGithubCredentialProvider();
+  const credentialProxy = new CredentialProxy();
+  // Bind all interfaces, not just loopback: containers reach the proxy via
+  // host.docker.internal (the host-gateway IP), so a 127.0.0.1-only bind is
+  // refused from inside a container.
+  await credentialProxy.start({ port: CREDENTIAL_PROXY_PORT, host: '0.0.0.0' });
+  setProxyInstance(credentialProxy);
+  initOAuthModule({
+    proxy: credentialProxy,
+    oauthEvents: oauthInteractive,
+    deliverCallback: dockerExecDeliver,
+  });
+  log.info('Credential proxy live', { port: credentialProxy.getBoundPort() });
 
   // 2b. Host-RPC server — containers reach it over the bridge network.
   // Started after the network exists so the bind is meaningful.

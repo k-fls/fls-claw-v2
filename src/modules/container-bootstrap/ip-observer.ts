@@ -15,7 +15,14 @@ import { asContainerScope } from './types.js';
 
 registerContainerLifecycleObserver('container-ip', {
   onSpawnPre(ctx) {
-    const allocated = allocateContainerIP(asContainerScope(ctx.agentGroup.id), ctx.session.id);
+    // Scope key is the agent-group **folder**, not its id: the credential /
+    // substitute / MITM stack is folder-keyed throughout
+    // (`getOrCreateResolverForAgentGroup(ownFolder)`, `credentialsDir/<folder>`,
+    // substitutes minted under `asGroupScope(folder)`). The proxy resolves a
+    // request's scope via `lookupContainerIP(sourceIP)` and feeds it straight
+    // into `resolveSubstitute`, so this must be the folder or the swap can't
+    // find the minted substitute.
+    const allocated = allocateContainerIP(asContainerScope(ctx.agentGroup.folder), ctx.session.id);
     return {
       args: [...networkArgs(allocated.ip)],
       cleanup: () => allocated.release(),

@@ -35,6 +35,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         fonts-noto-color-emoji \
         libgbm1 \
         libnss3 \
+        libnss3-tools \
         libatk-bridge2.0-0 \
         libgtk-3-0 \
         libx11-xcb1 \
@@ -49,8 +50,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         ca-certificates \
         curl \
         git \
+        openssh-client \
         tini \
         unzip \
+        util-linux \
+        iptables \
     && if [ "$INSTALL_CJK_FONTS" = "true" ]; then \
         apt-get install -y --no-install-recommends fonts-noto-cjk; \
        fi \
@@ -90,7 +94,10 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 #     binary (linux-arm64 variant on our image). Without the allowlist
 #     the SDK fails at spawn time with "native binary not found".
 ENV PNPM_HOME="/pnpm"
-ENV PATH="$PNPM_HOME:$PATH"
+# $PNPM_HOME/bin is where pnpm 10+ puts global bins; $PNPM_HOME stays for
+# backward compatibility. Without /pnpm/bin on PATH, `pnpm install -g` exits
+# with "configured global bin directory '/pnpm/bin' is not in PATH".
+ENV PATH="$PNPM_HOME/bin:$PNPM_HOME:$PATH"
 # Pin pnpm to match the host (package.json packageManager). pnpm 11 stopped
 # honoring `only-built-dependencies[]=` in .npmrc for global installs, which
 # silently skips claude-code's native-binary postinstall and agent-browser's
@@ -116,8 +123,11 @@ RUN printf '#!/bin/sh\nexec bun /app/src/cli/ncl.ts "$@"\n' > /usr/local/bin/ncl
     chmod +x /usr/local/bin/ncl
 
 # ---- Entrypoint --------------------------------------------------------------
-COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+# The real entrypoint is mounted at runtime from the host's container-bootstrap
+# snapshot. The in-image stub fails loudly so an unmounted run is impossible
+# to miss (vs. silently running stale baked-in code).
+RUN printf '#!/bin/bash\necho "FATAL: entrypoint.sh not mounted — host container-bootstrap snapshot is missing" >&2\nexit 1\n' \
+    > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
 # ---- Workspace + permissions -------------------------------------------------
 RUN mkdir -p /workspace/group /workspace/extra && \

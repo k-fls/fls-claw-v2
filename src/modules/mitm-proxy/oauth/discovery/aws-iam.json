@@ -1,0 +1,18 @@
+{
+  "api_base_url": "https://iam.amazonaws.com",
+  "sts_endpoint": "https://sts.{region}.amazonaws.com",
+  "_source": "manually researched from official docs (docs.aws.amazon.com/IAM/latest/UserGuide/ and docs.aws.amazon.com/singlesignon/latest/OIDCAPIReference/)",
+  "_note": "AWS IAM does NOT use OAuth2/OIDC for direct API authentication. IAM uses AWS Signature Version 4 (SigV4) with access key ID + secret access key, or temporary credentials from STS (AssumeRole, AssumeRoleWithWebIdentity, AssumeRoleWithSAML). IAM can consume OIDC tokens from external providers (e.g. GitHub Actions, Google) via Web Identity Federation to issue temporary STS credentials, but IAM itself is not an OAuth2 authorization server.",
+  "_auth_method": "aws_sigv4",
+  "_related_oidc_services": {
+    "iam_identity_center_oidc": {
+      "register_client_endpoint": "https://oidc.{region}.amazonaws.com/client/register",
+      "token_endpoint": "https://oidc.{region}.amazonaws.com/token",
+      "_note": "AWS IAM Identity Center (successor to AWS SSO) has an OIDC API (namespace: sso-oidc) that implements portions of the OAuth 2.0 Device Authorization Grant for CLI/native app SSO. The RegisterClient API returns authorizationEndpoint and tokenEndpoint dynamically. Supports Authorization Code, Device Code, and Refresh Token grant types."
+    },
+    "iam_oidc_discovery": {
+      "well_known_openid_configuration": "https://token.actions.githubusercontent.com/.well-known/openid-configuration",
+      "_note": "This is an example of an external OIDC provider (GitHub Actions) that IAM can federate with. IAM itself publishes a per-account OIDC discovery document for outbound federation at a unique issuer URL."
+    }
+  }
+}

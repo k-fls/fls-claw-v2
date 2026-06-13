@@ -30,8 +30,12 @@
  * dispatch), and `delivery.ts` + `session-manager.ts` (outbound-suppression
  * predicate + resume subscription).
  */
+import type Database from 'better-sqlite3';
+
 import { log } from './log.js';
+import { deliverDirect } from './delivery.js';
 import type { DeliveryAddress } from './channels/adapter.js';
+import type { AgentGroup, Session } from './types.js';
 
 // ── Public types ──
 
@@ -449,4 +453,76 @@ function fireReleaseSubscribers(skey: string): void {
       log.error('onAnyInteractionRelease subscriber threw', { err });
     }
   }
+}
+
+/**
+ * Derive an {@link InteractionOrigin} for a session from its recent inbound
+ * chat. Shared by the host-side consumers that prompt "whoever is talking to
+ * this session" from outside a command context — the mid-session reauth
+ * dispatcher and the interactive OAuth flows. Both have only a session in
+ * hand, so they reconstruct the routing triple + sender from the newest real
+ * inbound row.
+ *
+ * Field precedence (`senderId` / `sender` / chat-sdk `author.userId`,
+ * namespaced as `<channel>:<handle>`) mirrors what the permissions module
+ * uses when it upserts users. Returns null when no identifiable human is
+ * found (cron/webhook-only history) — callers surface/skip accordingly.
+ */
+export function deriveOrigin(
+  session: Session,
+  agentGroup: AgentGroup,
+  inDb: Database.Database,
+): InteractionOrigin | null {
+  if (!session.messaging_group_id) return null;
+
+  let key: { channelType: string; platformId: string; threadId: string | null; userId: string } | null = null;
+
+  const rows = inDb
+    .prepare(
+      `SELECT content, channel_type, platform_id, thread_id FROM messages_in
+       WHERE kind IN ('chat', 'chat-sdk') ORDER BY seq DESC LIMIT 20`,
+    )
+    .all() as Array<{
+    content: string;
+    channel_type: string | null;
+    platform_id: string | null;
+    thread_id: string | null;
+  }>;
+
+  for (const row of rows) {
+    if (!row.channel_type || !row.platform_id) continue;
+    let content: Record<string, unknown>;
+    try {
+      content = JSON.parse(row.content) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const author =
+      typeof content.author === 'object' && content.author !== null
+        ? (content.author as Record<string, unknown>)
+        : undefined;
+    const rawHandle =
+      (typeof content.senderId === 'string' ? content.senderId : undefined) ??
+      (typeof content.sender === 'string' ? content.sender : undefined) ??
+      (typeof author?.userId === 'string' ? (author.userId as string) : undefined);
+    if (!rawHandle || rawHandle === 'system') continue;
+    key = {
+      channelType: row.channel_type,
+      platformId: row.platform_id,
+      threadId: row.thread_id,
+      userId: rawHandle.includes(':') ? rawHandle : `${row.channel_type}:${rawHandle}`,
+    };
+    break;
+  }
+
+  if (!key) return null;
+
+  const { channelType, platformId, threadId } = key;
+  return {
+    key,
+    agentGroupId: agentGroup.id,
+    messagingGroupId: session.messaging_group_id,
+    replyAddr: { channelType, platformId, threadId },
+    writeReply: (text) => deliverDirect(channelType, platformId, threadId, text),
+  };
 }

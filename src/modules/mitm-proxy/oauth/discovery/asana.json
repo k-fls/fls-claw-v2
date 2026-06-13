@@ -1,0 +1,21 @@
+{
+  "issuer": "https://app.asana.com",
+  "authorization_endpoint": "https://app.asana.com/-/oauth_authorize",
+  "token_endpoint": "https://app.asana.com/-/oauth_token",
+  "revocation_endpoint": "https://app.asana.com/-/oauth_revoke",
+  "response_types_supported": [
+    "code"
+  ],
+  "grant_types_supported": [
+    "authorization_code",
+    "refresh_token"
+  ],
+  "token_endpoint_auth_methods_supported": [
+    "client_secret_post",
+    "client_secret_basic"
+  ],
+  "code_challenge_methods_supported": [
+    "S256"
+  ],
+  "_well_known_url": false
+}

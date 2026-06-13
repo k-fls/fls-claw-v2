@@ -1,0 +1,8 @@
+{
+  "issuer": "https://{subdomain}.zendesk.com",
+  "authorization_endpoint": "https://{subdomain}.zendesk.com/oauth/authorizations/new",
+  "token_endpoint": "https://{subdomain}.zendesk.com/oauth/tokens",
+  "api_base_url": "https://{subdomain}.zendesk.com/api/v2",
+  "_source": "manually researched from official docs",
+  "_note": "Tenant-specific: replace {subdomain} with your Zendesk subdomain. No standard revocation or userinfo endpoints documented. Chat/Live Chat uses separate endpoints at /oauth2/chat/."
+}

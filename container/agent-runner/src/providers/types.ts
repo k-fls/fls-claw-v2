@@ -16,6 +16,18 @@ export interface AgentProvider {
   isSessionInvalid(err: unknown): boolean;
 
   /**
+   * Classify an error thrown by `query()` (or surfaced as an error event)
+   * into a host-facing tag — e.g. 'auth-invalid' for a credential rejection —
+   * or `undefined` when unrecognized. Optional: providers that don't classify
+   * omit it. The poll-loop forwards the tag across the container→host boundary
+   * via a `feedback.container` system row so the host can route the failure
+   * (reauth, back off, surface). The tag is opaque to the framework; the host's
+   * per-provider `feedback.container` reader interprets it. Recommended
+   * convention strings are documented but not enforced.
+   */
+  classifyError?(err: unknown): string | undefined;
+
+  /**
    * Optional pre-resume maintenance. Given the stored continuation token,
    * decide whether its backing transcript has grown too large or too old to
    * resume cheaply. Return a non-null reason string to tell the caller to drop

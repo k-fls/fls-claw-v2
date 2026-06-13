@@ -1,0 +1,12 @@
+{
+  "api_base_url": "https://{resource}.openai.azure.com",
+  "_api_hosts": [
+    "{resource}.services.ai.azure.com",
+    "{resource}.cognitiveservices.azure.com"
+  ],
+  "_source": "manually researched from official docs (learn.microsoft.com/en-us/azure/ai-services/openai/reference)",
+  "_note": "Azure OpenAI Service ({resource}.openai.azure.com), Azure AI Foundry ({resource}.services.ai.azure.com), and Azure Cognitive Services ({resource}.cognitiveservices.azure.com). Auth via custom api-key header or Azure AD Bearer token. Proxy scans all header values so substitute token works in either header.",
+  "_auth_method": "api_key",
+  "_auth_header_format": "api-key: {api_key}",
+  "_env_vars": { "AZURE_OPENAI_KEY": "api_key" }
+}

@@ -1,0 +1,8 @@
+{
+  "authorization_endpoint": "https://identity.pagerduty.com/oauth/authorize",
+  "token_endpoint": "https://identity.pagerduty.com/oauth/token",
+  "api_base_url": "https://api.pagerduty.com",
+  "_source": "manually researched from official docs",
+  "_docs": "https://developer.pagerduty.com/docs/a708c20fb57e5-obtaining-a-user-o-auth-token-via-pkce",
+  "_note": "PagerDuty uses PKCE (S256) for the authorization code flow. Token endpoint expects application/x-www-form-urlencoded content type. Supports refresh_token grant type. No dedicated revocation endpoint documented — use DELETE /oauth_delegations to revoke access."
+}

@@ -126,7 +126,12 @@ describe('pickEvictionVictim', () => {
     const v = pickEvictionVictim([cand('a', { heartbeatMtimeMs: 0, spawnedAt: now - 5 * IDLE })], new Set(), IDLE, now);
     expect(v).toBe('a');
     // …but a just-spawned no-heartbeat container is protected.
-    const v2 = pickEvictionVictim([cand('b', { heartbeatMtimeMs: 0, spawnedAt: now - IDLE / 2 })], new Set(), IDLE, now);
+    const v2 = pickEvictionVictim(
+      [cand('b', { heartbeatMtimeMs: 0, spawnedAt: now - IDLE / 2 })],
+      new Set(),
+      IDLE,
+      now,
+    );
     expect(v2).toBeNull();
   });
 

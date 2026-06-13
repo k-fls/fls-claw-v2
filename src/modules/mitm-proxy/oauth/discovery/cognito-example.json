@@ -1,0 +1,13 @@
+{
+  "issuer": "https://cognito-idp.{region}.amazonaws.com/{user_pool_id}",
+  "authorization_endpoint": "https://{domain}.auth.{region}.amazoncognito.com/oauth2/authorize",
+  "token_endpoint": "https://{domain}.auth.{region}.amazoncognito.com/oauth2/token",
+  "userinfo_endpoint": "https://{domain}.auth.{region}.amazoncognito.com/oauth2/userInfo",
+  "revocation_endpoint": "https://{domain}.auth.{region}.amazoncognito.com/oauth2/revoke",
+  "jwks_uri": "https://cognito-idp.{region}.amazonaws.com/{user_pool_id}/.well-known/jwks.json",
+  "_well_known_url": "https://cognito-idp.{region}.amazonaws.com/{user_pool_id}/.well-known/openid-configuration",
+  "logout_endpoint": "https://{domain}.auth.{region}.amazoncognito.com/logout",
+  "login_endpoint": "https://{domain}.auth.{region}.amazoncognito.com/login",
+  "_source": "manually researched from official docs (docs.aws.amazon.com/cognito/latest/developerguide/)",
+  "_note": "Replace {region} with AWS region (e.g. us-east-1), {user_pool_id} with the Cognito User Pool ID (e.g. us-east-1_aBcDeFgHi), and {domain} with either your custom domain or the Cognito prefix domain (e.g. myapp). The OIDC discovery endpoints (.well-known/*) are always on the cognito-idp domain, NOT on your custom domain. The OAuth2 endpoints (authorize, token, userInfo, revoke, logout) use the Hosted UI domain. The /oauth2/authorize endpoint only supports HTTPS GET. The /oauth2/token endpoint only supports HTTPS POST. The /oauth2/revoke endpoint revokes both the refresh token and all access tokens issued from it."
+}

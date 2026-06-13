@@ -1,0 +1,7 @@
+{
+  "api_base_url": "https://api.sendgrid.com/v3",
+  "_source": "manually researched from official docs (docs.sendgrid.com)",
+  "_note": "SendGrid does NOT support OAuth2 for API authentication. Authentication is API-key only. API keys are created in the SendGrid UI and sent as Bearer tokens in the Authorization header. Basic auth with username/password was deprecated in Q4 2020. The only OAuth2 usage is for Event Webhook security (Client Credentials grant for machine-to-machine webhook verification), which is unrelated to API access.",
+  "_auth_method": "api_key",
+  "_auth_header_format": "Authorization: Bearer {api_key}"
+}

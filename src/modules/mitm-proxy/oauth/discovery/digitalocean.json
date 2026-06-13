@@ -1,0 +1,11 @@
+{
+  "issuer": "https://cloud.digitalocean.com",
+  "authorization_endpoint": "https://cloud.digitalocean.com/v1/oauth/authorize",
+  "token_endpoint": "https://cloud.digitalocean.com/v1/oauth/token",
+  "revocation_endpoint": "https://cloud.digitalocean.com/v1/oauth/revoke",
+  "userinfo_endpoint": "https://api.digitalocean.com/v2/account",
+  "api_base_url": "https://api.digitalocean.com/v2",
+  "_source": "manually researched from official docs",
+  "_note": "Tokens expire after 30 days. OAuth server is on cloud.digitalocean.com, API is on api.digitalocean.com.",
+  "_well_known_url": false
+}

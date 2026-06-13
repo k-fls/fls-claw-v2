@@ -1,0 +1,9 @@
+{
+  "issuer": "https://console.anthropic.com",
+  "authorization_endpoint": "https://console.anthropic.com/oauth/authorize",
+  "token_endpoint": "https://console.anthropic.com/v1/oauth/token",
+  "api_base_url": "https://api.anthropic.com",
+  "_source": "manually researched from official docs and anthropic-auth open-source implementations",
+  "_note": "Anthropic OAuth uses PKCE (SHA-256). The token endpoint at console.anthropic.com is behind Cloudflare managed challenge; https://api.anthropic.com/v1/oauth/token is an alternative without Cloudflare protection. Two OAuth modes exist: 'max' (Claude Pro/Max subscription auth) and 'console' (API key creation). WARNING: As of early 2026, Anthropic has restricted OAuth tokens (sk-ant-oat01-*) to first-party apps only (Claude Code, Claude.ai). Using OAuth tokens in third-party tools violates Consumer Terms of Service and may return 401 errors.",
+  "_well_known_url": false
+}

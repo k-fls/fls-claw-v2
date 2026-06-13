@@ -1,0 +1,8 @@
+{
+  "api_base_url": "https://api.bing.microsoft.com",
+  "_source": "manually researched from official docs (learn.microsoft.com/en-us/bing/search-apis/bing-web-search/reference/headers)",
+  "_note": "Bing Search API (Azure AI Services). Authentication is API-key only via 'Ocp-Apim-Subscription-Key' header. No OAuth2. Covers Web Search, Image Search, News Search, Video Search under the same key.",
+  "_auth_method": "api_key",
+  "_auth_header_format": "Ocp-Apim-Subscription-Key: {api_key}",
+  "_env_vars": { "BING_SEARCH_KEY": "api_key" }
+}

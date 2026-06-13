@@ -1,0 +1,5 @@
+{
+  "issuer": "https://token.cloudflareaccess.com",
+  "jwks_uri": "https://token.cloudflareaccess.com/cdn-cgi/access/certs",
+  "_well_known_url": "https://token.cloudflareaccess.com/.well-known/openid-configuration"
+}

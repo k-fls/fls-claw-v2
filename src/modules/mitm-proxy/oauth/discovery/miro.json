@@ -1,0 +1,9 @@
+{
+  "issuer": "https://miro.com",
+  "authorization_endpoint": "https://miro.com/oauth/authorize",
+  "token_endpoint": "https://api.miro.com/v1/oauth/token",
+  "api_base_url": "https://api.miro.com/v2",
+  "_source": "manually researched from official docs (developers.miro.com/docs/getting-started-with-oauth)",
+  "_note": "Miro OAuth2. Token endpoint handles both authorization_code and refresh_token grant types. The v1 in the token endpoint URL is not deprecated. No documented revocation endpoint.",
+  "_well_known_url": false
+}

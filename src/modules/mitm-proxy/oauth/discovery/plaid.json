@@ -1,0 +1,10 @@
+{
+  "issuer": "https://production.plaid.com",
+  "token_endpoint": "https://production.plaid.com/oauth/token",
+  "introspection_endpoint": "https://production.plaid.com/oauth/introspect",
+  "revocation_endpoint": "https://production.plaid.com/oauth/revoke",
+  "api_base_url": "https://production.plaid.com",
+  "_source": "manually researched from official docs (plaid.com/docs/api/oauth/)",
+  "_note": "Plaid OAuth2 is for partners/services integrating with Plaid's platform, NOT for end-user bank connections (those use Plaid Link with /link/token/create). Token endpoint supports client_credentials, refresh_token, and token-exchange grant types. Sandbox base URL is https://sandbox.plaid.com, development is https://development.plaid.com. No standard authorization_endpoint; Plaid uses API keys (client_id + secret) rather than a browser-based authorization code flow for developer access.",
+  "_well_known_url": false
+}

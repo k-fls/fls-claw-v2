@@ -10,6 +10,7 @@
  * Module-local — kept here rather than in `src/types.ts` so the bootstrap
  * module stands on its own without a wider type dependency.
  */
+import type { ContainerConfig } from '../../container-config.js';
 import type { VolumeMount } from '../../providers/provider-container-registry.js';
 import type { AgentGroup, Session } from '../../types.js';
 
@@ -36,6 +37,18 @@ export type ReleaseListener = (ip: string, scope: ContainerScope) => void;
 export interface SpawnPreContext {
   agentGroup: AgentGroup;
   session: Session;
+  /**
+   * Resolved effective provider name for this spawn. The
+   * spawn-validation observer uses it to look up the provider's
+   * `AGENT_RUNTIME` extension and validate required credential providers.
+   */
+  providerName: string;
+  /**
+   * Materialized container config for this spawn. Carries the
+   * provider, model, and the optional `runtimeConfig` the agent-runtime
+   * extension parses.
+   */
+  containerConfig: ContainerConfig;
 }
 
 export interface SpawnPreResult {

@@ -1,0 +1,10 @@
+{
+  "issuer": "https://auth.monday.com",
+  "authorization_endpoint": "https://auth.monday.com/oauth2/authorize",
+  "token_endpoint": "https://auth.monday.com/oauth2/token",
+  "api_base_url": "https://api.monday.com/v2",
+  "_source": "manually researched from official docs",
+  "_docs": "https://developer.monday.com/apps/docs/oauth",
+  "_note": "Monday.com uses GraphQL; api_base_url is the single GraphQL endpoint. No userinfo endpoint — use the GraphQL `me` query instead. Authorization codes expire after 10 minutes.",
+  "_well_known_url": false
+}

@@ -1,0 +1,8 @@
+{
+  "issuer": "https://oauth.twilio.com",
+  "token_endpoint": "https://oauth.twilio.com/v2/token",
+  "api_base_url": "https://api.twilio.com/2010-04-01",
+  "_source": "manually researched from official docs (twilio.com/docs/iam/oauth-apps/oauth-access-token)",
+  "_note": "Twilio uses OAuth2 client_credentials grant for machine-to-machine API access. No browser-based authorization_endpoint; OAuth apps are created in the Twilio Console which provides a client_id and client_secret. Access tokens are valid for 1 hour. Twilio's primary authentication method is Account SID + Auth Token (HTTP Basic Auth); OAuth2 is an alternative for scoped, short-lived access.",
+  "_well_known_url": false
+}
