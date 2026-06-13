@@ -65,3 +65,5 @@ export { reserveEnvName, isEnvNameReserved, reservedEnvNames, _resetReservedEnvF
 // Side-effects: built-in IP allocation observer + reserved-env statics.
 import './ip-observer.js';
 import './reserved-env.js';
+// Side-effect: register the egress-lockdown observer (no-op unless opted in).
+import './egress-observer.js';
