@@ -90,40 +90,47 @@ ignores it (or a raw socket) could reach the internet directly and bypass
 credential injection, approvals, and audit. Egress lockdown closes that hole at
 the network layer.
 
-**How it works:** agents are placed on a Docker `--internal` network
-(`nanoclaw-egress`) that has **no route to the internet**. The OneCLI gateway
-container is attached to that network, aliased as `host.docker.internal`, so the
-injected proxy URL (`…@host.docker.internal:10255`) resolves to the gateway
-*container-to-container*. The gateway is therefore the **only reachable hop** —
-anything else has nowhere to go. The agent is non-root with no `NET_ADMIN`, so
-it cannot undo this. Identical mechanism on macOS and Linux (no host firewall,
-no `host-gateway` route).
+**How it works (in-container firewall).** Rather than putting the container on a
+Docker `--internal` network with no route at all, NanoClaw keeps its managed
+`nanoclaw` bridge (the static per-container IP that `host-rpc` authorizes by is
+load-bearing, and an `--internal` net would sever it). Instead, egress is
+enforced *inside* the container:
 
-- **Self-healing:** the gateway is re-attached to the network at every spawn and
-  on each host-sweep tick, so an out-of-band detach (e.g. `docker compose up` on
-  the OneCLI stack — its compose lives in `~/.onecli`, not this repo) recovers
-  automatically.
-- **Fail-fast:** if lockdown is on but the network can't be created or the
-  gateway can't be attached (e.g. a non-standard gateway container name, or the
-  gateway isn't running), nanoclaw **refuses to spawn the agent** and surfaces a
-  clear error — it never silently falls back to open egress. Fix the cause (or
-  set `NANOCLAW_EGRESS_LOCKDOWN=false`) and retry. The host-sweep re-heal is the
-  exception: a heal failure there is logged but not fatal, since already-running
-  agents stay on the internal net (no leak) until the gateway returns.
+1. The `egress` spawn observer grants `NET_ADMIN`, drops `NET_RAW`, disables
+   IPv6 in the container netns (`--sysctl`), and forces the root-drop launch
+   mode.
+2. `container/entrypoint.sh`, running as root, installs a **default-DROP OUTPUT
+   firewall** (`iptables`) that permits egress ONLY to the host hop: the OneCLI
+   proxy (`host:port` parsed from the injected `HTTPS_PROXY`) and the host-rpc
+   port. Loopback and established/related return traffic are allowed.
+3. The entrypoint then `setpriv`-drops to the host UID with an **empty
+   capability bounding set** (`--bounding-set=-all`). Combined with the always-on
+   `--security-opt=no-new-privileges`, the unprivileged agent has no `NET_ADMIN`
+   and cannot regain it — so it **cannot flush the rules**.
+
+A raw socket or non-proxy-aware client therefore has nowhere to go except the
+proxy hop, while `host-rpc` and the credential broker stay reachable (the host
+route is preserved, not removed).
+
+- **Fail-closed:** the entrypoint runs under `set -e`, so any firewall error
+  aborts the container rather than running it with open egress. The host also
+  refuses to spawn (`EgressLockdownError`) if lockdown is on but the root-drop
+  launch path is unavailable — it never silently falls back to open egress.
+- **Docker-only:** the capability/sysctl/iptables mechanism requires Docker;
+  Apple Container is not supported (same gap as the bridge network).
 
 **Configuration:**
 
 | Env | Default | Meaning |
 | --- | --- | --- |
-| `NANOCLAW_EGRESS_LOCKDOWN` | `false` | Set `true` to opt in (otherwise the host-gateway path is used). Enabled automatically by `/add-golden-registry`. |
-| `NANOCLAW_EGRESS_NETWORK` | `nanoclaw-egress` | Network name. |
-| `ONECLI_GATEWAY_CONTAINER` | `onecli` | Gateway container to attach. |
+| `NANOCLAW_EGRESS_LOCKDOWN` | `false` | Set `true` to opt in (otherwise the host-gateway path is used unchanged). |
+| `NANOCLAW_HOST_RPC_PORT` | `17381` | host-rpc port the firewall allowlists (mirrors the host-rpc bind). |
 
-**⚠ Behavior when enabled:** with lockdown on, agents have **no direct
-internet** — all traffic must go through OneCLI. Proxy-aware clients (npm, pnpm,
-pip, curl, node/bun with the proxy env) are unaffected. Any workflow that relies
-on a **non-proxy-aware** tool reaching the internet directly will fail by design.
-Lockdown is **off by default**; opt in with `NANOCLAW_EGRESS_LOCKDOWN=true`.
+**⚠ Behavior when enabled:** agents have **no direct internet** — all traffic
+must go through the proxy hop. Proxy-aware clients (npm, pnpm, pip, curl,
+node/bun with the proxy env) are unaffected. Any workflow relying on a
+**non-proxy-aware** tool reaching the internet directly will fail by design.
+Lockdown is **off by default**.
 
 ## Privilege Comparison
 

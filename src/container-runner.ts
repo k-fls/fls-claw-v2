@@ -36,7 +36,7 @@ import {
   stopContainer,
   stopContainerGraceful,
 } from './container-runtime.js';
-import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from './egress-lockdown.js';
+import { assertEgressLaunchable } from './egress-lockdown.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
@@ -345,6 +345,14 @@ async function spawnContainer(session: Session): Promise<void> {
     session,
     hostEnv: process.env,
   });
+
+  // Egress lockdown is enforced by the root entrypoint's firewall, which only
+  // runs on the root-drop launch path. Refuse to spawn (rather than silently
+  // leak) if lockdown is on but root-drop is unavailable. Checked here, before
+  // fireSpawnPre allocates the container IP, so the throw frees no resources.
+  // The egress observer forces needsRootEntrypoint, so resolveLaunchMode(true)
+  // matches the launch mode this spawn will actually use.
+  assertEgressLaunchable(resolveLaunchMode(true));
 
   // Container-bootstrap lifecycle pipeline. `fireSpawnPre` aggregates
   // observer contributions (IP allocation today, future cred broker / ssh
@@ -763,14 +771,12 @@ async function buildContainerArgs(
   }
   log.info('OneCLI gateway applied', { containerName });
 
-  // Egress lockdown when enabled — throws if it can't be established, aborting
-  // the spawn rather than running with open egress. Otherwise the host gateway.
-  if (ensureEgressNetwork()) {
-    args.push(...egressNetworkArgs());
-    log.info('Egress lockdown active', { containerName, network: EGRESS_NETWORK });
-  } else {
-    args.push(...hostGatewayArgs());
-  }
+  // Host gateway. Egress lockdown (when enabled) keeps the container on the
+  // managed bridge and enforces egress with an in-container firewall installed
+  // by the root entrypoint — the docker flags + env for that are contributed by
+  // the egress observer via fireSpawnPre, not here. The host route is preserved
+  // either way so host-rpc / the credential broker stay reachable.
+  args.push(...hostGatewayArgs());
 
   // Privilege mode. rootless → --user UID:GID. root-drop → no --user, but
   // HOST_UID/HOST_GID env so the entrypoint's setpriv block drops cleanly
