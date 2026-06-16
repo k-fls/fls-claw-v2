@@ -20,6 +20,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
 
 import type { AgentGroup, Session } from '../../types.js';
@@ -108,6 +109,20 @@ function imageAvailable(tag: string): boolean {
 
 const HAVE_IMAGE = imageAvailable(CONTAINER_IMAGE);
 const RUN_E2E = HAVE_IMAGE;
+
+// Egress lockdown is a sibling feature: its firewall is installed by an
+// entrypoint block that only exists once that branch is composed in (the
+// union). On the mitm branch alone, NANOCLAW_EGRESS_LOCKDOWN is a no-op, so the
+// composition test below cannot pass — gate it on the enforcement actually
+// being present in the entrypoint that the image is built from.
+const HAS_EGRESS_LOCKDOWN = (() => {
+  try {
+    const entrypoint = fileURLToPath(new URL('../../../container/entrypoint.sh', import.meta.url));
+    return fs.readFileSync(entrypoint, 'utf8').includes('NANOCLAW_EGRESS_LOCKDOWN');
+  } catch {
+    return false;
+  }
+})();
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -472,7 +487,7 @@ describe.skipIf(!RUN_E2E)('mitm-proxy — live container', () => {
     }
   }, 180_000);
 
-  it('egress lockdown composes with the mitm proxy: firewall enforced, proxy path intact', async () => {
+  it.skipIf(!HAS_EGRESS_LOCKDOWN)('egress lockdown composes with the mitm proxy: firewall enforced, proxy path intact', async () => {
     // Both features want the root entrypoint and both install iptables rules
     // (mitm: nat-table :443 DNAT → proxy; lockdown: filter-table OUTPUT
     // default-DROP). They compose only because the lockdown allowlist permits
