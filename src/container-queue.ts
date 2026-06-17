@@ -99,8 +99,12 @@ export class ContainerQueue {
   private waiting: string[] = [];
   private evicting = new Set<string>();
   private shuttingDown = false;
+  /** Live concurrency cap; starts at deps.cap, adjustable via setCapacity. */
+  private cap: number;
 
-  constructor(private deps: ContainerQueueDeps) {}
+  constructor(private deps: ContainerQueueDeps) {
+    this.cap = deps.cap;
+  }
 
   /** active + reserved — the true slot occupancy. */
   occupancy(): number {
@@ -114,14 +118,53 @@ export class ContainerQueue {
    * caller's first await so two concurrent wakes can't both pass the cap (P1).
    */
   admit(sessionId: string): 'reserved' | 'deferred' {
-    if (this.shuttingDown) return 'deferred';
-    if (this.occupancy() >= this.deps.cap) {
+    // Hard latch: a 0 cap (graceful drain / runtime pause) or teardown defers
+    // with no enqueue and no evict-to-serve — a draining host must never spawn
+    // or evict a warm container to admit fresh work.
+    if (this.cap <= 0 || this.shuttingDown) return 'deferred';
+    if (this.occupancy() >= this.cap) {
       this.enqueueWaiting(sessionId);
       this.tryEvict();
       return 'deferred';
     }
     this.reserved.add(sessionId);
     return 'reserved';
+  }
+
+  /**
+   * Adjust the concurrency cap at runtime. Lowering it below current occupancy
+   * immediately pings idle containers to stop (`shedIdleOverCapacity`); raising
+   * it drains waiters into the new headroom. `cap = 0` is the graceful-drain
+   * latch — "handle no fresh work" — so the whole drain is `setCapacity(0)`.
+   */
+  setCapacity(cap: number): void {
+    this.cap = Math.max(0, Math.floor(cap));
+    this.shedIdleOverCapacity();
+    this.drain();
+  }
+
+  /** Current cap (observability / drain orchestration). */
+  capacity(): number {
+    return this.cap;
+  }
+
+  /**
+   * Over-capacity shed: if there are more containers than the cap allows, ping
+   * every idle one (no outstanding claim, not already stopping) to stop. Simple
+   * by design — no victim ordering, no throttle: too many ⇒ stop all idle. A
+   * mid-turn container is skipped and re-pinged once its claim clears (the host
+   * sweep re-runs this each tick). With `cap = 0` this stops every container as
+   * it goes idle — the engine behind `beginGracefulDrain`.
+   */
+  shedIdleOverCapacity(): void {
+    if (this.occupancy() <= this.cap) return;
+    for (const c of this.deps.candidates()) {
+      if (c.hasOutstandingClaim) continue; // mid-turn — let it finish; sweep re-pings
+      if (this.evicting.has(c.sessionId)) continue; // already stopping
+      this.evicting.add(c.sessionId);
+      log.info('Shedding idle container over capacity', { sessionId: c.sessionId, cap: this.cap });
+      this.deps.evict(c.sessionId);
+    }
   }
 
   /**
@@ -188,10 +231,10 @@ export class ContainerQueue {
   }
 
   private drain(): void {
-    if (this.shuttingDown) return;
+    if (this.shuttingDown || this.cap <= 0) return;
     // FIFO hand-off. The reserve is claimed synchronously per iteration, so
     // occupancy() reflects it immediately and the loop stays bounded by the cap.
-    while (this.waiting.length > 0 && this.occupancy() < this.deps.cap) {
+    while (this.waiting.length > 0 && this.occupancy() < this.cap) {
       const sessionId = this.waiting.shift()!;
       if (this.deps.isActive(sessionId)) continue; // already running (a later wake won)
       if (!this.deps.canSpawn(sessionId)) continue; // session gone / no longer active

@@ -18,6 +18,7 @@ import {
   GROUPS_DIR,
   IDLE_BEFORE_EVICT,
   MAX_CONCURRENT_CONTAINERS,
+  MAX_DRAIN_TIMEOUT_MS,
   ONECLI_API_KEY,
   ONECLI_URL,
   TIMEZONE,
@@ -172,6 +173,64 @@ export async function shutdownContainers(): Promise<void> {
       }),
     ),
   );
+}
+
+/**
+ * Re-run the queue's over-capacity shed. Called by the host sweep each tick
+ * (after it stamps liveness) so a container that was mid-turn when capacity
+ * dropped gets re-pinged the moment its claim clears. No-op unless the queue is
+ * over cap (the normal case).
+ */
+export function reconcileContainerCapacity(): void {
+  queue.shedIdleOverCapacity();
+}
+
+/** Resolves when the in-flight graceful drain reaches zero live containers. */
+let drainComplete: (() => void) | null = null;
+
+/**
+ * Graceful drain (D-c). Takes queue capacity to 0 — no fresh work is admitted,
+ * and every container is stopped as it goes idle (`shedIdleOverCapacity`,
+ * re-pinged each sweep tick for mid-turn ones) — then resolves once all
+ * containers have exited.
+ *
+ * `drainTimeoutMs` is clamped to `[0, MAX_DRAIN_TIMEOUT_MS]` and selects the mode:
+ *   - `0`        → immediate: don't wait for idle, hard-drain now (soft stop +
+ *                  SIGKILL fallback via `shutdownContainers`).
+ *   - finite > 0 → wait for natural completion up to the budget; on timeout,
+ *                  hard-drain the remainder.
+ *   - max        → effectively "wait for natural completion" (timer never fires
+ *                  in practice).
+ *
+ * In every mode capacity goes to 0 *first*, so a drain never keeps serving while
+ * it waits. The host sweep must stay running across the await — it feeds the
+ * idle detection that drives the shed.
+ */
+export async function beginGracefulDrain(drainTimeoutMs: number): Promise<void> {
+  const t = Math.max(0, Math.min(Math.floor(drainTimeoutMs) || 0, MAX_DRAIN_TIMEOUT_MS));
+  queue.setCapacity(0); // latch admissions + shed every currently-idle container
+  if (activeContainers.size === 0) return;
+  if (t === 0) {
+    log.info('Immediate shutdown — hard-stopping all containers', { count: activeContainers.size });
+    await shutdownContainers();
+    return;
+  }
+  log.info('Graceful drain started', { drainTimeoutMs: t, active: activeContainers.size });
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      log.warn('Graceful drain timed out — hard-stopping remaining containers', {
+        remaining: activeContainers.size,
+      });
+      drainComplete = null;
+      void shutdownContainers().finally(resolve);
+    }, t);
+    drainComplete = () => {
+      clearTimeout(timer);
+      drainComplete = null;
+      log.info('Graceful drain complete — all containers idle and stopped');
+      resolve();
+    };
+  });
 }
 
 export function getActiveContainerCount(): number {
@@ -335,6 +394,7 @@ async function spawnContainer(session: Session): Promise<void> {
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
     log.info('Container exited', { sessionId: session.id, code, containerName });
+    if (drainComplete && activeContainers.size === 0) drainComplete();
   });
 
   container.on('error', (err) => {
@@ -343,6 +403,7 @@ async function spawnContainer(session: Session): Promise<void> {
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
     log.error('Container spawn error', { sessionId: session.id, err });
+    if (drainComplete && activeContainers.size === 0) drainComplete();
   });
 }
 

@@ -45,7 +45,13 @@ import {
 } from './db/session-db.js';
 import { log } from './log.js';
 import { openInboundDb, openOutboundDb, openOutboundDbRw, inboundDbPath, heartbeatPath } from './session-manager.js';
-import { isContainerRunning, killContainer, recordContainerLiveness, wakeContainer } from './container-runner.js';
+import {
+  isContainerRunning,
+  killContainer,
+  recordContainerLiveness,
+  reconcileContainerCapacity,
+  wakeContainer,
+} from './container-runner.js';
 import { EVICTION_TIMEOUT } from './config.js';
 import type { Session } from './types.js';
 
@@ -153,6 +159,11 @@ async function sweep(): Promise<void> {
     for (const session of sessions) {
       await sweepSession(session);
     }
+    // After liveness is stamped this tick, re-ping the over-capacity shed so a
+    // container that was mid-turn when capacity dropped (e.g. a graceful drain
+    // set cap to 0) gets stopped now that its claim has cleared. No-op unless
+    // the queue is over cap.
+    reconcileContainerCapacity();
   } catch (err) {
     log.error('Host sweep error', { err });
   }

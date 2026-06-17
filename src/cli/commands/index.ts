@@ -5,6 +5,7 @@
  * Help commands are registered after resources are loaded.
  */
 import '../resources/index.js';
+import './shutdown.js';
 import { registerResourceHelpCommands } from './help.js';
 
 registerResourceHelpCommands();
