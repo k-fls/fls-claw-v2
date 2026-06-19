@@ -83,6 +83,16 @@ export type {
   ProviderResult,
 } from './providers/types.js';
 
+// Container contribution: a provider's spawn env + mounts, assembled by merging
+// a set of contributor calls (see ./providers/contributions.ts). Each capability
+// layer adds one call rather than rewriting a shared body; object in, object out.
+export { mergeContributions } from './providers/contributions.js';
+export type {
+  ContainerContributor,
+  ContainerContributionCtx,
+  ContainerContributionResult,
+} from './providers/contributions.js';
+
 export { defaultManifestBuilder, noManifestSideEffect } from './providers/defaults.js';
 
 export {

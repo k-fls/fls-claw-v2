@@ -16,7 +16,8 @@
  * `SubstitutingProvider.substitutes` property (existing rails).
  */
 import type { InteractionOrigin } from '../../../host-interactions.js';
-import type { VolumeMount, ProviderContainerContribution } from '../../../providers/provider-container-registry.js';
+import type { ProviderContainerContribution } from '../../../providers/provider-container-registry.js';
+import type { ContainerContributionCtx, ContainerContributionResult } from './contributions.js';
 import type { CredentialScope, GroupScope } from '../types.js';
 
 // ── Extension mechanism ─────────────────────────────────────────────────────
@@ -58,20 +59,16 @@ export class ExtensionBag {
 // ── Agent runtime ──────────────────────────────────────────────────────
 
 export interface AgentRuntimeExt {
-  containerContribution(ctx: {
-    agentGroupId: string;
-    /** The group's runtime scope — keys substitute minting in the token engine. */
-    groupScope: GroupScope;
-    sessionDir: string;
-    hostEnv: NodeJS.ProcessEnv;
-    runtimeConfig: unknown;
-    /**
-     * Selected CLI version from the provider identity's `:version` suffix
-     * (`2.1.154` | `latest`), or undefined for the default. The runtime maps it
-     * to a host-installed CLI mount via its RUNTIME_UPDATER (F2).
-     */
-    cliVersion?: string;
-  }): { env?: Record<string, string>; mounts?: VolumeMount[] };
+  /**
+   * Build the container shape (env + mounts, + optional cliVersion metadata) by
+   * merging a set of contributor calls — see `./contributions.ts`. Capability
+   * layers (mitm substitutes, runtime-updater CLI mount) add one call to the
+   * merge rather than rewriting this body, and read/emit object fields, so they
+   * compose without colliding. Returns a `ContainerContributionResult` (use
+   * `mergeContributions`); the resolver splits env/mounts from the host-only
+   * cliVersion.
+   */
+  containerContribution(ctx: ContainerContributionCtx): ContainerContributionResult;
   requiredCredentialProviders(runtimeConfig: unknown): Array<{ id: string; required: boolean }>;
   parseRuntimeConfig(raw: unknown): unknown;
   /**

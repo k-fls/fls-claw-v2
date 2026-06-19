@@ -542,28 +542,32 @@ function resolveProviderContribution(
     runtime: getCredentialProvider(provider)?.getExtension?.(AGENT_RUNTIME),
   };
 
-  // Generic AGENT_RUNTIME dispatch (credentials owns the contract): a provider's
-  // runtime extension wins over the legacy provider-container registry. Capability
-  // layers extend the result below via additive lines (updater → version-mount +
-  // cliVersion), so this resolver stays agnostic to which extensions exist.
-  let contribution: ProviderContainerContribution;
+  // The container shape comes from the provider's AGENT_RUNTIME extension, whose
+  // `containerContribution` merges a set of contributor calls (base env, mitm
+  // credential substitutes, runtime-updater's CLI-version mount, …). Capability
+  // layers add a call to that merge, so this resolver stays agnostic. Here we
+  // split the spawn-facing env/mounts from the host-only `cliVersion` (in-use
+  // bookkeeping) — the one place that split lives.
   if (input.runtime) {
-    contribution = input.runtime.containerContribution({
+    const { env, mounts, cliVersion } = input.runtime.containerContribution({
       agentGroupId: input.agentGroupId,
       groupScope: input.groupScope,
       sessionDir: input.sessionDir,
       hostEnv: input.hostEnv,
       runtimeConfig: input.runtime.parseRuntimeConfig(input.runtimeConfig),
+      agentProvider: input.agentProvider,
+      providerVersion: input.providerVersion,
     });
-  } else {
-    const fn = getProviderContainerConfig(provider);
-    contribution = fn
-      ? fn({ sessionDir: input.sessionDir, agentGroupId: input.agentGroupId, hostEnv: input.hostEnv })
-      : {};
+    return { provider, contribution: { env, mounts }, cliVersion: cliVersion ?? null };
   }
 
-  const out: ProviderResult = { provider, contribution, cliVersion: null };
-  return out;
+  // Legacy fallback: out-of-tree providers that register only a single
+  // host-config fn in the provider-container registry (no AGENT_RUNTIME ext).
+  const fn = getProviderContainerConfig(provider);
+  const contribution: ProviderContainerContribution = fn
+    ? fn({ sessionDir: input.sessionDir, agentGroupId: input.agentGroupId, hostEnv: input.hostEnv })
+    : {};
+  return { provider, contribution, cliVersion: null };
 }
 
 function buildMounts(

@@ -2,25 +2,31 @@
  * Claude credential provider — baseline (credentials layer).
  *
  * Founds the claude credential-provider registration plus a **non-mitm**
- * AGENT_RUNTIME runtime contribution: a custom Anthropic-compatible endpoint is
- * wired via env (`ANTHROPIC_BASE_URL` + a placeholder bearer that the credential
- * proxy rewrites on the wire); the standard api.anthropic.com path needs nothing
- * here.
+ * container contribution: a custom Anthropic-compatible endpoint is wired via
+ * env (`ANTHROPIC_BASE_URL` + a placeholder bearer that the credential proxy
+ * rewrites on the wire); the standard api.anthropic.com path needs nothing here.
  *
- * Capability layers MODIFY this file in place (the single `registerCredentialProvider`
- * call stays put; siblings only edit the extension bag + impls, composed at the
- * `everything` merge):
- *   - mitm-proxy: replaces `containerContribution` with token-engine substitutes;
- *     adds ACQUIRE / REAUTH / CONTAINER_FEEDBACK + the `substitutes` spec.
- *   - runtime-updater: adds the RUNTIME_UPDATER extension + the CLI version-mount.
+ * Capability layers EXTEND this provider ADDITIVELY — they do not rewrite the
+ * bodies here. Each is a pure `ContainerContributor` added as one call to the
+ * `containerContribution` merge, plus its own extension, so sibling branches
+ * merge cleanly:
+ *   - mitm-proxy: a contributor minting token-engine substitutes; +
+ *     `ext.set(ACQUIRE/REAUTH/CONTAINER_FEEDBACK, …)` + the `substitutes` spec.
+ *   - runtime-updater: a contributor mounting the selected CLI version (reads
+ *     `ctx.agentProvider` / `ctx.providerVersion`, reports the concrete
+ *     `cliVersion`); + `ext.set(RUNTIME_UPDATER, …)`.
+ * `mergeContributions` folds the calls: env keys union (later wins), mounts
+ * concatenate, first non-null cliVersion wins.
  */
 import {
   registerCredentialProvider,
+  mergeContributions,
   defaultManifestBuilder,
   noManifestSideEffect,
   ExtensionBag,
   AGENT_RUNTIME,
   type AgentRuntimeExt,
+  type ContainerContributor,
   type CredentialProvider,
 } from '../modules/credentials/index.js';
 import { readEnvFile } from '../env.js';
@@ -59,16 +65,31 @@ function isAnthropicEndpoint(base: string): boolean {
   }
 }
 
+/**
+ * Baseline container contribution: wire a custom Anthropic-compatible endpoint
+ * via env (`ANTHROPIC_BASE_URL` + a placeholder bearer the proxy rewrites on the
+ * wire); the standard api.anthropic.com path contributes nothing here.
+ */
+const baseUrlContributor: ContainerContributor = () => {
+  const dotenv = readEnvFile(['ANTHROPIC_BASE_URL']);
+  const env: Record<string, string> = {};
+  if (dotenv.ANTHROPIC_BASE_URL) {
+    env.ANTHROPIC_BASE_URL = dotenv.ANTHROPIC_BASE_URL;
+    env.ANTHROPIC_AUTH_TOKEN = 'placeholder';
+  }
+  return { env };
+};
+
 const agentRuntime: AgentRuntimeExt = {
-  containerContribution: () => {
-    const dotenv = readEnvFile(['ANTHROPIC_BASE_URL']);
-    const env: Record<string, string> = {};
-    if (dotenv.ANTHROPIC_BASE_URL) {
-      env.ANTHROPIC_BASE_URL = dotenv.ANTHROPIC_BASE_URL;
-      env.ANTHROPIC_AUTH_TOKEN = 'placeholder';
-    }
-    return { env };
-  },
+  // Merge the set of contributor calls into the container shape. A capability
+  // layer adds one call to this list (it does not rewrite the body); object in,
+  // object out, so contributors compose without colliding.
+  containerContribution: (ctx) =>
+    mergeContributions([
+      baseUrlContributor(ctx),
+      // mitm-proxy adds:      credentialSubstitutes(ctx),
+      // runtime-updater adds: runtimeCliMount(ctx),
+    ]),
   // Claude is only required when the runtime actually talks to Anthropic. A
   // group repointed at a custom endpoint (e.g. Ollama via ANTHROPIC_BASE_URL)
   // needs no Claude credential — requiring one false-gates the spawn.
