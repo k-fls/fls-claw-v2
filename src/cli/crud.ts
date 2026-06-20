@@ -162,11 +162,31 @@ function genericCreate(def: ResourceDef) {
   };
 }
 
+// Keys the dispatcher auto-fills into update args for group-scoped agent
+// callers (see dispatch.ts) that are NOT user-provided fields. These are only
+// injected for resources that don't carry them as real columns; if a resource
+// DOES declare one of these as a column it is still validated against
+// `updatable` below (the column lookup wins over this allow-list).
+const FRAMEWORK_INJECTED_KEYS = new Set(['agent_group_id', 'group']);
+
 function genericUpdate(def: ResourceDef) {
   const updatableCols = def.columns.filter((c) => c.updatable);
+  const columnsByName = new Map(def.columns.map((c) => [c.name, c]));
   return async (args: Record<string, unknown>) => {
     const id = args.id as string;
     if (!id) throw new Error(`${def.name} id is required`);
+
+    // Validate every provided flag up front so a flag naming a non-updatable
+    // or unknown column is a clear error rather than a silent no-op (#6).
+    for (const key of Object.keys(args)) {
+      if (key === 'id') continue; // the row selector, not a field to write
+      const col = columnsByName.get(key);
+      if (col) {
+        if (!col.updatable) throw new Error(`${key} is not updatable`);
+      } else if (!FRAMEWORK_INJECTED_KEYS.has(key)) {
+        throw new Error(`unknown field: ${key}`);
+      }
+    }
 
     const updates: Record<string, unknown> = {};
     for (const col of updatableCols) {
