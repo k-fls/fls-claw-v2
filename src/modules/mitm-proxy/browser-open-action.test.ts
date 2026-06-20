@@ -32,7 +32,7 @@ function invoke(body: unknown, method = 'POST', callerIP = '10.0.0.7') {
   const entry = matchHostRpc('/oauth/browser-open');
   if (!entry) throw new Error('handler not registered');
   const req: HostRpcRequest = { method, path: '/oauth/browser-open', body, callerIP };
-  return entry.handler(req, asContainerScope('grp'), 'test-session');
+  return entry.invoke(req, asContainerScope('grp'), 'test-session');
 }
 
 beforeEach(() => {

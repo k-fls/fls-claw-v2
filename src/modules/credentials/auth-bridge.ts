@@ -33,7 +33,7 @@
  * secret rides a host-owned file, not an rpc body). This module brokers only
  * the non-secret URL and the one-time auth code.
  */
-import { registerHostRpc, type HostRpcRequest } from '../host-rpc/index.js';
+import { registerScopedHostRpc, type HostRpcRequest } from '../host-rpc/index.js';
 import { pastePlainOn } from '../interactions/index.js';
 import { BeginInteractionConflictError, type InteractionOrigin } from '../../host-interactions.js';
 import { log } from '../../log.js';
@@ -186,7 +186,10 @@ async function handleAuthRpc(req: HostRpcRequest, scope: ContainerScope): Promis
   throw new Error('unknown-auth-path');
 }
 
-registerHostRpc('/auth', handleAuthRpc);
+// Scope-only: the auth container reaches /auth/* with a resolved scope but no
+// session (it allocates its IP via `allocateContainerIP(scope)`). A session-bound
+// registration would 403 it as "unknown caller IP". See host-rpc #9.
+registerScopedHostRpc('/auth', handleAuthRpc);
 
 /** Test hook — drops all episodes between cases. */
 export function _resetAuthBridgeForTests(): void {

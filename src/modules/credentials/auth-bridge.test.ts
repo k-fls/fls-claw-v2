@@ -34,7 +34,7 @@ function makeOrigin(replies: string[]): InteractionOrigin {
 function authRpc(path: string, body: unknown, scope: ContainerScope = SCOPE): Promise<unknown> {
   const entry = matchHostRpc(path);
   if (!entry) throw new Error(`no host-rpc handler for ${path}`);
-  return Promise.resolve(entry.handler({ method: 'POST', path, body, callerIP: '172.20.0.2' }, scope, 'test-session'));
+  return Promise.resolve(entry.invoke({ method: 'POST', path, body, callerIP: '172.20.0.2' }, scope, 'test-session'));
 }
 
 /** Simulate the user pasting `text` into the active interaction. */

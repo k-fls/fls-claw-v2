@@ -74,7 +74,7 @@ function registerClaude(opts: { acquire?: AcquireExt } = {}): void {
 function seedStoredCredential(): void {
   const dir = path.join(TMP, '.config', 'nanoclaw', 'credentials', FOLDER);
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, 'claude.json'), JSON.stringify({ api_key: { value: 'enc:x' } }));
+  fs.writeFileSync(path.join(dir, 'claude.keys.json'), JSON.stringify({ api_key: { value: 'enc:x' } }));
 }
 
 beforeEach(() => {

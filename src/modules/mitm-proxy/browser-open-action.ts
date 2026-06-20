@@ -17,14 +17,17 @@
  * a browser-launch URL is opened on the operator's machine, never on the
  * wire we MITM, so the shim is the only way to catch it.
  */
-import { registerHostRpc } from '../host-rpc/index.js';
+import { registerScopedHostRpc } from '../host-rpc/index.js';
 
 import { getProxy, hasProxyInstance } from './credential-proxy.js';
 import { logger } from './logger.js';
 import { matchAuthorizeUrl } from './oauth/index.js';
 import { dockerExecDeliver, oauthInteractive } from './oauth/oauth-interactive.js';
 
-registerHostRpc('/oauth/browser-open', (req) => {
+// Scope-only: the `xdg-open` shim fires from any container, including the
+// session-less auth container during browser-auth. The handler only needs the
+// caller's scope (resolved from req.callerIP), never a session. See host-rpc #9.
+registerScopedHostRpc('/oauth/browser-open', (req) => {
   if (req.method !== 'POST') return {};
   const body = req.body as { url?: unknown } | undefined;
   const url = typeof body?.url === 'string' ? body.url : null;
