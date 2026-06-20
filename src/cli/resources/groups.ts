@@ -1,10 +1,14 @@
+import { randomUUID } from 'crypto';
+
 import type { McpServerConfig } from '../../container-config.js';
 import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
+import { createAgentGroup } from '../../db/agent-groups.js';
 import { getDb, hasTable } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import {
+  ensureContainerConfig,
   getContainerConfig,
   updateContainerConfigScalars,
   updateContainerConfigJson,
@@ -58,11 +62,48 @@ registerResource({
     },
     { name: 'created_at', type: 'string', description: 'Auto-set.', generated: true },
   ],
-  // `delete` is intentionally not in `operations` — the generic single-table
-  // DELETE violates FK constraints (see #2525). The cascading handler is
-  // provided as `customOperations.delete` below.
-  operations: { list: 'open', get: 'open', create: 'approval', update: 'approval' },
+  // `create` and `delete` are intentionally not in `operations`:
+  //  - the generic single-table CREATE inserts only the agent_groups row and
+  //    never the matching container_configs row, leaving the group unspawnable
+  //    (see #4). The handler below mirrors the non-CLI creation paths
+  //    (group-init.ts, commands/agent-runtime.ts) by calling
+  //    ensureContainerConfig() after the insert.
+  //  - the generic single-table DELETE violates FK constraints (see #2525).
+  // Both are provided as `customOperations` below.
+  operations: { list: 'open', get: 'open', update: 'approval' },
   customOperations: {
+    create: {
+      access: 'approval',
+      description:
+        'Create a new agent group and its container config. Use --name <name> --folder <folder>. ' +
+        'Provisions the matching container_configs row so the group is spawnable (mirrors group-init).',
+      handler: async (args) => {
+        const name = args.name as string;
+        if (!name) throw new Error('--name is required');
+        const folder = args.folder as string;
+        if (!folder) throw new Error('--folder is required');
+
+        const id = randomUUID();
+        const created_at = new Date().toISOString();
+
+        const group = {
+          id,
+          name,
+          folder,
+          agent_provider: (args.agent_provider as string | undefined) ?? null,
+          created_at,
+        };
+
+        // Atomic: insert the group and ensure its container config together so
+        // a half-created (unspawnable) group can never be left behind.
+        getDb().transaction(() => {
+          createAgentGroup(group);
+          ensureContainerConfig(id);
+        })();
+
+        return { ...group, container_config: 'ensured' };
+      },
+    },
     delete: {
       access: 'approval',
       description:
