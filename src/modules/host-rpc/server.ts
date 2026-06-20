@@ -125,9 +125,10 @@ export async function handleRequest(req: IncomingMessage, res: ServerResponse): 
     reply(res, 400, { ok: false, error: 'no-caller-ip' });
     return;
   }
+  // Scope is the unspoofable caller identity (container IP → scope). Required
+  // for every endpoint; an unmapped IP is rejected before any handler runs.
   const scope = lookupContainerIP(callerIP);
-  const sessionId = lookupContainerSession(callerIP);
-  if (!scope || !sessionId) {
+  if (!scope) {
     log.warn('host-rpc: unknown caller IP, rejecting', { callerIP, url: req.url });
     reply(res, 403, { ok: false, error: 'unknown-caller' });
     return;
@@ -137,6 +138,20 @@ export async function handleRequest(req: IncomingMessage, res: ServerResponse): 
   const entry = matchHostRpc(path);
   if (!entry) {
     reply(res, 404, { ok: false, error: 'no-handler' });
+    return;
+  }
+
+  // Session is required only for session-bound endpoints. Session-less callers
+  // (e.g. the auth container, which allocates its IP with no session) can reach
+  // scope-only endpoints. This is why `sessionId` is resolved here, not folded
+  // into the scope gate above.
+  const sessionId = lookupContainerSession(callerIP);
+  if (entry.requiresSession && !sessionId) {
+    log.warn('host-rpc: session-bound endpoint called by session-less caller, rejecting', {
+      callerIP,
+      url: req.url,
+    });
+    reply(res, 403, { ok: false, error: 'no-session' });
     return;
   }
 
@@ -161,7 +176,7 @@ export async function handleRequest(req: IncomingMessage, res: ServerResponse): 
   };
 
   try {
-    const result = await entry.handler(request, scope, sessionId);
+    const result = await entry.invoke(request, scope, sessionId);
     reply(res, 200, { ok: true, result });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

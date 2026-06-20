@@ -27,7 +27,7 @@ let testSessionCounter = 0;
 function allocateContainerIP(scope: ContainerScope) {
   return allocateContainerIPRaw(scope, `test-session-${++testSessionCounter}`);
 }
-import { __resetHostRpcRegistryForTests, registerHostRpc } from './registry.js';
+import { __resetHostRpcRegistryForTests, registerHostRpc, registerScopedHostRpc } from './registry.js';
 import { startHostRpcServer, stopHostRpcServer, __isHostRpcServerRunning } from './server.js';
 
 const SCOPE = asContainerScope('test-scope');
@@ -134,6 +134,64 @@ describe('host-rpc server', () => {
     expect(res.status).toBe(403);
     expect(await res.json()).toEqual({ ok: false, error: 'unknown-caller' });
     expect(handlerCalled).toBe(false);
+  });
+
+  // Downstream contract: session-bound handlers (the `registerHostRpc` default)
+  // consume the third `sessionId` parameter as a non-null `string` — e.g. the
+  // sync-action wakeup and other session-scoped RPCs added on feature branches.
+  // This test pins that contract so it can't be silently relaxed (e.g. by
+  // widening the type to `string | null`). Session-less endpoints must use
+  // `registerScopedHostRpc` instead — see the two tests below.
+  it('session-bound handler always receives a non-null sessionId', async () => {
+    const allocated = allocateContainerIPRaw(SCOPE, 'sess-abc'); // 127.0.0.1 → (scope, session)
+    const baseUrl = await startOnFreePort();
+
+    let receivedSessionId: unknown = 'unset';
+    registerHostRpc('/sess', (_req, _scope, sessionId) => {
+      receivedSessionId = sessionId;
+      return 'ok';
+    });
+
+    const res = await fetch(`${baseUrl}/sess`, { method: 'GET', headers: { Connection: 'close' } });
+    expect(res.status).toBe(200);
+    expect(receivedSessionId).toBe('sess-abc');
+    allocated.release();
+  });
+
+  it('session-bound endpoint rejects a session-less caller with 403 no-session', async () => {
+    // Auth-container case: IP allocated with a scope but NO session.
+    allocateContainerIPRaw(SCOPE); // no sessionId arg
+    const baseUrl = await startOnFreePort();
+
+    let handlerCalled = false;
+    registerHostRpc('/sess', () => {
+      handlerCalled = true;
+      return 'should not get here';
+    });
+
+    const res = await fetch(`${baseUrl}/sess`, { method: 'GET', headers: { Connection: 'close' } });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ ok: false, error: 'no-session' });
+    expect(handlerCalled).toBe(false);
+  });
+
+  it('scope-only endpoint (registerScopedHostRpc) serves a session-less caller', async () => {
+    // The #9 fix: an auth container (scope, no session) can reach /auth-style
+    // endpoints. Before this, the blanket session requirement rejected it as
+    // "unknown caller IP" even though the scope resolved fine.
+    allocateContainerIPRaw(SCOPE); // no sessionId arg
+    const baseUrl = await startOnFreePort();
+
+    let seenScope: string | undefined;
+    registerScopedHostRpc('/auth', (_req, scope) => {
+      seenScope = scope;
+      return { url: 'https://example.test/oauth' };
+    });
+
+    const res = await fetch(`${baseUrl}/auth/url`, { method: 'POST', body: '{}' });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, result: { url: 'https://example.test/oauth' } });
+    expect(seenScope).toBe('test-scope');
   });
 
   it('returns 404 when no prefix matches', async () => {
