@@ -58,6 +58,20 @@ describe('sanitizeTelegramLegacyMarkdown', () => {
     expect(sanitizeTelegramLegacyMarkdown('')).toBe('');
   });
 
+  it('unwraps a code span nested in *bold* (Telegram cannot nest — would 400)', () => {
+    // *the `init` step* → keep the code, drop the bold for that span.
+    expect(sanitizeTelegramLegacyMarkdown('Run *the `init` step* now')).toBe('Run the `init` step now');
+  });
+
+  it('unwraps a code span nested in _italic_', () => {
+    expect(sanitizeTelegramLegacyMarkdown('_see `x` here_')).toBe('see `x` here');
+  });
+
+  it('leaves a standalone code span and a separate bold span intact', () => {
+    const input = '*bold* and `code`';
+    expect(sanitizeTelegramLegacyMarkdown(input)).toBe(input);
+  });
+
   it('replaces dash list bullets with • so the adapter does not re-emit `*` markers', () => {
     expect(sanitizeTelegramLegacyMarkdown('- one\n- two')).toBe('• one\n• two');
   });

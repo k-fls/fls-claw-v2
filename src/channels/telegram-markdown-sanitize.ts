@@ -36,6 +36,18 @@ export function sanitizeTelegramLegacyMarkdown(input: string): string {
   text = text.replace(/\*\*([^*\n]+?)\*\*/g, '*$1*');
   text = text.replace(/__([^_\n]+?)__/g, '_$1_');
 
+  // Telegram's legacy Markdown cannot nest a code span inside *bold* / _italic_:
+  // the backticks (now masked as a placeholder) and any `*`/`_` they protect make
+  // the parser lose the entity boundary ("can't find end of the entity" → 400).
+  // Drop the emphasis delimiters that wrap a code placeholder — keep the code,
+  // lose the bold/italic for that one span. Bounded to a span with no other
+  // `*`/`_` between the delimiters so it can't swallow neighbouring emphasis.
+  const NESTED_CODE_IN_EMPHASIS = new RegExp(
+    `([*_])([^*_\\n]*${PLACEHOLDER_PREFIX}\\d+${PLACEHOLDER_SUFFIX}[^*_\\n]*)\\1`,
+    'g',
+  );
+  text = text.replace(NESTED_CODE_IN_EMPHASIS, '$2');
+
   const starCount = (text.match(/\*/g) ?? []).length;
   const underCount = (text.match(/_/g) ?? []).length;
   if (starCount % 2 !== 0 || underCount % 2 !== 0) {
