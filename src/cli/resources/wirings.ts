@@ -1,3 +1,7 @@
+import { randomUUID } from 'crypto';
+
+import { createMessagingGroupAgent } from '../../db/messaging-groups.js';
+import type { MessagingGroupAgent } from '../../types.js';
 import { registerResource } from '../crud.js';
 
 registerResource({
@@ -66,5 +70,62 @@ registerResource({
     },
     { name: 'created_at', type: 'string', description: 'Auto-set.', generated: true },
   ],
-  operations: { list: 'open', get: 'open', create: 'approval', update: 'approval', delete: 'approval' },
+  // `create` is intentionally not in `operations` — the generic single-table
+  // INSERT bypasses the domain helper `createMessagingGroupAgent`, which also
+  // auto-creates the matching `agent_destinations` row so the agent can deliver
+  // to the wired chat as a target. Without it, `destinations list` is empty and
+  // the agent's `<message to="...">` blocks get dropped (#5). The custom handler
+  // below routes through `createMessagingGroupAgent` instead.
+  operations: { list: 'open', get: 'open', update: 'approval', delete: 'approval' },
+  customOperations: {
+    create: {
+      access: 'approval',
+      description:
+        'Wire a messaging group to an agent group, and auto-create the matching channel destination ' +
+        'so the agent can deliver to that chat as a target. ' +
+        'Use --messaging-group-id <id> --agent-group-id <id> ' +
+        '[--engage-mode mention|mention-sticky|pattern] [--engage-pattern <regex>] ' +
+        '[--sender-scope all|known] [--ignored-message-policy drop|accumulate] ' +
+        '[--session-mode shared|per-thread|agent-shared].',
+      handler: async (args) => {
+        const messagingGroupId = args.messaging_group_id as string | undefined;
+        if (!messagingGroupId) throw new Error('--messaging-group-id is required');
+        const agentGroupId = args.agent_group_id as string | undefined;
+        if (!agentGroupId) throw new Error('--agent-group-id is required');
+
+        // Replicate generic-create enum validation + DEFAULTS for the
+        // remaining columns declared in this resource.
+        const enums: Record<string, string[]> = {
+          engage_mode: ['pattern', 'mention', 'mention-sticky'],
+          sender_scope: ['all', 'known'],
+          ignored_message_policy: ['drop', 'accumulate'],
+          session_mode: ['shared', 'per-thread', 'agent-shared'],
+        };
+        function pick(name: keyof typeof enums, def: string): string {
+          const v = args[name];
+          if (v === undefined) return def;
+          if (!enums[name].includes(String(v))) {
+            throw new Error(`${name} must be one of: ${enums[name].join(', ')}`);
+          }
+          return String(v);
+        }
+
+        const mga: MessagingGroupAgent = {
+          id: randomUUID(),
+          messaging_group_id: messagingGroupId,
+          agent_group_id: agentGroupId,
+          engage_mode: pick('engage_mode', 'mention') as MessagingGroupAgent['engage_mode'],
+          engage_pattern: args.engage_pattern !== undefined ? (args.engage_pattern as string) : null,
+          sender_scope: pick('sender_scope', 'all') as MessagingGroupAgent['sender_scope'],
+          ignored_message_policy: pick('ignored_message_policy', 'drop') as MessagingGroupAgent['ignored_message_policy'],
+          session_mode: pick('session_mode', 'shared') as MessagingGroupAgent['session_mode'],
+          priority: 0,
+          created_at: new Date().toISOString(),
+        };
+
+        createMessagingGroupAgent(mga);
+        return mga;
+      },
+    },
+  },
 });
