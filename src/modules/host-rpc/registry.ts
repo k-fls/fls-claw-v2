@@ -13,13 +13,21 @@
  *     `/foo/` are equivalent and only one registration wins.
  */
 import { log } from '../../log.js';
-import type { HostRpcHandler } from './types.js';
+import type { ContainerScope } from '../container-bootstrap/index.js';
+import type { HostRpcHandler, HostRpcRequest, ScopedHostRpcHandler } from './types.js';
 
 const VALID_PREFIX = /^\/[a-zA-Z0-9._/-]*$/;
 
 interface Entry {
   readonly prefix: string;
-  readonly handler: HostRpcHandler;
+  /** Whether the gate must resolve a session before invoking. Session-bound
+   *  entries (`registerHostRpc`) get a non-null `sessionId`; scope-only
+   *  entries (`registerScopedHostRpc`) do not require one. */
+  readonly requiresSession: boolean;
+  /** Uniform call shape. For session-bound entries the gate guarantees
+   *  `sessionId` is non-null before this runs, so the wrapped
+   *  `HostRpcHandler` safely receives a `string`. */
+  readonly invoke: (req: HostRpcRequest, scope: ContainerScope, sessionId: string | null) => Promise<unknown> | unknown;
 }
 
 const entries = new Map<string, Entry>(); // keyed by normalized prefix
@@ -32,12 +40,40 @@ function normalize(prefix: string): string {
   return prefix.length > 1 && prefix.endsWith('/') ? prefix.slice(0, -1) : prefix;
 }
 
-export function registerHostRpc(prefix: string, handler: HostRpcHandler): void {
+function register(prefix: string, entry: Omit<Entry, 'prefix'>): void {
   const norm = normalize(prefix);
   if (entries.has(norm)) {
     log.warn('host-rpc handler re-registered (overwriting)', { prefix: norm });
   }
-  entries.set(norm, { prefix: norm, handler });
+  entries.set(norm, { prefix: norm, ...entry });
+}
+
+/**
+ * Register a **session-bound** handler (the default — most RPCs act on the
+ * caller's session). The gate requires both a resolved scope and a session,
+ * so the handler's `sessionId` third parameter is always a non-null `string`.
+ * Downstream branches rely on that; see `HostRpcHandler` in `types.ts`.
+ */
+export function registerHostRpc(prefix: string, handler: HostRpcHandler): void {
+  register(prefix, {
+    requiresSession: true,
+    // `sessionId as string` is sound: the gate returns 403 before invoke when
+    // a session-bound entry has no session bound to the caller IP.
+    invoke: (req, scope, sessionId) => handler(req, scope, sessionId as string),
+  });
+}
+
+/**
+ * Register a **scope-only** handler for endpoints reachable by session-less
+ * callers (e.g. the auth container's `/auth/*` flow — it allocates its IP
+ * with no session). The gate still requires a known scope; it does not
+ * require a session.
+ */
+export function registerScopedHostRpc(prefix: string, handler: ScopedHostRpcHandler): void {
+  register(prefix, {
+    requiresSession: false,
+    invoke: (req, scope) => handler(req, scope),
+  });
 }
 
 /**
