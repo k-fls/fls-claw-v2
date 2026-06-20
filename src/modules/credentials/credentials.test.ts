@@ -281,6 +281,37 @@ describe('store', () => {
     expect(fs.existsSync(keysFilePath(scope, 'oauth'))).toBe(false);
     expect(() => deleteKeysFile(scope, 'oauth')).not.toThrow();
   });
+
+  it('keys file is named `<providerId>.keys.json` (v1 scheme, refs-file counterpart)', () => {
+    const scope = asCredentialScope('group-name');
+    writeKeysFile(scope, 'claude', { api_key: { value: 'enc:x' } });
+    const file = keysFilePath(scope, 'claude');
+    expect(path.basename(file)).toBe('claude.keys.json');
+    expect(fs.existsSync(file)).toBe(true);
+  });
+
+  it('reads a credential store migrated in under the v1 `<prov>.keys.json` name', () => {
+    // A v1 store copied in as-is has `claude.keys.json` (not `claude.json`).
+    // The store must read it directly — no rename/migration step.
+    const scope = asCredentialScope('group-v1');
+    const dir = path.join(credentialsDir(), scope as unknown as string);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'claude.keys.json'), JSON.stringify({ api_key: { value: 'enc:x' }, v: 1 }));
+
+    expect(readKeysFile(scope, 'claude')).toEqual({ api_key: { value: 'enc:x' }, v: 1 });
+    expect(listProviderIds(scope)).toEqual(['claude']);
+  });
+
+  it('listProviderIds counts keys files only, ignoring the `<prov>.refs.json` sidecar', () => {
+    const scope = asCredentialScope('group-refs');
+    const dir = path.join(credentialsDir(), scope as unknown as string);
+    fs.mkdirSync(dir, { recursive: true });
+    // A refs sidecar present without a keys file must NOT register a provider.
+    fs.writeFileSync(path.join(dir, 'github.refs.json'), JSON.stringify({ subs: {} }));
+    writeKeysFile(scope, 'github', { oauth: { value: 'enc:x' } });
+
+    expect(listProviderIds(scope)).toEqual(['github']);
+  });
 });
 
 // ---------------------------------------------------------------------------
