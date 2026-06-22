@@ -1,95 +1,94 @@
 /**
- * Egress lockdown — force ALL agent traffic through the OneCLI gateway.
- * Agents run on a Docker `--internal` network (no internet route) with the
- * gateway attached as host.docker.internal, so the injected proxy is the only
- * reachable hop. Non-root, no NET_ADMIN — the agent can't undo it.
+ * Egress lockdown (opt-in) — force ALL agent traffic through the proxy hop.
  *
- * Fail-fast: when the flag is on but the network/gateway can't be set up, throw
- * rather than silently spawn an agent with open egress.
+ * This is the fork's replacement for upstream's `--internal`-network egress
+ * lockdown. The fork can't use the upstream mechanism: putting the container on
+ * a Docker `--internal` net severs the `host.docker.internal` / docker0 route
+ * that `host-rpc` (and the credential broker) depend on. So instead of removing
+ * the route, the fork keeps its managed `nanoclaw` bridge and enforces egress
+ * *inside* the container with a netfilter ruleset installed by the root
+ * entrypoint, then drops `NET_ADMIN` so the agent can't undo it.
+ *
+ * Mechanism (per spawn, when enabled):
+ *   1. This module contributes docker flags (`--cap-add=NET_ADMIN`,
+ *      `--cap-drop=NET_RAW`, IPv6-off sysctls) and env (`NANOCLAW_EGRESS_LOCKDOWN=1`
+ *      plus the host-rpc port) via the `egress` container-bootstrap observer,
+ *      and forces the root-drop launch mode (`needsRootEntrypoint`).
+ *   2. `container/entrypoint.sh`, running as root, installs a default-DROP
+ *      OUTPUT firewall that permits egress ONLY to the OneCLI proxy hop and the
+ *      host-rpc port, then `setpriv`-drops to the host UID with an empty
+ *      capability + bounding set. Combined with the always-on
+ *      `--security-opt=no-new-privileges`, the dropped agent has no `NET_ADMIN`
+ *      and cannot regain it, so it cannot flush the rules.
+ *
+ * Fail-closed: the entrypoint aborts (set -e) if the firewall can't be
+ * installed, and `assertEgressLaunchable` refuses to spawn if lockdown is on but
+ * the root-drop path isn't available — never a silent fall-back to open egress.
+ *
+ * Off by default; opt in with NANOCLAW_EGRESS_LOCKDOWN=true.
  */
-import { execFileSync } from 'child_process';
+// Imported from the host-rpc leaf module (not the barrel) so the allowlist is
+// derived from the SAME source the server binds — they can never drift — while
+// avoiding the import cycle the barrel would introduce.
+import { hostRpcPort } from './modules/host-rpc/port.js';
+import type { LaunchMode } from './modules/container-bootstrap/index.js';
 
-import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
-import { log } from './log.js';
-
-/** Locked-down, no-internet network agents are placed on. */
-export const EGRESS_NETWORK = process.env.NANOCLAW_EGRESS_NETWORK || 'nanoclaw-egress';
-/** The OneCLI gateway container attached as the only egress hop. */
-const ONECLI_GATEWAY_CONTAINER = process.env.ONECLI_GATEWAY_CONTAINER || 'onecli';
 /** Off by default; set NANOCLAW_EGRESS_LOCKDOWN=true to opt in. */
-const EGRESS_LOCKDOWN = process.env.NANOCLAW_EGRESS_LOCKDOWN === 'true';
+export function egressLockdownEnabled(): boolean {
+  return process.env.NANOCLAW_EGRESS_LOCKDOWN === 'true';
+}
 
-/** Raised when lockdown is requested but can't be established. */
+/** Raised when lockdown is requested but can't be safely established. */
 export class EgressLockdownError extends Error {
   constructor(reason: string) {
     super(
       `Egress lockdown is on (NANOCLAW_EGRESS_LOCKDOWN=true) but ${reason}. ` +
-        `Refusing to spawn with open egress. Start the OneCLI gateway container ` +
-        `"${ONECLI_GATEWAY_CONTAINER}", or set NANOCLAW_EGRESS_LOCKDOWN=false to opt out.`,
+        `Refusing to spawn with open egress. Fix the cause, or set ` +
+        `NANOCLAW_EGRESS_LOCKDOWN=false to opt out.`,
     );
     this.name = 'EgressLockdownError';
   }
 }
 
-function dockerOk(args: string[]): boolean {
-  try {
-    execFileSync(CONTAINER_RUNTIME_BIN, args, { stdio: 'pipe', timeout: 15000 });
-    return true;
-  } catch {
-    return false;
-  }
+/**
+ * Docker run flags for a locked-down container:
+ *   - NET_ADMIN so the root entrypoint can install iptables rules.
+ *   - drop NET_RAW so no leftover raw-socket capability survives in the
+ *     bounding set to bypass netfilter (the setpriv drop also clears it).
+ *   - disable IPv6 in the container netns so a v6 route can't bypass the
+ *     v4-only firewall (avoids needing ip6tables in the image).
+ */
+export function egressSpawnArgs(): string[] {
+  return [
+    '--cap-add=NET_ADMIN',
+    '--cap-drop=NET_RAW',
+    '--sysctl',
+    'net.ipv6.conf.all.disable_ipv6=1',
+    '--sysctl',
+    'net.ipv6.conf.default.disable_ipv6=1',
+  ];
 }
 
-/** Is the OneCLI gateway currently attached to the egress network? */
-function gatewayAttached(): boolean {
-  try {
-    const out = execFileSync(
-      CONTAINER_RUNTIME_BIN,
-      ['network', 'inspect', EGRESS_NETWORK, '--format', '{{range .Containers}}{{.Name}} {{end}}'],
-      { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8', timeout: 15000 },
-    );
-    return out.split(/\s+/).includes(ONECLI_GATEWAY_CONTAINER);
-  } catch {
-    return false;
-  }
+/** Env the entrypoint reads to install the firewall + harden the setpriv drop. */
+export function egressSpawnEnv(): Record<string, string> {
+  return {
+    NANOCLAW_EGRESS_LOCKDOWN: '1',
+    NANOCLAW_HOST_RPC_PORT: String(hostRpcPort()),
+  };
 }
 
 /**
- * Ensure the egress network exists with the OneCLI gateway attached (aliased
- * host.docker.internal). Idempotent + self-healing. Returns false when lockdown
- * is disabled (caller uses the host gateway), true when it's active. Throws
- * EgressLockdownError when enabled but unestablishable — fail fast rather than
- * spawn an agent with open egress.
+ * Fail-fast guard: lockdown enforcement lives in the root entrypoint, so it is
+ * only real on the root-drop launch path. If lockdown is on but we resolved a
+ * non-root launch mode (e.g. a host that doesn't expose uid/gid), refuse to
+ * spawn rather than run the agent with the firewall never installed.
  */
-export function ensureEgressNetwork(): boolean {
-  if (!EGRESS_LOCKDOWN) return false;
-
-  if (
-    !dockerOk(['network', 'inspect', EGRESS_NETWORK]) &&
-    !dockerOk(['network', 'create', '--internal', EGRESS_NETWORK])
-  ) {
-    throw new EgressLockdownError(`the "${EGRESS_NETWORK}" internal network could not be created`);
+export function assertEgressLaunchable(launchMode: LaunchMode): void {
+  if (!egressLockdownEnabled()) return;
+  if (launchMode.kind !== 'root-drop') {
+    throw new EgressLockdownError(
+      'the root-drop launch mode is unavailable (the host did not expose a ' +
+        'UID/GID to drop to), so the in-container firewall cannot be installed',
+    );
   }
-
-  if (gatewayAttached()) return true;
-
-  if (
-    dockerOk(['network', 'connect', '--alias', 'host.docker.internal', EGRESS_NETWORK, ONECLI_GATEWAY_CONTAINER]) &&
-    gatewayAttached()
-  ) {
-    log.info('Egress lockdown: OneCLI gateway attached', {
-      network: EGRESS_NETWORK,
-      gateway: ONECLI_GATEWAY_CONTAINER,
-    });
-    return true;
-  }
-
-  throw new EgressLockdownError(
-    `the OneCLI gateway "${ONECLI_GATEWAY_CONTAINER}" could not be attached to "${EGRESS_NETWORK}"`,
-  );
-}
-
-/** CLI args placing a container on the locked-down egress network. */
-export function egressNetworkArgs(): string[] {
-  return ['--network', EGRESS_NETWORK];
 }
