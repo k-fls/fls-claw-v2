@@ -63,6 +63,21 @@ export const GRACEFUL_STOP_MS = Math.max(2000, parseInt(process.env.GRACEFUL_STO
 // external firewall rule). The actual bound port is observable via
 // `CredentialProxy.getBoundPort()`.
 export const CREDENTIAL_PROXY_PORT = parseInt(process.env.CREDENTIAL_PROXY_PORT || '0', 10);
+// Graceful-drain budget (ms): how long a shutdown/restart waits for in-flight
+// agent turns to finish naturally before it force-stops the remainder. Distinct
+// from GRACEFUL_STOP_MS, which is the per-container SIGTERM-flush window once a
+// stop is actually issued. Keep this below the service manager's stop timeout
+// (systemd TimeoutStopSec / launchd exit timeout) or the host is SIGKILLed
+// mid-drain. The default SIGTERM path uses this; `--now` uses 0; `--wait` uses
+// MAX_DRAIN_TIMEOUT_MS.
+export const SHUTDOWN_DRAIN_TIMEOUT_MS = Math.max(
+  0,
+  parseInt(process.env.SHUTDOWN_DRAIN_TIMEOUT_MS || '60000', 10) || 60000,
+);
+// setTimeout overflows (clamps to 1ms, fires immediately) above 2^31-1 ms, so a
+// "wait for natural completion" drain is capped here (~24.8 days ≈ never), never
+// expressed as Infinity. beginGracefulDrain clamps drainTimeout into [0, this].
+export const MAX_DRAIN_TIMEOUT_MS = 2_147_483_647;
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

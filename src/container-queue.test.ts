@@ -343,3 +343,73 @@ describe('ContainerQueue — shutdown latch (P10)', () => {
     expect(h.spawned).not.toContain('c');
   });
 });
+
+describe('setCapacity / shedIdleOverCapacity (graceful-drain engine)', () => {
+  it('cap 0 sheds every idle container (the drain)', () => {
+    const h = harness(3);
+    h.complete('a');
+    h.complete('b');
+    h.complete('c');
+    h.q.setCapacity(0);
+    expect(h.evicted.sort()).toEqual(['a', 'b', 'c']);
+  });
+
+  it('skips a mid-turn container and sheds the rest', () => {
+    const h = harness(3);
+    h.complete('a');
+    h.complete('b', { hasOutstandingClaim: true }); // mid-turn
+    h.complete('c');
+    h.q.setCapacity(0);
+    expect(h.evicted.sort()).toEqual(['a', 'c']);
+    expect(h.evicted).not.toContain('b');
+  });
+
+  it('re-pings (sweep tick) and sheds the container once its claim clears', () => {
+    const h = harness(3);
+    h.complete('a', { hasOutstandingClaim: true });
+    h.q.setCapacity(0);
+    expect(h.evicted).toEqual([]); // still mid-turn
+    // Sweep stamps it idle, then re-runs the shed.
+    h.candidates.find((c) => c.sessionId === 'a')!.hasOutstandingClaim = false;
+    h.q.shedIdleOverCapacity();
+    expect(h.evicted).toEqual(['a']);
+  });
+
+  it('does not double-evict an already-stopping container', () => {
+    const h = harness(2);
+    h.complete('a');
+    h.complete('b');
+    h.q.setCapacity(0);
+    expect(h.evicted.sort()).toEqual(['a', 'b']);
+    h.q.shedIdleOverCapacity(); // re-ping while stops are in flight
+    expect(h.evicted.sort()).toEqual(['a', 'b']); // no duplicates
+  });
+
+  it('is a no-op when occupancy is within cap', () => {
+    const h = harness(5);
+    h.complete('a');
+    h.complete('b');
+    h.q.setCapacity(2); // 2 active, cap 2 — not over
+    expect(h.evicted).toEqual([]);
+  });
+
+  it('latches admissions at cap 0 — no spawn, no evict-to-serve', () => {
+    const h = harness(2);
+    h.complete('a');
+    h.q.setCapacity(0);
+    h.evicted.length = 0; // ignore the shed of 'a'
+    expect(h.wake('x')).toBe('deferred');
+    expect(h.spawned).not.toContain('x');
+    expect(h.evicted).toEqual([]); // never evicts a warm container to admit fresh work
+    expect(h.q.waitingCount()).toBe(0); // not even enqueued
+  });
+
+  it('raising capacity drains waiting sessions into the new headroom', () => {
+    const h = harness(1);
+    h.complete('a', { heartbeatMtimeMs: 999_999_999 }); // recent → not eviction-eligible
+    expect(h.wake('b')).toBe('deferred'); // at cap, queued
+    expect(h.spawned).not.toContain('b');
+    h.q.setCapacity(2);
+    expect(h.spawned).toContain('b'); // drained into the freed headroom
+  });
+});

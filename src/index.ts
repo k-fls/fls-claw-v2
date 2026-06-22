@@ -7,8 +7,8 @@
 import path from 'path';
 
 import { backfillContainerConfigs } from './backfill-container-configs.js';
-import { DATA_DIR } from './config.js';
-import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
+import { DATA_DIR, SHUTDOWN_DRAIN_TIMEOUT_MS } from './config.js';
+import { enforceStartupBackoff } from './circuit-breaker.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
@@ -18,7 +18,7 @@ import { startHostRpcServer } from './modules/host-rpc/index.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { routeInbound } from './router.js';
-import { shutdownContainers } from './container-runner.js';
+import { initiateShutdown } from './shutdown.js';
 import { log } from './log.js';
 import { enforceUpgradeTripwire } from './upgrade-state.js';
 
@@ -31,7 +31,6 @@ import {
   registerResponseHandler,
   getResponseHandlers,
   onShutdown,
-  getShutdownCallbacks,
   type ResponsePayload,
   type ResponseHandler,
 } from './response-registry.js';
@@ -65,7 +64,7 @@ import './cli/commands/index.js';
 // Top-level host commands. Side-effect registration.
 import './commands/stop.js'; // /stop (B1a)
 import './cli/delivery-action.js';
-import { startCliServer, stopCliServer } from './cli/socket-server.js';
+import { startCliServer } from './cli/socket-server.js';
 
 // Native-path credential providers (this branch runs the MITM proxy as the
 // credential path). Registered explicitly at boot (not via the modules barrel)
@@ -84,7 +83,7 @@ import { getOrCreateResolverForAgentGroup } from './modules/credentials/index.js
 import { CREDENTIAL_PROXY_PORT } from './config.js';
 
 import type { ChannelAdapter, ChannelSetup } from './channels/adapter.js';
-import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from './channels/channel-registry.js';
+import { initChannelAdapters, getChannelAdapter } from './channels/channel-registry.js';
 
 async function main(): Promise<void> {
   log.info('NanoClaw starting');
@@ -236,36 +235,11 @@ async function main(): Promise<void> {
   log.info('NanoClaw running');
 }
 
-/** Graceful shutdown. */
-async function shutdown(signal: string): Promise<void> {
-  log.info('Shutdown signal received', { signal });
-  for (const cb of getShutdownCallbacks()) {
-    try {
-      await cb();
-    } catch (err) {
-      log.error('Shutdown callback threw', { err });
-    }
-  }
-  stopDeliveryPolls();
-  stopHostSweep();
-  // Best-effort kill of live containers (latches the admission queue shut so
-  // nothing respawns mid-teardown). Containers are DB-durable; a kill mid-turn
-  // resets the message to pending for the next boot.
-  await shutdownContainers();
-  await stopCliServer();
-  try {
-    await teardownChannelAdapters();
-  } finally {
-    // Always reset on graceful shutdown — even if teardown threw, we got here
-    // via SIGTERM/SIGINT, not a crash, so the next start shouldn't be counted
-    // as one.
-    resetCircuitBreaker();
-    process.exit(0);
-  }
-}
-
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+// SIGTERM (service stop) → graceful drain up to the budget; SIGINT (Ctrl-C) →
+// immediate. A second signal mid-drain escalates to immediate (handled inside
+// initiateShutdown). See src/shutdown.ts.
+process.on('SIGTERM', () => void initiateShutdown(SHUTDOWN_DRAIN_TIMEOUT_MS, 'SIGTERM'));
+process.on('SIGINT', () => void initiateShutdown(0, 'SIGINT'));
 
 main().catch((err) => {
   log.fatal('Startup failed', { err });
