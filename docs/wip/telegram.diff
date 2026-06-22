@@ -1,0 +1,85 @@
+# Bug #11 (Telegram outbound) — changes
+# 1) src/channels/telegram-markdown-sanitize.ts  (vs upstream nanocoai/nanoclaw channels branch)
+# 2) src/channels/chat-sdk-bridge.ts             (vs integration/v2-hagent)
+
+diff --git a/src/channels/telegram-markdown-sanitize.ts b/src/channels/telegram-markdown-sanitize.ts
+index c848c11..e2b2d00 100644
+--- a/src/channels/telegram-markdown-sanitize.ts
++++ b/src/channels/telegram-markdown-sanitize.ts
+@@ -36,6 +36,13 @@ export function sanitizeTelegramLegacyMarkdown(input: string): string {
+   text = text.replace(/\*\*([^*\n]+?)\*\*/g, '*$1*');
+   text = text.replace(/__([^_\n]+?)__/g, '_$1_');
+ 
++  // Telegram's legacy Markdown cannot nest a code span inside *bold* / _italic_;
++  // the backticks (and any literal `*`/`_` they protect) make the parser lose the
++  // entity boundary ("can't find end of the entity"). Drop the emphasis delimiters
++  // that wrap a code placeholder — keep the code, lose the bold/italic for that span.
++  const NEST = new RegExp(`([*_])([^*_\\n]*${PLACEHOLDER_PREFIX}\\d+${PLACEHOLDER_SUFFIX}[^*_\\n]*)\\1`, 'g');
++  text = text.replace(NEST, '$2');
++
+   const starCount = (text.match(/\*/g) ?? []).length;
+   const underCount = (text.match(/_/g) ?? []).length;
+   if (starCount % 2 !== 0 || underCount % 2 !== 0) {
+
+diff --git a/src/channels/chat-sdk-bridge.ts b/src/channels/chat-sdk-bridge.ts
+index efeb32f..d1a7454 100644
+--- a/src/channels/chat-sdk-bridge.ts
++++ b/src/channels/chat-sdk-bridge.ts
+@@ -119,6 +119,22 @@ export function splitForLimit(text: string, limit: number): string[] {
+   return chunks;
+ }
+ 
++/** A channel rejected the message for markup/entity parsing reasons (not transport). */
++export function isFormatError(err: unknown): boolean {
++  const m = err instanceof Error ? err.message : String(err);
++  return /parse entit|find end of the entity|can't parse|Bad Request:.*entit/i.test(m);
++}
++
++/** Strip legacy-Markdown delimiters so text is readable when sent as plain. */
++export function toPlainText(s: string): string {
++  return s
++    .replace(/```([\s\S]*?)```/g, '$1')
++    .replace(/`([^`\n]*)`/g, '$1')
++    .replace(/\*\*?([^*\n]+?)\*\*?/g, '$1')
++    .replace(/__?([^_\n]+?)__?/g, '$1')
++    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');
++}
++
+ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
+   const { adapter } = config;
+   const transformText = (t: string): string => (config.transformOutboundText ? config.transformOutboundText(t) : t);
+@@ -488,10 +504,30 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
+         for (let i = 0; i < chunks.length; i++) {
+           const chunk = chunks[i];
+           const attachFiles = i === 0 && fileUploads && fileUploads.length > 0;
+-          const result = await adapter.postMessage(
+-            tid,
+-            attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
+-          );
++          let result;
++          try {
++            result = await adapter.postMessage(
++              tid,
++              attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
++            );
++          } catch (err) {
++            if (!isFormatError(err)) throw err;
++            // The agent generated a reply — a formatting rejection must never
++            // silently drop it. Degrade to plain text (no parse mode), then a stub.
++            log.warn('channel rejected markdown; retrying as plain text', { err: String(err) });
++            const plain = toPlainText(chunk);
++            try {
++              result = await adapter.postMessage(
++                tid,
++                attachFiles ? { raw: plain, files: fileUploads } : { raw: plain },
++              );
++            } catch (err2) {
++              log.error('plain-text fallback failed; sending stub', { err: String(err2) });
++              result = await adapter.postMessage(tid, {
++                raw: '⚠️ The agent replied, but the message could not be delivered in this channel’s format.',
++              });
++            }
++          }
+           if (i === 0) firstId = result?.id;
+         }
+         return firstId;
