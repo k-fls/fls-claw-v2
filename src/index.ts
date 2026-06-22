@@ -65,7 +65,7 @@ import './cli/commands/index.js';
 
 // Top-level host commands. Side-effect registration.
 import './commands/agent-runtime.js'; // /agent-runtime (F2)
-import { startRuntimeUpdaters, stopRuntimeUpdaters } from './modules/runtime-updater/index.js';
+import { startRuntimeUpdaters } from './modules/runtime-updater/index.js';
 import './cli/delivery-action.js';
 import { startCliServer, stopCliServer } from './cli/socket-server.js';
 
@@ -223,7 +223,6 @@ async function shutdown(signal: string): Promise<void> {
       log.error('Shutdown callback threw', { err });
     }
   }
-  stopRuntimeUpdaters();
   stopDeliveryPolls();
   stopHostSweep();
   // Best-effort kill of live containers (latches the admission queue shut so

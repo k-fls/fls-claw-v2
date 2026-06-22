@@ -17,6 +17,7 @@ import { parseProviderSpec } from '../../container-config.js';
 import { getAllContainerConfigs } from '../../db/container-configs.js';
 import { getRuntimeAutoUpdate, setRuntimeAutoUpdate } from '../../db/runtime-auto-update.js';
 import { log } from '../../log.js';
+import { onShutdown } from '../../response-registry.js';
 import { maxSemver } from './updater.js';
 
 /** Normalized form of an auto-update setting ('', '24h', '2.1.92', …). */
@@ -140,12 +141,24 @@ export class RuntimeUpdateManager {
 
 const managers = new Map<string, RuntimeUpdateManager>();
 
+/** Guards one-time shutdown-hook registration across repeated start calls. */
+let shutdownHookRegistered = false;
+
 /**
  * Create a manager for every provider declaring RUNTIME_UPDATER, seed its
  * cadence from the DB, and apply it (initial fetch + timer). Call once at boot,
  * after provider registration.
+ *
+ * Registers its own teardown via `onShutdown` so the host shutdown path tears
+ * the timers down without `index.ts` having to know about this module — works
+ * regardless of which shutdown orchestration is in effect (both the inline
+ * handler and the graceful-drain `initiateShutdown` drain the same callbacks).
  */
 export async function startRuntimeUpdaters(): Promise<void> {
+  if (!shutdownHookRegistered) {
+    shutdownHookRegistered = true;
+    onShutdown(() => stopRuntimeUpdaters());
+  }
   for (const provider of getAllCredentialProviders()) {
     const updater = provider.getExtension?.(RUNTIME_UPDATER);
     if (!updater) continue;
