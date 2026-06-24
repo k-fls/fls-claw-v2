@@ -129,6 +129,20 @@ export function networkArgs(ip: string): readonly string[] {
   return ['--network', NANOCLAW_NETWORK, '--ip', ip];
 }
 
+/**
+ * The host's IP on the nanoclaw bridge — the `.0.1` gateway Docker assigns when
+ * it creates the network. Host-side services that containers call (host-rpc,
+ * the MITM proxy) bind here, and containers reach them here, rather than via
+ * docker0 / the `host-gateway` alias. Agent containers live on the nanoclaw
+ * bridge, so a hop to its own gateway is delivered at L2 and never crosses to
+ * another bridge — Docker's per-network MASQUERADE rule (`-s <subnet> ! -o
+ * nanoclaw`) never fires, so the container's real source IP survives. host-rpc's
+ * caller-IP gate depends on seeing that real IP. (host-rpc bug #9)
+ */
+export function gatewayIP(): string {
+  return `${NANOCLAW_SUBNET_PREFIX}.0.1`;
+}
+
 /** @internal — for tests. */
 export function __resetPoolForTests(): void {
   nextHostPart = POOL_MIN;
