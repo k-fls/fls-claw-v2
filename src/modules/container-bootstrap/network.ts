@@ -9,6 +9,7 @@
  * (registry.ts) doesn't carry shell-out responsibility.
  */
 import { execSync } from 'child_process';
+import fs from 'fs';
 import os from 'os';
 
 import { CONTAINER_RUNTIME_BIN } from '../../container-runtime.js';
@@ -141,6 +142,30 @@ export function networkArgs(ip: string): readonly string[] {
  */
 export function gatewayIP(): string {
   return `${NANOCLAW_SUBNET_PREFIX}.0.1`;
+}
+
+/**
+ * The address host-side services (host-rpc, the credential proxy) should BIND
+ * to: reachable from agent containers, but not from the wider host or LAN.
+ *
+ * Containers always reach these services at `host.docker.internal`, which
+ * `hostGatewayArgs` points at:
+ *   - loopback inside the Docker Desktop / WSL VM → bind `127.0.0.1`
+ *   - the nanoclaw bridge gateway on bare-metal Linux → bind that gateway
+ *
+ * Binding this specific address (never `0.0.0.0`) keeps the listener off every
+ * other host interface, so only containers on the nanoclaw bridge can connect.
+ * That is the network-layer half of the defense the caller-IP gate completes —
+ * a credential-bearing service should not be reachable from the LAN at all,
+ * not merely rejected once a stranger connects. Single source of truth shared
+ * by host-rpc's bind and the proxy's bind so the two cannot drift. (#9)
+ */
+export function gatewayBindHost(): string {
+  if (os.platform() === 'darwin') return '127.0.0.1';
+  // WSL: Docker Desktop routes host-gateway → loopback in the VM.
+  if (fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) return '127.0.0.1';
+  // Bare-metal Linux: the nanoclaw bridge gateway.
+  return gatewayIP();
 }
 
 /** @internal — for tests. */

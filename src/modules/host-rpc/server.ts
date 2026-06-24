@@ -25,15 +25,17 @@
  *   Response: { ok: true, result: <handler return> }      (200)
  *           | { ok: false, error: <message> }             (4xx/5xx)
  */
-import fs from 'fs';
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'http';
-import os from 'os';
 
 import { log } from '../../log.js';
 import { lookupContainerIP, lookupContainerSession } from '../container-bootstrap/index.js';
-// Leaf import (not the barrel) so the bind address is derived from the SAME
-// source that allocates container IPs and builds the network — they can't drift.
-import { gatewayIP } from '../container-bootstrap/network.js';
+// Leaf import (not the barrel): bind to the SAME address the proxy binds and
+// containers reach via host.docker.internal — gatewayBindHost is the one source
+// of truth, so host-rpc's bind and the proxy's bind can't drift. Binding the
+// bridge gateway (not docker0, not 0.0.0.0) keeps the hop on the container's
+// own bridge — no cross-bridge MASQUERADE — so the caller-IP gate below sees
+// the real container IP. (host-rpc bug #9)
+import { gatewayBindHost } from '../container-bootstrap/network.js';
 import { matchHostRpc } from './registry.js';
 import { hostRpcPort } from './port.js';
 import type { HostRpcRequest } from './types.js';
@@ -43,30 +45,7 @@ const MAX_BODY = 1024 * 1024; // 1 MiB
 
 let server: Server | null = null;
 
-/**
- * Detect the host interface reachable from container bridge networks.
- * Mirrors the fork's `detectProxyBindHost` in src/auth/container-args.ts.
- *
- * - Docker Desktop (macOS / WSL): `host.docker.internal` resolves to
- *   loopback inside the VM, so binding `127.0.0.1` works.
- * - Bare-metal Linux: bind the nanoclaw bridge gateway. Containers reach
- *   us at `host.docker.internal`, which hostGatewayArgs remaps to this same
- *   gateway. Because that keeps the hop on the container's own bridge, the
- *   source IP is never MASQUERADE'd, so the caller-IP gate below sees the
- *   container's real IP. (Previously bound docker0 — a different bridge —
- *   which forced a cross-bridge hop that rewrote the source IP and 403'd
- *   every call: host-rpc bug #9.)
- */
-function detectBindHost(): string {
-  if (os.platform() === 'darwin') return '127.0.0.1';
-  // WSL: Docker Desktop also routes host-gateway → loopback in the VM.
-  if (fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) return '127.0.0.1';
-  // Bare-metal Linux: the nanoclaw bridge gateway (deterministic from the
-  // subnet — no docker0 probing needed).
-  return gatewayIP();
-}
-
-const DEFAULT_BIND = process.env.NANOCLAW_HOST_RPC_BIND || detectBindHost();
+const DEFAULT_BIND = process.env.NANOCLAW_HOST_RPC_BIND || gatewayBindHost();
 
 function reply(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
