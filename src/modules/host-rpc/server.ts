@@ -6,7 +6,8 @@
  * host is detected the same way the fork's credential proxy detects
  * its bind: `127.0.0.1` on macOS / WSL / Docker Desktop (where
  * `host.docker.internal` resolves to loopback in the VM), and the
- * `docker0` bridge IP on bare-metal Linux.
+ * `nanoclaw` bridge gateway on bare-metal Linux — the same address
+ * `host.docker.internal` is remapped to there (see hostGatewayArgs).
  *
  * Authorization:
  *   The caller IP is resolved against the container-ip registry. If
@@ -24,13 +25,17 @@
  *   Response: { ok: true, result: <handler return> }      (200)
  *           | { ok: false, error: <message> }             (4xx/5xx)
  */
-import { execSync } from 'child_process';
-import fs from 'fs';
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'http';
-import os from 'os';
 
 import { log } from '../../log.js';
 import { lookupContainerIP, lookupContainerSession } from '../container-bootstrap/index.js';
+// Leaf import (not the barrel): bind to the SAME address the proxy binds and
+// containers reach via host.docker.internal — gatewayBindHost is the one source
+// of truth, so host-rpc's bind and the proxy's bind can't drift. Binding the
+// bridge gateway (not docker0, not 0.0.0.0) keeps the hop on the container's
+// own bridge — no cross-bridge MASQUERADE — so the caller-IP gate below sees
+// the real container IP. (host-rpc bug #9)
+import { gatewayBindHost } from '../container-bootstrap/network.js';
 import { matchHostRpc } from './registry.js';
 import { hostRpcPort } from './port.js';
 import type { HostRpcRequest } from './types.js';
@@ -40,42 +45,7 @@ const MAX_BODY = 1024 * 1024; // 1 MiB
 
 let server: Server | null = null;
 
-/**
- * Detect the host interface reachable from container bridge networks.
- * Mirrors the fork's `detectProxyBindHost` in src/auth/container-args.ts.
- *
- * - Docker Desktop (macOS / WSL): `host.docker.internal` resolves to
- *   loopback inside the VM, so binding `127.0.0.1` works.
- * - Bare-metal Linux: `host.docker.internal` is wired via
- *   `--add-host=...:host-gateway`, which resolves to the docker0 bridge
- *   IP. Bind there so the port is reachable from containers without
- *   also exposing it on every host interface.
- */
-function detectBindHost(): string {
-  if (os.platform() === 'darwin') return '127.0.0.1';
-  // WSL: Docker Desktop also routes host-gateway → loopback in the VM.
-  if (fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) return '127.0.0.1';
-
-  // Linux: prefer docker0's IPv4. `os.networkInterfaces()` omits DOWN
-  // interfaces, so fall back to parsing `ip addr` when no containers are
-  // running yet and docker0 is idle.
-  const ifaces = os.networkInterfaces();
-  const docker0 = ifaces['docker0'];
-  if (docker0) {
-    const ipv4 = docker0.find((a) => a.family === 'IPv4');
-    if (ipv4) return ipv4.address;
-  }
-  try {
-    const out = execSync('ip addr show docker0', { encoding: 'utf-8', timeout: 3000 });
-    const m = out.match(/inet (\d+\.\d+\.\d+\.\d+)/);
-    if (m) return m[1];
-  } catch {
-    /* docker0 not present */
-  }
-  return '127.0.0.1';
-}
-
-const DEFAULT_BIND = process.env.NANOCLAW_HOST_RPC_BIND || detectBindHost();
+const DEFAULT_BIND = process.env.NANOCLAW_HOST_RPC_BIND || gatewayBindHost();
 
 function reply(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
