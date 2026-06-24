@@ -5,7 +5,13 @@
  */
 import { describe, it, expect, beforeEach } from 'vitest';
 
-import { allocateIPFromPool, networkArgs, __resetPoolForTests, __PREFIX } from './network.js';
+import {
+  allocateIPFromPool,
+  networkArgs,
+  gatewayIP,
+  __resetPoolForTests,
+  __PREFIX,
+} from './network.js';
 
 beforeEach(() => {
   __resetPoolForTests();
@@ -35,5 +41,11 @@ describe('container-ip network', () => {
 
   it('networkArgs returns the expected Docker CLI shape', () => {
     expect(networkArgs('172.29.0.5')).toEqual(['--network', 'nanoclaw', '--ip', '172.29.0.5']);
+  });
+
+  it('gatewayIP is the .0.1 host address on the bridge', () => {
+    // Host-rpc and the MITM proxy bind here; containers reach them here so the
+    // hop stays same-subnet and the real source IP survives. (bug #9)
+    expect(gatewayIP()).toBe(`${__PREFIX}.0.1`);
   });
 });

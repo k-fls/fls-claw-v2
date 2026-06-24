@@ -17,18 +17,42 @@ vi.mock('child_process', () => ({
   execSync: (...args: unknown[]) => mockExecSync(...args),
 }));
 
+import os from 'os';
+import fs from 'fs';
+
 import {
   CONTAINER_RUNTIME_BIN,
   readonlyMountArgs,
   stopContainer,
+  hostGatewayArgs,
   ensureContainerRuntimeRunning,
   cleanupOrphans,
 } from './container-runtime.js';
 import { CONTAINER_INSTALL_LABEL } from './config.js';
+import { gatewayIP } from './modules/container-bootstrap/network.js';
 import { log } from './log.js';
 
 beforeEach(() => {
   vi.clearAllMocks();
+});
+
+describe('hostGatewayArgs', () => {
+  it('adds nothing on macOS (host.docker.internal is built in)', () => {
+    vi.spyOn(os, 'platform').mockReturnValue('darwin');
+    expect(hostGatewayArgs()).toEqual([]);
+  });
+
+  it('keeps the host-gateway alias on WSL (bridge gateway not host-bindable)', () => {
+    vi.spyOn(os, 'platform').mockReturnValue('linux');
+    vi.spyOn(fs, 'existsSync').mockReturnValue(true); // /proc/.../WSLInterop present
+    expect(hostGatewayArgs()).toEqual(['--add-host=host.docker.internal:host-gateway']);
+  });
+
+  it('points host.docker.internal at the nanoclaw gateway on bare-metal Linux (bug #9)', () => {
+    vi.spyOn(os, 'platform').mockReturnValue('linux');
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false); // not WSL
+    expect(hostGatewayArgs()).toEqual([`--add-host=host.docker.internal:${gatewayIP()}`]);
+  });
 });
 
 // --- Pure functions ---
