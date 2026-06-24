@@ -3,21 +3,38 @@
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
  */
 import { exec, execSync } from 'child_process';
+import fs from 'fs';
 import os from 'os';
 
 import { CONTAINER_INSTALL_LABEL } from './config.js';
 import { log } from './log.js';
+// Single source of truth for the nanoclaw bridge gateway. This import closes a
+// load-safe cycle (network.ts imports CONTAINER_RUNTIME_BIN from here): neither
+// module references the other's binding at top level, so initialization order
+// is irrelevant. Deriving the gateway here instead would duplicate the subnet
+// parsing and let it drift from the network the allocator actually creates.
+import { gatewayIP } from './modules/container-bootstrap/network.js';
 
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'docker';
 
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
-  // On Linux, host.docker.internal isn't built-in — add it explicitly
-  if (os.platform() === 'linux') {
+  // macOS / Docker Desktop: host.docker.internal is built in — nothing to add.
+  if (os.platform() !== 'linux') return [];
+  // WSL (Docker Desktop's VM) routes host-gateway correctly and the nanoclaw
+  // bridge gateway isn't bindable from the Windows host, so keep the built-in
+  // host-gateway alias there. Mirrors host-rpc's detectBindHost() branching.
+  if (fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) {
     return ['--add-host=host.docker.internal:host-gateway'];
   }
-  return [];
+  // Bare-metal Linux: point host.docker.internal at the nanoclaw bridge gateway
+  // instead of docker0 (the default host-gateway target). Containers live on
+  // the nanoclaw bridge, so reaching the host on its own bridge IP keeps the
+  // hop same-subnet — no cross-bridge MASQUERADE, so host-rpc and the MITM
+  // proxy (both bound on this address) see the container's real source IP,
+  // which host-rpc's caller-IP gate requires. (host-rpc bug #9)
+  return [`--add-host=host.docker.internal:${gatewayIP()}`];
 }
 
 /** Returns CLI args for a readonly bind mount. */
