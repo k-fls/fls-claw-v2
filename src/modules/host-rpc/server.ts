@@ -29,13 +29,12 @@ import { createServer, type Server, type IncomingMessage, type ServerResponse } 
 
 import { log } from '../../log.js';
 import { lookupContainerIP, lookupContainerSession } from '../container-bootstrap/index.js';
-// Leaf import (not the barrel): bind to the SAME address the proxy binds and
-// containers reach via host.docker.internal — gatewayBindHost is the one source
-// of truth, so host-rpc's bind and the proxy's bind can't drift. Binding the
-// bridge gateway (not docker0, not 0.0.0.0) keeps the hop on the container's
-// own bridge — no cross-bridge MASQUERADE — so the caller-IP gate below sees
-// the real container IP. (host-rpc bug #9)
-import { gatewayBindHost } from '../container-bootstrap/network.js';
+// Leaf import (not the barrel): bind to the SAME address the proxy binds —
+// serviceBindHost is the one source of truth, so host-rpc's bind and the proxy's
+// bind can't drift. Open mode (default) → 0.0.0.0 (rootless; the caller-IP gate
+// below still sees the container's real source IP); gateway mode → the bridge
+// gateway, off the LAN. See CLAW_HOST_NET_MODE. (host-rpc bug #9)
+import { serviceBindHost } from '../container-bootstrap/network.js';
 import { matchHostRpc } from './registry.js';
 import { hostRpcPort } from './port.js';
 import type { HostRpcRequest } from './types.js';
@@ -44,8 +43,6 @@ const DEFAULT_PORT = hostRpcPort();
 const MAX_BODY = 1024 * 1024; // 1 MiB
 
 let server: Server | null = null;
-
-const DEFAULT_BIND = process.env.NANOCLAW_HOST_RPC_BIND || gatewayBindHost();
 
 function reply(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
@@ -163,7 +160,11 @@ export async function startHostRpcServer(opts?: {
     throw new Error('host-rpc server already running');
   }
   const port = opts?.port ?? DEFAULT_PORT;
-  const bind = opts?.bind ?? DEFAULT_BIND;
+  // Resolve the bind lazily at start (not module load) so CLAW_HOST_NET_MODE is
+  // read when the server actually starts. Open mode → 0.0.0.0; gateway → the
+  // bridge gateway. Clients never use this address to connect — they dial the
+  // host.docker.internal hostname, which --add-host maps to the right target.
+  const bind = opts?.bind ?? serviceBindHost();
 
   const s = createServer((req, res) => {
     handleRequest(req, res).catch((err) => {
@@ -194,9 +195,12 @@ let currentAddress: { bind: string; port: number } | null = null;
 
 /**
  * Address of the running host-rpc server, or null if not started yet.
- * Containers reach the server at `http://<bind>:<port>`; modules use
- * this to expose the URL to containers via an env var
- * (`CLAW_HOST_RPC_URL`).
+ *
+ * `bind` is the LISTEN address — it may be `0.0.0.0` (open mode) and is NOT a
+ * connectable address. Containers must reach the server via the
+ * `host.docker.internal` hostname (which --add-host maps to the right target
+ * per CLAW_HOST_NET_MODE), so modules building `CLAW_HOST_RPC_URL` use that
+ * hostname with `port` — never `bind`.
  */
 export function getHostRpcAddress(): { bind: string; port: number } | null {
   return currentAddress;

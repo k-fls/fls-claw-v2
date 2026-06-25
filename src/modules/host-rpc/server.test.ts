@@ -16,7 +16,7 @@ vi.mock('../container-bootstrap/network.js', () => ({
   allocateIPFromPool: () => nextPoolValue,
   releaseIPToPool: () => {},
   gatewayIP: () => '172.29.0.1',
-  gatewayBindHost: () => '127.0.0.1',
+  serviceBindHost: () => '127.0.0.1',
 }));
 
 import {
