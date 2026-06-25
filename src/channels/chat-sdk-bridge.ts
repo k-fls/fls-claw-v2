@@ -119,6 +119,31 @@ export function splitForLimit(text: string, limit: number): string[] {
   return chunks;
 }
 
+/**
+ * A channel rejected the message for markup/entity parsing reasons (a 4xx about
+ * the markup itself), not a transport/availability failure. Used to decide
+ * whether a plain-text retry is worth attempting — transport errors should
+ * propagate so the normal retry/backoff path handles them.
+ */
+export function isFormatError(err: unknown): boolean {
+  const m = err instanceof Error ? err.message : String(err);
+  return /parse entit|find end of the entity|can't parse|Bad Request:.*entit/i.test(m);
+}
+
+/**
+ * Strip legacy-Markdown delimiters so the text stays readable when re-sent as
+ * plain (no parse mode). Best-effort: drops code fences/spans and bold/italic
+ * markers and unwraps links to their label.
+ */
+export function toPlainText(s: string): string {
+  return s
+    .replace(/```([\s\S]*?)```/g, '$1')
+    .replace(/`([^`\n]*)`/g, '$1')
+    .replace(/\*\*?([^*\n]+?)\*\*?/g, '$1')
+    .replace(/__?([^_\n]+?)__?/g, '$1')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');
+}
+
 export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
   const { adapter } = config;
   const transformText = (t: string): string => (config.transformOutboundText ? config.transformOutboundText(t) : t);
@@ -470,8 +495,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       }
 
       // Normal message
+      // plain: true (set by deliverDirect for system/interaction replies, e.g.
+      // an OAuth sign-in URL) must bypass the platform Markdown transform —
+      // Telegram legacy-Markdown would parse the URL's query-param underscores
+      // as italics and strip them. Pass it through raw, with no parse mode (and
+      // so no format-error fallback — raw can't trigger one).
+      const plain = content.plain === true;
       const rawText = (content.markdown as string) || (content.text as string);
-      const text = rawText ? transformText(rawText) : rawText;
+      const text = rawText ? (plain ? rawText : transformText(rawText)) : rawText;
       if (text) {
         // Attach files if present (FileUpload format: { data, filename })
         const fileUploads = message.files?.map((f: { data: Buffer; filename: string }) => ({
@@ -488,10 +519,40 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
           const attachFiles = i === 0 && fileUploads && fileUploads.length > 0;
-          const result = await adapter.postMessage(
-            tid,
-            attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
-          );
+          let result: Awaited<ReturnType<typeof adapter.postMessage>> | undefined;
+          if (plain) {
+            result = await adapter.postMessage(
+              tid,
+              attachFiles ? { raw: chunk, files: fileUploads } : { raw: chunk },
+            );
+            if (i === 0) firstId = result?.id;
+            continue;
+          }
+          try {
+            result = await adapter.postMessage(
+              tid,
+              attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
+            );
+          } catch (err) {
+            // Transport/availability errors propagate to the normal retry path.
+            if (!isFormatError(err)) throw err;
+            // The agent generated a reply — a formatting rejection must never
+            // silently drop it. Degrade to plain text (no parse mode); if even
+            // that is rejected, send a stub so the user knows a reply existed.
+            log.warn('channel rejected markdown; retrying as plain text', { err: String(err) });
+            const plain = toPlainText(chunk);
+            try {
+              result = await adapter.postMessage(
+                tid,
+                attachFiles ? { raw: plain, files: fileUploads } : { raw: plain },
+              );
+            } catch (err2) {
+              log.error('plain-text fallback failed; sending stub', { err: String(err2) });
+              result = await adapter.postMessage(tid, {
+                raw: '⚠️ The agent replied, but the message could not be delivered in this channel’s format.',
+              });
+            }
+          }
           if (i === 0) firstId = result?.id;
         }
         return firstId;

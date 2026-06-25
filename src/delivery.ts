@@ -117,7 +117,12 @@ export function deliverDirect(channelType: string, platformId: string, threadId:
     });
     return;
   }
-  const content = JSON.stringify({ text });
+  // plain: true tells the bridge to pass this through verbatim (raw), never
+  // through a platform Markdown transform. These are system/interaction
+  // messages (e.g. an OAuth sign-in URL), not agent Markdown — Telegram
+  // legacy-Markdown would parse the URL's query-param underscores as italics
+  // and strip them, producing an invalid URL.
+  const content = JSON.stringify({ text, plain: true });
   void (async () => {
     let lastErr: unknown;
     for (let attempt = 1; attempt <= MAX_DELIVERY_ATTEMPTS; attempt++) {
