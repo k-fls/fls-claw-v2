@@ -14,7 +14,7 @@ import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { ensureContainerNetwork, initSnapshot } from './modules/container-bootstrap/index.js';
-import { gatewayBindHost } from './modules/container-bootstrap/network.js';
+import { serviceBindHost } from './modules/container-bootstrap/network.js';
 import { startHostRpcServer } from './modules/host-rpc/index.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
@@ -126,13 +126,12 @@ async function main(): Promise<void> {
   registerClaudeCredentialProvider();
   registerGithubCredentialProvider();
   const credentialProxy = new CredentialProxy();
-  // Bind the SAME address host-rpc binds (gatewayBindHost): the nanoclaw bridge
-  // gateway on bare-metal Linux, loopback inside the Docker Desktop / WSL VM.
-  // Deliberately NOT 0.0.0.0 — this proxy injects credentials, so it must be
-  // reachable only by containers on the nanoclaw bridge, never from the host's
-  // other interfaces or the LAN. Containers reach it via host.docker.internal,
-  // which resolves to this same address. (host-rpc #9)
-  await credentialProxy.start({ port: CREDENTIAL_PROXY_PORT, host: gatewayBindHost() });
+  // Bind the SAME address host-rpc binds (serviceBindHost), driven by
+  // CLAW_HOST_NET_MODE: open (default) → 0.0.0.0 (rootless; the proxy's
+  // caller-IP gate still sees the container's real source IP); gateway → the
+  // nanoclaw bridge gateway, off the LAN. Containers reach it via
+  // host.docker.internal regardless. (host-rpc #9)
+  await credentialProxy.start({ port: CREDENTIAL_PROXY_PORT, host: serviceBindHost() });
   setProxyInstance(credentialProxy);
   initOAuthModule({
     proxy: credentialProxy,
