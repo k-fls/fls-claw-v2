@@ -495,8 +495,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       }
 
       // Normal message
+      // plain: true (set by deliverDirect for system/interaction replies, e.g.
+      // an OAuth sign-in URL) must bypass the platform Markdown transform —
+      // Telegram legacy-Markdown would parse the URL's query-param underscores
+      // as italics and strip them. Pass it through raw, with no parse mode (and
+      // so no format-error fallback — raw can't trigger one).
+      const plain = content.plain === true;
       const rawText = (content.markdown as string) || (content.text as string);
-      const text = rawText ? transformText(rawText) : rawText;
+      const text = rawText ? (plain ? rawText : transformText(rawText)) : rawText;
       if (text) {
         // Attach files if present (FileUpload format: { data, filename })
         const fileUploads = message.files?.map((f: { data: Buffer; filename: string }) => ({
@@ -514,6 +520,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           const chunk = chunks[i];
           const attachFiles = i === 0 && fileUploads && fileUploads.length > 0;
           let result: Awaited<ReturnType<typeof adapter.postMessage>> | undefined;
+          if (plain) {
+            result = await adapter.postMessage(
+              tid,
+              attachFiles ? { raw: chunk, files: fileUploads } : { raw: chunk },
+            );
+            if (i === 0) firstId = result?.id;
+            continue;
+          }
           try {
             result = await adapter.postMessage(
               tid,
