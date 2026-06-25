@@ -231,7 +231,11 @@ export function registerSSHProviders(): void {
       );
     }
     return {
-      env: { CLAW_HOST_RPC_URL: `http://${addr.bind}:${addr.port}` },
+      // Containers reach host-rpc via the host.docker.internal hostname (mapped
+      // by --add-host per CLAW_HOST_NET_MODE), NOT addr.bind — the bind may be
+      // 0.0.0.0 (open mode), which is unconnectable. Only the port comes from
+      // the running server. (host-rpc bug #9)
+      env: { CLAW_HOST_RPC_URL: `http://host.docker.internal:${addr.port}` },
       mounts: [{ hostPath, containerPath: '/ssh-sockets', readonly: false }],
     };
   });

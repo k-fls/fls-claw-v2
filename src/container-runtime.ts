@@ -3,38 +3,28 @@
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
  */
 import { exec, execSync } from 'child_process';
-import fs from 'fs';
 import os from 'os';
 
 import { CONTAINER_INSTALL_LABEL } from './config.js';
 import { log } from './log.js';
-// Single source of truth for the nanoclaw bridge gateway. This import closes a
-// load-safe cycle (network.ts imports CONTAINER_RUNTIME_BIN from here): neither
-// module references the other's binding at top level, so initialization order
-// is irrelevant. Deriving the gateway here instead would duplicate the subnet
-// parsing and let it drift from the network the allocator actually creates.
-import { gatewayIP } from './modules/container-bootstrap/network.js';
+// Single source of truth for the host.docker.internal target — kept in network.ts
+// (mode-aware) so the --add-host target, the host-rpc bind, and the proxy bind
+// can't drift. This import closes a load-safe cycle (network.ts imports
+// CONTAINER_RUNTIME_BIN from here): neither module references the other's binding
+// at top level, so initialization order is irrelevant.
+import { serviceConnectTarget } from './modules/container-bootstrap/network.js';
 
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'docker';
 
-/** CLI args needed for the container to resolve the host gateway. */
+/** CLI args so the container can resolve `host.docker.internal` to the host. */
 export function hostGatewayArgs(): string[] {
   // macOS / Docker Desktop: host.docker.internal is built in — nothing to add.
   if (os.platform() !== 'linux') return [];
-  // WSL (Docker Desktop's VM) routes host-gateway correctly and the nanoclaw
-  // bridge gateway isn't bindable from the Windows host, so keep the built-in
-  // host-gateway alias there. Mirrors host-rpc's detectBindHost() branching.
-  if (fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) {
-    return ['--add-host=host.docker.internal:host-gateway'];
-  }
-  // Bare-metal Linux: point host.docker.internal at the nanoclaw bridge gateway
-  // instead of docker0 (the default host-gateway target). Containers live on
-  // the nanoclaw bridge, so reaching the host on its own bridge IP keeps the
-  // hop same-subnet — no cross-bridge MASQUERADE, so host-rpc and the MITM
-  // proxy (both bound on this address) see the container's real source IP,
-  // which host-rpc's caller-IP gate requires. (host-rpc bug #9)
-  return [`--add-host=host.docker.internal:${gatewayIP()}`];
+  // Linux (bare-metal or WSL): point host.docker.internal at the mode's connect
+  // target — `host-gateway` (docker0) in open mode, the nanoclaw bridge gateway
+  // in gateway mode. (host-rpc bug #9)
+  return [`--add-host=host.docker.internal:${serviceConnectTarget()}`];
 }
 
 /** Returns CLI args for a readonly bind mount. */

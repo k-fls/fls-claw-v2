@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Mock log
 vi.mock('./log.js', () => ({
@@ -37,21 +37,36 @@ beforeEach(() => {
 });
 
 describe('hostGatewayArgs', () => {
+  const prevMode = process.env.CLAW_HOST_NET_MODE;
+  afterEach(() => {
+    if (prevMode === undefined) delete process.env.CLAW_HOST_NET_MODE;
+    else process.env.CLAW_HOST_NET_MODE = prevMode;
+  });
+
   it('adds nothing on macOS (host.docker.internal is built in)', () => {
     vi.spyOn(os, 'platform').mockReturnValue('darwin');
     expect(hostGatewayArgs()).toEqual([]);
   });
 
-  it('keeps the host-gateway alias on WSL (bridge gateway not host-bindable)', () => {
+  it('open mode (default): points host.docker.internal at host-gateway on Linux', () => {
+    delete process.env.CLAW_HOST_NET_MODE;
     vi.spyOn(os, 'platform').mockReturnValue('linux');
-    vi.spyOn(fs, 'existsSync').mockReturnValue(true); // /proc/.../WSLInterop present
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false);
     expect(hostGatewayArgs()).toEqual(['--add-host=host.docker.internal:host-gateway']);
   });
 
-  it('points host.docker.internal at the nanoclaw gateway on bare-metal Linux (bug #9)', () => {
+  it('gateway mode: points host.docker.internal at the nanoclaw gateway on bare-metal Linux (bug #9)', () => {
+    process.env.CLAW_HOST_NET_MODE = 'gateway';
     vi.spyOn(os, 'platform').mockReturnValue('linux');
     vi.spyOn(fs, 'existsSync').mockReturnValue(false); // not WSL
     expect(hostGatewayArgs()).toEqual([`--add-host=host.docker.internal:${gatewayIP()}`]);
+  });
+
+  it('gateway mode in WSL still uses host-gateway (bridge gateway not host-bindable)', () => {
+    process.env.CLAW_HOST_NET_MODE = 'gateway';
+    vi.spyOn(os, 'platform').mockReturnValue('linux');
+    vi.spyOn(fs, 'existsSync').mockReturnValue(true); // WSLInterop present
+    expect(hostGatewayArgs()).toEqual(['--add-host=host.docker.internal:host-gateway']);
   });
 });
 

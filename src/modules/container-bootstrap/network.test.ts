@@ -12,7 +12,8 @@ import {
   allocateIPFromPool,
   networkArgs,
   gatewayIP,
-  gatewayBindHost,
+  serviceBindHost,
+  serviceConnectTarget,
   __resetPoolForTests,
   __PREFIX,
 } from './network.js';
@@ -48,32 +49,53 @@ describe('container-ip network', () => {
   });
 
   it('gatewayIP is the .0.1 host address on the bridge', () => {
-    // Host-rpc and the MITM proxy bind here; containers reach them here so the
-    // hop stays same-subnet and the real source IP survives. (bug #9)
     expect(gatewayIP()).toBe(`${__PREFIX}.0.1`);
   });
 });
 
-describe('gatewayBindHost', () => {
+describe('serviceBindHost / serviceConnectTarget (CLAW_HOST_NET_MODE)', () => {
+  const prevMode = process.env.CLAW_HOST_NET_MODE;
   afterEach(() => {
     vi.restoreAllMocks();
+    if (prevMode === undefined) delete process.env.CLAW_HOST_NET_MODE;
+    else process.env.CLAW_HOST_NET_MODE = prevMode;
   });
 
-  it('binds loopback on macOS (host.docker.internal → VM loopback)', () => {
-    vi.spyOn(os, 'platform').mockReturnValue('darwin');
-    expect(gatewayBindHost()).toBe('127.0.0.1');
+  describe('open mode (default)', () => {
+    beforeEach(() => {
+      delete process.env.CLAW_HOST_NET_MODE;
+    });
+
+    it('binds 0.0.0.0 regardless of platform (rootless, real source IP preserved)', () => {
+      vi.spyOn(os, 'platform').mockReturnValue('linux');
+      vi.spyOn(fs, 'existsSync').mockReturnValue(false);
+      expect(serviceBindHost()).toBe('0.0.0.0');
+    });
+
+    it('connect target is host-gateway (docker0)', () => {
+      vi.spyOn(os, 'platform').mockReturnValue('linux');
+      vi.spyOn(fs, 'existsSync').mockReturnValue(false);
+      expect(serviceConnectTarget()).toBe('host-gateway');
+    });
   });
 
-  it('binds loopback on WSL (Docker Desktop VM)', () => {
-    vi.spyOn(os, 'platform').mockReturnValue('linux');
-    vi.spyOn(fs, 'existsSync').mockReturnValue(true); // WSLInterop present
-    expect(gatewayBindHost()).toBe('127.0.0.1');
-  });
+  describe('gateway mode (opt-in)', () => {
+    beforeEach(() => {
+      process.env.CLAW_HOST_NET_MODE = 'gateway';
+    });
 
-  it('binds the bridge gateway on bare-metal Linux — never 0.0.0.0 (bug #9)', () => {
-    vi.spyOn(os, 'platform').mockReturnValue('linux');
-    vi.spyOn(fs, 'existsSync').mockReturnValue(false); // not WSL
-    expect(gatewayBindHost()).toBe(gatewayIP());
-    expect(gatewayBindHost()).not.toBe('0.0.0.0');
+    it('binds the bridge gateway on bare-metal Linux — off the LAN', () => {
+      vi.spyOn(os, 'platform').mockReturnValue('linux');
+      vi.spyOn(fs, 'existsSync').mockReturnValue(false); // not WSL
+      expect(serviceBindHost()).toBe(gatewayIP());
+      expect(serviceConnectTarget()).toBe(gatewayIP());
+    });
+
+    it('binds loopback inside the Docker Desktop / WSL VM', () => {
+      vi.spyOn(os, 'platform').mockReturnValue('linux');
+      vi.spyOn(fs, 'existsSync').mockReturnValue(true); // WSLInterop present
+      expect(serviceBindHost()).toBe('127.0.0.1');
+      expect(serviceConnectTarget()).toBe('host-gateway');
+    });
   });
 });
