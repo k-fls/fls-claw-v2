@@ -24,13 +24,13 @@ interface ParsedSubnet {
 
 function parseSubnet(value: string): ParsedSubnet {
   if (!/^\d+\.\d+\.0\.0\/16$/.test(value)) {
-    throw new Error(`Invalid NANOCLAW_SUBNET "${value}" — must be X.Y.0.0/16`);
+    throw new Error(`Invalid CLAW_SUBNET "${value}" — must be X.Y.0.0/16`);
   }
   return { subnet: value, prefix: value.split('.').slice(0, 2).join('.') };
 }
 
 const { subnet: NANOCLAW_SUBNET, prefix: NANOCLAW_SUBNET_PREFIX } = parseSubnet(
-  process.env.NANOCLAW_SUBNET || '172.29.0.0/16',
+  process.env.CLAW_SUBNET || '172.29.0.0/16',
 );
 
 // Skip .0.0 (network) and .0.1 (gateway). Pool ranges 2..65534 inclusive.
