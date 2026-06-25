@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { Adapter, AdapterPostableMessage, RawMessage } from 'chat';
 
-import { createChatSdkBridge, splitForLimit } from './chat-sdk-bridge.js';
+import { createChatSdkBridge, isFormatError, splitForLimit, toPlainText } from './chat-sdk-bridge.js';
 
 function stubAdapter(partial: Partial<Adapter>): Adapter {
   return { name: 'stub', ...partial } as unknown as Adapter;
@@ -47,6 +47,94 @@ describe('splitForLimit', () => {
     expect(chunks.length).toBe(Math.ceil(100 / 30));
     for (const c of chunks) expect(c.length).toBeLessThanOrEqual(30);
     expect(chunks.join('')).toBe(text);
+  });
+});
+
+describe('isFormatError', () => {
+  it('matches markup/entity parse rejections (4xx about the markup)', () => {
+    for (const m of [
+      "Bad Request: can't find end of the entity starting at byte offset 12",
+      "Bad Request: can't parse entities",
+      'can not parse entities in message text',
+    ]) {
+      expect(isFormatError(new Error(m))).toBe(true);
+    }
+  });
+
+  it('does not match transport/availability errors (those must propagate)', () => {
+    for (const m of ['503 Service Unavailable', 'ETIMEDOUT', 'socket hang up', 'rate limited']) {
+      expect(isFormatError(new Error(m))).toBe(false);
+    }
+  });
+});
+
+describe('toPlainText', () => {
+  it('strips code fences/spans, emphasis, and unwraps links', () => {
+    expect(toPlainText('**bold** and `code`')).toBe('bold and code');
+    expect(toPlainText('see [docs](https://example.com)')).toBe('see docs');
+    expect(toPlainText('```\nblock\n```')).toBe('\nblock\n');
+  });
+});
+
+describe('createChatSdkBridge.deliver — format-error fallback (bug #11)', () => {
+  // A reply the agent generated must never be silently dropped because a
+  // channel rejected its markup. The bridge degrades markdown → plain (no
+  // parse mode) → stub, and lets non-format (transport) errors propagate.
+
+  function makeProgrammablePost(behavior: (call: PostCall, n: number) => RawMessage<unknown>) {
+    const calls: PostCall[] = [];
+    const postMessage = async (threadId: string, message: AdapterPostableMessage): Promise<RawMessage<unknown>> => {
+      calls.push({ threadId, message });
+      return behavior({ threadId, message }, calls.length);
+    };
+    return { calls, postMessage };
+  }
+
+  const entityErr = () => new Error("Bad Request: can't find end of the entity starting at byte offset 4");
+
+  it('retries as plain text when the channel rejects markdown', async () => {
+    const { calls, postMessage } = makeProgrammablePost((call) => {
+      if ('markdown' in (call.message as object)) throw entityErr();
+      return { id: 'msg-stub', threadId: call.threadId, raw: {} };
+    });
+    const bridge = createChatSdkBridge({ adapter: stubAdapter({ postMessage }), supportsThreads: false });
+
+    const id = await bridge.deliver('telegram:42', null, {
+      kind: 'chat-sdk',
+      content: { text: '*bold* `code`' },
+    });
+
+    expect(id).toBe('msg-stub');
+    expect(calls).toHaveLength(2);
+    expect((calls[0].message as { markdown?: string }).markdown).toBe('*bold* `code`');
+    // Plain retry uses `raw` (no parse mode) with delimiters stripped.
+    expect((calls[1].message as { raw?: string }).raw).toBe('bold code');
+  });
+
+  it('sends a stub when even the plain-text retry is rejected', async () => {
+    const { calls, postMessage } = makeProgrammablePost((_call, n) => {
+      if (n < 3) throw entityErr();
+      return { id: 'msg-stub', threadId: _call.threadId, raw: {} };
+    });
+    const bridge = createChatSdkBridge({ adapter: stubAdapter({ postMessage }), supportsThreads: false });
+
+    const id = await bridge.deliver('telegram:42', null, { kind: 'chat-sdk', content: { text: 'hi' } });
+
+    expect(id).toBe('msg-stub');
+    expect(calls).toHaveLength(3);
+    expect((calls[2].message as { raw?: string }).raw).toContain('could not be delivered');
+  });
+
+  it('propagates non-format (transport) errors instead of falling back', async () => {
+    const { calls, postMessage } = makeProgrammablePost(() => {
+      throw new Error('503 Service Unavailable');
+    });
+    const bridge = createChatSdkBridge({ adapter: stubAdapter({ postMessage }), supportsThreads: false });
+
+    await expect(
+      bridge.deliver('telegram:42', null, { kind: 'chat-sdk', content: { text: 'hi' } }),
+    ).rejects.toThrow('503');
+    expect(calls).toHaveLength(1); // no plain-text retry
   });
 });
 

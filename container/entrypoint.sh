@@ -11,11 +11,14 @@
 
 set -e
 
-# ----- (optional) passwd shim — ssh-auth, future tools that resolve $UID -----
+# ----- passwd shim — ssh, git, and any tool that resolves $UID via getpwuid -----
 # When the container runs as a host UID with no matching /etc/passwd entry,
-# tools like ssh and git fail with "No user exists for uid". The shim adds
-# a minimal entry so getpwuid succeeds.
-if [ -n "${ENSURE_PASSWD_ENTRY:-}" ] && [ -n "${HOST_UID:-}" ] && \
+# tools like ssh and git fail with "No user exists for uid <N>" (getpwuid
+# can't resolve $HOME). Add a minimal entry so getpwuid succeeds. Gated on
+# HOST_UID alone — every root-drop launch needs this, not just the credential
+# container (matching v1). Previously gated on ENSURE_PASSWD_ENTRY, which the
+# agent-container spawn path never set, so agent containers regressed.
+if [ -n "${HOST_UID:-}" ] && \
    ! getent passwd "$HOST_UID" >/dev/null 2>&1; then
   echo "agent:x:${HOST_UID}:${HOST_GID:-$HOST_UID}::/home/node:/bin/bash" \
     >> /etc/passwd
