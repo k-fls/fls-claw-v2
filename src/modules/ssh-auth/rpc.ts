@@ -30,7 +30,7 @@ import { containerSocketPath, SSHManager, SSHError, SSHHostKeyMismatchError } fr
 import type { CredentialResolver } from './manager.js';
 import { addPendingRequest } from './pending.js';
 import { notifyUser as defaultNotifyUser } from './notify-user.js';
-import { getAgentGroup } from '../../db/agent-groups.js';
+import { getAgentGroupByFolder } from '../../db/agent-groups.js';
 import type { ContainerScope } from '../container-bootstrap/index.js';
 
 // ── Handler ───────────────────────────────────────────────────────
@@ -359,16 +359,17 @@ interface HostRpcRequestLike {
  * handler, captures the response payload, and returns it (host-rpc wraps
  * in `{ ok:true, result }` on its end).
  *
- * Caller scope (ContainerScope = agent group id) is resolved into a
- * GroupScope via `getAgentGroup(id).folder` before dispatch — ssh-auth's
- * substrate uses the folder string everywhere.
+ * Caller scope (ContainerScope = agent group folder — see ip-observer.ts,
+ * which registers the IP under `agentGroup.folder`) is resolved into a
+ * GroupScope before dispatch — ssh-auth's substrate uses the folder string
+ * everywhere.
  */
 export function makeSSHRpcHandler(
   manager: SSHManager,
   resolver: CredentialResolver,
 ): (req: HostRpcRequestLike, scope: ContainerScope, sessionId: string) => Promise<unknown> {
   return async (req, containerScope, sessionId) => {
-    const ag = getAgentGroup(containerScope as unknown as string);
+    const ag = getAgentGroupByFolder(containerScope as unknown as string);
     if (!ag) throw new Error(`agent group not found for scope ${containerScope}`);
 
     const groupScope = asGroupScope(ag.folder);
