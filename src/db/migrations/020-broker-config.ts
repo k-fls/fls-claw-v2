@@ -19,8 +19,8 @@ import type { Migration } from './index.js';
  * Connection (url/apiKey/gatewayUrl) is NOT stored here — it stays in env
  * (ONECLI_URL / ONECLI_API_KEY), matching the existing wiring.
  */
-export const migration017: Migration = {
-  version: 17,
+export const migration020: Migration = {
+  version: 20,
   name: 'broker-config',
   up(db: Database.Database) {
     db.exec(`

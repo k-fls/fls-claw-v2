@@ -99,3 +99,63 @@ describe('baseRunArgs', () => {
     expect(idx).toBeLessThan(args.length);
   });
 });
+
+describe('buildContainerArgs ordering invariant (structural)', () => {
+  // C3 (onecli-broker): the OneCLI gateway is no longer wired in container-runner
+  // at all — the always-on MITM credential proxy owns egress and OneCLI is a
+  // broker behind it. The upstream "gateway must apply after the mounts loop"
+  // ordering invariant is therefore moot here; instead pin that no gateway apply
+  // leaks back into the spawn path (it would re-collide with the proxy on
+  // HTTPS_PROXY). The mounts loop itself still exists.
+  it('does not wire the OneCLI gateway in the spawn path (broker model)', () => {
+    const src = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf-8');
+    const mountsLoop = src.indexOf('for (const mount of mounts)');
+    expect(mountsLoop).toBeGreaterThan(-1);
+    expect(src).not.toContain('onecli.applyContainerConfig');
+  });
+});
+
+describe('per-container resource limits (structural)', () => {
+  // CONTAINER_CPU_LIMIT / CONTAINER_MEMORY_LIMIT pass through to `docker run` as
+  // --cpus / --memory, but only when set. The default is empty string → no flag →
+  // today's unbounded behavior (don't OOM existing OSS workloads). Swap is not
+  // managed here (a swapless host makes --memory a hard cap). buildContainerArgs
+  // needs a live gateway to drive, so guard the wiring structurally: the flags
+  // must be pushed, and each must be guarded by its env knob so empty emits nothing.
+  it('reads both limit knobs from config', () => {
+    const src = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf-8');
+    expect(src).toContain('CONTAINER_CPU_LIMIT');
+    expect(src).toContain('CONTAINER_MEMORY_LIMIT');
+  });
+
+  it('guards --cpus behind a truthy CONTAINER_CPU_LIMIT', () => {
+    const src = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf-8');
+    expect(src).toMatch(/if \(CONTAINER_CPU_LIMIT\)[\s\S]*?args\.push\('--cpus', CONTAINER_CPU_LIMIT\)/);
+  });
+
+  it('guards --memory behind a truthy CONTAINER_MEMORY_LIMIT (and sets no swap flag)', () => {
+    const src = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf-8');
+    expect(src).toMatch(/if \(CONTAINER_MEMORY_LIMIT\) args\.push\('--memory', CONTAINER_MEMORY_LIMIT\)/);
+    expect(src).not.toContain('--memory-swap');
+  });
+
+  it('defaults both knobs to empty string in config (no flag = unbounded)', () => {
+    const cfg = fs.readFileSync(path.join(process.cwd(), 'src', 'config.ts'), 'utf-8');
+    expect(cfg).toContain("CONTAINER_CPU_LIMIT = process.env.CONTAINER_CPU_LIMIT || ''");
+    expect(cfg).toContain("CONTAINER_MEMORY_LIMIT = process.env.CONTAINER_MEMORY_LIMIT || ''");
+  });
+});
+
+describe('container boot-failure tripwire (structural)', () => {
+  // A container that dies at boot (unknown provider, missing CLI binary, bad
+  // config) explains itself only on stderr — which logs at debug, below the
+  // default level. The spawn handler must keep a stderr tail and surface it
+  // at warn on a non-zero exit, or the operator sees only "exited code 1" on
+  // repeat. Driving a real failing spawn needs a container runtime, so this
+  // guards the wiring structurally, matching the invariant test above.
+  it('surfaces the stderr tail when the container exits non-zero', () => {
+    const src = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf-8');
+    expect(src).toContain('stderrTail.push(line)');
+    expect(src).toMatch(/Container exited non-zero.*stderrTail/s);
+  });
+});

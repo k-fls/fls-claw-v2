@@ -37,7 +37,7 @@ export { ensureContainerNetwork, networkArgs } from './network.js';
 export { initSnapshot, snapshotPath } from './snapshot.js';
 
 // Default launch shape
-export { defaultLaunchShape } from './launch-shape.js';
+export { defaultLaunchShape, snapshotAgentSurfaces } from './launch-shape.js';
 export type { LaunchShape } from './launch-shape.js';
 
 // Observer registry

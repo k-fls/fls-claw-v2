@@ -10,9 +10,11 @@ import path from 'path';
 import { type AgentGroupContribution, invokeAgentGroupContributions } from './agent-group-contributions.js';
 import { FatalSpawnError, isSpawnPoisoned, markSpawnPoisoned } from './spawn-failure.js';
 import {
+  CONTAINER_CPU_LIMIT,
   CONTAINER_IMAGE,
   CONTAINER_IMAGE_BASE,
   CONTAINER_INSTALL_LABEL,
+  CONTAINER_MEMORY_LIMIT,
   DATA_DIR,
   GRACEFUL_STOP_MS,
   GROUPS_DIR,
@@ -42,6 +44,7 @@ import { getDb, hasTable } from './db/connection.js';
 import { initGroupFilesystem } from './group-init.js';
 import {
   defaultLaunchShape,
+  snapshotAgentSurfaces,
   type ExitReason,
   fireContainerExited,
   fireContainerStarted,
@@ -64,6 +67,7 @@ import { hasProxyInstance } from './modules/mitm-proxy/credential-proxy.js';
 import './providers/index.js';
 import {
   getProviderContainerConfig,
+  providerProvidesAgentSurfaces,
   type ProviderContainerContribution,
   type VolumeMount,
 } from './providers/provider-container-registry.js';
@@ -402,6 +406,13 @@ async function spawnContainer(session: Session): Promise<void> {
   // and buildContainerArgs so we don't re-read.
   const containerConfig = materializeContainerJson(agentGroup.id);
 
+  // Per-group filesystem state lives forever after first creation. Init is
+  // idempotent: it only writes paths that don't already exist, so this call
+  // is a no-op for groups that have spawned before. Runs before the provider
+  // contribution so a surfaces-providing provider finds the group dir ready.
+  const providerName = resolveProviderName(session.agent_provider, containerConfig.provider);
+  initGroupFilesystem(agentGroup, { provider: providerName });
+
   // Resolve the effective provider + any host-side contribution it declares
   // (extra mounts, env passthrough). Computed once and threaded through both
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
@@ -433,7 +444,7 @@ async function spawnContainer(session: Session): Promise<void> {
   // collected yet at that point.
   const spawnPre: MergedSpawnPre = fireSpawnPre({ agentGroup, session, providerName: provider, containerConfig });
 
-  const mounts = buildMounts(agentGroup, session, containerConfig, contribution, groupContribution, spawnPre);
+  const mounts = buildMounts(agentGroup, session, containerConfig, provider, contribution, groupContribution, spawnPre);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
 
   const launchMode = resolveLaunchMode(spawnPre.needsRootEntrypoint);
@@ -507,10 +518,16 @@ async function spawnContainer(session: Session): Promise<void> {
   markContainerRunning(session.id);
   fireContainerStarted({ agentGroup, session, containerName });
 
-  // Log stderr
+  // Log stderr. A container that dies at boot (unknown provider, missing
+  // binary, bad config) explains itself only here — and debug is below the
+  // default log level — so keep a tail to surface on a non-zero exit.
+  const stderrTail: string[] = [];
   container.stderr?.on('data', (data) => {
     for (const line of data.toString().trim().split('\n')) {
-      if (line) log.debug(line, { container: agentGroup.folder });
+      if (!line) continue;
+      log.debug(line, { container: agentGroup.folder });
+      stderrTail.push(line);
+      if (stderrTail.length > 10) stderrTail.shift();
     }
   });
 
@@ -524,9 +541,17 @@ async function spawnContainer(session: Session): Promise<void> {
 
   container.on('close', (code) => {
     // `killedSessions` is consumed by `fireExitOnce` (clears it) so peek before.
+    // fireExitOnce owns teardown (activeContainers.delete + markContainerStopped
+    // + stopTypingRefresh + queue.onExit + exit observers); we only add the
+    // upstream stderr-tail boot-failure diagnostic inside it.
     const reason: ExitReason = killedSessions.has(session.id) ? 'killed' : 'normal';
     if (fireExitOnce(code, reason)) {
-      log.info('Container exited', { sessionId: session.id, code, containerName, reason });
+      // code null = killed by signal (normal shutdown path), not a boot failure.
+      if (code !== 0 && code !== null && stderrTail.length > 0) {
+        log.warn('Container exited non-zero', { sessionId: session.id, code, containerName, reason, stderrTail });
+      } else {
+        log.info('Container exited', { sessionId: session.id, code, containerName, reason });
+      }
     }
     if (drainComplete && activeContainers.size === 0) drainComplete();
   });
@@ -625,16 +650,23 @@ function resolveProviderContribution(
   // Legacy fallback: out-of-tree providers that register only a single
   // host-config fn in the provider-container registry (no AGENT_RUNTIME ext).
   const fn = getProviderContainerConfig(provider);
-  const contribution: ProviderContainerContribution = fn
-    ? fn({ sessionDir: input.sessionDir, agentGroupId: input.agentGroupId, hostEnv: input.hostEnv })
+  const contribution = fn
+    ? fn({
+        sessionDir: sessionDir(agentGroup.id, session.id),
+        agentGroupId: agentGroup.id,
+        groupDir: path.resolve(GROUPS_DIR, agentGroup.folder),
+        selectedSkills: selectedSkillNames(containerConfig),
+        hostEnv: process.env,
+      })
     : {};
   return { provider, contribution, cliVersion: null };
 }
 
-function buildMounts(
+export function buildMounts(
   agentGroup: AgentGroup,
   session: Session,
   containerConfig: import('./container-config.js').ContainerConfig,
+  provider: string,
   providerContribution: ProviderContainerContribution,
   groupContribution: AgentGroupContribution,
   spawnPre: MergedSpawnPre,
@@ -644,13 +676,20 @@ function buildMounts(
   // is a no-op for groups that have spawned before.
   initGroupFilesystem(agentGroup);
 
-  // Sync skill symlinks based on container.json selection before mounting.
-  const claudeDir = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.claude-shared');
-  syncSkillSymlinks(claudeDir, containerConfig);
+  // Default agent surfaces (composed project doc, skill links, provider state
+  // dir) apply unless the provider's registration declares it provides its
+  // own — a capability, never a provider name. See provider-container-registry.
+  const defaultSurfaces = !providerProvidesAgentSurfaces(provider);
 
-  // Compose CLAUDE.md fresh every spawn from the shared base, enabled skill
-  // fragments, and MCP server instructions. See `claude-md-compose.ts`.
-  composeGroupClaudeMd(agentGroup);
+  const claudeDir = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.claude-shared');
+  if (defaultSurfaces) {
+    // Sync skill symlinks based on container.json selection before mounting.
+    syncSkillSymlinks(claudeDir, containerConfig);
+
+    // Compose CLAUDE.md fresh every spawn from the shared base, enabled skill
+    // fragments, and MCP server instructions. See `claude-md-compose.ts`.
+    composeGroupClaudeMd(agentGroup);
+  }
 
   const mounts: VolumeMount[] = [];
   const sessDir = sessionDir(agentGroup.id, session.id);
@@ -677,11 +716,11 @@ function buildMounts(
   // already RO-mounted, so writes through it fail regardless — no need for
   // a nested mount there.
   const composedClaudeMd = path.join(groupDir, 'CLAUDE.md');
-  if (fs.existsSync(composedClaudeMd)) {
+  if (defaultSurfaces && fs.existsSync(composedClaudeMd)) {
     mounts.push({ hostPath: composedClaudeMd, containerPath: '/workspace/agent/CLAUDE.md', readonly: true });
   }
   const fragmentsDir = path.join(groupDir, '.claude-fragments');
-  if (fs.existsSync(fragmentsDir)) {
+  if (defaultSurfaces && fs.existsSync(fragmentsDir)) {
     mounts.push({ hostPath: fragmentsDir, containerPath: '/workspace/agent/.claude-fragments', readonly: true });
   }
 
@@ -691,21 +730,32 @@ function buildMounts(
     mounts.push({ hostPath: globalDir, containerPath: '/workspace/global', readonly: true });
   }
 
-  // Snapshot-derived bootstrap mounts: entrypoint.sh, /app/src, /app/skills,
-  // /app/CLAUDE.md — all read-only. Owned by container-bootstrap so the
-  // launch shape is independent of `process.cwd()` after host boot.
+  // Provider-agnostic launch infrastructure (entrypoint.sh, /app/src,
+  // /app/skills) — all read-only. Owned by container-bootstrap so the launch
+  // shape is independent of `process.cwd()` after host boot.
   mounts.push(...defaultLaunchShape().mounts);
 
-  // Per-group persistent home directory at /home/node. The .claude mount below
-  // nests on top of this and lives in a separate host dir, so the file-wipe in
-  // `prepareGroupHomeDir` never touches it; agent-written ~/.env-vars
-  // (regenerated each launch) is correctly cleared as a top-level file.
+  // Snapshot agent surface: the shared /app/CLAUDE.md base doc. A *surface*, so
+  // gated by `defaultSurfaces` — a provider that owns its surfaces gets none.
+  if (defaultSurfaces) {
+    mounts.push(...snapshotAgentSurfaces());
+  }
+
+  // Per-group persistent home directory at /home/node. INFRA, never gated — the
+  // .claude surface below nests on top of this and lives in a separate host
+  // dir, so the file-wipe in `prepareGroupHomeDir` never touches it;
+  // agent-written ~/.env-vars (regenerated each launch) is correctly cleared as
+  // a top-level file. A surfaces-owning provider still gets the persistent home
+  // and nests its own state dir.
   const groupHomeDir = prepareGroupHomeDir(path.join(DATA_DIR, 'v2-sessions', agentGroup.id, 'home'));
   mounts.push({ hostPath: groupHomeDir, containerPath: '/home/node', readonly: false });
 
   // Per-group .claude-shared at /home/node/.claude (Claude state, settings,
-  // skill symlinks). Nested on top of the persistent /home/node mount above.
-  mounts.push({ hostPath: claudeDir, containerPath: '/home/node/.claude', readonly: false });
+  // skill symlinks). A *surface*, gated by `defaultSurfaces`. Nested on top of
+  // the persistent /home/node mount above.
+  if (defaultSurfaces) {
+    mounts.push({ hostPath: claudeDir, containerPath: '/home/node/.claude', readonly: false });
+  }
 
   // Additional mounts from container config
   if (containerConfig.additionalMounts && containerConfig.additionalMounts.length > 0) {
@@ -745,25 +795,7 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
     fs.mkdirSync(skillsDir, { recursive: true });
   }
 
-  // Determine desired skill set
-  const projectRoot = process.cwd();
-  const sharedSkillsDir = path.join(projectRoot, 'container', 'skills');
-  let desired: string[];
-  if (containerConfig.skills === 'all') {
-    // Recompute from shared dir — newly-added upstream skills appear automatically
-    desired = fs.existsSync(sharedSkillsDir)
-      ? fs.readdirSync(sharedSkillsDir).filter((e) => {
-          try {
-            return fs.statSync(path.join(sharedSkillsDir, e)).isDirectory();
-          } catch {
-            return false;
-          }
-        })
-      : [];
-  } else {
-    desired = containerConfig.skills;
-  }
-
+  const desired = selectedSkillNames(containerConfig);
   const desiredSet = new Set(desired);
 
   // Remove symlinks not in the desired set
@@ -818,12 +850,30 @@ export function baseRunArgs(containerName: string): string[] {
   ];
 }
 
+/**
+ * Resolve the group's skill selection to concrete names — `'all'` recomputes
+ * from `container/skills/` so newly-added upstream skills appear automatically.
+ */
+function selectedSkillNames(containerConfig: import('./container-config.js').ContainerConfig): string[] {
+  if (containerConfig.skills !== 'all') return containerConfig.skills;
+  const sharedSkillsDir = path.join(process.cwd(), 'container', 'skills');
+  return fs.existsSync(sharedSkillsDir)
+    ? fs.readdirSync(sharedSkillsDir).filter((e) => {
+        try {
+          return fs.statSync(path.join(sharedSkillsDir, e)).isDirectory();
+        } catch {
+          return false;
+        }
+      })
+    : [];
+}
+
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
-  provider: string,
+  _provider: string,
   providerContribution: ProviderContainerContribution,
   groupContribution: AgentGroupContribution,
   spawnPre: MergedSpawnPre,
@@ -837,6 +887,13 @@ async function buildContainerArgs(
   if (spawnPre.args.length > 0) {
     args.push(...spawnPre.args);
   }
+
+  // Per-container resource caps (opt-in; empty = unbounded, today's behavior).
+  // Only --memory is set. Whether that's a hard cap depends on the host having no
+  // swap (a deployment concern) — on a swapless host --memory is hard and a runaway
+  // is OOM-killed; we don't manage swap from here.
+  if (CONTAINER_CPU_LIMIT) args.push('--cpus', CONTAINER_CPU_LIMIT);
+  if (CONTAINER_MEMORY_LIMIT) args.push('--memory', CONTAINER_MEMORY_LIMIT);
 
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
@@ -907,9 +964,14 @@ async function buildContainerArgs(
     }
   }
 
+  // No OneCLI gateway here (C3): the always-on MITM credential proxy owns
+  // egress and OneCLI is a broker behind it (provisioned at IP-allocate). See
+  // the egress note above and docs/fls/specs/onecli-broker.md.
+
   // Use per-agent-group image if one has been built, otherwise base image.
   // The image's baked-in ENTRYPOINT runs — `container/entrypoint.sh` mounted
   // from the snapshot owns the bun exec; no --entrypoint override here.
+
   const imageTag = containerConfig.imageTag || CONTAINER_IMAGE;
   args.push(imageTag);
 
