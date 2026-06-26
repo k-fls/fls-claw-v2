@@ -508,8 +508,17 @@ export class ClaudeProvider implements AgentProvider {
         if (message.type === 'system' && message.subtype === 'init') {
           yield { type: 'init', continuation: message.session_id };
         } else if (message.type === 'result') {
-          const r = message as { result?: string; subtype?: string; is_error?: boolean; api_error_status?: number | null };
-          const text = r.result ?? null;
+          // `result` text exists only on subtype:"success"; error subtypes
+          // (e.g. a non-retryable 403 billing_error) carry their message in
+          // `errors[]` instead. Both are read so either can surface.
+          const r = message as {
+            result?: string;
+            subtype?: string;
+            is_error?: boolean;
+            api_error_status?: number | null;
+            errors?: string[];
+          };
+          const text = r.result ?? (r.errors && r.errors.length > 0 ? r.errors.join('\n') : null);
           // Structured error markers — SDK-set, the model cannot forge them.
           log(`Result message: subtype=${r.subtype} is_error=${r.is_error} api_error_status=${r.api_error_status ?? 'null'}`);
           // The SDK reports some auth failures as a *normal* result message —
@@ -518,18 +527,21 @@ export class ClaudeProvider implements AgentProvider {
           // failure prose in `result`). Classification is decided ONLY by the
           // structured fields — never by result text, which is model output
           // and therefore spoofable (v1's guard drew the same trust line:
-          // protocol-set error fields are trusted; agent text is not). The
-          // text is used purely as the human-readable message. On
-          // classification the failure text is NOT yielded as the result:
-          // dispatching it would land in scratchpad and trigger the "response
-          // not wrapped" nudge, burning another doomed turn against the dead
-          // credential. A null result still ends the turn.
+          // protocol-set error fields are trusted; agent text is not). On a
+          // classified (e.g. auth-invalid) failure the text is NOT yielded as
+          // the result — dispatching it would land in scratchpad and trigger
+          // the "response not wrapped" nudge, burning another doomed turn
+          // against the dead credential.
+          //
+          // An UNclassified result still carries `isError` so the poll-loop can
+          // deliver a billing/quota notice (e.g. a non-retryable 403) to the
+          // user instead of dropping the turn, without re-nudging.
           const classification = classifyResultMessage(r);
           if (classification) {
             yield { type: 'error', message: text ?? `API error ${r.api_error_status}`, retryable: false, classification };
             yield { type: 'result', text: null };
           } else {
-            yield { type: 'result', text };
+            yield { type: 'result', text, isError: r.is_error === true };
           }
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
