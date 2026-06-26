@@ -111,6 +111,24 @@ export function setSenderScopeGate(fn: SenderScopeGateFn): void {
 }
 
 /**
+ * Message-interceptor hook. Runs at the very top of routeInbound, before
+ * messaging-group resolution. When an interceptor returns true the message is
+ * consumed and routing stops. Multiple interceptors may register; they run in
+ * registration order and the first to claim the message (return true) wins.
+ *
+ * Used by modules to capture free-text DM replies during multi-step approval
+ * flows — the permissions module (agent naming during channel registration)
+ * and the approvals module (reject-with-reason capture).
+ */
+export type MessageInterceptorFn = (event: InboundEvent) => Promise<boolean>;
+
+const messageInterceptors: MessageInterceptorFn[] = [];
+
+export function registerMessageInterceptor(fn: MessageInterceptorFn): void {
+  messageInterceptors.push(fn);
+}
+
+/**
  * Channel-registration hook. Runs when the router sees a mention/DM on a
  * messaging group that has no wirings AND hasn't been denied. The hook is
  * expected to escalate to an owner (card, etc.) and arrange for future
@@ -144,9 +162,19 @@ function safeParseContent(raw: string): { text?: string; sender?: string; sender
  * Creates messaging group + session if they don't exist yet.
  */
 export async function routeInbound(event: InboundEvent): Promise<void> {
+  // Pre-route interceptors — let modules consume messages before any routing
+  // (e.g. free-text DM replies during multi-step approval flows). They run in
+  // registration order; the first to claim the message stops routing. The
+  // sequential await is intentional — first-to-claim is order-dependent.
+  for (const intercept of messageInterceptors) {
+    if (await intercept(event)) return;
+  }
+
   // 0. Apply the adapter's thread policy. Non-threaded adapters (Telegram,
-  //    WhatsApp, iMessage, email) collapse threads to the channel.
-  const adapter = getChannelAdapter(event.channelType);
+  //    WhatsApp, iMessage, email) collapse threads to the channel. Resolved
+  //    by the RECEIVING instance — sibling instances of one platform can
+  //    differ in thread support.
+  const adapter = getChannelAdapter(event.instance ?? event.channelType);
   if (adapter && !adapter.supportsThreads) {
     event = { ...event, threadId: null };
   }
@@ -156,8 +184,14 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   // 1. Combined lookup: messaging_group row + count of wired agents in a
   //    single query. Cheap short-circuit for the common "unwired channel"
   //    case — one DB read and we're out, no auto-create, no sender
-  //    resolution, no log spam.
-  const found = getMessagingGroupWithAgentCount(event.channelType, event.platformId);
+  //    resolution, no log spam. Exact-on-instance: an unknown named
+  //    instance falls through to auto-create rather than hijacking a
+  //    sibling instance's row.
+  const found = getMessagingGroupWithAgentCount(
+    event.channelType,
+    event.platformId,
+    event.instance ?? event.channelType,
+  );
 
   let mg: MessagingGroup;
   let agentCount: number;
@@ -171,6 +205,9 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       id: mgId,
       channel_type: event.channelType,
       platform_id: event.platformId,
+      // Persist the receiving instance — without this, the first bot's row
+      // would absorb every sibling instance's traffic.
+      instance: event.instance ?? event.channelType,
       name: null,
       is_group: event.message.isGroup ? 1 : 0,
       unknown_sender_policy: 'request_approval',
@@ -555,7 +592,15 @@ async function deliverToAgent(
   if (wake) {
     // Typing indicator + wake are only for the engaged branch; accumulated
     // messages sit silently until a real trigger fires.
-    startTypingRefresh(session.id, session.agent_group_id, event.channelType, event.platformId, event.threadId);
+    // Typing fires via the adapter instance that owns this chat's row.
+    startTypingRefresh(
+      session.id,
+      session.agent_group_id,
+      event.channelType,
+      event.platformId,
+      event.threadId,
+      mg.instance,
+    );
     const freshSession = getSession(session.id);
     if (freshSession) {
       const woke = await wakeContainer(freshSession);
