@@ -33,7 +33,7 @@ user_dms (user_id, channel_type, messaging_group_id) — cold-DM cache
 
 agent_groups (workspace, memory, CLAUDE.md, personality, container config)
     ↕ many-to-many via messaging_group_agents (session_mode, trigger_rules, priority)
-messaging_groups (one chat/channel on one platform; unknown_sender_policy)
+messaging_groups (one chat/channel on one platform; instance = adapter-instance name, defaults to channel_type; unknown_sender_policy)
 
 sessions (agent_group_id + messaging_group_id + thread_id → per-session container)
 ```
@@ -69,8 +69,8 @@ For ad-hoc queries from skills or scripts, use the in-tree wrapper rather than t
 | `src/modules/permissions/access.ts` | `canAccessAgentGroup` — owner / global admin / scoped admin / member resolution against `user_roles` + `agent_group_members` |
 | `src/modules/approvals/primitive.ts` | `pickApprover`, `pickApprovalDelivery`, `requestApproval`, approval-handler registry |
 | `src/command-gate.ts` | Router-side admin command gate — queries `user_roles` directly (no env var, no container-side check) |
-| `src/onecli-approvals.ts` | OneCLI credentialed-action approval bridge |
-| `src/user-dm.ts` | Cold-DM resolution + `user_dms` cache |
+| `src/modules/approvals/onecli-approvals.ts` | OneCLI credentialed-action approval bridge |
+| `src/modules/permissions/user-dm.ts` | Cold-DM resolution + `user_dms` cache |
 | `src/group-init.ts` | Per-agent-group filesystem scaffold (CLAUDE.md, skills, agent-runner-src overlay) |
 | `src/db/container-configs.ts` | CRUD for `container_configs` table (per-group container runtime config) |
 | `src/backfill-container-configs.ts` | Migrates legacy `container.json` files into the DB on startup |
@@ -83,6 +83,7 @@ For ad-hoc queries from skills or scripts, use the in-tree wrapper rather than t
 | `groups/<folder>/` | Per-agent-group filesystem (CLAUDE.md, skills, per-group `agent-runner-src/` overlay) |
 | `scripts/init-first-agent.ts` | Bootstrap the first DM-wired agent (used by `/init-first-agent` skill) |
 | `migrate-v2.sh` + `setup/migrate-v2/` | v1→v2 migration. Standalone script: `bash migrate-v2.sh`. Seeds DB, copies groups/sessions, installs channels, builds container, offers service switchover, then hands off to `/migrate-from-v1` skill for owner setup and CLAUDE.md cleanup. See [docs/migration-dev.md](docs/migration-dev.md). |
+| `nanoclaw.sh --uninstall` + `setup/uninstall/` | Uninstall this copy only (slug-scoped): service, containers + image, `data/`, `logs/`, `groups/`, this copy's OneCLI agents. Confirms per group; `--dry-run` previews, `--yes` skips prompts. Other copies and the shared OneCLI app are untouched. Bypasses bootstrap entirely; `uninstall.sh` is a pointer that execs it. |
 
 ## Admin CLI (`ncl`)
 
@@ -151,7 +152,7 @@ Key files: `src/container-restart.ts`, `src/container-runner.ts` (`killContainer
 
 ## Secrets / Credentials / OneCLI
 
-API keys, OAuth tokens, and auth credentials are managed by the OneCLI gateway. Secrets are injected into per-agent containers at request time — none are passed in env vars or through chat context. The container agent sees this via the `onecli-gateway` container skill (`container/skills/onecli-gateway/SKILL.md`), which teaches it how the proxy works, how to handle auth errors, and to never ask for raw credentials. Host-side wiring: `src/onecli-approvals.ts`, `ensureAgent()` in `container-runner.ts`. Run `onecli --help`.
+API keys, OAuth tokens, and auth credentials are managed by the OneCLI gateway. Secrets are injected into per-agent containers at request time — none are passed in env vars or through chat context. The container agent sees this via the `onecli-gateway` container skill (`container/skills/onecli-gateway/SKILL.md`), which teaches it how the proxy works, how to handle auth errors, and to never ask for raw credentials. Host-side wiring: `src/modules/approvals/onecli-approvals.ts`, `ensureAgent()` in `container-runner.ts`. Run `onecli --help`.
 
 ### Secret modes
 
@@ -192,6 +193,7 @@ Four types of skills. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full taxono
 | `/debug` | Container issues, logs, troubleshooting |
 | `/update-nanoclaw` | Bring upstream updates into a customized install |
 | `/init-onecli` | Install OneCLI Agent Vault and migrate `.env` credentials |
+| `/migrate-memory` | Carry a group's agent memory across a provider switch (operator-run, both directions) |
 
 ## Contributing
 
@@ -274,6 +276,10 @@ This project uses pnpm with `minimumReleaseAge: 4320` (3 days) in `pnpm-workspac
 | [docs/build-and-runtime.md](docs/build-and-runtime.md) | Runtime split (Node host + Bun container), lockfiles, image build surface, CI, key invariants |
 | [docs/v1-to-v2-changes.md](docs/v1-to-v2-changes.md) | v1→v2 architecture diff — vocabulary for where v1 things moved |
 | [docs/migration-dev.md](docs/migration-dev.md) | Migration development guide — testing, debugging, dev loop |
+| [docs/provider-migration.md](docs/provider-migration.md) | Switching a live agent group between providers (e.g. Claude → Codex) — what carries over, rollback |
+| [docs/customizing.md](docs/customizing.md) | Short intro to customizing via skills |
+| [docs/skills-model.md](docs/skills-model.md) | The skills model in full: recipes, tests, upgrades, migrations |
+| [docs/skill-guidelines.md](docs/skill-guidelines.md) | Authoritative checklist for writing a skill |
 
 ## Container Build Cache
 

@@ -15,8 +15,8 @@ import type { Migration } from './index.js';
  * string, e.g. '24h') — global-admin state set via `/agent-runtime auto`, keyed
  * by provider id so each runtime tracks its own cadence and survives restarts.
  */
-export const migration016: Migration = {
-  version: 16,
+export const migration019: Migration = {
+  version: 19,
   name: 'runtime-auto-update',
   up(db: Database.Database) {
     db.prepare(
