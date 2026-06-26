@@ -16,11 +16,14 @@ export interface LaunchShape {
 }
 
 /**
- * Mounts produced (all read-only):
+ * Provider-agnostic launch infrastructure (all read-only):
  *   - snapshot `entrypoint.sh` → `/app/entrypoint.sh`
  *   - snapshot `agent-runner/src` → `/app/src`
  *   - snapshot `skills` → `/app/skills`
- *   - snapshot `CLAUDE.md` → `/app/CLAUDE.md` (if present)
+ *
+ * The Claude base doc (`/app/CLAUDE.md`) is intentionally NOT here — it is an
+ * agent *surface*, gated by `providesAgentSurfaces` at the buildMounts caller.
+ * See `snapshotAgentSurfaces()`.
  */
 export function defaultLaunchShape(): LaunchShape {
   const mounts: VolumeMount[] = [];
@@ -40,10 +43,22 @@ export function defaultLaunchShape(): LaunchShape {
     mounts.push({ hostPath: skills, containerPath: '/app/skills', readonly: true });
   }
 
+  return { mounts };
+}
+
+/**
+ * Snapshot-derived default *agent surfaces* (read-only). Split out of
+ * `defaultLaunchShape` so the caller can withhold them for a provider that
+ * owns its own surfaces (`providesAgentSurfaces`):
+ *   - snapshot `CLAUDE.md` → `/app/CLAUDE.md` (if present)
+ */
+export function snapshotAgentSurfaces(): VolumeMount[] {
+  const mounts: VolumeMount[] = [];
+
   const claudeMd = snapshotPath('CLAUDE.md');
   if (fs.existsSync(claudeMd)) {
     mounts.push({ hostPath: claudeMd, containerPath: '/app/CLAUDE.md', readonly: true });
   }
 
-  return { mounts };
+  return mounts;
 }
