@@ -556,10 +556,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           const attachFiles = i === 0 && fileUploads && fileUploads.length > 0;
           let result: Awaited<ReturnType<typeof adapter.postMessage>> | undefined;
           if (plain) {
-            result = await adapter.postMessage(
-              tid,
-              attachFiles ? { raw: chunk, files: fileUploads } : { raw: chunk },
-            );
+            result = await adapter.postMessage(tid, attachFiles ? { raw: chunk, files: fileUploads } : { raw: chunk });
             if (i === 0) firstId = result?.id;
             continue;
           }
