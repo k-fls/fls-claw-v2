@@ -17,10 +17,11 @@ import { migration016 } from './016-messaging-group-instance.js';
 import { moduleApprovalsPendingApprovals } from './module-approvals-pending-approvals.js';
 import { moduleApprovalsTitleOptions } from './module-approvals-title-options.js';
 import { migration018 } from './018-approvals-approver-user-id.js';
-// Our runtime-auto-update migration — renumbered 016 → 019 to clear the
-// collision with upstream's 016-messaging-group-instance (uniqueness is by
-// name, but the file/binding number must not clash). See docs/db-central.md.
-import { migration019 } from './019-runtime-version.js';
+// Fork migration — namespaced out of upstream's numeric sequence (`16-fls-NN-…`
+// filename, `flsMigrationNNN` binding, `fls-…` name) so upstream's incrementing
+// 0NN migrations never collide with ours on merge. `16` = the upstream epoch
+// this was reconciled against. See docs/upstream-changes-report.md.
+import { flsMigration001 } from './16-fls-01-runtime-version.js';
 
 export interface Migration {
   version: number;
@@ -54,7 +55,10 @@ export const migrations: Migration[] = [
   migration014,
   migration015,
   migration016,
-  migration019,
+  // Fork migrations run last (after every upstream migration) — they depend on
+  // upstream tables already existing, and appending keeps them clear of the
+  // upstream sequence.
+  flsMigration001,
 ];
 
 /** Row shape of PRAGMA foreign_key_check. Child rowids are stable across a
