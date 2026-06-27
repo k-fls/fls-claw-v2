@@ -19,12 +19,20 @@ import type { Migration } from './index.js';
  * Connection (url/apiKey/gatewayUrl) is NOT stored here — it stays in env
  * (ONECLI_URL / ONECLI_API_KEY), matching the existing wiring.
  */
-export const migration020: Migration = {
-  version: 20,
-  name: 'broker-config',
+export const flsMigration002: Migration = {
+  // Fork migration (fls sequence #002). Binding mirrors upstream's `migrationNNN`
+  // style, fork-namespaced (`flsMigrationNNN`), so it never collides with an
+  // upstream import. `version` is unused by the runner (array order + `name` are
+  // authoritative) — kept at the upstream epoch (16) this was reconciled against,
+  // matching the `16-fls-02-` filename. `name` carries the `fls-` namespace so it
+  // can never collide with an upstream migration name. IF NOT EXISTS makes the
+  // rename safe: a DB that already applied the old `broker-config` name re-runs
+  // this harmlessly under the new name.
+  version: 16,
+  name: 'fls-broker-config',
   up(db: Database.Database) {
     db.exec(`
-      CREATE TABLE broker_config (
+      CREATE TABLE IF NOT EXISTS broker_config (
         broker_id        TEXT PRIMARY KEY,
         write_authority  TEXT NOT NULL DEFAULT 'global-admin',
         default_routing  TEXT NOT NULL DEFAULT '{}',

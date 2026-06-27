@@ -17,10 +17,11 @@ import { migration016 } from './016-messaging-group-instance.js';
 import { moduleApprovalsPendingApprovals } from './module-approvals-pending-approvals.js';
 import { moduleApprovalsTitleOptions } from './module-approvals-title-options.js';
 import { migration018 } from './018-approvals-approver-user-id.js';
-// Our onecli-broker migration — renumbered 017 → 020 to clear the collision
-// with upstream's 017-agent-message-policies (uniqueness is by name, but the
-// file/binding number must not clash).
-import { migration020 } from './020-broker-config.js';
+// Fork migration — namespaced out of upstream's numeric sequence (`16-fls-NN-…`
+// filename, `flsMigrationNNN` binding, `fls-…` name) so upstream's incrementing
+// 0NN migrations never collide with ours on merge. `16` = the upstream epoch
+// this was reconciled against. See docs/upstream-changes-report.md.
+import { flsMigration002 } from './16-fls-02-broker-config.js';
 
 export interface Migration {
   version: number;
@@ -54,7 +55,10 @@ export const migrations: Migration[] = [
   migration014,
   migration015,
   migration016,
-  migration020,
+  // Fork migrations run last (after every upstream migration) — they depend on
+  // upstream tables already existing, and appending keeps them clear of the
+  // upstream sequence.
+  flsMigration002,
 ];
 
 /** Row shape of PRAGMA foreign_key_check. Child rowids are stable across a
