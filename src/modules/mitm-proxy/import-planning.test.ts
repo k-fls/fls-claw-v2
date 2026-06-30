@@ -135,15 +135,18 @@ describe('planImport — single-provider form', () => {
     register('gitlab', { envBindings: [] });
 
     const SECRET = 'sk-super-secret-token-value';
-    const plan = planImport(
-      [tok(null, 'MYSTERY_TOKEN', SECRET), tok('gitlab', 'oauth', SECRET)],
-      'github',
-    );
-    expect(plan.stores).toEqual([]);
-    // Both the "no provider" and "ignored" paths must warn but redact the value.
-    expect(plan.warnings.some((w) => /no provider: MYSTERY_TOKEN/.test(w))).toBe(true);
-    expect(plan.warnings.some((w) => /ignored \(gitlab ≠ github\)/.test(w))).toBe(true);
-    expect(plan.warnings.some((w) => w.includes(SECRET))).toBe(false);
+
+    // "no provider" path — bulk mode, un-prefixed key matching no binding.
+    const bulk = planImport([tok(null, 'MYSTERY_TOKEN', SECRET)], null);
+    expect(bulk.stores).toEqual([]);
+    expect(bulk.warnings.some((w) => /no provider: MYSTERY_TOKEN/.test(w))).toBe(true);
+    expect(bulk.warnings.some((w) => w.includes(SECRET))).toBe(false);
+
+    // "ignored" path — single-provider mode, line prefixed for another provider.
+    const single = planImport([tok('gitlab', 'oauth', SECRET)], 'github');
+    expect(single.stores).toEqual([]);
+    expect(single.warnings.some((w) => /ignored \(gitlab ≠ github\)/.test(w))).toBe(true);
+    expect(single.warnings.some((w) => w.includes(SECRET))).toBe(false);
   });
 });
 
