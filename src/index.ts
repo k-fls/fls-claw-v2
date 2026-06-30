@@ -80,7 +80,11 @@ import {
   oauthInteractive,
   dockerExecDeliver,
 } from './modules/mitm-proxy/index.js';
-import { getOrCreateResolverForAgentGroup, regenerateAllManifests } from './modules/credentials/index.js';
+import {
+  getBorrowSource,
+  getOrCreateResolverForAgentGroup,
+  regenerateAllManifests,
+} from './modules/credentials/index.js';
 import { CREDENTIAL_PROXY_PORT } from './config.js';
 
 import type { ChannelAdapter, ChannelSetup } from './channels/adapter.js';
@@ -126,7 +130,13 @@ async function main(): Promise<void> {
   // proxy (whose rebuildIndex picks up the registered provider's swap rules),
   // publish the instance (the lifecycle observer then routes every container's
   // egress through it), and init the OAuth module for the discovery providers.
-  initTokenEngine((scope) => getOrCreateResolverForAgentGroup(scope));
+  const tokenEngine = initTokenEngine((scope) => getOrCreateResolverForAgentGroup(scope));
+  // Wire the borrow redirect: when a group has no own credential for a provider,
+  // the engine consults its borrowed source scope (the `borrowed` symlink set by
+  // `/creds borrow`). Without this the engine is own-scope only and borrowed
+  // credentials never resolve. Access is still gated per-read by the per-group
+  // resolver (canAccess(ownFolder, scope)), so borrowSource alone is sufficient.
+  tokenEngine.setBorrowSourceResolver((groupScope) => getBorrowSource(groupScope as unknown as string) ?? undefined);
   registerClaudeCredentialProvider();
   registerGithubCredentialProvider();
   const credentialProxy = new CredentialProxy();
