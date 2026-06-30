@@ -129,6 +129,25 @@ describe('planImport — single-provider form', () => {
     expect(plan.stores).toEqual([]);
     expect(plan.warnings.some((w) => /ignored \(gitlab ≠ github\)/.test(w))).toBe(true);
   });
+
+  it('never echoes the secret value in skip warnings (rendered back to chat)', () => {
+    register('github', { envBindings: [] });
+    register('gitlab', { envBindings: [] });
+
+    const SECRET = 'sk-super-secret-token-value';
+
+    // "no provider" path — bulk mode, un-prefixed key matching no binding.
+    const bulk = planImport([tok(null, 'MYSTERY_TOKEN', SECRET)], null);
+    expect(bulk.stores).toEqual([]);
+    expect(bulk.warnings.some((w) => /no provider: MYSTERY_TOKEN/.test(w))).toBe(true);
+    expect(bulk.warnings.some((w) => w.includes(SECRET))).toBe(false);
+
+    // "ignored" path — single-provider mode, line prefixed for another provider.
+    const single = planImport([tok('gitlab', 'oauth', SECRET)], 'github');
+    expect(single.stores).toEqual([]);
+    expect(single.warnings.some((w) => /ignored \(gitlab ≠ github\)/.test(w))).toBe(true);
+    expect(single.warnings.some((w) => w.includes(SECRET))).toBe(false);
+  });
 });
 
 describe('planImport — scope-aware (per-group providers)', () => {

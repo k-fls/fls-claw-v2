@@ -376,8 +376,8 @@ function replyImport(ctx: HostCommandContext, scope: CredentialScope): void {
     const warnings = [...lineWarnings];
     for (const t of tokens) {
       if (defaultProviderId !== null && t.prefix !== null && t.prefix !== defaultProviderId) {
-        // Don't echo the credential value in warnings (secret-leak hardening,
-        // ported from FLS v1 key-management.ts). Key name is safe; value is not.
+        // Never echo the value — these warnings are rendered back into chat
+        // (secret-leak hardening, originally ported from FLS v1 key-management.ts).
         warnings.push(`ignored (${t.prefix} ≠ ${defaultProviderId}): ${t.key}`);
         continue;
       }
@@ -406,9 +406,7 @@ function replyImport(ctx: HostCommandContext, scope: CredentialScope): void {
 function tokenizeImportLines(plaintext: string): { tokens: ImportToken[]; warnings: string[] } {
   const tokens: ImportToken[] = [];
   const warnings: string[] = [];
-  let lineNo = 0;
   for (const raw of plaintext.split('\n')) {
-    lineNo++;
     const line = raw.trim();
     if (!line || line.startsWith('#')) continue;
 
@@ -423,9 +421,10 @@ function tokenizeImportLines(plaintext: string): { tokens: ImportToken[]; warnin
     const value = restEq >= 0 ? rest.slice(restEq + 1).trim() : '';
 
     if (!key || !value) {
-      // Report the line number, not the line content (secret-leak hardening,
-      // ported from FLS v1) — a malformed line may still contain a secret.
-      warnings.push(`malformed: line ${lineNo}`);
+      // Don't echo the raw line — a bare token or `=secret` could be the
+      // value itself. Report the key when we parsed one; otherwise stay
+      // content-free. (Warnings are rendered back into chat.)
+      warnings.push(key ? `malformed (no value): ${key}` : 'malformed line (expected KEY=value)');
       continue;
     }
     tokens.push({ prefix, key, value });

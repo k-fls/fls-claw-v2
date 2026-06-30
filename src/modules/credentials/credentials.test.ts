@@ -414,6 +414,31 @@ describe('manifest pipeline', () => {
     expect(fs.existsSync(path.join(TMP_GROUPS, 'grantee-a', 'credentials', 'granted', 'grantor'))).toBe(false);
   });
 
+  it('mirrors the source manifest into the scope OWN group folder (container visibility)', async () => {
+    registerCredentialProvider(makeProvider('github'));
+    const scope = asCredentialScope('grantor');
+    // The own group folder must exist for the mirror to fire (else it is a
+    // no-op — non-group scopes like 'default' must not spawn a group dir).
+    fs.mkdirSync(path.join(TMP_GROUPS, 'grantor'), { recursive: true });
+
+    writeKeysFile(scope, 'github', { api: { value: 't' } });
+
+    const ownPath = path.join(TMP_GROUPS, 'grantor', 'credentials', 'manifests', 'github.jsonl');
+    expect(fs.readFileSync(ownPath, 'utf-8').trim()).toBe(JSON.stringify({ provider: 'github', name: 'api' }));
+
+    // Deleting the keys file removes the own mirror too.
+    deleteKeysFile(scope, 'github');
+    await new Promise((r) => setImmediate(r));
+    expect(fs.existsSync(ownPath)).toBe(false);
+  });
+
+  it('does not create a group folder when mirroring a scope that has none', () => {
+    registerCredentialProvider(makeProvider('github'));
+    // No groups/no-group-scope dir created beforehand.
+    writeKeysFile(asCredentialScope('no-group-scope'), 'github', { api: { value: 't' } });
+    expect(fs.existsSync(path.join(TMP_GROUPS, 'no-group-scope'))).toBe(false);
+  });
+
   it('distributeAllManifests copies every existing manifest to a new grantee', async () => {
     registerCredentialProvider(makeProvider('oauth'));
     writeKeysFile(asCredentialScope('grantor'), 'oauth', { x: 1 });
