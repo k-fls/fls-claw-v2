@@ -80,7 +80,7 @@ import {
   oauthInteractive,
   dockerExecDeliver,
 } from './modules/mitm-proxy/index.js';
-import { getOrCreateResolverForAgentGroup } from './modules/credentials/index.js';
+import { getOrCreateResolverForAgentGroup, regenerateAllManifests } from './modules/credentials/index.js';
 import { CREDENTIAL_PROXY_PORT } from './config.js';
 
 import type { ChannelAdapter, ChannelSetup } from './channels/adapter.js';
@@ -143,6 +143,18 @@ async function main(): Promise<void> {
     deliverCallback: dockerExecDeliver,
   });
   log.info('Credential proxy live', { port: credentialProxy.getBoundPort() });
+
+  // Rebuild every credential manifest from the current on-disk keys state now
+  // that all providers are registered (claude/github/onecli above, ssh via the
+  // modules barrel, OAuth via initOAuthModule). This is the once-per-boot sweep
+  // the pipeline's lazy first-use trigger never guarantees on a daemon restart,
+  // and it mirrors each scope's own manifests into its group folder so they're
+  // visible to the container. Synchronous, fast, and side-effect-light.
+  try {
+    regenerateAllManifests();
+  } catch (err) {
+    log.warn('startup: credential manifest regenerate failed', { err });
+  }
 
   // 2b. Host-RPC server — containers reach it over the bridge network.
   // Started after the network exists so the bind is meaningful.
