@@ -8,8 +8,6 @@
  * Called once at module load via the barrel `index.ts`.
  */
 import fs from 'fs';
-import os from 'os';
-import path from 'path';
 
 import { log } from '../../log.js';
 import {
@@ -17,6 +15,7 @@ import {
   getBorrowSource,
   getOrCreateResolverForAgentGroup,
   asGroupScope,
+  noManifestSideEffect,
   readKeysFile,
   registerCredentialProvider,
   type CredentialResolver as V2CredentialResolver,
@@ -28,7 +27,6 @@ import { registerAgentGroupContribution } from '../../agent-group-contributions.
 import { registerContainerLifecycleObserver } from '../container-bootstrap/index.js';
 import { FatalSpawnError } from '../../spawn-failure.js';
 import { socketDir } from './manager.js';
-import { resolveGroupFolderPath } from '../../group-folder.js';
 import { SSH_PROVIDER_ID, PEM_PASSWORDS_PROVIDER_ID } from './types.js';
 import { SSHManager } from './manager.js';
 import type { CredentialResolver as SSHResolver } from './manager.js';
@@ -114,42 +112,11 @@ function sshBuildManifest(credentialScope: CredentialScope): string[] {
   return lines;
 }
 
-/**
- * Copy source manifest to the group's own credentials/manifests/ directory
- * so it's visible inside the container at
- * /workspace/group/credentials/manifests/ssh.jsonl.
- */
-function copyManifestToGroupDir(credentialScope: CredentialScope, providerId: string): void {
-  try {
-    const srcDir = path.join(
-      process.env.HOME || os.homedir(),
-      '.config',
-      'nanoclaw',
-      'credentials',
-      credentialScope as unknown as string,
-      'manifests',
-    );
-    const srcPath = path.join(srcDir, `${providerId}.jsonl`);
-    if (!fs.existsSync(srcPath)) return;
-
-    const groupDir = resolveGroupFolderPath(credentialScope as unknown as string);
-    const dstDir = path.join(groupDir, 'credentials', 'manifests');
-    fs.mkdirSync(dstDir, { recursive: true });
-    fs.copyFileSync(srcPath, path.join(dstDir, `${providerId}.jsonl`));
-  } catch {
-    // Group dir may not exist (e.g. scope is 'default')
-  }
-}
-
-function removeManifestFromGroupDir(credentialScope: CredentialScope, providerId: string): void {
-  try {
-    const groupDir = resolveGroupFolderPath(credentialScope as unknown as string);
-    const dstPath = path.join(groupDir, 'credentials', 'manifests', `${providerId}.jsonl`);
-    fs.unlinkSync(dstPath);
-  } catch {
-    // Already gone or group doesn't exist
-  }
-}
+// Mirroring a scope's own manifest into its group folder (for container
+// visibility at /workspace/agent/credentials/manifests/) is now done generically
+// by the manifest pipeline for every provider — see mirrorManifestToOwnGroupDir
+// in credentials/manifest.ts. SSH no longer needs a bespoke onManifestWritten
+// hook; it uses the shared no-op like every other provider.
 
 // ── Initialization ────────────────────────────────────────────────
 
@@ -258,14 +225,14 @@ export function registerSSHProviders(): void {
   registerCredentialProvider({
     id: SSH_PROVIDER_ID,
     buildManifest: sshBuildManifest,
-    onManifestWritten: (scope) => copyManifestToGroupDir(scope, SSH_PROVIDER_ID),
-    onManifestDeleted: (scope) => removeManifestFromGroupDir(scope, SSH_PROVIDER_ID),
+    onManifestWritten: noManifestSideEffect,
+    onManifestDeleted: noManifestSideEffect,
   });
 
   registerCredentialProvider({
     id: PEM_PASSWORDS_PROVIDER_ID,
     buildManifest: () => [],
-    onManifestWritten: () => {},
-    onManifestDeleted: () => {},
+    onManifestWritten: noManifestSideEffect,
+    onManifestDeleted: noManifestSideEffect,
   });
 }
