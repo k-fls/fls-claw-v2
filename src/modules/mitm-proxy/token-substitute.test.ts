@@ -400,8 +400,9 @@ describe('TokenSubstituteEngine — borrow / access check', () => {
     resolver.put(groupScope, 'gh', CRED_OAUTH, 'ghp_own_1234567890abcdef1234567890ab');
 
     const engine = new TokenSubstituteEngine(() => resolver);
-    // getBorrowSource returns null for a group with no `borrowed` link.
-    engine.setBorrowSourceResolver(() => (null as string | null) ?? undefined);
+    // getBorrowSource returns null for a group with no `borrowed` link; the
+    // wiring adapter (`?? undefined`) turns that into undefined.
+    engine.setBorrowSourceResolver(() => undefined);
 
     const sub = engine.getOrCreateSubstitute('gh', {}, group)!;
     const resolved = engine.resolveSubstitute(sub, group);
