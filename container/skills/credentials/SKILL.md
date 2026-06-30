@@ -55,3 +55,76 @@ secret when the request goes out.
 - **"Unknown provider" / "No credentials found":** that provider/credential
   isn't stored for this group yet. Tell the user what's missing rather than
   improvising a credential.
+
+## Discovering what credentials exist
+
+This container can see only **manifests** — listings of which credentials exist
+for your scope. There are **no token files to read** (v2 stores no
+ready-to-use substitutes on disk); you always obtain a usable value via
+`get_credential`. Your group folder is mounted at `/workspace/agent`:
+
+```bash
+# Own-scope manifests — one JSONL file per provider that has stored creds
+ls /workspace/agent/credentials/manifests/ 2>/dev/null
+cat /workspace/agent/credentials/manifests/github.jsonl 2>/dev/null
+```
+
+Each line describes one credential (no secret, no substitute):
+```json
+{"provider":"github","name":"oauth","credScope":"my-group"}
+```
+- `provider` — service id. `name` — the **credentialPath** to pass to
+  `get_credential` (e.g. `oauth`, `api_key`). `credScope` — owning scope (your
+  group, or a grantor you borrow from).
+
+### Borrowed credentials
+`credentials/borrowed` is a symlink to the active grantor under
+`credentials/granted/<grantor>/`. Only credentials reachable through it are
+usable:
+```bash
+ls -l /workspace/agent/credentials/borrowed
+cat /workspace/agent/credentials/borrowed/*.jsonl 2>/dev/null
+```
+To start/stop borrowing, the user runs `/creds borrow <grantor>` /
+`/creds stop-borrowing` (see the `proxy-operator` skill).
+
+## When a credential is missing — acquisition ladder
+
+If a credential isn't stored, do **not** ask the user for a raw key. Work down
+this ladder:
+
+1. **Device-code OAuth (preferred).** If the provider supports it, just start the
+   flow (e.g. `gh auth login`). The proxy intercepts the device-code response and
+   notifies the user (verification URL + code) out-of-band; when they approve,
+   the credential becomes available via `get_credential`.
+2. **Browser OAuth (authorize-stub).** Initiate the redirect flow. The proxy
+   returns a JSON stub with an `interactionId` + `statusUrl`/`eventsUrl` instead
+   of a real redirect — the host is now driving it with the user. Poll/stream
+   status (below). If you get a *real* login page instead of a stub, the provider
+   isn't proxy-configured — tell the user; never collect login credentials
+   yourself.
+3. **Manual key entry (operator command).** For plain API keys (no OAuth), tell
+   the user to store it via chat — never pasted raw to you:
+   - `/creds gpg` first (prints the group's public key to encrypt to),
+   - then `/creds set-key <provider> [id]` (one key) or `/creds import [provider]`
+     (bulk `[provider:]id=value` lines), or `/auth import` for the proxy set.
+   Once stored, pull it with `get_credential`.
+
+## Tracking interaction status (OAuth in flight)
+
+The proxy is reachable from the container at `$PROXY_HOST:$PROXY_PORT`. Using the
+`interactionId` from an authorize-stub response:
+```bash
+# status code only: 202=in-progress, 200=done, 410=failed/superseded, 404=unknown
+curl -s -o /dev/null -w '%{http_code}' \
+  http://${PROXY_HOST}:${PROXY_PORT}/interaction/<interactionId>/status
+# live SSE stream: queued -> active -> completed|failed
+curl -N http://${PROXY_HOST}:${PROXY_PORT}/interaction/<interactionId>/events
+```
+A `410` "superseded by <newId>" means a newer flow started — switch to the new id.
+
+## Adding a provider the proxy doesn't know
+
+If the service has no built-in provider, declare a per-group provider def and
+reload — see the **`auth-providers`** skill (`/workspace/agent/.auth-discovery/`
++ `reload_auth_providers`).
