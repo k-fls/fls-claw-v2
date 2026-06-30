@@ -21,6 +21,7 @@
 import fs from 'fs';
 import path from 'path';
 
+import { resolveGroupFolderPath } from '../../group-folder.js';
 import { log } from '../../log.js';
 
 import { credentialsDir, listProviderIds, listScopes, scopeDir } from './store.js';
@@ -75,6 +76,53 @@ function deleteManifestFile(scope: CredentialScope, providerId: string): void {
     fs.unlinkSync(manifestPath(scope, providerId));
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+}
+
+// ── Own-scope mirror into the group folder ──────────────────────────────────
+//
+// The source manifests dir (credentials/{scope}/manifests/) is not mounted
+// into the container — only the group folder is, at /workspace/agent. So a
+// scope's OWN manifests are invisible to its own agent unless we copy them
+// into groups/{scope}/credentials/manifests/{providerId}.jsonl. This is the
+// own-scope analogue of the grantee copy below, and is generic across every
+// provider — own-scope discovery must not depend on a provider wiring a
+// bespoke onManifestWritten hook (only SSH ever did). Best effort: a scope
+// with no backing group folder (e.g. 'default') is silently skipped.
+
+function ownGroupManifestDir(scope: CredentialScope): string | null {
+  let groupDir: string;
+  try {
+    groupDir = resolveGroupFolderPath(scope as unknown as string);
+  } catch {
+    return null; // not a valid/real group folder (e.g. 'default')
+  }
+  if (!fs.existsSync(groupDir)) return null;
+  return path.join(groupDir, 'credentials', 'manifests');
+}
+
+function mirrorManifestToOwnGroupDir(scope: CredentialScope, providerId: string): void {
+  const src = manifestPath(scope, providerId);
+  if (!fs.existsSync(src)) return;
+  const dstDir = ownGroupManifestDir(scope);
+  if (!dstDir) return;
+  try {
+    fs.mkdirSync(dstDir, { recursive: true });
+    fs.copyFileSync(src, path.join(dstDir, `${providerId}.jsonl`));
+  } catch (err) {
+    log.warn('manifest pipeline: own-group mirror failed', { err, scope, providerId });
+  }
+}
+
+function removeManifestFromOwnGroupDir(scope: CredentialScope, providerId: string): void {
+  const dstDir = ownGroupManifestDir(scope);
+  if (!dstDir) return;
+  try {
+    fs.unlinkSync(path.join(dstDir, `${providerId}.jsonl`));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn('manifest pipeline: own-group mirror delete failed', { err, scope, providerId });
+    }
   }
 }
 
@@ -172,6 +220,7 @@ export function onKeysFileWritten(scope: CredentialScope, providerId: string): v
     });
   }
 
+  mirrorManifestToOwnGroupDir(scope, providerId);
   asyncDistribute(scope, providerId, 'copy');
 }
 
@@ -196,6 +245,7 @@ export function onKeysFileDeleted(scope: CredentialScope, providerId?: string): 
         });
       }
     }
+    removeManifestFromOwnGroupDir(scope, providerId);
     asyncDistribute(scope, providerId, 'delete');
     return;
   }
@@ -208,6 +258,16 @@ export function onKeysFileDeleted(scope: CredentialScope, providerId?: string): 
       err,
       scope: scope,
     });
+  }
+
+  // Drop the scope's own mirrored manifests in its group folder too.
+  const ownDir = ownGroupManifestDir(scope);
+  if (ownDir) {
+    try {
+      fs.rmSync(ownDir, { recursive: true, force: true });
+    } catch (err) {
+      log.warn('manifest pipeline: own-group manifests remove failed', { err, scope });
+    }
   }
 
   const grantees = listGrantees(scope);
@@ -295,33 +355,50 @@ export function regenerateAllManifests(): void {
   regenerateAllManifestsImpl();
 }
 
+/**
+ * Rewrite every manifest for a single scope from its current keys-file
+ * state, mirroring each into the scope's own group folder. Called at
+ * container spawn (see `container-runner.ts`) so a group's own-scope
+ * manifests are fresh and visible before its mount — covers the case where
+ * keys files land on disk (e.g. v1→v2 migration) without ever flowing
+ * through `onKeysFileWritten` and without a daemon restart.
+ */
+export function regenerateScopeManifests(scope: CredentialScope): void {
+  regenerateScopeManifestsImpl(scope);
+}
+
 /** Test-only: reset the once-flag so the next pipeline call sweeps again. */
 export function _resetRegenForTests(): void {
   regenScheduled = false;
 }
 
+function regenerateScopeManifestsImpl(scope: CredentialScope): void {
+  for (const providerId of listProviderIds(scope)) {
+    const provider = getCredentialProvider(providerId);
+    if (!provider) {
+      log.warn('manifest pipeline: regenerate skipping unregistered provider', {
+        providerId,
+        scope: scope,
+      });
+      continue;
+    }
+    try {
+      const lines = provider.buildManifest(scope);
+      writeManifestFile(scope, providerId, lines);
+      provider.onManifestWritten(scope);
+      mirrorManifestToOwnGroupDir(scope, providerId);
+    } catch (err) {
+      log.warn('manifest pipeline: regenerate failed for entry', {
+        err,
+        scope: scope,
+        providerId,
+      });
+    }
+  }
+}
+
 function regenerateAllManifestsImpl(): void {
   for (const scope of listScopes()) {
-    for (const providerId of listProviderIds(scope)) {
-      const provider = getCredentialProvider(providerId);
-      if (!provider) {
-        log.warn('manifest pipeline: regenerate skipping unregistered provider', {
-          providerId,
-          scope: scope,
-        });
-        continue;
-      }
-      try {
-        const lines = provider.buildManifest(scope);
-        writeManifestFile(scope, providerId, lines);
-        provider.onManifestWritten(scope);
-      } catch (err) {
-        log.warn('manifest pipeline: regenerate failed for entry', {
-          err,
-          scope: scope,
-          providerId,
-        });
-      }
-    }
+    regenerateScopeManifestsImpl(scope);
   }
 }
