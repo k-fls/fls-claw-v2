@@ -1,0 +1,8 @@
+{
+  "api_base_url": "https://api.perplexity.ai",
+  "_source": "manually researched from official docs (docs.perplexity.ai)",
+  "_note": "Perplexity AI API. OpenAI-compatible — accepts OpenAI SDK pointed at api.perplexity.ai with a Perplexity key. Authentication via Authorization: Bearer header. Keys start with pplx- prefix. No OAuth2 support, API key only. Ported from FLS v1 (local-only file added on the prod server).",
+  "_auth_method": "api_key",
+  "_auth_header_format": "Authorization: Bearer {api_key}",
+  "_env_vars": { "PERPLEXITY_API_KEY": "api_key" }
+}
