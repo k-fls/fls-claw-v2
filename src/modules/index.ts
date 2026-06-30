@@ -28,3 +28,4 @@ import './mitm-proxy/index.js';
 import './permissions/index.js';
 import './agent-to-agent/index.js';
 import './self-mod/index.js';
+import './ssh-auth/index.js';

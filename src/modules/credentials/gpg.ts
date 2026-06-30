@@ -27,6 +27,7 @@ import {
   exportPublicKey as exportPublicKeyAt,
   exportPublicKeyBinary as exportPublicKeyBinaryAt,
   getKeyMeta as getKeyMetaAt,
+  gpgDecryptAt,
   gpgHome as gpgHomeAt,
   isKeyExpired as isKeyExpiredAt,
   type GpgKeyMeta,
@@ -114,4 +115,9 @@ export function getKeyMeta(scope: CredentialScope): GpgKeyMeta | null {
 /** Check whether the GPG key for `scope` has passed its configured max age. */
 export function isKeyExpired(scope: CredentialScope): boolean {
   return isKeyExpiredAt(gpgBaseDir(), scope);
+}
+
+/** Decrypt a PGP ciphertext using the per-scope GNUPGHOME. */
+export function gpgDecrypt(scope: CredentialScope, ciphertext: string): string {
+  return gpgDecryptAt(gpgHomeForScope(scope), ciphertext);
 }

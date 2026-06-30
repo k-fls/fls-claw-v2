@@ -108,6 +108,7 @@ export {
   isGpgAvailable,
   isPgpMessage,
   normalizeArmoredBlock,
+  gpgDecrypt,
   type GpgKeyMeta,
 } from './gpg.js';
 

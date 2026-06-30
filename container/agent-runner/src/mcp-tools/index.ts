@@ -12,6 +12,7 @@ import './agents.js';
 import './self-mod.js';
 import './credentials.js';
 import './auth-providers.js';
+import './ssh.js';
 import { startMcpServer } from './server.js';
 
 function log(msg: string): void {
