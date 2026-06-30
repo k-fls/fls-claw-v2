@@ -129,6 +129,22 @@ describe('planImport — single-provider form', () => {
     expect(plan.stores).toEqual([]);
     expect(plan.warnings.some((w) => /ignored \(gitlab ≠ github\)/.test(w))).toBe(true);
   });
+
+  it('never echoes the secret value in skip warnings (rendered back to chat)', () => {
+    register('github', { envBindings: [] });
+    register('gitlab', { envBindings: [] });
+
+    const SECRET = 'sk-super-secret-token-value';
+    const plan = planImport(
+      [tok(null, 'MYSTERY_TOKEN', SECRET), tok('gitlab', 'oauth', SECRET)],
+      'github',
+    );
+    expect(plan.stores).toEqual([]);
+    // Both the "no provider" and "ignored" paths must warn but redact the value.
+    expect(plan.warnings.some((w) => /no provider: MYSTERY_TOKEN/.test(w))).toBe(true);
+    expect(plan.warnings.some((w) => /ignored \(gitlab ≠ github\)/.test(w))).toBe(true);
+    expect(plan.warnings.some((w) => w.includes(SECRET))).toBe(false);
+  });
 });
 
 describe('planImport — scope-aware (per-group providers)', () => {
