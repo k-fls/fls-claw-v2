@@ -376,12 +376,13 @@ function replyImport(ctx: HostCommandContext, scope: CredentialScope): void {
     const warnings = [...lineWarnings];
     for (const t of tokens) {
       if (defaultProviderId !== null && t.prefix !== null && t.prefix !== defaultProviderId) {
-        warnings.push(`ignored (${t.prefix} ≠ ${defaultProviderId}): ${t.key}=${t.value}`);
+        // Never echo the value — these warnings are rendered back into chat.
+        warnings.push(`ignored (${t.prefix} ≠ ${defaultProviderId}): ${t.key}`);
         continue;
       }
       const providerId = t.prefix ?? defaultProviderId;
       if (!providerId) {
-        warnings.push(`no provider: ${t.key}=${t.value}`);
+        warnings.push(`no provider: ${t.key}`);
         continue;
       }
       if (unknownProviderError(providerId, scope)) {
@@ -419,7 +420,10 @@ function tokenizeImportLines(plaintext: string): { tokens: ImportToken[]; warnin
     const value = restEq >= 0 ? rest.slice(restEq + 1).trim() : '';
 
     if (!key || !value) {
-      warnings.push(`malformed: ${line}`);
+      // Don't echo the raw line — a bare token or `=secret` could be the
+      // value itself. Report the key when we parsed one; otherwise stay
+      // content-free. (Warnings are rendered back into chat.)
+      warnings.push(key ? `malformed (no value): ${key}` : 'malformed line (expected KEY=value)');
       continue;
     }
     tokens.push({ prefix, key, value });

@@ -147,6 +147,7 @@ export {
   distributeAllManifests,
   revokeGranteeManifests,
   regenerateAllManifests,
+  regenerateScopeManifests,
   _resetRegenForTests,
 } from './manifest.js';
 

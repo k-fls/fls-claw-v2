@@ -56,7 +56,13 @@ import {
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
-import { getCredentialProvider, AGENT_RUNTIME, asGroupScope } from './modules/credentials/index.js';
+import {
+  getCredentialProvider,
+  AGENT_RUNTIME,
+  asGroupScope,
+  asCredentialScope,
+  regenerateScopeManifests,
+} from './modules/credentials/index.js';
 import type { ContributionInput, ProviderResult } from './modules/credentials/index.js';
 // Provider host-side config barrel — each provider that needs host-side
 // container setup self-registers on import.
@@ -633,6 +639,19 @@ export function buildMounts(
   const mounts: VolumeMount[] = [];
   const sessDir = sessionDir(agentGroup.id, session.id);
   const groupDir = path.resolve(GROUPS_DIR, agentGroup.folder);
+
+  // Refresh this group's own-scope credential manifests and mirror them into
+  // the group folder before mounting it. The source manifests dir is not
+  // mounted into the container, so this is the only path by which a group's
+  // own (non-claude) provider manifests become visible at
+  // /workspace/agent/credentials/manifests/. Covers keys files that landed on
+  // disk without flowing through the live write hook (e.g. v1→v2 migration).
+  // Best effort — never block a spawn on manifest I/O.
+  try {
+    regenerateScopeManifests(asCredentialScope(agentGroup.folder));
+  } catch (err) {
+    log.warn('spawn: scope manifest regenerate failed', { groupId: agentGroup.id, err });
+  }
 
   // Session folder at /workspace (contains inbound.db, outbound.db, outbox/, .claude/)
   mounts.push({ hostPath: sessDir, containerPath: '/workspace', readonly: false });
