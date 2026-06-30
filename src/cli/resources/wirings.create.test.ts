@@ -81,7 +81,13 @@ describe('wirings CLI create auto-creates agent_destinations row (#5)', () => {
     expect(resp.ok).toBe(true);
 
     // The wiring row exists.
-    expect(count('SELECT COUNT(*) AS c FROM messaging_group_agents WHERE messaging_group_id = ? AND agent_group_id = ?', MGID, GID)).toBe(1);
+    expect(
+      count(
+        'SELECT COUNT(*) AS c FROM messaging_group_agents WHERE messaging_group_id = ? AND agent_group_id = ?',
+        MGID,
+        GID,
+      ),
+    ).toBe(1);
 
     // …and the matching channel destination was auto-created.
     const dest = getDb()
@@ -106,7 +112,12 @@ describe('wirings CLI create auto-creates agent_destinations row (#5)', () => {
     );
 
     expect(
-      count('SELECT COUNT(*) AS c FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ?', GID, 'channel', MGID),
+      count(
+        'SELECT COUNT(*) AS c FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ?',
+        GID,
+        'channel',
+        MGID,
+      ),
     ).toBe(1);
   });
 });

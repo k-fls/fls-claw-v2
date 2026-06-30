@@ -487,54 +487,58 @@ describe.skipIf(!RUN_E2E)('mitm-proxy — live container', () => {
     }
   }, 180_000);
 
-  it.skipIf(!HAS_EGRESS_LOCKDOWN)('egress lockdown composes with the mitm proxy: firewall enforced, proxy path intact', async () => {
-    // Both features want the root entrypoint and both install iptables rules
-    // (mitm: nat-table :443 DNAT → proxy; lockdown: filter-table OUTPUT
-    // default-DROP). They compose only because the lockdown allowlist permits
-    // exactly the proxy hop the DNAT redirects to (HTTPS_PROXY == DNAT target,
-    // both set by the mitm observer). This test proves that composition live.
-    const prev = process.env.NANOCLAW_EGRESS_LOCKDOWN;
-    process.env.NANOCLAW_EGRESS_LOCKDOWN = 'true';
-    try {
-      const exited = waitForExit();
-      const ok = await wakeContainer(mkSession());
-      expect(ok).toBe(true);
-      const exit = await exited;
-      // The firewall must not break the agent's own startup / probe run.
-      expect(exit.reason).toBe('normal');
-      expect(exit.exitCode).toBe(0);
+  it.skipIf(!HAS_EGRESS_LOCKDOWN)(
+    'egress lockdown composes with the mitm proxy: firewall enforced, proxy path intact',
+    async () => {
+      // Both features want the root entrypoint and both install iptables rules
+      // (mitm: nat-table :443 DNAT → proxy; lockdown: filter-table OUTPUT
+      // default-DROP). They compose only because the lockdown allowlist permits
+      // exactly the proxy hop the DNAT redirects to (HTTPS_PROXY == DNAT target,
+      // both set by the mitm observer). This test proves that composition live.
+      const prev = process.env.NANOCLAW_EGRESS_LOCKDOWN;
+      process.env.NANOCLAW_EGRESS_LOCKDOWN = 'true';
+      try {
+        const exited = waitForExit();
+        const ok = await wakeContainer(mkSession());
+        expect(ok).toBe(true);
+        const exit = await exited;
+        // The firewall must not break the agent's own startup / probe run.
+        expect(exit.reason).toBe('normal');
+        expect(exit.exitCode).toBe(0);
 
-      const probe = readProbeResult() as {
-        substitute: { status: number; body: string };
-        transparent: { status: number; body: string };
-        external: { status: number; body: string };
-        blockedEgress: { status: number; code: number; body: string };
-      };
+        const probe = readProbeResult() as {
+          substitute: { status: number; body: string };
+          transparent: { status: number; body: string };
+          external: { status: number; body: string };
+          blockedEgress: { status: number; code: number; body: string };
+        };
 
-      // Composition: the lockdown OUTPUT allowlist permits the proxy hop, so
-      // both the explicit-proxy substitute endpoint AND the transparent :443
-      // DNAT path still reach the proxy *through* the firewall.
-      expect(probe.substitute.status).toBe(200);
-      expect(probe.transparent.status).toBe(200);
-      const tb = JSON.parse(probe.transparent.body) as { intercepted: boolean };
-      expect(tb.intercepted).toBe(true);
+        // Composition: the lockdown OUTPUT allowlist permits the proxy hop, so
+        // both the explicit-proxy substitute endpoint AND the transparent :443
+        // DNAT path still reach the proxy *through* the firewall.
+        expect(probe.substitute.status).toBe(200);
+        expect(probe.transparent.status).toBe(200);
+        const tb = JSON.parse(probe.transparent.body) as { intercepted: boolean };
+        expect(tb.intercepted).toBe(true);
 
-      // External HTTPS still works — but only because it is tunneled via the
-      // proxy (:443 DNAT → allowlisted proxy port), never direct egress.
-      // Soft-skip when there's no outbound network.
-      if (probe.external.status !== 0) {
-        expect(probe.external.status).toBe(200);
+        // External HTTPS still works — but only because it is tunneled via the
+        // proxy (:443 DNAT → allowlisted proxy port), never direct egress.
+        // Soft-skip when there's no outbound network.
+        if (probe.external.status !== 0) {
+          expect(probe.external.status).toBe(200);
+        }
+
+        // Firewall is actually enforcing: a direct (no-proxy) :80 connection to a
+        // non-allowlisted destination is dropped → curl times out (status 0).
+        expect(probe.blockedEgress.status).toBe(0);
+        expect(probe.blockedEgress.code).not.toBe(0);
+      } finally {
+        if (prev === undefined) delete process.env.NANOCLAW_EGRESS_LOCKDOWN;
+        else process.env.NANOCLAW_EGRESS_LOCKDOWN = prev;
       }
-
-      // Firewall is actually enforcing: a direct (no-proxy) :80 connection to a
-      // non-allowlisted destination is dropped → curl times out (status 0).
-      expect(probe.blockedEgress.status).toBe(0);
-      expect(probe.blockedEgress.code).not.toBe(0);
-    } finally {
-      if (prev === undefined) delete process.env.NANOCLAW_EGRESS_LOCKDOWN;
-      else process.env.NANOCLAW_EGRESS_LOCKDOWN = prev;
-    }
-  }, 180_000);
+    },
+    180_000,
+  );
 
   it('get_credential + reload_auth_providers round-trip through the real container', async () => {
     // Declare a per-group provider so the reload has something to install. The

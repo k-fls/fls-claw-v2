@@ -21,7 +21,10 @@ const ctx = (over: Partial<ContainerContributionCtx> = {}): ContainerContributio
 describe('mergeContributions', () => {
   it('folds env (later wins) and concatenates mounts; same type in and out', () => {
     const parts: ContainerContributionResult[] = [
-      { env: { ANTHROPIC_BASE_URL: 'x', SHARED: 'base' }, mounts: [{ hostPath: '/a', containerPath: '/a', readonly: true }] },
+      {
+        env: { ANTHROPIC_BASE_URL: 'x', SHARED: 'base' },
+        mounts: [{ hostPath: '/a', containerPath: '/a', readonly: true }],
+      },
       { env: { SHARED: 'override' }, mounts: [{ hostPath: '/b', containerPath: '/b', readonly: false }] },
     ];
     const merged = mergeContributions(parts);
