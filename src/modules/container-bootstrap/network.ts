@@ -15,7 +15,10 @@ import os from 'os';
 import { CONTAINER_RUNTIME_BIN } from '../../container-runtime.js';
 import { log } from '../../log.js';
 
-const NANOCLAW_NETWORK = 'nanoclaw';
+// Network name is overridable (CLAW_NETWORK) so multiple installs can run on
+// one host without sharing a bridge / colliding on container IPs — pairs with
+// the CLAW_SUBNET override below. Defaults to 'nanoclaw' for single-install hosts.
+const NANOCLAW_NETWORK = process.env.CLAW_NETWORK || 'nanoclaw';
 
 interface ParsedSubnet {
   readonly subnet: string;
