@@ -4,7 +4,7 @@ import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
-import { isCorruptionError, processQuery } from './poll-loop.js';
+import { isCorruptionError, processQuery, PerTurnResultDedup } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
 
@@ -435,6 +435,75 @@ describe('error result with no <message> envelope', () => {
     expect(getUndeliveredMessages()).toHaveLength(0);
     expect(pushes).toHaveLength(1);
     expect(pushes[0]).toContain('was not delivered');
+  });
+});
+
+describe('duplicate result dedup (CLI stream-json re-emit)', () => {
+  function seedDest(name: string, channelType: string, platformId: string): void {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES (?, ?, 'channel', ?, ?, NULL)`,
+      )
+      .run(name, name, channelType, platformId);
+  }
+
+  /** A query that yields init + a scripted sequence of result events, then ends. */
+  function multiResultQuery(results: ProviderEvent[]): AgentQuery {
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-dup' };
+      for (const r of results) yield r;
+    }
+    return { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+  }
+
+  const chatOut = () => getUndeliveredMessages().filter((m) => m.kind === 'chat');
+
+  // End-to-end: the observed prod pattern for one turn — an empty (scratchpad)
+  // result, then the SAME 1-block result twice. The CLI stream-json layer
+  // re-emits the final result; without the guard both copies are dispatched →
+  // two Slack posts (seq 29 + seq 31, byte-identical). Expect exactly one send.
+  it('dispatches a re-emitted identical result only once per turn', async () => {
+    seedDest('d', 'discord', 'chan-1');
+    const text = '<message to="d">Status — all systems go</message>';
+    const query = multiResultQuery([
+      { type: 'result', text: '' },
+      { type: 'result', text },
+      { type: 'result', text },
+    ]);
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'mock', undefined, 'prompt', undefined);
+
+    const out = chatOut();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe('Status — all systems go');
+  });
+
+  // Unit-level (deterministic, no timers): the guard itself. processQuery calls
+  // reset() at every turn boundary (each query.push), which is what keeps this
+  // from becoming a #2506-style cross-turn over-drop.
+  describe('PerTurnResultDedup', () => {
+    it('claim() is true once, then false for an exact re-emission', () => {
+      const d = new PerTurnResultDedup();
+      expect(d.claim('<message to="d">hi</message>')).toBe(true);
+      expect(d.claim('<message to="d">hi</message>')).toBe(false);
+      expect(d.claim('<message to="d">hi</message>')).toBe(false);
+    });
+
+    it('distinguishes different bodies (hash, not identity)', () => {
+      const d = new PerTurnResultDedup();
+      expect(d.claim('a')).toBe(true);
+      expect(d.claim('b')).toBe(true); // different body → dispatched
+      expect(d.claim('a')).toBe(false); // still remembers 'a' this turn
+    });
+
+    it('reset() re-allows identical text (a new turn must send it again)', () => {
+      const d = new PerTurnResultDedup();
+      expect(d.claim('same')).toBe(true);
+      expect(d.claim('same')).toBe(false);
+      d.reset(); // turn boundary (query.push)
+      expect(d.claim('same')).toBe(true); // distinct turn, identical text → sends
+    });
   });
 });
 
