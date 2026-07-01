@@ -146,7 +146,8 @@ export function planImport(
     // Single-provider mode: a line explicitly prefixed for another provider
     // is ignored (v1 parity), not stored under the default.
     if (defaultProviderId !== null && t.prefix !== null && t.prefix !== defaultProviderId) {
-      warnings.push(`ignored (${t.prefix} ≠ ${defaultProviderId}): ${t.key}=${t.value}`);
+      // Never echo the value — these warnings are rendered back into chat.
+      warnings.push(`ignored (${t.prefix} ≠ ${defaultProviderId}): ${t.key} (line ${t.line})`);
       continue;
     }
     let providerId = t.prefix ?? defaultProviderId;
@@ -155,12 +156,14 @@ export function planImport(
       if (candidates && candidates.length === 1) {
         providerId = candidates[0];
       } else if (candidates && candidates.length > 1) {
-        warnings.push(`ambiguous env var ${t.key}: matches [${candidates.join(', ')}] — prefix with 'provider:'`);
+        warnings.push(
+          `ambiguous env var ${t.key} (line ${t.line}): matches [${candidates.join(', ')}] — prefix with 'provider:'`,
+        );
         continue;
       }
     }
     if (!providerId) {
-      warnings.push(`no provider: ${t.key}=${t.value}`);
+      warnings.push(`no provider: ${t.key} (line ${t.line})`);
       continue;
     }
     let target = byProvider.get(providerId);

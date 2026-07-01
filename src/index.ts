@@ -82,7 +82,11 @@ import {
   oauthInteractive,
   dockerExecDeliver,
 } from './modules/mitm-proxy/index.js';
-import { getOrCreateResolverForAgentGroup } from './modules/credentials/index.js';
+import {
+  getBorrowSource,
+  getOrCreateResolverForAgentGroup,
+  regenerateAllManifests,
+} from './modules/credentials/index.js';
 import { CREDENTIAL_PROXY_PORT } from './config.js';
 
 import type { ChannelAdapter, ChannelSetup } from './channels/adapter.js';
@@ -128,7 +132,13 @@ async function main(): Promise<void> {
   // proxy (whose rebuildIndex picks up the registered provider's swap rules),
   // publish the instance (the lifecycle observer then routes every container's
   // egress through it), and init the OAuth module for the discovery providers.
-  initTokenEngine((scope) => getOrCreateResolverForAgentGroup(scope));
+  const tokenEngine = initTokenEngine((scope) => getOrCreateResolverForAgentGroup(scope));
+  // Wire the borrow redirect: when a group has no own credential for a provider,
+  // the engine consults its borrowed source scope (the `borrowed` symlink set by
+  // `/creds borrow`). Without this the engine is own-scope only and borrowed
+  // credentials never resolve. Access is still gated per-read by the per-group
+  // resolver (canAccess(ownFolder, scope)), so borrowSource alone is sufficient.
+  tokenEngine.setBorrowSourceResolver((groupScope) => getBorrowSource(groupScope as unknown as string) ?? undefined);
   registerClaudeCredentialProvider();
   registerGithubCredentialProvider();
   // C3 OneCLI-as-broker: the agent-identifier credential (grantable) + the
@@ -150,6 +160,18 @@ async function main(): Promise<void> {
     deliverCallback: dockerExecDeliver,
   });
   log.info('Credential proxy live', { port: credentialProxy.getBoundPort() });
+
+  // Rebuild every credential manifest from the current on-disk keys state now
+  // that all providers are registered (claude/github/onecli above, ssh via the
+  // modules barrel, OAuth via initOAuthModule). This is the once-per-boot sweep
+  // the pipeline's lazy first-use trigger never guarantees on a daemon restart,
+  // and it mirrors each scope's own manifests into its group folder so they're
+  // visible to the container. Synchronous, fast, and side-effect-light.
+  try {
+    regenerateAllManifests();
+  } catch (err) {
+    log.warn('startup: credential manifest regenerate failed', { err });
+  }
 
   // 2b. Host-RPC server — containers reach it over the bridge network.
   // Started after the network exists so the bind is meaningful.

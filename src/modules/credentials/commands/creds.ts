@@ -376,12 +376,13 @@ function replyImport(ctx: HostCommandContext, scope: CredentialScope): void {
     const warnings = [...lineWarnings];
     for (const t of tokens) {
       if (defaultProviderId !== null && t.prefix !== null && t.prefix !== defaultProviderId) {
-        warnings.push(`ignored (${t.prefix} ≠ ${defaultProviderId}): ${t.key}=${t.value}`);
+        // Never echo the value — these warnings are rendered back into chat.
+        warnings.push(`ignored (${t.prefix} ≠ ${defaultProviderId}): ${t.key} (line ${t.line})`);
         continue;
       }
       const providerId = t.prefix ?? defaultProviderId;
       if (!providerId) {
-        warnings.push(`no provider: ${t.key}=${t.value}`);
+        warnings.push(`no provider: ${t.key} (line ${t.line})`);
         continue;
       }
       if (unknownProviderError(providerId, scope)) {
@@ -404,7 +405,12 @@ function replyImport(ctx: HostCommandContext, scope: CredentialScope): void {
 function tokenizeImportLines(plaintext: string): { tokens: ImportToken[]; warnings: string[] } {
   const tokens: ImportToken[] = [];
   const warnings: string[] = [];
+  // 1-based line number in the original paste — count every raw line, including
+  // the blank / `#` lines we skip, so the number a warning cites matches what
+  // the operator sees in their editor.
+  let lineNo = 0;
   for (const raw of plaintext.split('\n')) {
+    lineNo += 1;
     const line = raw.trim();
     if (!line || line.startsWith('#')) continue;
 
@@ -419,10 +425,17 @@ function tokenizeImportLines(plaintext: string): { tokens: ImportToken[]; warnin
     const value = restEq >= 0 ? rest.slice(restEq + 1).trim() : '';
 
     if (!key || !value) {
-      warnings.push(`malformed: ${line}`);
+      // Don't echo the raw line — a bare token or `=secret` could be the
+      // value itself. Report the key when we parsed one; otherwise stay
+      // content-free. (Warnings are rendered back into chat.)
+      warnings.push(
+        key
+          ? `malformed (no value): ${key} (line ${lineNo})`
+          : `malformed: line ${lineNo} (expected KEY=value)`,
+      );
       continue;
     }
-    tokens.push({ prefix, key, value });
+    tokens.push({ prefix, key, value, line: lineNo });
   }
   return { tokens, warnings };
 }

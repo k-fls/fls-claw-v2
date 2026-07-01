@@ -369,4 +369,44 @@ describe('TokenSubstituteEngine — borrow / access check', () => {
     expect(engine.resolveSubstitute(sub, group)).toBeNull();
     expect(engine.size).toBe(0);
   });
+
+  // Regression: production (index.ts) wires only setBorrowSourceResolver, with
+  // no engine-level accessCheck — the per-group resolver enforces canAccess on
+  // every read. These two cover that exact configuration and the string|null →
+  // undefined adapter shape used to plug in getBorrowSource. Before the wiring
+  // fix, borrowSource was never set, so borrowed credentials never resolved.
+  it('borrows with only borrowSource wired (no engine accessCheck), via a string|null resolver', () => {
+    registerDefaultProvider('gh');
+    const resolver = new MockResolver();
+    const sourceScope = asCredentialScope('source-group');
+    resolver.put(sourceScope, 'gh', CRED_OAUTH, 'ghp_borrowed_1234567890abcdef1234567890');
+
+    const engine = new TokenSubstituteEngine(() => resolver);
+    // Mirror production: getBorrowSource returns string | null; the wiring
+    // adapter coerces null → undefined. No setAccessCheck call.
+    const getBorrowSourceStub = (folder: string): string | null =>
+      folder === (group as unknown as string) ? 'source-group' : null;
+    engine.setBorrowSourceResolver((gs) => getBorrowSourceStub(gs as unknown as string) ?? undefined);
+
+    const sub = engine.getOrCreateSubstitute('gh', {}, group)!;
+    const resolved = engine.resolveSubstitute(sub, group);
+    expect(resolved?.realToken).toBe('ghp_borrowed_1234567890abcdef1234567890');
+    expect(resolved?.mapping.credentialScope).toBe(sourceScope);
+  });
+
+  it('falls back to own scope when the borrow-source resolver yields nothing', () => {
+    registerDefaultProvider('gh');
+    const resolver = new MockResolver();
+    resolver.put(groupScope, 'gh', CRED_OAUTH, 'ghp_own_1234567890abcdef1234567890ab');
+
+    const engine = new TokenSubstituteEngine(() => resolver);
+    // getBorrowSource returns null for a group with no `borrowed` link; the
+    // wiring adapter (`?? undefined`) turns that into undefined.
+    engine.setBorrowSourceResolver(() => undefined);
+
+    const sub = engine.getOrCreateSubstitute('gh', {}, group)!;
+    const resolved = engine.resolveSubstitute(sub, group);
+    expect(resolved?.realToken).toBe('ghp_own_1234567890abcdef1234567890ab');
+    expect(resolved?.mapping.credentialScope).toBe(groupScope);
+  });
 });

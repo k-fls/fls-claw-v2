@@ -23,6 +23,8 @@ export interface ImportToken {
   prefix: string | null;
   key: string;
   value: string;
+  /** 1-based position in the pasted import block, for actionable warnings. */
+  line: number;
 }
 
 /** A credential the caller should persist via the resolver. */

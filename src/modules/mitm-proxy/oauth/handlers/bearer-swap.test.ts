@@ -104,6 +104,7 @@ function makeCtx(engine: TokenSubstituteEngine): HandlerContext {
     resolverFor: () => ({ store: vi.fn() }) as unknown as CredentialResolver,
     fetchImpl: vi.fn() as unknown as typeof fetch,
     inFlightRefresh: new Map(),
+    redirectRefreshBreaker: new Map(),
   };
 }
 
@@ -393,6 +394,64 @@ describe('buildBearerSwapHandler — 401 refresh strategies', () => {
     expect(tryRefresh).toHaveBeenCalledTimes(1);
     expect(res.statusCode).toBe(401);
     expect(res.body).toBe('unauthorized');
+  });
+
+  it('redirect strategy: refreshes+redirects once, then forwards the 401 on retry (breaker stops the loop)', async () => {
+    // The pathological case: refresh always succeeds (mints a new access token)
+    // but upstream keeps rejecting it with 401. Without the breaker each retry
+    // is a fresh request → 401→refresh→307 forever until the client's redirect
+    // cap. One handler + one ctx (shared breaker map) reused across two hops.
+    vi.mocked(tryRefresh).mockResolvedValue(true);
+    const handler = buildBearerSwapHandler(provider('redirect'), rule(), makeCtx(refreshableEngine('REAL', 'SUB')));
+
+    // Hop 1: 401 → refresh → 307 to the same URL (records the breaker entry).
+    up.response = {
+      statusCode: 401,
+      headers: { 'content-type': 'text/plain' },
+      body: Buffer.from('unauthorized'),
+      mode: 'events',
+    };
+    const res1 = makeRes();
+    await run(handler, makeReq({ authorization: 'Bearer SUB' }), res1);
+    expect(res1.statusCode).toBe(307);
+
+    // Hop 2 (the client following the 307): 401 again. The breaker sees the
+    // prior refresh+redirect didn't clear it and forwards the 401 instead of
+    // redirecting again — exactly one 307 total.
+    up.response = {
+      statusCode: 401,
+      headers: { 'content-type': 'text/plain' },
+      body: Buffer.from('unauthorized'),
+      mode: 'events',
+    };
+    const res2 = makeRes();
+    await run(handler, makeReq({ authorization: 'Bearer SUB' }), res2);
+    expect(res2.statusCode).toBe(401);
+    expect(res2.body).toBe('unauthorized');
+  });
+
+  it('redirect breaker resets after an intervening non-401 success', async () => {
+    vi.mocked(tryRefresh).mockResolvedValue(true);
+    const handler = buildBearerSwapHandler(provider('redirect'), rule(), makeCtx(refreshableEngine('REAL', 'SUB')));
+
+    // Hop 1: 401 → refresh → 307 (arms the breaker).
+    up.response = { statusCode: 401, headers: {}, body: Buffer.from('unauthorized'), mode: 'events' };
+    const res1 = makeRes();
+    await run(handler, makeReq({ authorization: 'Bearer SUB' }), res1);
+    expect(res1.statusCode).toBe(307);
+
+    // Hop 2: a 200 clears the breaker entry (the token works now).
+    up.response = { statusCode: 200, headers: {}, body: Buffer.from('ok'), mode: 'pipe' };
+    const res2 = makeRes();
+    await run(handler, makeReq({ authorization: 'Bearer SUB' }), res2);
+    expect(res2.statusCode).toBe(200);
+
+    // Hop 3: a fresh 401 gets a fresh refresh+redirect — the earlier redirect
+    // no longer counts against this credential's one-retry budget.
+    up.response = { statusCode: 401, headers: {}, body: Buffer.from('unauthorized'), mode: 'events' };
+    const res3 = makeRes();
+    await run(handler, makeReq({ authorization: 'Bearer SUB' }), res3);
+    expect(res3.statusCode).toBe(307);
   });
 
   it('does not attempt a refresh when no swapped credential is refreshable', async () => {
