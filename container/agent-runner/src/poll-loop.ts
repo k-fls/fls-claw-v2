@@ -16,6 +16,8 @@ import {
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
 
+import { createHash } from 'node:crypto';
+
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
 
@@ -107,6 +109,39 @@ export function reportClassifiedError(
     retryable: false,
   });
   return classification;
+}
+
+/**
+ * Per-turn guard against the `claude` CLI re-emitting an identical `result`
+ * for a single turn. The Agent SDK relays every stdout `result` line verbatim
+ * with no dedup (observed live: an empty result, then the same 431-char result
+ * twice → the same <message> block written to outbound twice → a duplicate
+ * Slack post). A turn dispatches at most one copy of a given result body.
+ *
+ * Keyed on a sha256 hash of the body, never the body itself, so the guard's
+ * footprint stays fixed-size regardless of reply length. `reset()` is called at
+ * every turn boundary (each `query.push`), so this is NOT a stream-lifetime
+ * guard: two distinct turns that happen to produce identical text (e.g. the
+ * same `/status` output asked twice) both dispatch.
+ */
+export class PerTurnResultDedup {
+  private readonly seen = new Set<string>();
+
+  /**
+   * Record `text` as dispatched this turn and return true; or, if an identical
+   * body was already dispatched this turn, return false (caller skips it).
+   */
+  claim(text: string): boolean {
+    const hash = createHash('sha256').update(text).digest('hex');
+    if (this.seen.has(hash)) return false;
+    this.seen.add(hash);
+    return true;
+  }
+
+  /** New turn — allow an identical body to dispatch again. */
+  reset(): void {
+    this.seen.clear();
+  }
 }
 
 export interface PollLoopConfig {
@@ -435,6 +470,9 @@ export async function processQuery(
   let queryContinuation: string | undefined;
   let done = false;
   let unwrappedNudged = false;
+  // Drops an exact re-emission of one turn's result (see PerTurnResultDedup).
+  // Reset on every `query.push()` below so distinct turns aren't affected.
+  const resultDedup = new PerTurnResultDedup();
   // Prompt queue for the exchange hook — each result event consumes the
   // oldest unanswered prompt, except a wrapping-retry result, which answers
   // the same prompt again. Unused (and unmaintained) when the provider
@@ -519,6 +557,7 @@ export async function processQuery(
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         query.push(prompt);
+        resultDedup.reset(); // new turn — reset the per-turn dedup guard
         archivePrompts.push(prompt);
         markCompleted(keptIds);
       } catch (err) {
@@ -581,7 +620,13 @@ export async function processQuery(
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
-        if (event.text) {
+        if (event.text && !resultDedup.claim(event.text)) {
+          // Spurious duplicate `result` for this turn (CLI stream-json re-emit).
+          // markCompleted above already ran for the first copy; skip the re-send
+          // and the re-archive/notify so we don't double-post or double-count
+          // the exchange.
+          log(`Duplicate result event (${event.text.length} chars) already dispatched this turn — skipping re-dispatch`);
+        } else if (event.text) {
           const { sent, hasUnwrapped } = dispatchResultText(event.text, routing);
           if (sent === 0 && event.isError === true) {
             // Non-retryable error turn (e.g. a 403 billing_error) with no
@@ -614,6 +659,7 @@ export async function processQuery(
                   `Your destinations: ${names}. ` +
                   `Please re-send your response with the correct wrapping.</system>`,
               );
+              resultDedup.reset(); // wrapping-retry answers a fresh turn — reset guard
             }
             // The wrapping-retry result answers the SAME user prompt — keep it
             // queued so the retry archives against it, not the nudge text.
