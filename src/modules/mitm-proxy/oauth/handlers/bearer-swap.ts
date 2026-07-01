@@ -33,6 +33,13 @@ type HeaderMap = Record<string, string | number | string[] | undefined>;
 const BUFFER_MAX_BYTES = 2 * 1024 * 1024;
 /** Proactive refresh trigger: refresh if token expires within this window. */
 const REFRESH_AHEAD_MS = 60_000;
+/**
+ * Redirect-strategy circuit-breaker TTL. A refresh+redirect round-trip is
+ * sub-second, so this window doesn't gate legitimate retries — it only bounds
+ * how long a stale entry (left by an aborted/dropped retry) lingers before the
+ * breaker treats it as absent and self-heals.
+ */
+const REDIRECT_BREAKER_TTL_MS = 30_000;
 
 function prepareHeaders(req: IncomingMessage, targetHost: string): HeaderMap {
   const headers: HeaderMap = {
@@ -271,8 +278,15 @@ export function buildBearerSwapHandler(provider: OAuthProvider, rule: InterceptR
           });
           const statusCode = upRes.statusCode!;
 
-          // Happy path: not a 401 — pipe through.
+          // Happy path: not a 401 — pipe through. A success means the current
+          // token works, so reset the redirect breaker's one-retry budget for
+          // these credentials — future legitimate refreshes redirect as normal.
           if (statusCode !== 401) {
+            if (ctx.redirectRefreshBreaker) {
+              for (const id of refreshable) {
+                ctx.redirectRefreshBreaker.delete(`${groupScope}::${provider.id}::${id}`);
+              }
+            }
             clientRes.writeHead(statusCode, upRes.headers);
             upRes.pipe(clientRes);
             resolve();
@@ -310,6 +324,38 @@ export function buildBearerSwapHandler(provider: OAuthProvider, rule: InterceptR
 
           switch (effectiveStrategy) {
             case 'redirect': {
+              // The redirect retry is a fresh proxy request with no per-request
+              // memory, so a refreshable-but-structurally-invalid credential
+              // (refresh succeeds, upstream keeps 401ing the new token) would
+              // loop 401→refresh→307 until the client's redirect cap. The
+              // breaker gives us exactly one refresh+redirect per credential:
+              // if we already redirected within the TTL and the 401 is back,
+              // the refresh didn't help — forward the 401 and reset the budget.
+              const breaker = ctx.redirectRefreshBreaker;
+              if (breaker) {
+                const now = Date.now();
+                const keys = [...refreshable].map((id) => `${groupScope}::${provider.id}::${id}`);
+                const tripped = keys.some((k) => {
+                  const ts = breaker.get(k);
+                  if (ts === undefined) return false;
+                  if (now - ts >= REDIRECT_BREAKER_TTL_MS) {
+                    breaker.delete(k); // stale — treat as absent (self-heal)
+                    return false;
+                  }
+                  return true;
+                });
+                if (tripped) {
+                  for (const k of keys) breaker.delete(k);
+                  logger.warn(
+                    { provider: provider.id, scope: groupScope, credentials: [...refreshable] },
+                    'oauth.bearer-swap: refresh did not clear 401, forwarding 401 (redirect breaker tripped)',
+                  );
+                  forwardBuffered(statusCode, upRes.headers, upBody);
+                  resolve();
+                  break;
+                }
+                for (const k of keys) breaker.set(k, now);
+              }
               clientRes.writeHead(307, {
                 location: `https://${targetHost}${clientReq.url}`,
                 'content-length': '0',
