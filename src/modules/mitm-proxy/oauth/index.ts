@@ -159,6 +159,7 @@ export function oauthSubstitutesFor(provider: OAuthProvider): SubstitutesSpec {
     resolverFor: (scope) => getOrCreateResolverForAgentGroup(scope),
     fetchImpl: globalThis.fetch,
     inFlightRefresh: new Map(),
+    redirectRefreshBreaker: new Map(),
     isGlobalProvider: (id) => hasProxyInstance() && getProxy().isGlobalProvider(id),
   };
   return toSubstitutingProvider(provider, ctx).substitutes;
@@ -195,6 +196,7 @@ export function initOAuthModule(opts: InitOAuthModuleOptions): OAuthModuleHandle
     resolverFor: (scope) => getOrCreateResolverForAgentGroup(scope),
     fetchImpl,
     inFlightRefresh: new Map(),
+    redirectRefreshBreaker: new Map(),
     isGlobalProvider: (id) => opts.proxy.isGlobalProvider(id),
     oauthEvents: opts.oauthEvents,
     deliverCallback: opts.deliverCallback,
@@ -378,6 +380,7 @@ export function loadGroupProvidersForContainer(
       resolverFor: (s) => getOrCreateResolverForAgentGroup(s),
       fetchImpl: globalThis.fetch,
       inFlightRefresh: new Map(),
+      redirectRefreshBreaker: new Map(),
       isGlobalProvider: (id) => proxy.isGlobalProvider(id),
       oauthEvents: moduleOAuthEvents,
       deliverCallback: moduleDeliverCallback,

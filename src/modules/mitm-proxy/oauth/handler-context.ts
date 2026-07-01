@@ -71,6 +71,23 @@ export interface HandlerContext {
    */
   inFlightRefresh: Map<string, Promise<boolean>>;
   /**
+   * Circuit breaker for the `redirect` refresh strategy. Keyed
+   * `${scope}::${providerId}::${credentialId}`, value = the ms timestamp of the
+   * refresh+redirect last emitted for that credential.
+   *
+   * A `redirect` retry is a brand-new proxy request with no per-request memory,
+   * so a credential that is refreshable but structurally invalid (the refresh
+   * mints a new access token, yet upstream still 401s it) otherwise loops
+   * 401→refresh→307 until the client's redirect cap. This map lets the handler
+   * detect "I already refreshed+redirected this credential and it's back with a
+   * 401" and forward the 401 instead of redirecting again. Cleared on any
+   * non-401 success (resetting the one-retry budget) and self-heals via a TTL.
+   * Lives on the context so all handlers built off one `initOAuthModule` call
+   * share it. Absent → breaker disabled (falls back to always-redirect); every
+   * production context wires it, only lightweight test contexts may omit it.
+   */
+  redirectRefreshBreaker?: Map<string, number>;
+  /**
    * Is this provider id globally registered? Token-exchange capture uses it
    * to skip stamping `boundDomain` on global credentials (which legitimately
    * span multiple registrable domains). Evaluated at request time. Absent →
