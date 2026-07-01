@@ -53,6 +53,19 @@ export function writeMessageOut(msg: WriteMessageOut): number {
   const max = Math.max(maxOut, maxIn);
   const nextSeq = max % 2 === 0 ? max + 1 : max + 2; // next odd
 
+  // TEMP INSTRUMENTATION (duplicate-reply investigation): log every outbound
+  // write with its call path so a duplicate shows exactly what wrote it twice.
+  const caller = (new Error().stack || '')
+    .split('\n')
+    .slice(2, 6)
+    .map((s) => s.trim().replace(/^at\s+/, ''))
+    .join(' <- ');
+  console.error(
+    `[outbound-write] seq=${nextSeq} kind=${msg.kind} to=${msg.platform_id ?? '?'} ` +
+      `in_reply_to=${msg.in_reply_to ?? 'null'} len=${msg.content.length} ` +
+      `head=${JSON.stringify(msg.content.slice(0, 60))} via ${caller}`,
+  );
+
   // bun:sqlite requires named parameters to be passed with the prefix character
   // in the JS object keys (better-sqlite3 auto-stripped it, bun:sqlite does not).
   outbound

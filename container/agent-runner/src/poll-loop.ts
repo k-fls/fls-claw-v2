@@ -728,6 +728,10 @@ function deliverErrorResult(text: string, routing: RoutingContext): void {
  * blocks, even with a single destination. Bare text is scratchpad only.
  */
 function dispatchResultText(text: string, routing: RoutingContext): { sent: number; hasUnwrapped: boolean } {
+  // TEMP INSTRUMENTATION (duplicate-reply investigation): count invocations +
+  // block matches per turn, so a double-dispatch of one result is visible.
+  const blockCount = (text.match(/<message\s+to="/g) || []).length;
+  log(`[dispatch-call] textLen=${text.length} blocks=${blockCount} inReplyTo=${routing.inReplyTo ?? 'null'}`);
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
 
   let match: RegExpExecArray | null;
