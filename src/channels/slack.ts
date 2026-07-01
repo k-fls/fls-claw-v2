@@ -25,7 +25,12 @@ registerChannelAdapter('slack', {
       appToken: env.SLACK_APP_TOKEN,
       mode: useSocketMode ? 'socket' : 'webhook',
     });
-    const bridge = createChatSdkBridge({ adapter: slackAdapter, concurrency: 'concurrent', supportsThreads: true });
+    // supportsThreads=false (FLS): match v1 — reply in the channel (not a thread)
+    // and key ONE shared session per group (thread_id=null). Threaded mode
+    // (true) fragments each group into per-thread sessions, which hid scheduled
+    // tasks from `list_tasks` (it reads the running session's inbound.db, but
+    // tasks live in the group's shared session) and diverged conversation state.
+    const bridge = createChatSdkBridge({ adapter: slackAdapter, concurrency: 'concurrent', supportsThreads: false });
     bridge.resolveChannelName = async (platformId: string) => {
       try {
         const info = await slackAdapter.fetchThread(platformId);
