@@ -165,24 +165,24 @@ describe('buildTokenExchangeHandler — response transform', () => {
     expect(out).not.toContain('REAL_REFRESH');
   });
 
-  it('re-auth of a borrowed credential stores to the owning (grantor) scope, not the borrower', async () => {
+  it('a refresh of a borrowed credential stores to the owning (grantor) scope, not the borrower', async () => {
     const GRANTOR: CredentialScope = asCredentialScope('grantor-group');
     const store = vi.fn();
     const engine = makeEngine({
-      // The borrower already has a substitute for this provider whose mapping
-      // resolves to the grantor's scope (refs.json sourceScope → grantor).
-      getSubstitute: vi.fn((_pid: string, _scope: GroupScope, path: string) =>
-        path === CRED_OAUTH ? 'SUB_ACCESS' : null,
-      ),
+      // The swapped refresh substitute is bound to the grantor's scope.
       resolveSubstitute: vi.fn((s: string) =>
-        s === 'SUB_ACCESS' ? { realToken: 'GRANTOR_ACCESS', mapping: { credentialScope: GRANTOR } } : null,
+        s === 'SUB_REFRESH'
+          ? { realToken: 'REAL_GRANTOR_REFRESH', mapping: { credentialScope: GRANTOR } }
+          : null,
       ),
       getOrCreateSubstitute: vi.fn((_pid: string, _attrs: unknown, _scope: GroupScope, path: string) =>
         path === CRED_OAUTH ? 'SUB_ACCESS' : path === CRED_OAUTH_REFRESH ? 'SUB_REFRESH' : null,
       ),
     });
-    const { transformResponse } = await capture(makeCtx(engine, store));
+    const { transformRequest, transformResponse } = await capture(makeCtx(engine, store));
 
+    // Request carries the grantor-bound refresh substitute — captures the source scope.
+    transformRequest('grant_type=refresh_token&refresh_token=SUB_REFRESH');
     transformResponse(
       JSON.stringify({ access_token: 'FRESH_ACCESS', refresh_token: 'FRESH_REFRESH', expires_in: 3600 }),
       200,
@@ -193,6 +193,24 @@ describe('buildTokenExchangeHandler — response transform', () => {
     expect(scope).toBe(GRANTOR); // healed at the grantor, where every borrower reads it
     expect(credentialId).toBe(CRED_OAUTH);
     expect(credential.value).toBe('FRESH_ACCESS');
+  });
+
+  it('a fresh auth (authorization_code) stores to the requester own scope — a direct write shadows the grantor', async () => {
+    const store = vi.fn();
+    const engine = makeEngine({
+      getOrCreateSubstitute: vi.fn((_pid: string, _attrs: unknown, _scope: GroupScope, path: string) =>
+        path === CRED_OAUTH ? 'SUB_ACCESS' : null,
+      ),
+    });
+    const { transformRequest, transformResponse } = await capture(makeCtx(engine, store));
+
+    // No refresh substitute is swapped for an authorization_code grant, so no
+    // source scope is captured → the fresh credential lands in the own scope.
+    transformRequest('grant_type=authorization_code&code=abc123');
+    transformResponse(JSON.stringify({ access_token: 'FRESH_ACCESS', expires_in: 3600 }), 200);
+
+    expect(store).toHaveBeenCalledTimes(1);
+    expect(store.mock.calls[0][0]).toBe(asCredentialScope(SCOPE)); // own scope, not a grantor
   });
 
   it('passes the body through untouched when there is no access_token', async () => {
