@@ -3,7 +3,12 @@ import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } 
 import { writeMessageOut } from './db/messages-out.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
-import { clearCurrentInReplyTo, setCurrentInReplyTo } from './current-batch.js';
+import {
+  clearCurrentInReplyTo,
+  hasSentUserMsgThisTurn,
+  resetSentUserMsgThisTurn,
+  setCurrentInReplyTo,
+} from './current-batch.js';
 import {
   formatMessages,
   extractRouting,
@@ -306,6 +311,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // can stamp it on outbound rows — needed for a2a return-path routing.
     setCurrentInReplyTo(routing.inReplyTo);
     currentQuery = query; // expose to the SIGTERM handler for graceful abort
+    // New turn: clear the "delivered via send_message" flag so a send from a
+    // prior batch can't suppress this turn's re-wrap nudge.
+    resetSentUserMsgThisTurn();
     try {
       const result = await processQuery(
         query,
@@ -492,6 +500,10 @@ export async function processQuery(
         const prompt = formatMessages(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
+        // A follow-up push starts a fresh turn — the delivered-this-turn flag
+        // must reset alongside unwrappedNudged, or a send_message in the prior
+        // turn would suppress a legitimate nudge here and silently drop output.
+        resetSentUserMsgThisTurn();
         query.push(prompt);
         resultDedup.reset(); // new turn — reset the per-turn dedup guard
         archivePrompts.push(prompt);
@@ -578,12 +590,18 @@ export async function processQuery(
             });
             archivePrompts.shift();
           } else {
-            const willRetryWrapping = hasUnwrapped && !unwrappedNudged;
+            // If the turn already delivered a user-facing message via
+            // send_message, bare end-of-turn text is a genuine "nothing more to
+            // wrap" ending — not an undelivered response. Gating on this flag
+            // stops the nudge (and the duplicate re-send it provokes) while
+            // still firing when the turn truly delivered nothing.
+            const deliveredThisTurn = hasSentUserMsgThisTurn();
+            const willRetryWrapping = hasUnwrapped && !unwrappedNudged && !deliveredThisTurn;
             notifyExchangeComplete(onExchangeComplete, {
               prompt: archivePrompts[0] ?? initialPrompt,
               result: event.text,
               continuation: queryContinuation ?? initialContinuation,
-              status: hasUnwrapped ? 'undelivered' : 'completed',
+              status: hasUnwrapped && !deliveredThisTurn ? 'undelivered' : 'completed',
             });
             if (willRetryWrapping) {
               unwrappedNudged = true;
