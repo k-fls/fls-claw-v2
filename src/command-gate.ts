@@ -123,11 +123,17 @@ interface HostCommandEntry {
   scope: HostCommandScope;
   access: HostCommandAccess;
   help?: string;
+  details?: string;
 }
 
 export interface RegisterHostCommandOptions {
   /** One-line description shown by `/help`. Omit to hide from help output. */
   help?: string;
+  /**
+   * Optional long-form help (usage, subcommands, examples) shown by
+   * `/help <command>`. May be multi-line. Falls back to `help` when omitted.
+   */
+  details?: string;
   /** Where the command's effect lives. Default: 'agent'. See HostCommandScope. */
   scope?: HostCommandScope;
   /** Privilege required to invoke (and list in `/help`). Default: 'any'. See HostCommandAccess. */
@@ -164,6 +170,7 @@ export function registerHostCommand(
     scope: options.scope ?? 'agent',
     access: options.access ?? 'any',
     help: options.help,
+    details: options.details,
   });
 }
 
@@ -533,16 +540,31 @@ function buildHelpOverview(userId: string | null): string {
   return lines.join('\n').trimEnd();
 }
 
+/** Human phrasing for a command's access level, shown in `/help <command>`. */
+function describeAccess(access: HostCommandAccess): string {
+  switch (access) {
+    case 'global-admin':
+      return 'owner / global admin';
+    case 'group-admin':
+      return 'group admin';
+    default:
+      return 'anyone';
+  }
+}
+
 function lookupHelpFor(rawArg: string, userId: string | null): string | null {
   const normalized = (rawArg.startsWith('/') ? rawArg : `/${rawArg}`).toLowerCase();
   const host = hostCommands.get(normalized);
   // Commands the caller can't access are reported as unknown, matching
   // their absence from the overview.
   if (host && host.help && passesCommandAccess(host.access, userId, null)) {
-    return `${normalized} — ${host.help}`;
+    const lines = [`${normalized} — ${host.help}`, '', `Scope: ${host.scope} · Access: ${describeAccess(host.access)}`];
+    // Long-form usage/subcommands/examples when the command provides it.
+    if (host.details) lines.push('', host.details);
+    return lines.join('\n');
   }
   const container = CONTAINER_HELP.get(normalized);
-  if (container) return `${normalized} — ${container}`;
+  if (container) return `${normalized} — ${container}\n\nRuns inside the agent container.`;
   return null;
 }
 
@@ -559,6 +581,13 @@ function registerBuiltinHelp(): void {
     },
     {
       help: 'Show available commands (use `/help <command>` for details)',
+      details: [
+        'Usage:',
+        '  /help              — list all commands available to you',
+        '  /help <command>    — show details for one command (e.g. `/help /creds`)',
+        '',
+        'The leading slash is optional: `/help creds` works too.',
+      ].join('\n'),
       scope: 'channel',
     },
   );
