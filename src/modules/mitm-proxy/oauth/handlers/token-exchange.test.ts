@@ -17,7 +17,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { CredentialResolver } from '../../../credentials/index.js';
-import { CRED_OAUTH, CRED_OAUTH_REFRESH, asGroupScope, type GroupScope } from '../../types.js';
+import {
+  CRED_OAUTH,
+  CRED_OAUTH_REFRESH,
+  asCredentialScope,
+  asGroupScope,
+  type CredentialScope,
+  type GroupScope,
+} from '../../types.js';
 import type { TokenSubstituteEngine } from '../../token-substitute.js';
 import type { HandlerContext } from '../handler-context.js';
 import type { InterceptRule, OAuthProvider } from '../types.js';
@@ -70,6 +77,7 @@ function makeEngine(overrides: Partial<Record<keyof TokenSubstituteEngine, unkno
   return {
     resolveSubstitute: vi.fn(() => null),
     getOrCreateSubstitute: vi.fn(() => null),
+    getSubstitute: vi.fn(() => null),
     ...overrides,
   } as unknown as TokenSubstituteEngine;
 }
@@ -155,6 +163,36 @@ describe('buildTokenExchangeHandler — response transform', () => {
     expect(outParsed.token_type).toBe('Bearer'); // untouched field preserved
     expect(out).not.toContain('REAL_ACCESS');
     expect(out).not.toContain('REAL_REFRESH');
+  });
+
+  it('re-auth of a borrowed credential stores to the owning (grantor) scope, not the borrower', async () => {
+    const GRANTOR: CredentialScope = asCredentialScope('grantor-group');
+    const store = vi.fn();
+    const engine = makeEngine({
+      // The borrower already has a substitute for this provider whose mapping
+      // resolves to the grantor's scope (refs.json sourceScope → grantor).
+      getSubstitute: vi.fn((_pid: string, _scope: GroupScope, path: string) =>
+        path === CRED_OAUTH ? 'SUB_ACCESS' : null,
+      ),
+      resolveSubstitute: vi.fn((s: string) =>
+        s === 'SUB_ACCESS' ? { realToken: 'GRANTOR_ACCESS', mapping: { credentialScope: GRANTOR } } : null,
+      ),
+      getOrCreateSubstitute: vi.fn((_pid: string, _attrs: unknown, _scope: GroupScope, path: string) =>
+        path === CRED_OAUTH ? 'SUB_ACCESS' : path === CRED_OAUTH_REFRESH ? 'SUB_REFRESH' : null,
+      ),
+    });
+    const { transformResponse } = await capture(makeCtx(engine, store));
+
+    transformResponse(
+      JSON.stringify({ access_token: 'FRESH_ACCESS', refresh_token: 'FRESH_REFRESH', expires_in: 3600 }),
+      200,
+    );
+
+    expect(store).toHaveBeenCalledTimes(1);
+    const [scope, , credentialId, credential] = store.mock.calls[0];
+    expect(scope).toBe(GRANTOR); // healed at the grantor, where every borrower reads it
+    expect(credentialId).toBe(CRED_OAUTH);
+    expect(credential.value).toBe('FRESH_ACCESS');
   });
 
   it('passes the body through untouched when there is no access_token', async () => {

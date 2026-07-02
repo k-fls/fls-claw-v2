@@ -20,6 +20,7 @@ import { request as httpsRequest, RequestOptions } from 'https';
 import type { HostHandler } from '../../credential-proxy.js';
 import { sameRegistrableDomain } from '../../domain.js';
 import { logger } from '../../logger.js';
+import { CRED_OAUTH, asCredentialScope } from '../../types.js';
 import type { CredentialScope, GroupScope } from '../../types.js';
 import type { HandlerContext } from '../handler-context.js';
 import type { CredentialContext, InterceptRule, OAuthProvider } from '../types.js';
@@ -207,6 +208,23 @@ export function buildBearerSwapHandler(provider: OAuthProvider, rule: InterceptR
       });
     }
 
+    // Owning (source) scope per swapped credential — the grantor's scope for a
+    // borrowed credential, the requester's own scope otherwise. Refresh dedup
+    // and the redirect breaker key off this, not the requester `groupScope`, so
+    // N borrowers of one grantor share a single exchange / breaker entry instead
+    // of thrashing per-borrower; and the refresh writes where the outbound path
+    // reads. `credentialScope` came from the substitute mapping, so it's driven
+    // by the resolved `sourceScope` — no grantor-side declaration required.
+    const owningScopeByCredId = new Map<string, CredentialScope>();
+    for (const swap of swapped) {
+      if (!owningScopeByCredId.has(swap.credentialId)) {
+        owningScopeByCredId.set(swap.credentialId, swap.credentialScope);
+      }
+    }
+    const breakerKey = (credentialId: string): string =>
+      `${owningScopeByCredId.get(credentialId) ?? asCredentialScope(groupScope)}::${provider.id}::${credentialId}`;
+    const oauthOwningScope = owningScopeByCredId.get(CRED_OAUTH);
+
     // Figure out which swapped credentials are refreshable / near expiry.
     let proactiveAttempted = false;
     const refreshable = new Set<string>();
@@ -239,7 +257,7 @@ export function buildBearerSwapHandler(provider: OAuthProvider, rule: InterceptR
         { provider: provider.id, scope: groupScope, credentials: [...nearExpiry] },
         'oauth.bearer-swap: proactive refresh before send',
       );
-      const ok = await tryRefresh(provider, groupScope, ctx);
+      const ok = await tryRefresh(provider, groupScope, ctx, oauthOwningScope);
       if (ok) reResolveHeaders();
     }
 
@@ -284,7 +302,7 @@ export function buildBearerSwapHandler(provider: OAuthProvider, rule: InterceptR
           if (statusCode !== 401) {
             if (ctx.redirectRefreshBreaker) {
               for (const id of refreshable) {
-                ctx.redirectRefreshBreaker.delete(`${groupScope}::${provider.id}::${id}`);
+                ctx.redirectRefreshBreaker.delete(breakerKey(id));
               }
             }
             clientRes.writeHead(statusCode, upRes.headers);
@@ -313,7 +331,7 @@ export function buildBearerSwapHandler(provider: OAuthProvider, rule: InterceptR
               { provider: provider.id, scope: groupScope, status: statusCode },
               'oauth.bearer-swap: 401, attempting refresh',
             );
-            refreshed = await tryRefresh(provider, groupScope, ctx);
+            refreshed = await tryRefresh(provider, groupScope, ctx, oauthOwningScope);
           }
 
           if (!refreshed) {
@@ -334,7 +352,7 @@ export function buildBearerSwapHandler(provider: OAuthProvider, rule: InterceptR
               const breaker = ctx.redirectRefreshBreaker;
               if (breaker) {
                 const now = Date.now();
-                const keys = [...refreshable].map((id) => `${groupScope}::${provider.id}::${id}`);
+                const keys = [...refreshable].map((id) => breakerKey(id));
                 const tripped = keys.some((k) => {
                   const ts = breaker.get(k);
                   if (ts === undefined) return false;
