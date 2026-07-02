@@ -172,6 +172,9 @@ export function buildTokenExchangeHandler(
             );
           }
           ctx.resolverFor(groupScope).store(targetScope, provider.id, CRED_OAUTH, credential);
+          // A fresh credential for this scope — clear any pending expired alert
+          // (a grantor re-auth heals every borrower).
+          ctx.borrowedCredentialEvents?.onCredentialHealed({ credentialScope: targetScope, providerId: provider.id });
 
           const subAccess = ctx.tokenEngine.getOrCreateSubstitute(provider.id, scopeAttrs, groupScope, CRED_OAUTH);
           if (!subAccess) {

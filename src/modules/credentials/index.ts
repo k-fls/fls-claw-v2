@@ -141,6 +141,9 @@ export {
   canAccess,
 } from './grants.js';
 
+// ── Borrow-aware provider availability ──────────────────────────────────────
+export { availableProviderIds } from './provider-availability.js';
+
 // ── Manifest pipeline (C7s) ─────────────────────────────────────────────────
 export {
   onKeysFileWritten,

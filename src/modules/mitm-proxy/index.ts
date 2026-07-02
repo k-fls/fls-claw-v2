@@ -130,6 +130,7 @@ export { buildMitmProxyContribution, type MitmProxyContribution } from './observ
 // relay) + the production code-delivery primitive. The host passes both to
 // `initOAuthModule` at boot.
 export { oauthInteractive, dockerExecDeliver } from './oauth/oauth-interactive.js';
+export { borrowedCredentialNotifier } from './oauth/borrowed-cred-notify.js';
 export type { OAuthEvents, AuthCodeDeliver } from './oauth/handler-context.js';
 
 // Side-effect: register the `get_credential` sync action.
