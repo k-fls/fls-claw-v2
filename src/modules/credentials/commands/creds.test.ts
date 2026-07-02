@@ -15,11 +15,26 @@ const h = vi.hoisted(() => ({
   borrowSource: null as string | null,
   canAccess: true,
   byScope: new Map<string, string[]>(), // non-own scope → provider ids (grantor scopes)
+  isAdmin: false, // cross-group owner gate
+  groupsById: new Map<string, { id: string; folder: string; name: string }>(),
+  groupsByFolder: new Map<string, { id: string; folder: string; name: string }>(),
+  messagingGroups: new Map<string, { id: string }>(),
+  messagingGroupAgents: new Map<string, Array<{ agent_group_id: string }>>(),
 }));
 
+const SELF = { id: 'g1', folder: 'mygroup', name: 'My Group' };
+
 vi.mock('../../../db/agent-groups.js', () => ({
-  getAgentGroup: (id: string) => (id ? { id, folder: 'mygroup' } : undefined),
-  getAgentGroupByFolder: (f: string) => ({ id: `id-${f}`, folder: f }),
+  getAgentGroup: (id: string) => (id === 'g1' ? SELF : h.groupsById.get(id)),
+  getAgentGroupByFolder: (f: string) => (f === 'mygroup' ? SELF : h.groupsByFolder.get(f)),
+  getAllAgentGroups: () => [SELF, ...h.groupsById.values()],
+}));
+vi.mock('../../../db/messaging-groups.js', () => ({
+  getMessagingGroup: (id: string) => h.messagingGroups.get(id),
+  getMessagingGroupAgents: (mgId: string) => h.messagingGroupAgents.get(mgId) ?? [],
+}));
+vi.mock('../../../command-gate.js', () => ({
+  isAdmin: () => h.isAdmin,
 }));
 vi.mock('../../interactions/index.js', () => ({
   pastePgp: (...a: unknown[]) => h.paste(...a),
@@ -58,7 +73,7 @@ vi.mock('../store.js', () => ({
 }));
 vi.mock('../types.js', () => ({ asCredentialScope: (s: string) => s }));
 
-import { handleCredsCommand } from './creds.js';
+import { handleCredsCommand, _resetCredsCrossInFlightForTests } from './creds.js';
 
 function run(args: string[]): string[] {
   const replies: string[] = [];
@@ -90,6 +105,12 @@ beforeEach(() => {
   h.borrowSource = null;
   h.canAccess = true;
   h.byScope = new Map();
+  h.isAdmin = false;
+  h.groupsById = new Map();
+  h.groupsByFolder = new Map();
+  h.messagingGroups = new Map();
+  h.messagingGroupAgents = new Map();
+  _resetCredsCrossInFlightForTests();
 });
 
 describe('/creds gpg (C7g)', () => {
@@ -299,5 +320,80 @@ describe('/creds set-key + import — borrow shadow warning', () => {
     h.borrowSource = null;
     run(['set-key', 'github']);
     expect(pastePrompt()).not.toMatch(/borrowing/i);
+  });
+});
+
+describe('/creds cross-group (system-owner) — <target>@<provider>', () => {
+  function seedGroup(id: string, folder: string, name = folder): void {
+    const g = { id, folder, name };
+    h.groupsById.set(id, g);
+    h.groupsByFolder.set(folder, g);
+  }
+
+  it('denies a non-owner', () => {
+    h.isAdmin = false;
+    seedGroup('ag-other', 'other');
+    const r = run(['set-key', 'other@github']);
+    expect(r[0]).toMatch(/requires an owner or global admin/);
+    expect(h.paste).not.toHaveBeenCalled();
+  });
+
+  it('owner set-key targets another group by folder (stores to its scope)', async () => {
+    h.isAdmin = true;
+    seedGroup('ag-other', 'other');
+    run(['set-key', 'other@github']);
+    await new Promise((res) => setTimeout(res, 0));
+    expect(h.store).toHaveBeenCalledTimes(1);
+    const [scope, providerId] = h.store.mock.calls[0];
+    expect(scope).toBe('other'); // target scope (asCredentialScope identity in tests)
+    expect(providerId).toBe('github');
+    // The paste prompt names the target group.
+    const prompt = (h.paste.mock.calls[0][0] as { prompt: string }).prompt;
+    expect(prompt).toContain('for *other*');
+  });
+
+  it('reports when the target group is unknown', () => {
+    h.isAdmin = true;
+    expect(run(['delete', 'ghost@github'])[0]).toMatch(/No agent group matches "ghost"/);
+  });
+
+  it('reports ambiguity when a name matches multiple groups', () => {
+    h.isAdmin = true;
+    h.groupsById.set('ag-1', { id: 'ag-1', folder: 'team-a', name: 'dupe' });
+    h.groupsById.set('ag-2', { id: 'ag-2', folder: 'team-b', name: 'dupe' });
+    const r = run(['list', 'dupe@'])[0];
+    expect(r).toMatch(/matches multiple groups/);
+    expect(r).toContain('team-a');
+    expect(r).toContain('team-b');
+  });
+
+  it('owner list targets another group', () => {
+    h.isAdmin = true;
+    seedGroup('ag-other', 'other');
+    h.byScope.set('other', ['claude', 'github']);
+    const r = run(['list', 'other@'])[0];
+    expect(r).toContain('[→ other]');
+    expect(r).toContain('*claude*');
+    expect(r).toContain('*github*');
+  });
+
+  it('resolves a target by channel (messaging-group id) with a single agent', async () => {
+    h.isAdmin = true;
+    seedGroup('ag-other', 'other');
+    h.messagingGroups.set('mg-x', { id: 'mg-x' });
+    h.messagingGroupAgents.set('mg-x', [{ agent_group_id: 'ag-other' }]);
+    run(['set-key', 'mg-x@github']);
+    await new Promise((res) => setTimeout(res, 0));
+    expect(h.store).toHaveBeenCalledTimes(1);
+    expect(h.store.mock.calls[0][0]).toBe('other');
+  });
+
+  it('fan-out guard: same message dispatched twice runs the op once', () => {
+    h.isAdmin = true;
+    seedGroup('ag-other', 'other');
+    h.entries.set('github', ['oauth']); // so delete has something to remove
+    run(['delete', 'other@github']);
+    run(['delete', 'other@github']); // second engaged-agent dispatch of the same message
+    expect(h.del).toHaveBeenCalledTimes(1);
   });
 });
