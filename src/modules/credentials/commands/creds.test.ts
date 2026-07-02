@@ -13,6 +13,8 @@ const h = vi.hoisted(() => ({
   pasteResult: { reason: 'submitted', text: 'the-secret' } as { reason: string; text: string | null },
   paste: vi.fn(),
   borrowSource: null as string | null,
+  canAccess: true,
+  byScope: new Map<string, string[]>(), // non-own scope → provider ids (grantor scopes)
 }));
 
 vi.mock('../../../db/agent-groups.js', () => ({
@@ -24,6 +26,7 @@ vi.mock('../../interactions/index.js', () => ({
 }));
 vi.mock('../grants.js', () => ({
   addGrantee: () => {},
+  canAccess: () => h.canAccess,
   clearBorrowSource: () => {},
   getBorrowSource: () => h.borrowSource,
   isGrantee: () => false,
@@ -48,7 +51,9 @@ vi.mock('../resolver.js', () => ({
 }));
 vi.mock('../scope-invalidator.js', () => ({ invalidateScope: () => {} }));
 vi.mock('../store.js', () => ({
-  listProviderIds: () => h.storeProviders,
+  // Own scope is 'mygroup' (the test agent group's folder); any other scope is a
+  // grantor scope seeded via h.byScope.
+  listProviderIds: (scope: string) => (scope === 'mygroup' ? h.storeProviders : (h.byScope.get(scope) ?? [])),
   listEntries: (_s: string, p: string) => h.entries.get(p) ?? [],
 }));
 vi.mock('../types.js', () => ({ asCredentialScope: (s: string) => s }));
@@ -83,6 +88,8 @@ beforeEach(() => {
   h.pasteResult = { reason: 'submitted', text: 'the-secret' };
   h.paste = vi.fn(() => Promise.resolve(h.pasteResult));
   h.borrowSource = null;
+  h.canAccess = true;
+  h.byScope = new Map();
 });
 
 describe('/creds gpg (C7g)', () => {
@@ -115,6 +122,59 @@ describe('/creds list + status (C7o)', () => {
     h.storeProviders = ['github'];
     h.entries.set('github', ['oauth']);
     expect(run(['status'])[0]).toContain('*github* (1)');
+  });
+});
+
+describe('/creds list borrow|shadow (C7s/C7o)', () => {
+  it('rejects an unknown mode', () => {
+    expect(run(['list', 'bogus'])[0]).toMatch(/Usage: \/creds list \[borrow\|shadow\]/);
+  });
+
+  it('borrow: reports when not borrowing', () => {
+    h.borrowSource = null;
+    expect(run(['list', 'borrow'])[0]).toMatch(/Not borrowing from any group/);
+  });
+
+  it('borrow: reports pending when the grant is not active', () => {
+    h.borrowSource = 'lender';
+    h.canAccess = false;
+    expect(run(['list', 'borrow'])[0]).toMatch(/not active yet/);
+  });
+
+  it('borrow: lists the grantor providers, marking own-shadowed ones', () => {
+    h.borrowSource = 'lender';
+    h.canAccess = true;
+    h.byScope.set('lender', ['claude', 'github']);
+    h.storeProviders = ['github']; // own github shadows the borrowed one
+    const r = run(['list', 'borrow'])[0];
+    expect(r).toContain('Borrowable credentials');
+    expect(r).toContain('*lender*');
+    expect(r).toMatch(/\*claude\* — in use \(borrowed\)/);
+    expect(r).toMatch(/\*github\* — shadowed by your own credential/);
+  });
+
+  it('shadow: lists providers where an own credential overrides a borrowed one', () => {
+    h.borrowSource = 'lender';
+    h.canAccess = true;
+    h.byScope.set('lender', ['claude', 'github']);
+    h.storeProviders = ['github'];
+    const r = run(['list', 'shadow'])[0];
+    expect(r).toContain('Shadowed credentials');
+    expect(r).toContain('*github*');
+    expect(r).not.toContain('*claude*'); // claude is borrowed, not shadowed
+  });
+
+  it('shadow: reports none when not actively borrowing', () => {
+    h.borrowSource = null;
+    expect(run(['list', 'shadow'])[0]).toMatch(/not actively borrowing/);
+  });
+
+  it('shadow: reports none when own creds do not overlap the grantor', () => {
+    h.borrowSource = 'lender';
+    h.canAccess = true;
+    h.byScope.set('lender', ['claude']);
+    h.storeProviders = ['github']; // no overlap
+    expect(run(['list', 'shadow'])[0]).toMatch(/No shadowed credentials/);
   });
 });
 
