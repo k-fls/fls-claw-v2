@@ -120,4 +120,31 @@ export interface HandlerContext {
    * forwards the request unchanged.
    */
   deliverCallback?: AuthCodeDeliver;
+  /**
+   * Host surface for credential lifecycle events that need to reach a human.
+   * Absent in tests / programmatic contexts — refresh/token-exchange degrade to
+   * a no-op.
+   */
+  borrowedCredentialEvents?: BorrowedCredentialEvents;
+}
+
+/**
+ * Host surface for notifying a grantor when a *borrowed* credential can no
+ * longer be kept alive. The refresh/token-exchange paths only report the raw
+ * event; owner resolution, delivery, and spam-control live in the host
+ * implementation (`borrowed-cred-notify.ts`).
+ */
+export interface BorrowedCredentialEvents {
+  /**
+   * A borrowed credential failed to refresh at the token endpoint — the
+   * grantor's stored credential is expired/revoked, so no borrower can heal it
+   * by refresh. `owningScope` is the grantor's credential scope (folder).
+   */
+  onBorrowedRefreshFailed(args: { owningScope: string; providerId: string }): void;
+  /**
+   * A credential for `credentialScope` was (re)stored successfully (refresh or
+   * re-auth). Clears any pending expired-notification state so a later expiry
+   * alerts again.
+   */
+  onCredentialHealed(args: { credentialScope: string; providerId: string }): void;
 }

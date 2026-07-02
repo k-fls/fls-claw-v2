@@ -48,7 +48,7 @@ import {
 import { loadDiscoveryProviders, type DiscoveryLoadResult } from './discovery-loader.js';
 import { startDiscoveryRefreshSchedule, type RefreshResult, type RefreshScheduleHandle } from './discovery-refresh.js';
 import { toSubstitutingProvider } from './provider-adapter.js';
-import type { AuthCodeDeliver, HandlerContext, OAuthEvents } from './handler-context.js';
+import type { AuthCodeDeliver, BorrowedCredentialEvents, HandlerContext, OAuthEvents } from './handler-context.js';
 import type { OAuthProvider } from './types.js';
 import type { SubstitutesSpec, SubstitutingProvider } from '../types.js';
 import { logger } from '../logger.js';
@@ -94,6 +94,12 @@ export interface InitOAuthModuleOptions {
    * (`dockerExecDeliver`). Absent → authorize-stub passes through.
    */
   deliverCallback?: AuthCodeDeliver;
+  /**
+   * Host surface for credential lifecycle notifications (borrowed-credential
+   * expiry alerts to the grantor's owners). Wired at boot from
+   * `./borrowed-cred-notify.ts`. Absent → refresh/token-exchange skip alerting.
+   */
+  borrowedCredentialEvents?: BorrowedCredentialEvents;
 }
 
 /**
@@ -200,6 +206,7 @@ export function initOAuthModule(opts: InitOAuthModuleOptions): OAuthModuleHandle
     isGlobalProvider: (id) => opts.proxy.isGlobalProvider(id),
     oauthEvents: opts.oauthEvents,
     deliverCallback: opts.deliverCallback,
+    borrowedCredentialEvents: opts.borrowedCredentialEvents,
   };
 
   const registered: string[] = [];

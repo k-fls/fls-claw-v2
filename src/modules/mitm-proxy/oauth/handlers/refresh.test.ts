@@ -58,6 +58,8 @@ function buildCtx(opts: {
   ctx: HandlerContext;
   store: ReturnType<typeof vi.fn>;
   read: (scope: CredentialScope) => Credential | null;
+  onFailed: ReturnType<typeof vi.fn>;
+  onHealed: ReturnType<typeof vi.fn>;
 } {
   const byScope = new Map<string, Credential>();
   for (const { scope, cred } of opts.seed ?? []) byScope.set(scope as string, cred);
@@ -73,13 +75,16 @@ function buildCtx(opts: {
 
   const engine = { pruneStaleRefs: vi.fn() } as unknown as TokenSubstituteEngine;
 
+  const onFailed = vi.fn();
+  const onHealed = vi.fn();
   const ctx: HandlerContext = {
     tokenEngine: engine,
     resolverFor: () => resolver,
     fetchImpl: opts.fetchImpl,
     inFlightRefresh: new Map(),
+    borrowedCredentialEvents: { onBorrowedRefreshFailed: onFailed, onCredentialHealed: onHealed },
   };
-  return { ctx, store, read: (scope) => byScope.get(scope as string) ?? null };
+  return { ctx, store, read: (scope) => byScope.get(scope as string) ?? null, onFailed, onHealed };
 }
 
 function cred(value: string, refresh?: string, authFields?: Record<string, string>): Credential {
@@ -235,5 +240,53 @@ describe('tryRefresh — borrowed credential (owningScope)', () => {
     // Both borrowers share the grantor-keyed in-flight exchange → one fetch.
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(maxInflight).toBe(1);
+  });
+});
+
+describe('tryRefresh — borrowed-credential expiry events', () => {
+  const borrower: GroupScope = asGroupScope('borrower-group');
+
+  it('fires onBorrowedRefreshFailed (not onCredentialHealed) when a borrowed refresh is rejected', async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: false, status: 400, json: async () => ({}) })) as unknown as typeof fetch;
+    const { ctx, onFailed, onHealed } = buildCtx({
+      seed: [{ scope: GRANTOR, cred: cred('GRANTOR_ACCESS', 'GRANTOR_REFRESH') }],
+      fetchImpl,
+    });
+    const ok = await tryRefresh(buildProvider(), borrower, ctx, GRANTOR);
+    expect(ok).toBe(false);
+    expect(onFailed).toHaveBeenCalledWith({ owningScope: GRANTOR, providerId: 'example' });
+    expect(onHealed).not.toHaveBeenCalled();
+  });
+
+  it('fires onBorrowedRefreshFailed when the endpoint returns no access_token', async () => {
+    const fetchImpl = okFetch({ refresh_token: 'x' }); // 200 but no access_token
+    const { ctx, onFailed } = buildCtx({
+      seed: [{ scope: GRANTOR, cred: cred('GRANTOR_ACCESS', 'GRANTOR_REFRESH') }],
+      fetchImpl,
+    });
+    await tryRefresh(buildProvider(), borrower, ctx, GRANTOR);
+    expect(onFailed).toHaveBeenCalledWith({ owningScope: GRANTOR, providerId: 'example' });
+  });
+
+  it('fires onCredentialHealed (not onBorrowedRefreshFailed) on a successful borrowed refresh', async () => {
+    const fetchImpl = okFetch({ access_token: 'FRESH', refresh_token: 'FRESH_R', expires_in: 3600 });
+    const { ctx, onFailed, onHealed } = buildCtx({
+      seed: [{ scope: GRANTOR, cred: cred('GRANTOR_ACCESS', 'GRANTOR_REFRESH') }],
+      fetchImpl,
+    });
+    const ok = await tryRefresh(buildProvider(), borrower, ctx, GRANTOR);
+    expect(ok).toBe(true);
+    expect(onHealed).toHaveBeenCalledWith({ credentialScope: GRANTOR, providerId: 'example' });
+    expect(onFailed).not.toHaveBeenCalled();
+  });
+
+  it('does NOT fire onBorrowedRefreshFailed for a self-owned refresh failure', async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: false, status: 400, json: async () => ({}) })) as unknown as typeof fetch;
+    const { ctx, onFailed } = buildCtx({
+      seed: [{ scope: OWN, cred: cred('OWN_ACCESS', 'OWN_REFRESH') }],
+      fetchImpl,
+    });
+    await tryRefresh(buildProvider(), SCOPE, ctx); // self-owned (owning defaults to own)
+    expect(onFailed).not.toHaveBeenCalled();
   });
 });
