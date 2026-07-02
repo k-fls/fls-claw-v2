@@ -12,6 +12,7 @@ const h = vi.hoisted(() => ({
   ensureGpgKey: vi.fn(),
   pasteResult: { reason: 'submitted', text: 'the-secret' } as { reason: string; text: string | null },
   paste: vi.fn(),
+  borrowSource: null as string | null,
 }));
 
 vi.mock('../../../db/agent-groups.js', () => ({
@@ -24,7 +25,7 @@ vi.mock('../../interactions/index.js', () => ({
 vi.mock('../grants.js', () => ({
   addGrantee: () => {},
   clearBorrowSource: () => {},
-  getBorrowSource: () => null,
+  getBorrowSource: () => h.borrowSource,
   isGrantee: () => false,
   listGrantees: () => [],
   removeGrantee: () => {},
@@ -81,6 +82,7 @@ beforeEach(() => {
   h.ensureGpgKey = vi.fn();
   h.pasteResult = { reason: 'submitted', text: 'the-secret' };
   h.paste = vi.fn(() => Promise.resolve(h.pasteResult));
+  h.borrowSource = null;
 });
 
 describe('/creds gpg (C7g)', () => {
@@ -206,5 +208,36 @@ describe('/creds import (C7o)', () => {
     expect(h.store).toHaveBeenCalledTimes(1);
     expect(h.store.mock.calls[0][1]).toBe('github');
     expect(replies[0]).toMatch(/unknown provider/i);
+  });
+});
+
+describe('/creds set-key + import — borrow shadow warning', () => {
+  function pastePrompt(): string {
+    return (h.paste.mock.calls[0][0] as { prompt: string }).prompt;
+  }
+
+  it('set-key warns that setting a key shadows the borrowed credential', () => {
+    h.borrowSource = 'grantor-group';
+    run(['set-key', 'github']);
+    const prompt = pastePrompt();
+    expect(prompt).toMatch(/borrowing/i);
+    expect(prompt).toContain('grantor-group');
+    expect(prompt).toMatch(/shadow/i);
+    expect(prompt).toContain('github');
+  });
+
+  it('import warns when borrowing', () => {
+    h.borrowSource = 'grantor-group';
+    run(['import']);
+    const prompt = pastePrompt();
+    expect(prompt).toMatch(/borrowing/i);
+    expect(prompt).toContain('grantor-group');
+    expect(prompt).toMatch(/shadow/i);
+  });
+
+  it('no warning when the group is not borrowing', () => {
+    h.borrowSource = null;
+    run(['set-key', 'github']);
+    expect(pastePrompt()).not.toMatch(/borrowing/i);
   });
 });
