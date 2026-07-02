@@ -19,7 +19,7 @@ const noopDeliver: AuthCodeDeliver = async () => {};
 
 function ctxWith(oauthEvents?: OAuthEvents, deliverCallback?: AuthCodeDeliver): HandlerContext {
   return {
-    tokenEngine: {} as HandlerContext['tokenEngine'],
+    tokenEngine: { borrowedFrom: () => null } as unknown as HandlerContext['tokenEngine'],
     resolverFor: () => ({}) as ReturnType<HandlerContext['resolverFor']>,
     fetchImpl: globalThis.fetch,
     inFlightRefresh: new Map(),

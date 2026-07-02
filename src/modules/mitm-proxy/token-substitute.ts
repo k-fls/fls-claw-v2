@@ -307,6 +307,26 @@ export class TokenSubstituteEngine {
   }
 
   /**
+   * If this group currently *borrows* the credential for (provider, path) — its
+   * effective substitute resolves to another (grantor) scope rather than its own
+   * — return that owning scope; otherwise null. Because `getSubstitute` prefers
+   * the own entry, a group that already has its own credential reports not
+   * borrowing. Used to warn a user that authenticating here mints an own
+   * credential which will shadow the borrowed one.
+   */
+  borrowedFrom(
+    providerId: string,
+    groupScope: GroupScope,
+    credentialPath: string = CRED_OAUTH,
+  ): CredentialScope | null {
+    const sub = this.getSubstitute(providerId, groupScope, credentialPath);
+    if (!sub) return null;
+    const owning = this.resolveSubstitute(sub, groupScope)?.mapping.credentialScope;
+    if (!owning) return null;
+    return owning === toCredentialScope(groupScope) ? null : owning;
+  }
+
+  /**
    * Get an existing substitute or ask the provider to generate one for
    * the resolver's stored credential. The engine is a pure cache + a
    * collision/retry loop; substitute *shape* lives entirely on the

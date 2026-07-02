@@ -38,6 +38,7 @@ export function buildAuthorizeStubHandler(
             providerId: provider.id,
             authUrl,
             deliverCallback: ctx.deliverCallback,
+            borrowedFrom: ctx.tokenEngine.borrowedFrom(provider.id, scope) ?? undefined,
           })
         : null;
 
