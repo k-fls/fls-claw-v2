@@ -138,21 +138,36 @@ function interactionIdFor(providerId: string, authUrl: string, port: number): st
   }
 }
 
+/**
+ * A leading warning shown when the calling group is currently *borrowing* this
+ * credential from another scope: authenticating here mints the group's own
+ * credential, which shadows the borrowed one. Empty when not borrowing.
+ */
+export function shadowWarning(providerId: string, borrowedFrom?: string): string {
+  if (!borrowedFrom) return '';
+  return (
+    `⚠️ This group is *borrowing* the \`${providerId}\` credential from \`${borrowedFrom}\`. ` +
+    `Authenticating here creates this group's own credential and will *shadow* the borrowed one — ` +
+    `this group will stop using \`${borrowedFrom}\`'s.\n\n`
+  );
+}
+
 export const oauthInteractive: OAuthEvents = {
-  notifyDeviceCode({ sourceIP, providerId, userCode, verificationUri }) {
+  notifyDeviceCode({ sourceIP, providerId, userCode, verificationUri, borrowedFrom }) {
     const resolved = resolveContainerOrigin(sourceIP);
     if (!resolved) {
       log.info('oauth.device-code: no identifiable user to notify', { sourceIP, providerId });
       return;
     }
     resolved.origin.writeReply(
-      `🔐 *${providerId}* wants to authorize.\n\n` +
+      shadowWarning(providerId, borrowedFrom) +
+        `🔐 *${providerId}* wants to authorize.\n\n` +
         `Open ${verificationUri} and enter this code:\n\n\`${userCode}\`\n\n` +
         'Once you approve in the browser, the agent will pick up the credential automatically.',
     );
   },
 
-  beginAuthorizeStub({ sourceIP, providerId, authUrl, deliverCallback }) {
+  beginAuthorizeStub({ sourceIP, providerId, authUrl, deliverCallback, borrowedFrom }) {
     const resolved = resolveContainerOrigin(sourceIP);
     if (!resolved) {
       log.info('oauth.authorize-stub: no identifiable user to prompt — passing through', {
@@ -172,6 +187,7 @@ export const oauthInteractive: OAuthEvents = {
       try {
         beginInteractionOn(origin, {
           initialPrompt:
+            shadowWarning(providerId, borrowedFrom) +
             `🔐 *${providerId}* wants to authorize.\n\n` +
             `Open this URL and complete the sign-in:\n${authUrl}\n\n` +
             'No code needs to come back here — your browser is redirected automatically. ' +
@@ -232,6 +248,7 @@ export const oauthInteractive: OAuthEvents = {
     try {
       beginInteractionOn(origin, {
         initialPrompt:
+          shadowWarning(providerId, borrowedFrom) +
           `🔐 *${providerId}* wants to authorize.\n\n` +
           `1. Open this URL and approve:\n${authUrl}\n\n` +
           '2. Your browser will then redirect to a *localhost* URL and show a ' +

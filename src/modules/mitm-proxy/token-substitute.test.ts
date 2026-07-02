@@ -471,4 +471,30 @@ describe('TokenSubstituteEngine — getSubstitute name-based resolution', () => 
     // Own is preferred anyway, but the dangling borrowed entry is also gone.
     expect(engine.getSubstitute('gh', group, CRED_OAUTH)).toBe('SUB_OWN');
   });
+
+  it('borrowedFrom reports the grantor scope while borrowing, and null once an own cred shadows it', () => {
+    const resolver = new MockResolver();
+    const sourceScope = asCredentialScope('source-group');
+    resolver.put(sourceScope, 'gh', CRED_OAUTH, 'grantor-token');
+    writeRefs('gh', {
+      SUB_BORROWED: { credentialPath: CRED_OAUTH, scopeAttrs: {}, sourceScope: 'source-group' },
+    });
+
+    const engine = new TokenSubstituteEngine(() => resolver);
+    engine.loadPersistedRefs(group, 'gh');
+
+    // Only a borrowed substitute + grantor cred → borrowing from the grantor.
+    expect(engine.borrowedFrom('gh', group, CRED_OAUTH)).toBe(sourceScope);
+
+    // Once the group has its own credential (+ own substitute), it shadows the
+    // grantor — no longer borrowing.
+    resolver.put(groupScope, 'gh', CRED_OAUTH, 'own-token');
+    writeRefs('gh', {
+      SUB_BORROWED: { credentialPath: CRED_OAUTH, scopeAttrs: {}, sourceScope: 'source-group' },
+      SUB_OWN: { credentialPath: CRED_OAUTH, scopeAttrs: {} },
+    });
+    const engine2 = new TokenSubstituteEngine(() => resolver);
+    engine2.loadPersistedRefs(group, 'gh');
+    expect(engine2.borrowedFrom('gh', group, CRED_OAUTH)).toBeNull();
+  });
 });

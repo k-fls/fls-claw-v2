@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { parseCallbackUrl } from './oauth-interactive.js';
+import { parseCallbackUrl, shadowWarning } from './oauth-interactive.js';
 
 describe('parseCallbackUrl', () => {
   it('extracts code, state, and port from a localhost callback URL', () => {
@@ -23,5 +23,20 @@ describe('parseCallbackUrl', () => {
     expect(parseCallbackUrl('http://localhost:1234/cb?code=a')).toBeNull(); // no state
     expect(parseCallbackUrl('http://localhost/cb?code=a&state=b')).toBeNull(); // no port
     expect(parseCallbackUrl('not a url')).toBeNull();
+  });
+});
+
+describe('shadowWarning', () => {
+  it('is empty when the group is not borrowing', () => {
+    expect(shadowWarning('claude', undefined)).toBe('');
+  });
+
+  it('names the provider and grantor and flags shadowing when borrowing', () => {
+    const w = shadowWarning('claude', 'slack_flsclaw-ai-native-marketing');
+    expect(w).toContain('borrowing');
+    expect(w).toContain('claude');
+    expect(w).toContain('slack_flsclaw-ai-native-marketing');
+    expect(w).toContain('shadow');
+    expect(w.endsWith('\n\n')).toBe(true); // renders as a leading block before the prompt
   });
 });

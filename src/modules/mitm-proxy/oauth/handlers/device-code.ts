@@ -52,6 +52,7 @@ export function buildDeviceCodeHandler(
             providerId: provider.id,
             userCode,
             verificationUri,
+            borrowedFrom: ctx.tokenEngine.borrowedFrom(provider.id, scope) ?? undefined,
           });
         } else {
           logger.warn(
