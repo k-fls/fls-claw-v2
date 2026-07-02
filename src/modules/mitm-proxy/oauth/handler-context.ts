@@ -37,8 +37,17 @@ export interface OAuthEvents {
    * Device-code flow: surface the `user_code` + verification URI to the
    * user as a one-shot chat message. No reply is captured — the container
    * polls the token endpoint itself once the user authorizes.
+   *
+   * `borrowedFrom`, when set, is the scope this group currently borrows the
+   * credential from — the UX layer warns that authenticating here shadows it.
    */
-  notifyDeviceCode(args: { sourceIP?: string; providerId: string; userCode: string; verificationUri: string }): void;
+  notifyDeviceCode(args: {
+    sourceIP?: string;
+    providerId: string;
+    userCode: string;
+    verificationUri: string;
+    borrowedFrom?: string;
+  }): void;
   /**
    * Authorize-stub flow: surface the authorization URL to the user, capture
    * the returned code (or full localhost callback URL), and hand it to
@@ -51,6 +60,8 @@ export interface OAuthEvents {
     providerId: string;
     authUrl: string;
     deliverCallback: AuthCodeDeliver;
+    /** Grantor scope this group currently borrows from, if any (shadow warning). */
+    borrowedFrom?: string;
   }): string | null;
 }
 
