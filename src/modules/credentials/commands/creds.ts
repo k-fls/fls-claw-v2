@@ -25,6 +25,7 @@ import { pastePgp } from '../../interactions/index.js';
 
 import {
   addGrantee,
+  canAccess,
   clearBorrowSource,
   getBorrowSource,
   isGrantee,
@@ -60,7 +61,7 @@ const USAGE = [
   '`/creds set-key <provider> [id] [expiry=<ts>]` — store a key (GPG-encrypted paste)',
   '`/creds import [provider]` — bulk import `[provider:]id=value` lines (GPG-encrypted paste)',
   '`/creds delete <provider>` — delete a provider’s stored credentials',
-  '`/creds list` — list providers with stored credentials',
+  '`/creds list [borrow|shadow]` — stored credentials (or borrowable / shadowed ones)',
   '`/creds status` — credential + sharing summary',
   '`/creds gpg` — print this group’s GPG public key for encrypting secrets',
 ].join('\n');
@@ -105,7 +106,7 @@ export function handleCredsCommand(ctx: HostCommandContext): void {
     case 'delete':
       return replyDelete(ctx, scope, target);
     case 'list':
-      return replyList(ctx, scope);
+      return replyList(ctx, scope, selfFolder);
     case 'status':
       return replyCredentialStatus(ctx, selfFolder, scope);
     // ── Public key export (C7g) ─────────────────────────────────────────────────
@@ -498,8 +499,23 @@ function replyDelete(ctx: HostCommandContext, scope: CredentialScope, providerId
   ctx.replyText(`Deleted *${providerId}* credentials (${count} entr${count !== 1 ? 'ies' : 'y'} removed).`);
 }
 
-/** `/creds list` — providers with stored credentials + their entry ids. */
-function replyList(ctx: HostCommandContext, scope: CredentialScope): void {
+/**
+ * `/creds list [borrow|shadow]`:
+ *   - (no arg) providers with credentials stored in this group's own scope.
+ *   - `borrow` providers this group can borrow from its grantor (marking any
+ *     that are shadowed by an own credential).
+ *   - `shadow` providers where this group's own credential shadows one it could
+ *     otherwise borrow from the grantor.
+ */
+function replyList(ctx: HostCommandContext, scope: CredentialScope, selfFolder: string): void {
+  const mode = (ctx.args[1] ?? '').toLowerCase();
+  if (mode === 'borrow') return replyListBorrowable(ctx, scope, selfFolder);
+  if (mode === 'shadow') return replyListShadowed(ctx, scope, selfFolder);
+  if (mode) {
+    ctx.replyText('Usage: /creds list [borrow|shadow]');
+    return;
+  }
+
   const providers = listProviderIds(scope);
   if (providers.length === 0) {
     ctx.replyText('No credentials stored for this group.');
@@ -510,6 +526,63 @@ function replyList(ctx: HostCommandContext, scope: CredentialScope): void {
     const ids = listEntries(scope, p).sort();
     lines.push(`*${p}*: ${ids.length > 0 ? ids.join(', ') : '(empty)'}`);
   }
+  ctx.replyText(lines.join('\n'));
+}
+
+/**
+ * Resolve the group's *active* borrow source — the grantor it borrows from AND
+ * that has granted it access (`canAccess`). Null when not borrowing or the grant
+ * isn't active. Mirrors the runtime resolver's borrow gate.
+ */
+function activeBorrowSource(selfFolder: string): string | null {
+  const source = getBorrowSource(selfFolder);
+  if (!source || !canAccess(selfFolder, source)) return null;
+  return source;
+}
+
+/** `/creds list borrow` — providers available from the active borrow source. */
+function replyListBorrowable(ctx: HostCommandContext, scope: CredentialScope, selfFolder: string): void {
+  const source = getBorrowSource(selfFolder);
+  if (!source) {
+    ctx.replyText('Not borrowing from any group. Use `/creds borrow <group>` to borrow credentials.');
+    return;
+  }
+  if (!canAccess(selfFolder, source)) {
+    ctx.replyText(
+      `Borrowing from *${source}* is not active yet — the source must run \`/creds share ${selfFolder}\` to grant access.`,
+    );
+    return;
+  }
+  const borrowable = listProviderIds(asCredentialScope(source)).sort();
+  if (borrowable.length === 0) {
+    ctx.replyText(`*${source}* has no stored credentials to borrow.`);
+    return;
+  }
+  const own = new Set(listProviderIds(scope));
+  const lines: string[] = [`*Borrowable credentials* (from *${source}*)`, ''];
+  for (const p of borrowable) {
+    lines.push(own.has(p) ? `*${p}* — shadowed by your own credential` : `*${p}* — in use (borrowed)`);
+  }
+  ctx.replyText(lines.join('\n'));
+}
+
+/** `/creds list shadow` — own credentials that shadow a borrowable grantor one. */
+function replyListShadowed(ctx: HostCommandContext, scope: CredentialScope, selfFolder: string): void {
+  const source = activeBorrowSource(selfFolder);
+  if (!source) {
+    ctx.replyText('No shadowed credentials — this group is not actively borrowing from any source.');
+    return;
+  }
+  const own = new Set(listProviderIds(scope));
+  const shadowed = listProviderIds(asCredentialScope(source))
+    .filter((p) => own.has(p))
+    .sort();
+  if (shadowed.length === 0) {
+    ctx.replyText(`No shadowed credentials — none of your own credentials override one borrowed from *${source}*.`);
+    return;
+  }
+  const lines: string[] = [`*Shadowed credentials* — your own overrides the one borrowed from *${source}*:`, ''];
+  for (const p of shadowed) lines.push(`*${p}*`);
   ctx.replyText(lines.join('\n'));
 }
 

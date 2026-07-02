@@ -364,7 +364,29 @@ describe('built-in /help handler', () => {
       ...helpCtxStub,
       replyText: (t) => replies.push(t),
     });
-    expect(replies[0]).toBe('/a1-helptest — a1 help-test description');
+    expect(replies[0]).toContain('/a1-helptest — a1 help-test description');
+    expect(replies[0]).toContain('Scope:');
+    expect(replies[0]).toContain('Access:');
+  });
+
+  it('/help <command> includes long-form details when the command registers them', () => {
+    registerHostCommand('/a1-detailed', vi.fn(), {
+      help: 'short summary',
+      details: 'LONG-FORM DETAILS\nUsage: /a1-detailed <thing>',
+    });
+    const result = classifyAtMessagingGroup(jsonChat('/help a1-detailed'), 'user-1');
+    if (result.action !== 'handle') throw new Error('expected handle');
+    const replies: string[] = [];
+    result.handler({
+      command: '/help',
+      argsRaw: 'a1-detailed',
+      args: ['a1-detailed'],
+      ...helpCtxStub,
+      replyText: (t) => replies.push(t),
+    });
+    expect(replies[0]).toContain('short summary');
+    expect(replies[0]).toContain('LONG-FORM DETAILS');
+    expect(replies[0]).toContain('/a1-detailed <thing>');
   });
 
   it('/help overview combines host and container commands in one reply', () => {
@@ -493,7 +515,7 @@ describe('built-in /help handler', () => {
 
     it('/help <cmd> on an inaccessible command replies Unknown command', () => {
       expect(runHelp('a1d-help-glob', 'user-1')).toMatch(/^Unknown command:/);
-      expect(runHelp('a1d-help-glob', 'global')).toBe('/a1d-help-glob — global-admin-only command');
+      expect(runHelp('a1d-help-glob', 'global')).toContain('/a1d-help-glob — global-admin-only command');
     });
   });
 });
