@@ -4,6 +4,7 @@ import path from 'path';
 
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
+import { markSentUserMsgThisTurn } from '../current-batch.js';
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
@@ -166,6 +167,13 @@ const preToolUseHook: HookCallback = async (input) => {
       decision: 'block',
       stopReason: `Tool '${toolName}' is not available in this environment — use the nanoclaw equivalent.`,
     } as unknown as ReturnType<HookCallback>;
+  }
+  // Observe user-facing sends so the poll-loop's result handler can suppress
+  // the re-wrap nudge for a turn that already delivered via send_message.
+  // This hook runs in the poll-loop process; send_message itself executes in
+  // the MCP subprocess, so the flag must be set here, not in the tool handler.
+  if (toolName === 'mcp__nanoclaw__send_message') {
+    markSentUserMsgThisTurn();
   }
   // Bash exposes its timeout via the tool_input.timeout field (ms). Any other
   // tool: no declared timeout.
