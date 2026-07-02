@@ -81,6 +81,7 @@ import {
   initOAuthModule,
   oauthInteractive,
   dockerExecDeliver,
+  borrowedCredentialNotifier,
 } from './modules/mitm-proxy/index.js';
 import {
   getBorrowSource,
@@ -158,6 +159,7 @@ async function main(): Promise<void> {
     proxy: credentialProxy,
     oauthEvents: oauthInteractive,
     deliverCallback: dockerExecDeliver,
+    borrowedCredentialEvents: borrowedCredentialNotifier,
   });
   log.info('Credential proxy live', { port: credentialProxy.getBoundPort() });
 

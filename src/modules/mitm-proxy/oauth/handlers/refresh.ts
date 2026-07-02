@@ -91,6 +91,15 @@ async function runRefresh(
 
   const authFields = oauthCred?.authFields ?? {};
 
+  // A borrowed credential is one whose owning scope isn't the requester's own.
+  // When its refresh is rejected at the token endpoint, the grantor's stored
+  // credential is expired/revoked and no borrower can heal it — surface that to
+  // the host so it can alert the grantor's owners.
+  const borrowed = owning !== asCredentialScope(scope);
+  const alertBorrowedFailure = (): void => {
+    if (borrowed) ctx.borrowedCredentialEvents?.onBorrowedRefreshFailed({ owningScope: owning, providerId: provider.id });
+  };
+
   let body: { access_token?: string; refresh_token?: string; expires_in?: number };
   try {
     const response = await ctx.fetchImpl(tokenEndpoint, {
@@ -108,15 +117,20 @@ async function runRefresh(
         { provider: provider.id, scope, status: response.status },
         'oauth.refresh: token endpoint returned error',
       );
+      alertBorrowedFailure();
       return false;
     }
     body = (await response.json()) as typeof body;
   } catch (err) {
+    // Transient (network) — don't alert the grantor; the next request retries.
     logger.warn({ err, provider: provider.id, scope }, 'oauth.refresh: fetch failed');
     return false;
   }
 
-  if (!body.access_token) return false;
+  if (!body.access_token) {
+    alertBorrowedFailure();
+    return false;
+  }
 
   const expiresTs = body.expires_in ? Date.now() + body.expires_in * 1000 : 0;
 
@@ -151,6 +165,9 @@ async function runRefresh(
   // correctness, but pruning stale refs keeps state tidy when an old
   // substitute would no longer resolve.
   ctx.tokenEngine.pruneStaleRefs(scope, provider.id);
+
+  // The owning credential is fresh again — clear any pending expired alert.
+  ctx.borrowedCredentialEvents?.onCredentialHealed({ credentialScope: owning, providerId: provider.id });
 
   logger.info({ provider: provider.id, scope, owning }, 'oauth.refresh: succeeded');
   return true;

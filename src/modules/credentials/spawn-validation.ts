@@ -15,10 +15,9 @@ import { effectiveRouting, listEnabledBrokerIds } from '../../db/broker-config.j
 import { FatalSpawnError } from '../../spawn-failure.js';
 import { registerContainerLifecycleObserver, type SpawnPreContext } from '../container-bootstrap/index.js';
 
+import { availableProviderIds } from './provider-availability.js';
 import { getCredentialProvider } from './providers/registry.js';
 import { AGENT_RUNTIME, type AgentRuntimeExt } from './providers/types.js';
-import { listProviderIds } from './store.js';
-import { asCredentialScope } from './types.js';
 
 /**
  * Validate that every `required` credential provider the runtime declares is
@@ -66,19 +65,6 @@ export function runtimeFor(providerName: string): AgentRuntimeExt | undefined {
 }
 
 /**
- * The group's bound credential providers ("has" set) — today the providers
- * with a keys file under the group's own folder scope.
- *
- * NOTE (refine before enforcement is relied on): if a group can *borrow*
- * a required provider's credential (grant/borrow), this set must also
- * consult borrow state / the resolver, or a borrowing group would be
- * false-rejected. Safe to defer while the validator is dormant.
- */
-function boundProviderIds(folder: string): Set<string> {
-  return new Set(listProviderIds(asCredentialScope(folder)));
-}
-
-/**
  * Does any enabled broker overtake `providerId` for this group (folder)?
  * Pre-spawn there is no container IP yet, so this resolves by folder via
  * `effectiveRouting` (the per-group merged routing). Catch-all is irrelevant
@@ -94,14 +80,17 @@ function brokerSuppliesProvider(folder: string, providerId: string): boolean {
 
 registerContainerLifecycleObserver('provider-runtime-validation', {
   onSpawnPre(ctx: SpawnPreContext) {
-    // Compute the (FS-backed) has-set lazily and once — skipped entirely in the
-    // common no-op case where the provider declares no agent-runtime extension.
+    // Compute the has-set lazily and once — skipped entirely in the common
+    // no-op case where the provider declares no agent-runtime extension.
+    // Borrow-aware (`availableProviderIds`): a group borrowing a required
+    // provider from a granting source passes, matching the runtime resolver —
+    // otherwise a borrowing group with no own keys would be false-rejected.
     let cached: Set<string> | undefined;
     validateRuntimeCredentials({
       providerName: ctx.providerName,
       runtimeConfigRaw: ctx.containerConfig.runtimeConfig ?? {},
       getRuntime: runtimeFor,
-      hasProvider: (id) => (cached ??= boundProviderIds(ctx.agentGroup.folder)).has(id),
+      hasProvider: (id) => (cached ??= availableProviderIds(ctx.agentGroup.folder)).has(id),
       brokerSupplies: (id) => brokerSuppliesProvider(ctx.agentGroup.folder, id),
     });
   },
