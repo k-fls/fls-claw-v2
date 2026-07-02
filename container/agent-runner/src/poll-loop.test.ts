@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
+import { markSentUserMsgThisTurn, resetSentUserMsgThisTurn } from './current-batch.js';
 import { formatMessages, extractRouting } from './formatter.js';
 import { isCorruptionError, processQuery } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
@@ -428,6 +429,7 @@ describe('error result with no <message> envelope', () => {
   });
 
   it('still nudges (and does not deliver) a normal unwrapped result', async () => {
+    resetSentUserMsgThisTurn();
     const { query, pushes } = makeResultQuery({ type: 'result', text: 'bare text, no envelope' });
 
     await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
@@ -435,6 +437,26 @@ describe('error result with no <message> envelope', () => {
     expect(getUndeliveredMessages()).toHaveLength(0);
     expect(pushes).toHaveLength(1);
     expect(pushes[0]).toContain('was not delivered');
+  });
+});
+
+describe('re-wrap nudge suppression when delivered via send_message', () => {
+  afterEach(() => {
+    // Module-level turn flag — clear it so it can't leak into other tests.
+    resetSentUserMsgThisTurn();
+  });
+
+  it('does NOT nudge when the turn already delivered via send_message and ends with bare text', async () => {
+    // Simulates the PreToolUse hook having observed a send_message this turn.
+    markSentUserMsgThisTurn();
+    const { query, pushes } = makeResultQuery({ type: 'result', text: 'bare closing text, no envelope' });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    // The bare text is scratchpad, not an undelivered response: no nudge (which
+    // would provoke a duplicate re-send) and nothing extra delivered here.
+    expect(pushes).toHaveLength(0);
+    expect(getUndeliveredMessages()).toHaveLength(0);
   });
 });
 
