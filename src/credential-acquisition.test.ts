@@ -29,6 +29,7 @@ import {
   registerCredentialProvider,
   _resetProviderRegistryForTests,
 } from './modules/credentials/providers/registry.js';
+import { setBorrowSource, addGrantee } from './modules/credentials/grants.js';
 import { ExtensionBag, AGENT_RUNTIME, type AgentRuntimeExt } from './modules/credentials/providers/types.js';
 import type { AcquireExt } from './credential-acquisition.js';
 import type { AgentGroup, Session } from './types.js';
@@ -71,8 +72,8 @@ function registerClaude(opts: { acquire?: AcquireExt } = {}): void {
   });
 }
 
-function seedStoredCredential(): void {
-  const dir = path.join(TMP, '.config', 'nanoclaw', 'credentials', FOLDER);
+function seedStoredCredential(folder: string = FOLDER): void {
+  const dir = path.join(TMP, '.config', 'nanoclaw', 'credentials', folder);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'claude.keys.json'), JSON.stringify({ api_key: { value: 'enc:x' } }));
 }
@@ -112,6 +113,25 @@ describe('maybeBeginCredentialAcquisition (wake-time gate)', () => {
       deliveryAddr,
       userId: 'cli:op',
     });
+    expect(started).toBe(false);
+    expect(acquire).not.toHaveBeenCalled();
+  });
+
+  it('proceeds (false) when the required cred is borrowed from a granting source (no own keys)', () => {
+    const acquire = vi.fn(async () => true);
+    registerClaude({ acquire: { acquire } });
+    // Own scope has NO claude keys; a grantor holds claude and grants to this group.
+    seedStoredCredential('lender');
+    setBorrowSource(FOLDER, 'lender');
+    addGrantee('lender', FOLDER);
+    const started = maybeBeginCredentialAcquisition({
+      agentGroup: agentGroup(),
+      session: session(),
+      deliveryAddr,
+      userId: 'cli:op',
+    });
+    // Borrow-aware gate: the group borrows claude → don't prompt, let it spawn
+    // and resolve the grantor's credential at runtime.
     expect(started).toBe(false);
     expect(acquire).not.toHaveBeenCalled();
   });

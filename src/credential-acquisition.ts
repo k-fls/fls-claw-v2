@@ -24,7 +24,7 @@ import { wakeContainer } from './container-runner.js';
 import {
   getCredentialProvider,
   asCredentialScope,
-  listProviderIds,
+  availableProviderIds,
   AGENT_RUNTIME,
   defineExtension,
   type CredentialScope,
@@ -83,11 +83,14 @@ export function maybeBeginCredentialAcquisition(args: {
   const acquireExt = provider?.getExtension?.(ACQUIRE);
   if (!runtime || !acquireExt) return false; // provider declares no need + acquire
 
-  const have = new Set(listProviderIds(asCredentialScope(agentGroup.folder)));
+  // Borrow-aware: a group that borrows a required provider from a granting
+  // source counts as having it (it resolves the grantor's credential at
+  // runtime), so we must not prompt-to-acquire before the borrow path runs.
+  const have = availableProviderIds(agentGroup.folder);
   const missing = runtime
     .requiredCredentialProviders(runtime.parseRuntimeConfig({}))
     .filter((r) => r.required && !have.has(r.id));
-  if (missing.length === 0) return false; // credentials present → proceed
+  if (missing.length === 0) return false; // credentials present (own or borrowed) → proceed
 
   const origin: InteractionOrigin = {
     key: {
