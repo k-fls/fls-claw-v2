@@ -15,7 +15,7 @@ import { proxyBuffered } from '../../credential-proxy.js';
 import type { HostHandler } from '../../credential-proxy.js';
 import { logger } from '../../logger.js';
 import { CRED_OAUTH, CRED_OAUTH_REFRESH, asCredentialScope } from '../../types.js';
-import type { Credential } from '../../types.js';
+import type { Credential, CredentialScope } from '../../types.js';
 import type { HandlerContext } from '../handler-context.js';
 import { parseBody } from '../oauth-interceptor.js';
 import type { InterceptRule, OAuthProvider } from '../types.js';
@@ -95,6 +95,14 @@ export function buildTokenExchangeHandler(
   return async (clientReq, clientRes, targetHost, targetPort, groupScope) => {
     const scopeAttrs = extractScopeAttrs(targetHost, rule);
     let capturedReq: Record<string, string> | null = null;
+    // When this exchange is a refresh (grant_type=refresh_token), the request
+    // carries a substitute refresh_token bound to a specific credential. Its
+    // source scope — the grantor's, for a borrowed credential — is where the
+    // refreshed token must be stored, so the outbound path (which reads that
+    // same substitute) sees it. Captured here, consumed in the response
+    // transform. Left undefined for a fresh auth (authorization_code), which
+    // establishes the requester's OWN credential and stores to its own scope.
+    let refreshSourceScope: CredentialScope | undefined;
 
     await proxyBuffered(
       clientReq,
@@ -114,6 +122,9 @@ export function buildTokenExchangeHandler(
         if (parsed.fields.grant_type === 'refresh_token' && parsed.fields.refresh_token) {
           const entry = ctx.tokenEngine.resolveSubstitute(parsed.fields.refresh_token, groupScope);
           if (entry) {
+            // Store the refreshed token to the scope this substitute is bound
+            // to (grantor for a borrowed credential), not the requester's own.
+            refreshSourceScope = entry.mapping.credentialScope;
             parsed.set('refresh_token', entry.realToken);
             return parsed.serialize();
           }
@@ -146,28 +157,19 @@ export function buildTokenExchangeHandler(
             };
           }
 
-          // Re-auth of a BORROWED credential must heal it at its OWNING
-          // (grantor) scope — the scope the outbound path reads through the
-          // existing substitute. Storing the freshly-captured token to the
-          // borrower's own scope instead leaves refs.json still pointing at the
-          // (stale) grantor, orphaning the new credential so re-auth appears to
-          // do nothing. When an existing substitute for this (provider, group)
-          // resolves to a different source scope, store there so every borrower
-          // — and the grantor — sees the fresh token; a first-time auth (no
-          // existing substitute) stores to the group's own scope as before.
-          // Keyed off the resolved substitute's `sourceScope`, so no
-          // grantor-side declaration (grantees.json) is required.
-          let targetScope = asCredentialScope(groupScope);
-          const existingSub = ctx.tokenEngine.getSubstitute(provider.id, groupScope, CRED_OAUTH);
-          if (existingSub) {
-            const owning = ctx.tokenEngine.resolveSubstitute(existingSub, groupScope)?.mapping.credentialScope;
-            if (owning && owning !== targetScope) {
-              targetScope = owning;
-              logger.info(
-                { provider: provider.id, scope: groupScope, owning },
-                'oauth.token-exchange: re-auth of borrowed credential — storing to owning (grantor) scope',
-              );
-            }
+          // A refresh writes back to the scope the swapped refresh substitute
+          // is bound to (grantor for a borrowed credential), so the outbound
+          // path reading that substitute sees the fresh token and every
+          // borrower is healed. A fresh auth (no substitute swapped) stores to
+          // the requester's OWN scope, where its newly minted substitute will
+          // resolve — a borrower that directly authenticates thereby shadows
+          // the grantor with its own credential.
+          const targetScope = refreshSourceScope ?? asCredentialScope(groupScope);
+          if (refreshSourceScope && refreshSourceScope !== asCredentialScope(groupScope)) {
+            logger.info(
+              { provider: provider.id, scope: groupScope, owning: refreshSourceScope },
+              'oauth.token-exchange: refresh of borrowed credential — storing to owning (grantor) scope',
+            );
           }
           ctx.resolverFor(groupScope).store(targetScope, provider.id, CRED_OAUTH, credential);
 
