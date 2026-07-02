@@ -124,7 +124,7 @@ function buildDestinationsSection(): string {
   );
   lines.push('');
   lines.push(
-    'The `send_message` MCP tool is the same delivery, available mid-turn — handy for a quick acknowledgment ("on it") before a slow tool call. Each `send_message` call and each final-response `<message>` block lands as its own message in the conversation, so they read as a sequence rather than as one combined reply.',
+    'The `send_message` MCP tool and the `<message>` block are NOT interchangeable: `send_message` is for interim/progress updates mid-turn (a quick "on it" before a slow tool call), while your actual answer/final reply always goes in an end-of-turn `<message to="name">` block. Never put the answer/final reply in `send_message` — if you send the same content both ways it posts twice.',
   );
   return lines.join('\n');
 }
