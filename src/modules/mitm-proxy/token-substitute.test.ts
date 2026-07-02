@@ -22,6 +22,7 @@ import {
   _resetProviderRegistryForTests,
 } from '../credentials/providers/registry.js';
 
+import { credentialsDir } from '../credentials/index.js';
 import { TokenSubstituteEngine } from './token-substitute.js';
 import { defaultSubstitutes } from './defaults.js';
 import type {
@@ -58,6 +59,9 @@ class MockResolver implements EngineCredentialResolver {
       updated_ts: Date.now(),
       refresh: { value: refreshValue, updated_ts: Date.now() },
     });
+  }
+  remove(scope: CredentialScope, providerId: string, credentialId: string): void {
+    this.creds.delete(this.key(scope, providerId, credentialId));
   }
   resolve(scope: CredentialScope, providerId: string, credentialId: string): Credential | null {
     return this.creds.get(this.key(scope, providerId, credentialId)) ?? null;
@@ -408,5 +412,63 @@ describe('TokenSubstituteEngine — borrow / access check', () => {
     const resolved = engine.resolveSubstitute(sub, group);
     expect(resolved?.realToken).toBe('ghp_own_1234567890abcdef1234567890ab');
     expect(resolved?.mapping.credentialScope).toBe(groupScope);
+  });
+});
+
+describe('TokenSubstituteEngine — getSubstitute name-based resolution', () => {
+  function writeRefs(providerId: string, subs: Record<string, Record<string, unknown>>): void {
+    const dir = path.join(credentialsDir(), group as unknown as string);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${providerId}.refs.json`), JSON.stringify({ v: 4, substitutes: subs }));
+  }
+
+  it('prefers the OWN substitute over a borrowed one for the same credential path', () => {
+    const resolver = new MockResolver();
+    resolver.put(groupScope, 'gh', CRED_OAUTH, 'own-token');
+    resolver.put(asCredentialScope('source-group'), 'gh', CRED_OAUTH, 'grantor-token');
+    // Both a borrowed and an own substitute exist for oauth (e.g. the borrower
+    // later captured its own credential alongside a pre-existing borrow).
+    writeRefs('gh', {
+      SUB_BORROWED: { credentialPath: CRED_OAUTH, scopeAttrs: {}, sourceScope: 'source-group' },
+      SUB_OWN: { credentialPath: CRED_OAUTH, scopeAttrs: {} },
+    });
+
+    const engine = new TokenSubstituteEngine(() => resolver);
+    engine.loadPersistedRefs(group, 'gh');
+
+    // Own shadows the grantor for name-based lookup.
+    expect(engine.getSubstitute('gh', group, CRED_OAUTH)).toBe('SUB_OWN');
+    expect(engine.resolveSubstitute('SUB_OWN', group)?.realToken).toBe('own-token');
+  });
+
+  it('drops a dangling substitute (no live credential behind it) and returns null', () => {
+    const resolver = new MockResolver();
+    resolver.put(groupScope, 'gh', CRED_OAUTH, 'own-token');
+    writeRefs('gh', { SUB_OWN: { credentialPath: CRED_OAUTH, scopeAttrs: {} } });
+
+    const engine = new TokenSubstituteEngine(() => resolver);
+    engine.loadPersistedRefs(group, 'gh');
+    expect(engine.getSubstitute('gh', group, CRED_OAUTH)).toBe('SUB_OWN');
+
+    // Credential deleted underneath the substitute — the ref is now dangling.
+    resolver.remove(groupScope, 'gh', CRED_OAUTH);
+    expect(engine.getSubstitute('gh', group, CRED_OAUTH)).toBeNull();
+    expect(engine.size).toBe(0); // pruned
+  });
+
+  it('falls through a dangling borrowed substitute to a live own one', () => {
+    const resolver = new MockResolver();
+    resolver.put(groupScope, 'gh', CRED_OAUTH, 'own-token');
+    // Grantor credential is absent → SUB_BORROWED is dangling.
+    writeRefs('gh', {
+      SUB_BORROWED: { credentialPath: CRED_OAUTH, scopeAttrs: {}, sourceScope: 'source-group' },
+      SUB_OWN: { credentialPath: CRED_OAUTH, scopeAttrs: {} },
+    });
+
+    const engine = new TokenSubstituteEngine(() => resolver);
+    engine.loadPersistedRefs(group, 'gh');
+
+    // Own is preferred anyway, but the dangling borrowed entry is also gone.
+    expect(engine.getSubstitute('gh', group, CRED_OAUTH)).toBe('SUB_OWN');
   });
 });

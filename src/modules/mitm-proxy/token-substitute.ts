@@ -279,12 +279,31 @@ export class TokenSubstituteEngine {
   getSubstitute(providerId: string, groupScope: GroupScope, credentialPath: string = CRED_OAUTH): string | null {
     const ps = this.scopes.get(groupScope)?.get(providerId);
     if (!ps) return null;
-    const matches: string[] = [];
+
+    // Prefer the requester's OWN entry (no sourceScope) over a borrowed one, so
+    // a borrower's own credential always shadows a grantor's for name-based
+    // resolution. Deterministic order within each bucket.
+    const own: string[] = [];
+    const borrowed: string[] = [];
     for (const [sub, entry] of ps.substitutes) {
-      if (entry.credentialPath === credentialPath) matches.push(sub);
+      if (entry.credentialPath !== credentialPath) continue;
+      (entry.sourceScope ? borrowed : own).push(sub);
     }
-    if (matches.length === 0) return null;
-    return matches.sort()[0];
+
+    for (const sub of [...own.sort(), ...borrowed.sort()]) {
+      // Only hand back a substitute that still has a live credential behind it.
+      // resolveSubstitute prunes access-revoked borrows itself; if it returns
+      // null while the entry is still present, the credential is simply gone —
+      // drop the dangling substitute so it is never returned and a fresh one
+      // can be minted in its place.
+      if (this.resolveSubstitute(sub, groupScope)) return sub;
+      if (ps.substitutes.has(sub)) {
+        ps.substitutes.delete(sub);
+        this.subToProvider.delete(sub);
+        this.persistRefs(groupScope, providerId);
+      }
+    }
+    return null;
   }
 
   /**
