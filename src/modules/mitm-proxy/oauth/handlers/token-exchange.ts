@@ -146,8 +146,30 @@ export function buildTokenExchangeHandler(
             };
           }
 
-          const ownScope = asCredentialScope(groupScope);
-          ctx.resolverFor(groupScope).store(ownScope, provider.id, CRED_OAUTH, credential);
+          // Re-auth of a BORROWED credential must heal it at its OWNING
+          // (grantor) scope — the scope the outbound path reads through the
+          // existing substitute. Storing the freshly-captured token to the
+          // borrower's own scope instead leaves refs.json still pointing at the
+          // (stale) grantor, orphaning the new credential so re-auth appears to
+          // do nothing. When an existing substitute for this (provider, group)
+          // resolves to a different source scope, store there so every borrower
+          // — and the grantor — sees the fresh token; a first-time auth (no
+          // existing substitute) stores to the group's own scope as before.
+          // Keyed off the resolved substitute's `sourceScope`, so no
+          // grantor-side declaration (grantees.json) is required.
+          let targetScope = asCredentialScope(groupScope);
+          const existingSub = ctx.tokenEngine.getSubstitute(provider.id, groupScope, CRED_OAUTH);
+          if (existingSub) {
+            const owning = ctx.tokenEngine.resolveSubstitute(existingSub, groupScope)?.mapping.credentialScope;
+            if (owning && owning !== targetScope) {
+              targetScope = owning;
+              logger.info(
+                { provider: provider.id, scope: groupScope, owning },
+                'oauth.token-exchange: re-auth of borrowed credential — storing to owning (grantor) scope',
+              );
+            }
+          }
+          ctx.resolverFor(groupScope).store(targetScope, provider.id, CRED_OAUTH, credential);
 
           const subAccess = ctx.tokenEngine.getOrCreateSubstitute(provider.id, scopeAttrs, groupScope, CRED_OAUTH);
           if (!subAccess) {
