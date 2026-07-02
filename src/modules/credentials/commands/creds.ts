@@ -99,9 +99,9 @@ export function handleCredsCommand(ctx: HostCommandContext): void {
       return replyStopBorrowing(ctx, selfFolder);
     // ── Credential-setting (C7o) ───────────────────────────────────────────────
     case 'set-key':
-      return replySetKey(ctx, scope);
+      return replySetKey(ctx, scope, selfFolder);
     case 'import':
-      return replyImport(ctx, scope);
+      return replyImport(ctx, scope, selfFolder);
     case 'delete':
       return replyDelete(ctx, scope, target);
     case 'list':
@@ -230,6 +230,21 @@ function replyStopBorrowing(ctx: HostCommandContext, selfFolder: string): void {
 
 // ── Credential-setting subcommands (C7o) ──────────────────────────────────────
 
+/**
+ * Leading warning shown when this group currently *borrows* credentials:
+ * setting/importing its own key here mints an own credential that shadows the
+ * borrowed one. Empty when the group isn't borrowing. `subject` names the
+ * action (e.g. "Setting a `github` key here").
+ */
+function borrowShadowNotice(borrowSource: string | null | undefined, subject: string): string {
+  if (!borrowSource) return '';
+  return (
+    `⚠️ This group is *borrowing* credentials from *${borrowSource}*. ` +
+    `${subject} creates this group's own credential and will *shadow* the borrowed one — ` +
+    `this group will stop using *${borrowSource}*'s.\n\n`
+  );
+}
+
 /** Validate a provider id against the registry. Returns a user-facing error or null. */
 function unknownProviderError(providerId: string, scope: CredentialScope): string | null {
   // Scope-aware: recognizes per-group `.auth-discovery/` providers (scope tier)
@@ -246,7 +261,7 @@ function unknownProviderError(providerId: string, scope: CredentialScope): strin
  * cleartext. Launches the paste interaction and returns immediately (the
  * router must not block on the multi-turn flow).
  */
-function replySetKey(ctx: HostCommandContext, scope: CredentialScope): void {
+function replySetKey(ctx: HostCommandContext, scope: CredentialScope, selfFolder: string): void {
   if (!isGpgAvailable()) {
     ctx.replyText('GPG is not available on the host. Install gnupg first.');
     return;
@@ -279,6 +294,7 @@ function replySetKey(ctx: HostCommandContext, scope: CredentialScope): void {
   void pastePgp({
     ctx,
     prompt:
+      borrowShadowNotice(getBorrowSource(selfFolder), `Setting a *${providerId}* key here`) +
       `Storing a *${providerId}* credential (*${credId}*), **GPG-encrypted** — never pasted in cleartext.\n\n` +
       `1. Encrypt the secret for this group here: ${buildPgpEncryptUrl(scope)}\n` +
       '2. Paste the resulting `-----BEGIN PGP MESSAGE-----` block back here.\n\n' +
@@ -311,7 +327,7 @@ function replySetKey(ctx: HostCommandContext, scope: CredentialScope): void {
  * stored under its binding's credentialPath (composite slices joined), not
  * the literal name.
  */
-function replyImport(ctx: HostCommandContext, scope: CredentialScope): void {
+function replyImport(ctx: HostCommandContext, scope: CredentialScope, selfFolder: string): void {
   if (!isGpgAvailable()) {
     ctx.replyText('GPG is not available on the host. Install gnupg first.');
     return;
@@ -329,6 +345,10 @@ function replyImport(ctx: HostCommandContext, scope: CredentialScope): void {
   void pastePgp({
     ctx,
     prompt:
+      borrowShadowNotice(
+        getBorrowSource(selfFolder),
+        defaultProviderId ? `Importing *${defaultProviderId}* credentials here` : 'Importing credentials here',
+      ) +
       'Bulk credential import, **GPG-encrypted** — never pasted in cleartext.\n\n' +
       `1. Encrypt your ${defaultProviderId ? `\`KEY=value\` lines for *${defaultProviderId}*` : '`[provider:]KEY=value` lines'} ` +
       `here: ${buildPgpEncryptUrl(scope)}\n` +
