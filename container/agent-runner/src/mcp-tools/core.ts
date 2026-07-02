@@ -95,7 +95,11 @@ function resolveRouting(
 export const sendMessage: McpToolDefinition = {
   tool: {
     name: 'send_message',
-    description: 'Send a message to a named destination. If you have only one destination, you can omit `to`.',
+    description:
+      'Send an INTERIM/PROGRESS message mid-turn (e.g. a quick "on it" before a slow tool call). ' +
+      'This is NOT where your answer goes: put the answer/final reply in an end-of-turn <message to="name">…</message> block instead. ' +
+      'Do not send the same content both ways — a reply sent here AND in a <message> block posts twice. ' +
+      'If you have only one destination, you can omit `to`.',
     inputSchema: {
       type: 'object' as const,
       properties: {
