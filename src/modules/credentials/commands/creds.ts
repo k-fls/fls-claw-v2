@@ -19,8 +19,10 @@
  * Registered with `scope: 'agent'` so the handler can resolve the current
  * agent group via `ctx.agentGroupId`.
  */
-import { getAgentGroup, getAgentGroupByFolder } from '../../../db/agent-groups.js';
-import type { HostCommandContext } from '../../../command-gate.js';
+import { getAgentGroup, getAgentGroupByFolder, getAllAgentGroups } from '../../../db/agent-groups.js';
+import { getMessagingGroup, getMessagingGroupAgents } from '../../../db/messaging-groups.js';
+import { isAdmin, type HostCommandContext } from '../../../command-gate.js';
+import type { AgentGroup } from '../../../types.js';
 import { pastePgp } from '../../interactions/index.js';
 
 import {
@@ -64,6 +66,8 @@ const USAGE = [
   '`/creds list [borrow|shadow]` — stored credentials (or borrowable / shadowed ones)',
   '`/creds status` — credential + sharing summary',
   '`/creds gpg` — print this group’s GPG public key for encrypting secrets',
+  '*Owner (cross-group):*',
+  '`/creds <set-key|import|delete|list|status|gpg> <group|id|channel>@<provider>` — run a credential op for another group',
 ].join('\n');
 
 export const CREDS_HELP =
@@ -87,6 +91,13 @@ export function handleCredsCommand(ctx: HostCommandContext): void {
   const target = ctx.args[1];
 
   if (!sub) return replyStatus(ctx, selfFolder);
+
+  // System-owner cross-group form: `/creds <cred-op> <group|id|channel>@<provider>`.
+  // An '@' in the first arg (never present in the self-form) signals it; routed
+  // to another group's scope, owner/global-admin only. Credential ops only.
+  if (CROSS_GROUP_OPS.has(sub) && (ctx.args[1] ?? '').includes('@')) {
+    return handleCrossGroupCreds(ctx, sub);
+  }
 
   switch (sub) {
     // ── Sharing (C7s) ────────────────────────────────────────────────────────
@@ -114,6 +125,130 @@ export function handleCredsCommand(ctx: HostCommandContext): void {
       return replyGpg(ctx, scope);
     default:
       ctx.replyText(USAGE);
+  }
+}
+
+// ── Cross-group form (system-owner) ───────────────────────────────────────────
+
+/** Credential ops that support the `<target>@<provider>` cross-group form. */
+const CROSS_GROUP_OPS = new Set(['set-key', 'import', 'delete', 'list', 'status', 'gpg']);
+
+/**
+ * Fan-out guard. `/creds` is `scope: 'agent'`, so the router dispatches it once
+ * per engaging agent in the channel. A cross-group op targets a single other
+ * group and must run once per typed message — this in-flight set (keyed by the
+ * message's op/target/args) lets the first dispatch through and no-ops the rest.
+ * Self-clears after the fan-out burst.
+ */
+const crossInFlight = new Set<string>();
+const CROSS_DEDUP_TTL_MS = 10_000;
+
+/** Test hook — clear the cross-group fan-out guard between cases. */
+export function _resetCredsCrossInFlightForTests(): void {
+  crossInFlight.clear();
+}
+
+type ResolvedTarget =
+  | { kind: 'group'; group: AgentGroup }
+  | { kind: 'ambiguous'; groups: AgentGroup[] }
+  | { kind: 'none' };
+
+/**
+ * Resolve a cross-group target spec to a single agent group, by priority:
+ * agent-group id → folder → display name → messaging-group (channel) id. The
+ * first tier that matches wins; a tier with >1 match is reported ambiguous.
+ */
+function resolveTargetGroup(spec: string): ResolvedTarget {
+  const byId = getAgentGroup(spec);
+  if (byId) return { kind: 'group', group: byId };
+
+  const byFolder = getAgentGroupByFolder(spec);
+  if (byFolder) return { kind: 'group', group: byFolder };
+
+  const byName = getAllAgentGroups().filter((g) => g.name === spec);
+  if (byName.length === 1) return { kind: 'group', group: byName[0] };
+  if (byName.length > 1) return { kind: 'ambiguous', groups: byName };
+
+  const mg = getMessagingGroup(spec);
+  if (mg) {
+    const groups = getMessagingGroupAgents(mg.id)
+      .map((a) => getAgentGroup(a.agent_group_id))
+      .filter((g): g is AgentGroup => g !== undefined);
+    if (groups.length === 1) return { kind: 'group', group: groups[0] };
+    if (groups.length > 1) return { kind: 'ambiguous', groups };
+  }
+
+  return { kind: 'none' };
+}
+
+/** Clone ctx with rewritten args and a target-prefixed replyText. */
+function forTarget(ctx: HostCommandContext, args: string[], targetFolder: string): HostCommandContext {
+  return {
+    ...ctx,
+    args,
+    argsRaw: args.slice(1).join(' '),
+    replyText: (t: string) => ctx.replyText(`[→ ${targetFolder}] ${t}`),
+  };
+}
+
+/**
+ * Handle `/creds <op> <target>@<provider>` for a system owner: resolve the
+ * target group, then run the same credential op against its scope.
+ */
+function handleCrossGroupCreds(ctx: HostCommandContext, sub: string): void {
+  // Owner / global admin only — a scoped admin can't reach into other groups.
+  if (!isAdmin(ctx.userId)) {
+    ctx.replyText('Cross-group `/creds` (targeting another group) requires an owner or global admin.');
+    return;
+  }
+
+  const rawArg = ctx.args[1];
+  const at = rawArg.lastIndexOf('@');
+  const targetSpec = rawArg.slice(0, at);
+  const provider = rawArg.slice(at + 1); // may be '' (e.g. list/status/gpg, or bulk import)
+  if (!targetSpec) {
+    ctx.replyText('Usage: `/creds <op> <group|id|channel>@<provider>`');
+    return;
+  }
+
+  const resolved = resolveTargetGroup(targetSpec);
+  if (resolved.kind === 'none') {
+    ctx.replyText(`No agent group matches "${targetSpec}" (tried id, folder, name, channel).`);
+    return;
+  }
+  if (resolved.kind === 'ambiguous') {
+    const list = resolved.groups.map((g) => `  • ${g.folder} (id: ${g.id})`).join('\n');
+    ctx.replyText(`"${targetSpec}" matches multiple groups — retry with a folder or id:\n${list}`);
+    return;
+  }
+
+  const targetFolder = resolved.group.folder;
+  const targetScope = asCredentialScope(targetFolder);
+
+  // Fan-out guard: run once per typed message even if several agents engaged.
+  const dedupKey = `${ctx.messagingGroupId}::${sub}::${targetFolder}::${provider}::${ctx.args.slice(2).join(' ')}`;
+  if (crossInFlight.has(dedupKey)) return;
+  crossInFlight.add(dedupKey);
+  setTimeout(() => crossInFlight.delete(dedupKey), CROSS_DEDUP_TTL_MS);
+
+  const rest = ctx.args.slice(2);
+  switch (sub) {
+    case 'set-key':
+      return replySetKey(forTarget(ctx, ['set-key', provider, ...rest], targetFolder), targetScope, targetFolder);
+    case 'import':
+      return replyImport(
+        forTarget(ctx, provider ? ['import', provider, ...rest] : ['import', ...rest], targetFolder),
+        targetScope,
+        targetFolder,
+      );
+    case 'delete':
+      return replyDelete(forTarget(ctx, ['delete', provider, ...rest], targetFolder), targetScope, provider);
+    case 'list':
+      return replyList(forTarget(ctx, ['list', ...rest], targetFolder), targetScope, targetFolder);
+    case 'status':
+      return replyCredentialStatus(forTarget(ctx, ['status', ...rest], targetFolder), targetFolder, targetScope);
+    case 'gpg':
+      return replyGpg(forTarget(ctx, ['gpg', ...rest], targetFolder), targetScope);
   }
 }
 
@@ -296,7 +431,7 @@ function replySetKey(ctx: HostCommandContext, scope: CredentialScope, selfFolder
     ctx,
     prompt:
       borrowShadowNotice(getBorrowSource(selfFolder), `Setting a *${providerId}* key here`) +
-      `Storing a *${providerId}* credential (*${credId}*), **GPG-encrypted** — never pasted in cleartext.\n\n` +
+      `Storing a *${providerId}* credential (*${credId}*) for *${selfFolder}*, **GPG-encrypted** — never pasted in cleartext.\n\n` +
       `1. Encrypt the secret for this group here: ${buildPgpEncryptUrl(scope)}\n` +
       '2. Paste the resulting `-----BEGIN PGP MESSAGE-----` block back here.\n\n' +
       'Or reply `cancel`.',
@@ -350,7 +485,7 @@ function replyImport(ctx: HostCommandContext, scope: CredentialScope, selfFolder
         getBorrowSource(selfFolder),
         defaultProviderId ? `Importing *${defaultProviderId}* credentials here` : 'Importing credentials here',
       ) +
-      'Bulk credential import, **GPG-encrypted** — never pasted in cleartext.\n\n' +
+      `Bulk credential import for *${selfFolder}*, **GPG-encrypted** — never pasted in cleartext.\n\n` +
       `1. Encrypt your ${defaultProviderId ? `\`KEY=value\` lines for *${defaultProviderId}*` : '`[provider:]KEY=value` lines'} ` +
       `here: ${buildPgpEncryptUrl(scope)}\n` +
       '2. Paste the resulting `-----BEGIN PGP MESSAGE-----` block back here.\n\n' +
