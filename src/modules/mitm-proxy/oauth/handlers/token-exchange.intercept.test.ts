@@ -81,6 +81,11 @@ const resolver = {
     credStore.set(key(credScope, providerId, credentialId), credential);
     storeCalls.push({ credentialId, credential });
   },
+  // This mock keys storage by the scope argument (no own-scope guard), so the
+  // owning resolver is itself — changeScope is a self-return.
+  changeScope(): CredentialResolver {
+    return resolver as unknown as CredentialResolver;
+  },
 };
 
 function makeSelfSignedCert(dir: string): { key: Buffer; cert: Buffer } {

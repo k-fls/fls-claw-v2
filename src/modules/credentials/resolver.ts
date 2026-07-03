@@ -79,6 +79,15 @@ export interface CredentialResolver {
   store(scope: CredentialScope, providerId: string, credentialId: string, credential: Credential): void;
 
   /**
+   * Return the resolver that OWNS `scope` — i.e. one for which `scope` is its
+   * own scope, so `store(scope, …)` is permitted. Returns `this` when `scope`
+   * is already this resolver's own scope. Use to perform a write under a
+   * *borrowed* credential's owning (grantor) scope, which this resolver's own
+   * `store` forbids: `resolver.changeScope(owning).store(owning, …)`.
+   */
+  changeScope(scope: CredentialScope): CredentialResolver;
+
+  /**
    * Delete a single keys file (`providerId` given) or the whole scope's
    * keys files (`providerId` omitted). Evicts the corresponding cache
    * entries first.
@@ -164,6 +173,17 @@ class CachedCredentialResolver implements CredentialResolver {
     // this scope. Re-populate the freshly-written entry so the next
     // resolve from this resolver hits cache.
     this.cache.set(scope, providerId, credentialId, encrypted);
+  }
+
+  changeScope(scope: CredentialScope): CredentialResolver {
+    this.assertLive();
+    if ((scope as string) === this.opts.ownFolder) return this;
+    // Registry-backed, so the returned resolver shares this process's cache-
+    // invalidation subscription and is the same instance every other reader of
+    // that scope sees. A cross-scope write through it therefore evicts every
+    // borrower's cache of that scope (via registerScopeInvalidator), same as
+    // any self-owned write.
+    return getOrCreateResolverForAgentGroup(scope as string);
   }
 
   delete(scope: CredentialScope, providerId?: string): void {

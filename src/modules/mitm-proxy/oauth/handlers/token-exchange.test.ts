@@ -82,10 +82,40 @@ function makeEngine(overrides: Partial<Record<keyof TokenSubstituteEngine, unkno
   } as unknown as TokenSubstituteEngine;
 }
 
+/**
+ * `resolverFor(s)` returns a per-scope resolver owning scope `s`, and each
+ * enforces the production `CachedCredentialResolver.store` guard: a write whose
+ * target scope isn't the resolver's own scope THROWS (borrowing is read-only,
+ * resolver.ts). This is what makes the borrowed-refresh test meaningful — the
+ * handler must write through the resolver owning the *target* (grantor) scope,
+ * not the requester's, or the guarded store throws exactly as in production.
+ * The shared `store` spy still records every persisted write for assertions.
+ */
 function makeCtx(engine: TokenSubstituteEngine, store: ReturnType<typeof vi.fn>): HandlerContext {
+  const resolvers = new Map<string, CredentialResolver>();
+  const resolverFor = (rscope: GroupScope): CredentialResolver => {
+    const own = rscope as string;
+    let r = resolvers.get(own);
+    if (!r) {
+      r = {
+        store: (scope: CredentialScope, ...rest: unknown[]) => {
+          if ((scope as string) !== own) {
+            throw new Error(
+              `resolver.store: cannot write under scope '${scope}' from resolver owning '${own}'`,
+            );
+          }
+          (store as (...a: unknown[]) => unknown)(scope, ...rest);
+        },
+        // Mirror the real registry: hand back the resolver owning `s`.
+        changeScope: (s: CredentialScope) => resolverFor(s as unknown as GroupScope),
+      } as unknown as CredentialResolver;
+      resolvers.set(own, r);
+    }
+    return r;
+  };
   return {
     tokenEngine: engine,
-    resolverFor: () => ({ store }) as unknown as CredentialResolver,
+    resolverFor,
     fetchImpl: vi.fn() as unknown as typeof fetch,
     inFlightRefresh: new Map(),
   };
@@ -188,6 +218,10 @@ describe('buildTokenExchangeHandler — response transform', () => {
       200,
     );
 
+    // Regression: the write must go through the resolver OWNING the grantor
+    // scope. Writing via the requester's resolver (bound to the borrower's own
+    // scope) trips the guard in the mock above and throws in transformResponse,
+    // exactly as the real resolver would — never silently healing the borrower.
     expect(store).toHaveBeenCalledTimes(1);
     const [scope, , credentialId, credential] = store.mock.calls[0];
     expect(scope).toBe(GRANTOR); // healed at the grantor, where every borrower reads it

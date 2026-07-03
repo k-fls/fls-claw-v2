@@ -442,6 +442,41 @@ describe('resolver — per-agent-group factory', () => {
 });
 
 // ---------------------------------------------------------------------------
+// changeScope — cross-scope write escape hatch (borrowed-credential healing)
+// ---------------------------------------------------------------------------
+
+describe('resolver — changeScope', () => {
+  it('returns the same resolver for its own scope', () => {
+    const r = ownResolver('group-a');
+    expect(r.changeScope(asCredentialScope('group-a'))).toBe(r);
+    r.dispose();
+  });
+
+  it('hands back the target-owning resolver, turning a forbidden cross-scope write into a self-write', () => {
+    const A = asCredentialScope('group-a');
+    freshGroupDir('group-a');
+    freshGroupDir('group-b');
+
+    // A borrower owning group-b may not store under group-a directly.
+    const borrower = getOrCreateResolverForAgentGroup('group-b');
+    expect(() => borrower.store(A, 'oauth', 'k', makeCred('nope'))).toThrow(/cannot write/);
+
+    // changeScope(A) returns the group-a-owning resolver — the same instance
+    // the registry hands out — for which storing under A is a self-write.
+    const owning = borrower.changeScope(A);
+    expect(owning).toBe(getOrCreateResolverForAgentGroup('group-a'));
+    owning.store(A, 'oauth', 'k', makeCred('healed'));
+    expect(owning.resolve(A, 'oauth', 'k')?.value).toBe('healed');
+  });
+
+  it('throws after dispose', () => {
+    const r = ownResolver('group-a');
+    r.dispose();
+    expect(() => r.changeScope(asCredentialScope('group-b'))).toThrow(/after dispose/);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Direct writeKeysFile auto-invalidation hook
 // ---------------------------------------------------------------------------
 
