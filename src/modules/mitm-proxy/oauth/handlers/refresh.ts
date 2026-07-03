@@ -153,8 +153,18 @@ async function runRefresh(
     if (oauthCred?.refresh) accessCred.refresh = oauthCred.refresh;
   }
 
+  // Write through the resolver that OWNS the credential's scope, not the
+  // requester's. `CachedCredentialResolver.store` hard-guards
+  // `scope === ownFolder` (resolver.ts) — borrowing is read-only — so the
+  // requester-scoped resolver (bound to the borrower's own folder) throws on
+  // the cross-scope write that heals the grantor. `changeScope(owning)` hands
+  // back the grantor-owning resolver, for which this is a self-write; for a
+  // self-owned credential `owning` IS the requester scope, so it returns the
+  // same resolver and nothing changes. Reads above stay on the requester's
+  // resolver so the grant (`canAccess`) is still enforced on the read path.
+  const owningResolver = resolver.changeScope(owning);
   try {
-    resolver.store(owning, provider.id, CRED_OAUTH, accessCred);
+    owningResolver.store(owning, provider.id, CRED_OAUTH, accessCred);
   } catch (err) {
     logger.error({ err, provider: provider.id, scope, owning }, 'oauth.refresh: resolver.store failed');
     return false;

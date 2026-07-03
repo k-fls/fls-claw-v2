@@ -171,7 +171,15 @@ export function buildTokenExchangeHandler(
               'oauth.token-exchange: refresh of borrowed credential — storing to owning (grantor) scope',
             );
           }
-          ctx.resolverFor(groupScope).store(targetScope, provider.id, CRED_OAUTH, credential);
+          // Write through the resolver that OWNS `targetScope`, not the
+          // requester's. `CachedCredentialResolver.store` hard-guards
+          // `scope === ownFolder` (resolver.ts) — borrowing is read-only — so
+          // for a borrowed refresh (targetScope = grantor) the requester-scoped
+          // resolver throws on the cross-scope write that heals the grantor.
+          // `changeScope(targetScope)` hands back the owning resolver, for which
+          // this is a self-write; for a fresh self-auth targetScope ===
+          // groupScope and it returns the same resolver.
+          ctx.resolverFor(groupScope).changeScope(targetScope).store(targetScope, provider.id, CRED_OAUTH, credential);
           // A fresh credential for this scope — clear any pending expired alert
           // (a grantor re-auth heals every borrower).
           ctx.borrowedCredentialEvents?.onCredentialHealed({ credentialScope: targetScope, providerId: provider.id });

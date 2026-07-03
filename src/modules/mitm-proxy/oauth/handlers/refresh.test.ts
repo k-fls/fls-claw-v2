@@ -47,13 +47,28 @@ function buildProvider(): OAuthProvider {
 }
 
 /**
- * A resolver whose `resolve`/`store` are keyed by scope, seeded with the
- * OAuth credential for zero or more scopes. `store` also updates the map so a
- * follow-up `resolve` observes the fresh token, and records every call.
+ * `resolverFor(s)` returns a **per-scope** resolver owning scope `s`, mirroring
+ * the production factory (`getOrCreateResolverForAgentGroup`, which binds one
+ * resolver to each agent-group folder). Crucially, each resolver enforces the
+ * same guard as the real `CachedCredentialResolver.store` (resolver.ts): a
+ * write whose target scope isn't the resolver's own scope **throws** — because
+ * borrowing is read-only. Reads are cross-scope permitted (the grant), so
+ * `resolve` ignores the guard.
+ *
+ * This is what makes the borrowed-credential tests meaningful: a fix that
+ * writes through the *requester's* resolver (bound to the borrower's folder)
+ * would throw here on the cross-scope store, exactly as it does in production —
+ * so the tests fail against that bug instead of passing against a guardless
+ * mock.
+ *
+ * `store` is a single shared spy recording every store across all resolvers
+ * (so `store.mock.calls[0]` reads the same as before); `storeCalls` additionally
+ * records which resolver's own scope performed each write.
  */
 function buildCtx(opts: { seed?: Array<{ scope: CredentialScope; cred: Credential }>; fetchImpl: typeof fetch }): {
   ctx: HandlerContext;
   store: ReturnType<typeof vi.fn>;
+  storeCalls: Array<{ ownerScope: string; writeScope: string }>;
   read: (scope: CredentialScope) => Credential | null;
   onFailed: ReturnType<typeof vi.fn>;
   onHealed: ReturnType<typeof vi.fn>;
@@ -61,14 +76,36 @@ function buildCtx(opts: { seed?: Array<{ scope: CredentialScope; cred: Credentia
   const byScope = new Map<string, Credential>();
   for (const { scope, cred } of opts.seed ?? []) byScope.set(scope as string, cred);
 
+  const storeCalls: Array<{ ownerScope: string; writeScope: string }> = [];
   const store = vi.fn((scope: CredentialScope, _p: string, credId: string, cred: Credential) => {
     if (credId === CRED_OAUTH) byScope.set(scope as string, cred);
   });
-  const resolver = {
-    resolve: (scope: CredentialScope, _p: string, credId: string) =>
-      credId === CRED_OAUTH ? (byScope.get(scope as string) ?? null) : null,
-    store,
-  } as unknown as CredentialResolver;
+
+  // One resolver per owning scope, memoized (idempotent, like the real registry).
+  const resolvers = new Map<string, CredentialResolver>();
+  const resolverFor = (rscope: GroupScope): CredentialResolver => {
+    const own = rscope as string;
+    let r = resolvers.get(own);
+    if (!r) {
+      r = {
+        resolve: (scope: CredentialScope, _p: string, credId: string) =>
+          credId === CRED_OAUTH ? (byScope.get(scope as string) ?? null) : null,
+        store: (scope: CredentialScope, p: string, credId: string, cred: Credential) => {
+          if ((scope as string) !== own) {
+            throw new Error(
+              `resolver.store: cannot write under scope '${scope}' from resolver owning '${own}'`,
+            );
+          }
+          storeCalls.push({ ownerScope: own, writeScope: scope as string });
+          store(scope, p, credId, cred);
+        },
+        // Mirror the real registry: hand back the resolver owning `s`.
+        changeScope: (s: CredentialScope) => resolverFor(s as unknown as GroupScope),
+      } as unknown as CredentialResolver;
+      resolvers.set(own, r);
+    }
+    return r;
+  };
 
   const engine = { pruneStaleRefs: vi.fn() } as unknown as TokenSubstituteEngine;
 
@@ -76,12 +113,12 @@ function buildCtx(opts: { seed?: Array<{ scope: CredentialScope; cred: Credentia
   const onHealed = vi.fn();
   const ctx: HandlerContext = {
     tokenEngine: engine,
-    resolverFor: () => resolver,
+    resolverFor,
     fetchImpl: opts.fetchImpl,
     inFlightRefresh: new Map(),
     borrowedCredentialEvents: { onBorrowedRefreshFailed: onFailed, onCredentialHealed: onHealed },
   };
-  return { ctx, store, read: (scope) => byScope.get(scope as string) ?? null, onFailed, onHealed };
+  return { ctx, store, storeCalls, read: (scope) => byScope.get(scope as string) ?? null, onFailed, onHealed };
 }
 
 function cred(value: string, refresh?: string, authFields?: Record<string, string>): Credential {
@@ -216,6 +253,28 @@ describe('tryRefresh — borrowed credential (owningScope)', () => {
     expect(store.mock.calls[0][0]).toBe(GRANTOR);
     expect(read(GRANTOR)?.value).toBe('FRESH_ACCESS');
     expect(read(asCredentialScope(borrower))?.value).toBe('STALE_BORROWER_ACCESS');
+  });
+
+  it('writes through the grantor-owning resolver, so the guarded cross-scope store does not throw', async () => {
+    // Regression: refresh.ts used to write via `resolverFor(scope)` — the
+    // requester's (borrower's) resolver — then call `.store(owning, …)`. The
+    // real resolver hard-guards `scope === ownFolder`, so a borrower's refresh
+    // threw and never healed the grantor. The write must go through the
+    // resolver OWNING the grantor scope.
+    const borrower: GroupScope = asGroupScope('borrower-group');
+    const fetchImpl = okFetch({ access_token: 'FRESH_ACCESS', refresh_token: 'FRESH_REFRESH', expires_in: 3600 });
+    const { ctx, storeCalls } = buildCtx({
+      seed: [{ scope: GRANTOR, cred: cred('GRANTOR_ACCESS', 'GRANTOR_REFRESH') }],
+      fetchImpl,
+    });
+
+    const ok = await tryRefresh(buildProvider(), borrower, ctx, GRANTOR);
+
+    expect(ok).toBe(true);
+    // The store was performed by the resolver whose own scope is the grantor —
+    // not the borrower's resolver (which would have thrown the guard).
+    expect(storeCalls).toEqual([{ ownerScope: GRANTOR, writeScope: GRANTOR }]);
+    expect(storeCalls[0].ownerScope).not.toBe(borrower as string);
   });
 
   it('dedups two borrowers of one grantor into a single exchange (keyed by owning scope)', async () => {
