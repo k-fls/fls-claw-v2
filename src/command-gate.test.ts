@@ -94,6 +94,22 @@ describe('parseSlashCommand', () => {
     const r = parseSlashCommand(JSON.stringify({ text: '   /auth' }));
     expect(r?.command).toBe('/auth');
   });
+
+  it('parses from mentionPrefixEnd so a mention-prefixed command is seen', () => {
+    // "@U0AKKG67T7X " is 13 chars → the real command starts at "/auth claude".
+    const r = parseSlashCommand(JSON.stringify({ text: '@U0AKKG67T7X /auth claude', mentionPrefixEnd: 13 }));
+    expect(r?.command).toBe('/auth');
+    expect(r?.args).toEqual(['claude']);
+  });
+
+  it('without mentionPrefixEnd, a mention-prefixed command is not a command (the bug)', () => {
+    expect(parseSlashCommand(JSON.stringify({ text: '@U0AKKG67T7X /auth' }))).toBeNull();
+  });
+
+  it('ignores an out-of-range mentionPrefixEnd', () => {
+    const r = parseSlashCommand(JSON.stringify({ text: '/auth', mentionPrefixEnd: 999 }));
+    expect(r?.command).toBe('/auth');
+  });
 });
 
 describe('gateCommand — existing behaviors', () => {

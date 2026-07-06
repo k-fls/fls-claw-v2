@@ -216,13 +216,27 @@ export interface ParsedSlashCommand {
  * stamp `{"text": "..."}`; raw strings are also accepted. Returns `null`
  * when the content doesn't begin with a slash command.
  *
+ * When the channel layer marked a leading bot-mention (`mentionPrefixEnd`,
+ * set by the chat-sdk bridge from the bot's own platform identity — see
+ * `leadingBotMentionEnd` there), parsing resumes FROM that offset. In a
+ * group channel a user must @-mention the bot to engage it, and platforms
+ * deliver that mention as a literal prefix — "@U0AKKG67T7X /auth" (Slack),
+ * "<@123> /auth" (Discord), "@botname /auth" (Telegram). Without skipping
+ * it the text never starts with '/', so every mention-prefixed host/admin
+ * command in a group channel would slip past the gate into the container.
+ * This is read-only: the stored `content` (what the container receives) is
+ * never modified.
+ *
  * No quoting / escape parsing — `args` is a plain whitespace split.
  */
 export function parseSlashCommand(content: string): ParsedSlashCommand | null {
   let text: string;
   try {
     const parsed = JSON.parse(content);
-    text = (parsed.text || '').trim();
+    text = typeof parsed.text === 'string' ? parsed.text : '';
+    const end = typeof parsed.mentionPrefixEnd === 'number' ? parsed.mentionPrefixEnd : 0;
+    if (end > 0 && end <= text.length) text = text.slice(end);
+    text = text.trim();
   } catch {
     text = content.trim();
   }
