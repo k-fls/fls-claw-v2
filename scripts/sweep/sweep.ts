@@ -12,7 +12,7 @@
  *   merge              DAG-ordered propagation to stop points     (MUTATES)
  *   verify             everything rebuild + test matrix in a temp worktree
  *   record             fold report/outcomes/verify into the state branch (MUTATES)
- *   status             human-readable sweep-state summary
+ *   status             human-readable sweep-state summary (--report adds per-branch scan verdicts)
  *   validate-registry  6-rule registry validator (exit 1 on ALERTs)
  *   route              score report PoIs against feature entries
  *   replay             replay registry test-cases (exit 1 on failure)
@@ -26,7 +26,7 @@
  *   --base <ref>           PoI range base              (default: state lastSweep.upstreamTip, else merge-base(main, upstream))
  *   --branch <name>        restrict to one branch (repeatable)
  *   --out <file>           write the subcommand's JSON artifact to a file
- *   --report <file>        input sweep-report.json     (merge/route/record)
+ *   --report <file>        input sweep-report.json     (merge/route/record/status)
  *   --outcomes <file>      input merge-outcomes JSON   (record/verify --rollback)
  *   --verify-result <file> input verify result JSON    (record)
  *   --recipe <a,b,c>       verify recipe override      (default: sweep-scope.yaml recipe)
@@ -34,9 +34,10 @@
  *   --case <id>            replay a single case
  *
  * Safety model: mutating stages are dry-run by default; `main` only ever
- * fast-forwards; everything* / design/* / docs/* / maint/* branches are
- * never merge targets; state mutations are journaled commits on the state
- * branch (never checked out). See scripts/sweep/README.md.
+ * fast-forwards; everything* / design/* / maint/* branches are never merge
+ * targets (fix/* and docs/notes ARE swept — upstream-PR candidates); state
+ * mutations are journaled commits on the state branch (never checked out).
+ * See scripts/sweep/README.md.
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 
@@ -56,7 +57,7 @@ import { loadRegistry, loadReplayCases, loadRoutingConfig } from './registry.js'
 import { replayCases } from './replay.js';
 import { routePois } from './routing.js';
 import { buildReport, enrichPois, type BuildReportOptions } from './scan.js';
-import { resolveScope, type ScopeResult } from './scope.js';
+import { resolveScope, stateActiveBranches, type ScopeResult } from './scope.js';
 import { findStopPoint } from './stop-points.js';
 import { readSweepState, writeSweepState } from './state.js';
 import type { SweepReport } from './types.js';
@@ -178,7 +179,10 @@ function readJson<T>(path: string): T {
 async function scopeBranches(cli: Cli): Promise<{ scope: ScopeResult; warnings: string[] }> {
   const registry = await loadRegistry(cli.repo, cli.stateBranch);
   const warnings = [...registry.warnings];
-  let scope = await resolveScope(cli.repo, registry.features, registry.scope);
+  // Scope = registry entries UNION sweep-state active branches (fix/*,
+  // docs/notes etc. are swept in practice but carry no feature entry).
+  const state = await readSweepState(cli.repo, cli.stateBranch);
+  let scope = await resolveScope(cli.repo, registry.features, registry.scope, stateActiveBranches(state));
   if (scope.ordered.length === 0) {
     warnings.push(
       'registry produced an empty scope — falling back to module/*|feat/*|edition/* + main_patched enumeration',
@@ -389,12 +393,27 @@ async function cmdStatus(cli: Cli): Promise<number> {
       `${cli.upstream}: ${upstreamTip.slice(0, 12)}${pending ? '  ** NEW upstream commits since last sweep **' : ''}`,
     );
   }
-  const branches = Object.entries(state.branches);
-  console.log(`branches tracked: ${branches.length}`);
-  for (const [name, bs] of branches) {
-    const merged = bs.lastMergedUpstream ? bs.lastMergedUpstream.slice(0, 12) : 'never';
-    const extras = [bs.frozenBy ? `frozen by ${bs.frozenBy}` : '', bs.notes].filter(Boolean).join('; ');
-    console.log(`  ${bs.status.padEnd(8)} ${name}  lastMerged=${merged}${extras ? `  [${extras}]` : ''}`);
+  // With --report, enrich each branch with its scan verdict: clean/ready,
+  // gated at stop point, or up-to-date.
+  const report = cli.report ? readJson<SweepReport>(cli.report) : null;
+  const names = [...new Set([...Object.keys(state.branches), ...Object.keys(report?.branches ?? {})])].sort();
+  console.log(`branches tracked: ${names.length}`);
+  for (const name of names) {
+    const bs = state.branches[name];
+    const merged = bs?.lastMergedUpstream ? bs.lastMergedUpstream.slice(0, 12) : 'never';
+    const extras = [bs?.frozenBy ? `frozen by ${bs.frozenBy}` : '', bs?.notes ?? ''].filter(Boolean).join('; ');
+    let verdict = '';
+    const scan = report?.branches[name];
+    if (scan) {
+      if (scan.upToDate) verdict = '  => up-to-date';
+      else if (scan.clean) verdict = `  => clean, ready to merge ${report!.upstreamTip.slice(0, 12)}`;
+      else if (scan.stopPoint)
+        verdict = `  => gated at stop point ${scan.stopPoint.slice(0, 12)} (${scan.conflictFiles.length} conflict files beyond)`;
+      else verdict = `  => fully gated (first pending commit conflicts: ${scan.conflictFiles.length} files at tip)`;
+    }
+    console.log(
+      `  ${(bs?.status ?? '-').padEnd(8)} ${name}  lastMerged=${merged}${extras ? `  [${extras}]` : ''}${verdict}`,
+    );
   }
   const open = state.openPois.filter((p) => p.state === 'open');
   console.log(`open PoIs: ${open.length}`);

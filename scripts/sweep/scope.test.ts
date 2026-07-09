@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildScope } from './scope.js';
+import { buildScope, stateActiveBranches } from './scope.js';
 import type { FeatureEntry } from './types.js';
 
 function entry(partial: Partial<FeatureEntry> & { id: string }): FeatureEntry {
@@ -80,5 +80,45 @@ describe('buildScope', () => {
     const scope = buildScope(FEATURES, {}, REPO_BRANCHES);
     expect(scope.edges['feat/mitm']).toEqual(['module/agc', 'module/host-rpc']);
     expect(scope.edges['module/host-rpc']).toEqual(['module/agc']);
+  });
+
+  it('unions sweep-state active branches (fix/*, docs/notes) into scope with no feature link', () => {
+    const repoBranches = [...REPO_BRANCHES, 'fix/chat-sdk-format-fallback', 'docs/notes', 'design/flsclaw'];
+    const stateActive = [
+      'fix/chat-sdk-format-fallback',
+      'docs/notes',
+      'design/flsclaw', // namespace-excluded even when state says active
+      'fix/gone-from-repo', // drift: dropped with a warning
+      'module/agc', // already in scope via registry — no duplicate
+    ];
+    const scope = buildScope(FEATURES, {}, repoBranches, stateActive);
+    expect(scope.ordered).toContain('fix/chat-sdk-format-fallback');
+    expect(scope.ordered).toContain('docs/notes');
+    expect(scope.ordered).not.toContain('design/flsclaw');
+    expect(scope.ordered).not.toContain('fix/gone-from-repo');
+    expect(scope.ordered.filter((b) => b === 'module/agc')).toHaveLength(1);
+    expect(scope.warnings.some((w) => w.includes("'fix/gone-from-repo'") && w.includes('missing from the repo'))).toBe(
+      true,
+    );
+    // State-only branches carry no DAG edges (null feature link).
+    expect(scope.edges['fix/chat-sdk-format-fallback']).toBeUndefined();
+    expect(scope.edges['docs/notes']).toBeUndefined();
+  });
+
+  it('stateActiveBranches picks only status=active entries', () => {
+    const bs = (status: 'active' | 'frozen' | 'excluded') => ({
+      status,
+      lastMergedUpstream: null,
+      frozenBy: null,
+      pendingBehindFreeze: 0,
+      notes: '',
+    });
+    const state = {
+      schemaVersion: 1 as const,
+      lastSweep: null,
+      openPois: [],
+      branches: { 'fix/a': bs('active'), 'fix/b': bs('frozen'), 'fix/c': bs('excluded'), 'docs/notes': bs('active') },
+    };
+    expect(stateActiveBranches(state).sort()).toEqual(['docs/notes', 'fix/a']);
   });
 });

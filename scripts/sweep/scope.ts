@@ -1,9 +1,12 @@
 /**
  * scripts/sweep/scope.ts — in-scope branch enumeration + DAG ordering.
  *
- * Branches come from the feature registry (entries with an owning branch)
- * plus sweep-scope.yaml include list; exclusions from config +
- * sweep-scope.yaml. DAG edges come from entry parents/dependents plus
+ * Scope = UNION of (registry feature entries' branches), (sweep-scope.yaml
+ * include list) and (sweep-state.json branches with status active) —
+ * fix/* upstream-PR candidates and docs/notes are swept in this fork's
+ * practice but have no feature entry, so they enter via the state file
+ * (with a null feature link). Exclusions from config + sweep-scope.yaml
+ * apply to all sources. DAG edges come from entry parents/dependents plus
  * scope.extra_edges; order = parents before children (topological), with
  * main_patched forced first when present. Cross-checked against
  * `git branch --list` — drift produces warnings, never a crash.
@@ -11,7 +14,7 @@
 import { EXCLUDED_BRANCH_GLOBS } from './config.js';
 import { globMatchAny } from './globs.js';
 import { localBranches } from './git.js';
-import type { FeatureEntry, SweepScope } from './types.js';
+import type { FeatureEntry, SweepScope, SweepState } from './types.js';
 
 export interface ScopeResult {
   /** In-scope branches in DAG order (parents before children). */
@@ -23,7 +26,19 @@ export interface ScopeResult {
 
 const SWEEPABLE_STATUS = new Set(['in-progress', 'shipped', 'experimental']);
 
-export function buildScope(features: FeatureEntry[], scope: SweepScope, repoBranches: string[]): ScopeResult {
+/** Branches the state file marks active (the practice-derived sweep set). */
+export function stateActiveBranches(state: SweepState): string[] {
+  return Object.entries(state.branches)
+    .filter(([, bs]) => bs.status === 'active')
+    .map(([name]) => name);
+}
+
+export function buildScope(
+  features: FeatureEntry[],
+  scope: SweepScope,
+  repoBranches: string[],
+  stateActive: string[] = [],
+): ScopeResult {
   const warnings: string[] = [];
   const exclude = [...EXCLUDED_BRANCH_GLOBS, ...(scope.exclude ?? [])];
   const excluded = (b: string) => globMatchAny(exclude, b);
@@ -48,6 +63,10 @@ export function buildScope(features: FeatureEntry[], scope: SweepScope, repoBran
   for (const b of scope.include ?? []) {
     if (excluded(b)) warnings.push(`scope include '${b}' matches an exclusion glob; skipped`);
     else branches.add(b);
+  }
+  // Union with sweep-state active branches (no feature link, no DAG edges).
+  for (const b of stateActive) {
+    if (!excluded(b)) branches.add(b);
   }
   for (const [child, parents] of Object.entries(scope.extra_edges ?? {})) {
     for (const p of parents) if (!excluded(child) && !excluded(p)) addEdge(child, p);
@@ -100,6 +119,11 @@ export function buildScope(features: FeatureEntry[], scope: SweepScope, repoBran
   return { ordered, edges: Object.fromEntries(Object.entries(parentOf).filter(([, v]) => v.length > 0)), warnings };
 }
 
-export async function resolveScope(repo: string, features: FeatureEntry[], scope: SweepScope): Promise<ScopeResult> {
-  return buildScope(features, scope, await localBranches(repo));
+export async function resolveScope(
+  repo: string,
+  features: FeatureEntry[],
+  scope: SweepScope,
+  stateActive: string[] = [],
+): Promise<ScopeResult> {
+  return buildScope(features, scope, await localBranches(repo), stateActive);
 }

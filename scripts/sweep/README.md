@@ -109,12 +109,13 @@ push policy. Nothing here deploys anything.
 - **Dry-run default** — every mutating subcommand requires `--execute`.
 - **`main` is a pristine upstream mirror** — `ff-main` refuses (exit 1) any
   non-fast-forward; nothing else ever writes to `main`.
-- **Protected branches** — `main`, `everything*`, `design/*`, `docs/*`,
-  `maint/*` are hard-excluded merge targets in `merge.ts`
-  (`skip-protected`), on top of the scope exclusions (`experimental/*`,
-  `wip/*`, `worktree-agent-*`, `integration/*`, `test/*`). `everything` is
-  rebuilt ONLY as a throwaway temp worktree in `verify` — never committed to,
-  never merged anywhere.
+- **Protected branches** — `main`, `everything*`, `design/*`, `maint/*` are
+  hard-excluded merge targets in `merge.ts` (`skip-protected`), on top of
+  the scope exclusions (`experimental/*`, `wip/*`, `worktree-agent-*`,
+  `integration/*`, `test/*`). `fix/*` and `docs/notes` are NOT protected —
+  they are swept in this fork's practice (upstream-PR candidates kept
+  current). `everything` is rebuilt ONLY as a throwaway temp worktree in
+  `verify` — never committed to, never merged anywhere.
 - **Conflict detection is new-style `git merge-tree --write-tree`** (full
   ort, virtual multi-base). Never `--merge-base=<x>` single-base previews —
   they produce bogus conflicts on branches with two merge bases (verified
@@ -132,11 +133,20 @@ push policy. Nothing here deploys anything.
   --rollback` and `merge.rollbackBranch()` reset via `update-ref` (or
   `reset --hard` in the owning worktree).
 
+Scope: the swept branch set is the UNION of registry feature entries'
+branches and `sweep-state.json` branches with status `active` — fix/*
+upstream-PR candidates and docs/notes are swept in practice without feature
+entries (null feature link, no DAG edges). Namespace exclusions apply to
+both sources. `status --report <sweep-report.json>` shows each branch's
+verdict: up-to-date, clean/ready-to-merge, gated at stop point, or fully
+gated.
+
 ## References
 
-- `docs/design/02-self-maintaining-flsclaw.md` §5 — the pipeline this
-  implements (watcher = fetch/scan, maintainer = route/classify,
-  change-author = merge/verify/record + PRs).
-- Sweep pipeline spec + feature-inventory registry design (scratchpad docs,
-  2026-07-10) — stage semantics, PoI taxonomy, routing algorithm, validator
-  rules.
+- `scripts/sweep/DESIGN.md` — the pipeline spec this implements, committed
+  verbatim, plus documented implementation deviations (§10).
+- `docs/design/02-self-maintaining-flsclaw.md` §5 — component mapping
+  (watcher = fetch/scan, maintainer = route/classify, change-author =
+  merge/verify/record + PRs).
+- Feature-inventory registry design (design subagent, 2026-07-10) — PoI
+  taxonomy, routing algorithm, validator rules.

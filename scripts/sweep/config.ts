@@ -55,7 +55,12 @@ export const SENSITIVE_PATHS = [
 /** Paths whose change counts as a dependency/SDK bump PoI. */
 export const DEP_PATHS = ['package.json', '**/package.json', 'pnpm-lock.yaml', '**/bun.lock', '**/bun.lockb'];
 
-/** Branch name globs never swept, never merged into, never enumerated as scope. */
+/**
+ * Branch name globs never swept, never merged into, never enumerated as
+ * scope. NOTE: fix/* (upstream-PR candidates) and docs/notes ARE swept in
+ * this fork's practice — they enter scope via sweep-state.json active
+ * branches, so they must not be excluded here (only fix/sweep/* is ours).
+ */
 export const EXCLUDED_BRANCH_GLOBS = [
   'everything*',
   'experimental/**',
@@ -64,7 +69,6 @@ export const EXCLUDED_BRANCH_GLOBS = [
   'integration/**',
   'test/**',
   'design/**',
-  'docs/**',
   'maint/**',
   'sweep/**',
   'fix/sweep/**',

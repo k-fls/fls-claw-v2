@@ -27,8 +27,12 @@ import {
 import { readRrCacheFiles } from './state.js';
 import type { SweepState } from './types.js';
 
-/** Branches the merge stage must never write to, regardless of scope/plan input. */
-const PROTECTED_BRANCH_RE = /^(main|everything.*|design\/.*|docs\/.*|maint\/.*)$/;
+/**
+ * Branches the merge stage must never write to, regardless of scope/plan
+ * input. fix/* and docs/notes are legitimate sweep targets (kept current
+ * for upstream PRs) and are deliberately NOT protected.
+ */
+const PROTECTED_BRANCH_RE = /^(main|everything.*|design\/.*|maint\/.*)$/;
 
 export interface MergePlanItem {
   branch: string;
