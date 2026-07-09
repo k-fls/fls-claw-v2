@@ -117,7 +117,10 @@ registerResource({
           engage_mode: pick('engage_mode', 'mention') as MessagingGroupAgent['engage_mode'],
           engage_pattern: args.engage_pattern !== undefined ? (args.engage_pattern as string) : null,
           sender_scope: pick('sender_scope', 'all') as MessagingGroupAgent['sender_scope'],
-          ignored_message_policy: pick('ignored_message_policy', 'drop') as MessagingGroupAgent['ignored_message_policy'],
+          ignored_message_policy: pick(
+            'ignored_message_policy',
+            'drop',
+          ) as MessagingGroupAgent['ignored_message_policy'],
           session_mode: pick('session_mode', 'shared') as MessagingGroupAgent['session_mode'],
           priority: 0,
           created_at: new Date().toISOString(),
