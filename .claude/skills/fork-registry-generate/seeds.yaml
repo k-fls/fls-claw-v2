@@ -1,0 +1,561 @@
+# Judgment seeds for fork-registry generation — canonical home of the
+# human/agent-authored fields (owner decision 2026-07-10: invariants and
+# overlap hints live HERE, not on a registry branch). The
+# fork-registry-generate skill merges these over mechanically derived
+# fields. Extracted from the 27 entries of the dissolved
+# maint/fork-registry branch (ca693b0e, features tree e91f4b4e33e9).
+#
+# Per feature id:
+#   name / summary          human-readable identity (judgment)
+#   invariants              upstream assumptions; tripwire => OVERLAP-TOUCH+
+#   overlap_hints           what upstream work would duplicate this feature
+#   routing                 keywords + always_check_on (semi-judgment)
+#   prompt_extra_context    injected into the overlap-check subagent prompt
+#   notes                   ownership corrections / enrichment status
+features:
+  edition.fls-ai-bot:
+    name: FLS AI bot edition (deployable prod instance)
+    summary: "The named deployable FLSclaw instance running the corporate trial: Slack channel adapter,
+      operator skills (custom-env, proxy-operator), edition-specific OAuth discovery (perplexity),
+      plus carried ssh-auth module content. Deployed on prod via the three-slot dist scheme; checked
+      out in a dedicated worktree at /home/user/workspace/fls/wt/edition-fls-ai-bot."
+    overlap_hints: Upstream shipping an official Slack channel/adapter (e.g. slack socket mode work) is
+      the primary overlap risk; also any upstream skills that collide with
+      custom-env/proxy-operator.
+    routing:
+      keywords:
+        - slack
+        - edition
+        - deploy
+        - skill
+      always_check_on:
+        - new-skill
+    notes: skeleton — needs enrichment. Carries ssh-auth module files without feat/ssh-auth tip ancestry
+      — see feat.ssh-auth entry. Upstream 2026-07 sweep included slack socket-mode changes; this
+      adapter is the fork's own.
+  feat.autonomy-matrix:
+    name: Autonomy matrix / checkAutonomy (design 08 WS-E)
+    summary: "checkAutonomy for approval handlers (design 08 §3.4): per-action autonomy resolution over
+      the ops registry with DB-backed overrides (migration 022), autonomy module + `ncl autonomy`
+      CLI resource."
+    overlap_hints: Upstream adding auto-approval policies, permission matrices, or approval-gating
+      configuration is OVERLAP-HIGH.
+    routing:
+      keywords:
+        - autonomy
+        - approval
+        - auto-approve
+        - gated
+        - policy
+      always_check_on: []
+    notes: skeleton — needs enrichment. WS-E done+reviewed; stacked on feat/ops-registry. Wiring
+      checkAutonomy into approval handlers is WS-D's job (F5 follow-up, not blocking).
+  feat.calendar-triggers:
+    name: Calendar triggers sweep (design 08 WS-G)
+    summary: "Sweep that reads per-tenant calendars and materializes kind='task' jobs from matching
+      events: rules engine, YAML config with fixtures, trigger latches (migration 024), and `ncl
+      calendar-triggers` CLI resource."
+    overlap_hints: Upstream adding calendar integrations, event-driven task creation, or
+      scheduled-trigger config is OVERLAP-HIGH; scheduling-module changes are OVERLAP-TOUCH.
+    routing:
+      keywords:
+        - calendar
+        - trigger
+        - schedule
+        - event
+        - gcal
+      always_check_on: []
+    notes: skeleton — needs enrichment. WS-G done+reviewed; stacked on feat/ops-registry. F10 (calendar
+      re-ensure from sweep) is a tracked follow-up.
+  feat.dependent-groups:
+    name: Dependent agent groups (design 01 P0, WS-D)
+    summary: "Parent/child agent-group hierarchies: group tree (migration 020), parent-scoped wirings,
+      child quotas, and CLI support for creating/inspecting dependent groups (design 01 P0)."
+    overlap_hints: Upstream adding sub-agents-as-groups, group nesting, or per-group parent/child
+      permission models is OVERLAP-HIGH.
+    routing:
+      keywords:
+        - group
+        - parent
+        - child
+        - hierarchy
+        - quota
+      always_check_on: []
+    notes: "skeleton — needs enrichment. WS-D partial: builder agent died on session limit; needs
+      recovery+verify. Also owns the F5 follow-up (wire checkAutonomy into approval handlers)."
+  feat.maintenance-sweep:
+    name: Upstream-sweep tooling (design 02 §5 mechanics, M0 operator CLI)
+    summary: "The scripted core of the self-maintenance pipeline: sweep.ts CLI (scan, stop-points,
+      DAG-ordered merge with rerere, everything-rebuild verify, state journaling, registry
+      validation/routing, test-case replay). Consumes this registry branch via git show; dry-run by
+      default, mutations gated behind --execute."
+    invariants:
+      - New-style git merge-tree only (never --merge-base single-base preview); merge unit is the
+        upstream first-parent commit; everything branch is verification-only.
+      - sweep-state.json and fork-registry/** live on maint/fork-registry and are mutated only via
+        script subcommands (journaled).
+    overlap_hints: Upstream adding its own fork-maintenance/upstream-sync automation, a merge-queue, or
+      update-nanoclaw skill rework is OVERLAP-HIGH; changes to scripts/ conventions, vitest scripts
+      glob, or the yaml dependency are OVERLAP-TOUCH.
+    routing:
+      keywords:
+        - sweep
+        - upstream
+        - fork
+        - merge
+        - update-nanoclaw
+      always_check_on: []
+    notes: skeleton — created by the orchestrator to close the validator rule-5 ALERT; scope-gap fix and
+      DESIGN.md commits will advance the tip past verified_against.
+  feat.memory-substrate:
+    name: Memory substrate P0 (design 06, WS-H)
+    summary: "Memory architecture P0: LogAdapter over session logs including rotated files,
+      NormalizedEvent (frozen contract §3.5), L0 salience scanning, leads store, degradation
+      handling, and a memory-scan script (design 06 §2-3, §9-P0)."
+    overlap_hints: Upstream adding conversation-log mining, memory extraction, salience scoring, or any
+      episodic-log-to-findings pipeline is OVERLAP-HIGH; session log format changes are
+      OVERLAP-TOUCH (LogAdapter parses them).
+    routing:
+      keywords:
+        - memory
+        - salience
+        - log
+        - leads
+        - mining
+      always_check_on: []
+    notes: skeleton — needs enrichment. WS-H; NormalizedEvent is a frozen contract consumed by WS-I
+      (planned.ops-kb). Log-mining opt-in + retention defaults are unratified owner decisions.
+  feat.mitm-credential-proxy:
+    name: MITM credential proxy (host-side token substitution)
+    summary: >
+      Keeps real credentials out of agent containers. Containers see placeholder tokens; all
+      container egress is forced through a host-side MITM TLS proxy (per-group CA, SNI parsing)
+      which recognizes provider endpoints and swaps placeholders for real tokens at the wire
+      (bearer-swap / token-exchange / refresh / device-code OAuth handlers, driven by per-provider
+      discovery documents). Includes interactive OAuth flows delivered through chat,
+      borrowed-credential notification, per-group credential env materialization, and a tap logger
+      for auditing proxied traffic.
+    invariants:
+      - "Real tokens never enter the container: agents only see placeholders; substitution happens
+        host-side in the proxy. Upstream putting provider tokens into container env/config directly
+        defeats the security model."
+      - "All container egress must traverse the proxy: CA trust + proxy env are injected via
+        container bootstrap (Dockerfile/entrypoint/env-vars). Upstream changes to container
+        networking, base image, or entrypoint can silently bypass interception."
+      - Composes via the AgentGroupContribution additive-merge (buildMitmProxyContribution); the
+        single contribution merge point in container-runner must survive.
+      - egress-lockdown parent's default-deny must stay compatible with proxy allow-listing.
+      - OAuth module is init-explicit (initOAuthModule after proxy.start()); no import side effects.
+      - "KNOWN RECURRING CONFLICT: poll-loop.{ts,test.ts} right after generateId
+        (writeContainerFeedback/reportClassifiedError vs PerTurnResultDedup) — resolution is always
+        KEEP BOTH; rerere has it recorded."
+    overlap_hints: >
+      Upstream work that counts as OVERLAP-HIGH: any credential brokering / secret manager / "keep
+      API keys out of the sandbox" mechanism; OAuth device-flow or token-refresh plumbing for
+      provider auth; an egress proxy, allowlist, or CA-injection scheme for containers; per-provider
+      auth adapters or discovery documents. Upstream renaming or restructuring
+      container/agent-runner auth or provider files is OVERLAP-TOUCH.
+    routing:
+      keywords:
+        - proxy
+        - mitm
+        - credential
+        - oauth
+        - token
+        - secret
+        - egress
+        - sandbox-network
+      always_check_on:
+        - dockerfile-change
+        - new-skill
+    prompt_extra_context: >
+      Security-sensitive feature — prefer needs_human=true when unsure. Pay special attention to
+      upstream changes in container/ (image, entrypoint, env plumbing): the interception path
+      depends on them even when no fork-owned file is touched. Discovery JSONs under
+      oauth/discovery/ are data, not code — upstream adding provider integrations may duplicate
+      individual discovery entries without threatening the engine.
+    notes: Borrowed-cred scope bug fixed via circuit-breaker ee0c1874 (2026-07-01).
+  feat.onecli-broker:
+    name: OneCLI broker routing for provider calls
+    summary: "Routes provider API traffic through a OneCLI gateway/broker: broker registry + routing
+      inside the mitm proxy, per-group broker config (DB + migration 16-fls-02), OneCLI client,
+      onecli-broker/onecli-credential providers, `ncl broker` resource, and broker approvals."
+    overlap_hints: Upstream adding LLM gateway/router support (LiteLLM-style brokers, provider fallback
+      routing, gateway credentials) is OVERLAP-HIGH.
+    routing:
+      keywords:
+        - broker
+        - gateway
+        - onecli
+        - routing
+        - provider
+      always_check_on: []
+    notes: skeleton — needs enrichment. Feature-complete, maintained and pushed to origin; NOT merged
+      into edition/fls-ai-bot, hence in-progress under the content-based shipped rule.
+  feat.ops-registry:
+    name: Ops registry (tenant/group YAML registry, design 08 WS-B)
+    summary: >
+      Version-controlled YAML registry (default estate/registry.yaml, overridable via
+      OPS_REGISTRY_PATH) mapping tenants -> subscription, agent groups, Todoist projects, chat
+      surface, calendars, budget, quiet hours, and per-action autonomy levels. Exposes a frozen
+      OpsRegistry consumer contract (design 08 §3.2) plus read-only `ncl registry list|get|reload`
+      CLI. Loader is mtime-cached and fail-closed: absent or invalid file yields a no-op registry
+      where autonomyFor() always returns 'gated' — never throws, never auto-approves — with the
+      invalid state distinguished in getOpsRegistryStatus() and logged once per distinct error.
+    invariants:
+      - "FAIL CLOSED: invalid or absent registry file must never throw to callers and never
+        auto-approve — autonomyFor() falls back to 'gated'. (Review decision F3, resolved
+        2026-07-03.)"
+      - "The OpsRegistry interface is FROZEN (design 08 §3.2): workstreams C, E, F, G, J are
+        compiled against it; changes require re-freezing in 08-implementation-plan.md."
+      - The registry is a version-controlled YAML file, not a DB table; edits go through
+        PR/approval-card flows. Upstream adding DB-backed org config would fork the model.
+      - "Autonomy precedence: group > tenant > defaults > 'gated' (F7: tenant-level autonomy block
+        is a sanctioned §4.1 extension)."
+    overlap_hints: >
+      OVERLAP-HIGH if upstream introduces tenant/org/workspace configuration, autonomy or
+      approval-policy configuration, budgets, quiet hours, or a YAML-file-backed settings registry
+      with a CLI. OVERLAP-TOUCH for changes to src/config.ts env handling, the `ncl` CLI resource
+      framework (src/cli/resources/*), or a yaml dependency bump.
+    routing:
+      keywords:
+        - registry
+        - tenant
+        - autonomy
+        - budget
+        - quiet-hours
+        - yaml
+      always_check_on:
+        - dep-change
+    prompt_extra_context: >
+      Status is in-progress: the branch is unmerged, so upstream conflicts will not surface as merge
+      conflicts yet — evaluate overlap against the BRANCH content, not main_patched. Three sibling
+      branches (autonomy-matrix, tenant-budgets, calendar-triggers) consume the frozen contract;
+      treat contract-threatening upstream changes as OVERLAP-HIGH.
+    notes: "Migrations renumbered per F2: 022=autonomy-overrides, 023=usage-events (shipped)."
+  feat.question-fanout:
+    name: Question fan-out coordinator (design 08 WS-C)
+    summary: "Q&A fan-out coordinator with quiet-hours gate: routes owner-directed questions to
+      configured surfaces (migration 021 question-surfaces), tracks answers, respects quiet hours
+      (design 08 §3.3, §4.2, §6)."
+    overlap_hints: Upstream adding ask-the-user routing, notification digests, or
+      do-not-disturb/quiet-hours handling is OVERLAP-HIGH.
+    routing:
+      keywords:
+        - question
+        - fanout
+        - quiet-hours
+        - notify
+        - surface
+      always_check_on: []
+    notes: skeleton — needs enrichment. WS-C; consumes the frozen OpsRegistry contract
+      (feat.ops-registry) for surface lookup; merges after WS-K (shared delivery.ts).
+  feat.ssh-auth:
+    name: SSH auth for agent containers
+    summary: "SSH key/auth management for agent containers: pending-auth flow with user notification
+      through chat, host-RPC handlers, an ssh MCP tool in the agent runner, an ssh skill, and the
+      `ncl ssh` command."
+    overlap_hints: Upstream adding SSH agent forwarding, key injection into sandboxes, or git-over-ssh
+      credential handling.
+    routing:
+      keywords:
+        - ssh
+        - key
+        - known-hosts
+        - agent-forwarding
+      always_check_on: []
+    notes: "skeleton — needs enrichment. STATUS AMBIGUITY: edition/fls-ai-bot carries the ssh-auth
+      module files but this branch tip is NOT an ancestor of edition (parallel/earlier merge); local
+      branches broken-ssh-auth and everything-ssh-l3 suggest unfinished L3 work. Reconcile which
+      version shipped during enrichment."
+  feat.tenant-budgets:
+    name: Tenant budgets + usage ledger (design 08 WS-F)
+    summary: Per-group-to-tenant usage tally with a usage ledger (migration 023), budget aggregation,
+      alert_at pings via the quiet-hours gate, weekly digest with an idempotency latch, and `ncl
+      budgets` CLI resource.
+    overlap_hints: Upstream adding cost/usage tracking, spend limits, or billing digests is OVERLAP-HIGH.
+    routing:
+      keywords:
+        - budget
+        - usage
+        - cost
+        - ledger
+        - digest
+      always_check_on: []
+    notes: skeleton — needs enrichment. WS-F done+reviewed; stacked on feat/ops-registry. F6
+      weekly-digest latch (idempotent polling) added in the fix-loop.
+  feat.todoist-channel:
+    name: Todoist channel adapter (design 08 WS-A)
+    summary: "Todoist as a chat channel: polling ingest (item = thread) with a webhook path scaffolded,
+      REST writes, echo suppression via a ledger, idempotent traces, and channel registration."
+    overlap_hints: Upstream shipping a Todoist (or generic task-manager) channel/integration is
+      OVERLAP-HIGH; channel-registry or adapter-interface changes are OVERLAP-TOUCH.
+    routing:
+      keywords:
+        - todoist
+        - channel
+        - webhook
+        - polling
+        - task
+      always_check_on: []
+    notes: "skeleton — needs enrichment. WS-A done+reviewed. F1 (deferred): attribution-as-owner assumes
+      single-user Todoist projects; loud warn on foreign posted_uid; full posted_uid routing is the
+      follow-up before any shared project."
+  feat.topic-routing:
+    name: Session/topic routing (design 04 P0, WS-K)
+    summary: "Per-task topic routing: topics table (migration 019), topic-scoped session routing of
+      inbound messages, and agent-runner awareness of topic destinations (design 04 §1-4,6,10)."
+    overlap_hints: Upstream adding threads/topics/session-splitting or per-conversation session scoping
+      is OVERLAP-HIGH; schema/messaging-groups changes are OVERLAP-TOUCH.
+    routing:
+      keywords:
+        - topic
+        - session
+        - routing
+        - thread
+      always_check_on: []
+    notes: "skeleton — needs enrichment. WS-K: implementation done (570/570 green); adversarial review
+      pending. Single-primary routing (design 05) is a related but separate planned behavior
+      change."
+  module.agent-group-contributions:
+    name: Agent-group contributions + spawn-failure classification
+    summary: >
+      The fork's extension seam for per-agent-group container customization: modules register
+      callbacks (registerAgentGroupContribution) that are invoked synchronously at spawn time and
+      additively merged into one AgentGroupContribution consumed by buildMounts in container-runner.
+      Also reworks the wakeContainer failure contract: retryable failures return false (host-sweep
+      retries quietly), non-retryable failures throw FatalSpawnError and mark the session
+      spawn-poisoned so subsequent wakes are no-ops until the next user inbound clears the flag.
+    invariants:
+      - "wakeContainer contract: true = spawned; false = retryable (host-sweep silently retries,
+        inbound row stays pending); throws FatalSpawnError = non-retryable, session poisoned, router
+        reports via deliverDirect. Upstream refactors of the spawn path / host-sweep retry semantics
+        are high merge risk."
+      - Contribution callbacks run synchronously; any throw is wrapped in FatalSpawnError by the
+        registry. There is exactly ONE additive merge point, immediately before buildMounts.
+      - Poison flag is cleared by the next user inbound (router); callers without channel context
+        (host-sweep, notifyAgent wake) must .catch() and log only.
+      - This is the composition substrate for every module/feat above it — an upstream change that
+        replaces or reshapes ContainerContributor / buildMounts breaks the whole fork stack.
+    overlap_hints: >
+      OVERLAP-HIGH if upstream adds any plugin/extension/hook system for container spawn (per-group
+      mounts, env, or config contributed by modules), or its own spawn-failure classification /
+      retry-suppression. OVERLAP-TOUCH for any change to container-runner's spawn path, buildMounts
+      signature, host-sweep retry loop, or router error delivery.
+    routing:
+      keywords:
+        - contribution
+        - plugin
+        - hook
+        - mounts
+        - spawn
+        - wake
+      always_check_on: []
+    prompt_extra_context: >
+      Highest blast radius entry in the registry: every dependent branch inherits this seam. If
+      verdict is OVERLAP-HIGH, recommended_action must address migration for ALL dependents listed
+      above, and needs_human is mandatory.
+    notes: src/provider-surfaces.test.ts intentionally NOT owned here — originates in shared commit
+      14810a50 (agent-surfaces seam) present on main_patched too.
+  module.command-gate:
+    name: Command gate extensions + host interactions
+    summary: Extends the inbound command gate and adds host-side interaction commands operators can
+      invoke (host commands surface). Standalone root module.
+    overlap_hints: Upstream changes to command parsing/dispatch (parseSlashCommand, command-gate) or any
+      new host-command/admin-command surface.
+    routing:
+      keywords:
+        - command
+        - slash
+        - gate
+        - host-command
+        - dispatch
+      always_check_on: []
+    notes: "skeleton — needs enrichment. OPEN fork bug lives on this surface: slash commands unreachable
+      in Slack group channels (@mention prefix defeats parseSlashCommand); fix belongs in
+      src/command-gate.ts."
+  module.container-bootstrap:
+    name: Container bootstrap (launch shape, network, privilege)
+    summary: "Structured container launch pipeline: launch-shape assembly, network setup, privilege
+      handling, IP registry/observer, reserved env names, snapshotting, container-env module, and
+      mount-security checks. Registered via the agent-group-contributions seam."
+    overlap_hints: Upstream changes to how containers are launched (docker run args, networking, mounts,
+      env injection) overlap directly; any new sandbox-hardening feature is a candidate duplicate.
+    routing:
+      keywords:
+        - bootstrap
+        - network
+        - privilege
+        - mount
+        - launch
+        - sandbox
+      always_check_on:
+        - dockerfile-change
+    notes: skeleton — needs enrichment. Branch content shows sibling root modules (crypto,
+      interaction-status, container-queue, command-gate) merged in — DAG edge list may be
+      incomplete; confirm during enrichment. src/modules/container-bootstrap/egress-observer.ts is
+      owned by module/egress-lockdown, not here.
+  module.container-queue:
+    name: Container concurrency queue + graceful shutdown
+    summary: "Bounded container-spawn concurrency queue plus graceful shutdown/drain: `ncl shutdown`
+      drains running containers instead of killing them (the sanctioned way to restart the daemon)."
+    overlap_hints: Upstream adding spawn throttling/concurrency limits, queueing, or any
+      graceful-shutdown/drain mechanism. Poll-loop stop semantics changes are merge risk.
+    routing:
+      keywords:
+        - queue
+        - concurrency
+        - shutdown
+        - drain
+        - graceful
+      always_check_on: []
+    notes: skeleton — needs enrichment
+  module.credentials:
+    name: Per-group credential store + provider registry
+    summary: GPG-encrypted per-group credential store with provider registry/contributions, grants
+      (credential borrowing between groups), import resolver, scoped cache and scope invalidation,
+      plus the `ncl creds` command and the Claude credential provider.
+    overlap_hints: "Upstream adding credential/secret storage, provider auth registries, or API-key
+      management is OVERLAP-HIGH. Live prod creds layout: ~/.config/nanoclaw/credentials
+      (keys.json/refs.json)."
+    routing:
+      keywords:
+        - credential
+        - gpg
+        - grant
+        - provider
+        - store
+        - secret
+      always_check_on: []
+    notes: skeleton — needs enrichment. mitm-era additions (auth-bridge, provider-availability, reauth*,
+      spawn-validation) live under the same glob but were authored on feat/mitm-credential-proxy;
+      src/providers/github-credential.ts is mitm-owned.
+  module.crypto:
+    name: Crypto primitives (AES + GPG)
+    summary: "Shared crypto primitives module: AES encryption helpers and GPG wrappers used by the
+      credentials stack. Standalone root module."
+    overlap_hints: Upstream adding encryption-at-rest, GPG integration, or crypto utility modules.
+    routing:
+      keywords:
+        - crypto
+        - aes
+        - gpg
+        - encrypt
+      always_check_on: []
+    notes: skeleton — needs enrichment
+  module.egress-lockdown:
+    name: Container egress lockdown (default-deny)
+    summary: Default-deny egress policy for agent containers with an egress observer hooked into
+      container bootstrap; documented in SECURITY.md. The mitm proxy's allow-listing builds on it.
+    overlap_hints: Upstream adding network egress restrictions, firewall rules, or allowlists for
+      sandboxes is OVERLAP-HIGH; container networking changes are OVERLAP-TOUCH.
+    routing:
+      keywords:
+        - egress
+        - lockdown
+        - firewall
+        - allowlist
+        - network
+      always_check_on:
+        - dockerfile-change
+    notes: skeleton — needs enrichment. src/egress-lockdown.ts predates this branch tip in shared
+      lineage with module/host-rpc; confirm canonical origin during enrichment.
+  module.host-rpc:
+    name: Host RPC server (host<->container control channel)
+    summary: "Host-side RPC server that agent containers call back into: port allocation, handler
+      registry, typed request/response. The control channel the credentials/mitm/ssh stacks ride
+      on."
+    overlap_hints: Upstream adding any host<->container IPC/RPC mechanism (unix socket, HTTP callback,
+      MCP host bridge) is OVERLAP-HIGH; changes to container env/port plumbing are OVERLAP-TOUCH.
+    routing:
+      keywords:
+        - rpc
+        - ipc
+        - host
+        - callback
+        - port
+      always_check_on: []
+    notes: skeleton — needs enrichment
+  module.interaction-status:
+    name: Interaction status registry
+    summary: Registry tracking the lifecycle/status of interactive prompts sent to users, so other
+      modules can await or inspect pending interactions. Standalone root module.
+    overlap_hints: Upstream adding any pending-interaction/awaiting-user-input tracking mechanism.
+    routing:
+      keywords:
+        - interaction
+        - status
+        - pending
+        - prompt
+      always_check_on: []
+    notes: skeleton — needs enrichment
+  module.interactions-helpers:
+    name: Interactive-prompt helpers
+    summary: "Reusable interactive-prompt building blocks on top of interaction-status: confirm-action,
+      paste-plain, paste-pgp, pick-from-buttons (pick-option added later on the mitm stack)."
+    overlap_hints: Upstream adding button/confirm/secure-paste interaction primitives to chat channels.
+    routing:
+      keywords:
+        - interaction
+        - confirm
+        - paste
+        - buttons
+        - prompt
+      always_check_on: []
+    notes: skeleton — needs enrichment. src/modules/interactions/pick-option.* is owned by
+      feat/mitm-credential-proxy (added there), though the glob here matches it — acceptable
+      double-routing.
+  module.runtime-updater:
+    name: Agent runtime version tracking + auto-update
+    summary: "Tracks the managed agent-runtime version per group and auto-updates it: runtime-version
+      migration (16-fls-01), runtime-auto-update DB helpers, updater/manager module, and the `ncl
+      agent-runtime` command."
+    overlap_hints: Upstream adding runtime/SDK version pinning, auto-upgrade of the agent runner, or
+      migration-driven version tracking.
+    routing:
+      keywords:
+        - runtime
+        - update
+        - upgrade
+        - version
+      always_check_on: []
+    notes: skeleton — needs enrichment
+  planned.estate-config:
+    name: Estate config + doctrine seeds (design 08 WS-J)
+    summary: "Planned: the estate/ configuration content — ops registry YAML content, doctrine seeds
+      estate/ops/{cos,tenant-parent}/CLAUDE.md (design 08 §4.3), and a bring-up script. No code
+      branch; lands with integration (J1 after A+B, J2 after D)."
+    overlap_hints: Upstream introducing an estate/, fleet-config, or seeded-CLAUDE.md convention, or
+      reserving the estate/ path, would collide.
+    routing:
+      keywords:
+        - estate
+        - doctrine
+        - registry
+        - seed
+      always_check_on:
+        - new-top-level-dir
+    prompt_extra_context: Planned-only configuration content (no code). The runtime reader of
+      estate/registry.yaml is feat.ops-registry.
+    notes: planned — content workstream WS-J; no branch will exist (lands with integration); retire when
+      estate/ content ships.
+  planned.ops-kb:
+    name: Ops knowledge base / miners as dependent groups (design 08 WS-I)
+    summary: "Planned: log miners run as dependent agent groups with log_access/view_access mount
+      capabilities, vault rendering of findings, and edits flowing back as leads (design 06 §5-6,
+      design 08 §9). Intended branch feat/ops-kb; depends on WS-D (dependent groups) and WS-H
+      (memory substrate)."
+    overlap_hints: Upstream adding knowledge-base generation from logs, memory vaults, or background
+      summarizer agents would collide with this plan.
+    routing:
+      keywords:
+        - miner
+        - vault
+        - knowledge
+        - ops-kb
+      always_check_on: []
+    prompt_extra_context: "Planned-only: no fork code exists yet. OVERLAP-HIGH here means 'upstream is
+      building what we planned' — recommend adopting or re-scoping the plan rather than merge-risk
+      analysis."
+    notes: planned — owned_paths are intended, not yet real; rename to feat.ops-kb.yaml when the branch
+      is cut (WS-I, after D+H).
