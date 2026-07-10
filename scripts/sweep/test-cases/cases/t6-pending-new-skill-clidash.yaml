@@ -1,0 +1,37 @@
+id: t6-pending-new-skill-clidash
+taxonomy: T6
+title: upstream adds a whole skill directory (.claude/skills/add-clidash/, 36 files) plus new top-level folders
+fork_branch: docs/notes
+fork_base_commit: b22148751213656492d9bd9ad025001056e75d59
+upstream_range:
+  from: cb6e3d117c127054ca5bc5a53645d794d93cc595
+  to: 0c0f4c2592d7f4191eff92e7d4a3a9b7042f74d9
+expected:
+  classification: clean
+  conflicts: []
+  pois:
+    - new-skill-dir: >-
+        .claude/skills/add-clidash/ — 36 files including a full Node
+        web-dashboard payload; added by
+        01b07d665220c0e6955e4fb209c5e199946edf2d (PR #2795, third-party
+        contributor)
+    - new-folder: >-
+        templates/ + src/templates/ (+ group-persona/group-skills,
+        docs/templates.md) — c87f2e55dc1a46544e8fa5a8098ef99da3745ae1
+        (PR #2890, third-party contributor)
+    - new-files-in-existing-folder: >-
+        src/cli/resources/tasks.{ts,test.ts} +
+        container/agent-runner/src/scheduling/task-script.test.ts —
+        f7a43ef88109513d1fbcd849870e64007075b176 (PR #2981 ncl-tasks-core)
+  notes: >
+    Verified via git diff --diff-filter=A cb6e3d11..upstream/main and
+    per-file first-parent attribution, 2026-07-10. docs/notes merges the whole
+    range clean, isolating the PoI-extraction assertion from conflict
+    handling.
+source: live pending-range scan, 2026-07-10
+replay_notes: >
+  01b07d66 sits late in the range, so no `to` commit isolates JUST the skill
+  add — assert PoI extraction from the full range instead. Both new-folder
+  PoIs come from third-party PRs (leetwito, amit-shafnir): the pipeline
+  should treat contributor-payload skill dirs with extra scrutiny (they ship
+  executable JS served to a browser).

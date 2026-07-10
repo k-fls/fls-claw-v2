@@ -1,0 +1,32 @@
+id: t2c-live-upstream-analog
+family: t2-pollloop-keepboth
+taxonomy: T2
+title: LIVE — poll-loop conflicts again when main_patched meets the pending upstream range
+fork_branch: main_patched
+fork_base_commit: ad619134b9b0b783996265d0b121a616bab4ccdc
+upstream_range:
+  from: cb6e3d117c127054ca5bc5a53645d794d93cc595
+  to: 0c0f4c2592d7f4191eff92e7d4a3a9b7042f74d9
+expected:
+  classification: mixed
+  conflicts:
+    - container/agent-runner/src/poll-loop.ts
+    - container/agent-runner/src/current-batch.ts (modify/delete)
+    - src/cli/resources/groups.ts
+    - src/command-gate.test.ts (add/add)
+  pois: []
+  notes: >
+    The recurring poll-loop family recurs against a real upstream range: the
+    poll-loop.ts hunk is an import-block conflict — upstream #2942
+    (c1965cfcaf6f07a2e5caa510b53d494f2ce81aae) moved the per-batch stamping
+    functions into db/session-state.js and deleted current-batch.ts, while the
+    fork imports hasSentUserMsgThisTurn/resetSentUserMsgThisTurn from
+    current-batch.js. classification is mixed: poll-loop.ts is
+    known-recurring, the current-batch modify/delete is semantic (see
+    t4-live-currentbatch-delete), groups.ts and command-gate.test.ts are
+    agent-resolvable (see t3-live-commandgate-addadd).
+source: live pending-range merge-tree scan, 2026-07-10
+replay_notes: >
+  This is simultaneously a regression case and the first real work item of the
+  next sweep: resolving it once on main_patched and propagating is the
+  recommended sweep order (see fixtures/pending-range-recon.md).

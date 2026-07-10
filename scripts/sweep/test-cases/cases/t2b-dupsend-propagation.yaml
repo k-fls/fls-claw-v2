@@ -1,0 +1,30 @@
+id: t2b-dupsend-propagation
+family: t2-pollloop-keepboth
+taxonomy: T2
+title: poll-loop.ts adjacent-insert conflict propagating the duplicate-send-message fix
+fork_branch: module/interactions-helpers
+fork_base_commit: 70798713fd0b20c51fafcda0a2a7526ba0419356
+merge_source: f3e947ff56748dbac5a33cdb1b5a41c812d63cbb
+resolution_ref: 8fc0ca9e3684485be8e3497cc3bfea272b4649bb # recorded merge with the canonical keep-both resolution (rerere seed)
+expected:
+  classification: known-recurring
+  conflicts:
+    - container/agent-runner/src/poll-loop.ts
+  pois: []
+  notes: >
+    Replay of recorded merge 8fc0ca9e3684485be8e3497cc3bfea272b4649bb.
+    merge_source = module/agent-group-contributions after the second
+    main_patched propagation (carrying fix/main/duplicate-send-message-reply,
+    merged into main_patched at f4afedc7c6d56de0269fdd71af3dc1a26f8be709).
+    Single hunk, right after setCurrentInReplyTo(routing.inReplyTo):
+    ours "currentQuery = query; // expose to the SIGTERM handler for graceful
+    abort" vs theirs "resetSentUserMsgThisTurn();".
+    Canonical resolution: keep both lines.
+source: recorded fork history, re-verified via merge-tree replay 2026-07-10 (hunk content pinned)
+replay_notes: >
+  Fork-internal propagation merge — merge merge_source into the worktree at
+  fork_base_commit. This is the cleanest single-hunk reproduction of the
+  recurring poll-loop keep-both family; ideal rerere seed. The
+  branch-topology memory describes the same family via different symbol names
+  (PerTurnResultDedup vs writeContainerFeedback/reportClassifiedError after
+  generateId); the hunk pinned here is the verified concrete instance.

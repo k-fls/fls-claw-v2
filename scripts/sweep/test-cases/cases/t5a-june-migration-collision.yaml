@@ -1,0 +1,36 @@
+id: t5a-june-migration-collision
+taxonomy: T5
+title: migration number collision 016/017 — both sides silently add same-numbered migration files
+fork_branch: module/runtime-updater (pre-June-sweep tip, tag sweep-backup/module/runtime-updater)
+fork_base_commit: eb41acfa08df253e2dbe399f6784f4eb0de3b78d
+upstream_range:
+  from: d85efea229ea63fb0bd4f57a039f4ef73ece563b
+  to: 2afbd1823356a610302cc13e95f87204d3413d43
+expected:
+  classification: semantic-collision
+  conflicts:
+    - container/agent-runner/src/poll-loop.test.ts
+    - container/agent-runner/src/poll-loop.ts
+    - src/config.ts
+    - src/container-runner.ts
+    - src/db/migrations/index.ts
+    - src/host-core.test.ts
+  pois:
+    - both sides ADD 016-*/017-* migration files (upstream
+      016-messaging-group-instance/017-agent-message-policies/018-approvals-*,
+      fork 016-runtime-version/017-broker-config) — the file adds themselves
+      merge SILENTLY with no textual conflict; only the barrel
+      src/db/migrations/index.ts conflicts textually. The pipeline must detect
+      the numbering collision from the silent adds, not just the barrel.
+  notes: >
+    6-file conflict set verified via merge-tree 2026-07-10. Canonical fix
+    (already applied at current tips): fork side-numbering — filenames
+    16-fls-MM-name.ts, export bindings flsMigrationMMM, name field
+    fls-<descriptive>, appended last in the array. A migrations/fork/ barrel
+    is the recommended follow-up so index.ts stops conflicting on every pull.
+source: June 2026 sweep record, re-verified 2026-07-10
+replay_notes: >
+  Assert the semantic-collision PoI fires on the silent same-number file adds
+  even though the only textual conflict is the index barrel. The other 5
+  conflicts overlap t4-june-container-runner-9hunk (same June set) — scope
+  assertions to src/db/migrations/** for this case.

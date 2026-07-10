@@ -1,0 +1,28 @@
+id: t5b-july-crud-defaultfrom
+taxonomy: T5
+title: crud.ts defaultFrom — textually CLEAN merge with semantic overlap on the same file
+fork_branch: fix/ncl-crud-side-effects (pre-July-sweep tip = 94db9f4e^1)
+fork_base_commit: adc402f4048a1e5888703a97988c7f469e28df25
+upstream_range:
+  from: 2afbd1823356a610302cc13e95f87204d3413d43
+  to: cb6e3d117c127054ca5bc5a53645d794d93cc595
+expected:
+  classification: clean-with-semantic-poi
+  conflicts: []
+  pois:
+    - >-
+      src/cli/crud.ts modified on BOTH sides — upstream +4 lines (defaultFrom
+      on ColumnDef, ncl messaging-groups create defaulting instance to
+      channel_type; #2882 = add3fc8f70b8d638a009f81f48f82c9684d7bd0c) vs fork
+      +20 lines (create/delete side-effects handling)
+  notes: >
+    merge-tree exit 0 verified 2026-07-10; correctness of the combined
+    behavior was only provable by running the 45 crud tests during the July
+    sweep. The archetypal "a clean merge is not enough" case.
+source: July 2026 sweep record, re-verified 2026-07-10
+replay_notes: >
+  The pipeline must intersect both-sides-touched files against the
+  feature-registry owned/touch paths and gate on tests despite zero textual
+  conflicts. The recorded July merge commit is
+  94db9f4e4dd9cc15b253eeff243557eefe553f83 (its first parent is this case's
+  fork_base_commit).

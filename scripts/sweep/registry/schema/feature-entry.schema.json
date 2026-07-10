@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "flsclaw://fork-registry/feature-entry",
+  "title": "FLSclaw fork feature registry entry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "name", "kind", "status", "summary", "owned_paths", "routing", "prompt", "maintenance"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^(module|feat|edition|fix|planned)\\.[a-z0-9][a-z0-9-]*$",
+      "description": "Must equal the filename stem: <kind>.<slug>."
+    },
+    "name": { "type": "string", "minLength": 3 },
+    "kind": { "enum": ["module", "feat", "edition", "fix", "planned"] },
+    "status": { "enum": ["planned", "in-progress", "shipped", "experimental", "absorbed", "retired"] },
+    "branch": {
+      "type": "string",
+      "description": "Owning branch (canonical authoring home). Required unless status=planned."
+    },
+    "parents": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "DAG edges: the branches this one stacks on (child <- parents)."
+    },
+    "dependents": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Branches stacked on this one (blast radius of a bad merge)."
+    },
+    "summary": { "type": "string", "minLength": 20 },
+    "owned_paths": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" },
+      "description": "Gitignore-style globs whose canonical home is `branch`. Derived from branch-vs-parent ADDITIONS, never symmetric diff (see README)."
+    },
+    "touch_paths": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Upstream/shared files this feature modifies or hooks — the merge-risk surface."
+    },
+    "key_symbols": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "\"Symbol — file\" strings naming the feature's API."
+    },
+    "symbol_watch": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Case-insensitive regexes run against upstream diff text and new file basenames."
+    },
+    "invariants": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Assumptions about upstream behavior this feature depends on; each is a tripwire."
+    },
+    "design_docs": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[^@]+@[^@]+$" },
+      "description": "\"path@branch\" references, readable via `git show <branch>:<path>`."
+    },
+    "test_anchors": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Test files (on the owning branch) proving the feature works."
+    },
+    "overlap_hints": { "type": "string" },
+    "routing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["keywords"],
+      "properties": {
+        "keywords": { "type": "array", "items": { "type": "string" } },
+        "always_check_on": {
+          "type": "array",
+          "items": { "enum": ["new-skill", "new-top-level-dir", "dockerfile-change", "dep-change", "large-new-file", "sensitive-surface-touch"] }
+        }
+      }
+    },
+    "prompt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["template"],
+      "properties": {
+        "template": { "type": "string" },
+        "extra_context": { "type": "string" }
+      }
+    },
+    "maintenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner", "last_verified"],
+      "properties": {
+        "owner": { "type": "string" },
+        "last_verified": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+        "verified_against": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "Tip SHA of `branch` at last verification. Null only for status=planned."
+        },
+        "notes": { "type": "string" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "not": { "const": "planned" } } }, "required": ["status"] },
+      "then": { "required": ["branch", "parents", "test_anchors"] }
+    }
+  ]
+}

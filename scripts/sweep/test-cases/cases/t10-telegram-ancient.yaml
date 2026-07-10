@@ -1,0 +1,29 @@
+id: t10-telegram-ancient
+taxonomy: T10
+title: fix/channels/telegram-markdown-nesting — 750 behind, classify excluded, never sweep
+fork_branch: fix/channels/telegram-markdown-nesting
+fork_base_commit: bf35198f079220c50d99049cb2db2acac3c0249e
+upstream_range:
+  from: cb6e3d117c127054ca5bc5a53645d794d93cc595
+  to: 0c0f4c2592d7f4191eff92e7d4a3a9b7042f74d9
+expected:
+  classification: excluded
+  conflicts: []
+  pois:
+    - >-
+      exclusion-gate: 750 commits behind main, 878 behind upstream/main;
+      merge-base 7e37b13aabd0d7ed8ebdedfa96cecad8e1e89796 dated 2026-04-28
+      (re-measured 2026-07-10). Documented structural conflicts if forced:
+      package.json, pnpm-lock.yaml, deltachat skills, setup/index.ts.
+  notes: >
+    The branch sits on the old upstream/channels lineage; force-merging ~750
+    commits of drift for a small telegram fix is the wrong move — it needs a
+    separate rebase of its ~59 unique commits or a rework. The July sweep
+    excluded it for the same reason.
+source: July 2026 sweep record, drift re-measured 2026-07-10
+replay_notes: >
+  upstream_range is included for data completeness only — the test asserts
+  the exclusion gate (behind-count threshold and/or merge-base age) trips
+  BEFORE any merge or merge-tree is attempted. Also assert namespace-based
+  exclusions: experimental/*, wip/*, everything*, worktree-agent-*, and the
+  registry branch maint/fork-registry itself are never swept.

@@ -1,0 +1,25 @@
+id: t3-live-commandgate-addadd
+taxonomy: T3
+title: LIVE — add/add of src/command-gate.test.ts (fork test file vs upstream #2930 test file)
+fork_branch: fix/main/command-gate-mention-prefix
+fork_base_commit: 9f5d74b49fc4697b2c3d0f96e375a243c6fdc56f
+upstream_range:
+  from: cb6e3d117c127054ca5bc5a53645d794d93cc595
+  to: 0c0f4c2592d7f4191eff92e7d4a3a9b7042f74d9
+expected:
+  classification: agent-resolvable
+  conflicts:
+    - src/command-gate.test.ts (add/add)
+  pois: []
+  notes: >
+    Both sides independently created src/command-gate.test.ts — the fork for
+    its @mention-prefix slash-command fix, upstream in #2930
+    (6dc25a9b8a951d0cbe172b26724fe056988c17b1,
+    cleanup/command-gate-start-and-failopen). Resolution = union of the two
+    test suites. Single-conflict replay, verified live 2026-07-10.
+source: live pending-range merge-tree scan, 2026-07-10
+replay_notes: >
+  Minimal, fast case — good smoke test for the agent-resolution path. Note the
+  paired content conflict in src/command-gate.ts does NOT appear for this
+  branch alone; it appears once the branch is combined with the module stack
+  (see module/runtime-updater row in fixtures/pending-range-recon.md).

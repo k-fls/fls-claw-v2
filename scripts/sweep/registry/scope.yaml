@@ -1,0 +1,33 @@
+# Sweep scope configuration — POLICY, not state (exclusions are config;
+# frozen/open-PoI state lives in the group-owned ledger).
+#
+# Scope = (inventory entries' branches) UNION (repo branches matching
+# `include` globs), minus `exclude` and the built-in namespace exclusions
+# (everything*, experimental/*, wip/*, design/*, maint/*, worktree-agent-*,
+# integration/*, test/*, sweep/*, fix/sweep/*).
+
+include:
+  # base for shared fixes — always swept first
+  - main_patched
+  # upstream-PR candidates: kept current so they stay cleanly upstreamable
+  - fix/**
+  # fork documentation branch, swept in practice since June 2026
+  - docs/notes
+
+exclude:
+  # 750 commits behind main (merge-base 2026-04-28); structural conflicts.
+  # Needs a dedicated rebase of its ~59 unique commits, not a sweep merge.
+  - fix/channels/telegram-markdown-nesting
+
+# extra_edges: child -> parents DAG edges not expressible in the inventory.
+extra_edges: {}
+
+# recipe: ordered branch list for the everything rebuild (verify stage).
+# Mirrors the everything-branch rebuild order confirmed 2026-06-28.
+recipe:
+  - module/runtime-updater
+  - feat/mitm-credential-proxy
+  - feat/ssh-auth
+  - feat/onecli-broker
+  - module/container-bootstrap
+  - docs/notes

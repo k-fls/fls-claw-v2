@@ -1,0 +1,50 @@
+id: t9-live-egress-lockdown-overlap
+taxonomy: T9
+title: LIVE — upstream evolves egress-lockdown + mount-security where the fork rewrote both
+fork_branch: module/egress-lockdown
+fork_base_commit: 01b10d1c2059a166894cb834b445c83d35caaf50
+upstream_range:
+  from: cb6e3d117c127054ca5bc5a53645d794d93cc595
+  to: 0c0f4c2592d7f4191eff92e7d4a3a9b7042f74d9
+expected:
+  classification: feature-overlap
+  conflicts:
+    - src/egress-lockdown.ts
+    - src/modules/mount-security/index.test.ts (add/add)
+    - src/host-sweep.ts
+    - src/modules/index.ts
+    - docs/SECURITY.md
+    - src/config.ts
+    - src/container-runner.ts
+    - src/command-gate.ts
+    - src/command-gate.test.ts (add/add)
+    - src/cli/resources/groups.ts
+    - container/agent-runner/src/poll-loop.ts
+    - container/agent-runner/src/current-batch.ts (modify/delete)
+  pois:
+    - >-
+      feature-overlap: src/egress-lockdown.ts — fork rewrote 143 lines
+      (default-deny module) vs upstream #2934
+      (776bc14ca08781d2ba256617c49312838a32c414) perimeter-env evolution.
+      Co-evolution, not add/add: the file predates the fork point (upstream
+      6420c0e254b63ab51ce13242cb93e188705cc7dc).
+    - >-
+      feature-overlap: src/modules/mount-security/index.test.ts — fork wrote
+      its own 465-line suite (6de8b41183f16dfcebfd8c7d8e7e07e0362db69e) and
+      upstream added its own in #2943
+      (b7d6eebf4df0ad1622d7dfb8fc3f87b29f33e452) at the same path (add/add).
+  notes: >
+    12-file conflict set verified live 2026-07-10 (last 7 files are the shared
+    main_patched/module-stack core, see t2c/t4-live). Route to the
+    module.egress-lockdown feature entry's overlap-check; escalate — both
+    sides changed security semantics.
+source: live pending-range merge-tree scan, 2026-07-10
+replay_notes: >
+  Historical overlap variants for extra coverage: (a) June OneCLI gateway —
+  the fork REMOVED the gateway on feat/onecli-broker while upstream fixed its
+  stub-shadowing (fork_base tag sweep-backup/feat/onecli-broker =
+  43cd1354a5135213ee2d9bc0174f9c55ded53c44, June range d85efea2..2afbd182);
+  (b) upstream per-group provider selection
+  a142c496f7b0c531a3bd81f85d6f09e1771c9eda (#2756) vs
+  module/runtime-updater's version-aware provider parsing — the standing
+  watch-item from the June semantic-alignment audit.

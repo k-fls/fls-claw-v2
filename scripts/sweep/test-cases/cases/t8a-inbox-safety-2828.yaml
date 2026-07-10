@@ -1,0 +1,30 @@
+id: t8a-inbox-safety-2828
+taxonomy: T8
+title: inbox symlink containment (upstream issue 2828) — clean merge that MUST be security-flagged
+fork_branch: fix/ncl-crud-side-effects (pre-July tip; any July-swept branch works, all merged clean)
+fork_base_commit: adc402f4048a1e5888703a97988c7f469e28df25
+upstream_range:
+  from: 2afbd1823356a610302cc13e95f87204d3413d43
+  to: cb6e3d117c127054ca5bc5a53645d794d93cc595
+expected:
+  classification: clean-with-security-poi
+  conflicts: []
+  pois:
+    - >-
+      security-surface: 186b9befcda839b637fc23ee5112b09bfa9f0b0e (PR #2880,
+      fixes upstream #2828) ADDS src/inbox-safety.ts (shared symlink
+      containment for forwardAttachedFiles + extractAttachmentFiles) and
+      touches src/session-manager.ts, src/modules/agent-to-agent/agent-route.ts
+      (attachment ingest/egress surface), plus new tests
+      src/session-manager.attachments.test.ts,
+      src/modules/agent-to-agent/agent-route.test.ts
+  notes: >
+    File list verified via diff-tree 2026-07-10. The July sweep merged this
+    range textually clean into all 18 branches — the security PoI must fire
+    from file-path/surface matching alone, with zero conflicts.
+source: July 2026 sweep record, re-verified 2026-07-10
+replay_notes: >
+  Same fork_base_commit as t5b-july-crud-defaultfrom (same range) — one replay
+  can serve both assertions. Assert the security classifier keys on the new
+  src/inbox-safety.ts file and the session-manager attachment path, not on
+  merge outcome.
