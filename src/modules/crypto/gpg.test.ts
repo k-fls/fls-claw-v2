@@ -34,6 +34,7 @@ const {
   exportPublicKey,
   gpgDecrypt,
   isPgpMessage,
+  normalizeArmoredBlock,
   gpgHome,
   isKeyExpired,
   getKeyMeta,
@@ -51,8 +52,19 @@ describe('isPgpMessage', () => {
     expect(isPgpMessage('-----BEGIN PGP MESSAGE-----\nabc\n-----END PGP MESSAGE-----')).toBe(true);
   });
 
-  it('detects PGP header with surrounding text', () => {
-    expect(isPgpMessage('here is the encrypted key:\n-----BEGIN PGP MESSAGE-----\nabc')).toBe(true);
+  it('detects PGP block with surrounding text', () => {
+    expect(
+      isPgpMessage('here is the encrypted key:\n-----BEGIN PGP MESSAGE-----\nabc\n-----END PGP MESSAGE-----'),
+    ).toBe(true);
+  });
+
+  it('returns false for a truncated block missing the END marker', () => {
+    expect(isPgpMessage('-----BEGIN PGP MESSAGE-----\nabc')).toBe(false);
+  });
+
+  it('detects a block whose BEGIN marker is contaminated by an invisible char', () => {
+    // U+200B glued to the BEGIN line — survives .trim(). See normalizeArmoredBlock.
+    expect(isPgpMessage('-----BEGIN PGP MESSAGE-----\u200B\nabc\n-----END PGP MESSAGE-----')).toBe(true);
   });
 
   it('returns false for plain text', () => {
@@ -64,7 +76,49 @@ describe('isPgpMessage', () => {
   });
 
   it('returns false for other PGP blocks', () => {
-    expect(isPgpMessage('-----BEGIN PGP PUBLIC KEY BLOCK-----')).toBe(false);
+    expect(isPgpMessage('-----BEGIN PGP PUBLIC KEY BLOCK-----\nabc\n-----END PGP PUBLIC KEY BLOCK-----')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// normalizeArmoredBlock (no GPG needed)
+// ---------------------------------------------------------------------------
+
+describe('normalizeArmoredBlock', () => {
+  const canonical = '-----BEGIN PGP MESSAGE-----\n\nAAAA\nBBBB\n=zzzz\n-----END PGP MESSAGE-----';
+
+  it('leaves a well-formed block canonical', () => {
+    expect(normalizeArmoredBlock(canonical)).toBe(canonical);
+  });
+
+  it('splits a base64 body glued onto the BEGIN marker line', () => {
+    // The real field failure: the newline after the marker was dropped, so the
+    // first body chunk rode on the marker line and gpg saw no armor header.
+    const glued = '-----BEGIN PGP MESSAGE-----AAAA\nBBBB\n=zzzz\n-----END PGP MESSAGE-----';
+    expect(normalizeArmoredBlock(glued)).toBe(canonical);
+  });
+
+  it('inserts the mandatory blank line when it is missing', () => {
+    const noBlank = '-----BEGIN PGP MESSAGE-----\nAAAA\nBBBB\n=zzzz\n-----END PGP MESSAGE-----';
+    expect(normalizeArmoredBlock(noBlank)).toBe(canonical);
+  });
+
+  it('strips an invisible char glued to the BEGIN marker', () => {
+    const dirty = '-----BEGIN PGP MESSAGE-----\u200B\n\nAAAA\nBBBB\n=zzzz\n-----END PGP MESSAGE-----';
+    const out = normalizeArmoredBlock(dirty);
+    expect(out).toBe(canonical);
+    expect(out).not.toContain('\u200B');
+  });
+
+  it('tolerates extra dashes on the delimiters', () => {
+    const dashy = '------BEGIN PGP MESSAGE------\n\nAAAA\nBBBB\n=zzzz\n------END PGP MESSAGE------';
+    expect(normalizeArmoredBlock(dashy)).toBe(canonical);
+  });
+
+  it('preserves armor headers before the payload', () => {
+    const withHeaders =
+      '-----BEGIN PGP MESSAGE-----\nVersion: OpenPGP.js\n\nAAAA\nBBBB\n=zzzz\n-----END PGP MESSAGE-----';
+    expect(normalizeArmoredBlock(withHeaders)).toBe(withHeaders);
   });
 });
 
@@ -214,6 +268,37 @@ describe.skipIf(!gpgAvailable)('GPG integration', () => {
     // Decrypt on the server side
     const decrypted = gpgDecrypt(baseDir, scope, encrypted);
     expect(decrypted).toBe(plaintext);
+  });
+
+  it('decrypts a block whose body was glued onto the BEGIN marker line', () => {
+    // Reproduces the real "no valid OpenPGP data found" field failure: the
+    // newline + blank line after the marker were lost, gluing the first base64
+    // chunk onto the marker line. Raw gpg rejects it; normalize must repair it.
+    const scope = 'gpg-glued-body';
+    ensureGpgKey(baseDir, scope);
+    const pubKey = exportPublicKey(baseDir, scope);
+
+    const userGpgHome = path.join(tmpDir, 'user-gpg-glued');
+    fs.mkdirSync(userGpgHome, { mode: 0o700, recursive: true });
+    execFileSync('gpg', ['--homedir', userGpgHome, '--batch', '--import'], {
+      input: pubKey,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const encrypted = execFileSync(
+      'gpg',
+      ['--homedir', userGpgHome, '--batch', '--trust-model', 'always', '--encrypt', '--armor', '--recipient', 'nanoclaw'],
+      { input: 'glued-secret', stdio: ['pipe', 'pipe', 'pipe'] },
+    ).toString('utf-8');
+
+    // Glue the first body chunk onto the marker line (drop the newline + blank).
+    const armorLines = encrypted.split('\n').filter((l) => l.length > 0);
+    const body = armorLines.slice(1, -1); // drop BEGIN and END lines
+    const glued = `-----BEGIN PGP MESSAGE-----${body[0]}\n${body.slice(1).join('\n')}\n-----END PGP MESSAGE-----`;
+
+    // Raw glued block is undecryptable...
+    expect(() => gpgDecrypt(baseDir, scope, glued)).toThrow();
+    // ...but after normalization it decrypts cleanly.
+    expect(gpgDecrypt(baseDir, scope, normalizeArmoredBlock(glued))).toBe('glued-secret');
   });
 
   it('gpgDecrypt works regardless of key expiry', () => {
