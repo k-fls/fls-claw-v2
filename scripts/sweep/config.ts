@@ -1,20 +1,44 @@
 /**
  * scripts/sweep/config.ts — static defaults for the sweep toolkit.
  *
- * Everything here is overridable: thresholds/sensitive paths via ScanOptions,
- * routing weights via fork-registry/routing.yaml, scope via
- * fork-registry/sweep-scope.yaml on the state branch.
+ * Durable tooling config (routing.yaml, scope.yaml, prompts, schema, test
+ * cases, bootstrap inventory snapshot) lives in this directory and is read
+ * from the LOCAL WORKING TREE. Live state is derived (merge-base) or
+ * group-owned (the ledger file in the sweep workspace). There is no state
+ * branch (dissolved 2026-07-10 by owner decision).
  */
+import { existsSync, readdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-export const DEFAULT_STATE_BRANCH = 'maint/fork-registry';
+/** Directory this toolkit lives in (module-relative config resolution). */
+export const SWEEP_DIR = dirname(fileURLToPath(import.meta.url));
 
-/** Directory prefixes on the state branch. */
-export const STATE_DIR = 'sweep-state';
-export const REGISTRY_DIR = 'fork-registry';
-export const STATE_FILE = `${STATE_DIR}/sweep-state.json`;
-export const LOG_FILE = `${STATE_DIR}/sweep-log.jsonl`;
-export const RR_CACHE_DIR = `${STATE_DIR}/rr-cache`;
-export const REPORTS_DIR = `${STATE_DIR}/reports`;
+export const DEFAULT_ROUTING_FILE = join(SWEEP_DIR, 'registry', 'routing.yaml');
+export const DEFAULT_SCOPE_FILE = join(SWEEP_DIR, 'registry', 'scope.yaml');
+export const DEFAULT_CASES_DIR = join(SWEEP_DIR, 'test-cases', 'cases');
+
+/**
+ * Default live inventory = the latest committed bootstrap snapshot
+ * (scripts/sweep/bootstrap/fork-registry@<hash>/features). Groups pass
+ * --inventory to point at a regenerated inventory in their workspace.
+ */
+export function defaultInventoryDir(): string | null {
+  const bootstrap = join(SWEEP_DIR, 'bootstrap');
+  if (!existsSync(bootstrap)) return null;
+  const snapshots = readdirSync(bootstrap)
+    .filter((name) => name.startsWith('fork-registry@'))
+    .sort();
+  if (snapshots.length === 0) return null;
+  const features = join(bootstrap, snapshots[snapshots.length - 1], 'features');
+  return existsSync(features) ? features : null;
+}
+
+/** Group-workspace file/dir names (all under --workspace, default cwd). */
+export const LEDGER_FILENAME = 'sweep-ledger.json';
+export const LOG_FILENAME = 'sweep-log.jsonl';
+export const RR_CACHE_DIRNAME = 'rr-cache';
+export const REPORTS_DIRNAME = 'reports';
 
 export const DEFAULT_UPSTREAM_REF = 'upstream/main';
 
@@ -58,8 +82,8 @@ export const DEP_PATHS = ['package.json', '**/package.json', 'pnpm-lock.yaml', '
 /**
  * Branch name globs never swept, never merged into, never enumerated as
  * scope. NOTE: fix/* (upstream-PR candidates) and docs/notes ARE swept in
- * this fork's practice — they enter scope via sweep-state.json active
- * branches, so they must not be excluded here (only fix/sweep/* is ours).
+ * this fork's practice — they enter scope via registry/scope.yaml include
+ * globs, so they must not be excluded here (only fix/sweep/* is ours).
  */
 export const EXCLUDED_BRANCH_GLOBS = [
   'everything*',

@@ -1,15 +1,27 @@
 /**
- * scripts/sweep/registry.ts — read the fork feature registry from the state
- * branch (fork-registry/**) without checking it out.
+ * scripts/sweep/registry.ts — load the fork feature inventory + tooling
+ * config from the LOCAL WORKING TREE (no state branch; dissolved
+ * 2026-07-10). The live inventory is a directory of <id>.yaml entries
+ * (--inventory; default = the committed bootstrap snapshot), routing/scope
+ * config live in scripts/sweep/registry/, replay cases in
+ * scripts/sweep/test-cases/cases/.
  *
  * Fail-closed loader in the feat/ops-registry idiom: a malformed entry never
  * crashes the sweep — it is dropped and surfaced as a load warning, and the
  * router treats its PoIs via catch-all.
  */
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
 import { parse } from 'yaml';
 
-import { DEFAULT_ROUTING, REGISTRY_DIR } from './config.js';
-import { listTreePaths, readFileFromBranch } from './git.js';
+import {
+  DEFAULT_CASES_DIR,
+  DEFAULT_ROUTING,
+  DEFAULT_ROUTING_FILE,
+  DEFAULT_SCOPE_FILE,
+  defaultInventoryDir,
+} from './config.js';
 import type { FeatureEntry, ReplayCase, RoutingConfig, SweepScope } from './types.js';
 
 export interface RegistryLoad {
@@ -42,33 +54,35 @@ export function parseFeatureEntry(raw: string, sourceName: string): { entry?: Fe
   return { entry: e };
 }
 
-export async function loadFeatures(
-  repo: string,
-  stateBranch: string,
-): Promise<{ features: FeatureEntry[]; warnings: string[] }> {
+/** Load all feature entries from an inventory directory. */
+export function loadFeatures(inventoryDir: string | null): { features: FeatureEntry[]; warnings: string[] } {
   const warnings: string[] = [];
   const features: FeatureEntry[] = [];
-  const paths = await listTreePaths(repo, stateBranch, `${REGISTRY_DIR}/features`);
-  for (const path of paths.filter((p) => p.endsWith('.yaml') || p.endsWith('.yml'))) {
-    const raw = await readFileFromBranch(repo, stateBranch, path);
-    if (raw === null) continue;
-    const { entry, error } = parseFeatureEntry(raw, path);
+  if (!inventoryDir || !existsSync(inventoryDir)) {
+    if (inventoryDir) warnings.push(`inventory directory '${inventoryDir}' does not exist`);
+    return { features, warnings };
+  }
+  const files = readdirSync(inventoryDir)
+    .filter((f) => f.endsWith('.yaml') || f.endsWith('.yml'))
+    .sort();
+  for (const file of files) {
+    const raw = readFileSync(join(inventoryDir, file), 'utf8');
+    const { entry, error } = parseFeatureEntry(raw, file);
     if (error) warnings.push(error);
     else if (entry) features.push(entry);
   }
   return { features, warnings };
 }
 
-export async function loadRoutingConfig(
-  repo: string,
-  stateBranch: string,
-): Promise<{ routing: RoutingConfig; warnings: string[] }> {
+export function loadRoutingConfig(routingFile: string = DEFAULT_ROUTING_FILE): {
+  routing: RoutingConfig;
+  warnings: string[];
+} {
   const warnings: string[] = [];
-  const raw = await readFileFromBranch(repo, stateBranch, `${REGISTRY_DIR}/routing.yaml`);
   let routing: RoutingConfig = { ...DEFAULT_ROUTING, weights: { ...DEFAULT_ROUTING.weights } };
-  if (raw !== null) {
+  if (existsSync(routingFile)) {
     try {
-      const doc = parse(raw) as
+      const doc = parse(readFileSync(routingFile, 'utf8')) as
         | (Partial<RoutingConfig> & {
             catch_all?: { always_include?: string[] };
             large_new_file_kb?: number;
@@ -86,36 +100,37 @@ export async function loadRoutingConfig(
         if (Array.isArray(doc.sensitive_surfaces)) routing.sensitiveSurfaces = doc.sensitive_surfaces;
       }
     } catch (err) {
-      warnings.push(`routing.yaml: parse error, using defaults: ${(err as Error).message}`);
+      warnings.push(`${routingFile}: parse error, using defaults: ${(err as Error).message}`);
     }
   }
   return { routing, warnings };
 }
 
-export async function loadSweepScope(
-  repo: string,
-  stateBranch: string,
-): Promise<{ scope: SweepScope; warnings: string[] }> {
+export function loadScopeConfig(scopeFile: string = DEFAULT_SCOPE_FILE): { scope: SweepScope; warnings: string[] } {
   const warnings: string[] = [];
-  const raw = await readFileFromBranch(repo, stateBranch, `${REGISTRY_DIR}/sweep-scope.yaml`);
   let scope: SweepScope = {};
-  if (raw !== null) {
+  if (existsSync(scopeFile)) {
     try {
-      const doc = parse(raw) as SweepScope | null;
+      const doc = parse(readFileSync(scopeFile, 'utf8')) as SweepScope | null;
       if (doc && typeof doc === 'object') scope = doc;
     } catch (err) {
-      warnings.push(`sweep-scope.yaml: parse error, ignoring: ${(err as Error).message}`);
+      warnings.push(`${scopeFile}: parse error, ignoring: ${(err as Error).message}`);
     }
   }
   return { scope, warnings };
 }
 
-export async function loadRegistry(repo: string, stateBranch: string): Promise<RegistryLoad> {
-  const [feat, routing, scope] = [
-    await loadFeatures(repo, stateBranch),
-    await loadRoutingConfig(repo, stateBranch),
-    await loadSweepScope(repo, stateBranch),
-  ];
+export interface LoadRegistryOptions {
+  /** undefined = use the bootstrap snapshot; null = no inventory. */
+  inventoryDir?: string | null;
+  routingFile?: string;
+  scopeFile?: string;
+}
+
+export function loadRegistry(opts: LoadRegistryOptions = {}): RegistryLoad {
+  const feat = loadFeatures(opts.inventoryDir !== undefined ? opts.inventoryDir : defaultInventoryDir());
+  const routing = loadRoutingConfig(opts.routingFile);
+  const scope = loadScopeConfig(opts.scopeFile);
   return {
     features: feat.features,
     routing: routing.routing,
@@ -124,31 +139,32 @@ export async function loadRegistry(repo: string, stateBranch: string): Promise<R
   };
 }
 
-/** Replay cases from fork-registry/test-cases/*.yaml (one case or a list per file). */
-export async function loadReplayCases(
-  repo: string,
-  stateBranch: string,
-): Promise<{ cases: ReplayCase[]; warnings: string[] }> {
+/** Replay cases from a local directory (one case or a list per file). */
+export function loadReplayCases(casesDir: string = DEFAULT_CASES_DIR): { cases: ReplayCase[]; warnings: string[] } {
   const warnings: string[] = [];
   const cases: ReplayCase[] = [];
-  const paths = await listTreePaths(repo, stateBranch, `${REGISTRY_DIR}/test-cases`);
-  for (const path of paths.filter((p) => p.endsWith('.yaml') || p.endsWith('.yml'))) {
-    const raw = await readFileFromBranch(repo, stateBranch, path);
-    if (raw === null) continue;
+  if (!existsSync(casesDir)) {
+    warnings.push(`cases directory '${casesDir}' does not exist`);
+    return { cases, warnings };
+  }
+  const files = readdirSync(casesDir)
+    .filter((f) => f.endsWith('.yaml') || f.endsWith('.yml'))
+    .sort();
+  for (const file of files) {
     try {
-      const doc = parse(raw) as ReplayCase | ReplayCase[] | null;
+      const doc = parse(readFileSync(join(casesDir, file), 'utf8')) as ReplayCase | ReplayCase[] | null;
       const list = Array.isArray(doc) ? doc : doc ? [doc] : [];
       for (const c of list) {
         if (!c.id || !c.fork_branch || !c.expected || (!c.upstream_range && !c.merge_source)) {
           warnings.push(
-            `${path}: case missing required fields (id/fork_branch/expected + upstream_range|merge_source)`,
+            `${file}: case missing required fields (id/fork_branch/expected + upstream_range|merge_source)`,
           );
           continue;
         }
         cases.push(c);
       }
     } catch (err) {
-      warnings.push(`${path}: YAML parse error: ${(err as Error).message}`);
+      warnings.push(`${file}: YAML parse error: ${(err as Error).message}`);
     }
   }
   return { cases, warnings };

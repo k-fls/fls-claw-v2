@@ -1,12 +1,13 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
-import { initFixtureRepo } from './fixtures.js';
-import { commitFilesOnBranch } from './git.js';
-import { loadRegistry, parseFeatureEntry } from './registry.js';
+import { defaultInventoryDir } from './config.js';
+import { loadFeatures, loadRegistry, loadReplayCases, loadRoutingConfig, parseFeatureEntry } from './registry.js';
 
-const STATE_BRANCH = 'maint/fork-registry';
-const repo = initFixtureRepo();
-afterAll(() => repo.destroy());
+const scratch = mkdtempSync(join(tmpdir(), 'sweep-registry-'));
+afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
 describe('parseFeatureEntry (fail closed)', () => {
   it('accepts a minimal valid entry', () => {
@@ -29,25 +30,26 @@ describe('parseFeatureEntry (fail closed)', () => {
   });
 });
 
-describe('loadRegistry', () => {
-  it('loads features/routing/scope from the state branch; bad entries become warnings', async () => {
-    await commitFilesOnBranch(
-      repo.dir,
-      STATE_BRANCH,
-      {
-        'fork-registry/features/feat.good.yaml':
-          'id: feat.good\nname: Good\nkind: feat\nstatus: shipped\nbranch: feat/good\nowned_paths:\n  - src/good/**\n',
-        'fork-registry/features/feat.broken.yaml': 'id: feat.broken\nname: no kind or status\n',
-        'fork-registry/routing.yaml':
-          'weights:\n  owned: 20\nthreshold: 8\nlarge_new_file_kb: 32\nsensitive_surfaces:\n  - src/router.ts\ncatch_all:\n  always_include: [new-skill]\n',
-        'fork-registry/sweep-scope.yaml': 'include: [main_patched]\nrecipe: [module/a, feat/b]\n',
-      },
-      'seed registry',
-    );
-    const reg = await loadRegistry(repo.dir, STATE_BRANCH);
+describe('local-tree loaders', () => {
+  const inventory = join(scratch, 'inventory');
+  mkdirSync(inventory, { recursive: true });
+  writeFileSync(
+    join(inventory, 'feat.good.yaml'),
+    'id: feat.good\nname: Good\nkind: feat\nstatus: shipped\nbranch: feat/good\nowned_paths:\n  - src/good/**\n',
+  );
+  writeFileSync(join(inventory, 'feat.broken.yaml'), 'id: feat.broken\nname: no kind or status\n');
+  const routingFile = join(scratch, 'routing.yaml');
+  writeFileSync(
+    routingFile,
+    'weights:\n  owned: 20\nthreshold: 8\nlarge_new_file_kb: 32\nsensitive_surfaces:\n  - src/router.ts\ncatch_all:\n  always_include: [new-skill]\n',
+  );
+  const scopeFile = join(scratch, 'scope.yaml');
+  writeFileSync(scopeFile, 'include: [main_patched, "fix/**"]\nrecipe: [module/a, feat/b]\n');
+
+  it('loads features/routing/scope from local files; bad entries become warnings', () => {
+    const reg = loadRegistry({ inventoryDir: inventory, routingFile, scopeFile });
     expect(reg.features.map((f) => f.id)).toEqual(['feat.good']);
     expect(reg.warnings.some((w) => w.includes('feat.broken'))).toBe(true);
-    // routing: overrides merge over defaults; live-schema extras are surfaced
     expect(reg.routing).toEqual({
       weights: { owned: 20, touch: 6, symbol: 3, keyword: 1 },
       threshold: 8,
@@ -56,14 +58,37 @@ describe('loadRegistry', () => {
       sensitiveSurfaces: ['src/router.ts'],
       catchAllAlwaysInclude: ['new-skill'],
     });
-    expect(reg.scope).toEqual({ include: ['main_patched'], recipe: ['module/a', 'feat/b'] });
+    expect(reg.scope).toEqual({ include: ['main_patched', 'fix/**'], recipe: ['module/a', 'feat/b'] });
   });
 
-  it('returns defaults when the state branch has no registry at all', async () => {
-    const reg = await loadRegistry(repo.dir, 'no-such-branch');
-    expect(reg.features).toEqual([]);
-    expect(reg.routing.threshold).toBe(6);
-    expect(reg.scope).toEqual({});
-    expect(reg.warnings).toEqual([]);
+  it('warns on a missing inventory dir and returns defaults for missing config files', () => {
+    const { features, warnings } = loadFeatures(join(scratch, 'nope'));
+    expect(features).toEqual([]);
+    expect(warnings[0]).toContain('does not exist');
+    const { routing } = loadRoutingConfig(join(scratch, 'no-routing.yaml'));
+    expect(routing.threshold).toBe(6);
+  });
+
+  it('loads replay cases from a local directory', () => {
+    const casesDir = join(scratch, 'cases');
+    mkdirSync(casesDir, { recursive: true });
+    writeFileSync(
+      join(casesDir, 'ok.yaml'),
+      'id: c1\ntaxonomy: T1\nfork_branch: feat/x\nfork_base_commit: abc\nupstream_range: a..b\nexpected:\n  classification: clean\n',
+    );
+    writeFileSync(join(casesDir, 'bad.yaml'), 'id: c2\ntaxonomy: T1\n');
+    const { cases, warnings } = loadReplayCases(casesDir);
+    expect(cases.map((c) => c.id)).toEqual(['c1']);
+    expect(warnings.some((w) => w.includes('bad.yaml'))).toBe(true);
+  });
+
+  it('the committed bootstrap snapshot is the default inventory and parses clean', () => {
+    const dir = defaultInventoryDir();
+    expect(dir).toBeTruthy();
+    expect(dir).toContain('bootstrap/fork-registry@');
+    const { features, warnings } = loadFeatures(dir);
+    expect(features.length).toBe(27);
+    expect(warnings).toEqual([]);
+    expect(features.some((f) => f.id === 'feat.mitm-credential-proxy')).toBe(true);
   });
 });

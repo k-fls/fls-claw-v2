@@ -1,17 +1,21 @@
-import { existsSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { initFixtureRepo } from './fixtures.js';
 import { revParse } from './git.js';
-import { executeMerges, exportRrCache, planMerges, rollbackBranch } from './merge.js';
-import { commitFilesOnBranch } from './git.js';
-import { emptyState } from './state.js';
-import type { SweepState } from './types.js';
+import { executeMerges, exportRrCache, planMerges, rollbackBranch, writeRrCacheDir } from './merge.js';
+import { emptyLedger } from './ledger.js';
+import type { Ledger } from './types.js';
 
-const STATE_BRANCH = 'maint/fork-registry';
+// Workspace rr-cache dir (the shared rerere cache is a plain directory now).
+const RR_DIR = join(mkdtempSync(join(tmpdir(), 'sweep-rr-')), 'rr-cache');
 const repo = initFixtureRepo();
-afterAll(() => repo.destroy());
+afterAll(() => {
+  rmSync(join(RR_DIR, '..'), { recursive: true, force: true });
+  repo.destroy();
+});
 
 const CONFLICT_EDIT = 'export const app = () => 1;\nexport const shared = "fork-side";\n';
 const RESOLUTION = 'export const app = () => 1;\nexport const shared = "merged-both";\n';
@@ -35,8 +39,8 @@ repo.commit('upstream: same-line edit', {
 repo.checkout('main');
 const upstreamTip = repo.sha('upstream-main');
 
-function stateWith(branches: SweepState['branches']): SweepState {
-  return { ...emptyState(), branches };
+function ledgerWith(branches: Ledger['branches']): Ledger {
+  return { ...emptyLedger(), branches };
 }
 
 async function targetsFor(...branches: string[]) {
@@ -45,14 +49,8 @@ async function targetsFor(...branches: string[]) {
 
 describe('planMerges', () => {
   it('classifies protected / frozen / up-to-date / clean / conflicting targets', async () => {
-    const state = stateWith({
-      'feat/gated': {
-        status: 'frozen',
-        lastMergedUpstream: null,
-        frozenBy: 'PR #7',
-        pendingBehindFreeze: 1,
-        notes: '',
-      },
+    const ledger = ledgerWith({
+      'feat/gated': { status: 'frozen', frozenBy: 'PR #7', pendingBehindFreeze: 1, notes: '' },
     });
     const plan = await planMerges(
       repo.dir,
@@ -64,7 +62,7 @@ describe('planMerges', () => {
         { branch: 'feat/replay-me', stopPoint: null, upToDate: false },
         { branch: 'feat/clean', stopPoint: upstreamTip, upToDate: false },
       ],
-      state,
+      ledger,
     );
     expect(plan.map((p) => p.action)).toEqual([
       'skip-protected',
@@ -80,7 +78,7 @@ describe('planMerges', () => {
   });
 
   it('routes conflicting merges through a worktree', async () => {
-    const plan = await planMerges(repo.dir, await targetsFor('feat/replay-me'), emptyState());
+    const plan = await planMerges(repo.dir, await targetsFor('feat/replay-me'), emptyLedger());
     expect(plan[0].method).toBe('worktree');
     expect(plan[0].expectConflicts).toEqual(['src/app.ts']);
   });
@@ -89,8 +87,8 @@ describe('planMerges', () => {
 describe('executeMerges', () => {
   it('clean merge on a non-checked-out branch uses plumbing only', async () => {
     const pre = await revParse(repo.dir, 'feat/clean');
-    const plan = await planMerges(repo.dir, await targetsFor('feat/clean'), emptyState());
-    const { outcomes } = await executeMerges(repo.dir, plan, STATE_BRANCH);
+    const plan = await planMerges(repo.dir, await targetsFor('feat/clean'), emptyLedger());
+    const { outcomes } = await executeMerges(repo.dir, plan, RR_DIR);
     expect(outcomes[0].result).toBe('merged');
     expect(outcomes[0].preRef).toBe(pre);
     expect(outcomes[0].newRef).toBe(await revParse(repo.dir, 'feat/clean'));
@@ -100,8 +98,8 @@ describe('executeMerges', () => {
 
   it('gates a conflicting merge with no rerere resolution and leaves the ref alone', async () => {
     const pre = await revParse(repo.dir, 'feat/gated');
-    const plan = await planMerges(repo.dir, await targetsFor('feat/gated'), emptyState());
-    const { outcomes } = await executeMerges(repo.dir, plan, STATE_BRANCH);
+    const plan = await planMerges(repo.dir, await targetsFor('feat/gated'), emptyLedger());
+    const { outcomes } = await executeMerges(repo.dir, plan, RR_DIR);
     expect(outcomes[0].result).toBe('gated');
     expect(outcomes[0].unresolved).toEqual(['src/app.ts']);
     expect(await revParse(repo.dir, 'feat/gated')).toBe(pre);
@@ -122,19 +120,18 @@ describe('executeMerges', () => {
     repo.git('-c', 'rerere.enabled=true', 'commit', '--no-edit', '--no-verify');
     repo.checkout('main');
 
-    // 2. Export the recorded resolution to the state branch (shared cache).
+    // 2. Export the recorded resolution to the workspace rr-cache directory.
     const rrFiles = await exportRrCache(repo.dir, {});
     expect(Object.keys(rrFiles).length).toBeGreaterThan(0);
-    expect(Object.keys(rrFiles).every((p) => p.startsWith('sweep-state/rr-cache/'))).toBe(true);
-    await commitFilesOnBranch(repo.dir, STATE_BRANCH, rrFiles, 'seed rr-cache');
+    expect(writeRrCacheDir(RR_DIR, rrFiles)).toBe(Object.keys(rrFiles).length);
 
     // 3. Fresh-clone simulation: drop the local rerere cache.
     rmSync(join(repo.dir, '.git/rr-cache'), { recursive: true, force: true });
     expect(existsSync(join(repo.dir, '.git/rr-cache'))).toBe(false);
 
     // 4. The sweep now merges the second branch with the same conflict.
-    const plan = await planMerges(repo.dir, await targetsFor('feat/replay-me'), emptyState());
-    const { outcomes } = await executeMerges(repo.dir, plan, STATE_BRANCH);
+    const plan = await planMerges(repo.dir, await targetsFor('feat/replay-me'), emptyLedger());
+    const { outcomes } = await executeMerges(repo.dir, plan, RR_DIR);
     expect(outcomes[0].result).toBe('merged');
     expect(outcomes[0].rerereResolved).toEqual(['src/app.ts']);
     expect(repo.git('show', 'feat/replay-me:src/app.ts')).toBe(RESOLUTION.trim());
@@ -143,10 +140,10 @@ describe('executeMerges', () => {
   it('skips a dirty checked-out worktree instead of merging over WIP', async () => {
     repo.checkout('feat/gated'); // check it out in the main fixture worktree
     writeFileSync(join(repo.dir, 'src/app.ts'), 'dirty WIP\n');
-    const plan = await planMerges(repo.dir, await targetsFor('feat/gated'), emptyState());
+    const plan = await planMerges(repo.dir, await targetsFor('feat/gated'), emptyLedger());
     expect(plan[0].method).toBe('worktree');
     expect(plan[0].worktree).toBe(repo.dir);
-    const { outcomes } = await executeMerges(repo.dir, plan, STATE_BRANCH);
+    const { outcomes } = await executeMerges(repo.dir, plan, RR_DIR);
     expect(outcomes[0].result).toBe('dirty-worktree');
     repo.git('checkout', '--', 'src/app.ts');
     repo.checkout('main');

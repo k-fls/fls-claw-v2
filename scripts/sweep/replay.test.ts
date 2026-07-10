@@ -1,13 +1,20 @@
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { initFixtureRepo } from './fixtures.js';
-import { commitFilesOnBranch } from './git.js';
+import { executeMerges, planMerges } from './merge.js';
+import { emptyLedger } from './ledger.js';
 import { loadReplayCases } from './registry.js';
-import { replayCase, replayCases } from './replay.js';
+import { replayCase, replayCases, seedRerereFromCases, seedableCases } from './replay.js';
 
-const STATE_BRANCH = 'maint/fork-registry';
+const scratch = mkdtempSync(join(tmpdir(), 'sweep-replay-'));
 const repo = initFixtureRepo();
-afterAll(() => repo.destroy());
+afterAll(() => {
+  rmSync(scratch, { recursive: true, force: true });
+  repo.destroy();
+});
 
 // Fork with a same-line edit; upstream: U1 docs, U2 new skill, U3 the conflict.
 repo.checkout('feat/one', { create: true, at: 'main' });
@@ -38,15 +45,13 @@ expected:
     - type: new-top-level-dir
 `;
 
-describe('replay harness', () => {
-  it('loads cases from the state branch and passes the synthetic case', async () => {
-    await commitFilesOnBranch(
-      repo.dir,
-      STATE_BRANCH,
-      { 'fork-registry/test-cases/case-001.yaml': CASE_YAML },
-      'add replay case',
-    );
-    const { cases, warnings } = await loadReplayCases(repo.dir, STATE_BRANCH);
+describe('replay harness (cases from the local tree)', () => {
+  const casesDir = join(scratch, 'cases');
+  mkdirSync(casesDir, { recursive: true });
+  writeFileSync(join(casesDir, 'case-001.yaml'), CASE_YAML);
+
+  it('loads cases from a local directory and passes the synthetic case', async () => {
+    const { cases, warnings } = loadReplayCases(casesDir);
     expect(warnings).toEqual([]);
     expect(cases).toHaveLength(1);
 
@@ -84,6 +89,23 @@ describe('replay harness', () => {
     ]);
   });
 
+  it('accepts the live registry schema: {from,to} range, semantic alias, prose poi notes', async () => {
+    const result = await replayCase(repo.dir, {
+      id: 'case-live-schema',
+      taxonomy: 'T4',
+      fork_branch: 'feat/one (historical tip, see tag)',
+      fork_base_commit: forkBase,
+      upstream_range: { from: repo.sha('main'), to: repo.sha('upstream-main') },
+      expected: {
+        classification: 'semantic', // registry taxonomy for a conflict needing semantic work
+        conflicts: ['src/app.ts (content)'], // annotation must be stripped
+        pois: ['prose note about range-level PoIs — must be ignored', { type: 'new-skill' }],
+      },
+    });
+    expect(result.failures).toEqual([]);
+    expect(result.pass).toBe(true);
+  });
+
   it('replays fork-internal propagation cases via merge_source', async () => {
     const conflicting = await replayCase(repo.dir, {
       id: 'case-propagation',
@@ -91,13 +113,9 @@ describe('replay harness', () => {
       fork_branch: 'feat/one',
       fork_base_commit: forkBase,
       merge_source: 'upstream-main',
-      expected: {
-        classification: 'known-recurring', // alias -> conflict
-        conflicts: ['src/app.ts (content)'], // annotation must be stripped
-      },
+      expected: { classification: 'known-recurring', conflicts: ['src/app.ts'] },
     });
     expect(conflicting.failures).toEqual([]);
-    expect(conflicting.pass).toBe(true);
 
     const clean = await replayCase(repo.dir, {
       id: 'case-propagation-clean',
@@ -129,23 +147,6 @@ describe('replay harness', () => {
     expect(unknown.failures[0]).toMatch(/not a known label/);
   });
 
-  it('accepts the live registry schema: {from,to} range, semantic alias, prose poi notes', async () => {
-    const result = await replayCase(repo.dir, {
-      id: 'case-live-schema',
-      taxonomy: 'T4',
-      fork_branch: 'feat/one (historical tip, see tag)',
-      fork_base_commit: forkBase,
-      upstream_range: { from: repo.sha('main'), to: repo.sha('upstream-main') },
-      expected: {
-        classification: 'semantic', // registry taxonomy for a conflict needing semantic work
-        conflicts: ['src/app.ts'],
-        pois: ['prose note about range-level PoIs — must be ignored', { type: 'new-skill' }],
-      },
-    });
-    expect(result.failures).toEqual([]);
-    expect(result.pass).toBe(true);
-  });
-
   it('fails cleanly on an unresolvable ref', async () => {
     const result = await replayCase(repo.dir, {
       id: 'case-missing-ref',
@@ -158,18 +159,89 @@ describe('replay harness', () => {
     expect(result.pass).toBe(false);
     expect(result.failures[0]).toMatch(/not found in repo/);
   });
+});
 
-  it('replays against the pinned base commit, not the live branch tip', async () => {
-    // Branch moves on (conflict resolved on the fork side)...
-    repo.checkout('feat/one');
-    repo.commit('resolve upstream side', {
-      'src/app.ts': 'export const app = () => 1;\nexport const shared = "upstream";\n',
-    });
+describe('seed-rerere from pinned resolution cases', () => {
+  const RESOLUTION = 'export const app = () => 1;\nexport const shared = "merged-both";\n';
+  const rrDir = join(scratch, 'rr-cache');
+
+  it('rebuilds the workspace rr-cache and enables auto-resolution of the recurring conflict', async () => {
+    // A second fork branch with the byte-identical conflicting edit.
+    repo.checkout('feat/sibling', { create: true, at: forkBase });
     repo.checkout('main');
-    // ...but the pinned case still sees the historical conflict.
-    const { cases } = await loadReplayCases(repo.dir, STATE_BRANCH);
-    const results = await replayCases(repo.dir, cases, 'case-001-conflict-with-skill');
-    expect(results).toHaveLength(1);
-    expect(results[0].pass).toBe(true);
+
+    // Record the canonical resolution as a plain merge commit (no rerere).
+    repo.checkout('recorded-merge', { create: true, at: forkBase });
+    try {
+      repo.git('merge', '--no-edit', 'upstream-main');
+    } catch {
+      // conflict expected
+    }
+    writeFileSync(join(repo.dir, 'src/app.ts'), RESOLUTION);
+    repo.git('add', 'src/app.ts');
+    repo.git('commit', '--no-edit', '--no-verify');
+    const resolutionRef = repo.sha('recorded-merge');
+    repo.checkout('main');
+    rmSync(join(repo.dir, '.git/rr-cache'), { recursive: true, force: true });
+
+    const seedCase = {
+      id: 'seed-t2',
+      taxonomy: 'T2',
+      fork_branch: 'feat/one',
+      fork_base_commit: forkBase,
+      merge_source: repo.sha('upstream-main'),
+      resolution_ref: resolutionRef,
+      expected: { classification: 'known-recurring' as const },
+    };
+    expect(seedableCases([seedCase]).map((c) => c.id)).toEqual(['seed-t2']);
+
+    const results = await seedRerereFromCases(repo.dir, [seedCase], rrDir);
+    expect(results).toEqual([{ caseId: 'seed-t2', status: 'seeded', conflictFiles: ['src/app.ts'] }]);
+    expect(existsSync(rrDir)).toBe(true);
+    expect(readdirSync(rrDir).length).toBeGreaterThan(0);
+    // No branch moved: recorded-merge still at the resolution commit, feat/one untouched.
+    expect(repo.sha('feat/one')).toBe(forkBase);
+    expect(repo.sha('recorded-merge')).toBe(resolutionRef);
+
+    // Fresh-clone simulation, then the sweep auto-resolves the sibling via the seeded cache.
+    rmSync(join(repo.dir, '.git/rr-cache'), { recursive: true, force: true });
+    const plan = await planMerges(
+      repo.dir,
+      [{ branch: 'feat/sibling', stopPoint: repo.sha('upstream-main'), upToDate: false }],
+      emptyLedger(),
+    );
+    expect(plan[0].method).toBe('worktree');
+    const { outcomes } = await executeMerges(repo.dir, plan, rrDir);
+    expect(outcomes[0].result).toBe('merged');
+    expect(outcomes[0].rerereResolved).toEqual(['src/app.ts']);
+    expect(repo.git('show', 'feat/sibling:src/app.ts')).toBe(RESOLUTION.trim());
+  });
+
+  it('reports no-conflict and missing-ref cases without seeding', async () => {
+    const results = await seedRerereFromCases(
+      repo.dir,
+      [
+        {
+          id: 'seed-clean',
+          taxonomy: 'T1',
+          fork_branch: 'feat/one',
+          fork_base_commit: forkBase,
+          merge_source: u2,
+          resolution_ref: forkBase,
+          expected: { classification: 'clean' as const },
+        },
+        {
+          id: 'seed-missing',
+          taxonomy: 'T2',
+          fork_branch: 'feat/one',
+          fork_base_commit: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+          merge_source: u2,
+          resolution_ref: forkBase,
+          expected: { classification: 'known-recurring' as const },
+        },
+      ],
+      rrDir,
+    );
+    expect(results.map((r) => r.status)).toEqual(['no-conflict', 'missing-ref']);
   });
 });

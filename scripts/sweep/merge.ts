@@ -9,12 +9,14 @@
  * checked out and clean, else a temporary one) with rerere enabled;
  * rerere-auto-resolved conflicts count as clean but are surfaced as
  * annotate-PoIs of type rerere-replay. Unresolved conflicts abort the merge
- * and gate the branch. Pre-merge refs are recorded for rollback.
+ * and gate the branch. Pre-merge refs are recorded for rollback. The shared
+ * rerere cache is a plain directory in the group workspace (seeded via
+ * `seed-rerere`), installed into .git/rr-cache before merging and exported
+ * back after.
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 
-import { RR_CACHE_DIR } from './config.js';
 import {
   addTempWorktree,
   commitTreeMerge,
@@ -24,8 +26,7 @@ import {
   revParse,
   worktreeBranches,
 } from './git.js';
-import { readRrCacheFiles } from './state.js';
-import type { SweepState } from './types.js';
+import type { Ledger } from './types.js';
 
 /**
  * Branches the merge stage must never write to, regardless of scope/plan
@@ -56,13 +57,13 @@ export interface MergeOutcome extends MergePlanItem {
 export async function planMerges(
   repo: string,
   ordered: { branch: string; stopPoint: string | null; upToDate: boolean }[],
-  state: SweepState,
+  ledger: Ledger,
 ): Promise<MergePlanItem[]> {
   const checkedOut = await worktreeBranches(repo);
   const plan: MergePlanItem[] = [];
   for (const { branch, stopPoint, upToDate } of ordered) {
     const preRef = await revParse(repo, branch);
-    const bs = state.branches[branch];
+    const bs = ledger.branches[branch];
     let action: MergePlanItem['action'];
     if (PROTECTED_BRANCH_RE.test(branch)) action = 'skip-protected';
     else if (bs?.status === 'frozen' || bs?.status === 'excluded') action = 'skip-frozen';
@@ -103,9 +104,13 @@ function collectRrCache(dir: string): Record<string, Buffer> {
   return out;
 }
 
-/** Install the shared rerere cache from the state branch into .git/rr-cache. */
-export async function installRrCache(repo: string, stateBranch: string): Promise<number> {
-  const files = await readRrCacheFiles(repo, stateBranch);
+/**
+ * Install the shared rerere cache from the workspace rr-cache directory
+ * (local/ephemeral; seeded by `seed-rerere`) into .git/rr-cache.
+ */
+export async function installRrCache(repo: string, rrSourceDir: string | null): Promise<number> {
+  if (!rrSourceDir) return 0;
+  const files = collectRrCache(rrSourceDir);
   const target = join(await gitCommonDir(repo), 'rr-cache');
   for (const [rel, content] of Object.entries(files)) {
     const dest = join(target, rel);
@@ -115,12 +120,22 @@ export async function installRrCache(repo: string, stateBranch: string): Promise
   return Object.keys(files).length;
 }
 
-/** rr-cache entries in .git/rr-cache that are new/changed vs the given baseline. */
+/** Write rr-cache entries (relative path -> content) into a workspace rr-cache dir. */
+export function writeRrCacheDir(rrDir: string, files: Record<string, Buffer>): number {
+  for (const [rel, content] of Object.entries(files)) {
+    const dest = join(rrDir, rel);
+    mkdirSync(dirname(dest), { recursive: true });
+    writeFileSync(dest, content);
+  }
+  return Object.keys(files).length;
+}
+
+/** rr-cache entries in .git/rr-cache that are new/changed vs the given baseline (relative paths). */
 export async function exportRrCache(repo: string, baseline: Record<string, Buffer>): Promise<Record<string, Buffer>> {
   const current = collectRrCache(join(await gitCommonDir(repo), 'rr-cache'));
   const changed: Record<string, Buffer> = {};
   for (const [rel, content] of Object.entries(current)) {
-    if (!baseline[rel] || !baseline[rel].equals(content)) changed[`${RR_CACHE_DIR}/${rel}`] = content;
+    if (!baseline[rel] || !baseline[rel].equals(content)) changed[rel] = content;
   }
   return changed;
 }
@@ -162,16 +177,16 @@ async function mergeInWorktree(
 
 export interface ExecuteMergesResult {
   outcomes: MergeOutcome[];
-  /** New/changed rr-cache files (state-branch paths), to be committed by record. */
+  /** New/changed rr-cache files (relative paths) — persisted back into the workspace rr-cache dir. */
   rrCacheExport: Record<string, Buffer>;
 }
 
 export async function executeMerges(
   repo: string,
   plan: MergePlanItem[],
-  stateBranch: string,
+  rrSourceDir: string | null,
 ): Promise<ExecuteMergesResult> {
-  await installRrCache(repo, stateBranch);
+  await installRrCache(repo, rrSourceDir);
   const baseline = collectRrCache(join(await gitCommonDir(repo), 'rr-cache'));
   const outcomes: MergeOutcome[] = [];
   for (const item of plan) {

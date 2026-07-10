@@ -11,55 +11,65 @@
  *   stop-points        per-branch largest clean first-parent prefix
  *   merge              DAG-ordered propagation to stop points     (MUTATES)
  *   verify             everything rebuild + test matrix in a temp worktree
- *   record             fold report/outcomes/verify into the state branch (MUTATES)
- *   status             human-readable sweep-state summary (--report adds per-branch scan verdicts)
- *   validate-registry  6-rule registry validator (exit 1 on ALERTs)
+ *   record             fold report/outcomes/verify into the workspace ledger (writes files)
+ *   status             sweep summary: derived merge-base + ledger overrides
+ *                      (--report adds per-branch scan verdicts)
+ *   validate-registry  6-rule inventory validator (exit 1 on ALERTs)
  *   route              score report PoIs against feature entries
- *   replay             replay registry test-cases (exit 1 on failure)
+ *   replay             replay test-cases from the local tree (exit 1 on failure)
+ *   seed-rerere        rebuild the workspace rr-cache from pinned resolution cases (MUTATES .git/rr-cache)
  *
  * Common flags:
- *   --repo <path>          repo to operate on          (default: cwd)
- *   --state-branch <name>  registry/state branch       (default: maint/fork-registry)
+ *   --repo <path>          repo to operate on              (default: cwd)
+ *   --workspace <dir>      group workspace for ledger/log/reports/rr-cache (default: cwd)
+ *   --inventory <dir>      live feature inventory           (default: latest scripts/sweep/bootstrap snapshot)
+ *   --ledger <file>        group-owned ledger JSON          (default: <workspace>/sweep-ledger.json)
+ *   --scope-config <file>  scope policy                     (default: scripts/sweep/registry/scope.yaml)
+ *   --routing-config <file> router/scan tuning              (default: scripts/sweep/registry/routing.yaml)
+ *   --cases <dir>          replay cases                     (default: scripts/sweep/test-cases/cases)
  *   --execute              actually perform mutations; WITHOUT it every
  *                          mutating subcommand only prints its plan (dry-run)
- *   --upstream <ref>       upstream ref                (default: upstream/main)
- *   --base <ref>           PoI range base              (default: state lastSweep.upstreamTip, else merge-base(main, upstream))
+ *   --upstream <ref>       upstream ref                     (default: upstream/main)
+ *   --base <ref>           PoI range base                   (default: ledger lastSweep.upstreamTip, else merge-base(main, upstream))
  *   --branch <name>        restrict to one branch (repeatable)
  *   --out <file>           write the subcommand's JSON artifact to a file
- *   --report <file>        input sweep-report.json     (merge/route/record/status)
- *   --outcomes <file>      input merge-outcomes JSON   (record/verify --rollback)
- *   --verify-result <file> input verify result JSON    (record)
- *   --recipe <a,b,c>       verify recipe override      (default: sweep-scope.yaml recipe)
+ *   --report <file>        input sweep-report.json          (merge/route/record/status)
+ *   --outcomes <file>      input merge-outcomes JSON        (record/verify --rollback)
+ *   --verify-result <file> input verify result JSON         (record)
+ *   --recipe <a,b,c>       verify recipe override           (default: scope.yaml recipe)
  *   --commands-file <file> verify command list JSON [{cmd, cwd?}] (test injection)
- *   --case <id>            replay a single case
+ *   --case <id>            replay/seed a single case
  *
  * Safety model: mutating stages are dry-run by default; `main` only ever
  * fast-forwards; everything* / design/* / maint/* branches are never merge
- * targets (fix/* and docs/notes ARE swept — upstream-PR candidates); state
- * mutations are journaled commits on the state branch (never checked out).
- * See scripts/sweep/README.md.
+ * targets (fix/* and docs/notes ARE swept — upstream-PR candidates); all
+ * state writes are plain files in the group workspace — no state branch
+ * exists (dissolved 2026-07-10). See scripts/sweep/README.md.
  */
 import { readFileSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 
 import {
-  DEFAULT_STATE_BRANCH,
   DEFAULT_UPSTREAM_REF,
   EXCLUDED_BRANCH_GLOBS,
   LARGE_ANY_BYTES,
+  LEDGER_FILENAME,
+  RR_CACHE_DIRNAME,
   SENSITIVE_PATHS,
   VERIFY_COMMANDS,
+  defaultInventoryDir,
 } from './config.js';
 import { git, isAncestor, localBranches, refExists, revParse, worktreeBranches } from './git.js';
 import { globMatchAny } from './globs.js';
-import { executeMerges, planMerges, rollbackBranch, type MergeOutcome } from './merge.js';
-import { recordSweep } from './record.js';
-import { loadRegistry, loadReplayCases, loadRoutingConfig } from './registry.js';
-import { replayCases } from './replay.js';
+import { appendSweepLog, derivedLastMerged, readLedger } from './ledger.js';
+import { executeMerges, planMerges, rollbackBranch, writeRrCacheDir, type MergeOutcome } from './merge.js';
+import { applyRecord, recordSweep } from './record.js';
+import { loadFeatures, loadRegistry, loadReplayCases, loadRoutingConfig } from './registry.js';
+import { replayCases, seedableCases, seedRerereFromCases } from './replay.js';
 import { routePois } from './routing.js';
 import { buildReport, enrichPois, type BuildReportOptions } from './scan.js';
-import { resolveScope, stateActiveBranches, type ScopeResult } from './scope.js';
+import { resolveScope, type ScopeResult } from './scope.js';
 import { findStopPoint } from './stop-points.js';
-import { readSweepState, writeSweepState } from './state.js';
 import type { SweepReport } from './types.js';
 import { validateRegistry } from './validate.js';
 import { verifyEverything, type VerifyCommand, type VerifyResult } from './verify.js';
@@ -67,7 +77,12 @@ import { verifyEverything, type VerifyCommand, type VerifyResult } from './verif
 interface Cli {
   cmd: string;
   repo: string;
-  stateBranch: string;
+  workspace: string;
+  inventory: string | null;
+  ledgerPath: string;
+  scopeFile?: string;
+  routingFile?: string;
+  casesDir?: string;
   execute: boolean;
   upstream: string;
   base?: string;
@@ -83,7 +98,7 @@ interface Cli {
 }
 
 const USAGE =
-  'Usage: pnpm exec tsx scripts/sweep/sweep.ts <fetch|ff-main|scan|stop-points|merge|verify|record|status|validate-registry|route|replay> [--repo <path>] [--state-branch <name>] [--execute] [flags]';
+  'Usage: pnpm exec tsx scripts/sweep/sweep.ts <fetch|ff-main|scan|stop-points|merge|verify|record|status|validate-registry|route|replay|seed-rerere> [--repo <path>] [--workspace <dir>] [--inventory <dir>] [--execute] [flags]';
 
 function parseCli(argv: string[]): Cli {
   const [cmd, ...rest] = argv;
@@ -91,10 +106,13 @@ function parseCli(argv: string[]): Cli {
     console.error(USAGE);
     process.exit(2);
   }
+  const raw: Record<string, string | undefined> = {};
   const cli: Cli = {
     cmd,
     repo: process.cwd(),
-    stateBranch: DEFAULT_STATE_BRANCH,
+    workspace: process.cwd(),
+    inventory: null,
+    ledgerPath: '',
     execute: false,
     upstream: DEFAULT_UPSTREAM_REF,
     branches: [],
@@ -114,8 +132,23 @@ function parseCli(argv: string[]): Cli {
       case '--repo':
         cli.repo = need();
         break;
-      case '--state-branch':
-        cli.stateBranch = need();
+      case '--workspace':
+        cli.workspace = resolve(need());
+        break;
+      case '--inventory':
+        raw.inventory = need();
+        break;
+      case '--ledger':
+        raw.ledger = need();
+        break;
+      case '--scope-config':
+        cli.scopeFile = need();
+        break;
+      case '--routing-config':
+        cli.routingFile = need();
+        break;
+      case '--cases':
+        cli.casesDir = need();
         break;
       case '--execute':
         cli.execute = true;
@@ -158,7 +191,13 @@ function parseCli(argv: string[]): Cli {
         process.exit(2);
     }
   }
+  cli.inventory = raw.inventory !== undefined ? resolve(raw.inventory) : defaultInventoryDir();
+  cli.ledgerPath = raw.ledger !== undefined ? resolve(raw.ledger) : join(cli.workspace, LEDGER_FILENAME);
   return cli;
+}
+
+function rrDirOf(cli: Cli): string {
+  return join(cli.workspace, RR_CACHE_DIRNAME);
 }
 
 function emit(cli: Cli, artifact: unknown): void {
@@ -175,17 +214,18 @@ function readJson<T>(path: string): T {
   return JSON.parse(readFileSync(path, 'utf8')) as T;
 }
 
-/** Scope from registry; namespace-enumeration fallback while the registry is being seeded. */
+/** Scope from the inventory + scope config; namespace fallback while the inventory is empty. */
 async function scopeBranches(cli: Cli): Promise<{ scope: ScopeResult; warnings: string[] }> {
-  const registry = await loadRegistry(cli.repo, cli.stateBranch);
+  const registry = loadRegistry({
+    inventoryDir: cli.inventory,
+    scopeFile: cli.scopeFile,
+    routingFile: cli.routingFile,
+  });
   const warnings = [...registry.warnings];
-  // Scope = registry entries UNION sweep-state active branches (fix/*,
-  // docs/notes etc. are swept in practice but carry no feature entry).
-  const state = await readSweepState(cli.repo, cli.stateBranch);
-  let scope = await resolveScope(cli.repo, registry.features, registry.scope, stateActiveBranches(state));
+  let scope = await resolveScope(cli.repo, registry.features, registry.scope);
   if (scope.ordered.length === 0) {
     warnings.push(
-      'registry produced an empty scope — falling back to module/*|feat/*|edition/* + main_patched enumeration',
+      'inventory produced an empty scope — falling back to module/*|feat/*|edition/* + main_patched enumeration',
     );
     const branches = (await localBranches(cli.repo)).filter(
       (b) => (/^(module|feat|edition)\//.test(b) || b === 'main_patched') && !globMatchAny(EXCLUDED_BRANCH_GLOBS, b),
@@ -208,9 +248,9 @@ async function scopeBranches(cli: Cli): Promise<{ scope: ScopeResult; warnings: 
 
 async function resolveRangeBase(cli: Cli): Promise<string> {
   if (cli.base) return cli.base;
-  const state = await readSweepState(cli.repo, cli.stateBranch);
-  if (state.lastSweep?.upstreamTip && (await refExists(cli.repo, state.lastSweep.upstreamTip))) {
-    return state.lastSweep.upstreamTip;
+  const ledger = readLedger(cli.ledgerPath);
+  if (ledger.lastSweep?.upstreamTip && (await refExists(cli.repo, ledger.lastSweep.upstreamTip))) {
+    return ledger.lastSweep.upstreamTip;
   }
   const res = await git(cli.repo, ['merge-base', 'main', cli.upstream]);
   return res.stdout.trim();
@@ -223,10 +263,10 @@ async function cmdFetch(cli: Cli): Promise<number> {
   }
   await git(cli.repo, ['fetch', 'upstream', 'origin', '--prune']);
   const tip = await revParse(cli.repo, cli.upstream);
-  const state = await readSweepState(cli.repo, cli.stateBranch);
-  const open = state.openPois.filter((p) => p.state === 'open').length;
+  const ledger = readLedger(cli.ledgerPath);
+  const open = ledger.openPois.filter((p) => p.state === 'open').length;
   console.log(`${cli.upstream} = ${tip}`);
-  if (state.lastSweep?.upstreamTip === tip && open === 0) {
+  if (ledger.lastSweep?.upstreamTip === tip && open === 0) {
     console.log('up to date with last sweep and no open PoIs — nothing to do');
   }
   return 0;
@@ -260,8 +300,8 @@ async function cmdFfMain(cli: Cli): Promise<number> {
 async function cmdScan(cli: Cli): Promise<number> {
   const { scope, warnings } = await scopeBranches(cli);
   const rangeBase = await resolveRangeBase(cli);
-  // Scan tuning from routing.yaml (registry is the tuning surface, not code).
-  const { routing } = await loadRoutingConfig(cli.repo, cli.stateBranch);
+  // Scan tuning from routing.yaml (the registry config is the tuning surface, not code).
+  const { routing } = loadRoutingConfig(cli.routingFile);
   const opts: BuildReportOptions = {};
   if (routing.largeNewFileKb !== undefined) {
     opts.largeSourceBytes = routing.largeNewFileKb * 1024;
@@ -282,7 +322,7 @@ async function cmdStopPoints(cli: Cli): Promise<number> {
 }
 
 async function cmdMerge(cli: Cli): Promise<number> {
-  const state = await readSweepState(cli.repo, cli.stateBranch);
+  const ledger = readLedger(cli.ledgerPath);
   let targets: { branch: string; stopPoint: string | null; upToDate: boolean }[];
   if (cli.report) {
     const report = readJson<SweepReport>(cli.report);
@@ -297,39 +337,31 @@ async function cmdMerge(cli: Cli): Promise<number> {
       targets.push({ branch, stopPoint: sp.stopPoint, upToDate: sp.upToDate });
     }
   }
-  const plan = await planMerges(cli.repo, targets, state);
+  const plan = await planMerges(cli.repo, targets, ledger);
   if (!cli.execute) {
     console.error('DRY-RUN (no --execute): merge plan follows');
     emit(cli, plan);
     return 0;
   }
-  const { outcomes, rrCacheExport } = await executeMerges(cli.repo, plan, cli.stateBranch);
-  // Journal the merge action (+ any new rerere resolutions) immediately.
-  const st = await readSweepState(cli.repo, cli.stateBranch);
-  await writeSweepState(
-    cli.repo,
-    cli.stateBranch,
-    st,
-    {
-      action: 'merge',
-      merged: outcomes
-        .filter((o) => o.result === 'merged')
-        .map((o) => ({ branch: o.branch, pre: o.preRef, post: o.newRef })),
-      gated: outcomes.filter((o) => o.result === 'gated').map((o) => o.branch),
-      rrCacheNewFiles: Object.keys(rrCacheExport).length,
-    },
-    rrCacheExport,
-    'sweep: merge journal + rr-cache export',
-  );
+  const { outcomes, rrCacheExport } = await executeMerges(cli.repo, plan, rrDirOf(cli));
+  const rrCacheNewFiles = writeRrCacheDir(rrDirOf(cli), rrCacheExport);
+  appendSweepLog(cli.workspace, {
+    action: 'merge',
+    merged: outcomes
+      .filter((o) => o.result === 'merged')
+      .map((o) => ({ branch: o.branch, pre: o.preRef, post: o.newRef })),
+    gated: outcomes.filter((o) => o.result === 'gated').map((o) => o.branch),
+    rrCacheNewFiles,
+  });
   emit(cli, outcomes);
   return outcomes.some((o) => o.result === 'gated' || o.result === 'dirty-worktree') ? 1 : 0;
 }
 
 async function cmdVerify(cli: Cli): Promise<number> {
-  const registry = await loadRegistry(cli.repo, cli.stateBranch);
+  const registry = loadRegistry({ inventoryDir: cli.inventory, scopeFile: cli.scopeFile });
   const recipe = cli.recipe ?? registry.scope.recipe ?? [];
   if (recipe.length === 0) {
-    console.error('verify: no recipe (pass --recipe a,b,c or add `recipe:` to fork-registry/sweep-scope.yaml)');
+    console.error('verify: no recipe (pass --recipe a,b,c or add `recipe:` to registry/scope.yaml)');
     return 2;
   }
   const commands: VerifyCommand[] = cli.commandsFile ? readJson<VerifyCommand[]>(cli.commandsFile) : VERIFY_COMMANDS;
@@ -366,41 +398,48 @@ async function cmdRecord(cli: Cli): Promise<number> {
   const outcomes = cli.outcomes ? readJson<MergeOutcome[]>(cli.outcomes) : undefined;
   const verify = cli.verifyResult ? readJson<VerifyResult>(cli.verifyResult) : undefined;
   if (!cli.execute) {
-    console.error('DRY-RUN (no --execute): would commit state update to ' + cli.stateBranch);
-    const { applyRecord } = await import('./record.js');
-    const prev = await readSweepState(cli.repo, cli.stateBranch);
+    console.error(
+      `DRY-RUN (no --execute): would write ledger ${cli.ledgerPath} + report archive under ${cli.workspace}`,
+    );
+    const prev = readLedger(cli.ledgerPath);
     emit(cli, applyRecord(prev, { report, outcomes, verify }));
     return 0;
   }
-  const { state, commit } = await recordSweep(cli.repo, cli.stateBranch, { report, outcomes, verify });
-  console.error(`state committed: ${commit} on ${cli.stateBranch}`);
-  emit(cli, state);
+  const { ledger, reportPath } = recordSweep(cli.workspace, cli.ledgerPath, { report, outcomes, verify });
+  console.error(`ledger written: ${cli.ledgerPath}; report archived: ${reportPath}`);
+  emit(cli, ledger);
   return 0;
 }
 
 async function cmdStatus(cli: Cli): Promise<number> {
-  const state = await readSweepState(cli.repo, cli.stateBranch);
+  const ledger = readLedger(cli.ledgerPath);
   const upstreamTip = (await refExists(cli.repo, cli.upstream)) ? await revParse(cli.repo, cli.upstream) : null;
-  console.log(`state branch: ${cli.stateBranch}`);
+  console.log(`workspace:    ${cli.workspace}`);
+  console.log(`ledger:       ${cli.ledgerPath}`);
+  console.log(`inventory:    ${cli.inventory ?? '(none)'}`);
   console.log(
-    state.lastSweep?.upstreamTip
-      ? `last sweep:   ${state.lastSweep.id} -> ${state.lastSweep.upstreamTip.slice(0, 12)} (${state.lastSweep.result})`
+    ledger.lastSweep?.upstreamTip
+      ? `last sweep:   ${ledger.lastSweep.id} -> ${ledger.lastSweep.upstreamTip.slice(0, 12)} (${ledger.lastSweep.result})`
       : 'last sweep:   never',
   );
   if (upstreamTip) {
-    const pending = state.lastSweep?.upstreamTip && upstreamTip !== state.lastSweep.upstreamTip;
+    const pending = ledger.lastSweep?.upstreamTip && upstreamTip !== ledger.lastSweep.upstreamTip;
     console.log(
       `${cli.upstream}: ${upstreamTip.slice(0, 12)}${pending ? '  ** NEW upstream commits since last sweep **' : ''}`,
     );
   }
-  // With --report, enrich each branch with its scan verdict: clean/ready,
-  // gated at stop point, or up-to-date.
+  // Branch set: scope union report union ledger overrides.
   const report = cli.report ? readJson<SweepReport>(cli.report) : null;
-  const names = [...new Set([...Object.keys(state.branches), ...Object.keys(report?.branches ?? {})])].sort();
-  console.log(`branches tracked: ${names.length}`);
+  const { scope } = await scopeBranches(cli);
+  const names = [
+    ...new Set([...scope.ordered, ...Object.keys(report?.branches ?? {}), ...Object.keys(ledger.branches)]),
+  ].sort();
+  console.log(`branches in scope: ${names.length}`);
   for (const name of names) {
-    const bs = state.branches[name];
-    const merged = bs?.lastMergedUpstream ? bs.lastMergedUpstream.slice(0, 12) : 'never';
+    const bs = ledger.branches[name];
+    // DERIVED state: merge-base(branch, upstream) replaces stored lastMergedUpstream.
+    const mergeBase = (await refExists(cli.repo, name)) ? await derivedLastMerged(cli.repo, name, cli.upstream) : null;
+    const merged = mergeBase ? mergeBase.slice(0, 12) : 'n/a';
     const extras = [bs?.frozenBy ? `frozen by ${bs.frozenBy}` : '', bs?.notes ?? ''].filter(Boolean).join('; ');
     let verdict = '';
     const scan = report?.branches[name];
@@ -412,10 +451,10 @@ async function cmdStatus(cli: Cli): Promise<number> {
       else verdict = `  => fully gated (first pending commit conflicts: ${scan.conflictFiles.length} files at tip)`;
     }
     console.log(
-      `  ${(bs?.status ?? '-').padEnd(8)} ${name}  lastMerged=${merged}${extras ? `  [${extras}]` : ''}${verdict}`,
+      `  ${(bs?.status ?? 'active').padEnd(8)} ${name}  mergeBase=${merged}${extras ? `  [${extras}]` : ''}${verdict}`,
     );
   }
-  const open = state.openPois.filter((p) => p.state === 'open');
+  const open = ledger.openPois.filter((p) => p.state === 'open');
   console.log(`open PoIs: ${open.length}`);
   for (const p of open)
     console.log(`  [${p.class}/${p.type}] ${p.id}${p.branches.length ? ` branches=${p.branches.join(',')}` : ''}`);
@@ -423,9 +462,9 @@ async function cmdStatus(cli: Cli): Promise<number> {
 }
 
 async function cmdValidateRegistry(cli: Cli): Promise<number> {
-  const registry = await loadRegistry(cli.repo, cli.stateBranch);
-  for (const w of registry.warnings) console.error(`LOAD WARN: ${w}`);
-  const result = await validateRegistry(cli.repo, registry.features);
+  const { features, warnings } = loadFeatures(cli.inventory);
+  for (const w of warnings) console.error(`LOAD WARN: ${w}`);
+  const result = await validateRegistry(cli.repo, features);
   emit(cli, result);
   return result.ok ? 0 : 1;
 }
@@ -436,19 +475,21 @@ async function cmdRoute(cli: Cli): Promise<number> {
     return 2;
   }
   const report = readJson<SweepReport>(cli.report);
-  const registry = await loadRegistry(cli.repo, cli.stateBranch);
-  const validation = await validateRegistry(cli.repo, registry.features);
+  const { features, warnings } = loadFeatures(cli.inventory);
+  for (const w of warnings) console.error(`LOAD WARN: ${w}`);
+  const { routing } = loadRoutingConfig(cli.routingFile);
+  const validation = await validateRegistry(cli.repo, features);
   const pois = await enrichPois(cli.repo, report);
-  const outcome = routePois(pois, registry.features, registry.routing, validation.alertedFeatureIds);
+  const outcome = routePois(pois, features, routing, validation.alertedFeatureIds);
   emit(cli, { validationAlerts: validation.alertedFeatureIds, ...outcome });
   return 0;
 }
 
 async function cmdReplay(cli: Cli): Promise<number> {
-  const { cases, warnings } = await loadReplayCases(cli.repo, cli.stateBranch);
+  const { cases, warnings } = loadReplayCases(cli.casesDir);
   for (const w of warnings) console.error(`LOAD WARN: ${w}`);
   if (cases.length === 0) {
-    console.error(`replay: no cases found on ${cli.stateBranch}:fork-registry/test-cases/`);
+    console.error('replay: no cases found');
     return 2;
   }
   const results = await replayCases(cli.repo, cases, cli.caseId);
@@ -458,6 +499,29 @@ async function cmdReplay(cli: Cli): Promise<number> {
   }
   emit(cli, results);
   return results.every((r) => r.pass) ? 0 : 1;
+}
+
+async function cmdSeedRerere(cli: Cli): Promise<number> {
+  const { cases, warnings } = loadReplayCases(cli.casesDir);
+  for (const w of warnings) console.error(`LOAD WARN: ${w}`);
+  const selected = cli.caseId ? cases.filter((c) => c.id === cli.caseId) : cases;
+  const seedable = seedableCases(selected);
+  if (seedable.length === 0) {
+    console.error('seed-rerere: no cases with merge_source + resolution_ref');
+    return 2;
+  }
+  if (!cli.execute) {
+    console.error('DRY-RUN (no --execute): would seed rr-cache from these cases');
+    emit(
+      cli,
+      seedable.map((c) => ({ id: c.id, fork_base_commit: c.fork_base_commit, resolution_ref: c.resolution_ref })),
+    );
+    return 0;
+  }
+  const results = await seedRerereFromCases(cli.repo, seedable, rrDirOf(cli));
+  appendSweepLog(cli.workspace, { action: 'seed-rerere', results });
+  emit(cli, results);
+  return results.every((r) => r.status === 'seeded' || r.status === 'no-conflict') ? 0 : 1;
 }
 
 const HANDLERS: Record<string, (cli: Cli) => Promise<number>> = {
@@ -472,6 +536,7 @@ const HANDLERS: Record<string, (cli: Cli) => Promise<number>> = {
   'validate-registry': cmdValidateRegistry,
   route: cmdRoute,
   replay: cmdReplay,
+  'seed-rerere': cmdSeedRerere,
 };
 
 const cli = parseCli(process.argv.slice(2));

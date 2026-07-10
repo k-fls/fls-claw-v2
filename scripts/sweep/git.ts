@@ -81,12 +81,6 @@ export async function refExists(repo: string, ref: string): Promise<boolean> {
   return (await git(repo, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { allowCodes: [1] })).code === 0;
 }
 
-/** `git show ref:path` — null when the path does not exist on the ref. */
-export async function readFileFromBranch(repo: string, ref: string, path: string): Promise<string | null> {
-  const res = await git(repo, ['show', `${ref}:${path}`], { allowCodes: [128] });
-  return res.code === 0 ? res.stdout : null;
-}
-
 export async function listTreePaths(repo: string, ref: string, subdir?: string): Promise<string[]> {
   const args = ['ls-tree', '-r', '--name-only', ref];
   if (subdir) args.push('--', subdir);
@@ -268,45 +262,4 @@ export async function addTempWorktree(
 export async function gitCommonDir(repo: string): Promise<string> {
   const res = await git(repo, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
   return res.stdout.trim();
-}
-
-/** Write a blob and return its oid. */
-export async function hashObject(repo: string, content: string | Buffer): Promise<string> {
-  const res = await git(repo, ['hash-object', '-w', '--stdin'], { input: content });
-  return res.stdout.trim();
-}
-
-/**
- * Commit a set of files onto a branch WITHOUT checking it out, via a
- * temporary index (read-tree + update-index --cacheinfo + write-tree +
- * commit-tree + update-ref). Creates the branch if it does not exist.
- * Returns the new commit sha.
- */
-export async function commitFilesOnBranch(
-  repo: string,
-  branch: string,
-  files: Record<string, string | Buffer>,
-  message: string,
-): Promise<string> {
-  const tip = (await refExists(repo, branch)) ? await revParse(repo, branch) : null;
-  const indexFile = join(mkdtempSync(join(tmpdir(), 'sweep-idx-')), 'index');
-  const env = { GIT_INDEX_FILE: indexFile };
-  try {
-    if (tip) await git(repo, ['read-tree', tip], { env });
-    else await git(repo, ['read-tree', '--empty'], { env });
-    for (const [path, content] of Object.entries(files)) {
-      const oid = await hashObject(repo, content);
-      await git(repo, ['update-index', '--add', '--cacheinfo', `100644,${oid},${path}`], { env });
-    }
-    const tree = (await git(repo, ['write-tree'], { env })).stdout.trim();
-    const commitArgs = ['commit-tree', tree, '-m', message];
-    if (tip) commitArgs.push('-p', tip);
-    const commit = (await git(repo, commitArgs)).stdout.trim();
-    const updateArgs = ['update-ref', `refs/heads/${branch}`, commit];
-    if (tip) updateArgs.push(tip);
-    await git(repo, updateArgs);
-    return commit;
-  } finally {
-    rmSync(join(indexFile, '..'), { recursive: true, force: true });
-  }
 }

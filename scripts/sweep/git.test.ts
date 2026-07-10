@@ -1,17 +1,7 @@
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { makeSweepFixture } from './fixtures.js';
-import {
-  commitFilesOnBranch,
-  commitTreeMerge,
-  firstParentChain,
-  isAncestor,
-  listTreePaths,
-  newStyleMergeTree,
-  readFileFromBranch,
-  refExists,
-  revParse,
-} from './git.js';
+import { commitTreeMerge, firstParentChain, isAncestor, listTreePaths, newStyleMergeTree, revParse } from './git.js';
 
 const { repo, chain } = makeSweepFixture();
 afterAll(() => repo.destroy());
@@ -58,20 +48,5 @@ describe('commitTreeMerge (July-sweep technique)', () => {
 
   it('refuses a conflicted merge', async () => {
     await expect(commitTreeMerge(repo.dir, 'feat/one', 'upstream-main', 'nope')).rejects.toThrow(/not a clean merge/);
-  });
-});
-
-describe('commitFilesOnBranch', () => {
-  it('creates and extends a branch without checkout', async () => {
-    expect(await refExists(repo.dir, 'state-branch')).toBe(false);
-    await commitFilesOnBranch(repo.dir, 'state-branch', { 'dir/a.txt': 'one\n' }, 'c1');
-    const second = await commitFilesOnBranch(repo.dir, 'state-branch', { 'dir/b.txt': 'two\n' }, 'c2');
-    expect(await revParse(repo.dir, 'state-branch')).toBe(second);
-    expect(await readFileFromBranch(repo.dir, 'state-branch', 'dir/a.txt')).toBe('one\n');
-    expect(await readFileFromBranch(repo.dir, 'state-branch', 'dir/b.txt')).toBe('two\n');
-    expect(await readFileFromBranch(repo.dir, 'state-branch', 'missing.txt')).toBeNull();
-    // Still on main, still clean.
-    expect(repo.git('branch', '--show-current')).toBe('main');
-    expect(repo.git('status', '--porcelain')).toBe('');
   });
 });

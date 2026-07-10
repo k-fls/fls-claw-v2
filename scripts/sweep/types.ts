@@ -65,18 +65,27 @@ export interface SweepReport {
   warnings: string[];
 }
 
-export interface BranchState {
+/**
+ * Group-owned ledger branch override. Absence of an entry = active.
+ * lastMergedUpstream is NOT stored — it is derived as
+ * `git merge-base <branch> upstream/main` (see ledger.derivedLastMerged).
+ */
+export interface LedgerBranch {
   status: 'active' | 'frozen' | 'excluded';
-  lastMergedUpstream: string | null;
   frozenBy: string | null;
   pendingBehindFreeze: number;
   notes: string;
 }
 
-export interface SweepState {
+/**
+ * The group-owned ledger file (--ledger, default <workspace>/sweep-ledger.json):
+ * freeze/exclude overrides, open PoIs, last-sweep record. Plain JSON in the
+ * group workspace — no state branch exists (dissolved 2026-07-10).
+ */
+export interface Ledger {
   schemaVersion: 1;
   lastSweep: { id: string; upstreamTip: string; result: 'clean' | 'partial' | 'blocked' } | null;
-  branches: Record<string, BranchState>;
+  branches: Record<string, LedgerBranch>;
   openPois: Array<
     Pick<Poi, 'id' | 'class' | 'type' | 'paths' | 'branches' | 'upstreamCommits'> & {
       state: 'open' | 'reported' | 'resolved';
@@ -85,7 +94,7 @@ export interface SweepState {
   >;
 }
 
-/** fork-registry/features/<id>.yaml (feature-inventory design §3). */
+/** Inventory entry <id>.yaml (feature-inventory design §3; --inventory dir). */
 export interface FeatureEntry {
   id: string;
   name: string;
@@ -108,7 +117,7 @@ export interface FeatureEntry {
   maintenance?: { owner?: string; last_verified?: string; verified_against?: string; notes?: string };
 }
 
-/** fork-registry/routing.yaml. */
+/** scripts/sweep/registry/routing.yaml. */
 export interface RoutingConfig {
   weights: { owned: number; touch: number; symbol: number; keyword: number };
   threshold: number;
@@ -120,8 +129,13 @@ export interface RoutingConfig {
   sensitiveSurfaces?: string[];
 }
 
-/** fork-registry/sweep-scope.yaml — scope additions on top of registry-derived branches. */
+/**
+ * scripts/sweep/registry/scope.yaml — committed scope POLICY (exclusions are
+ * config, not state). Scope = inventory branches UNION repo branches
+ * matching `include` globs, minus `exclude` + namespace exclusions.
+ */
 export interface SweepScope {
+  /** Branch-name globs matched against `git branch --list`. */
   include?: string[];
   exclude?: string[];
   /** child -> parents edges not expressible in the registry (e.g. main_patched roots). */
@@ -170,6 +184,8 @@ export interface ReplayCase {
   upstream_range?: string | { from: string; to: string };
   /** Fork-internal propagation case: merge this ref into fork_base_commit instead of an upstream range. */
   merge_source?: string;
+  /** Commit whose tree carries the canonical resolution (rerere seeding via `seed-rerere`). */
+  resolution_ref?: string;
   expected: {
     /**
      * Mechanical labels: clean | conflict | up-to-date. Registry-taxonomy

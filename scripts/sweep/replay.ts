@@ -1,9 +1,15 @@
 /**
  * scripts/sweep/replay.ts — test-case replay harness ("the pipeline tests
- * the pipeline"). Cases live in fork-registry/test-cases/**.yaml on the
- * state branch; each pins a fork branch at a historical base commit plus
+ * the pipeline"). Cases live in scripts/sweep/test-cases/cases/*.yaml in
+ * the local tree; each pins a fork branch at a historical base commit plus
  * either an upstream range (sweep case) or a merge_source ref (fork-internal
  * propagation case), and asserts the pipeline's classification.
+ *
+ * seedRerereFromCases rebuilds the workspace rerere cache from pinned
+ * propagation cases carrying a resolution_ref (the recorded merge commit
+ * with the canonical resolution): replay the conflict in a temp DETACHED
+ * worktree with rerere recording, resolve from resolution_ref, commit (no
+ * branch ref moves), then export the fresh rr-cache entries.
  *
  * Replays are ref-only: new-style merge-tree and rev-list operate on the
  * pinned commits directly, so no throwaway worktree/clone is needed (and
@@ -17,7 +23,8 @@
  * outcome, and 'excluded' cases are skipped (policy, not mechanics).
  * Unknown labels fail closed.
  */
-import { newStyleMergeTree, refExists, revParse } from './git.js';
+import { addTempWorktree, git, newStyleMergeTree, refExists, revParse } from './git.js';
+import { exportRrCache, writeRrCacheDir } from './merge.js';
 import { extractPois } from './scan.js';
 import { findStopPoint } from './stop-points.js';
 import type { Poi, ReplayCase, ReplayResult } from './types.js';
@@ -151,5 +158,67 @@ export async function replayCases(repo: string, cases: ReplayCase[], onlyId?: st
   const selected = onlyId ? cases.filter((c) => c.id === onlyId) : cases;
   const results: ReplayResult[] = [];
   for (const c of selected) results.push(await replayCase(repo, c));
+  return results;
+}
+
+/** Cases usable as rerere seeds: propagation replays with a recorded resolution. */
+export function seedableCases(cases: ReplayCase[]): ReplayCase[] {
+  return cases.filter((c) => c.merge_source && c.resolution_ref);
+}
+
+export interface SeedResult {
+  caseId: string;
+  status: 'seeded' | 'no-conflict' | 'unresolved' | 'missing-ref';
+  conflictFiles: string[];
+}
+
+/**
+ * Rebuild the workspace rerere cache (rrDir) from pinned resolution cases.
+ * Detached temp worktrees only — no branch ref is ever moved. Writes into
+ * the repo's .git/rr-cache as a side effect (rerere's recording location);
+ * that cache is local/ephemeral by design.
+ */
+export async function seedRerereFromCases(repo: string, cases: ReplayCase[], rrDir: string): Promise<SeedResult[]> {
+  const results: SeedResult[] = [];
+  for (const c of seedableCases(cases)) {
+    const refs = [c.fork_base_commit, c.merge_source!, c.resolution_ref!];
+    let missing = false;
+    for (const ref of refs) {
+      if (!(await refExists(repo, ref))) missing = true;
+    }
+    if (missing) {
+      results.push({ caseId: c.id, status: 'missing-ref', conflictFiles: [] });
+      continue;
+    }
+    const baseline = await exportRrCache(repo, {}); // current .git/rr-cache content
+    const wt = await addTempWorktree(repo, c.fork_base_commit);
+    const rerereFlags = ['-c', 'rerere.enabled=true'];
+    try {
+      const merge = await git(repo, [...rerereFlags, 'merge', '--no-edit', c.merge_source!], {
+        cwd: wt.path,
+        allowCodes: [1],
+      });
+      if (merge.code === 0) {
+        results.push({ caseId: c.id, status: 'no-conflict', conflictFiles: [] });
+        continue;
+      }
+      const unresolved = (await git(repo, ['diff', '--name-only', '--diff-filter=U'], { cwd: wt.path })).stdout
+        .split('\n')
+        .filter(Boolean);
+      // Resolve every conflicted path from the recorded resolution commit.
+      for (const path of unresolved) {
+        await git(repo, ['checkout', c.resolution_ref!, '--', path], { cwd: wt.path });
+      }
+      await git(repo, ['add', '-A'], { cwd: wt.path });
+      // Commit on the detached HEAD so rerere records the postimage.
+      await git(repo, [...rerereFlags, 'commit', '--no-edit', '--no-verify'], { cwd: wt.path });
+      results.push({ caseId: c.id, status: 'seeded', conflictFiles: unresolved });
+    } finally {
+      await wt.remove();
+    }
+    // Persist only entries new relative to the pre-case baseline.
+    const fresh = await exportRrCache(repo, Object.fromEntries(Object.entries(baseline).map(([k, v]) => [k, v])));
+    writeRrCacheDir(rrDir, fresh);
+  }
   return results;
 }

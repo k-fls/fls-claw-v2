@@ -255,3 +255,33 @@ deviations from the letter of this spec and the feature-registry design:
    `experimental/*`, `wip/*`, `design/*`, `maint/*`, `worktree-agent-*`,
    `integration/*`, `test/*`, `sweep/*`, `fix/sweep/*`) and status
    `excluded`/`frozen` rules apply on top of both sources.
+
+5. **2026-07-10 restructure — registry branch dissolved (owner decision).**
+   The spec's "maintenance branch" / state-branch model (§3 `maint/self-update`,
+   §4 sweep-state.json on a branch, D-017/D-018 `estate/sweep` data placement,
+   D-023 `maint/fork-registry`) is superseded by a snapshot+seeds model:
+   - Durable tooling config is committed WITH the code:
+     `scripts/sweep/registry/` (schema, routing.yaml, scope.yaml, prompts) and
+     `scripts/sweep/test-cases/` (replay cases, read from the local tree).
+   - The feature inventory is a GENERATED artifact: mechanical fields derived
+     fresh from git, judgment fields (invariants, overlap hints, routing
+     keywords) merged from `.claude/skills/fork-registry-generate/seeds.yaml`
+     — their canonical home. A stamped verbatim snapshot
+     (`scripts/sweep/bootstrap/fork-registry@<tree-hash>/` + MANIFEST.md,
+     moment of capture explicit) provides cheap re-bootstrap and is the
+     default `--inventory`.
+   - Live state is DERIVED or GROUP-OWNED: `lastMergedUpstream` is never
+     stored (computed as `git merge-base <branch> upstream/main`);
+     freeze/exclude overrides, open PoIs and the last-sweep record live in a
+     plain JSON ledger in the group workspace (`--ledger`, default
+     `<workspace>/sweep-ledger.json`) with an append-only sweep-log.jsonl
+     journal; `record` writes workspace files only — no git commits.
+   - Exclusion policy is CONFIG, not state: `scripts/sweep/registry/scope.yaml`
+     (include globs main_patched/fix/**/docs/notes; explicit exclusion of the
+     telegram branch). Scope = inventory branches UNION include-glob matches,
+     minus exclusions — no state file participates.
+   - The rerere cache is local/ephemeral under the workspace
+     (`<workspace>/rr-cache/`); `seed-rerere` rebuilds it from pinned T2
+     resolution cases (`resolution_ref` = the recorded merge commit carrying
+     the canonical resolution), replayed in detached temp worktrees.
+   - `--state-branch` no longer exists anywhere in the CLI.

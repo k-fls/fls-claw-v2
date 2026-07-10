@@ -1,9 +1,11 @@
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
-import { initFixtureRepo } from './fixtures.js';
+import { emptyLedger, readLedger, readSweepLog } from './ledger.js';
 import type { MergeOutcome } from './merge.js';
 import { applyRecord, recordSweep } from './record.js';
-import { emptyState, readSweepLog, readSweepState } from './state.js';
 import type { SweepReport } from './types.js';
 import type { VerifyResult } from './verify.js';
 
@@ -30,7 +32,7 @@ function outcome(partial: Partial<MergeOutcome> & { branch: string; result: Merg
 }
 
 describe('applyRecord', () => {
-  it('records merged stop points, partial notes, gates, and open PoIs', () => {
+  it('records partial notes, gates, and open PoIs (no lastMergedUpstream — derived)', () => {
     const rep = report({
       branches: {
         'feat/one': {
@@ -59,13 +61,14 @@ describe('applyRecord', () => {
       outcome({ branch: 'feat/one', result: 'merged', stopPoint: STOP }),
       outcome({ branch: 'feat/gated', result: 'gated', unresolved: ['x.ts'] }),
     ];
-    const next = applyRecord(emptyState(), { report: rep, outcomes });
+    const next = applyRecord(emptyLedger(), { report: rep, outcomes });
 
-    expect(next.branches['feat/two'].lastMergedUpstream).toBe(TIP);
-    expect(next.branches['feat/two'].notes).toBe('');
-    expect(next.branches['feat/one'].lastMergedUpstream).toBe(STOP);
+    // fully merged branch needs no ledger override at all
+    expect(next.branches['feat/two']).toBeUndefined();
     expect(next.branches['feat/one'].notes).toContain('partial');
     expect(next.branches['feat/gated'].notes).toContain('gated');
+    // ledger branches never carry lastMergedUpstream (derived via merge-base)
+    expect(Object.values(next.branches).every((b) => !('lastMergedUpstream' in b))).toBe(true);
 
     const ids = next.openPois.map((p) => p.id);
     expect(ids).toContain('merge-conflict:feat/one');
@@ -82,12 +85,12 @@ describe('applyRecord', () => {
       branches: { 'feat/two': { branch: 'feat/two', clean: true, conflictFiles: [], stopPoint: TIP, upToDate: false } },
     });
     const merged = [outcome({ branch: 'feat/two', result: 'merged' })];
-    expect(applyRecord(emptyState(), { report: cleanRep, outcomes: merged }).lastSweep?.result).toBe('clean');
+    expect(applyRecord(emptyLedger(), { report: cleanRep, outcomes: merged }).lastSweep?.result).toBe('clean');
 
     const verify: VerifyResult = { ok: false, build: { ok: true, merged: [] }, commands: [], offender: 'feat/two' };
-    const next = applyRecord(emptyState(), { report: cleanRep, outcomes: merged, verify });
+    const next = applyRecord(emptyLedger(), { report: cleanRep, outcomes: merged, verify });
     expect(next.lastSweep?.result).toBe('partial');
-    expect(next.branches['feat/two'].lastMergedUpstream).toBeNull(); // rolled back
+    expect(next.branches['feat/two'].notes).toContain('rolled back');
     const gate = next.openPois.find((p) => p.type === 'test-fail')!;
     expect(gate.class).toBe('gate');
     expect(gate.branches).toEqual(['feat/two']);
@@ -107,35 +110,35 @@ describe('applyRecord', () => {
         },
       ],
     });
-    const once = applyRecord(emptyState(), { report: rep });
+    const once = applyRecord(emptyLedger(), { report: rep });
     const twice = applyRecord(once, { report: rep });
     expect(twice.openPois).toHaveLength(1);
   });
 });
 
-describe('recordSweep (state-branch integration)', () => {
-  const repo = initFixtureRepo();
-  afterAll(() => repo.destroy());
+describe('recordSweep (workspace files, no git)', () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'sweep-record-'));
+  const ledgerPath = join(workspace, 'sweep-ledger.json');
+  afterAll(() => rmSync(workspace, { recursive: true, force: true }));
 
-  it('commits state + journal + archived report in one commit on the state branch', async () => {
+  it('writes ledger + journal + archived report + rr-cache into the workspace', () => {
     const rep = report();
-    const { state, commit } = await recordSweep(repo.dir, 'maint/fork-registry', {
+    const { ledger, reportPath, rrCacheFiles } = recordSweep(workspace, ledgerPath, {
       report: rep,
       outcomes: [outcome({ branch: 'feat/two', result: 'merged' })],
-      extraFiles: { 'sweep-state/rr-cache/aa11/preimage': 'x\n' },
+      rrCacheExport: { 'aa11/preimage': Buffer.from('x\n') },
     });
-    expect(state.lastSweep?.upstreamTip).toBe(TIP);
-    expect(repo.sha('maint/fork-registry')).toBe(commit);
+    expect(ledger.lastSweep?.upstreamTip).toBe(TIP);
+    expect(readLedger(ledgerPath)).toEqual(ledger);
 
-    const reread = await readSweepState(repo.dir, 'maint/fork-registry');
-    expect(reread).toEqual(state);
-    const log = await readSweepLog(repo.dir, 'maint/fork-registry');
+    expect(reportPath).toBe(join(workspace, 'reports', '2026-07-10T120000.000Z.json'));
+    expect(JSON.parse(readFileSync(reportPath, 'utf8')).upstreamTip).toBe(TIP);
+
+    expect(rrCacheFiles).toBe(1);
+    expect(existsSync(join(workspace, 'rr-cache', 'aa11', 'preimage'))).toBe(true);
+
+    const log = readSweepLog(workspace);
     expect(log).toHaveLength(1);
     expect(log[0]).toMatchObject({ action: 'record', result: 'clean', merged: ['feat/two'] });
-
-    const files = repo.git('ls-tree', '-r', '--name-only', 'maint/fork-registry');
-    expect(files).toContain('sweep-state/reports/2026-07-10T120000.000Z.json');
-    expect(files).toContain('sweep-state/rr-cache/aa11/preimage');
-    expect(repo.git('branch', '--show-current')).toBe('main'); // never checked out
   });
 });
