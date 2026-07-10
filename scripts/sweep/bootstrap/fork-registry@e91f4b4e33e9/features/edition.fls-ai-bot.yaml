@@ -1,0 +1,52 @@
+id: edition.fls-ai-bot
+name: FLS AI bot edition (deployable prod instance)
+kind: edition
+status: shipped
+branch: edition/fls-ai-bot
+parents:
+- feat/mitm-credential-proxy
+dependents: []
+summary: 'The named deployable FLSclaw instance running the corporate trial: Slack channel adapter, operator
+  skills (custom-env, proxy-operator), edition-specific OAuth discovery (perplexity), plus carried ssh-auth
+  module content. Deployed on prod via the three-slot dist scheme; checked out in a dedicated worktree
+  at /home/user/workspace/fls/wt/edition-fls-ai-bot.'
+owned_paths:
+- src/channels/slack.ts
+- src/channels/slack-registration.test.ts
+- container/skills/custom-env/SKILL.md
+- container/skills/proxy-operator/SKILL.md
+- src/modules/mitm-proxy/oauth/discovery/perplexity.json
+touch_paths:
+- src/channels/index.ts
+- src/cli/resources/wirings.ts
+- src/command-gate.ts
+- package.json
+- container/agent-runner/src/destinations.ts
+- container/agent-runner/src/mcp-tools/index.ts
+- container/agent-runner/src/poll-loop.ts
+- container/agent-runner/src/db/messages-out.ts
+key_symbols: []
+symbol_watch: []
+invariants: []
+design_docs: []
+test_anchors:
+- src/channels/slack-registration.test.ts
+overlap_hints: Upstream shipping an official Slack channel/adapter (e.g. slack socket mode work) is the
+  primary overlap risk; also any upstream skills that collide with custom-env/proxy-operator.
+routing:
+  keywords:
+  - slack
+  - edition
+  - deploy
+  - skill
+  always_check_on:
+  - new-skill
+prompt:
+  template: prompts/overlap-check.md
+maintenance:
+  owner: sweep-agent-group
+  last_verified: '2026-07-10'
+  verified_against: ca2fec600f5c380eb5c98880ec684a9f3456c50f
+  notes: skeleton — needs enrichment. Carries ssh-auth module files without feat/ssh-auth tip ancestry
+    — see feat.ssh-auth entry. Upstream 2026-07 sweep included slack socket-mode changes; this adapter
+    is the fork's own.

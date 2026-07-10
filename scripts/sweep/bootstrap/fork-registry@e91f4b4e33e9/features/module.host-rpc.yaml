@@ -1,0 +1,47 @@
+id: module.host-rpc
+name: Host RPC server (host<->container control channel)
+kind: module
+status: shipped
+branch: module/host-rpc
+parents:
+- module/agent-group-contributions
+dependents:
+- module/egress-lockdown
+- module/credentials
+- feat/mitm-credential-proxy
+- feat/ssh-auth
+summary: 'Host-side RPC server that agent containers call back into: port allocation, handler registry,
+  typed request/response. The control channel the credentials/mitm/ssh stacks ride on.'
+owned_paths:
+- src/modules/host-rpc/**
+- docs/host-rpc.md
+touch_paths:
+- src/container-runner.ts
+- container/entrypoint.sh
+- src/config.ts
+- src/index.ts
+key_symbols: []
+symbol_watch: []
+invariants: []
+design_docs:
+- docs/host-rpc.md@module/host-rpc
+test_anchors:
+- src/modules/host-rpc/registry.test.ts
+- src/modules/host-rpc/server.test.ts
+overlap_hints: Upstream adding any host<->container IPC/RPC mechanism (unix socket, HTTP callback, MCP
+  host bridge) is OVERLAP-HIGH; changes to container env/port plumbing are OVERLAP-TOUCH.
+routing:
+  keywords:
+  - rpc
+  - ipc
+  - host
+  - callback
+  - port
+  always_check_on: []
+prompt:
+  template: prompts/overlap-check.md
+maintenance:
+  owner: sweep-agent-group
+  last_verified: '2026-07-10'
+  verified_against: 1386c873c9b0a69f89b11f24d2ecbdf60b385f74
+  notes: skeleton — needs enrichment

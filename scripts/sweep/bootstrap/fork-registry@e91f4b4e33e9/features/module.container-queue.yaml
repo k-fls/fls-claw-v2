@@ -1,0 +1,51 @@
+id: module.container-queue
+name: Container concurrency queue + graceful shutdown
+kind: module
+status: shipped
+branch: module/container-queue
+parents:
+- main_patched
+dependents:
+- feat/mitm-credential-proxy
+summary: 'Bounded container-spawn concurrency queue plus graceful shutdown/drain: `ncl shutdown` drains
+  running containers instead of killing them (the sanctioned way to restart the daemon).'
+owned_paths:
+- src/container-queue.ts
+- src/container-queue.test.ts
+- src/shutdown.ts
+- src/cli/commands/shutdown.ts
+- src/cli/commands/shutdown.test.ts
+- docs/container-queue.md
+touch_paths:
+- src/host-sweep.ts
+- src/container-runner.ts
+- src/container-runtime.ts
+- src/index.ts
+- src/config.ts
+- src/cli/commands/index.ts
+- container/agent-runner/src/poll-loop.ts
+key_symbols: []
+symbol_watch: []
+invariants: []
+design_docs:
+- docs/container-queue.md@module/container-queue
+test_anchors:
+- src/container-queue.test.ts
+- src/cli/commands/shutdown.test.ts
+overlap_hints: Upstream adding spawn throttling/concurrency limits, queueing, or any graceful-shutdown/drain
+  mechanism. Poll-loop stop semantics changes are merge risk.
+routing:
+  keywords:
+  - queue
+  - concurrency
+  - shutdown
+  - drain
+  - graceful
+  always_check_on: []
+prompt:
+  template: prompts/overlap-check.md
+maintenance:
+  owner: sweep-agent-group
+  last_verified: '2026-07-10'
+  verified_against: 09169ade7b414a8c2927327734e2decda14d2127
+  notes: skeleton — needs enrichment

@@ -1,0 +1,86 @@
+id: module.agent-group-contributions
+name: Agent-group contributions + spawn-failure classification
+kind: module
+status: shipped                  # root module; foundational — nearly everything cascades from it
+branch: module/agent-group-contributions
+parents: [main_patched]
+dependents: [module/container-bootstrap, module/host-rpc, module/interactions-helpers,
+             feat/mitm-credential-proxy, feat/ssh-auth, feat/onecli-broker, edition/fls-ai-bot]
+
+summary: >
+  The fork's extension seam for per-agent-group container customization: modules register
+  callbacks (registerAgentGroupContribution) that are invoked synchronously at spawn time
+  and additively merged into one AgentGroupContribution consumed by buildMounts in
+  container-runner. Also reworks the wakeContainer failure contract: retryable failures
+  return false (host-sweep retries quietly), non-retryable failures throw FatalSpawnError
+  and mark the session spawn-poisoned so subsequent wakes are no-ops until the next user
+  inbound clears the flag.
+
+owned_paths:
+  - src/agent-group-contributions.ts
+  - src/agent-group-contributions.test.ts
+  - src/spawn-failure.ts
+  - src/spawn-failure.test.ts
+  - docs/agent-group-contributions.md
+  - docs/spawn-failure.md
+
+touch_paths:
+  - src/container-runner.ts        # invokeAgentGroupContributions call before buildMounts;
+                                   # amended wakeContainer contract (throws FatalSpawnError)
+  - src/command-gate.ts            # minor shared-file touches; most main_patched-vs-branch
+  - src/channels/chat-sdk-bridge.ts  # delta here is propagation lag, not ownership
+
+key_symbols:
+  - "registerAgentGroupContribution / invokeAgentGroupContributions / clearAgentGroupContributions — src/agent-group-contributions.ts"
+  - "AgentGroupContribution / AgentGroupContributionContext / AgentGroupContributionFn — src/agent-group-contributions.ts"
+  - "FatalSpawnError / markSpawnPoisoned / isSpawnPoisoned — src/spawn-failure.ts"
+
+symbol_watch:
+  - "contribut(ion|or)"
+  - "buildMounts|wakeContainer"
+  - "spawn.{0,12}(fail|poison|retry)"
+
+invariants:
+  - "wakeContainer contract: true = spawned; false = retryable (host-sweep silently retries,
+     inbound row stays pending); throws FatalSpawnError = non-retryable, session poisoned,
+     router reports via deliverDirect. Upstream refactors of the spawn path / host-sweep
+     retry semantics are high merge risk."
+  - "Contribution callbacks run synchronously; any throw is wrapped in FatalSpawnError by the
+     registry. There is exactly ONE additive merge point, immediately before buildMounts."
+  - "Poison flag is cleared by the next user inbound (router); callers without channel context
+     (host-sweep, notifyAgent wake) must .catch() and log only."
+  - "This is the composition substrate for every module/feat above it — an upstream change that
+     replaces or reshapes ContainerContributor / buildMounts breaks the whole fork stack."
+
+design_docs:
+  - docs/agent-group-contributions.md@module/agent-group-contributions
+  - docs/spawn-failure.md@module/agent-group-contributions
+
+test_anchors:
+  - src/agent-group-contributions.test.ts
+  - src/spawn-failure.test.ts
+  - src/container-runner.test.ts      # exercises the amended wakeContainer contract
+
+overlap_hints: >
+  OVERLAP-HIGH if upstream adds any plugin/extension/hook system for container spawn
+  (per-group mounts, env, or config contributed by modules), or its own spawn-failure
+  classification / retry-suppression. OVERLAP-TOUCH for any change to container-runner's
+  spawn path, buildMounts signature, host-sweep retry loop, or router error delivery.
+
+routing:
+  keywords: [contribution, plugin, hook, mounts, spawn, wake]
+  always_check_on: []
+
+prompt:
+  template: prompts/overlap-check.md
+  extra_context: >
+    Highest blast radius entry in the registry: every dependent branch inherits this seam.
+    If verdict is OVERLAP-HIGH, recommended_action must address migration for ALL dependents
+    listed above, and needs_human is mandatory.
+
+maintenance:
+  owner: sweep-agent-group
+  last_verified: "2026-07-10"
+  verified_against: f3e947ff56748dbac5a33cdb1b5a41c812d63cbb
+  notes: "src/provider-surfaces.test.ts intentionally NOT owned here — originates in shared
+          commit 14810a50 (agent-surfaces seam) present on main_patched too."
