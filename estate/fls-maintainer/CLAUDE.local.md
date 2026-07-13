@@ -57,8 +57,21 @@ report it to the owner.
    a `fix/sweep/<date>-<topic>` branch; open a PR via `gh pr create` (traceability).
    Simple resolutions: merge the PR yourself if checks are green. Complex or
    judgment-needing: leave the PR open with your provisional resolution + rationale.
-   Unresolvable: PR with NOTES.md (conflict description + one-command reproduction),
-   no resolution, branch frozen in the ledger.
+   Unresolvable (D-030): push the `fix/sweep/*` branch pointing at the upstream
+   stop-point commit — the pending upstream commits verbatim, NO resolution, NO
+   committed conflict markers, and NEVER a NOTES.md file — and open a DRAFT PR
+   against the affected branch. GitHub shows the real upstream diff and flags the PR
+   unmergeable; that unmergeable state is the conflict exhibit. All analysis
+   (conflict inventory, per-file ours/theirs hunks, options, one-command
+   reproduction) goes in the PR DESCRIPTION. Branch frozen in the ledger. When the
+   owner decides, implement the resolution as a merge commit on the SAME branch —
+   the PR turns mergeable (case-3 shape) with full history.
+   Freeze guards (D-030): before opening any freeze PR, check `fix/sweep/*` PRs for
+   the same branch, open AND closed (`gh pr list --state all`) — a closed freeze PR
+   plus a merged fix PR means the decision was already made: record it (Registry
+   upkeep), never re-open. Never freeze a branch the current scan reports as merging
+   clean. An overlap whose decision is already recorded in the inventory
+   (`prompt.extra_context`) is one digest line, never a new freeze.
 5. Verify what you can (`pnpm exec tsc --noEmit`, `pnpm exec vitest run` in the clone;
    container/bun tests may not run in this environment — if a gate cannot run, say so
    explicitly in the PR/digest; a merge is not "verified" until the full matrix ran
@@ -73,6 +86,13 @@ report it to the owner.
   from `seeds.yaml`). New judgment (invariants, hints, recurring resolutions) goes into
   `seeds.yaml` / pinned test cases via a `fix/sweep/*` PR — that is how your knowledge
   survives you.
+- **Decision write-back is a mandatory sweep step, not optional upkeep (D-030):** the
+  moment a freeze/OVERLAP is resolved (fix PR merged, or the owner states a decision),
+  record the outcome in the live inventory entry (`prompt.extra_context`: what was
+  decided, when, implementing PR, and the standing consequence for future merges) and
+  propose the matching `seeds.yaml` update. A decision that is not written back WILL be
+  re-raised by a future session that lacks your context — that is how duplicate freeze
+  PRs (#5/#12, 2026-07-13) happened.
 - When the live inventory drifts materially from the committed bootstrap snapshot,
   propose a refreshed stamped snapshot via PR.
 
@@ -85,8 +105,10 @@ report it to the owner.
   on `fix/sweep/*`, open the PR, merge it yourself when its tests are green; case 3
   (resolvable but judgment-worthy, incl. anything security-flagged or touching an open
   fork fix) — open the PR with your PROVISIONAL resolution and leave it for the owner;
-  case 4 (unresolvable) — open the PR with the conflict inventory + NOTES.md
-  (reproduction command), no resolution. `edition/*` is always case 3 minimum.
+  case 4 (unresolvable) — draft PR whose head is the upstream stop-point commit
+  (unmergeable by construction), conflict inventory + reproduction command in the PR
+  description, no resolution, no NOTES.md file (D-030). `edition/*` is always case 3
+  minimum.
 - Ask the owner in chat only for genuine policy decisions (scope changes, inventory
   drift like missing branches, OVERLAP-HIGH follow-ups) — never for permission to do
   the work the cases already authorize.
