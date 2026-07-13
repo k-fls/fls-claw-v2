@@ -166,11 +166,28 @@ rerere cache, unfreeze, resume the merge loop for that branch (script stage 4-7 
 provisional resolution + rationale; branch may continue advancing on top of the
 provisional resolution (the one sanctioned continue-on-top case). Owner merge = final.
 
-**Case 4 — unresolvable (needs decision / tests non-trivially broken):** push the
-conflicting state to `fix/sweep/...` WITHOUT resolution (merge with conflict markers
-committed is ugly — instead: branch at stop point + a NOTES.md describing the conflict,
-hunks, and analysis; the actual conflicted merge is reproducible with one command
-recorded in the notes). Open PR, don't resolve, freeze branch, alert owner.
+**Case 4 — unresolvable (needs decision / tests non-trivially broken):** push
+`fix/sweep/<date>-<topic>` pointing at the upstream stop-point commit — the pending
+upstream commits verbatim, no resolution, no committed conflict markers, and never a
+NOTES.md file (D-030; supersedes the earlier branch-at-stop-point+NOTES.md shape,
+which produced content-free single-file PRs). Open a DRAFT PR against the affected
+branch: GitHub shows the real upstream diff and flags the PR unmergeable — the
+unmergeable state IS the conflict exhibit. ALL analysis (conflict inventory, per-file
+ours/theirs hunks, options, one-command reproduction) goes in the PR DESCRIPTION.
+Don't resolve, freeze branch, alert owner. When the owner decides and the agent
+implements, the resolution merge commit lands on the same fix/sweep branch, turning
+the PR mergeable (case-3 shape) — same PR, full history.
+
+**Case-4 guards (D-030, from the 2026-07-13 #5/#12 duplicate-freeze incident):**
+- Before opening a freeze PR, check existing `fix/sweep/*` PRs for the same branch —
+  open AND closed (`gh pr list --state all`). A closed freeze PR plus a merged fix PR
+  means the decision was already made: record it (next bullet), never re-open.
+- Decision write-back is mandatory, not optional upkeep: once a freeze resolves,
+  record the outcome immediately in the live inventory entry (`prompt.extra_context`)
+  and propose the matching seeds.yaml update via a fix/sweep PR. An overlap whose
+  decision is recorded is one digest line, never a new freeze.
+- Never open a freeze PR for a branch the current scan reports as merging clean —
+  no textual conflict and no undecided overlap means there is nothing to freeze.
 
 **Multiple gates on one branch:** they queue in the state file; the branch stays at its
 earliest stop point until the first PR lands (no stacking, D-004).

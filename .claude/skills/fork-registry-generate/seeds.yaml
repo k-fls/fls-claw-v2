@@ -417,6 +417,17 @@ features:
       drains running containers instead of killing them (the sanctioned way to restart the daemon)."
     overlap_hints: Upstream adding spawn throttling/concurrency limits, queueing, or any
       graceful-shutdown/drain mechanism. Poll-loop stop semantics changes are merge risk.
+    prompt_extra_context: >
+      DECIDED 2026-07-13 (owner, Option A — coexistence, implemented in PR #7, merged):
+      upstream tasks-core removed MAX_CONCURRENT_CONTAINERS ("isolation replaces
+      throttling"); the fork KEEPS the global admission queue and its fork-only config
+      constants (MAX_CONCURRENT_CONTAINERS, IDLE_BEFORE_EVICT, EVICTION_TIMEOUT)
+      coexisting with upstream's per-series task isolation. Do NOT re-raise this overlap
+      as OVERLAP-HIGH; the standing consequence is maintenance: re-apply the fork-only
+      config.ts constants and keep reconcileContainerCapacity() coexisting with
+      upstream's task-session GC at every future upstream change to config.ts /
+      host-sweep.ts. Only escalate again if upstream REINTRODUCES its own concurrency
+      cap or removes the seams the queue hooks into.
     routing:
       keywords:
         - queue
@@ -425,7 +436,7 @@ features:
         - drain
         - graceful
       always_check_on: []
-    notes: skeleton — needs enrichment
+    notes: skeleton — needs enrichment; tasks-core overlap decided 2026-07-13 (see prompt_extra_context)
   module.credentials:
     name: Per-group credential store + provider registry
     summary: GPG-encrypted per-group credential store with provider registry/contributions, grants
