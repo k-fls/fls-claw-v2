@@ -53,10 +53,12 @@ report it to the owner.
 1. `git fetch upstream origin` in the clone; then
    `pnpm exec tsx scripts/sweep/sweep.ts scan --inventory ../inventory --ledger ../sweep-ledger.json`
    Scope: non-inventory branches are IGNORED (no scan, no PRs — at most one digest
-   drift line) unless their tip is an ancestor of an `edition/*` branch. Those
-   edition-composition branches merge `main` ONLY (upstream-PR candidates — never
-   pollute them with main_patched/fork content) and must be flagged for an inventory
-   entry ("in edition composition but no inventory entry — add one").
+   drift line) unless they are part of the transitive edition composition — merged,
+   ever, into any branch whose merge history reaches an `edition/*` branch
+   (tip-ancestry OR fork-era merge-edge closure). Those edition-composition branches
+   merge `main` ONLY (upstream-PR candidates — never pollute them with
+   main_patched/fork content) and must be flagged for an inventory entry ("in edition
+   composition but no inventory entry — add one").
 2. Post a short digest here BEFORE acting: pending commit count, per-branch
    clean/gated verdicts, PoIs by class, anything security-flagged or OVERLAP-suspect.
 3. Route annotate-PoIs (`route`) and run overlap checks with the registry prompts

@@ -159,13 +159,14 @@ policy. Nothing here deploys anything.
   --rollback` and `merge.rollbackBranch()` reset via `update-ref` (or
   `reset --hard` in the owning worktree).
 
-Scope (owner rule 2026-07-14): the swept set is main_patched (structural) +
-inventory entries' branches + non-inventory branches whose tip is an
-ancestor of any `edition/*` branch (part of a shipped composition; merge
-source `main` ONLY — upstream-PR candidates never absorb main_patched/fork
-content; flagged "add an inventory entry"). Every other non-inventory branch
-is IGNORED — one digest drift line at most. Explicit + namespace exclusions
-apply first. Merge sources: `main` ff-only, `main_patched` merges main;
+Scope (owner rule 2026-07-14, D-033): the swept set is main_patched
+(structural) + inventory entries' branches + non-inventory branches in the
+TRANSITIVE edition composition — tip-ancestor of an `edition/*` branch OR
+ever merged (fork-era merge-edge closure, transitively) into any branch
+whose merge history reaches an edition (merge source `main` ONLY —
+upstream-PR candidates never absorb main_patched/fork content; flagged "add
+an inventory entry"). Every other non-inventory branch is IGNORED — one
+digest drift line at most. Explicit + namespace exclusions apply first. Merge sources: `main` ff-only, `main_patched` merges main;
 every inventory branch merges its DAG parents — conflicts resolve once at
 the topmost affected branch, descendants inherit via parent merges.
 "Registry entry (seed + regenerate) is step 3 of every new feature branch" —

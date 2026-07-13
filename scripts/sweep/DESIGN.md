@@ -336,3 +336,35 @@ deviations from the letter of this spec and the feature-registry design:
      validator/digest: "in edition composition but no inventory entry — add
      one". Explicit exclusions (scope.yaml, telegram) apply first; the
      scope.yaml include-glob mechanism is removed.
+
+7. **D-033 (2026-07-14): the edition-composition test is TRANSITIVE and
+   HISTORICAL.** Plain tip-ancestry misses the lagging case: a fix merged
+   into main_patched, where main_patched was historically merged into the
+   edition but the edition has not absorbed the newest tip yet, was wrongly
+   ignored (real instance: fix/main/command-gate-mention-prefix). A
+   non-inventory branch now qualifies if it was ever merged into any branch
+   whose merge history (transitively) reaches an edition/* branch:
+   - Tip-ancestry into a composition member remains the cheap first check.
+   - General test (fork-era, bounded at d85efea2; unbounded in repos without
+     that commit, e.g. fixtures): "B was merged into X" ⇔ some commit on
+     B's FIRST-PARENT line — excluding commits reachable from `main` (pure
+     upstream merges never qualify anything) and commits on the first-parent
+     line of a DIFFERENT composition member (a branch cut FROM main_patched
+     inherits its whole line; those commits are main_patched's own work, not
+     evidence about the cut — without this exclusion anything cut from a
+     member would qualify) — is reachable from member X. Reachability of
+     second-parent/own-line commits is the test; merge-commit subjects are
+     never trusted (squash/rename fragile). This is a strengthening of the
+     originally sketched merge-edge extraction (`M^2 ∈ B` per merge M),
+     which cannot distinguish a merged-in branch from a branch cut from the
+     member after the merge.
+   - Closure: seeds = edition/* branches plus main_patched (structural — it
+     flows into every edition by construction); grow to fixpoint, prune
+     members whose evidence got claimed by later-joining members, alternate
+     until stable. All git reads (rev-list, first-parent lines, ancestry)
+     are memoized per run; real-repo cost ≈ 4-6 s for 40 branches.
+   - Qualifying branches keep the D-032b treatment: in scope, merge `main`
+     ONLY, flagged "in edition composition but no inventory entry — add
+     one". Everything else non-inventory stays ignored; explicit exclusions
+     beat the closure; `everything*` and other namespace-excluded branches
+     can never pull branches in.
