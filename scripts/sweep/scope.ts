@@ -10,9 +10,11 @@
  *                      tips (entry `parents`, roots default to main_patched),
  *                      NEVER upstream/main directly. Conflicts resolve once
  *                      at the topmost affected branch; descendants inherit.
- *  - edition-ancestor: non-inventory branches whose tip is an ancestor of
- *                      any edition/* branch (they are part of a shipped
- *                      composition — upstream-PR candidates cut from main);
+ *  - edition-ancestor: non-inventory branches in the TRANSITIVE edition
+ *                      composition (D-033): tip-ancestor of an edition/*
+ *                      branch OR ever merged into any branch whose merge
+ *                      history reaches an edition (fork-era merge-edge
+ *                      closure — upstream-PR candidates cut from main);
  *                      mergeModel upstream-chain (merge main ONLY — never
  *                      polluted with main_patched/fork content). Flagged:
  *                      "in edition composition but no inventory entry".
@@ -24,9 +26,9 @@
  * Order = parents before children (topological), main_patched first, then
  * edition-ancestors (independent roots), then the inventory DAG.
  */
-import { EXCLUDED_BRANCH_GLOBS } from './config.js';
+import { EXCLUDED_BRANCH_GLOBS, FORK_POINT } from './config.js';
 import { globMatchAny } from './globs.js';
-import { isAncestor, localBranches } from './git.js';
+import { git, isAncestor, localBranches, refExists } from './git.js';
 import type { FeatureEntry, ScopeEntry, SweepScope } from './types.js';
 
 export interface ScopeResult {
@@ -42,25 +44,132 @@ export interface ScopeResult {
 const SWEEPABLE_STATUS = new Set(['in-progress', 'shipped', 'experimental']);
 
 /**
- * Non-inventory scope candidates whose tip is an ancestor of any edition/*
- * branch ("present in an edition composition"). Shared by scope + validator.
+ * D-033: the edition-composition test is TRANSITIVE and HISTORICAL. A branch
+ * qualifies if it was ever merged into any branch whose merge history
+ * (transitively) reaches an edition/* branch. Tip-ancestry into a member is
+ * the cheap first check; the general test is fork-era reachability of the
+ * branch's OWN work:
+ *
+ *   B was merged into X  ⇔  some commit on B's first-parent line — excluding
+ *   commits reachable from main (upstream merges never qualify anything) and
+ *   commits on the first-parent line of ANOTHER member (a branch cut FROM
+ *   main_patched inherits its whole line; those commits are main_patched's
+ *   own, not evidence about the cut) — is reachable from X.
+ *
+ * Second-parent reachability, never merge-commit subjects (squash/rename
+ * fragile). The walk is bounded at the fork point (unbounded in repos
+ * without it, e.g. fixtures). Closure: seeds = edition/* branches plus
+ * main_patched (structural — it flows into every edition by construction);
+ * grow to fixpoint, then prune members whose evidence was claimed by
+ * later-joining members (ordering artifacts), alternating until stable.
+ * Namespace-excluded branches are neither members nor candidates (so
+ * `everything*` can never pull branches in). Returns the composition minus
+ * the editions themselves and main_patched. All git reads memoized per run.
  */
-export async function editionAncestorBranches(repo: string, repoBranches?: string[]): Promise<string[]> {
+export async function editionCompositionBranches(
+  repo: string,
+  repoBranches?: string[],
+  opts: { forkPoint?: string } = {},
+): Promise<string[]> {
   const branches = repoBranches ?? (await localBranches(repo));
-  const editions = branches.filter((b) => /^edition\//.test(b) && !globMatchAny(EXCLUDED_BRANCH_GLOBS, b));
+  const usable = branches.filter((b) => b !== 'main' && !globMatchAny(EXCLUDED_BRANCH_GLOBS, b));
+  const editions = usable.filter((b) => /^edition\//.test(b));
   if (editions.length === 0) return [];
-  const out: string[] = [];
-  for (const b of branches) {
-    if (b === 'main' || b === 'main_patched' || /^edition\//.test(b)) continue;
-    if (globMatchAny(EXCLUDED_BRANCH_GLOBS, b)) continue;
-    for (const e of editions) {
-      if (await isAncestor(repo, b, e)) {
-        out.push(b);
-        break;
+
+  const forkPoint = opts.forkPoint ?? FORK_POINT;
+  const bound = (await refExists(repo, forkPoint)) ? forkPoint : null;
+  const boundArgs = bound ? [`^${bound}`] : [];
+
+  // --- memoized git reads ---
+  const revList = async (args: string[]): Promise<Set<string>> =>
+    new Set((await git(repo, ['rev-list', ...args, ...boundArgs])).stdout.split('\n').filter(Boolean));
+  const revSetMemo = new Map<string, Set<string>>();
+  const revSet = async (b: string): Promise<Set<string>> => {
+    let s = revSetMemo.get(b);
+    if (!s) {
+      s = await revList([b]);
+      revSetMemo.set(b, s);
+    }
+    return s;
+  };
+  const fpMemo = new Map<string, Set<string>>();
+  const firstParentLine = async (b: string): Promise<Set<string>> => {
+    let s = fpMemo.get(b);
+    if (!s) {
+      s = await revList(['--first-parent', b]);
+      fpMemo.set(b, s);
+    }
+    return s;
+  };
+  const mainSet = await revList(['main']);
+  const tipAncestorMemo = new Map<string, boolean>();
+  const tipAncestor = async (b: string, x: string): Promise<boolean> => {
+    const key = `${b}..${x}`;
+    let v = tipAncestorMemo.get(key);
+    if (v === undefined) {
+      v = await isAncestor(repo, b, x);
+      tipAncestorMemo.set(key, v);
+    }
+    return v;
+  };
+
+  const qualifies = async (b: string, members: Set<string>): Promise<boolean> => {
+    for (const x of members) {
+      if (x === b) continue;
+      if (await tipAncestor(b, x)) return true;
+    }
+    // B's own fork-era work: first-parent line minus main minus other members' lines.
+    const own: string[] = [];
+    outer: for (const c of await firstParentLine(b)) {
+      if (mainSet.has(c)) continue;
+      for (const m of members) {
+        if (m === b) continue;
+        if ((await firstParentLine(m)).has(c)) continue outer;
+      }
+      own.push(c);
+    }
+    if (own.length === 0) return false;
+    for (const x of members) {
+      if (x === b) continue;
+      const xSet = await revSet(x);
+      if (own.some((c) => xSet.has(c))) return true;
+    }
+    return false;
+  };
+
+  // --- closure: grow / prune alternation until stable ---
+  const seeds = new Set<string>(editions);
+  if (usable.includes('main_patched')) seeds.add('main_patched'); // structural upstream entry point
+  const members = new Set<string>(seeds);
+  for (let round = 0; round < 10; round++) {
+    let mutated = false;
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const b of usable) {
+        if (members.has(b)) continue;
+        if (await qualifies(b, members)) {
+          if (process.env.SWEEP_DEBUG_CLOSURE) console.error(`JOIN ${b}`);
+          members.add(b);
+          changed = mutated = true;
+        }
       }
     }
+    let pruned = true;
+    while (pruned) {
+      pruned = false;
+      for (const b of [...members]) {
+        if (seeds.has(b)) continue;
+        if (!(await qualifies(b, members))) {
+          if (process.env.SWEEP_DEBUG_CLOSURE) console.error(`PRUNE ${b}`);
+          members.delete(b);
+          pruned = mutated = true;
+        }
+      }
+    }
+    if (!mutated) break;
   }
-  return out;
+  return [...members].filter((b) => !/^edition\//.test(b) && b !== 'main_patched').sort();
 }
 
 export function buildScope(
@@ -179,6 +288,6 @@ export function buildScope(
 
 export async function resolveScope(repo: string, features: FeatureEntry[], scope: SweepScope): Promise<ScopeResult> {
   const repoBranches = await localBranches(repo);
-  const ancestors = await editionAncestorBranches(repo, repoBranches);
-  return buildScope(features, scope, repoBranches, ancestors);
+  const composition = await editionCompositionBranches(repo, repoBranches);
+  return buildScope(features, scope, repoBranches, composition);
 }

@@ -42,6 +42,13 @@ export const REPORTS_DIRNAME = 'reports';
 
 export const DEFAULT_UPSTREAM_REF = 'upstream/main';
 
+/**
+ * Fork point (nanocoai v2.1.1) — bounds the fork-era merge-edge walk of the
+ * D-033 edition-composition closure. Repos without this commit (fixtures)
+ * walk unbounded.
+ */
+export const FORK_POINT = 'd85efea229ea63fb0bd4f57a039f4ef73ece563b';
+
 /** New-file size thresholds (spec D-002; annotate-PoI "large file"). */
 export const LARGE_SOURCE_BYTES = 15 * 1024;
 export const LARGE_ANY_BYTES = 40 * 1024;

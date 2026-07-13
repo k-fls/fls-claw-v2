@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { initFixtureRepo } from './fixtures.js';
-import { buildScope, editionAncestorBranches } from './scope.js';
+import { buildScope, editionCompositionBranches } from './scope.js';
 import type { FeatureEntry, ScopeEntry } from './types.js';
 
 function entry(partial: Partial<FeatureEntry> & { id: string }): FeatureEntry {
@@ -123,11 +123,12 @@ describe('buildScope (2026-07-14 partition)', () => {
   });
 });
 
-describe('editionAncestorBranches', () => {
+describe('editionCompositionBranches (D-033: transitive + historical)', () => {
   const repo = initFixtureRepo();
   afterAll(() => repo.destroy());
 
-  it('detects branches whose tip is contained in an edition branch', async () => {
+  it('qualifies tip-ancestors and, transitively, branches merged into the composition — but not cut-from branches', async () => {
+    // fix/inside merged directly into the edition (tip-ancestry path).
     repo.checkout('fix/inside', { create: true, at: 'main' });
     repo.commit('upstreamable fix', { 'src/fix.ts': 'export const f = 1;\n' });
     repo.checkout('main');
@@ -138,19 +139,102 @@ describe('editionAncestorBranches', () => {
     repo.git('merge', '--no-edit', 'fix/inside');
     repo.checkout('main');
 
-    const ancestors = await editionAncestorBranches(repo.dir);
-    expect(ancestors).toContain('fix/inside');
-    expect(ancestors).not.toContain('docs/outside');
-    expect(ancestors).not.toContain('edition/ed'); // editions are not their own candidates
-    expect(ancestors).not.toContain('main');
+    const composition = await editionCompositionBranches(repo.dir);
+    expect(composition).toContain('fix/inside');
+    expect(composition).not.toContain('docs/outside');
+    expect(composition).not.toContain('edition/ed'); // editions are the seeds, not output
+    expect(composition).not.toContain('main');
+  });
+
+  it('lagging chain: B merged into X at an old tip, X@old merged into the edition, both advance — B still qualifies', async () => {
+    // B -> X (merge), X -> edition (merge), then B and X advance past what the edition saw.
+    repo.checkout('fix/lagging', { create: true, at: 'main' });
+    repo.commit('b1', { 'src/lag.ts': 'export const l = 1;\n' });
+    repo.checkout('module/carrier', { create: true, at: 'main' });
+    repo.commit('x1', { 'src/carrier.ts': 'export const x = 1;\n' });
+    repo.git('merge', '--no-edit', 'fix/lagging'); // B@b1 merged into X
+    repo.checkout('edition/ed');
+    repo.git('merge', '--no-edit', 'module/carrier'); // X@old merged into edition
+    repo.checkout('fix/lagging');
+    repo.commit('b2 not absorbed anywhere', { 'src/lag2.ts': 'export const l = 2;\n' });
+    repo.checkout('module/carrier');
+    repo.commit('x2 not absorbed anywhere', { 'src/carrier2.ts': 'export const x = 2;\n' });
+    repo.checkout('main');
+
+    // Tips are NOT ancestors of the edition anymore...
+    expect(() => repo.git('merge-base', '--is-ancestor', 'fix/lagging', 'edition/ed')).toThrow();
+    expect(() => repo.git('merge-base', '--is-ancestor', 'module/carrier', 'edition/ed')).toThrow();
+    // ...but both are in the historical composition.
+    const composition = await editionCompositionBranches(repo.dir);
+    expect(composition).toContain('module/carrier');
+    expect(composition).toContain('fix/lagging');
+  });
+
+  it('directionality: a branch cut FROM a composition member (no inward merges) does not qualify', async () => {
+    // Cut from module/carrier AFTER it absorbed fix/lagging: contains the merged
+    // head AND the merge commit -> not "merged into" anything.
+    repo.checkout('feat/cut-from-carrier', { create: true, at: 'module/carrier' });
+    repo.commit('own work', { 'src/cut.ts': 'export const c = 1;\n' });
+    repo.checkout('main');
+    const composition = await editionCompositionBranches(repo.dir);
+    expect(composition).not.toContain('feat/cut-from-carrier');
+  });
+
+  it('transitive depth >= 2: B -> X -> Y -> edition', async () => {
+    repo.checkout('fix/deep', { create: true, at: 'main' });
+    repo.commit('deep fix', { 'src/deep.ts': 'export const d = 1;\n' });
+    repo.checkout('module/mid', { create: true, at: 'main' });
+    repo.commit('mid work', { 'src/mid.ts': 'export const m = 1;\n' });
+    repo.git('merge', '--no-edit', 'fix/deep'); // B -> X
+    repo.checkout('feat/top', { create: true, at: 'main' });
+    repo.commit('top work', { 'src/top.ts': 'export const t = 1;\n' });
+    repo.git('merge', '--no-edit', 'module/mid'); // X -> Y
+    repo.checkout('edition/ed');
+    repo.git('merge', '--no-edit', 'feat/top'); // Y -> edition
+    repo.checkout('main');
+    // All three advance so no tip is an ancestor of the edition.
+    for (const b of ['fix/deep', 'module/mid', 'feat/top']) {
+      repo.checkout(b);
+      repo.commit(`${b} advances`, { [`src/adv-${b.replace(/\W/g, '_')}.ts`]: 'export {};\n' });
+      repo.checkout('main');
+    }
+    const composition = await editionCompositionBranches(repo.dir);
+    expect(composition).toEqual(expect.arrayContaining(['feat/top', 'module/mid', 'fix/deep']));
+  });
+
+  it('upstream merges never qualify anything: X merging main does not pull main-lineage branches in', async () => {
+    // Advance main, merge it into a composition member, and park an unrelated
+    // branch on the main lineage with its own commit.
+    repo.checkout('main');
+    repo.commit('mainline change', { 'src/mainline.ts': 'export const ml = 1;\n' });
+    repo.checkout('fix/unrelated', { create: true, at: 'main' });
+    repo.commit('unmerged work', { 'src/unrelated.ts': 'export const u = 1;\n' });
+    repo.checkout('module/carrier');
+    repo.git('merge', '--no-edit', 'main'); // pure upstream merge into a member
+    repo.checkout('main');
+    const composition = await editionCompositionBranches(repo.dir);
+    expect(composition).not.toContain('fix/unrelated');
+    expect(composition).not.toContain('main');
   });
 
   it('returns nothing when the repo has no edition branches', async () => {
     const bare = initFixtureRepo();
     try {
-      expect(await editionAncestorBranches(bare.dir)).toEqual([]);
+      expect(await editionCompositionBranches(bare.dir)).toEqual([]);
     } finally {
       bare.destroy();
     }
+  });
+});
+
+describe('exclusion beats the composition closure (buildScope level)', () => {
+  it('an explicitly excluded branch stays out even when the closure qualifies it', () => {
+    const repoBranches = ['main', 'main_patched', 'edition/bot', 'fix/qualified'];
+    const features: FeatureEntry[] = [
+      entry({ id: 'edition.bot', kind: 'edition', branch: 'edition/bot', parents: [] }),
+    ];
+    const scope = buildScope(features, { exclude: ['fix/qualified'] }, repoBranches, ['fix/qualified']);
+    expect(scope.ordered.map((e) => e.branch)).not.toContain('fix/qualified');
+    expect(scope.ignored).not.toContain('fix/qualified');
   });
 });
