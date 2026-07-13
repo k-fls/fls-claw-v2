@@ -12,6 +12,22 @@
 #   routing                 keywords + always_check_on (semi-judgment)
 #   prompt_extra_context    injected into the overlap-check subagent prompt
 #   notes                   ownership corrections / enrichment status
+#
+# local_only_features (owner decision 2026-07-13): implemented on the owner's
+# machine but NOT published to origin. Generators and bootstrap consumers MUST
+# emit these as status: planned entries (no branch/parents/test_anchors; keep
+# owned_paths as intended paths so overlap routing still works) until the
+# branch appears on origin. Do not raise missing-branch alerts for them.
+local_only_features:
+  - feat.autonomy-matrix
+  - feat.calendar-triggers
+  - feat.dependent-groups
+  - feat.memory-substrate
+  - feat.ops-registry
+  - feat.question-fanout
+  - feat.tenant-budgets
+  - feat.todoist-channel
+  - feat.topic-routing
 features:
   edition.fls-ai-bot:
     name: FLS AI bot edition (deployable prod instance)

@@ -28,6 +28,13 @@ excluding `experimental/*`, `wip/*`, `everything*`, `worktree-agent-*`,
 `integration/*`, `test/*` (compare `git branch --list`) — write
 `<target>/<kind>.<slug>.yaml`:
 
+**Local-only features (seeds.yaml `local_only_features`):** these are
+implemented on the owner's machine but deliberately NOT on origin. Always emit
+them as `status: planned` (no `branch`/`parents`/`test_anchors`; keep
+`owned_paths` as intended paths so overlap routing keeps working). They are out
+of sweep scope and must not raise missing-branch alerts. When one of them
+appears on origin, drop it from `local_only_features` and generate it normally.
+
 1. **Mechanical fields (derive fresh, never copy):**
    - `branch` — the branch itself; `kind` from the namespace; `id` =
      `<kind>.<slug>` = filename stem.
