@@ -22,6 +22,7 @@ import { migration018 } from './018-approvals-approver-user-id.js';
 // 0NN migrations never collide with ours on merge. `16` = the upstream epoch
 // this was reconciled against. See docs/upstream-changes-report.md.
 import { flsMigration002 } from './16-fls-02-broker-config.js';
+import { migration019 } from './019-wiring-threads.js';
 
 export interface Migration {
   version: number;
@@ -55,6 +56,7 @@ export const migrations: Migration[] = [
   migration014,
   migration015,
   migration016,
+  migration019,
   // Fork migrations run last (after every upstream migration) — they depend on
   // upstream tables already existing, and appending keeps them clear of the
   // upstream sequence.
