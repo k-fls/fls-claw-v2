@@ -139,6 +139,16 @@ register({
 });
 
 register({
+  name: 'host-only-cmd',
+  description: 'test command (operator-only, like add-mount)',
+  resource: 'groups',
+  access: 'approval',
+  hostOnly: true,
+  parseArgs: (raw) => raw,
+  handler: async (args) => ({ echo: args }),
+});
+
+register({
   name: 'approval-context-command',
   description: 'approval command that records caller context',
   resource: 'groups',
@@ -252,6 +262,24 @@ function agentCtx(overrides?: Partial<Extract<CallerContext, { caller: 'agent' }
 }
 
 // --- Tests ---
+
+describe('host-only commands (operator-only)', () => {
+  it('rejects an agent caller even at global scope', async () => {
+    // global scope is otherwise unrestricted — hostOnly must still reject.
+    mockGetContainerConfig.mockReturnValue({ cli_scope: 'global' });
+    const resp = await dispatch({ id: '1', command: 'host-only-cmd', args: {} }, agentCtx());
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) {
+      expect(resp.error.code).toBe('forbidden');
+      expect(resp.error.message).toContain('operator-only');
+    }
+  });
+
+  it('passes the gate for a host (operator) caller', async () => {
+    const resp = await dispatch({ id: '1', command: 'host-only-cmd', args: { x: 1 } }, { caller: 'host' });
+    expect(resp.ok).toBe(true);
+  });
+});
 
 describe('CLI scope enforcement', () => {
   it('disabled: rejects all CLI requests from agent', async () => {

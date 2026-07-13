@@ -47,6 +47,14 @@ function commandDecide(cmd: CommandDef, input: GuardInput) {
   if (actor.kind === 'host') return ALLOW('host caller (trusted socket)');
   if (actor.kind !== 'agent') return DENY('CLI commands accept host or agent callers only.');
 
+  // Host-only commands (e.g. mount management) are operator-only: rejected for
+  // ANY container caller, regardless of cli_scope (even `global`) or approval.
+  // The mount allowlist is the boundary cli_scope itself lives inside, so an
+  // agent must never alter it — not even with admin approval.
+  if (cmd.hostOnly) {
+    return DENY(`"${cmd.name}" is operator-only and cannot be run from inside a container.`);
+  }
+
   const args = input.payload;
   const cliScope = getContainerConfig(actor.agentGroupId)?.cli_scope ?? 'group';
 

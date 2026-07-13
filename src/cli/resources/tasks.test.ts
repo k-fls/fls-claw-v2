@@ -105,8 +105,8 @@ describe('tasks CLI resource', () => {
     const row = systemDb.prepare("SELECT content FROM messages_in WHERE kind = 'task'").get() as { content: string };
     const content = JSON.parse(row.content);
     expect(content).toMatchObject({ originSessionId: 'chat-1' });
-    expect(content.prompt).toContain('send a briefing');
-    expect(content.prompt).toContain(`tasks/${created.series_id}.md`); // log-path hint injected
+    expect(content.prompt).toBe('send a briefing');
+    expect(content.prompt).not.toContain('Task delivery contract');
     systemDb.close();
   });
 

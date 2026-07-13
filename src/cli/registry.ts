@@ -26,6 +26,13 @@ export type CommandDef<TArgs = unknown, TData = unknown> = {
   description: string;
   access: Access;
   /**
+   * Operator-only: rejected for ANY container (agent) caller regardless of
+   * cli_scope (even `global`) or approval. For privileged host-boundary ops
+   * like mount management — the mount allowlist is the boundary cli_scope
+   * itself lives inside, so an agent must never be able to alter it.
+   */
+  hostOnly?: boolean;
+  /**
    * Dotted guard-catalog action name (e.g. `roles.grant`,
    * `groups.config.add-mcp-server`). Set by registerResource from the
    * resource + verb; commands registered directly (help) fall back to

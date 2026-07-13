@@ -50,6 +50,8 @@ export interface CustomOperation {
   args?: ColumnDef[];
   /** Ready-to-paste invocations, rendered under EXAMPLES in deep help. */
   examples?: string[];
+  /** Operator-only: never runnable from inside a container (see CommandDef.hostOnly). */
+  hostOnly?: boolean;
   handler: (args: Record<string, unknown>, ctx: CallerContext) => Promise<unknown>;
   /** Presentational renderer for human mode — see CommandDef.formatHuman. */
   formatHuman?: (data: unknown) => string;
@@ -81,6 +83,13 @@ export interface ResourceDef {
     update?: Access;
     delete?: Access;
   };
+  /**
+   * Columns forming a natural unique key. When set, generic `create` is
+   * idempotent: if a row already matches on these columns it is returned
+   * instead of re-inserted (so a skill that wires via `ncl ... create` is
+   * safe to re-apply).
+   */
+  naturalKey?: string[];
   /** Non-standard verbs (grant, revoke, add, remove, restart, etc.). */
   customOperations?: Record<string, CustomOperation>;
   /**
@@ -228,6 +237,20 @@ function genericCreate(def: ResourceDef) {
       } else if (col.defaultFrom !== undefined && values[col.defaultFrom] !== undefined) {
         values[col.name] = values[col.defaultFrom];
       }
+    }
+
+    // Idempotent create: if a row already matches the natural key, return it
+    // rather than hitting a UNIQUE violation. Lets a skill re-run `ncl … create`.
+    // Runs after pass 3 so defaultFrom-filled columns (e.g. messaging-groups'
+    // `instance`) participate in the match. No new row means postCreate /
+    // postCommit are correctly skipped — no new companion rows to create.
+    if (def.naturalKey && def.naturalKey.length > 0) {
+      const where = def.naturalKey.map((c) => `${c} = ?`).join(' AND ');
+      const params = def.naturalKey.map((c) => values[c]);
+      const existing = getDb()
+        .prepare(`SELECT ${visibleColumns(def).join(', ')} FROM ${def.table} WHERE ${where}`)
+        .get(...params);
+      if (existing) return existing;
     }
 
     const colNames = Object.keys(values);
@@ -492,6 +515,7 @@ export function registerResource(def: ResourceDef): void {
         action: `${def.plural}.${verb.replace(/ /g, '.')}`,
         description: op.description,
         access: op.access,
+        hostOnly: op.hostOnly,
         resource: def.plural,
         parseArgs: declared
           ? (raw) => {

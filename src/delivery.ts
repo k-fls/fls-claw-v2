@@ -9,7 +9,14 @@
  */
 import type Database from 'better-sqlite3';
 
-import { getRunningSessions, getActiveSessions, createPendingQuestion } from './db/sessions.js';
+import {
+  getRunningSessions,
+  getActiveSessions,
+  createPendingQuestion,
+  isTaskThread,
+  TASKS_SYSTEM_THREAD_ID,
+} from './db/sessions.js';
+import { appendRunLog } from './modules/scheduling/run-log.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { getMessagingGroup, getMessagingGroupByPlatform } from './db/messaging-groups.js';
@@ -259,6 +266,24 @@ async function deliverMessage(
   // System actions — handle internally (cli_request, etc.)
   if (msg.kind === 'system') {
     await handleSystemAction(content, session, inDb);
+    return;
+  }
+
+  // Task-run log: the runner mirrors a run's final text here (one-door
+  // delivery — final text never reaches a channel; the send_message tool is
+  // the only delivery path from a task session). Append to the series log,
+  // never deliver. The caller marks it delivered so it isn't retried.
+  if (msg.kind === 'task_log') {
+    if (session.messaging_group_id === null && isTaskThread(session.thread_id) && session.thread_id) {
+      const series = session.thread_id.slice(`${TASKS_SYSTEM_THREAD_ID}:`.length);
+      try {
+        appendRunLog(session.agent_group_id, series, typeof content.text === 'string' ? content.text : '');
+      } catch (err) {
+        log.warn('Failed to append task run log', { id: msg.id, sessionId: session.id, err });
+      }
+    } else {
+      log.warn('task_log row outside a task session — ignoring', { id: msg.id, sessionId: session.id });
+    }
     return;
   }
 

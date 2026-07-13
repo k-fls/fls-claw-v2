@@ -24,8 +24,9 @@ import {
   type TaskUpdate,
 } from '../../modules/scheduling/db.js';
 import { inboundDbPath, resolveTaskSession, withInboundDb } from '../../session-manager.js';
-import { formatLocalStamp, parseZonedToUtc } from '../../timezone.js';
+import { parseZonedToUtc } from '../../timezone.js';
 import { registerResource } from '../crud.js';
+import { appendRunLog } from '../../modules/scheduling/run-log.js';
 import { formatTasksTable } from '../format-tasks.js';
 import type { CallerContext } from '../frame.js';
 
@@ -280,24 +281,17 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   const processAfter = firstRunIso(args.process_after, recurrence);
   const id = makeTaskId(args.name);
   const originSessionId = ctx.caller === 'agent' ? ctx.sessionId : null;
-  // Each series runs in its own isolated session; point the fire at its own log.
+  // Each series runs in its own isolated session. Delivery and run-log
+  // instructions are injected by that session's runtime prompt rather than
+  // baked into persisted task content, so the contract can evolve in code.
   const { session } = resolveTaskSession(group, id);
-  const promptWithLog =
-    `${prompt}\n\n` +
-    `[A task serves the user two separate ways — do whichever the task above asks for, and ALWAYS the run log:\n` +
-    `• MESSAGE (only if asked): if the task says to report/notify the user, send your result with an EXPLICIT destination — <message to="name">…</message> or send_message({ to: "name", … }). This run has no chat attached: an unaddressed reply is DISCARDED, so the explicit send is the ONLY thing the user receives.\n` +
-    `• RUN LOG (ALWAYS — even if you sent no message and did nothing else this run): after any sends, end the run with:\n` +
-    `    ncl tasks append-log --msg "<what you did, and why it mattered>"\n` +
-    `  Write it like a work-log entry a human keeps — concrete: what you did and WHY (a no-op run still gets a line saying why nothing was needed). If you wrote or modified files this run, name them in --msg. Not a greeting, not a copy of the message you sent. The host stamps the local time (do NOT add one), do NOT edit tasks/${id}.md by hand, and this NEVER goes to the user.\n` +
-    `Need context from past runs? Read tasks/${id}.md first.]`;
-
   const created = withInbound(session, (db) => {
     insertTaskRow(db, {
       id,
       seriesId: id,
       processAfter,
       recurrence,
-      content: JSON.stringify({ prompt: promptWithLog, script, originSessionId }),
+      content: JSON.stringify({ prompt, script, originSessionId }),
     });
     return selectTask(db, id);
   });
@@ -309,7 +303,7 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
  * Append one host-timestamped line to a task's run log
  * (`<GROUPS_DIR>/<folder>/tasks/<series>.md`). This is NOT a delivery — it writes
  * nothing to messages_out; it just records what happened so the agent (and human)
- * can see when and why each fire ran. Inside a task fire the series is derived from
+ * can see when and why each run happened. Inside a task run the series is derived from
  * the caller's own task session, so the agent supplies only --msg.
  */
 function appendTaskLog(
@@ -329,22 +323,12 @@ function appendTaskLog(
     }
   }
   if (!series) throw new Error('--id is required (no task session to derive it from)');
-  // Charset guard is the security boundary here: blocks path traversal and keeps
-  // the id safe as a filename / thread suffix. Group scope is already enforced by
-  // groupArg (a cli_scope=group caller can only ever resolve its own folder), so a
-  // foreign id at worst writes a stray log under the caller's OWN folder — no leak.
-  if (!/^[a-z0-9-]+$/.test(series)) throw new Error(`invalid task id: ${series}`);
   if (!group) throw new Error('could not resolve the agent group');
 
-  const ag = getAgentGroup(group);
-  if (!ag) throw new Error(`agent group not found: ${group}`);
-
-  const timestamp = formatLocalStamp(new Date(), TIMEZONE);
-  const dir = `${GROUPS_DIR}/${ag.folder}/tasks`;
-  const file = `${dir}/${series}.md`;
-  fs.mkdirSync(dir, { recursive: true });
-  fs.appendFileSync(file, `${timestamp} — ${msg}\n`);
-  return { series, timestamp, path: file, ok: true };
+  // Group scope is enforced by groupArg (a cli_scope=group caller can only
+  // ever resolve its own folder), so a foreign id at worst writes a stray log
+  // under the caller's OWN folder — no leak. appendRunLog guards the charset.
+  return { ...appendRunLog(group, series, msg), ok: true };
 }
 
 /**
@@ -659,9 +643,9 @@ registerResource({
     'append-log': {
       access: 'open',
       description:
-        'Append a one-line run summary to a task run log (tasks/<id>.md).\n\nThe host stamps the local timestamp; you supply --msg. This is a LOG ENTRY, not a message — it sends nothing to anyone. Inside a task fire --id is auto-derived from your session. If you wrote or modified files during the run, name them in --msg.',
+        'Append a one-line note to a task run log (tasks/<id>.md).\n\nOptional: every task run auto-logs its final text, so use this only for additive mid-run notes. The host stamps the local timestamp; you supply --msg. This is a LOG ENTRY, not a message — it sends nothing to anyone. Inside a task run --id is auto-derived from your session.',
       examples: [
-        `# Inside a task fire (--id auto-derived) — the run's work-log line:\nncl tasks append-log --msg "posted the daily digest to slack; one feed returned 403, skipped"`,
+        `# Inside a task run (--id auto-derived) — optional progress note:\nncl tasks append-log --msg "one feed returned 403; continuing with the remaining feeds"`,
       ],
       args: [
         {
@@ -674,7 +658,7 @@ registerResource({
         {
           name: 'id',
           type: 'string',
-          description: 'Task series id. Auto-derived when called from inside a task fire; required otherwise.',
+          description: 'Task series id. Auto-derived when called from inside a task run; required otherwise.',
         },
         {
           name: 'group',
