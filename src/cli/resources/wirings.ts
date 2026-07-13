@@ -1,8 +1,29 @@
-import { randomUUID } from 'crypto';
-
-import { createMessagingGroupAgent } from '../../db/messaging-groups.js';
-import type { MessagingGroupAgent } from '../../types.js';
+import {
+  resolveWiringDefaults,
+  validateEngageAgainstChannel,
+  type EngageValues,
+} from '../../channels/channel-defaults.js';
+import { hasDeclaredChannelDefaults } from '../../channels/channel-registry.js';
+import { getAgentGroup } from '../../db/agent-groups.js';
+import { ensureAgentDestinationForWiring, getMessagingGroup } from '../../db/messaging-groups.js';
+import { log } from '../../log.js';
+import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';
 import { registerResource } from '../crud.js';
+import { projectDestinationsToSessions } from './destinations.js';
+
+function requireMessagingGroup(id: unknown): MessagingGroup {
+  const mg = getMessagingGroup(String(id));
+  if (!mg) throw new Error(`messaging group not found: ${id}`);
+  return mg;
+}
+
+/** --threads accepts true/false (or 1/0); stored as INTEGER 1/0. Omitted =
+ *  column NULL = inherit the channel declaration. */
+function normalizeThreads(v: unknown): number {
+  if (v === true || v === 'true' || v === '1' || v === 1) return 1;
+  if (v === false || v === 'false' || v === '0' || v === 0) return 0;
+  throw new Error(`--threads must be true or false, got "${v}"`);
+}
 
 registerResource({
   name: 'wiring',
@@ -29,7 +50,7 @@ registerResource({
       name: 'engage_mode',
       type: 'string',
       description:
-        'When the agent engages. "mention" — only when @mentioned or in DMs. "mention-sticky" — once mentioned in a thread, the agent subscribes and responds to all subsequent messages in that thread without needing further mentions. "pattern" — matches every message against engage_pattern regex.',
+        'When the agent engages. "mention" — only when @mentioned or in DMs. "mention-sticky" — once mentioned in a thread, the agent subscribes and responds to all subsequent messages in that thread without needing further mentions. "pattern" — matches every message against engage_pattern regex. Default: declared by the channel adapter for the target chat (DM vs group); "mention" when the channel has no declaration.',
       enum: ['pattern', 'mention', 'mention-sticky'],
       default: 'mention',
       updatable: true,
@@ -68,64 +89,82 @@ registerResource({
       default: 'shared',
       updatable: true,
     },
+    {
+      name: 'threads',
+      type: 'boolean',
+      description:
+        'Per-wiring thread override: honor platform thread ids for this wiring (per-thread sessions in groups; replies, typing, and cards land in-thread). NULL = inherit channel default. Can disable threads on a threaded platform, never enable them on a non-threaded one.',
+      updatable: true,
+    },
+    {
+      name: 'priority',
+      type: 'number',
+      description: 'Fanout order when multiple agents are wired to the same messaging group — higher priority first.',
+      default: 0,
+      updatable: true,
+    },
     { name: 'created_at', type: 'string', description: 'Auto-set.', generated: true },
   ],
-  // `create` is intentionally not in `operations` — the generic single-table
-  // INSERT bypasses the domain helper `createMessagingGroupAgent`, which also
-  // auto-creates the matching `agent_destinations` row so the agent can deliver
-  // to the wired chat as a target. Without it, `destinations list` is empty and
-  // the agent's `<message to="...">` blocks get dropped (#5). The custom handler
-  // below routes through `createMessagingGroupAgent` instead.
-  operations: { list: 'open', get: 'open', update: 'approval', delete: 'approval' },
-  customOperations: {
-    create: {
-      access: 'approval',
-      description:
-        'Wire a messaging group to an agent group, and auto-create the matching channel destination ' +
-        'so the agent can deliver to that chat as a target. ' +
-        'Use --messaging-group-id <id> --agent-group-id <id> ' +
-        '[--engage-mode mention|mention-sticky|pattern] [--engage-pattern <regex>] ' +
-        '[--sender-scope all|known] [--ignored-message-policy drop|accumulate] ' +
-        '[--session-mode shared|per-thread|agent-shared].',
-      handler: async (args) => {
-        const messagingGroupId = args.messaging_group_id as string | undefined;
-        if (!messagingGroupId) throw new Error('--messaging-group-id is required');
-        const agentGroupId = args.agent_group_id as string | undefined;
-        if (!agentGroupId) throw new Error('--agent-group-id is required');
+  operations: { list: 'open', get: 'open', create: 'approval', update: 'approval', delete: 'approval' },
+  resolveDefaults: (values) => {
+    const mg = requireMessagingGroup(values.messaging_group_id);
+    if (values.threads !== undefined) values.threads = normalizeThreads(values.threads);
 
-        // Replicate generic-create enum validation + DEFAULTS for the
-        // remaining columns declared in this resource.
-        const enums: Record<string, string[]> = {
-          engage_mode: ['pattern', 'mention', 'mention-sticky'],
-          sender_scope: ['all', 'known'],
-          ignored_message_policy: ['drop', 'accumulate'],
-          session_mode: ['shared', 'per-thread', 'agent-shared'],
-        };
-        function pick(name: keyof typeof enums, def: string): string {
-          const v = args[name];
-          if (v === undefined) return def;
-          if (!enums[name].includes(String(v))) {
-            throw new Error(`${name} must be one of: ${enums[name].join(', ')}`);
-          }
-          return String(v);
+    const channelKey = mg.instance ?? mg.channel_type;
+    // Undeclared (stale) channels: leave engage_mode unset so the static
+    // 'mention' default applies afterwards — a trunk update alone must not
+    // change ncl's creation defaults for adapters without a declaration.
+    if (values.engage_mode === undefined) {
+      if (hasDeclaredChannelDefaults(channelKey, mg.channel_type)) {
+        const ag = getAgentGroup(String(values.agent_group_id));
+        if (!ag) throw new Error(`agent group not found: ${values.agent_group_id}`);
+        const resolved = resolveWiringDefaults(channelKey, mg.is_group === 1, ag.name, mg.channel_type);
+        values.engage_mode = resolved.engage_mode;
+        if (values.engage_pattern === undefined && resolved.engage_pattern !== null) {
+          values.engage_pattern = resolved.engage_pattern;
         }
+      } else {
+        log.warn(
+          `wiring create: channel '${channelKey}' has no declared defaults (adapter not installed or stale) — using legacy static defaults`,
+        );
+      }
+    }
+    validateEngageAgainstChannel(values, mg);
+  },
+  preUpdate: (updates, current) => {
+    const mg = requireMessagingGroup(current.messaging_group_id);
+    if (updates.threads !== undefined) updates.threads = normalizeThreads(updates.threads);
 
-        const mga: MessagingGroupAgent = {
-          id: randomUUID(),
-          messaging_group_id: messagingGroupId,
-          agent_group_id: agentGroupId,
-          engage_mode: pick('engage_mode', 'mention') as MessagingGroupAgent['engage_mode'],
-          engage_pattern: args.engage_pattern !== undefined ? (args.engage_pattern as string) : null,
-          sender_scope: pick('sender_scope', 'all') as MessagingGroupAgent['sender_scope'],
-          ignored_message_policy: pick('ignored_message_policy', 'drop') as MessagingGroupAgent['ignored_message_policy'],
-          session_mode: pick('session_mode', 'shared') as MessagingGroupAgent['session_mode'],
-          priority: 0,
-          created_at: new Date().toISOString(),
-        };
-
-        createMessagingGroupAgent(mga);
-        return mga;
-      },
-    },
+    const merged: EngageValues = { ...current, ...updates };
+    // Legacy rows can be engage_mode='pattern' with a NULL pattern (the
+    // router treats that as match-all). Don't reject unrelated updates to
+    // them — only enforce the pairing when the pattern fields change.
+    if (
+      updates.engage_mode === undefined &&
+      updates.engage_pattern === undefined &&
+      merged.engage_mode === 'pattern' &&
+      (merged.engage_pattern === undefined || merged.engage_pattern === null)
+    ) {
+      merged.engage_pattern = '.';
+    }
+    validateEngageAgainstChannel(merged, mg);
+    // Carry the sticky→mention coercion (if any) back into the update set.
+    if (merged.engage_mode !== (updates.engage_mode ?? current.engage_mode)) {
+      updates.engage_mode = merged.engage_mode;
+    }
+  },
+  postCreate: (row) => {
+    // Create the companion `agent_destinations` row so the agent has a
+    // local name it can address this chat by. Without this, the agent
+    // generates a response, but delivery's ACL drops the outbound message
+    // (no destination matches the target) and the reply is silently lost.
+    // See issue #2389 / fork issue #5.
+    ensureAgentDestinationForWiring(row as unknown as MessagingGroupAgent);
+  },
+  postCommit: async (row) => {
+    // Live-refresh: project the new destination into running sessions so
+    // the agent can immediately deliver to the new wiring without a restart.
+    await projectDestinationsToSessions((row as unknown as MessagingGroupAgent).agent_group_id);
+  },
   },
 });
