@@ -20,7 +20,12 @@ mechanics: `scripts/sweep/README.md` + `DESIGN.md` on branch `feat/maintenance-s
 4. Merge discipline: new-style `git merge-tree` (never `--merge-base`, never
    cherry-pick); merge unit = upstream first-parent commit; `everything*` branches are
    verification-only; sweep tooling runs dry-run by default — pass `--execute` only
-   after a plan looks right.
+   after a plan looks right. Merge sources are DAG parents: children NEVER merge
+   upstream/main directly — `main` (ff-only) and `main_patched` are the only upstream
+   entry points; every other inventory branch merges its parents' tips,
+   parents-before-children. Conflicts resolve once at the topmost affected branch;
+   descendants inherit the resolution via their parent merges (never re-present a
+   parent's conflict in a child PR).
 5. If upstream history is force-pushed/rewritten: halt, report, never "fix" it.
 6. Anything ambiguous, security-flagged (sensitive-surface PoIs), or OVERLAP-HIGH goes
    to the owner before action.
@@ -47,14 +52,25 @@ report it to the owner.
 
 1. `git fetch upstream origin` in the clone; then
    `pnpm exec tsx scripts/sweep/sweep.ts scan --inventory ../inventory --ledger ../sweep-ledger.json`
+   Scope: non-inventory branches are IGNORED (no scan, no PRs — at most one digest
+   drift line) unless their tip is an ancestor of an `edition/*` branch. Those
+   edition-composition branches merge `main` ONLY (upstream-PR candidates — never
+   pollute them with main_patched/fork content) and must be flagged for an inventory
+   entry ("in edition composition but no inventory entry — add one").
 2. Post a short digest here BEFORE acting: pending commit count, per-branch
    clean/gated verdicts, PoIs by class, anything security-flagged or OVERLAP-suspect.
 3. Route annotate-PoIs (`route`) and run overlap checks with the registry prompts
    (spawn one subagent per routed feature; prompts are self-contained). Report
    OVERLAP-HIGH findings as high priority.
-4. Merge clean prefixes per stop points (dry-run, review the plan, then `--execute`),
-   DAG order, rerere enabled. Conflicts: resolve once at the topmost affected branch on
-   a `fix/sweep/<date>-<topic>` branch; open a PR via `gh pr create` (traceability).
+4. Merge (dry-run, review the plan, then `--execute`), DAG order, rerere enabled.
+   Merge sources are DAG parents: `main_patched` (and edition-composition branches,
+   which merge `main` only) take the upstream stop point; every other inventory
+   branch merges its parents' updated tips — children never merge main/upstream
+   directly, so upstream content cascades down the parent chain and a gated parent
+   simply holds its children back (they can never overshoot). Conflicts: resolve once
+   at the topmost affected branch on a `fix/sweep/<date>-<topic>` branch; descendants
+   inherit the resolution via their next parent merge — never re-resolve (or re-PR)
+   the same conflict on a child. Open a PR via `gh pr create` (traceability).
    Simple resolutions: merge the PR yourself if checks are green. Complex or
    judgment-needing: leave the PR open with your provisional resolution + rationale.
    Unresolvable (D-030): push the `fix/sweep/*` branch pointing at the upstream
