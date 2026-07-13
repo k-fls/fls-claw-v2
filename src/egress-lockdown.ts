@@ -100,3 +100,14 @@ export function assertEgressLaunchable(launchMode: LaunchMode): void {
     );
   }
 }
+
+/**
+ * Fork-only stub — upstream's ensureEgressNetwork manages a Docker --internal
+ * network. The fork instead enforces egress via an in-container netfilter
+ * ruleset installed by the root entrypoint, so there is no external network to
+ * heal. Called by host-sweep.ts for compatibility; always returns false (no
+ * Docker-level lockdown active). No-op when lockdown is disabled.
+ */
+export function ensureEgressNetwork(): boolean {
+  return false;
+}
