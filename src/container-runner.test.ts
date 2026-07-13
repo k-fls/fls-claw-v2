@@ -73,8 +73,12 @@ describe('per-container resource limits (structural)', () => {
 
   it('defaults both knobs to empty string in config (no flag = unbounded)', () => {
     const cfg = fs.readFileSync(path.join(process.cwd(), 'src', 'config.ts'), 'utf-8');
-    expect(cfg).toContain("CONTAINER_CPU_LIMIT = process.env.CONTAINER_CPU_LIMIT || ''");
-    expect(cfg).toContain("CONTAINER_MEMORY_LIMIT = process.env.CONTAINER_MEMORY_LIMIT || ''");
+    expect(cfg).toContain(
+      "CONTAINER_CPU_LIMIT = process.env.CONTAINER_CPU_LIMIT || envConfig.CONTAINER_CPU_LIMIT || ''",
+    );
+    expect(cfg).toContain(
+      "CONTAINER_MEMORY_LIMIT = process.env.CONTAINER_MEMORY_LIMIT || envConfig.CONTAINER_MEMORY_LIMIT || ''",
+    );
   });
 });
 
@@ -89,5 +93,24 @@ describe('container boot-failure tripwire (structural)', () => {
     const src = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf-8');
     expect(src).toContain('stderrTail.push(line)');
     expect(src).toMatch(/Container exited non-zero.*stderrTail/s);
+  });
+});
+
+describe('syncSkillSymlinks blocked-entry warning (structural)', () => {
+  // Real directories in .claude-shared/skills/ block the managed symlinks:
+  // the prune loop only removes symlinks and the create loop skips any
+  // existing entry. Template overlays depend on surviving that (see
+  // src/group-skills.ts); stale pre-refactor skill copies (#3001) get served
+  // forever with no trace. Driving syncSkillSymlinks needs a real group
+  // filesystem, and importing more of the module pulls the provider side
+  // effects, so guard the wiring structurally: the create loop must warn
+  // when a non-symlink entry occupies a desired skill path.
+  it('warns instead of silently skipping when a real entry blocks a desired skill', () => {
+    const src = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf-8');
+    const createLoop = src.indexOf('// Create symlinks for desired skills');
+    expect(createLoop).toBeGreaterThan(-1);
+    const tail = src.slice(createLoop);
+    expect(tail).toMatch(/else if \(!entry\.isSymbolicLink\(\)\)/);
+    expect(tail).toMatch(/log\.warn\(\s*'Shared skill not symlinked/);
   });
 });
