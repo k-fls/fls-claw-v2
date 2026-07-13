@@ -302,3 +302,37 @@ deviations from the letter of this spec and the feature-registry design:
      resolution cases (`resolution_ref` = the recorded merge commit carrying
      the canonical resolution), replayed in detached temp worktrees.
    - `--state-branch` no longer exists anywhere in the CLI.
+
+6. **2026-07-14 merge-source correction (owner directive).** The original
+   merge stage fanned upstream/main directly into EVERY branch (July-sweep
+   style). With real conflicts this made leaf branches re-present their
+   PARENTS' conflicts — edition/fls-ai-bot's freeze PR (#16, closed) carried
+   10 conflicted files, none edition-owned — duplicating resolution work
+   across parallel PRs and violating "resolve each conflict once at the
+   topmost affected branch" (D-003). Corrected model (the branch-topology
+   rule):
+   - `main` only ever fast-forwards from upstream/main; `main_patched`
+     merges `main` — these are the ONLY upstream entry points.
+   - Every other inventory branch merges its DAG **parents'** tips
+     (inventory `parents`; roots default to `[main_patched]`),
+     parents-before-children. Upstream content reaches leaves exclusively
+     through the parent chain, so a conflict gates the topmost affected
+     branch and every descendant inherits the resolution via its parent
+     merge — no re-conflicts, no duplicate PRs.
+   - Stop points are bisected against the upstream first-parent chain only
+     at the upstream entry points; descendants inherit gating naturally (a
+     gated parent's tip does not advance, so children have nothing new to
+     merge and can never overshoot).
+   - `scan` forecasts each branch against its ACTUAL merge source (parents'
+     current tips) — that is what the merge stage will do; an informational
+     upstream/main probe is kept per branch (`upstreamInfo`).
+   - **Scope rule (owner, verbatim intent: "agent ignores non-inventory
+     branches, unless they are present in any edition branch"):** a branch
+     with no inventory entry is IGNORED (no scan, no PRs, at most one digest
+     drift line) UNLESS its tip is an ancestor of an `edition/*` branch
+     (`git merge-base --is-ancestor`). Such edition-composition branches are
+     swept with merge source `main` ONLY (upstream-PR candidates — never
+     polluted with main_patched/fork content) and are flagged by the
+     validator/digest: "in edition composition but no inventory entry — add
+     one". Explicit exclusions (scope.yaml, telegram) apply first; the
+     scope.yaml include-glob mechanism is removed.

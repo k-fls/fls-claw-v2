@@ -56,9 +56,9 @@ scripts/sweep/
 | ------------------- | -------------------------- | ------- |
 | `fetch`             | remote-tracking refs       | `git fetch upstream origin --prune`; reports early-exit when upstream tip == last sweep and no open PoIs |
 | `ff-main`           | `main` (FF only)           | fast-forward `main` to `upstream/main`; any non-FF is a loud failure (mirror invariant) |
-| `scan`              | no                         | per-branch merge-tree conflict scan + stop points + PoI extraction → sweep-report.json |
-| `stop-points`       | no                         | per-branch largest clean prefix of the upstream first-parent chain (bisected with merge-tree) |
-| `merge`             | swept branches, workspace  | DAG-ordered propagation to per-branch stop points with the workspace rerere cache; journals + exports new resolutions |
+| `scan`              | no                         | per-branch merge-tree conflict scan vs each branch's ACTUAL merge source (parents' tips for inventory branches, the upstream chain for main_patched/edition-ancestors) + stop points + PoI extraction → sweep-report.json |
+| `stop-points`       | no                         | largest clean prefix of the upstream first-parent chain — upstream-chain branches only (main_patched + edition-ancestors); inventory branches inherit gating from their parents |
+| `merge`             | swept branches, workspace  | DAG-ordered propagation: main_patched merges its upstream stop point; every inventory branch merges its DAG PARENTS' tips (never upstream directly), parents-before-children, with the workspace rerere cache; journals + exports new resolutions |
 | `verify`            | temp worktree only         | everything rebuild from the recipe (scope.yaml) + CI matrix; attributes failures; `--rollback --outcomes <f>` resets the offender |
 | `record`            | workspace files            | fold report/outcomes/verify into the ledger + journal + archived report — plain files, no git |
 | `status`            | no                         | derived merge-base + ledger overrides per branch; `--report` adds scan verdicts (up-to-date / clean-ready / gated at stop point / fully gated) |
@@ -112,9 +112,9 @@ pnpm exec tsx $S seed-rerere --repo . --workspace $WS --execute   # 0b. rebuild 
 pnpm exec tsx $S fetch --repo . --execute                  # 1. fetch both remotes
 pnpm exec tsx $S validate-registry --repo .                # 2. inventory sanity (ALERTs => regenerate or accept catch-all)
 pnpm exec tsx $S ff-main --repo . --execute                # 3. FF the pristine mirror
-pnpm exec tsx $S scan --repo . --workspace $WS --out $WS/sweep-report.json   # 4. conflicts + stop points + PoIs
-pnpm exec tsx $S merge --repo . --workspace $WS --report $WS/sweep-report.json          # 5a. inspect the plan
-pnpm exec tsx $S merge --repo . --workspace $WS --report $WS/sweep-report.json --execute --out $WS/outcomes.json  # 5b. do it
+pnpm exec tsx $S scan --repo . --workspace $WS --out $WS/sweep-report.json   # 4. conflicts vs ACTUAL merge sources + stop points + PoIs
+pnpm exec tsx $S merge --repo . --workspace $WS --report $WS/sweep-report.json          # 5a. inspect the plan (sources = DAG parents; only main_patched/edition-ancestors touch upstream)
+pnpm exec tsx $S merge --repo . --workspace $WS --report $WS/sweep-report.json --execute --out $WS/outcomes.json  # 5b. do it (one pass cascades upstream down the parent chain)
 pnpm exec tsx $S verify --repo . --execute --out $WS/verify.json \
   --outcomes $WS/outcomes.json --rollback                  # 6. everything rebuild + full matrix (~20 min)
 pnpm exec tsx $S record --repo . --workspace $WS --report $WS/sweep-report.json \
@@ -159,10 +159,15 @@ policy. Nothing here deploys anything.
   --rollback` and `merge.rollbackBranch()` reset via `update-ref` (or
   `reset --hard` in the owning worktree).
 
-Scope: the swept branch set is the UNION of inventory entries' branches and
-repo branches matching `registry/scope.yaml` include globs (`main_patched`,
-`fix/**`, `docs/notes` — swept in practice without feature entries, null
-feature link, no DAG edges), minus explicit + namespace exclusions.
+Scope (owner rule 2026-07-14): the swept set is main_patched (structural) +
+inventory entries' branches + non-inventory branches whose tip is an
+ancestor of any `edition/*` branch (part of a shipped composition; merge
+source `main` ONLY — upstream-PR candidates never absorb main_patched/fork
+content; flagged "add an inventory entry"). Every other non-inventory branch
+is IGNORED — one digest drift line at most. Explicit + namespace exclusions
+apply first. Merge sources: `main` ff-only, `main_patched` merges main;
+every inventory branch merges its DAG parents — conflicts resolve once at
+the topmost affected branch, descendants inherit via parent merges.
 "Registry entry (seed + regenerate) is step 3 of every new feature branch" —
 see the `fork-registry-generate` skill.
 
