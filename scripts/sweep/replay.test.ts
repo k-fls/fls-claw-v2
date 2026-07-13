@@ -207,7 +207,15 @@ describe('seed-rerere from pinned resolution cases', () => {
     rmSync(join(repo.dir, '.git/rr-cache'), { recursive: true, force: true });
     const plan = await planMerges(
       repo.dir,
-      [{ branch: 'feat/sibling', stopPoint: repo.sha('upstream-main'), upToDate: false }],
+      [
+        {
+          branch: 'feat/sibling',
+          mergeModel: 'upstream-chain' as const,
+          stopPoint: repo.sha('upstream-main'),
+          parents: [],
+          upToDate: false,
+        },
+      ],
       emptyLedger(),
     );
     expect(plan[0].method).toBe('worktree');

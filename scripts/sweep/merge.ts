@@ -1,8 +1,15 @@
 /**
- * scripts/sweep/merge.ts — DAG-ordered upstream propagation to per-branch
- * stop points, with a shared rerere cache.
+ * scripts/sweep/merge.ts — DAG-ordered propagation with a shared rerere
+ * cache (2026-07-14 merge-source correction).
  *
- * Per branch (parents before children): merge its stop point. Clean merges
+ * Merge sources per branch: main_patched and edition-ancestor branches merge
+ * their upstream STOP POINT (the only upstream entry points besides main's
+ * ff); every inventory branch merges its DAG PARENTS' tips, in order,
+ * parents-before-children — upstream content reaches leaves only through the
+ * parent chain, so a conflict is resolved once at the topmost affected
+ * branch and descendants inherit the resolution. A gated parent's tip does
+ * not advance, so its children naturally have nothing new to merge
+ * (inherited gating). Clean merges
  * on branches that are NOT checked out use plumbing only (merge-tree +
  * commit-tree + update-ref — the July-sweep technique). Conflicted merges
  * and checked-out branches use a worktree (existing one when the branch is
@@ -22,6 +29,7 @@ import {
   commitTreeMerge,
   git,
   gitCommonDir,
+  isAncestor,
   newStyleMergeTree,
   revParse,
   worktreeBranches,
@@ -35,56 +43,79 @@ import type { Ledger } from './types.js';
  */
 const PROTECTED_BRANCH_RE = /^(main|everything.*|design\/.*|maint\/.*)$/;
 
+export interface MergeTarget {
+  branch: string;
+  mergeModel: 'upstream-chain' | 'parents';
+  /** upstream-chain: the bisected stop point (null = fully gated). */
+  stopPoint: string | null;
+  /** parents model: DAG parent branches to merge, in order. */
+  parents: string[];
+  upToDate: boolean;
+}
+
 export interface MergePlanItem {
   branch: string;
+  mergeModel: 'upstream-chain' | 'parents';
   stopPoint: string | null;
   preRef: string;
   action: 'merge' | 'up-to-date' | 'skip-frozen' | 'skip-no-stop-point' | 'skip-protected';
-  method?: 'commit-tree' | 'worktree';
+  /** Merge sources in order: the stop-point sha (upstream-chain) or parent branch names. */
+  sources: string[];
+  method?: 'commit-tree' | 'worktree' | 'mixed';
   worktree?: string | null;
+  /** Preview union vs sources' CURRENT tips (post-cascade tips may differ). */
   expectConflicts: string[];
 }
 
 export interface MergeOutcome extends MergePlanItem {
   result: 'merged' | 'noop' | 'gated' | 'skipped' | 'dirty-worktree';
   newRef?: string;
+  /** Sources actually merged, as "<name>@<sha12>". */
+  mergedSources?: string[];
   /** Conflicted paths auto-resolved by rerere (annotate-PoI type rerere-replay). */
   rerereResolved?: string[];
   /** Unresolved conflict paths (gate). */
   unresolved?: string[];
 }
 
-export async function planMerges(
-  repo: string,
-  ordered: { branch: string; stopPoint: string | null; upToDate: boolean }[],
-  ledger: Ledger,
-): Promise<MergePlanItem[]> {
+export async function planMerges(repo: string, targets: MergeTarget[], ledger: Ledger): Promise<MergePlanItem[]> {
   const checkedOut = await worktreeBranches(repo);
   const plan: MergePlanItem[] = [];
-  for (const { branch, stopPoint, upToDate } of ordered) {
-    const preRef = await revParse(repo, branch);
-    const bs = ledger.branches[branch];
+  for (const t of targets) {
+    const preRef = await revParse(repo, t.branch);
+    const bs = ledger.branches[t.branch];
     let action: MergePlanItem['action'];
-    if (PROTECTED_BRANCH_RE.test(branch)) action = 'skip-protected';
+    if (PROTECTED_BRANCH_RE.test(t.branch)) action = 'skip-protected';
     else if (bs?.status === 'frozen' || bs?.status === 'excluded') action = 'skip-frozen';
-    else if (upToDate) action = 'up-to-date';
-    else if (!stopPoint) action = 'skip-no-stop-point';
+    else if (t.upToDate) action = 'up-to-date';
+    else if (t.mergeModel === 'upstream-chain' && !t.stopPoint) action = 'skip-no-stop-point';
     else action = 'merge';
+    const sources = t.mergeModel === 'upstream-chain' ? (t.stopPoint ? [t.stopPoint] : []) : t.parents;
     let method: MergePlanItem['method'];
-    let expectConflicts: string[] = [];
-    if (action === 'merge' && stopPoint) {
-      const probe = await newStyleMergeTree(repo, branch, stopPoint);
-      expectConflicts = probe.conflictFiles;
-      method = probe.clean && !checkedOut.has(branch) ? 'commit-tree' : 'worktree';
+    const expectConflicts = new Set<string>();
+    if (action === 'merge') {
+      // Preview vs CURRENT source tips (execution re-probes after parents move).
+      const methods = new Set<string>();
+      for (const src of sources) {
+        const tip = await revParse(repo, src);
+        if (await isAncestor(repo, tip, t.branch)) continue;
+        const probe = await newStyleMergeTree(repo, t.branch, tip);
+        for (const f of probe.conflictFiles) expectConflicts.add(f);
+        methods.add(probe.clean && !checkedOut.has(t.branch) ? 'commit-tree' : 'worktree');
+      }
+      method =
+        methods.size > 1 ? 'mixed' : ((methods.values().next().value as MergePlanItem['method']) ?? 'commit-tree');
     }
     plan.push({
-      branch,
-      stopPoint,
+      branch: t.branch,
+      mergeModel: t.mergeModel,
+      stopPoint: t.stopPoint,
       preRef,
       action,
+      sources,
       method,
-      worktree: checkedOut.get(branch) ?? null,
-      expectConflicts,
+      worktree: checkedOut.get(t.branch) ?? null,
+      expectConflicts: [...expectConflicts].sort(),
     });
   }
   return plan;
@@ -140,39 +171,40 @@ export async function exportRrCache(repo: string, baseline: Record<string, Buffe
   return changed;
 }
 
-async function mergeInWorktree(
+interface SourceMergeResult {
+  status: 'merged' | 'gated' | 'dirty-worktree';
+  rerereResolved: string[];
+  unresolved?: string[];
+}
+
+async function mergeSourceInWorktree(
   repo: string,
   wtPath: string,
-  item: MergePlanItem,
+  branch: string,
+  source: string,
   message: string,
-): Promise<MergeOutcome> {
+  expectConflicts: string[],
+): Promise<SourceMergeResult> {
   const status = await git(repo, ['status', '--porcelain'], { cwd: wtPath });
   if (status.stdout.trim() !== '') {
-    return { ...item, result: 'dirty-worktree' };
+    return { status: 'dirty-worktree', rerereResolved: [] };
   }
   const rerereFlags = ['-c', 'rerere.enabled=true', '-c', 'rerere.autoUpdate=true'];
-  const res = await git(repo, [...rerereFlags, 'merge', '--no-edit', '-m', message, item.stopPoint!], {
+  const res = await git(repo, [...rerereFlags, 'merge', '--no-edit', '-m', message, source], {
     cwd: wtPath,
     allowCodes: [1],
   });
-  if (res.code === 0) {
-    return { ...item, result: 'merged', newRef: await revParse(repo, item.branch), rerereResolved: [] };
-  }
+  if (res.code === 0) return { status: 'merged', rerereResolved: [] };
   const unresolved = (await git(repo, ['diff', '--name-only', '--diff-filter=U'], { cwd: wtPath })).stdout
     .split('\n')
     .filter(Boolean);
   if (unresolved.length === 0) {
     // rerere auto-resolved and auto-staged every conflict; finalize the merge.
     await git(repo, [...rerereFlags, 'commit', '--no-edit', '--no-verify'], { cwd: wtPath });
-    return {
-      ...item,
-      result: 'merged',
-      newRef: await revParse(repo, item.branch),
-      rerereResolved: item.expectConflicts,
-    };
+    return { status: 'merged', rerereResolved: expectConflicts };
   }
   await git(repo, ['merge', '--abort'], { cwd: wtPath });
-  return { ...item, result: 'gated', unresolved };
+  return { status: 'gated', rerereResolved: [], unresolved };
 }
 
 export interface ExecuteMergesResult {
@@ -188,28 +220,64 @@ export async function executeMerges(
 ): Promise<ExecuteMergesResult> {
   await installRrCache(repo, rrSourceDir);
   const baseline = collectRrCache(join(await gitCommonDir(repo), 'rr-cache'));
+  const checkedOut = await worktreeBranches(repo);
   const outcomes: MergeOutcome[] = [];
   for (const item of plan) {
-    if (item.action !== 'merge' || !item.stopPoint) {
+    if (item.action !== 'merge' || item.sources.length === 0) {
       outcomes.push({ ...item, result: item.action === 'up-to-date' ? 'noop' : 'skipped' });
       continue;
     }
-    const message = `Merge upstream ${item.stopPoint.slice(0, 12)} into ${item.branch} (sweep)`;
-    if (item.method === 'commit-tree') {
-      const newRef = await commitTreeMerge(repo, item.branch, item.stopPoint, message);
-      outcomes.push({ ...item, result: 'merged', newRef, rerereResolved: [] });
-      continue;
-    }
-    if (item.worktree) {
-      outcomes.push(await mergeInWorktree(repo, item.worktree, item, message));
-    } else {
-      const wt = await addTempWorktree(repo, item.branch, { branch: item.branch });
-      try {
-        outcomes.push(await mergeInWorktree(repo, wt.path, item, message));
-      } finally {
-        await wt.remove();
+    // Sources are merged in order, at their tips AS OF NOW — parents processed
+    // earlier in this run have already advanced, so children inherit their
+    // resolved upstream content (and a gated parent's unmoved tip means the
+    // child simply has nothing new to merge: inherited gating).
+    let outcome: MergeOutcome = { ...item, result: 'noop' };
+    const mergedSources: string[] = [];
+    const rerereResolved: string[] = [];
+    for (const source of item.sources) {
+      const sourceTip = await revParse(repo, source);
+      if (await isAncestor(repo, sourceTip, item.branch)) continue; // nothing new from this source
+      const label = item.mergeModel === 'parents' ? source : `upstream ${sourceTip.slice(0, 12)}`;
+      const message = `Merge ${label} into ${item.branch} (sweep)`;
+      const probe = await newStyleMergeTree(repo, item.branch, sourceTip);
+      if (probe.clean && !checkedOut.has(item.branch)) {
+        const newRef = await commitTreeMerge(repo, item.branch, sourceTip, message);
+        mergedSources.push(`${source}@${sourceTip.slice(0, 12)}`);
+        outcome = { ...item, result: 'merged', newRef, mergedSources, rerereResolved };
+        continue;
       }
+      const wtPath = checkedOut.get(item.branch) ?? null;
+      const wt = wtPath ? null : await addTempWorktree(repo, item.branch, { branch: item.branch });
+      let res: SourceMergeResult;
+      try {
+        res = await mergeSourceInWorktree(
+          repo,
+          wtPath ?? wt!.path,
+          item.branch,
+          sourceTip,
+          message,
+          probe.conflictFiles,
+        );
+      } finally {
+        if (wt) await wt.remove();
+      }
+      if (res.status === 'merged') {
+        mergedSources.push(`${source}@${sourceTip.slice(0, 12)}`);
+        rerereResolved.push(...res.rerereResolved);
+        outcome = {
+          ...item,
+          result: 'merged',
+          newRef: await revParse(repo, item.branch),
+          mergedSources,
+          rerereResolved,
+        };
+        continue;
+      }
+      // gated / dirty-worktree: stop processing further sources for this branch.
+      outcome = { ...item, result: res.status, mergedSources, rerereResolved, unresolved: res.unresolved };
+      break;
     }
+    outcomes.push(outcome);
   }
   return { outcomes, rrCacheExport: await exportRrCache(repo, baseline) };
 }

@@ -16,6 +16,12 @@ repo.commit('real feature', {
 repo.checkout('main');
 repo.git('branch', 'module/unregistered', 'main'); // rule-5 trigger
 repo.git('branch', 'everything', 'main'); // excluded namespace, must NOT trigger rule 5
+// Non-inventory branch inside an edition composition (rule-5 WARN, scope pass):
+repo.checkout('fix/candidate', { create: true, at: 'main' });
+repo.commit('upstreamable fix', { 'src/candidate.ts': 'export const x = 1;\n' });
+repo.checkout('edition/ed', { create: true, at: 'main' });
+repo.git('merge', '--no-edit', 'fix/candidate');
+repo.checkout('main');
 const realTip = repo.sha('feat/real');
 
 function entry(partial: Partial<FeatureEntry> & { id: string }): FeatureEntry {
@@ -76,11 +82,21 @@ describe('validateRegistry', () => {
 
   it('rule 5: sweepable branch without an entry is an ALERT; excluded namespaces are not', async () => {
     const res = await validateRegistry(repo.dir, [GOOD]);
-    const rule5 = res.issues.filter((i) => i.rule === 5);
-    expect(rule5).toEqual([
-      expect.objectContaining({ level: 'ALERT', message: expect.stringContaining('module/unregistered') }),
-    ]);
+    const alerts5 = res.issues.filter((i) => i.rule === 5 && i.level === 'ALERT').map((i) => i.message);
+    expect(alerts5.some((m) => m.includes('module/unregistered'))).toBe(true);
+    expect(alerts5.some((m) => m.includes('edition/ed'))).toBe(true); // edition without an entry alerts too
+    expect(alerts5.some((m) => m.includes('everything'))).toBe(false);
     expect(res.ok).toBe(false);
+  });
+
+  it('rule 5 extension: non-inventory branch in an edition composition is WARN-flagged ("add one")', async () => {
+    const res = await validateRegistry(repo.dir, [GOOD]);
+    const flag = res.issues.find((i) => i.rule === 5 && i.level === 'WARN' && i.message.includes('fix/candidate'));
+    expect(flag).toBeDefined();
+    expect(flag!.message).toContain('edition composition');
+    expect(flag!.message).toContain('add one');
+    // it is a WARN, not an ALERT: the branch is swept (merge source: main only)
+    expect(res.alertedFeatureIds).toEqual([]);
   });
 
   it('rule 6: stale verified_against and old last_verified are WARNs', async () => {

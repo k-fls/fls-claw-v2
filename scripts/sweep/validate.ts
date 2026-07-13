@@ -14,6 +14,7 @@
 import { EXCLUDED_BRANCH_GLOBS, REGISTRY_REQUIRED_GLOBS } from './config.js';
 import { git, listTreePaths, localBranches, refExists, revParse } from './git.js';
 import { globMatchAny } from './globs.js';
+import { editionAncestorBranches } from './scope.js';
 import type { FeatureEntry, ValidationIssue, ValidationResult } from './types.js';
 
 export interface ValidateOptions {
@@ -102,10 +103,19 @@ export async function validateRegistry(
 
   // Rule 5: reverse check — sweepable branches without a registry entry.
   const owned = new Set(features.filter((e) => e.branch).map((e) => e.branch!));
-  for (const b of await localBranches(repo)) {
+  const repoBranches = await localBranches(repo);
+  for (const b of repoBranches) {
     if (!globMatchAny(REGISTRY_REQUIRED_GLOBS, b)) continue;
     if (globMatchAny(EXCLUDED_BRANCH_GLOBS, b)) continue;
     if (!owned.has(b)) push('ALERT', null, 5, `branch '${b}' has no registry entry`);
+  }
+  // Rule 5 extension (2026-07-14 scope rule): non-inventory branches that are
+  // part of an edition composition are swept (merge source: main only) but
+  // must be flagged until they get an inventory entry.
+  for (const b of await editionAncestorBranches(repo, repoBranches)) {
+    if (!owned.has(b)) {
+      push('WARN', null, 5, `branch '${b}' is in an edition composition but has no inventory entry — add one`);
+    }
   }
 
   const alertedFeatureIds = [

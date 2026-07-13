@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,7 +17,6 @@ const emptyInventory = join(scratch, 'inventory-empty');
 mkdirSync(workspace, { recursive: true });
 mkdirSync(emptyInventory, { recursive: true });
 
-const scopeFile = join(scratch, 'scope.yaml');
 const { repo, chain } = makeSweepFixture();
 afterAll(() => {
   rmSync(scratch, { recursive: true, force: true });
@@ -78,19 +77,32 @@ describe('sweep CLI', () => {
   );
 
   it(
-    'scan scope unions scope-config include globs (fix/**, docs/notes) with inventory branches',
+    'scope partition: non-inventory branches are ignored unless their tip is in an edition composition',
     () => {
       repo.git('branch', 'fix/extra', chain[0]);
-      repo.git('branch', 'docs/notes', chain[0]);
-      repo.git('branch', 'design/flsclaw', chain[0]); // must stay excluded
-      writeFileSync(scopeFile, 'include: ["feat/**", "fix/**", "docs/notes", "design/**"]\n');
-      const res = cli('scan', ...COMMON, '--scope-config', scopeFile, '--out', join(scratch, 'report.json'));
+      repo.git('branch', 'design/flsclaw', chain[0]); // namespace-excluded, never appears anywhere
+      repo.checkout('docs/notes', { create: true, at: chain[0] });
+      repo.commit('docs-only commit not in any edition', { 'docs/drift.md': 'x\n' });
+      repo.checkout('main');
+      // edition/ed carries fix/extra's tip -> fix/extra passes the ancestry test.
+      repo.checkout('edition/ed', { create: true, at: 'feat/one' });
+      repo.git('merge', '--no-edit', 'fix/extra');
+      repo.checkout('main');
+
+      const res = cli('scan', ...COMMON, '--out', join(scratch, 'report.json'));
       expect(res.code).toBe(0);
       const report = JSON.parse(readFileSync(join(scratch, 'report.json'), 'utf8'));
       const names = Object.keys(report.branches).sort();
-      expect(names).toEqual(['docs/notes', 'feat/one', 'feat/two', 'fix/extra']);
-      expect(report.branches['fix/extra'].clean).toBe(true); // merges clean to upstream tip
-      expect(report.branches['docs/notes'].clean).toBe(true);
+      expect(names).toEqual(['edition/ed', 'feat/one', 'feat/two', 'fix/extra']);
+      // in edition composition, no inventory entry: swept, upstream-chain (main-only) source
+      expect(report.branches['fix/extra'].kind).toBe('edition-ancestor');
+      expect(report.branches['fix/extra'].mergeModel).toBe('upstream-chain');
+      expect(report.branches['fix/extra'].clean).toBe(true);
+      // not in any edition composition: ignored, one drift line
+      expect(report.ignoredBranches).toContain('docs/notes');
+      // namespace-excluded: neither scanned nor ignored-listed
+      expect(names).not.toContain('design/flsclaw');
+      expect(report.ignoredBranches).not.toContain('design/flsclaw');
     },
     CLI_TIMEOUT,
   );
@@ -99,7 +111,7 @@ describe('sweep CLI', () => {
     'merge without --execute prints the plan and moves nothing',
     () => {
       const before = repo.git('for-each-ref', '--format=%(refname) %(objectname)');
-      const res = cli('merge', ...COMMON, '--scope-config', scopeFile);
+      const res = cli('merge', ...COMMON);
       expect(res.code).toBe(0);
       expect(res.stderr).toContain('DRY-RUN');
       expect(repo.git('for-each-ref', '--format=%(refname) %(objectname)')).toBe(before);
@@ -110,7 +122,7 @@ describe('sweep CLI', () => {
   it(
     'merge --execute advances branches to their stop points and journals to the workspace',
     () => {
-      const res = cli('merge', ...COMMON, '--scope-config', scopeFile, '--execute');
+      const res = cli('merge', ...COMMON, '--execute');
       expect(res.code).toBe(0);
       const outcomes = JSON.parse(res.stdout.slice(res.stdout.indexOf('['))) as Array<{
         branch: string;
@@ -134,7 +146,7 @@ describe('sweep CLI', () => {
   it(
     'status --report distinguishes clean-ready, gated, and up-to-date; mergeBase is derived',
     () => {
-      const res = cli('status', ...COMMON, '--scope-config', scopeFile, '--report', join(scratch, 'report.json'));
+      const res = cli('status', ...COMMON, '--report', join(scratch, 'report.json'));
       expect(res.code).toBe(0);
       expect(res.stdout).toContain(`workspace:    ${workspace}`);
       // fix/extra never merged anything: clean and ready.
@@ -143,6 +155,8 @@ describe('sweep CLI', () => {
       expect(res.stdout).toMatch(/feat\/one .*gated at stop point/);
       // derived merge-base for feat/one is its merged stop point (U2).
       expect(res.stdout).toContain(`feat/one  mergeBase=${chain[1].slice(0, 12)}`);
+      // the digest drift line lists ignored non-inventory branches
+      expect(res.stdout).toMatch(/ignored \(no inventory entry.*docs\/notes/);
       // design/flsclaw stays out of scope entirely.
       expect(res.stdout).not.toContain('design/flsclaw');
     },

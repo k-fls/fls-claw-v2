@@ -21,28 +21,44 @@ function report(partial: Partial<SweepReport> = {}): SweepReport {
     upstreamTip: TIP,
     rangeBase: 'b'.repeat(40),
     branches: {},
+    ignoredBranches: [],
     pois: [],
     warnings: [],
     ...partial,
   };
 }
 
+function scan(partial: Partial<import('./types.js').BranchScan> & { branch: string }): import('./types.js').BranchScan {
+  return {
+    kind: 'inventory',
+    mergeModel: 'upstream-chain',
+    parents: [],
+    clean: true,
+    conflictFiles: [],
+    stopPoint: TIP,
+    upToDate: false,
+    ...partial,
+  };
+}
+
 function outcome(partial: Partial<MergeOutcome> & { branch: string; result: MergeOutcome['result'] }): MergeOutcome {
-  return { stopPoint: TIP, preRef: 'c'.repeat(40), action: 'merge', expectConflicts: [], ...partial };
+  return {
+    mergeModel: 'upstream-chain',
+    stopPoint: TIP,
+    sources: [TIP],
+    preRef: 'c'.repeat(40),
+    action: 'merge',
+    expectConflicts: [],
+    ...partial,
+  };
 }
 
 describe('applyRecord', () => {
   it('records partial notes, gates, and open PoIs (no lastMergedUpstream — derived)', () => {
     const rep = report({
       branches: {
-        'feat/one': {
-          branch: 'feat/one',
-          clean: false,
-          conflictFiles: ['src/app.ts'],
-          stopPoint: STOP,
-          upToDate: false,
-        },
-        'feat/two': { branch: 'feat/two', clean: true, conflictFiles: [], stopPoint: TIP, upToDate: false },
+        'feat/one': scan({ branch: 'feat/one', clean: false, conflictFiles: ['src/app.ts'], stopPoint: STOP }),
+        'feat/two': scan({ branch: 'feat/two' }),
       },
       pois: [
         {
@@ -82,7 +98,7 @@ describe('applyRecord', () => {
 
   it('clean sweep -> result clean; verify failure demotes the offender to a test-fail gate', () => {
     const cleanRep = report({
-      branches: { 'feat/two': { branch: 'feat/two', clean: true, conflictFiles: [], stopPoint: TIP, upToDate: false } },
+      branches: { 'feat/two': scan({ branch: 'feat/two' }) },
     });
     const merged = [outcome({ branch: 'feat/two', result: 'merged' })];
     expect(applyRecord(emptyLedger(), { report: cleanRep, outcomes: merged }).lastSweep?.result).toBe('clean');

@@ -1,18 +1,18 @@
 # Sweep scope configuration — POLICY, not state (exclusions are config;
 # frozen/open-PoI state lives in the group-owned ledger).
 #
-# Scope = (inventory entries' branches) UNION (repo branches matching
-# `include` globs), minus `exclude` and the built-in namespace exclusions
-# (everything*, experimental/*, wip/*, design/*, maint/*, worktree-agent-*,
-# integration/*, test/*, sweep/*, fix/sweep/*).
-
-include:
-  # base for shared fixes — always swept first
-  - main_patched
-  # upstream-PR candidates: kept current so they stay cleanly upstreamable
-  - fix/**
-  # fork documentation branch, swept in practice since June 2026
-  - docs/notes
+# Scope rule (owner directive 2026-07-14): the sweep covers
+#   - main_patched (structural: the only upstream entry point besides main's ff),
+#   - every branch owned by a sweepable inventory entry (merge source = its
+#     DAG parents, parents-before-children; NEVER upstream/main directly),
+#   - non-inventory branches whose tip is an ancestor of any edition/* branch
+#     ("present in an edition composition"; merge source = main ONLY — they
+#     are upstream-PR candidates and must never absorb main_patched/fork
+#     content). These are flagged until they get an inventory entry.
+# Every other non-inventory branch is IGNORED (one digest drift line at most).
+# There is no include-glob mechanism; `exclude` and the built-in namespace
+# exclusions (everything*, experimental/*, wip/*, design/*, maint/*,
+# worktree-agent-*, integration/*, test/*, sweep/*, fix/sweep/*) apply first.
 
 exclude:
   # 750 commits behind main (merge-base 2026-04-28); structural conflicts.

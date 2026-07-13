@@ -2,8 +2,8 @@
  * scripts/sweep/types.ts — shared types for the upstream-sweep toolkit.
  *
  * Boundary artifact between the scripted core and the agentic layer is the
- * sweep report (SweepReport); authoritative mutable state is SweepState,
- * committed only on the state branch (default maint/fork-registry).
+ * sweep report (SweepReport); mutable state is the group-owned Ledger file
+ * (no state branch — dissolved 2026-07-10).
  */
 
 /** PoI routing classes (feature-inventory design §4) plus pipeline extensions. */
@@ -41,15 +41,41 @@ export interface Poi {
   newBasenames?: string[];
 }
 
+/** How a branch participates in the sweep (2026-07-14 merge-source correction). */
+export type ScopeKind = 'structural' | 'inventory' | 'edition-ancestor';
+
+/**
+ * Merge model per branch: only main (ff) and `upstream-chain` branches
+ * (main_patched + edition-ancestor upstream-PR candidates) touch upstream
+ * directly; every inventory branch merges its DAG `parents` tips instead —
+ * conflicts resolve once at the topmost affected branch, descendants inherit
+ * via parent merges.
+ */
+export type MergeModel = 'upstream-chain' | 'parents';
+
+export interface ScopeEntry {
+  branch: string;
+  kind: ScopeKind;
+  mergeModel: MergeModel;
+  /** DAG parents (merge sources) for mergeModel 'parents'; empty otherwise. */
+  parents: string[];
+}
+
 export interface BranchScan {
   branch: string;
-  /** true when merge-tree vs the upstream ref produced no conflicts. */
+  kind: ScopeKind;
+  mergeModel: MergeModel;
+  parents: string[];
+  /** true when merge-tree vs the branch's ACTUAL merge source(s) produced no conflicts. */
   clean: boolean;
+  /** Conflicts vs the actual merge source(s) — what the merge stage will hit. */
   conflictFiles: string[];
-  /** Largest clean first-parent upstream commit to merge; null = nothing mergeable. */
+  /** Largest clean first-parent upstream commit to merge (upstream-chain model only). */
   stopPoint: string | null;
-  /** Upstream tip already reachable from the branch (nothing to do). */
+  /** Merge source(s) already reachable from the branch (nothing to do). */
   upToDate: boolean;
+  /** Informational upstream/main forecast for parents-model branches (cheap merge-tree). */
+  upstreamInfo?: { clean: boolean; conflictFiles: string[] };
 }
 
 export interface SweepReport {
@@ -61,6 +87,8 @@ export interface SweepReport {
   /** Base of the PoI-extraction range (exclusive). */
   rangeBase: string;
   branches: Record<string, BranchScan>;
+  /** Non-inventory branches ignored by the scope rule (digest drift line only). */
+  ignoredBranches: string[];
   pois: Poi[];
   warnings: string[];
 }
@@ -131,12 +159,12 @@ export interface RoutingConfig {
 
 /**
  * scripts/sweep/registry/scope.yaml — committed scope POLICY (exclusions are
- * config, not state). Scope = inventory branches UNION repo branches
- * matching `include` globs, minus `exclude` + namespace exclusions.
+ * config, not state). Scope = inventory branches + main_patched (structural)
+ * + non-inventory branches whose tip is an ancestor of any edition/* branch
+ * (owner rule 2026-07-14: "agent ignores non-inventory branches, unless they
+ * are present in any edition branch"). No include-glob mechanism anymore.
  */
 export interface SweepScope {
-  /** Branch-name globs matched against `git branch --list`. */
-  include?: string[];
   exclude?: string[];
   /** child -> parents edges not expressible in the registry (e.g. main_patched roots). */
   extra_edges?: Record<string, string[]>;

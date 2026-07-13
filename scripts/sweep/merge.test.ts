@@ -44,7 +44,27 @@ function ledgerWith(branches: Ledger['branches']): Ledger {
 }
 
 async function targetsFor(...branches: string[]) {
-  return branches.map((branch) => ({ branch, stopPoint: upstreamTip, upToDate: false }));
+  return branches.map((branch) => ({
+    branch,
+    mergeModel: 'upstream-chain' as const,
+    stopPoint: upstreamTip,
+    parents: [],
+    upToDate: false,
+  }));
+}
+
+function chainTarget(branch: string, opts: { stopPoint?: string | null; upToDate?: boolean } = {}) {
+  return {
+    branch,
+    mergeModel: 'upstream-chain' as const,
+    stopPoint: opts.stopPoint === undefined ? upstreamTip : opts.stopPoint,
+    parents: [],
+    upToDate: opts.upToDate ?? false,
+  };
+}
+
+function parentTarget(branch: string, parents: string[]) {
+  return { branch, mergeModel: 'parents' as const, stopPoint: null, parents, upToDate: false };
 }
 
 describe('planMerges', () => {
@@ -55,12 +75,12 @@ describe('planMerges', () => {
     const plan = await planMerges(
       repo.dir,
       [
-        { branch: 'main', stopPoint: upstreamTip, upToDate: false },
-        { branch: 'everything', stopPoint: upstreamTip, upToDate: false },
-        { branch: 'feat/gated', stopPoint: upstreamTip, upToDate: false },
-        { branch: 'feat/clean', stopPoint: null, upToDate: true },
-        { branch: 'feat/replay-me', stopPoint: null, upToDate: false },
-        { branch: 'feat/clean', stopPoint: upstreamTip, upToDate: false },
+        chainTarget('main'),
+        chainTarget('everything'),
+        chainTarget('feat/gated'),
+        chainTarget('feat/clean', { stopPoint: null, upToDate: true }),
+        chainTarget('feat/replay-me', { stopPoint: null }),
+        chainTarget('feat/clean'),
       ],
       ledger,
     );
@@ -150,11 +170,140 @@ describe('executeMerges', () => {
   });
 });
 
+describe('parent-merge model (2026-07-14 merge-source correction)', () => {
+  // Dedicated DAG fixture: main -> main_patched -> module/parent -> feat/child.
+  const dag = initFixtureRepo();
+  afterAll(() => dag.destroy());
+
+  dag.checkout('main_patched', { create: true, at: 'main' });
+  dag.commit('shared fix', { 'src/patch.ts': 'export const patch = 1;\n' });
+  dag.checkout('module/parent', { create: true, at: 'main_patched' });
+  dag.commit('parent edit on shared line', {
+    'src/app.ts': 'export const app = () => 1;\nexport const shared = "parent";\n',
+  });
+  dag.checkout('feat/child', { create: true, at: 'module/parent' });
+  dag.commit('child-only file', { 'src/child.ts': 'export const c = 1;\n' });
+  dag.checkout('main');
+  dag.checkout('upstream-main', { create: true, at: 'main' });
+  const u1 = dag.commit('U1: docs only', { 'docs/u1.md': 'u1\n' });
+  dag.checkout('main');
+
+  const targets = (stopPoint: string) => [
+    { branch: 'main_patched', mergeModel: 'upstream-chain' as const, stopPoint, parents: [], upToDate: false },
+    {
+      branch: 'module/parent',
+      mergeModel: 'parents' as const,
+      stopPoint: null,
+      parents: ['main_patched'],
+      upToDate: false,
+    },
+    {
+      branch: 'feat/child',
+      mergeModel: 'parents' as const,
+      stopPoint: null,
+      parents: ['module/parent'],
+      upToDate: false,
+    },
+  ];
+
+  it('children merge their PARENT tips, never upstream directly; one pass cascades upstream to the leaves', async () => {
+    const { outcomes } = await executeMerges(dag.dir, await planMerges(dag.dir, targets(u1), emptyLedger()), null);
+    expect(outcomes.map((o) => o.result)).toEqual(['merged', 'merged', 'merged']);
+    // main_patched merged the upstream stop point...
+    expect(outcomes[0].mergedSources).toEqual([`${u1}@${u1.slice(0, 12)}`]);
+    // ...the parent merged main_patched's NEW tip, the child merged the parent's NEW tip.
+    const mainPatchedTip = dag.sha('main_patched');
+    const parentTip = dag.sha('module/parent');
+    expect(outcomes[1].mergedSources).toEqual([`main_patched@${mainPatchedTip.slice(0, 12)}`]);
+    expect(outcomes[2].mergedSources).toEqual([`module/parent@${parentTip.slice(0, 12)}`]);
+    // The child's merge commit's second parent IS the parent branch tip — not an upstream commit.
+    expect(dag.sha('feat/child^2')).toBe(parentTip);
+    // Upstream content reached the leaf through the chain.
+    expect(dag.git('merge-base', '--is-ancestor', u1, 'feat/child')).toBe('');
+    // And the child never merged upstream-main directly (no upstream sha in its sources).
+    expect(outcomes[2].mergedSources!.every((s) => !s.startsWith(u1.slice(0, 12)))).toBe(true);
+  });
+
+  it('inherited gating: a gated parent does not advance, so the child has nothing new to merge', async () => {
+    // U2 conflicts with module/parent's shared-line edit.
+    dag.checkout('upstream-main');
+    const u2 = dag.commit('U2: conflicting edit', {
+      'src/app.ts': 'export const app = () => 1;\nexport const shared = "upstream";\n',
+    });
+    dag.checkout('main');
+    const childBefore = dag.sha('feat/child');
+    const { outcomes } = await executeMerges(dag.dir, await planMerges(dag.dir, targets(u2), emptyLedger()), null);
+    // main_patched (no edit on that line) takes U2 clean; the parent gates on it.
+    expect(outcomes[0].result).toBe('merged');
+    expect(outcomes[1].result).toBe('gated');
+    expect(outcomes[1].unresolved).toEqual(['src/app.ts']);
+    // The child saw no new parent commits: noop, ref untouched — it can never overshoot its parent.
+    expect(outcomes[2].result).toBe('noop');
+    expect(dag.sha('feat/child')).toBe(childBefore);
+  });
+
+  it('a conflict resolved once at the parent is INHERITED by the child without re-conflicting', async () => {
+    // Resolve the U2 conflict at the topmost affected branch (module/parent).
+    const RESOLUTION = 'export const app = () => 1;\nexport const shared = "parent+upstream";\n';
+    dag.checkout('module/parent');
+    try {
+      dag.git('merge', '--no-edit', 'main_patched');
+    } catch {
+      // conflict expected
+    }
+    dag.write('src/app.ts', RESOLUTION);
+    dag.git('add', 'src/app.ts');
+    dag.git('commit', '--no-edit', '--no-verify');
+    dag.checkout('main');
+    const parentTip = dag.sha('module/parent');
+
+    // The child scan/plan now sees a CLEAN parent merge (fan-out would re-conflict on src/app.ts).
+    const plan = await planMerges(
+      dag.dir,
+      [{ branch: 'feat/child', mergeModel: 'parents', stopPoint: null, parents: ['module/parent'], upToDate: false }],
+      emptyLedger(),
+    );
+    expect(plan[0].expectConflicts).toEqual([]);
+    const { outcomes } = await executeMerges(dag.dir, plan, null);
+    expect(outcomes[0].result).toBe('merged');
+    expect(outcomes[0].rerereResolved).toEqual([]);
+    expect(outcomes[0].mergedSources).toEqual([`module/parent@${parentTip.slice(0, 12)}`]);
+    expect(dag.git('show', 'feat/child:src/app.ts')).toBe(RESOLUTION.trim());
+  });
+
+  it('multiple parents are merged in order in one pass', async () => {
+    dag.git('branch', 'module/other', 'main_patched');
+    dag.checkout('module/other');
+    dag.commit('other parent file', { 'src/other.ts': 'export const o = 1;\n' });
+    dag.checkout('main');
+    const plan = await planMerges(
+      dag.dir,
+      [
+        {
+          branch: 'feat/child',
+          mergeModel: 'parents',
+          stopPoint: null,
+          parents: ['module/parent', 'module/other'],
+          upToDate: false,
+        },
+      ],
+      emptyLedger(),
+    );
+    const { outcomes } = await executeMerges(dag.dir, plan, null);
+    expect(outcomes[0].result).toBe('merged');
+    // module/parent tip was already reached in the previous test -> only module/other is new.
+    expect(outcomes[0].mergedSources).toEqual([`module/other@${dag.sha('module/other').slice(0, 12)}`]);
+    expect(dag.git('show', 'feat/child:src/other.ts')).toBe('export const o = 1;');
+  });
+});
+
 describe('rollbackBranch', () => {
   it('resets a merged branch to its recorded pre-merge ref', async () => {
     const outcome = {
       branch: 'feat/clean',
+      mergeModel: 'upstream-chain' as const,
       stopPoint: upstreamTip,
+      sources: [upstreamTip],
       preRef: repo.git('rev-parse', 'feat/clean^1'), // pre-merge tip (first parent)
       action: 'merge' as const,
       expectConflicts: [],

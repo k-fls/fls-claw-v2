@@ -73,7 +73,8 @@ export function applyRecord(ledger: Ledger, inputs: RecordInputs): Ledger {
           type: 'rerere-replay',
           paths: o.rerereResolved!,
           branches: [o.branch],
-          upstreamCommits: [o.stopPoint!],
+          // upstream-chain merges point at the stop point; parent merges at the merged source tips
+          upstreamCommits: o.stopPoint ? [o.stopPoint] : (o.mergedSources ?? []),
           state: 'open',
           pr: null,
         });

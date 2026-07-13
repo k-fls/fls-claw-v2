@@ -2,7 +2,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import { initFixtureRepo } from './fixtures.js';
 import { buildReport, extractPois, scanBranch } from './scan.js';
-import type { Poi } from './types.js';
+import type { Poi, ScopeEntry } from './types.js';
 
 const repo = initFixtureRepo();
 afterAll(() => repo.destroy());
@@ -70,18 +70,63 @@ describe('extractPois', () => {
   });
 });
 
+function chainEntry(branch: string): ScopeEntry {
+  return { branch, kind: 'structural', mergeModel: 'upstream-chain', parents: [] };
+}
+
 describe('scanBranch / buildReport', () => {
-  it('classifies clean and conflicting branches', async () => {
-    const conflicting = await scanBranch(repo.dir, 'feat/conflicting', 'upstream-main');
+  it('classifies clean and conflicting upstream-chain branches', async () => {
+    const conflicting = await scanBranch(repo.dir, chainEntry('feat/conflicting'), 'upstream-main');
     expect(conflicting.clean).toBe(false);
     expect(conflicting.conflictFiles).toEqual(['src/app.ts']);
     expect(conflicting.stopPoint).not.toBeNull(); // clean prefix before the conflicting commit
   });
 
-  it('emits a gate merge-conflict PoI per conflicted branch', async () => {
-    const report = await buildReport(repo.dir, ['feat/conflicting'], 'upstream-main', 'main');
+  it('parents-model branches are previewed against their ACTUAL merge source, not upstream', async () => {
+    // Child of feat/conflicting with its own non-conflicting commit.
+    repo.checkout('feat/child', { create: true, at: 'feat/conflicting' });
+    repo.commit('child-only file', { 'src/child.ts': 'export const c = 1;\n' });
+    repo.checkout('main');
+    const entry: ScopeEntry = {
+      branch: 'feat/child',
+      kind: 'inventory',
+      mergeModel: 'parents',
+      parents: ['feat/conflicting'],
+    };
+
+    // Parent tip is already an ancestor: nothing to merge (up-to-date vs its source)
+    // even though upstream/main would conflict — that conflict belongs to the parent.
+    const scan = await scanBranch(repo.dir, entry, 'upstream-main');
+    expect(scan.upToDate).toBe(true);
+    expect(scan.clean).toBe(true);
+    expect(scan.conflictFiles).toEqual([]);
+    expect(scan.stopPoint).toBeNull();
+    // ...but the informational upstream forecast still shows the inherited conflict.
+    expect(scan.upstreamInfo).toMatchObject({ clean: false, conflictFiles: ['src/app.ts'] });
+
+    // Parent advances with a change colliding with the child's edit -> parent-merge conflict.
+    repo.checkout('feat/conflicting');
+    repo.commit('parent edits child file', { 'src/child.ts': 'export const c = 2;\n' });
+    repo.checkout('main');
+    const scan2 = await scanBranch(repo.dir, entry, 'upstream-main');
+    expect(scan2.upToDate).toBe(false);
+    expect(scan2.clean).toBe(false);
+    expect(scan2.conflictFiles).toEqual(['src/child.ts']); // vs the parent, not upstream
+  });
+
+  it('emits a gate merge-conflict PoI per conflicted branch and carries ignored branches', async () => {
+    const report = await buildReport(
+      repo.dir,
+      [chainEntry('feat/conflicting')],
+      'upstream-main',
+      'main',
+      {},
+      [],
+      ['docs/ignored-branch'],
+    );
     expect(report.schemaVersion).toBe(1);
     expect(report.branches['feat/conflicting'].conflictFiles).toEqual(['src/app.ts']);
+    expect(report.ignoredBranches).toEqual(['docs/ignored-branch']);
     const gates = report.pois.filter((p) => p.class === 'gate');
     expect(gates).toHaveLength(1);
     expect(gates[0].type).toBe('merge-conflict');

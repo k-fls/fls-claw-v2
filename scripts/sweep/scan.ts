@@ -23,13 +23,15 @@ import {
   diffNameStatus,
   diffText,
   firstParentChain,
+  isAncestor,
   listTopLevel,
   listTreePaths,
+  newStyleMergeTree,
   revParse,
 } from './git.js';
 import { globMatchAny } from './globs.js';
 import { findStopPoint } from './stop-points.js';
-import type { BranchScan, Poi, PoiType, SweepReport } from './types.js';
+import type { BranchScan, Poi, PoiType, ScopeEntry, SweepReport } from './types.js';
 
 export interface ScanOptions {
   largeSourceBytes?: number;
@@ -57,15 +59,50 @@ function poiIdFactory(): (type: PoiType, hint: string) => string {
   };
 }
 
-/** Classify one branch: merge-tree conflicts vs upstream + stop point. */
-export async function scanBranch(repo: string, branch: string, upstreamRef: string): Promise<BranchScan> {
-  const sp = await findStopPoint(repo, branch, upstreamRef);
+/**
+ * Classify one branch against its ACTUAL merge source (2026-07-14 merge-source
+ * correction) — that is what the merge stage will do:
+ *  - upstream-chain (main_patched, edition-ancestors): merge-tree conflicts vs
+ *    the upstream ref + first-parent stop point, as before.
+ *  - parents (inventory branches): merge-tree preview vs each DAG parent's
+ *    CURRENT tip (post-cascade tips may differ once parents advance — the
+ *    verdict is refreshed on the next scan). A cheap upstream/main forecast is
+ *    kept as informational `upstreamInfo`.
+ */
+export async function scanBranch(repo: string, entry: ScopeEntry, upstreamRef: string): Promise<BranchScan> {
+  if (entry.mergeModel === 'upstream-chain') {
+    const sp = await findStopPoint(repo, entry.branch, upstreamRef);
+    return {
+      branch: entry.branch,
+      kind: entry.kind,
+      mergeModel: entry.mergeModel,
+      parents: entry.parents,
+      clean: sp.cleanAtTip,
+      conflictFiles: sp.conflictFiles,
+      stopPoint: sp.stopPoint,
+      upToDate: sp.upToDate,
+    };
+  }
+  // parents model: preview each parent merge at its current tip.
+  const conflictFiles = new Set<string>();
+  let upToDate = true;
+  for (const parent of entry.parents) {
+    if (await isAncestor(repo, parent, entry.branch)) continue; // nothing new from this parent
+    upToDate = false;
+    const probe = await newStyleMergeTree(repo, entry.branch, parent);
+    for (const f of probe.conflictFiles) conflictFiles.add(f);
+  }
+  const upstreamProbe = await newStyleMergeTree(repo, entry.branch, upstreamRef);
   return {
-    branch,
-    clean: sp.cleanAtTip,
-    conflictFiles: sp.conflictFiles,
-    stopPoint: sp.stopPoint,
-    upToDate: sp.upToDate,
+    branch: entry.branch,
+    kind: entry.kind,
+    mergeModel: entry.mergeModel,
+    parents: entry.parents,
+    clean: conflictFiles.size === 0,
+    conflictFiles: [...conflictFiles].sort(),
+    stopPoint: null,
+    upToDate,
+    upstreamInfo: { clean: upstreamProbe.clean, conflictFiles: upstreamProbe.conflictFiles },
   };
 }
 
@@ -197,19 +234,20 @@ export interface BuildReportOptions extends ScanOptions {
   skipStopPoints?: boolean;
 }
 
-/** Full scan: per-branch conflicts + stop points + range PoIs -> SweepReport. */
+/** Full scan: per-branch conflicts (vs actual merge sources) + stop points + range PoIs -> SweepReport. */
 export async function buildReport(
   repo: string,
-  branches: string[],
+  entries: ScopeEntry[],
   upstreamRef: string,
   rangeBase: string,
   opts: BuildReportOptions = {},
   warnings: string[] = [],
+  ignoredBranches: string[] = [],
 ): Promise<SweepReport> {
   const upstreamTip = await revParse(repo, upstreamRef);
   const branchScans: Record<string, BranchScan> = {};
-  for (const branch of branches) {
-    branchScans[branch] = await scanBranch(repo, branch, upstreamRef);
+  for (const entry of entries) {
+    branchScans[entry.branch] = await scanBranch(repo, entry, upstreamRef);
   }
   const pois = await extractPois(repo, rangeBase, upstreamRef, opts);
   // Conflict PoIs (gate class) from the branch scans.
@@ -224,7 +262,10 @@ export async function buildReport(
         upstreamCommits: [upstreamTip],
         commitSubjects: [],
         branches: [scan.branch],
-        detail: `merge of ${upstreamRef} into ${scan.branch} conflicts`,
+        detail:
+          scan.mergeModel === 'parents'
+            ? `merging parents [${scan.parents.join(', ')}] into ${scan.branch} conflicts`
+            : `merge of ${upstreamRef} into ${scan.branch} conflicts`,
       });
     }
   }
@@ -236,6 +277,7 @@ export async function buildReport(
     upstreamTip,
     rangeBase: await revParse(repo, rangeBase),
     branches: branchScans,
+    ignoredBranches,
     pois,
     warnings,
   };

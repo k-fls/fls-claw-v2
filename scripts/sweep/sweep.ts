@@ -7,9 +7,11 @@
  * Subcommands (pipeline spec §5; read-only unless marked MUTATES):
  *   fetch              git fetch upstream origin --prune          (MUTATES remotes state)
  *   ff-main            fast-forward main to upstream/main         (MUTATES)
- *   scan               conflict scan + stop points + PoIs -> sweep-report.json
- *   stop-points        per-branch largest clean first-parent prefix
- *   merge              DAG-ordered propagation to stop points     (MUTATES)
+ *   scan               conflict scan vs ACTUAL merge sources + stop points + PoIs -> sweep-report.json
+ *   stop-points        largest clean first-parent prefix (upstream-chain branches only)
+ *   merge              DAG-ordered propagation: parents' tips for inventory
+ *                      branches, upstream stop point for main_patched/edition-
+ *                      ancestors (MUTATES)
  *   verify             everything rebuild + test matrix in a temp worktree
  *   record             fold report/outcomes/verify into the workspace ledger (writes files)
  *   status             sweep summary: derived merge-base + ledger overrides
@@ -62,7 +64,14 @@ import {
 import { git, isAncestor, localBranches, refExists, revParse, worktreeBranches } from './git.js';
 import { globMatchAny } from './globs.js';
 import { appendSweepLog, derivedLastMerged, readLedger } from './ledger.js';
-import { executeMerges, planMerges, rollbackBranch, writeRrCacheDir, type MergeOutcome } from './merge.js';
+import {
+  executeMerges,
+  planMerges,
+  rollbackBranch,
+  writeRrCacheDir,
+  type MergeOutcome,
+  type MergeTarget,
+} from './merge.js';
 import { applyRecord, recordSweep } from './record.js';
 import { loadFeatures, loadRegistry, loadReplayCases, loadRoutingConfig } from './registry.js';
 import { replayCases, seedableCases, seedRerereFromCases } from './replay.js';
@@ -223,25 +232,32 @@ async function scopeBranches(cli: Cli): Promise<{ scope: ScopeResult; warnings: 
   });
   const warnings = [...registry.warnings];
   let scope = await resolveScope(cli.repo, registry.features, registry.scope);
-  if (scope.ordered.length === 0) {
-    warnings.push(
-      'inventory produced an empty scope — falling back to module/*|feat/*|edition/* + main_patched enumeration',
+  if (!scope.ordered.some((e) => e.kind === 'inventory')) {
+    warnings.push('inventory produced no in-scope branches — falling back to module/*|feat/*|edition/* enumeration');
+    const namespaceBranches = (await localBranches(cli.repo)).filter(
+      (b) => /^(module|feat|edition)\//.test(b) && !globMatchAny(EXCLUDED_BRANCH_GLOBS, b),
     );
-    const branches = (await localBranches(cli.repo)).filter(
-      (b) => (/^(module|feat|edition)\//.test(b) || b === 'main_patched') && !globMatchAny(EXCLUDED_BRANCH_GLOBS, b),
-    );
+    const namespaceSet = new Set(namespaceBranches);
+    const hasMainPatched = scope.ordered.some((e) => e.branch === 'main_patched');
     scope = {
       ordered: [
-        ...(branches.includes('main_patched') ? ['main_patched'] : []),
-        ...branches.filter((b) => b !== 'main_patched').sort(),
+        // keep the structural + edition-ancestor entries the partition already found
+        ...scope.ordered.filter((e) => !namespaceSet.has(e.branch)),
+        ...namespaceBranches.sort().map((b) => ({
+          branch: b,
+          kind: 'inventory' as const,
+          mergeModel: hasMainPatched ? ('parents' as const) : ('upstream-chain' as const),
+          parents: hasMainPatched ? ['main_patched'] : [],
+        })),
       ],
+      ignored: scope.ignored.filter((b) => !namespaceSet.has(b)),
       edges: {},
-      warnings: [],
+      warnings: scope.warnings,
     };
   }
   warnings.push(...scope.warnings);
   if (cli.branches.length > 0) {
-    scope = { ...scope, ordered: scope.ordered.filter((b) => cli.branches.includes(b)) };
+    scope = { ...scope, ordered: scope.ordered.filter((e) => cli.branches.includes(e.branch)) };
   }
   return { scope, warnings };
 }
@@ -308,33 +324,61 @@ async function cmdScan(cli: Cli): Promise<number> {
     opts.largeAnyBytes = Math.max(routing.largeNewFileKb * 1024, LARGE_ANY_BYTES);
   }
   if (routing.sensitiveSurfaces) opts.sensitivePaths = [...SENSITIVE_PATHS, ...routing.sensitiveSurfaces];
-  const report = await buildReport(cli.repo, scope.ordered, cli.upstream, rangeBase, opts, warnings);
+  const report = await buildReport(cli.repo, scope.ordered, cli.upstream, rangeBase, opts, warnings, scope.ignored);
   emit(cli, report);
   return 0;
 }
 
 async function cmdStopPoints(cli: Cli): Promise<number> {
   const { scope } = await scopeBranches(cli);
+  // Only upstream-chain branches (main_patched + edition-ancestors) bisect the
+  // upstream first-parent chain; inventory branches inherit via parent merges.
   const results = [];
-  for (const branch of scope.ordered) results.push(await findStopPoint(cli.repo, branch, cli.upstream));
+  for (const entry of scope.ordered) {
+    if (entry.mergeModel !== 'upstream-chain') continue;
+    results.push(await findStopPoint(cli.repo, entry.branch, cli.upstream));
+  }
   emit(cli, results);
   return 0;
 }
 
 async function cmdMerge(cli: Cli): Promise<number> {
   const ledger = readLedger(cli.ledgerPath);
-  let targets: { branch: string; stopPoint: string | null; upToDate: boolean }[];
+  let targets: MergeTarget[];
   if (cli.report) {
     const report = readJson<SweepReport>(cli.report);
     targets = Object.values(report.branches)
       .filter((b) => cli.branches.length === 0 || cli.branches.includes(b.branch))
-      .map((b) => ({ branch: b.branch, stopPoint: b.stopPoint, upToDate: b.upToDate }));
+      .map((b) => ({
+        branch: b.branch,
+        mergeModel: b.mergeModel,
+        stopPoint: b.stopPoint,
+        parents: b.parents,
+        upToDate: b.upToDate,
+      }));
   } else {
     const { scope } = await scopeBranches(cli);
     targets = [];
-    for (const branch of scope.ordered) {
-      const sp = await findStopPoint(cli.repo, branch, cli.upstream);
-      targets.push({ branch, stopPoint: sp.stopPoint, upToDate: sp.upToDate });
+    for (const entry of scope.ordered) {
+      if (entry.mergeModel === 'upstream-chain') {
+        const sp = await findStopPoint(cli.repo, entry.branch, cli.upstream);
+        targets.push({
+          branch: entry.branch,
+          mergeModel: 'upstream-chain',
+          stopPoint: sp.stopPoint,
+          parents: [],
+          upToDate: sp.upToDate,
+        });
+      } else {
+        // parents model: execution probes the parents' tips itself.
+        targets.push({
+          branch: entry.branch,
+          mergeModel: 'parents',
+          stopPoint: null,
+          parents: entry.parents,
+          upToDate: false,
+        });
+      }
     }
   }
   const plan = await planMerges(cli.repo, targets, ledger);
@@ -431,29 +475,48 @@ async function cmdStatus(cli: Cli): Promise<number> {
   // Branch set: scope union report union ledger overrides.
   const report = cli.report ? readJson<SweepReport>(cli.report) : null;
   const { scope } = await scopeBranches(cli);
+  const kindOf = new Map(scope.ordered.map((e) => [e.branch, e]));
   const names = [
-    ...new Set([...scope.ordered, ...Object.keys(report?.branches ?? {}), ...Object.keys(ledger.branches)]),
+    ...new Set([
+      ...scope.ordered.map((e) => e.branch),
+      ...Object.keys(report?.branches ?? {}),
+      ...Object.keys(ledger.branches),
+    ]),
   ].sort();
   console.log(`branches in scope: ${names.length}`);
   for (const name of names) {
     const bs = ledger.branches[name];
+    const entry = kindOf.get(name);
     // DERIVED state: merge-base(branch, upstream) replaces stored lastMergedUpstream.
     const mergeBase = (await refExists(cli.repo, name)) ? await derivedLastMerged(cli.repo, name, cli.upstream) : null;
     const merged = mergeBase ? mergeBase.slice(0, 12) : 'n/a';
     const extras = [bs?.frozenBy ? `frozen by ${bs.frozenBy}` : '', bs?.notes ?? ''].filter(Boolean).join('; ');
-    let verdict = '';
     const scan = report?.branches[name];
+    const model = entry ?? scan;
+    const sourceLabel =
+      model?.mergeModel === 'parents' ? `parents: ${(model.parents ?? []).join(', ')}` : 'upstream chain';
+    let verdict = '';
     if (scan) {
       if (scan.upToDate) verdict = '  => up-to-date';
-      else if (scan.clean) verdict = `  => clean, ready to merge ${report!.upstreamTip.slice(0, 12)}`;
+      else if (scan.clean)
+        verdict =
+          scan.mergeModel === 'parents'
+            ? '  => clean, ready to merge parents'
+            : `  => clean, ready to merge ${report!.upstreamTip.slice(0, 12)}`;
+      else if (scan.mergeModel === 'parents')
+        verdict = `  => gated on parent merge (${scan.conflictFiles.length} conflict files)`;
       else if (scan.stopPoint)
         verdict = `  => gated at stop point ${scan.stopPoint.slice(0, 12)} (${scan.conflictFiles.length} conflict files beyond)`;
       else verdict = `  => fully gated (first pending commit conflicts: ${scan.conflictFiles.length} files at tip)`;
     }
     console.log(
-      `  ${(bs?.status ?? 'active').padEnd(8)} ${name}  mergeBase=${merged}${extras ? `  [${extras}]` : ''}${verdict}`,
+      `  ${(bs?.status ?? 'active').padEnd(8)} ${(entry?.kind ?? '-').padEnd(16)} ${name}  mergeBase=${merged}  [${sourceLabel}]${extras ? `  [${extras}]` : ''}${verdict}`,
     );
   }
+  const ignoredList = report?.ignoredBranches ?? scope.ignored;
+  console.log(
+    `ignored (no inventory entry, not in any edition composition): ${ignoredList.length}${ignoredList.length ? ` — ${ignoredList.join(', ')}` : ''}`,
+  );
   const open = ledger.openPois.filter((p) => p.state === 'open');
   console.log(`open PoIs: ${open.length}`);
   for (const p of open)
