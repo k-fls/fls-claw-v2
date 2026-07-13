@@ -392,7 +392,7 @@ This is documented as a pattern, not a built-in feature.
 
 ## Core Properties
 - Container isolation via filesystem mounts
-- Credential proxy (OneCLI)
+- Credential proxy (host-side MITM credential proxy — see [mitm-proxy.md](mitm-proxy.md))
 - Per-agent-group workspace (folder, CLAUDE.md, skills)
 - Polling-based (not event-driven)
 - Per-agent-group agent-runner recompilation on container startup (agent can modify its own source, request rebuild/restart, changes persist across teardowns)

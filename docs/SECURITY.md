@@ -64,18 +64,18 @@ Messages and task operations are verified against group identity:
 | View all tasks | ✓ | Own only |
 | Manage other groups | ✓ | ✗ |
 
-### 5. Credential Isolation (OneCLI Agent Vault)
+### 5. Credential Isolation (MITM credential proxy)
 
-Real API credentials **never enter containers**. NanoClaw uses [OneCLI's Agent Vault](https://github.com/onecli/onecli) to proxy outbound requests and inject credentials at the gateway level.
+Real API credentials **never enter containers**. This fork runs a host-side **MITM credential proxy** (`src/modules/mitm-proxy/`, `src/modules/credentials/`) that hands containers substitute tokens and swaps in the real secret at the proxy boundary. Full contract: [mitm-proxy.md](mitm-proxy.md).
 
 **How it works:**
-1. Credentials are registered once with `onecli secrets create`, stored and managed by OneCLI
-2. When NanoClaw spawns a container, it calls `applyContainerConfig()` to route outbound HTTPS through the OneCLI gateway
-3. The gateway matches requests by host and path, injects the real credential, and forwards
-4. Agents cannot discover real credentials — not in environment, stdin, files, or `/proc`
+1. Real credentials live on the host in the credentials module; the container is given a **format-preserving substitute** — a placeholder that looks like the real token but is useless outside this container.
+2. When NanoClaw spawns a container, the credential-proxy lifecycle observer injects `HTTP_PROXY` and installs the host's MITM CA into the container's trust stores. Outbound HTTPS (explicit proxy or DNAT'd `:443`) is intercepted.
+3. For providers whose host rules are registered, the proxy MITMs the TLS connection, swaps the substitute in request headers for the real token, and forwards. Agents cannot discover real credentials — not in environment, stdin, files, or `/proc`.
+4. Substitutes are pulled on demand via `GET /credentials/<providerId>/substitute` (the `get_credential` MCP tool inside the container), or published as env vars at startup.
 
-**Per-agent policies:**
-Each NanoClaw group gets its own OneCLI agent identity. This allows different credential policies per group (e.g. your sales agent vs. support agent). OneCLI supports rate limits, and time-bound access and approval flows are on the roadmap.
+**Per-group scope:**
+The proxy identifies the calling container by IP → group scope and resolves credentials through that group's per-group resolver, which enforces grant/borrow access checks. A group only reaches its own credentials (or ones explicitly borrowed from another group), and a group-declared provider def is confined to the registrable domain its credential was issued for.
 
 **NOT Mounted:**
 - Channel auth sessions (`store/auth/`) — host only
@@ -100,8 +100,8 @@ enforced *inside* the container:
    IPv6 in the container netns (`--sysctl`), and forces the root-drop launch
    mode.
 2. `container/entrypoint.sh`, running as root, installs a **default-DROP OUTPUT
-   firewall** (`iptables`) that permits egress ONLY to the host hop: the OneCLI
-   proxy (`host:port` parsed from the injected `HTTPS_PROXY`) and the host-rpc
+   firewall** (`iptables`) that permits egress ONLY to the host hop: the
+   credential proxy (`host:port` parsed from the injected proxy URL) and the host-rpc
    port. Loopback and established/related return traffic are allowed.
 3. The entrypoint then `setpriv`-drops to the host UID with an **empty
    capability bounding set** (`--bounding-set=-all`). Combined with the always-on
@@ -159,7 +159,7 @@ Lockdown is **off by default**.
 │  • IPC authorization                                              │
 │  • Mount validation (external allowlist)                          │
 │  • Container lifecycle                                            │
-│  • OneCLI Agent Vault (injects credentials, enforces policies)   │
+│  • MITM credential proxy (injects credentials, enforces scope)   │
 └────────────────────────────────┬─────────────────────────────────┘
                                  │
                                  ▼ Explicit mounts only, no secrets
@@ -168,7 +168,7 @@ Lockdown is **off by default**.
 │  • Agent execution                                                │
 │  • Bash commands (sandboxed)                                      │
 │  • File operations (limited to mounts)                            │
-│  • API calls routed through OneCLI Agent Vault                   │
+│  • API calls routed through the MITM credential proxy            │
 │  • No real credentials in environment or filesystem              │
 └──────────────────────────────────────────────────────────────────┘
 ```

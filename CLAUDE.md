@@ -49,12 +49,12 @@ For ad-hoc queries from skills or scripts, use the in-tree wrapper rather than t
 | `src/delivery.ts` | Polls `outbound.db`, delivers via adapter, handles system actions (schedule, approvals, etc.) |
 | `src/host-sweep.ts` | 60s sweep: `processing_ack` sync, stale detection, due-message wake, recurrence |
 | `src/session-manager.ts` | Resolves sessions; opens `inbound.db` / `outbound.db`; manages heartbeat path |
-| `src/container-runner.ts` | Spawns per-agent-group Docker containers with session DB + outbox mounts, OneCLI `ensureAgent` |
+| `src/container-runner.ts` | Spawns per-agent-group Docker containers with session DB + outbox mounts; MITM proxy CA/env injected by the credential-proxy lifecycle observer (legacy OneCLI `ensureAgent`/`applyContainerConfig` is skipped when the proxy is live) |
 | `src/container-runtime.ts` | Runtime selection (Docker vs Apple containers), orphan cleanup |
 | `src/modules/permissions/access.ts` | `canAccessAgentGroup` — owner / global admin / scoped admin / member resolution against `user_roles` + `agent_group_members` |
 | `src/modules/approvals/primitive.ts` | `pickApprover`, `pickApprovalDelivery`, `requestApproval`, approval-handler registry |
 | `src/command-gate.ts` | Router-side admin command gate — queries `user_roles` directly (no env var, no container-side check) |
-| `src/modules/approvals/onecli-approvals.ts` | OneCLI credentialed-action approval bridge |
+| `src/modules/approvals/onecli-approvals.ts` | Legacy OneCLI credentialed-action approval bridge (dormant — skipped while the MITM proxy is live) |
 | `src/modules/permissions/user-dm.ts` | Cold-DM resolution + `user_dms` cache |
 | `src/group-init.ts` | Per-agent-group filesystem scaffold (CLAUDE.md, skills, agent-runner-src overlay) |
 | `src/db/container-configs.ts` | CRUD for `container_configs` table (per-group container runtime config) |
@@ -64,7 +64,7 @@ For ad-hoc queries from skills or scripts, use the in-tree wrapper rather than t
 | `src/channels/` | Channel adapter infra (registry, Chat SDK bridge); specific channel adapters are skill-installed from the `channels` branch |
 | `src/providers/` | Host-side provider container-config (`claude` baked in; `opencode` etc. installed from the `providers` branch) |
 | `container/agent-runner/src/` | Agent-runner: poll loop, formatter, provider abstraction, MCP tools, destinations |
-| `container/skills/` | Container skills mounted into every agent session (`onecli-gateway`, `welcome`, `self-customize`, `agent-browser`, `slack-formatting`) |
+| `container/skills/` | Container skills mounted into every agent session (`credentials`, `auth-providers`, `welcome`, `self-customize`, `agent-browser`, `slack-formatting`) |
 | `groups/<folder>/` | Per-agent-group filesystem (CLAUDE.md, skills, per-group `agent-runner-src/` overlay) |
 | `scripts/init-first-agent.ts` | Bootstrap the first DM-wired agent (used by `/init-first-agent` skill) |
 | `migrate-v2.sh` + `setup/migrate-v2/` | v1→v2 migration. Standalone script: `bash migrate-v2.sh`. Seeds DB, copies groups/sessions, installs channels, builds container, offers service switchover, then hands off to `/migrate-from-v1` skill for owner setup and CLAUDE.md cleanup. See [docs/migration-dev.md](docs/migration-dev.md). |
@@ -135,30 +135,28 @@ The `on_wake` column on `messages_in` ensures wake messages are only picked up b
 
 Key files: `src/container-restart.ts`, `src/container-runner.ts` (`killContainer`), `container/agent-runner/src/db/messages-in.ts` (`getPendingMessages`).
 
-## Secrets / Credentials / OneCLI
+## Secrets / Credentials (MITM proxy)
 
-API keys, OAuth tokens, and auth credentials are managed by the OneCLI gateway. Secrets are injected into per-agent containers at request time — none are passed in env vars or through chat context. The container agent sees this via the `onecli-gateway` container skill (`container/skills/onecli-gateway/SKILL.md`), which teaches it how the proxy works, how to handle auth errors, and to never ask for raw credentials. Host-side wiring: `src/modules/approvals/onecli-approvals.ts`, `ensureAgent()` in `container-runner.ts`. Run `onecli --help`.
+This fork's credential path is a host-side **MITM credential proxy**, not an external gateway. Real API keys / OAuth tokens live on the host in the credentials module (`src/modules/credentials/`) and **never enter containers**. What a container holds is a **substitute**: a format-preserving placeholder the proxy recognizes and swaps for the real secret as the request leaves. The proxy is always-on and transparent — explicit `HTTP_PROXY`/`HTTPS_PROXY` and iptables-DNAT'd `:443` both reach it, and the host's MITM CA is installed into the container's trust stores so `curl`/`git`/Node/Chromium all trust the forged certs. Full contract: [docs/mitm-proxy.md](docs/mitm-proxy.md).
 
-### Secret modes
+The container agent learns this through two container skills (not an always-on gateway skill):
 
-Auto-created agents default to `all` secret mode — every vault secret whose host pattern matches is injected automatically, so the common case needs no per-agent setup. If an agent is in `selective` mode it gets no secrets until you assign them, which shows up as a `401` from an API whose credential *is* in the vault. The SDK can't change this; use the CLI (or the web UI at `http://127.0.0.1:10254`):
+- **`credentials`** (`container/skills/credentials/SKILL.md`) — how substitutes work, pulling one with the `get_credential` MCP tool, binding it to an env var, and error recovery. Never ask the user for a raw credential.
+- **`auth-providers`** (`container/skills/auth-providers/SKILL.md`) — how a group declares its own provider definition (in `/workspace/agent/.auth-discovery/`) for a service the proxy doesn't know, and applies it live with `reload_auth_providers`.
 
-```bash
-onecli agents list                                          # check secretMode
-onecli agents set-secret-mode --id <agent-id> --mode all    # inject all matching secrets
-onecli agents set-secrets --id <agent-id> --secret-ids ...  # or stay selective, assign specific ones
-```
+Host boot wiring lives in `src/index.ts` (init token engine → register providers → `CredentialProxy.start()` → `setProxyInstance`). Providers ship as `SubstitutingProvider`s (e.g. `src/providers/claude-credential.ts`, `src/providers/github-credential.ts`); ~60 are known out of the box. There is **no** `onecli`/vault CLI, no per-agent "secret mode", and no external service at `127.0.0.1:10254` in this credential path.
 
-No container restart needed — the gateway looks up secrets per request.
+### Providers and access
 
-### Requiring approval for credential use
+- **Automatic injection.** Many providers publish a substitute as an env var at container start, so the agent just makes the request. Others are pulled on demand via `get_credential(providerId, credentialPath[, envVar])`.
+- **Per-group scope + borrow.** The proxy identifies the calling container by IP → group scope and resolves credentials through the group's per-group resolver, which enforces grant/borrow access checks (`getOrCreateResolverForAgentGroup`). A group with no own credential for a provider can be wired to borrow another group's via the borrow-source resolver.
+- **Bound-domain confinement.** Because a group can edit its own provider defs, a credential captured for a group provider is pinned to the registrable domain it was issued for — editing a def to point elsewhere forwards only the (useless) substitute. Built-in global providers are exempt.
 
-Approval-gating credentialed actions is a **two-sided** flow:
+### Approvals
 
-- **Server-side** (OneCLI gateway): decides *when* to hold a request and emit a pending approval. As of `onecli@1.3.0`, the CLI does **not** expose this — `rules create --action` only accepts `block` or `rate_limit`, and `secrets create` has no approval flag. Approval policies must be configured via the OneCLI web UI at `http://127.0.0.1:10254`. If/when the CLI grows an `approve` action, this section needs updating.
-- **Host-side** (nanoclaw): receives pending approvals and routes them to a human. `src/modules/approvals/onecli-approvals.ts` registers a callback via `onecli.configureManualApproval(cb)` (long-polls `GET /api/approvals/pending`). The callback uses `pickApprover` + `pickApprovalDelivery` from `src/modules/approvals/primitive.ts` to DM an approver. Approvers are resolved from the `user_roles` table — preference order: scoped admins for the agent group → global admins → owners. There is no env var like `NANOCLAW_ADMIN_USER_IDS`; roles are persisted in the central DB only.
+Self-modification actions (package / MCP-server installs) still route to a human approver via the host approval primitive — `pickApprover` + `pickApprovalDelivery` in `src/modules/approvals/primitive.ts`, resolving approvers from `user_roles` (scoped admins → global admins → owners; no env var). Credential *use* is gated by the per-group resolver's access checks rather than a per-request approval hold.
 
-If approvals are configured server-side but the host callback isn't running (or throws), every credentialed call hangs until the gateway times out. Conversely, if the gateway has no rule asking for approval, the host callback never fires regardless of how it's wired.
+> **Legacy OneCLI wiring (dormant).** OneCLI host code still exists on this branch (`src/modules/approvals/onecli-approvals.ts`, `onecli.ensureAgent()`/`applyContainerConfig()` in `container-runner.ts`, `ONECLI_URL`/`ONECLI_API_KEY` in `src/config.ts`, `setup/onecli.ts`). It is **skipped at runtime** whenever the MITM proxy is live (`hasProxyInstance()` is true) — which is always, since the proxy starts unconditionally at boot. Full removal of that wiring is a separate decision, not part of this credential path.
 
 ## Skills
 
@@ -166,8 +164,8 @@ Four types of skills. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full taxono
 
 - **Channel/provider install skills** — copy the relevant module(s) in from the `channels` or `providers` branch, wire imports, install pinned deps (e.g. `/add-discord`, `/add-slack`, `/add-whatsapp`, `/add-opencode`).
 - **Utility skills** — ship code files alongside `SKILL.md` (e.g. a `scripts/` CLI or helper).
-- **Operational skills** — instruction-only workflows (`/setup`, `/debug`, `/customize`, `/init-first-agent`, `/manage-channels`, `/init-onecli`, `/update-nanoclaw`).
-- **Container skills** — loaded inside agent containers at runtime (`container/skills/`: `onecli-gateway`, `welcome`, `self-customize`, `agent-browser`, `slack-formatting`, `credentials`).
+- **Operational skills** — instruction-only workflows (`/setup`, `/debug`, `/customize`, `/init-first-agent`, `/manage-channels`, `/update-nanoclaw`).
+- **Container skills** — loaded inside agent containers at runtime (`container/skills/`: `credentials`, `auth-providers`, `welcome`, `self-customize`, `agent-browser`, `slack-formatting`).
 
 | Skill | When to Use |
 |-------|-------------|
@@ -177,7 +175,6 @@ Four types of skills. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full taxono
 | `/customize` | Adding channels, integrations, behavior changes |
 | `/debug` | Container issues, logs, troubleshooting |
 | `/update-nanoclaw` | Bring upstream updates into a customized install |
-| `/init-onecli` | Install OneCLI Agent Vault and migrate `.env` credentials |
 | `/migrate-memory` | Carry a group's agent memory across a provider switch (operator-run, both directions) |
 
 ## Contributing
@@ -256,6 +253,7 @@ This project uses pnpm with `minimumReleaseAge: 4320` (3 days) in `pnpm-workspac
 | [docs/db-session.md](docs/db-session.md) | Per-session `inbound.db` + `outbound.db` schemas + seq parity |
 | [docs/agent-runner-details.md](docs/agent-runner-details.md) | Agent-runner internals + MCP tool interface |
 | [docs/isolation-model.md](docs/isolation-model.md) | Three-level channel isolation model |
+| [docs/mitm-proxy.md](docs/mitm-proxy.md) | MITM credential proxy — substitute tokens, host-rule index, provider contract, CA trust |
 | [docs/setup-wiring.md](docs/setup-wiring.md) | What's wired, what's open in the setup flow |
 | [docs/architecture-diagram.md](docs/architecture-diagram.md) | Diagram version of the architecture |
 | [docs/build-and-runtime.md](docs/build-and-runtime.md) | Runtime split (Node host + Bun container), lockfiles, image build surface, CI, key invariants |

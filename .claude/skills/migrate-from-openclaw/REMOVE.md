@@ -41,8 +41,8 @@ only the ones you no longer want — review each first.
 - Memories: `groups/*/memories.md`, `groups/*/daily-memories/`
 - Copied OpenClaw skills: directories you added under `container/skills/`
   (compare against the stock set before removing — do not delete
-  `onecli-gateway`, `welcome`, `self-customize`, `agent-browser`,
-  `slack-formatting`, or other shipped container skills).
+  `credentials`, `auth-providers`, `welcome`, `self-customize`,
+  `agent-browser`, `slack-formatting`, or other shipped container skills).
 
 If you edited shared instructions, the relevant edits live in
 `container/CLAUDE.md`, and per-group edits in `groups/<folder>/CLAUDE.local.md` —

@@ -78,11 +78,9 @@ Tasks can exist before a session is awake — the host sweep creates/wakes the c
 
 **v1:** `.env` — plain environment variables. `DISCORD_BOT_TOKEN`, `ANTHROPIC_API_KEY`, etc. The host read them directly and passed them in to any code that needed them.
 
-**v2:** OneCLI Agent Vault. A separate local service at `http://127.0.0.1:10254` holds secrets. Agents are *scoped* to specific secrets and the vault injects them into approved API requests as they leave the container. The container never sees the raw secret value.
+**v2 (this fork):** host-side **MITM credential proxy**. Real secrets live on the host in the credentials module (`src/modules/credentials/`); the container is handed format-preserving *substitute* tokens and the proxy swaps in the real secret at the proxy boundary as the request leaves. Credentials are scoped per group (per-group resolver with grant/borrow access checks). The container never sees the raw secret value. See the "Secrets / Credentials (MITM proxy)" section of the root CLAUDE.md and [mitm-proxy.md](mitm-proxy.md).
 
-Gotcha: auto-created agents default to `selective` secret mode — no secrets attached, even if matching secrets exist in the vault. See the "auto-created agents start in selective secret mode" section of the root CLAUDE.md for the fix (`onecli agents set-secret-mode --mode all`).
-
-**What the automated migration does:** copies every v1 `.env` key verbatim into v2 `.env`, never overwriting existing v2 keys. The OneCLI vault migration is a separate step owned by the `/init-onecli` skill, which knows how to pull from `.env`.
+**What the automated migration does:** copies every v1 `.env` key verbatim into v2 `.env`, never overwriting existing v2 keys. Loading those secrets into the host credentials store is driven out-of-band by the host, not by an in-container step.
 
 ---
 

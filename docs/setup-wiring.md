@@ -16,10 +16,10 @@ Last updated: 2026-04-09
 - Container image rebuilt with tsconfig (`container/agent-runner/tsconfig.json`)
 - E2E verified: host → Docker container → Claude responds → "E2E works!" ✓
 
-### OneCLI Integration
-- `ensureAgent()` call added before `applyContainerConfig()` in `src/container-runner.ts`
-- Without `ensureAgent`, OneCLI rejects unknown agent identifiers and returns false, leaving container with no credentials
-- E2E verified with OneCLI credential injection ✓
+### Credential Proxy Integration
+- Host-side MITM credential proxy starts unconditionally at boot (`CredentialProxy.start()` in `src/index.ts`); the credential-proxy lifecycle observer injects `HTTP_PROXY` + the MITM CA into each spawned container
+- Containers receive substitute tokens; real secrets are swapped in at the proxy boundary (see [mitm-proxy.md](mitm-proxy.md))
+- Legacy OneCLI `ensureAgent()`/`applyContainerConfig()` wiring remains in `src/container-runner.ts` but is skipped whenever the proxy is live (i.e. always)
 
 ### Channel Barrel
 - `src/index.ts` imports `./channels/index.js` (the barrel)
@@ -95,7 +95,7 @@ Channel adapter → routeInbound() → resolve messaging_group → resolve agent
 | `src/session-manager.ts` | Creates inbound.db + outbound.db per session |
 | `src/delivery.ts` | Polls outbound.db, delivers, handles system actions |
 | `src/host-sweep.ts` | Syncs processing_ack, stale detection, recurrence |
-| `src/container-runner.ts` | Spawns containers, OneCLI ensureAgent + applyContainerConfig |
+| `src/container-runner.ts` | Spawns containers; MITM proxy CA/env injected via lifecycle observer (legacy OneCLI ensureAgent + applyContainerConfig skipped when proxy live) |
 | `setup/register.ts` | Creates entities (agent_group, messaging_group, wiring) |
 | `setup/verify.ts` | Checks central DB for registered groups |
 | `container/agent-runner/src/db/connection.ts` | Two-DB connection layer (inbound read-only, outbound read-write) |
