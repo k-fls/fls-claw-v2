@@ -25,28 +25,14 @@ mechanics: `scripts/sweep/README.md` + `DESIGN.md` on branch `feat/maintenance-s
 6. Anything ambiguous, security-flagged (sensitive-surface PoIs), or OVERLAP-HIGH goes
    to the owner before action.
 
-## GitHub credentials — the ONLY correct procedure (start of EVERY session)
+## GitHub
 
-Your GitHub credential IS provisioned (provider `github`, credential path `api_key`,
-scope = this group). Do not conclude otherwise; past sessions wasted hours on this.
-
-1. If `GH_TOKEN` is already in your env — done; `gh` and `git push` work normally.
-2. If not (container spawned before the credential existed, or context was compacted):
-   call the `get_credential` MCP action with provider=`github`,
-   credentialPath=**`api_key`** (NEVER `oauth` — that path does not exist and returns
-   "No credentials found"), then:
-   `export GH_TOKEN=<substitute>; export GITHUB_TOKEN=$GH_TOKEN; gh auth setup-git`.
-   The value is a proxy substitute, not the real token — safe to hold in env.
-3. **Ignore the onecli-gateway skill for GitHub.** This host runs the NATIVE credential
-   proxy; there is no OneCLI dashboard and no `connect_url` flow. A 401 does NOT mean
-   "service not connected" — redo step 2 first.
-4. Only if step 2 itself fails for path `api_key` may you report missing credentials —
-   and then quote the exact error.
+Use `gh` and `git` as-is; the host authenticates them. If `gh` returns an auth error,
+report it to the owner.
 
 ## Bootstrap (first session; keep the clone across sessions)
 
-1. Set up GitHub credentials per the section above.
-2. `gh repo clone k-fls/fls-claw-v2 repo && cd repo`
+1. `gh repo clone k-fls/fls-claw-v2 repo && cd repo`
    `git remote add upstream https://github.com/nanocoai/nanoclaw.git && git fetch upstream`
    `git checkout feat/maintenance-sweep`
 3. `corepack enable && pnpm install --frozen-lockfile` (fall back to `npm i -g pnpm`).
