@@ -13,7 +13,9 @@ import {
   updateContainerConfigScalars,
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
-import type { ContainerConfigRow } from '../../types.js';
+import { initGroupFilesystem } from '../../group-init.js';
+import { createAgentFromTemplate } from '../../templates/create-agent.js';
+import type { AgentGroup, ContainerConfigRow } from '../../types.js';
 import { registerResource } from '../crud.js';
 
 /** Deserialize JSON columns for display. */
@@ -63,11 +65,9 @@ registerResource({
     { name: 'created_at', type: 'string', description: 'Auto-set.', generated: true },
   ],
   // `create` and `delete` are intentionally not in `operations`:
-  //  - the generic single-table CREATE inserts only the agent_groups row and
-  //    never the matching container_configs row, leaving the group unspawnable
-  //    (see #4). The handler below mirrors the non-CLI creation paths
-  //    (group-init.ts, commands/agent-runtime.ts) by calling
-  //    ensureContainerConfig() after the insert.
+  //  - create needs --template support (upstream) and must also provision the
+  //    container_configs row (ensureContainerConfig) for bare groups; the generic
+  //    path misses both. Mirrors non-CLI creation paths (group-init.ts).
   //  - the generic single-table DELETE violates FK constraints (see #2525).
   // Both are provided as `customOperations` below.
   operations: { list: 'open', get: 'open', update: 'approval' },
@@ -75,32 +75,34 @@ registerResource({
     create: {
       access: 'approval',
       description:
-        'Create a new agent group and its container config. Use --name <name> --folder <folder>. ' +
-        'Provisions the matching container_configs row so the group is spawnable (mirrors group-init).',
+        'Create an agent group. With --template <ref>, stamp from a local template under templates/ ' +
+        '(MCP servers + instructions + skills); else insert a bare row (--name, --folder) with container config provisioned.',
       handler: async (args) => {
+        if (args.template) {
+          return createAgentFromTemplate(String(args.template), {
+            name: args.name ? String(args.name) : undefined,
+          });
+        }
         const name = args.name as string;
         if (!name) throw new Error('--name is required');
         const folder = args.folder as string;
         if (!folder) throw new Error('--folder is required');
-
         const id = randomUUID();
         const created_at = new Date().toISOString();
-
-        const group = {
+        const group: AgentGroup = {
           id,
           name,
           folder,
           agent_provider: (args.agent_provider as string | undefined) ?? null,
           created_at,
         };
-
-        // Atomic: insert the group and ensure its container config together so
-        // a half-created (unspawnable) group can never be left behind.
+        // Atomic: insert group + container_configs together so a half-created
+        // (unspawnable) group can never be left behind (#4).
         getDb().transaction(() => {
           createAgentGroup(group);
           ensureContainerConfig(id);
         })();
-
+        initGroupFilesystem(group);
         return { ...group, container_config: 'ensured' };
       },
     },
