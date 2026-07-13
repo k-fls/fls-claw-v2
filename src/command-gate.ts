@@ -30,7 +30,7 @@ export type GateResult =
   | { action: 'deny'; command: string }
   | { action: 'handle'; command: string; handler: HostCommandHandler };
 
-const FILTERED_COMMANDS = new Set(['/login', '/logout', '/doctor', '/config', '/remote-control']);
+const FILTERED_COMMANDS = new Set(['/start', '/login', '/logout', '/doctor', '/config', '/remote-control']);
 const ADMIN_COMMANDS = new Set(['/clear', '/compact', '/context', '/cost', '/files', '/upload-trace']);
 
 /**
