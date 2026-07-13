@@ -166,5 +166,4 @@ registerResource({
     // the agent can immediately deliver to the new wiring without a restart.
     await projectDestinationsToSessions((row as unknown as MessagingGroupAgent).agent_group_id);
   },
-  },
 });
