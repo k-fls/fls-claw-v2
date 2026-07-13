@@ -17,15 +17,15 @@ flowchart TB
     Bridge["Chat SDK Bridge<br/>(src/channels/chat-sdk-bridge.ts)"]
     Router["Router<br/>(src/router.ts)<br/>platformId + threadId -> messaging_group -> agent_group -> session"]
     SessMgr["Session Manager<br/>(src/session-manager.ts)<br/>creates inbound.db + outbound.db"]
-    Runner["Container Runner<br/>(src/container-runner.ts)<br/>OneCLI ensureAgent + spawn"]
+    Runner["Container Runner<br/>(src/container-runner.ts)<br/>MITM proxy CA/env inject + spawn"]
     Delivery["Delivery Poller<br/>(src/delivery.ts)<br/>1s active / 60s sweep"]
     Sweep["Host Sweep<br/>(src/host-sweep.ts)<br/>heartbeat, retry, recurrence"]
     Central[("Central DB<br/>data/v2.db<br/>agent_groups<br/>messaging_groups<br/>messaging_group_agents<br/>sessions<br/>pending_approvals")]
   end
 
-  subgraph OneCLI["OneCLI Gateway (0.3.1)"]
-    Vault["Agent Vault<br/>secrets + OAuth"]
-    Approvals["configureManualApproval<br/>-> pending_approvals"]
+  subgraph CredProxy["MITM Credential Proxy (host-side)"]
+    Vault["Credentials module<br/>real secrets + per-group resolver"]
+    Approvals["substitute swap<br/>on outbound HTTPS"]
   end
 
   subgraph Session["Per-Session Container (Docker / Apple Container)"]
@@ -48,7 +48,7 @@ flowchart TB
   Router --> SessMgr
   SessMgr --> InDB
   SessMgr --> Runner
-  Runner --> OneCLI
+  Runner --> CredProxy
   Runner --> PollLoop
   PollLoop --> InDB
   PollLoop --> Provider

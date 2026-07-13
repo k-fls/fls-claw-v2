@@ -7,7 +7,7 @@ NanoClaw's runtime does not migrate anything when you switch. Provider-neutral s
 ## Preconditions
 
 1. **The target provider is installed** — run its `/add-<provider>` skill and rebuild the container image (`./container/build.sh`). If the provider isn't installed (or the name is a typo), the container fails at boot and the host surfaces its last words in the logs: look for `Container exited non-zero` with a `stderrTail` like `Unknown provider: codexx. Registered: claude, codex`.
-2. **Auth is configured** — each provider documents its own auth in its install skill (for Codex: a ChatGPT-subscription or API-key secret in the OneCLI vault).
+2. **Auth is configured** — each provider documents its own auth in its install skill (for Codex: a ChatGPT-subscription or API-key credential held on the host and injected by the MITM credential proxy).
 
 ## Switching
 

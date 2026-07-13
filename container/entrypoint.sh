@@ -104,8 +104,8 @@ cat > /tmp/input.json
 # ----- (optional) egress lockdown firewall -----
 # When NANOCLAW_EGRESS_LOCKDOWN=1 (set by the `egress` spawn observer, which
 # also grants NET_ADMIN and forces this root entrypoint), install a default-DROP
-# OUTPUT firewall that permits egress ONLY to the host hop: the OneCLI proxy and
-# the host-rpc port. The privilege drop below then strips NET_ADMIN (and the
+# OUTPUT firewall that permits egress ONLY to the host hop: the credential proxy
+# and the host-rpc port. The privilege drop below then strips NET_ADMIN (and the
 # whole bounding set), so the unprivileged agent cannot flush these rules.
 #
 # Fail-closed: `set -e` means any iptables failure aborts the container rather
@@ -133,8 +133,8 @@ if [ "${NANOCLAW_EGRESS_LOCKDOWN:-}" = "1" ]; then
     exit 1
   fi
 
-  # Proxy host:port from the OneCLI-injected proxy URL. Parsed (not assumed)
-  # so the allowlist tracks whatever OneCLI set, then resolved to an IP.
+  # Proxy host:port from the injected proxy URL. Parsed (not assumed) so the
+  # allowlist tracks whatever the credential proxy set, then resolved to an IP.
   egress_proxy_url="${HTTPS_PROXY:-${https_proxy:-}}"
   egress_proxy_host="$(printf '%s' "$egress_proxy_url" | sed -nE 's#^[a-zA-Z][a-zA-Z0-9+.-]*://([^@/]*@)?([^:/]+):([0-9]+).*#\2#p')"
   egress_proxy_port="$(printf '%s' "$egress_proxy_url" | sed -nE 's#^[a-zA-Z][a-zA-Z0-9+.-]*://([^@/]*@)?([^:/]+):([0-9]+).*#\3#p')"

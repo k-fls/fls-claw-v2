@@ -6,7 +6,7 @@ A two-class model for container-spawn failures and an in-memory
 "poisoned" flag that stops the host-sweep from re-waking a session that
 has hit a non-retryable error.
 
-- **Retryable** failures (plain `Error`, e.g. the OneCLI gateway
+- **Retryable** failures (plain `Error`, e.g. the credential proxy
   momentarily unreachable) keep the silent-retry behavior: the inbound
   row stays pending and the sweep tries again on its next tick.
 - **Non-retryable** failures (`FatalSpawnError`, e.g. a buggy
@@ -74,7 +74,7 @@ function wakeContainer(session: Session): Promise<boolean>;
 - Returns `false` immediately, without spawning, when the session is
   currently spawn-poisoned.
 - Returns `false` on a retryable failure — a plain `Error` thrown from
-  the spawn path (e.g. OneCLI gateway down), or admission-control
+  the spawn path (e.g. credential proxy down), or admission-control
   deferral at the concurrency cap. The inbound row stays pending.
 - On a `FatalSpawnError` from the spawn path, marks the session poisoned
   and rethrows the error.
