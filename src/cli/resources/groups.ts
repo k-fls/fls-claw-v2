@@ -87,20 +87,17 @@ registerResource({
         const name = (args.name as string) ?? folder;
         const existing = getAgentGroupByFolder(folder);
         if (existing) {
-          initGroupFilesystem(existing); // ensure a reused group is fully configured too (idempotent; also repairs a missing workspace folder)
+          initGroupFilesystem(existing);
           return existing;
         }
         const id = `ag-${randomUUID()}`;
         const group: AgentGroup = { id, name, folder, agent_provider: null, created_at: new Date().toISOString() };
-        createAgentGroup(group);
-        // Provision the workspace folder and the `container_configs` row that
-        // `getContainerConfig` and the spawn path require. Without this, a
-        // group created via `ncl groups create` would throw "Container config
-        // not found" on first spawn and stay broken until the host restart
-        // backfill ran (#2415). The template branch above provisions its own
-        // config + folder in `createAgentFromTemplate`; this covers the bare
-        // path. Mirrors what `setup/register.ts` does after creating an agent
-        // group via the setup flow.
+        // Atomic: insert group + container_configs together so a half-created
+        // (unspawnable) group can never be left behind (#4).
+        getDb().transaction(() => {
+          createAgentGroup(group);
+          ensureContainerConfig(id);
+        })();
         initGroupFilesystem(group);
         return getAgentGroupByFolder(folder);
       },
