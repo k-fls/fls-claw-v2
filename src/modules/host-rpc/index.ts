@@ -22,8 +22,8 @@
 import { onShutdown } from '../../response-registry.js';
 import { stopHostRpcServer } from './server.js';
 
-export type { HostRpcRequest, HostRpcHandler } from './types.js';
-export { registerHostRpc, matchHostRpc, listHostRpcHandlers } from './registry.js';
+export type { HostRpcRequest, HostRpcHandler, ScopedHostRpcHandler } from './types.js';
+export { registerHostRpc, registerScopedHostRpc, matchHostRpc, listHostRpcHandlers } from './registry.js';
 export { startHostRpcServer, stopHostRpcServer, getHostRpcAddress } from './server.js';
 export { hostRpcPort, DEFAULT_HOST_RPC_PORT } from './port.js';
 
