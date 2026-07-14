@@ -2,7 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Adapter, AdapterPostableMessage, RawMessage } from 'chat';
 
-import { createChatSdkBridge, isFormatError, splitForLimit, toPlainText } from './chat-sdk-bridge.js';
+import {
+  createChatSdkBridge,
+  isFormatError,
+  leadingBotMentionEnd,
+  splitForLimit,
+  toPlainText,
+} from './chat-sdk-bridge.js';
 
 vi.mock('../webhook-server.js', () => ({
   registerWebhookAdapter: vi.fn(),
@@ -25,6 +31,48 @@ function makePostCapture() {
   };
   return { calls, postMessage };
 }
+
+describe('leadingBotMentionEnd', () => {
+  it('marks the boundary past a bare id mention (Slack, flattened)', () => {
+    // "@U0AKKG67T7X " → 13 chars; content resumes at "/auth".
+    const text = '@U0AKKG67T7X /auth';
+    expect(leadingBotMentionEnd(text, 'U0AKKG67T7X')).toBe(13);
+    expect(text.slice(leadingBotMentionEnd(text, 'U0AKKG67T7X'))).toBe('/auth');
+  });
+
+  it('marks the boundary past an angle-bracket id mention (Discord / raw Slack)', () => {
+    const text = '<@U0AKKG67T7X> /auth claude';
+    expect(text.slice(leadingBotMentionEnd(text, 'U0AKKG67T7X'))).toBe('/auth claude');
+  });
+
+  it('handles the Discord nickname mention form <@!id>', () => {
+    const text = '<@!123456789> /creds';
+    expect(text.slice(leadingBotMentionEnd(text, '123456789'))).toBe('/creds');
+  });
+
+  it('matches a username mention (Telegram) and tolerates a leading @ in userName', () => {
+    const text = '@mybot /auth';
+    expect(text.slice(leadingBotMentionEnd(text, undefined, '@mybot'))).toBe('/auth');
+  });
+
+  it('does NOT match a mention of another user when the bot identity is known', () => {
+    // Precise: only the bot's own mention is a boundary — never someone else's.
+    expect(leadingBotMentionEnd('@alice /auth', 'U0AKKG67T7X')).toBe(0);
+  });
+
+  it('returns 0 when there is no leading mention', () => {
+    expect(leadingBotMentionEnd('hello /auth', 'U0AKKG67T7X')).toBe(0);
+  });
+
+  it('falls back to a generic leading @-token when identity is unknown but isMention is set', () => {
+    const text = '@somebot /auth';
+    expect(text.slice(leadingBotMentionEnd(text, undefined, undefined, true))).toBe('/auth');
+  });
+
+  it('does not guess a boundary when identity is unknown and isMention is false', () => {
+    expect(leadingBotMentionEnd('@alice hi', undefined, undefined, false)).toBe(0);
+  });
+});
 
 describe('splitForLimit', () => {
   it('returns a single chunk when text fits', () => {
