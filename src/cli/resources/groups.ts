@@ -75,7 +75,7 @@ registerResource({
       description:
         'Create (or return the existing) agent group with its container config. Idempotent on --folder. ' +
         'With --template <ref>, stamp from a local template under templates/ (MCP servers + instructions ' +
-        '+ skills). Use --folder <slug> and --name <display name>.',
+        '+ skills + paused recurring tasks). Use --folder <slug> and --name <display name>.',
       handler: async (args) => {
         if (args.template) {
           return createAgentFromTemplate(String(args.template), {

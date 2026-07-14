@@ -21,12 +21,14 @@ function write(rel: string, content: string): void {
 }
 
 describe('parseTemplate', () => {
-  it('parses mcpServers, instructions, context extras, and skills', () => {
+  it('parses mcpServers, instructions, context extras, skills, and tasks', () => {
     write('.mcp.json', JSON.stringify({ mcpServers: { fs: { command: 'mcp-fs', args: ['/data'] } } }));
     write('context/instructions.md', 'Be helpful.\n\n');
     write('context/playbook.md', '# Playbook');
     write('context/additional_context/faq.md', '# FAQ');
     write('skills/research/SKILL.md', 'do research');
+    write('tasks/weekly-review.md', "---\nschedule: '0 9 * * 1'\n---\n\nReview the week.\n");
+    write('tasks/daily-briefing.md', '---\nschedule: 0 8 * * *\n---\n\nSend the briefing.\n');
     fs.writeFileSync(path.join(dir, 'context', 'notes.txt'), 'ignored'); // non-.md is ignored
 
     const tpl = parseTemplate(dir);
@@ -36,6 +38,20 @@ describe('parseTemplate', () => {
     // Nested extras keep their context/-relative path as the name.
     expect(tpl.contextExtras.map((c) => c.name).sort()).toEqual(['additional_context/faq.md', 'playbook.md']);
     expect(tpl.skills.map((s) => s.name)).toEqual(['research']);
+    expect(tpl.tasks).toEqual([
+      {
+        name: 'daily-briefing',
+        schedule: '0 8 * * *',
+        prompt: 'Send the briefing.',
+        source: 'tasks/daily-briefing.md',
+      },
+      {
+        name: 'weekly-review',
+        schedule: '0 9 * * 1',
+        prompt: 'Review the week.',
+        source: 'tasks/weekly-review.md',
+      },
+    ]);
   });
 
   it('defaults the optionals when only instructions.md is present', () => {
@@ -44,6 +60,19 @@ describe('parseTemplate', () => {
     expect(tpl.mcpServers).toEqual({});
     expect(tpl.contextExtras).toEqual([]);
     expect(tpl.skills).toEqual([]);
+    expect(tpl.tasks).toEqual([]);
+  });
+
+  it.each([
+    ['missing frontmatter', 'Run it.', /must start with ---/],
+    ['unknown field', '---\ncron: 0 9 * * *\n---\nRun it.', /only schedule/],
+    ['extra field', '---\nschedule: 0 9 * * *\nenabled: true\n---\nRun it.', /only schedule/],
+    ['mismatched quote', '---\nschedule: "0 9 * * *\n---\nRun it.', /mismatched quotes/],
+    ['empty prompt', '---\nschedule: 0 9 * * *\n---\n', /prompt is required/],
+  ])('rejects a task with %s', (_case, content, expected) => {
+    write('context/instructions.md', 'Be helpful.');
+    write('tasks/broken.md', content);
+    expect(() => parseTemplate(dir)).toThrow(expected);
   });
 
   it('throws when context/instructions.md is missing', () => {

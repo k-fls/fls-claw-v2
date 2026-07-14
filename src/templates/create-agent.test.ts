@@ -1,3 +1,4 @@
+import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -18,9 +19,11 @@ vi.mock('../log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
 
-import { closeDb, initTestDb, runMigrations } from '../db/index.js';
+import { closeDb, getAllAgentGroups, initTestDb, runMigrations } from '../db/index.js';
 import { getContainerConfig } from '../db/container-configs.js';
+import { findTaskSessions } from '../db/sessions.js';
 import { PERSONA_PREPEND_FILE } from '../group-persona.js';
+import { inboundDbPath } from '../session-manager.js';
 import { createAgentFromTemplate } from './create-agent.js';
 
 function writeTemplate(): void {
@@ -36,6 +39,12 @@ function writeTemplate(): void {
   const skillDir = path.join(t, 'skills', 'widget');
   fs.mkdirSync(skillDir, { recursive: true });
   fs.writeFileSync(path.join(skillDir, 'SKILL.md'), '---\nname: widget\n---\n');
+}
+
+function writeTask(name: string, schedule: string, prompt: string): void {
+  const dir = path.join(TEMPLATES_DIR, 'sales', 'sdr', 'tasks');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${name}.md`), `---\nschedule: "${schedule}"\n---\n\n${prompt}\n`);
 }
 
 beforeEach(() => {
@@ -79,5 +88,40 @@ describe('createAgentFromTemplate', () => {
     expect(fs.existsSync(path.join(groupDir, 'playbook.md'))).toBe(true);
     expect(fs.existsSync(path.join(groupDir, 'additional_context', 'faq.md'))).toBe(true);
     expect(fs.existsSync(path.join(groupDir, 'context'))).toBe(false);
+  });
+
+  it('creates template tasks paused through the normal isolated task-session path', () => {
+    writeTask('weekday-briefing', '0 9 * * 1-5', 'Send the weekday briefing.');
+
+    const g = createAgentFromTemplate('sales/sdr', { name: 'SDR Tasks' });
+    const sessions = findTaskSessions(g.id);
+    expect(sessions).toHaveLength(1);
+
+    const db = new Database(inboundDbPath(g.id, sessions[0].id), { readonly: true });
+    const row = db
+      .prepare("SELECT status, recurrence, process_after, content FROM messages_in WHERE kind = 'task'")
+      .get() as { status: string; recurrence: string; process_after: string; content: string };
+    db.close();
+
+    expect(row.status).toBe('paused');
+    expect(row.recurrence).toBe('0 9 * * 1-5');
+    expect(new Date(row.process_after).getTime()).toBeGreaterThan(Date.now());
+    expect(JSON.parse(row.content)).toMatchObject({
+      prompt: 'Send the weekday briefing.',
+      script: null,
+      originSessionId: null,
+    });
+    expect(fs.existsSync(path.join(GROUPS_DIR, g.folder, 'tasks', 'weekday-briefing.md'))).toBe(false);
+  });
+
+  it.each([
+    ['invalid cron', 'not a cron', /invalid --recurrence/],
+    ['too-frequent cron', '* * * * *', /has not been scheduled/],
+  ])('rejects %s before creating the agent group', (_case, schedule, expected) => {
+    writeTask('broken', schedule, 'Never created.');
+
+    expect(() => createAgentFromTemplate('sales/sdr', { name: 'Broken Tasks' })).toThrow(expected);
+    expect(getAllAgentGroups()).toEqual([]);
+    expect(fs.existsSync(path.join(GROUPS_DIR, 'broken-tasks'))).toBe(false);
   });
 });

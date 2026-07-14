@@ -51,12 +51,19 @@ describe('setup carries the picked provider to creation via a setup-run env var'
   // The creation scripts run as child processes, inherit the env var, and apply
   // it to the group's runtime config — container_configs.provider, the source of
   // truth materialized into container.json (agent_provider is deprecated) — before
-  // the welcome wakes the container. No `--provider` flag in the contract (above).
-  for (const file of ['scripts/init-first-agent.ts', 'scripts/init-cli-agent.ts']) {
+  // the welcome wakes the container, falling back to the instance default
+  // (DEFAULT_AGENT_PROVIDER) when the env var is unset. No `--provider` flag in
+  // the contract (above). init-first-agent stamps directly via
+  // ensureContainerConfig; init-cli-agent threads it through initGroupFilesystem.
+  const applyPattern: Record<string, RegExp> = {
+    'scripts/init-first-agent.ts': /ensureContainerConfig\([^)]*pickedProvider/,
+    'scripts/init-cli-agent.ts': /provider:\s*pickedProvider/,
+  };
+  for (const [file, pattern] of Object.entries(applyPattern)) {
     it(`${file} applies the env-carried provider to container_configs.provider`, () => {
       const src = read(file);
       expect(src).toContain('NANOCLAW_PICKED_PROVIDER');
-      expect(src).toMatch(/updateContainerConfigScalars\([^)]*provider:\s*pickedProvider/);
+      expect(src).toMatch(pattern);
     });
   }
 });
