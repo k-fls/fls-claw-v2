@@ -1,8 +1,3 @@
-/**
- * Tests for the host-side command gate — filtered commands are dropped
- * before reaching the container, and admin commands are gated against
- * the user_roles table.
- */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { gateCommand } from './command-gate.js';
@@ -79,5 +74,37 @@ describe('normal messages pass through', () => {
 
   it('passes an unknown slash command', () => {
     expect(gateCommand('/whatever', 'telegram:1', 'ag-1')).toEqual({ action: 'pass' });
+  });
+});
+
+/**
+ * Fork-specific: slash commands arriving @-mention-prefixed in a Slack group
+ * channel must be classified from the boundary the adapter marked
+ * (`mentionPrefixEnd`), not from the raw '@…' text.
+ */
+describe('gateCommand — mention-prefixed slash commands', () => {
+  it('classifies a mention-prefixed filtered command when mentionPrefixEnd is set', () => {
+    const content = JSON.stringify({ text: '@U0AKKG67T7X /help', mentionPrefixEnd: 13 });
+    expect(gateCommand(content, 'slack:U1', 'ag-1')).toEqual({ action: 'filter' });
+  });
+
+  it('without the annotation, the mention-prefixed command falls through (the bug)', () => {
+    const content = JSON.stringify({ text: '@U0AKKG67T7X /help' });
+    expect(gateCommand(content, 'slack:U1', 'ag-1')).toEqual({ action: 'pass' });
+  });
+
+  it('still classifies a plain (DM-style) filtered command with no mention', () => {
+    const content = JSON.stringify({ text: '/help' });
+    expect(gateCommand(content, 'slack:U1', 'ag-1')).toEqual({ action: 'filter' });
+  });
+
+  it('passes ordinary chatter through', () => {
+    const content = JSON.stringify({ text: '@U0AKKG67T7X how are you?', mentionPrefixEnd: 13 });
+    expect(gateCommand(content, 'slack:U1', 'ag-1')).toEqual({ action: 'pass' });
+  });
+
+  it('ignores an out-of-range mentionPrefixEnd rather than throwing', () => {
+    const content = JSON.stringify({ text: '/help', mentionPrefixEnd: 999 });
+    expect(gateCommand(content, 'slack:U1', 'ag-1')).toEqual({ action: 'filter' });
   });
 });
