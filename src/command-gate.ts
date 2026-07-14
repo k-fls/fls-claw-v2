@@ -15,19 +15,43 @@ const FILTERED_COMMANDS = new Set(['/start', '/help', '/login', '/logout', '/doc
 const ADMIN_COMMANDS = new Set(['/clear', '/compact', '/context', '/cost', '/files', '/upload-trace']);
 
 /**
+ * Unwrap the text used for slash-command classification from an inbound
+ * `content` payload. Chat adapters stamp `{ "text": "..." }`; a raw string
+ * is also accepted.
+ *
+ * When the channel layer marked a leading bot-mention (`mentionPrefixEnd`,
+ * set by the chat-sdk bridge from the bot's own platform identity — see
+ * `leadingBotMentionEnd` there), the text is read FROM that offset. In a
+ * group channel a user must @-mention the bot to engage it, and platforms
+ * deliver that mention as a literal prefix — e.g. "@U0AKKG67T7X /auth"
+ * (Slack), "<@123> /auth" (Discord), "@botname /auth" (Telegram). Without
+ * skipping it the text never starts with '/', so every host/admin slash
+ * command issued via mention in a group channel would slip past the gate
+ * into the container.
+ *
+ * This is read-only: the stored `content` (what the container receives) is
+ * never modified — we only classify against the post-mention slice.
+ */
+function classifiableText(content: string): string {
+  try {
+    const parsed = JSON.parse(content);
+    let text = typeof parsed.text === 'string' ? parsed.text : '';
+    const end = typeof parsed.mentionPrefixEnd === 'number' ? parsed.mentionPrefixEnd : 0;
+    if (end > 0 && end <= text.length) text = text.slice(end);
+    return text.trim();
+  } catch {
+    return content.trim();
+  }
+}
+
+/**
  * Classify a message and decide whether it should reach the container.
  * Returns 'pass' for normal messages and authorized admin commands,
  * 'filter' for silently-dropped commands, 'deny' for unauthorized
  * admin commands.
  */
 export function gateCommand(content: string, userId: string | null, agentGroupId: string): GateResult {
-  let text: string;
-  try {
-    const parsed = JSON.parse(content);
-    text = (parsed.text || '').trim();
-  } catch {
-    text = content.trim();
-  }
+  const text = classifiableText(content);
 
   if (!text.startsWith('/')) return { action: 'pass' };
 
