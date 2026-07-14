@@ -478,11 +478,11 @@ export async function processQuery(
         const prompt = formatMessages(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
+        taskBlockNudged = false;
         // A follow-up push starts a fresh turn — the delivered-this-turn flag
         // must reset alongside unwrappedNudged, or a send_message in the prior
         // turn would suppress a legitimate nudge here and silently drop output.
         resetSentUserMsgThisTurn();
-        taskBlockNudged = false;
         query.push(prompt);
         resultDedup.reset(); // new turn — reset the per-turn dedup guard
         archivePrompts.push(prompt);
