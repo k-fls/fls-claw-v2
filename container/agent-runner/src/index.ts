@@ -28,6 +28,7 @@ import { fileURLToPath } from 'url';
 import { loadConfig } from './config.js';
 import { buildSystemPromptAddendum } from './destinations.js';
 import { ensureEnvVarsFile } from './env-vars.js';
+import { getTaskSeriesId } from './db/session-routing.js';
 import { ensureMemoryScaffold } from './memory-scaffold.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
@@ -77,7 +78,11 @@ async function main(): Promise<void> {
   // /workspace/agent/CLAUDE.md — the composed entry imports the shared
   // base (/app/CLAUDE.md) and each enabled module's fragment. Per-group
   // memory lives in /workspace/agent/CLAUDE.local.md (auto-loaded).
-  const instructions = buildSystemPromptAddendum(config.assistantName || undefined);
+  const taskId = getTaskSeriesId();
+  const instructions = buildSystemPromptAddendum(
+    config.assistantName || undefined,
+    taskId ? { kind: 'task', taskId } : { kind: 'chat' },
+  );
 
   // Discover additional directories mounted at /workspace/extra/*
   const additionalDirectories: string[] = [];

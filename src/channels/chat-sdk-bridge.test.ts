@@ -2,7 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Adapter, AdapterPostableMessage, RawMessage } from 'chat';
 
-import { createChatSdkBridge, isFormatError, splitForLimit, toPlainText } from './chat-sdk-bridge.js';
+import {
+  createChatSdkBridge,
+  isFormatError,
+  leadingBotMentionEnd,
+  splitForLimit,
+  toPlainText,
+} from './chat-sdk-bridge.js';
 
 vi.mock('../webhook-server.js', () => ({
   registerWebhookAdapter: vi.fn(),
@@ -25,6 +31,48 @@ function makePostCapture() {
   };
   return { calls, postMessage };
 }
+
+describe('leadingBotMentionEnd', () => {
+  it('marks the boundary past a bare id mention (Slack, flattened)', () => {
+    // "@U0AKKG67T7X " → 13 chars; content resumes at "/auth".
+    const text = '@U0AKKG67T7X /auth';
+    expect(leadingBotMentionEnd(text, 'U0AKKG67T7X')).toBe(13);
+    expect(text.slice(leadingBotMentionEnd(text, 'U0AKKG67T7X'))).toBe('/auth');
+  });
+
+  it('marks the boundary past an angle-bracket id mention (Discord / raw Slack)', () => {
+    const text = '<@U0AKKG67T7X> /auth claude';
+    expect(text.slice(leadingBotMentionEnd(text, 'U0AKKG67T7X'))).toBe('/auth claude');
+  });
+
+  it('handles the Discord nickname mention form <@!id>', () => {
+    const text = '<@!123456789> /creds';
+    expect(text.slice(leadingBotMentionEnd(text, '123456789'))).toBe('/creds');
+  });
+
+  it('matches a username mention (Telegram) and tolerates a leading @ in userName', () => {
+    const text = '@mybot /auth';
+    expect(text.slice(leadingBotMentionEnd(text, undefined, '@mybot'))).toBe('/auth');
+  });
+
+  it('does NOT match a mention of another user when the bot identity is known', () => {
+    // Precise: only the bot's own mention is a boundary — never someone else's.
+    expect(leadingBotMentionEnd('@alice /auth', 'U0AKKG67T7X')).toBe(0);
+  });
+
+  it('returns 0 when there is no leading mention', () => {
+    expect(leadingBotMentionEnd('hello /auth', 'U0AKKG67T7X')).toBe(0);
+  });
+
+  it('falls back to a generic leading @-token when identity is unknown but isMention is set', () => {
+    const text = '@somebot /auth';
+    expect(text.slice(leadingBotMentionEnd(text, undefined, undefined, true))).toBe('/auth');
+  });
+
+  it('does not guess a boundary when identity is unknown and isMention is false', () => {
+    expect(leadingBotMentionEnd('@alice hi', undefined, undefined, false)).toBe(0);
+  });
+});
 
 describe('splitForLimit', () => {
   it('returns a single chunk when text fits', () => {
@@ -323,6 +371,77 @@ describe('createChatSdkBridge.setup — webhook route and state namespace', () =
     }>;
     expect(rows.map((r) => r.thread_id)).toEqual(['slack:T9']);
     await bridge.teardown();
+  });
+});
+
+describe('createChatSdkBridge.deliver — ask_question cards (button styles)', () => {
+  // Approval cards color their buttons (Slack: primary→green, danger→red).
+  // The bridge must forward the normalized option style into Button() and
+  // omit it when unset — an invalid style surviving to Block Kit would fail
+  // the whole card with invalid_blocks (effective auto-deny).
+
+  interface CapturedButton {
+    type?: string;
+    id?: string;
+    label?: string;
+    value?: string;
+    style?: string;
+  }
+
+  function buttonsFrom(calls: PostCall[]): CapturedButton[] {
+    const msg = calls[0].message as {
+      card?: { children?: Array<{ type?: string; children?: CapturedButton[] }> };
+    };
+    const actionsRow = msg.card?.children?.find((c) => c.type === 'actions');
+    expect(actionsRow).toBeDefined();
+    return actionsRow?.children ?? [];
+  }
+
+  it('passes each option style through to the Button, and omits it when unset', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      supportsThreads: false,
+    });
+    await bridge.deliver('slack:C1', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'q-1',
+        title: 'Approval needed',
+        question: 'Allow the tool call?',
+        options: [
+          { label: 'Approve', style: 'primary' },
+          { label: 'Deny', style: 'danger' },
+          'Skip', // string shorthand — never styled
+        ],
+      },
+    });
+    expect(calls).toHaveLength(1);
+    const buttons = buttonsFrom(calls);
+    expect(buttons.map((b) => b.label)).toEqual(['Approve', 'Deny', 'Skip']);
+    expect(buttons.map((b) => b.style)).toEqual(['primary', 'danger', undefined]);
+  });
+
+  it('drops invalid styles before they reach the Button (delivery goes through normalizeOptions)', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      supportsThreads: false,
+    });
+    await bridge.deliver('slack:C1', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'q-2',
+        title: 'Approval needed',
+        question: 'Allow the tool call?',
+        options: [{ label: 'Approve', style: 'chartreuse' }],
+      },
+    });
+    const buttons = buttonsFrom(calls);
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0].style).toBeUndefined();
   });
 });
 
