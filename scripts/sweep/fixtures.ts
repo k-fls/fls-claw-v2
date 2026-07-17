@@ -106,3 +106,41 @@ export function makeSweepFixture(): {
   repo.checkout('main');
   return { repo, upstream: 'upstream-main', chain };
 }
+
+/**
+ * Propagation fixture with a NON-MONOTONIC conflict window (PROPAGATION.md §3):
+ *
+ *   main / base       src/x.ts = "orig"
+ *   fork              src/x.ts = "fork"                       (cut from base)
+ *   upstream-main     U0 add util (clean)         height 0
+ *                     U1 x = "up1" (conflicts fork)  height 1
+ *                     U2 x = "fork" (== fork, clean)  height 2
+ *                     U3 x = "up3" (conflicts fork)  height 3
+ *
+ * Merging `fork` up to height 0 or 2 is clean; heights 1 and 3 conflict. The
+ * linear sweep must merge at the LARGEST clean height (2, past the height-1
+ * conflict) and report height 3 as the case.
+ */
+export function makePropagationFixture(): {
+  repo: FixtureRepo;
+  base: string;
+  upstream: string;
+  chain: string[]; // U0..U3, oldest first (heights 0..3)
+} {
+  const repo = initFixtureRepo();
+  repo.commit('base: x = orig', { 'src/x.ts': 'orig\n' });
+  const base = repo.sha('main');
+
+  repo.checkout('fork', { create: true, at: 'main' });
+  repo.commit('fork: x = fork', { 'src/x.ts': 'fork\n' });
+
+  repo.checkout('main');
+  repo.checkout('upstream-main', { create: true, at: 'main' });
+  const chain: string[] = [];
+  chain.push(repo.commit('U0: add util', { 'src/util.ts': 'export const u = 1;\n' }));
+  chain.push(repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' }));
+  chain.push(repo.commit('U2: x = fork', { 'src/x.ts': 'fork\n' }));
+  chain.push(repo.commit('U3: x = up3', { 'src/x.ts': 'up3\n' }));
+  repo.checkout('main');
+  return { repo, base, upstream: 'upstream-main', chain };
+}

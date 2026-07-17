@@ -239,3 +239,149 @@ export interface ReplayResult {
   failures: string[];
   actual: { classification: string; conflicts: string[]; poiTypes: string[]; stopPoint: string | null };
 }
+
+// ---------------------------------------------------------------------------
+// Mechanical propagation driver (PROPAGATION.md, D-035..D-040). New flat
+// modules: heights / interval / tiers / plan / deferred / scope-guard / steps /
+// propagate. These are the shared data-model + JSON artifact schemas; the
+// per-module computational result types stay local to their modules.
+// ---------------------------------------------------------------------------
+
+/**
+ * A merge head: a `{sha, height}` pair. `height` is an index into the pinned
+ * trunk first-parent chain (§2). For entry-point branches the sha IS a trunk
+ * commit at that index; for parents-model branches the sha is a parent-branch
+ * commit whose DERIVED coverage equals `height` (§4). All barrier / DEFERRED /
+ * merge-point comparisons use `height`; the sha is an integrity check.
+ */
+export interface Head {
+  sha: string;
+  height: number;
+}
+
+/**
+ * Tier ladder (§1, D-035). `deferred` is off-ladder (a conflict that belongs to
+ * a HELD ancestor). Ladder severity: clean < mechanical < judged < held.
+ */
+export type Tier = 'clean' | 'mechanical' | 'judged' | 'held' | 'deferred';
+
+/**
+ * Per-parent verdict inside a branch plan:
+ *  - `up-to-date`: nothing above the branch's coverage to merge.
+ *  - `merge`: a clean merge lands (up to the merge point); a `case` may still be
+ *    attached for the conflict above it.
+ *  - `skip`: no-op (merge-tree result tree == branch tree).
+ *  - `case`: an own conflict is pending judgment and no clean prefix merges now.
+ *  - `defer`: DEFERRED to a HELD ancestor (frozen, NO PR — §5).
+ */
+export type ParentVerdict = 'merge' | 'skip' | 'defer' | 'up-to-date' | 'case';
+
+/** Reported conflict handed to the resolving agent (§3 step 4). */
+export interface ConflictCase {
+  /** The conflicting head: sha is the commit to merge, height its trunk index. */
+  head: Head;
+  conflictedPaths: string[];
+  /** Tree oid of the conflicted automerge (conflict markers), from new-style merge-tree. */
+  automergeTree: string;
+  reproduction: { command: string };
+}
+
+/** One parent's contribution to a branch's pass (`plan.json`). */
+export interface ParentPlan {
+  parent: string;
+  model: 'entry' | 'parents';
+  /** Chosen merge point = largest clean head (§3); null when even the oldest head conflicts. */
+  mergePoint: Head | null;
+  verdict: ParentVerdict;
+  /** Reported conflict above the merge point (the smallest conflicting height). */
+  case: ConflictCase | null;
+  /** DEFERRED: the transitive-ancestor branch whose HELD this conflict belongs to (§5). */
+  deferredTo: string | null;
+  /** No-op reason when verdict is skip. */
+  skipReason: string | null;
+  /** Forced (empty) merge to honour the leaf/always_merge rule (§6). */
+  forced?: boolean;
+}
+
+/** A branch's whole-pass plan row (`plan.json`). */
+export interface BranchPlan {
+  branch: string;
+  kind: ScopeKind;
+  tierFloor: Tier;
+  isLeaf: boolean;
+  alwaysMerge: boolean;
+  /** Transitive inventory ancestors (for DEFERRED matching). */
+  ancestors: string[];
+  parents: ParentPlan[];
+  /** Cheapest parent chain un-skipped to keep the leaf/always_merge invariant (§6). */
+  unskipChain?: string[];
+}
+
+/** Whole-pass plan artifact (`plan.json`) — pure derivation, idempotent (§7). */
+export interface PropagationPlan {
+  schemaVersion: 1;
+  watermark: string;
+  watermark12: string;
+  forkPoint: string | null;
+  chainLength: number;
+  order: string[];
+  branches: BranchPlan[];
+  warnings: string[];
+}
+
+/** One parent-merge inside a per-branch step contract. */
+export interface StepMerge {
+  parent: string;
+  model: 'entry' | 'parents';
+  action: 'merge' | 'skip';
+  head: Head | null;
+  skipReason: string | null;
+  /** Forced (empty) merge for the leaf/always_merge rule (§6). */
+  forced?: boolean;
+}
+
+/**
+ * Per-branch merge contract (`step-<branch>.json`). The executor re-verifies
+ * every field from first principles (§7, steps.ts) — it never trusts the author.
+ */
+export interface StepFile {
+  schemaVersion: 1;
+  branch: string;
+  watermark: string;
+  /** Legal inventory parents (or `main` for entry/D-032b branches). */
+  legalParents: string[];
+  /** Inventory parents that must have arrived this pass (journal barrier). */
+  requiredParents: string[];
+  isLeaf: boolean;
+  alwaysMerge: boolean;
+  merges: StepMerge[];
+}
+
+/** Reported-conflict contract (`case-<branch>-<height>.json`). */
+export interface CaseFile {
+  schemaVersion: 1;
+  id: string;
+  branch: string;
+  parent: string;
+  head: Head;
+  tierFloor: Tier;
+  conflictedPaths: string[];
+  automergeTree: string;
+  reproduction: { command: string };
+  /** DEFERRED-check inputs (§5). */
+  deferredCheck: { firstConflictHeight: number; transitiveAncestors: string[] };
+}
+
+/** A HELD branch's registry record used for DEFERRED matching (§5). */
+export interface HeldRecord {
+  branch: string;
+  height: number;
+  conflictedPaths: string[];
+  caseId: string;
+}
+
+/** Context-free cold-read verdict the driver requires before accepting MECHANICAL/JUDGED (§7). */
+export interface ColdReadVerdict {
+  verdict: 'confirm' | 'reject';
+  notes: string;
+}
