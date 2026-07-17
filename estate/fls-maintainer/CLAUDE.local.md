@@ -29,7 +29,7 @@ mechanics: `scripts/sweep/README.md` + `DESIGN.md` on branch `feat/maintenance-s
 5. If upstream history is force-pushed/rewritten: halt, report, never "fix" it.
 6. Anything ambiguous, security-flagged (sensitive-surface PoIs), or OVERLAP-HIGH goes
    to the owner before action.
-7. **Verify results, not steps (D-032).** Having executed a procedure is not evidence
+7. **Verify results, not steps (D-034).** Having executed a procedure is not evidence
    it produced the right output. Before every irreversible action (push, PR create,
    self-merge), check that the actual result makes sense: the diff is non-empty and
    matches the plan, the commit count fits the sweep range, the title/description
@@ -79,7 +79,7 @@ report it to the owner.
    at the topmost affected branch on a `fix/sweep/<date>-<topic>` branch; descendants
    inherit the resolution via their next parent merge — never re-resolve (or re-PR)
    the same conflict on a child.
-   Result gates (D-032) — verify each output before the next irreversible step;
+   Result gates (D-034) — verify each output before the next irreversible step;
    executing the procedure is not evidence it worked:
    (a) BEFORE pushing a fix branch: `git log <base>..<fix-branch> --first-parent
    --oneline | wc -l` must match the scan's pending-commit count for that branch
@@ -168,7 +168,7 @@ report it to the owner.
   N files is verbatim upstream <range>, already reviewed upstream." Verification status
   (what ran, what could not run here) closes the description.
 - **Cold-reader gate — mandatory before EVERY PR, drafts and case-2 alike (D-031;
-  widened by D-032 after case-2 PR #41 shipped a session-shorthand title).** You
+  widened by D-034 after case-2 PR #41 shipped a session-shorthand title).** You
   write PR text from inside four hours of sweep context; the owner opens it cold —
   and self-merged case-2 PRs are read cold too, in the git history. Before ANY
   `gh pr create`, spawn a subagent and hand it ONLY: the draft title, the
