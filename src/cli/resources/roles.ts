@@ -2,7 +2,7 @@ import type { RoleScopeDescription } from '../../modules/permissions/db/user-rol
 import type { UserRoleKind } from '../../types.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
-import { describeRoleScope } from '../../modules/permissions/db/user-roles.js';
+import { describeRoleScope, isLastOwner } from '../../modules/permissions/db/user-roles.js';
 import { registerResource } from '../crud.js';
 
 /**
@@ -154,6 +154,12 @@ registerResource({
 
         const groupId = resolveScope(args, role);
 
+        // Last-owner hard stop: the global owner is the root of trust and
+        // reaching zero owners is unrecoverable, so refuse to delete the sole
+        // remaining owner outright — before any DB change, on every path.
+        if (role === 'owner' && groupId === null && isLastOwner(userId)) {
+          throw new Error('cannot revoke the last remaining owner — grant another owner first');
+        }
         const result = getDb()
           .prepare('DELETE FROM user_roles WHERE user_id = ? AND role = ? AND agent_group_id IS ?')
           .run(userId, role, groupId);

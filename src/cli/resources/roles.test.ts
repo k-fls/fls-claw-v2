@@ -1,6 +1,7 @@
 /**
  * Tests for issue A — role-grant scope must be an explicit, required choice,
- * and grant/revoke must return a plain-language scope/capability summary.
+ * and grant/revoke must return a plain-language scope/capability summary — plus
+ * the last-owner hard stop on `ncl roles revoke`.
  *
  * The approval handler in `dispatch.ts` re-enters `dispatch()` with
  * `caller: 'host'` after admin approval, so these tests invoke dispatch with
@@ -17,6 +18,10 @@ vi.mock('../../container-runner.js', () => ({
   getActiveContainerCount: vi.fn().mockReturnValue(0),
   killContainer: vi.fn(),
   buildAgentGroupImage: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../../log.js', () => ({
+  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
 vi.mock('../../config.js', async () => {
@@ -52,24 +57,61 @@ async function revoke(args: Record<string, unknown>) {
   return dispatch({ id: 'req', command: 'roles-revoke', args }, { caller: 'host' });
 }
 
+function addUser(id: string): void {
+  getDb()
+    .prepare(`INSERT INTO users (id, kind, display_name, created_at) VALUES (?, 'telegram', ?, ?)`)
+    .run(id, id, now());
+}
+
+function grantOwner(userId: string): void {
+  getDb()
+    .prepare(
+      `INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at)
+       VALUES (?, 'owner', NULL, NULL, ?)`,
+    )
+    .run(userId, now());
+}
+
+function grantGlobalAdmin(userId: string): void {
+  getDb()
+    .prepare(
+      `INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at)
+       VALUES (?, 'admin', NULL, NULL, ?)`,
+    )
+    .run(userId, now());
+}
+
+function count(sql: string, ...params: unknown[]): number {
+  return (
+    getDb()
+      .prepare(sql)
+      .get(...params) as { c: number }
+  ).c;
+}
+
+function setupDb(): void {
+  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  fs.mkdirSync(TEST_DIR, { recursive: true });
+  const db = initTestDb();
+  runMigrations(db);
+}
+
+function teardownDb(): void {
+  closeDb();
+  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+}
+
 describe('roles CLI grant/revoke require explicit scope (issue A)', () => {
   beforeEach(() => {
-    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
-    fs.mkdirSync(TEST_DIR, { recursive: true });
-
-    const db = initTestDb();
-    runMigrations(db);
-
+    setupDb();
     createAgentGroup({ id: GID, name: 'team', folder: 'team', agent_provider: null, created_at: now() });
-    db.prepare(`INSERT INTO users (id, kind, display_name, created_at) VALUES (?, 'slack', 'someone', ?)`).run(
-      UID,
-      now(),
-    );
+    getDb()
+      .prepare(`INSERT INTO users (id, kind, display_name, created_at) VALUES (?, 'slack', 'someone', ?)`)
+      .run(UID, now());
   });
 
   afterEach(() => {
-    closeDb();
-    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    teardownDb();
   });
 
   it('errors and writes nothing when --scope is omitted (no silent global grant)', async () => {
@@ -167,5 +209,70 @@ describe('roles CLI grant/revoke require explicit scope (issue A)', () => {
     const resp = await revoke({ user: UID, role: 'admin', scope: 'global' });
     expect(resp.ok).toBe(false);
     expect(resp.ok === false && resp.error.message).toMatch(/role not found/);
+  });
+});
+
+describe('roles revoke — last-owner hard stop', () => {
+  beforeEach(() => {
+    setupDb();
+  });
+
+  afterEach(() => {
+    teardownDb();
+  });
+
+  it('refuses to revoke the sole remaining owner and makes no DB change', async () => {
+    addUser('u1');
+    grantOwner('u1');
+
+    const resp = await revoke({ user: 'u1', role: 'owner', scope: 'global' });
+
+    expect(resp.ok).toBe(false);
+    expect((resp as { ok: false; error: { code: string; message: string } }).error.code).toBe('handler-error');
+    expect((resp as { ok: false; error: { message: string } }).error.message).toMatch(
+      /cannot revoke the last remaining owner/i,
+    );
+
+    // The owner row must still be present — no DB change.
+    expect(count(`SELECT COUNT(*) AS c FROM user_roles WHERE user_id = 'u1' AND role = 'owner'`)).toBe(1);
+  });
+
+  it('allows revoking one of several owners, leaving the others', async () => {
+    addUser('u1');
+    addUser('u2');
+    grantOwner('u1');
+    grantOwner('u2');
+
+    const resp = await revoke({ user: 'u1', role: 'owner', scope: 'global' });
+
+    expect(resp.ok).toBe(true);
+    expect(count(`SELECT COUNT(*) AS c FROM user_roles WHERE user_id = 'u1' AND role = 'owner'`)).toBe(0);
+    expect(count(`SELECT COUNT(*) AS c FROM user_roles WHERE user_id = 'u2' AND role = 'owner'`)).toBe(1);
+  });
+
+  it('is unaffected when revoking a non-owner role even if only one owner exists', async () => {
+    addUser('u1');
+    addUser('u2');
+    grantOwner('u1');
+    grantGlobalAdmin('u2');
+
+    const resp = await revoke({ user: 'u2', role: 'admin', scope: 'global' });
+
+    expect(resp.ok).toBe(true);
+    expect(count(`SELECT COUNT(*) AS c FROM user_roles WHERE user_id = 'u2' AND role = 'admin'`)).toBe(0);
+    // The sole owner is untouched.
+    expect(count(`SELECT COUNT(*) AS c FROM user_roles WHERE user_id = 'u1' AND role = 'owner'`)).toBe(1);
+  });
+
+  it('returns "role not found" for a non-existent role (guard does not mask it)', async () => {
+    addUser('u1');
+    grantOwner('u1');
+
+    // u1 has no admin role — the guard is owner-only, so the delete runs and
+    // reports the normal not-found error.
+    const resp = await revoke({ user: 'u1', role: 'admin', scope: 'global' });
+
+    expect(resp.ok).toBe(false);
+    expect((resp as { ok: false; error: { message: string } }).error.message).toMatch(/role not found/i);
   });
 });
