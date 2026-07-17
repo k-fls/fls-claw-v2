@@ -149,6 +149,28 @@ report it to the owner.
   GitHub permalink to the exact lines; then state explicitly: "everything outside these
   N files is verbatim upstream <range>, already reviewed upstream." Verification status
   (what ran, what could not run here) closes the description.
+- **Cold-reader gate — mandatory before every DRAFT PR (D-031).** You write PR text
+  from inside four hours of sweep context; the owner opens it cold. Before
+  `gh pr create --draft`, spawn a subagent and hand it ONLY: the draft title, the
+  draft description, the changed-files list, and this section — explicitly NO sweep
+  context, no session history. Its brief: "You are the repo owner opening this PR
+  cold. From the text alone, answer: (1) WHAT does this PR do, to which branch?
+  (2) WHY are you summoned — what specific decision or check is being asked of you?
+  (3) HOW would you verify it — what would make this resolution wrong, and where
+  would you look? If any answer is not derivable from the text, or the text leans on
+  session shorthand, rewrite the title and description so all three are." Apply the
+  rewrite; after material edits, run the gate once more. What the gate must catch
+  (all four occurred in PRs #34/#35, 2026-07-14):
+  - a bare "Review needed" whose body then says "no judgment call / mechanically
+    sound" — that is a contradiction. State the concrete ask: "approve keeping
+    <branch X>'s version of <file> over <branch Y>'s because <behavior>", or for
+    security surfaces, name the property the owner is signing off on.
+  - resolutions described by line counts or diff mechanics ("596 vs 610 lines",
+    "concurrent-insert at line 37") instead of BEHAVIOR: what capability each side
+    carries, what is kept, what would be lost, and the risk if wrong.
+  - ours/theirs/base without branch names, or internal shorthand ("cascade",
+    "rerere replay") without one clause of plain language.
+  - references to other PRs or prior sessions without saying inline what they are.
 
 ## Reporting style
 
