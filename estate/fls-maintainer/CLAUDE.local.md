@@ -29,6 +29,12 @@ mechanics: `scripts/sweep/README.md` + `DESIGN.md` on branch `feat/maintenance-s
 5. If upstream history is force-pushed/rewritten: halt, report, never "fix" it.
 6. Anything ambiguous, security-flagged (sensitive-surface PoIs), or OVERLAP-HIGH goes
    to the owner before action.
+7. **Verify results, not steps (D-032).** Having executed a procedure is not evidence
+   it produced the right output. Before every irreversible action (push, PR create,
+   self-merge), check that the actual result makes sense: the diff is non-empty and
+   matches the plan, the commit count fits the sweep range, the title/description
+   survive a cold reader. An anomalous output means HALT that branch and investigate
+   or report — never "proceed and see".
 
 ## GitHub
 
@@ -72,7 +78,19 @@ report it to the owner.
    simply holds its children back (they can never overshoot). Conflicts: resolve once
    at the topmost affected branch on a `fix/sweep/<date>-<topic>` branch; descendants
    inherit the resolution via their next parent merge — never re-resolve (or re-PR)
-   the same conflict on a child. Open a PR via `gh pr create` (traceability).
+   the same conflict on a child.
+   Result gates (D-032) — verify each output before the next irreversible step;
+   executing the procedure is not evidence it worked:
+   (a) BEFORE pushing a fix branch: `git log <base>..<fix-branch> --first-parent
+   --oneline | wc -l` must match the scan's pending-commit count for that branch
+   (plus your own merge commits). A sweep range is a few to a few dozen commits —
+   an anomalous count (hundreds) means a wrong merge base or wrong merge source:
+   HALT and investigate, never push.
+   (b) BEFORE `gh pr create`: `git diff <base>...<fix-branch> --stat` must be
+   non-empty, AND the changed files must plausibly be the upstream range plus the
+   branch's owned_paths/touch_paths from the inventory. Empty diff = the base is
+   already current: record that in the ledger, delete the fix branch, NO PR.
+   Only then open the PR via `gh pr create` (traceability).
    Simple resolutions: merge the PR yourself if checks are green. Complex or
    judgment-needing: leave the PR open with your provisional resolution + rationale.
    Unresolvable (D-030): push the `fix/sweep/*` branch pointing at the upstream
@@ -149,9 +167,11 @@ report it to the owner.
   GitHub permalink to the exact lines; then state explicitly: "everything outside these
   N files is verbatim upstream <range>, already reviewed upstream." Verification status
   (what ran, what could not run here) closes the description.
-- **Cold-reader gate — mandatory before every DRAFT PR (D-031).** You write PR text
-  from inside four hours of sweep context; the owner opens it cold. Before
-  `gh pr create --draft`, spawn a subagent and hand it ONLY: the draft title, the
+- **Cold-reader gate — mandatory before EVERY PR, drafts and case-2 alike (D-031;
+  widened by D-032 after case-2 PR #41 shipped a session-shorthand title).** You
+  write PR text from inside four hours of sweep context; the owner opens it cold —
+  and self-merged case-2 PRs are read cold too, in the git history. Before ANY
+  `gh pr create`, spawn a subagent and hand it ONLY: the draft title, the
   draft description, the changed-files list, and this section — explicitly NO sweep
   context, no session history. Its brief: "You are the repo owner opening this PR
   cold. From the text alone, answer: (1) WHAT does this PR do, to which branch?
