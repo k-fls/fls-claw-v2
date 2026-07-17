@@ -10,6 +10,7 @@ const h = vi.hoisted(() => ({
   store: vi.fn(),
   del: vi.fn(),
   ensureGpgKey: vi.fn(),
+  decrypt: vi.fn(() => 'inline-secret') as (...a: unknown[]) => string,
   pasteResult: { reason: 'submitted', text: 'the-secret' } as { reason: string; text: string | null },
   paste: vi.fn(),
   borrowSource: null as string | null,
@@ -55,6 +56,10 @@ vi.mock('../gpg.js', () => ({
   exportPublicKey: () => '-----BEGIN PGP PUBLIC KEY BLOCK-----\n...\n-----END PGP PUBLIC KEY BLOCK-----',
   gpgHomeForScope: () => '/tmp/gpg-home/mygroup',
   isGpgAvailable: () => h.gpgAvailable,
+  normalizeArmoredBlock: (s: string) => s,
+}));
+vi.mock('../../crypto/gpg.js', () => ({
+  gpgDecryptAt: (...a: unknown[]) => h.decrypt(...a),
 }));
 vi.mock('../manifest.js', () => ({ distributeAllManifests: () => {}, revokeGranteeManifests: () => {} }));
 vi.mock('../providers/registry.js', () => ({
@@ -100,6 +105,7 @@ beforeEach(() => {
   h.store = vi.fn();
   h.del = vi.fn();
   h.ensureGpgKey = vi.fn();
+  h.decrypt = vi.fn(() => 'inline-secret');
   h.pasteResult = { reason: 'submitted', text: 'the-secret' };
   h.paste = vi.fn(() => Promise.resolve(h.pasteResult));
   h.borrowSource = null;
@@ -257,6 +263,35 @@ describe('/creds set-key (C7o)', () => {
     await new Promise((r) => setTimeout(r, 0));
     expect(h.store).not.toHaveBeenCalled();
   });
+
+  // v1-style inline block in the command tail (no interactive prompt).
+  const INLINE = '-----BEGIN PGP MESSAGE-----\n\nAAAA\n=zzzz\n-----END PGP MESSAGE-----';
+
+  it('stores an inline PGP block directly, without prompting', () => {
+    h.decrypt = vi.fn(() => 'inline-secret');
+    const replies = run(['set-key', 'github', 'ci', INLINE]);
+    expect(h.paste).not.toHaveBeenCalled();
+    expect(h.decrypt).toHaveBeenCalledTimes(1);
+    const [scope, providerId, credId, cred] = h.store.mock.calls[0];
+    expect([scope, providerId, credId]).toEqual(['mygroup', 'github', 'ci']);
+    expect((cred as { value: string }).value).toBe('inline-secret');
+    expect(replies[0]).toMatch(/Key stored for \*github\* \(\*ci\*\)/);
+  });
+
+  it('reports a decrypt failure for a bad inline block and does not store', () => {
+    h.decrypt = vi.fn(() => {
+      throw new Error('no valid OpenPGP data found');
+    });
+    const replies = run(['set-key', 'github', INLINE]);
+    expect(h.store).not.toHaveBeenCalled();
+    expect(h.paste).not.toHaveBeenCalled();
+    expect(replies[0]).toMatch(/PGP decrypt failed: no valid OpenPGP data found/);
+  });
+
+  it('still prompts interactively when no inline block is present', () => {
+    run(['set-key', 'github']);
+    expect(h.paste).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('/creds import (C7o)', () => {
@@ -289,6 +324,17 @@ describe('/creds import (C7o)', () => {
     expect(h.store).toHaveBeenCalledTimes(1);
     expect(h.store.mock.calls[0][1]).toBe('github');
     expect(replies[0]).toMatch(/unknown provider/i);
+  });
+
+  it('imports an inline PGP block directly, without prompting', () => {
+    h.decrypt = vi.fn(() => 'github:oauth=ghp_inline\nclaude:api_key=sk-inline');
+    const INLINE = '-----BEGIN PGP MESSAGE-----\n\nAAAA\n=zzzz\n-----END PGP MESSAGE-----';
+    run(['import', INLINE]);
+    expect(h.paste).not.toHaveBeenCalled();
+    expect(h.decrypt).toHaveBeenCalledTimes(1);
+    const stored = h.store.mock.calls.map((c) => [c[1], c[2], (c[3] as { value: string }).value]);
+    expect(stored).toContainEqual(['github', 'oauth', 'ghp_inline']);
+    expect(stored).toContainEqual(['claude', 'api_key', 'sk-inline']);
   });
 });
 
