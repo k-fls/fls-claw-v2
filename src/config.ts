@@ -6,7 +6,7 @@ import { getContainerImageBase, getDefaultContainerImage, getInstallSlug } from 
 import { isValidTimezone } from './timezone.js';
 
 // Read config values from .env (falls back to process.env).
-const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER', 'ONECLI_URL', 'ONECLI_API_KEY', 'TZ']);
+const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER', 'ONECLI_URL', 'ONECLI_API_KEY', 'TZ', 'NANOCLAW_EGRESS_LOCKDOWN', 'NANOCLAW_EGRESS_NETWORK', 'ONECLI_GATEWAY_CONTAINER']);
 
 export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
 export const ASSISTANT_HAS_OWN_NUMBER =
@@ -39,8 +39,18 @@ export const CONTAINER_TIMEOUT = parseInt(process.env.CONTAINER_TIMEOUT || '1800
 export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760', 10); // 10MB default
 export const ONECLI_URL = process.env.ONECLI_URL || envConfig.ONECLI_URL;
 export const ONECLI_API_KEY = process.env.ONECLI_API_KEY || envConfig.ONECLI_API_KEY;
+// Local agent-template library. Committed but ships empty (+ README). Resolved
+// once at load. Override to another LOCAL path via NANOCLAW_TEMPLATES_DIR; never
+// a remote URL, never an ncl flag, never runtime-mutable.
+export const TEMPLATES_DIR = process.env.NANOCLAW_TEMPLATES_DIR
+  ? path.resolve(process.env.NANOCLAW_TEMPLATES_DIR)
+  : path.resolve(PROJECT_ROOT, 'templates');
 export const MAX_MESSAGES_PER_PROMPT = Math.max(1, parseInt(process.env.MAX_MESSAGES_PER_PROMPT || '10', 10) || 10);
 export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min default — how long to keep container alive after last result
+// Fork-only: global container admission cap. Upstream removed this in tasks-core
+// ("isolation replaces throttling") but that only covers per-series task sessions.
+// The fork uses this as a global memory-overrun guard for all container types.
+// See module/container-queue and docs/fls/migration-analysis/d-queue-concurrency-risks.md.
 export const MAX_CONCURRENT_CONTAINERS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5);
 // Demand-driven eviction (group-queue port). A warm (idle) container holds a
 // concurrency slot; under cap pressure the oldest-idle one is evicted to make
@@ -79,11 +89,20 @@ export const SHUTDOWN_DRAIN_TIMEOUT_MS = Math.max(
 // expressed as Infinity. beginGracefulDrain clamps drainTimeout into [0, this].
 export const MAX_DRAIN_TIMEOUT_MS = 2_147_483_647;
 
+
 // Per-container resource caps, passed through to `docker run`. Default empty =
 // no flag added = today's unbounded behavior (don't OOM existing OSS workloads).
 // Operators opt in: CONTAINER_CPU_LIMIT=2, CONTAINER_MEMORY_LIMIT=8g.
-export const CONTAINER_CPU_LIMIT = process.env.CONTAINER_CPU_LIMIT || '';
-export const CONTAINER_MEMORY_LIMIT = process.env.CONTAINER_MEMORY_LIMIT || '';
+export const CONTAINER_CPU_LIMIT = process.env.CONTAINER_CPU_LIMIT || envConfig.CONTAINER_CPU_LIMIT || '';
+export const CONTAINER_MEMORY_LIMIT = process.env.CONTAINER_MEMORY_LIMIT || envConfig.CONTAINER_MEMORY_LIMIT || '';
+
+// Egress lockdown — force all agent traffic through the OneCLI gateway on a
+// no-internet Docker network. Off by default; consumed by src/egress-lockdown.ts.
+export const EGRESS_LOCKDOWN = (process.env.NANOCLAW_EGRESS_LOCKDOWN || envConfig.NANOCLAW_EGRESS_LOCKDOWN) === 'true';
+export const EGRESS_NETWORK =
+  process.env.NANOCLAW_EGRESS_NETWORK || envConfig.NANOCLAW_EGRESS_NETWORK || 'nanoclaw-egress';
+export const ONECLI_GATEWAY_CONTAINER =
+  process.env.ONECLI_GATEWAY_CONTAINER || envConfig.ONECLI_GATEWAY_CONTAINER || 'onecli';
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
