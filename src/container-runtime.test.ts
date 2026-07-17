@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Mock log
 vi.mock('./log.js', () => ({
@@ -17,18 +17,57 @@ vi.mock('child_process', () => ({
   execSync: (...args: unknown[]) => mockExecSync(...args),
 }));
 
+import os from 'os';
+import fs from 'fs';
+
 import {
   CONTAINER_RUNTIME_BIN,
   readonlyMountArgs,
   stopContainer,
+  hostGatewayArgs,
   ensureContainerRuntimeRunning,
   cleanupOrphans,
 } from './container-runtime.js';
 import { CONTAINER_INSTALL_LABEL } from './config.js';
+import { gatewayIP } from './modules/container-bootstrap/network.js';
 import { log } from './log.js';
 
 beforeEach(() => {
   vi.clearAllMocks();
+});
+
+describe('hostGatewayArgs', () => {
+  const prevMode = process.env.CLAW_HOST_NET_MODE;
+  afterEach(() => {
+    if (prevMode === undefined) delete process.env.CLAW_HOST_NET_MODE;
+    else process.env.CLAW_HOST_NET_MODE = prevMode;
+  });
+
+  it('adds nothing on macOS (host.docker.internal is built in)', () => {
+    vi.spyOn(os, 'platform').mockReturnValue('darwin');
+    expect(hostGatewayArgs()).toEqual([]);
+  });
+
+  it('open mode (default): points host.docker.internal at host-gateway on Linux', () => {
+    delete process.env.CLAW_HOST_NET_MODE;
+    vi.spyOn(os, 'platform').mockReturnValue('linux');
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false);
+    expect(hostGatewayArgs()).toEqual(['--add-host=host.docker.internal:host-gateway']);
+  });
+
+  it('gateway mode: points host.docker.internal at the nanoclaw gateway on bare-metal Linux (bug #9)', () => {
+    process.env.CLAW_HOST_NET_MODE = 'gateway';
+    vi.spyOn(os, 'platform').mockReturnValue('linux');
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false); // not WSL
+    expect(hostGatewayArgs()).toEqual([`--add-host=host.docker.internal:${gatewayIP()}`]);
+  });
+
+  it('gateway mode in WSL still uses host-gateway (bridge gateway not host-bindable)', () => {
+    process.env.CLAW_HOST_NET_MODE = 'gateway';
+    vi.spyOn(os, 'platform').mockReturnValue('linux');
+    vi.spyOn(fs, 'existsSync').mockReturnValue(true); // WSLInterop present
+    expect(hostGatewayArgs()).toEqual(['--add-host=host.docker.internal:host-gateway']);
+  });
 });
 
 // --- Pure functions ---

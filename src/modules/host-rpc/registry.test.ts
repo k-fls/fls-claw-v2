@@ -1,25 +1,40 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 
-import { registerHostRpc, matchHostRpc, listHostRpcHandlers, __resetHostRpcRegistryForTests } from './registry.js';
+import { asContainerScope } from '../container-bootstrap/types.js';
+import {
+  registerHostRpc,
+  registerScopedHostRpc,
+  matchHostRpc,
+  listHostRpcHandlers,
+  __resetHostRpcRegistryForTests,
+} from './registry.js';
+import type { HostRpcRequest } from './types.js';
 
 beforeEach(() => {
   __resetHostRpcRegistryForTests();
 });
 
+// The registry stores a uniform `invoke` wrapper, not the raw handler, so
+// matching is asserted by behavior (invoke routes to the registered handler)
+// rather than function identity.
+const REQ: HostRpcRequest = { method: 'GET', path: '/', body: undefined, callerIP: '127.0.0.1' };
+const SCOPE = asContainerScope('s');
+function invoke(path: string): Promise<unknown> | unknown {
+  return matchHostRpc(path)?.invoke(REQ, SCOPE, 'sess');
+}
+
 describe('host-rpc registry', () => {
-  it('register + match roundtrip on exact path', () => {
-    const fn = async () => 'ok';
-    registerHostRpc('/echo', fn);
-    expect(matchHostRpc('/echo')?.handler).toBe(fn);
+  it('register + match roundtrip on exact path', async () => {
+    registerHostRpc('/echo', async () => 'ok');
+    expect(await invoke('/echo')).toBe('ok');
   });
 
-  it('matches sub-paths under the registered prefix', () => {
-    const fn = () => 0;
-    registerHostRpc('/ssh', fn);
-    expect(matchHostRpc('/ssh')?.handler).toBe(fn);
-    expect(matchHostRpc('/ssh/connect')?.handler).toBe(fn);
-    expect(matchHostRpc('/ssh/connections')?.handler).toBe(fn);
-    expect(matchHostRpc('/ssh/a/b/c')?.handler).toBe(fn);
+  it('matches sub-paths under the registered prefix', async () => {
+    registerHostRpc('/ssh', () => 0);
+    expect(await invoke('/ssh')).toBe(0);
+    expect(await invoke('/ssh/connect')).toBe(0);
+    expect(await invoke('/ssh/connections')).toBe(0);
+    expect(await invoke('/ssh/a/b/c')).toBe(0);
   });
 
   it('does not match across path-segment boundaries', () => {
@@ -28,19 +43,16 @@ describe('host-rpc registry', () => {
     expect(matchHostRpc('/ssh-other')).toBeUndefined();
   });
 
-  it('longest-prefix wins when multiple match', () => {
-    const a = () => 'a';
-    const b = () => 'b';
-    registerHostRpc('/api', a);
-    registerHostRpc('/api/v2', b);
-    expect(matchHostRpc('/api/v2/things')?.handler).toBe(b);
-    expect(matchHostRpc('/api/v1/things')?.handler).toBe(a);
+  it('longest-prefix wins when multiple match', async () => {
+    registerHostRpc('/api', () => 'a');
+    registerHostRpc('/api/v2', () => 'b');
+    expect(await invoke('/api/v2/things')).toBe('b');
+    expect(await invoke('/api/v1/things')).toBe('a');
   });
 
-  it('root "/" matches everything', () => {
-    const fn = () => 1;
-    registerHostRpc('/', fn);
-    expect(matchHostRpc('/anything/at/all')?.handler).toBe(fn);
+  it('root "/" matches everything', async () => {
+    registerHostRpc('/', () => 1);
+    expect(await invoke('/anything/at/all')).toBe(1);
   });
 
   it('unknown path returns undefined', () => {
@@ -53,19 +65,23 @@ describe('host-rpc registry', () => {
     expect(new Set(listHostRpcHandlers())).toEqual(new Set(['/a', '/b/c']));
   });
 
-  it('re-registering the same prefix overwrites', () => {
-    const first = () => 1;
-    const second = () => 2;
-    registerHostRpc('/x', first);
-    registerHostRpc('/x', second);
-    expect(matchHostRpc('/x')?.handler).toBe(second);
+  it('re-registering the same prefix overwrites', async () => {
+    registerHostRpc('/x', () => 1);
+    registerHostRpc('/x', () => 2);
+    expect(await invoke('/x')).toBe(2);
   });
 
-  it('trailing slash on registration is normalized', () => {
-    const fn = () => 1;
-    registerHostRpc('/x/', fn);
-    expect(matchHostRpc('/x')?.handler).toBe(fn);
-    expect(matchHostRpc('/x/y')?.handler).toBe(fn);
+  it('scope-only registration carries requiresSession=false; session-bound is true', () => {
+    registerScopedHostRpc('/auth', () => 'scoped');
+    registerHostRpc('/action', () => 'sess');
+    expect(matchHostRpc('/auth')?.requiresSession).toBe(false);
+    expect(matchHostRpc('/action')?.requiresSession).toBe(true);
+  });
+
+  it('trailing slash on registration is normalized', async () => {
+    registerHostRpc('/x/', () => 1);
+    expect(await invoke('/x')).toBe(1);
+    expect(await invoke('/x/y')).toBe(1);
   });
 
   it.each([[''], ['foo'], ['/has space'], ['/has?query']])('rejects invalid prefix %j', (prefix) => {

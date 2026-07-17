@@ -7,17 +7,24 @@ import os from 'os';
 
 import { CONTAINER_INSTALL_LABEL } from './config.js';
 import { log } from './log.js';
+// Single source of truth for the host.docker.internal target — kept in network.ts
+// (mode-aware) so the --add-host target, the host-rpc bind, and the proxy bind
+// can't drift. This import closes a load-safe cycle (network.ts imports
+// CONTAINER_RUNTIME_BIN from here): neither module references the other's binding
+// at top level, so initialization order is irrelevant.
+import { serviceConnectTarget } from './modules/container-bootstrap/network.js';
 
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'docker';
 
-/** CLI args needed for the container to resolve the host gateway. */
+/** CLI args so the container can resolve `host.docker.internal` to the host. */
 export function hostGatewayArgs(): string[] {
-  // On Linux, host.docker.internal isn't built-in — add it explicitly
-  if (os.platform() === 'linux') {
-    return ['--add-host=host.docker.internal:host-gateway'];
-  }
-  return [];
+  // macOS / Docker Desktop: host.docker.internal is built in — nothing to add.
+  if (os.platform() !== 'linux') return [];
+  // Linux (bare-metal or WSL): point host.docker.internal at the mode's connect
+  // target — `host-gateway` (docker0) in open mode, the nanoclaw bridge gateway
+  // in gateway mode. (host-rpc bug #9)
+  return [`--add-host=host.docker.internal:${serviceConnectTarget()}`];
 }
 
 /** Returns CLI args for a readonly bind mount. */
