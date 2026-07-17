@@ -47,6 +47,10 @@ export const TEMPLATES_DIR = process.env.NANOCLAW_TEMPLATES_DIR
   : path.resolve(PROJECT_ROOT, 'templates');
 export const MAX_MESSAGES_PER_PROMPT = Math.max(1, parseInt(process.env.MAX_MESSAGES_PER_PROMPT || '10', 10) || 10);
 export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min default — how long to keep container alive after last result
+// Fork-only: global container admission cap. Upstream removed this in tasks-core
+// ("isolation replaces throttling") but that only covers per-series task sessions.
+// The fork uses this as a global memory-overrun guard for all container types.
+// See module/container-queue and docs/fls/migration-analysis/d-queue-concurrency-risks.md.
 export const MAX_CONCURRENT_CONTAINERS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5);
 // Demand-driven eviction (group-queue port). A warm (idle) container holds a
 // concurrency slot; under cap pressure the oldest-idle one is evicted to make
@@ -85,11 +89,12 @@ export const SHUTDOWN_DRAIN_TIMEOUT_MS = Math.max(
 // expressed as Infinity. beginGracefulDrain clamps drainTimeout into [0, this].
 export const MAX_DRAIN_TIMEOUT_MS = 2_147_483_647;
 
+
 // Per-container resource caps, passed through to `docker run`. Default empty =
 // no flag added = today's unbounded behavior (don't OOM existing OSS workloads).
 // Operators opt in: CONTAINER_CPU_LIMIT=2, CONTAINER_MEMORY_LIMIT=8g.
-export const CONTAINER_CPU_LIMIT = process.env.CONTAINER_CPU_LIMIT || '';
-export const CONTAINER_MEMORY_LIMIT = process.env.CONTAINER_MEMORY_LIMIT || '';
+export const CONTAINER_CPU_LIMIT = process.env.CONTAINER_CPU_LIMIT || envConfig.CONTAINER_CPU_LIMIT || '';
+export const CONTAINER_MEMORY_LIMIT = process.env.CONTAINER_MEMORY_LIMIT || envConfig.CONTAINER_MEMORY_LIMIT || '';
 
 // Egress lockdown — force all agent traffic through the OneCLI gateway on a
 // no-internet Docker network. Off by default; consumed by src/egress-lockdown.ts.
