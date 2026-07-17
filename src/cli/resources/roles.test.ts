@@ -82,7 +82,11 @@ describe('roles CLI grant/revoke require explicit scope (issue A)', () => {
   it('rejects an invalid --scope value', async () => {
     const resp = await grant({ user: UID, role: 'admin', scope: 'everywhere' });
     expect(resp.ok).toBe(false);
-    expect(resp.ok === false && resp.error.message).toMatch(/must be "global" or "group"/);
+    // main_patched's crud framework enum-validates declared args before the
+    // handler runs, so an invalid --scope is rejected with the uniform
+    // "must be one of" message (roles.ts's own guard is now a defensive
+    // fallback). A's intent — invalid scope rejected, nothing written — holds.
+    expect(resp.ok === false && resp.error.message).toMatch(/--scope must be one of: global, group/);
     expect(roleRows()).toEqual([]);
   });
 
