@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 
 import type { AdditionalMountConfig, McpServerConfig } from '../../container-config.js';
+import { DEFAULT_AGENT_PROVIDER } from '../../config.js';
 import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
 import { createAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
@@ -96,7 +97,7 @@ registerResource({
         // (unspawnable) group can never be left behind (#4).
         getDb().transaction(() => {
           createAgentGroup(group);
-          ensureContainerConfig(id);
+          ensureContainerConfig(id, DEFAULT_AGENT_PROVIDER);
         })();
         initGroupFilesystem(group);
         return getAgentGroupByFolder(folder);
