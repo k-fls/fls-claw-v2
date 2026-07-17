@@ -28,9 +28,29 @@ vi.mock('./crud.js', () => ({
   getResource: (...args: unknown[]) => mockGetResource(...args),
 }));
 
-vi.mock('../modules/approvals/index.js', () => ({
-  registerApprovalHandler: vi.fn(),
+const approvalState = vi.hoisted(() => ({
   requestApproval: vi.fn(),
+  cliCommandHandler: null as
+    | null
+    | ((args: {
+        session: unknown;
+        payload: Record<string, unknown>;
+        userId: string;
+        notify: (text: string) => void;
+      }) => Promise<void>),
+}));
+vi.mock('../modules/approvals/index.js', () => ({
+  registerApprovalHandler: vi.fn((action: string, handler: typeof approvalState.cliCommandHandler) => {
+    if (action === 'cli_command') approvalState.cliCommandHandler = handler;
+  }),
+  requestApproval: approvalState.requestApproval,
+}));
+
+// dispatch re-verifies role-change approvers at apply time via these.
+const roleState = vi.hoisted(() => ({ owners: new Set<string>(), globalAdmins: new Set<string>() }));
+vi.mock('../modules/permissions/db/user-roles.js', () => ({
+  isOwner: (u: string) => roleState.owners.has(u),
+  isGlobalAdmin: (u: string) => roleState.globalAdmins.has(u),
 }));
 
 // Register a test command so dispatch has something to find
@@ -98,6 +118,25 @@ register({
   handler: async (args) => ({ echo: args }),
 });
 
+// Role grant/revoke — privilege-sensitive, approval-gated. Used by the
+// approval-routing tests below.
+register({
+  name: 'roles-grant',
+  description: 'grant a role (approval-gated)',
+  resource: 'roles',
+  access: 'approval',
+  parseArgs: (raw) => raw,
+  handler: async (args) => ({ granted: args }),
+});
+register({
+  name: 'roles-revoke',
+  description: 'revoke a role (approval-gated)',
+  resource: 'roles',
+  access: 'approval',
+  parseArgs: (raw) => raw,
+  handler: async (args) => ({ revoked: args }),
+});
+
 // Commands that return data shaped like real resources (for post-handler filtering tests)
 register({
   name: 'groups-list-data',
@@ -152,6 +191,8 @@ import type { CallerContext } from './frame.js';
 
 beforeEach(() => {
   vi.clearAllMocks();
+  roleState.owners.clear();
+  roleState.globalAdmins.clear();
   // Default: the four CLI-whitelisted resources with their real scopeFields.
   const scopeFields: Record<string, string> = {
     groups: 'id',
@@ -510,5 +551,107 @@ describe('CLI scope enforcement', () => {
       expect(resp.error.code).toBe('forbidden');
       expect(resp.error.message).toContain('not available in group scope');
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Role-change approval routing (privilege-proportional, target-excluded)
+// ---------------------------------------------------------------------------
+
+describe('role-change approval routing', () => {
+  function constraintOf(): { minLevel?: string; excludeUserIds?: string[] } | undefined {
+    const call = approvalState.requestApproval.mock.calls[0]?.[0] as { approverConstraint?: unknown } | undefined;
+    return call?.approverConstraint as { minLevel?: string; excludeUserIds?: string[] } | undefined;
+  }
+
+  beforeEach(() => {
+    // Role commands are only reachable in global CLI scope.
+    mockGetContainerConfig.mockReturnValue({ cli_scope: 'global' });
+    mockGetSession.mockReturnValue({ id: 's1', agent_group_id: 'g1', messaging_group_id: 'mg1' });
+    mockGetAgentGroup.mockReturnValue({ id: 'g1', name: 'Group One' });
+  });
+
+  it('grant global admin (no --group): requires an OWNER approver, target excluded', async () => {
+    const resp = await dispatch(
+      { id: '1', command: 'roles-grant', args: { user: 'telegram:victim', role: 'admin' } },
+      agentCtx(),
+    );
+
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) expect(resp.error.code).toBe('approval-pending');
+    expect(constraintOf()).toEqual({ minLevel: 'owner', excludeUserIds: ['telegram:victim'] });
+  });
+
+  it('grant owner: requires an OWNER approver', async () => {
+    await dispatch({ id: '1', command: 'roles-grant', args: { user: 'telegram:x', role: 'owner' } }, agentCtx());
+    expect(constraintOf()).toEqual({ minLevel: 'owner', excludeUserIds: ['telegram:x'] });
+  });
+
+  it('revoke group-scoped admin (--group): a GLOBAL admin (or owner) may approve', async () => {
+    await dispatch(
+      { id: '1', command: 'roles-revoke', args: { user: 'telegram:x', role: 'admin', group: 'g1' } },
+      agentCtx(),
+    );
+    expect(constraintOf()).toEqual({ minLevel: 'global-admin', excludeUserIds: ['telegram:x'] });
+  });
+
+  it('unknown/garbled role fails strict (requires owner)', async () => {
+    await dispatch({ id: '1', command: 'roles-grant', args: { user: 'telegram:x' } }, agentCtx());
+    expect(constraintOf()).toEqual({ minLevel: 'owner', excludeUserIds: ['telegram:x'] });
+  });
+
+  it('non-role approval command carries NO approverConstraint (legacy routing unchanged)', async () => {
+    // groups-config-set-style approval command: register one on the fly.
+    register({
+      name: 'widgets-frob',
+      description: 'a non-role approval command',
+      resource: 'widgets',
+      access: 'approval',
+      parseArgs: (raw) => raw,
+      handler: async (args) => ({ ok: args }),
+    });
+    await dispatch({ id: '1', command: 'widgets-frob', args: { x: 1 } }, agentCtx());
+    expect(constraintOf()).toBeUndefined();
+    const payload = approvalState.requestApproval.mock.calls[0][0] as { payload: Record<string, unknown> };
+    expect(payload.payload.approverConstraint).toBeUndefined();
+  });
+
+  // --- apply-time re-verification (mirrors #2566) ---
+
+  it('apply time: a demoted/unqualified approver cannot apply the change', async () => {
+    await dispatch({ id: '1', command: 'roles-grant', args: { user: 'telegram:victim', role: 'admin' } }, agentCtx());
+    const payload = (approvalState.requestApproval.mock.calls[0][0] as { payload: Record<string, unknown> }).payload;
+
+    expect(approvalState.cliCommandHandler).toBeTypeOf('function');
+    const notify = vi.fn();
+    // 'telegram:notowner' holds no owner role → must be rejected at apply.
+    await approvalState.cliCommandHandler!({ session: {}, payload, userId: 'telegram:notowner', notify });
+
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0]).toContain('NOT applied');
+  });
+
+  it('apply time: the target cannot apply their own change even if still owner', async () => {
+    roleState.owners.add('telegram:victim'); // still an owner, but is the target
+    await dispatch({ id: '1', command: 'roles-revoke', args: { user: 'telegram:victim', role: 'owner' } }, agentCtx());
+    const payload = (approvalState.requestApproval.mock.calls[0][0] as { payload: Record<string, unknown> }).payload;
+
+    const notify = vi.fn();
+    await approvalState.cliCommandHandler!({ session: {}, payload, userId: 'telegram:victim', notify });
+
+    expect(notify.mock.calls[0][0]).toContain('NOT applied');
+    expect(notify.mock.calls[0][0]).toContain('self-approval');
+  });
+
+  it('apply time: a qualified owner applies the change (re-dispatched as host)', async () => {
+    roleState.owners.add('telegram:realowner');
+    await dispatch({ id: '1', command: 'roles-grant', args: { user: 'telegram:victim', role: 'admin' } }, agentCtx());
+    const payload = (approvalState.requestApproval.mock.calls[0][0] as { payload: Record<string, unknown> }).payload;
+
+    const notify = vi.fn();
+    await approvalState.cliCommandHandler!({ session: {}, payload, userId: 'telegram:realowner', notify });
+
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0]).toContain('approved and executed');
   });
 });
