@@ -36,7 +36,15 @@ import {
   setBorrowSource,
 } from '../grants.js';
 import { planCredentialImport, type ImportToken } from '../import-resolver.js';
-import { buildPgpEncryptUrl, ensureGpgKey, exportPublicKey, gpgHomeForScope, isGpgAvailable } from '../gpg.js';
+import {
+  buildPgpEncryptUrl,
+  ensureGpgKey,
+  exportPublicKey,
+  gpgHomeForScope,
+  isGpgAvailable,
+  normalizeArmoredBlock,
+} from '../gpg.js';
+import { gpgDecryptAt } from '../../crypto/gpg.js';
 import { distributeAllManifests, revokeGranteeManifests } from '../manifest.js';
 import { getAllCredentialProviders, getCredentialProvider } from '../providers/registry.js';
 import { getOrCreateResolverForAgentGroup } from '../resolver.js';
@@ -391,11 +399,36 @@ function unknownProviderError(providerId: string, scope: CredentialScope): strin
   return `Unknown provider: *${providerId}* (${known.length} providers registered). Check the provider id.`;
 }
 
+/** Matches a complete inline PGP block anywhere in a command tail. */
+const INLINE_PGP_RE = /-----BEGIN PGP MESSAGE-----[\s\S]*?-----END PGP MESSAGE-----/;
+
+/** Extract a complete inline PGP block from a command's raw args, if present. */
+function extractInlineBlock(argsRaw: string): string | null {
+  return argsRaw.match(INLINE_PGP_RE)?.[0] ?? null;
+}
+
+/**
+ * Decrypt an inline PGP block against the scope's GPG home. Returns the
+ * cleartext or `{ error }` on failure.
+ *
+ * Note: unlike the interactive `pastePgp` flow, an inline block travels in the
+ * command message itself, so its (still-encrypted) ciphertext is persisted in
+ * `messages_in` like any other command. This matches v1 behavior.
+ */
+function decryptInlineBlock(block: string, scope: CredentialScope): { text: string } | { error: string } {
+  try {
+    return { text: gpgDecryptAt(gpgHomeForScope(scope), normalizeArmoredBlock(block)) };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 /**
  * `/creds set-key <provider> [id] [expiry=<ts>]` — store one credential via a
  * GPG-encrypted paste. The decrypted value never travels through chat in
- * cleartext. Launches the paste interaction and returns immediately (the
- * router must not block on the multi-turn flow).
+ * cleartext. Accepts the block inline in the command tail (v1 form); otherwise
+ * launches the paste interaction and returns immediately (the router must not
+ * block on the multi-turn flow).
  */
 function replySetKey(ctx: HostCommandContext, scope: CredentialScope, selfFolder: string): void {
   if (!isGpgAvailable()) {
@@ -413,10 +446,14 @@ function replySetKey(ctx: HostCommandContext, scope: CredentialScope, selfFolder
     return;
   }
 
+  const block = extractInlineBlock(ctx.argsRaw);
+
   // Tokens after the provider: optional credential id + optional expiry=<ts>.
+  // Stop at an inline block — its tokens are payload, not a credential id.
   let credentialId: string | undefined;
   let expiresTs = 0;
   for (const tok of ctx.args.slice(2)) {
+    if (tok.startsWith('-----')) break;
     if (tok.startsWith('expiry=')) {
       const v = parseInt(tok.slice(7), 10);
       if (!Number.isNaN(v)) expiresTs = v;
@@ -427,6 +464,31 @@ function replySetKey(ctx: HostCommandContext, scope: CredentialScope, selfFolder
   const credId = credentialId ?? DEFAULT_CREDENTIAL_ID;
 
   ensureGpgKey(scope);
+
+  // v1-style inline block on the command line — store directly, no prompt.
+  if (block) {
+    const inline = decryptInlineBlock(block, scope);
+    if ('error' in inline) {
+      ctx.replyText(
+        `PGP decrypt failed: ${inline.error}. Re-send with a valid block, ` +
+          `or run \`/creds set-key ${providerId}\` to paste it interactively.`,
+      );
+      return;
+    }
+    const value = inline.text.trim();
+    if (!value) {
+      ctx.replyText('The decrypted value is empty.');
+      return;
+    }
+    getOrCreateResolverForAgentGroup(scope).store(scope, providerId, credId, {
+      value,
+      updated_ts: Date.now(),
+      expires_ts: expiresTs,
+    });
+    ctx.replyText(`Key stored for *${providerId}* (*${credId}*).`);
+    return;
+  }
+
   void pastePgp({
     ctx,
     prompt:
@@ -468,7 +530,11 @@ function replyImport(ctx: HostCommandContext, scope: CredentialScope, selfFolder
     ctx.replyText('GPG is not available on the host. Install gnupg first.');
     return;
   }
-  const defaultProviderId = ctx.args[1] ?? null;
+  const block = extractInlineBlock(ctx.argsRaw);
+  // A leading arg that isn't part of an inline block is the default provider;
+  // guard so `import <block>` (no provider) doesn't read the block as one.
+  const arg1 = ctx.args[1];
+  const defaultProviderId = arg1 && !arg1.startsWith('-----') ? arg1 : null;
   if (defaultProviderId) {
     const provErr = unknownProviderError(defaultProviderId, scope);
     if (provErr) {
@@ -478,30 +544,11 @@ function replyImport(ctx: HostCommandContext, scope: CredentialScope, selfFolder
   }
 
   ensureGpgKey(scope);
-  void pastePgp({
-    ctx,
-    prompt:
-      borrowShadowNotice(
-        getBorrowSource(selfFolder),
-        defaultProviderId ? `Importing *${defaultProviderId}* credentials here` : 'Importing credentials here',
-      ) +
-      `Bulk credential import for *${selfFolder}*, **GPG-encrypted** — never pasted in cleartext.\n\n` +
-      `1. Encrypt your ${defaultProviderId ? `\`KEY=value\` lines for *${defaultProviderId}*` : '`[provider:]KEY=value` lines'} ` +
-      `here: ${buildPgpEncryptUrl(scope)}\n` +
-      '2. Paste the resulting `-----BEGIN PGP MESSAGE-----` block back here.\n\n' +
-      (defaultProviderId ? '' : 'Un-prefixed `ALL_CAPS` env-var names auto-resolve to their provider. ') +
-      '(Lines starting with `#` are ignored.) Or reply `cancel`.',
-    gpgHome: gpgHomeForScope(scope),
-    validate: (plaintext) =>
-      tokenizeImportLines(plaintext).tokens.length > 0
-        ? null
-        : 'No valid `KEY=value` lines found in the decrypted message.',
-  }).then((r) => {
-    if (r.reason !== 'submitted' || !r.text) {
-      ctx.replyText(r.reason === 'cancelled' ? 'Cancelled — nothing imported.' : 'Timed out — nothing imported.');
-      return;
-    }
-    const { tokens, warnings: lineWarnings } = tokenizeImportLines(r.text);
+
+  // Process decrypted `[provider:]KEY=value` lines — shared by the inline and
+  // interactive paths.
+  const finishImport = (text: string): void => {
+    const { tokens, warnings: lineWarnings } = tokenizeImportLines(text);
     const resolver = getOrCreateResolverForAgentGroup(scope);
     const now = Date.now();
     const perProvider = new Map<string, number>();
@@ -549,6 +596,50 @@ function replyImport(ctx: HostCommandContext, scope: CredentialScope, selfFolder
       perProvider.set(providerId, (perProvider.get(providerId) ?? 0) + 1);
     }
     ctx.replyText(renderImportSummary(perProvider, [...unknown], warnings, {}));
+  };
+
+  // v1-style inline block on the command line — import directly, no prompt.
+  if (block) {
+    const inline = decryptInlineBlock(block, scope);
+    if ('error' in inline) {
+      ctx.replyText(
+        `PGP decrypt failed: ${inline.error}. Re-send with a valid block, ` +
+          `or run \`/creds import${defaultProviderId ? ` ${defaultProviderId}` : ''}\` to paste it interactively.`,
+      );
+      return;
+    }
+    if (tokenizeImportLines(inline.text).tokens.length === 0) {
+      ctx.replyText('No valid `KEY=value` lines found in the decrypted message.');
+      return;
+    }
+    finishImport(inline.text);
+    return;
+  }
+
+  void pastePgp({
+    ctx,
+    prompt:
+      borrowShadowNotice(
+        getBorrowSource(selfFolder),
+        defaultProviderId ? `Importing *${defaultProviderId}* credentials here` : 'Importing credentials here',
+      ) +
+      `Bulk credential import for *${selfFolder}*, **GPG-encrypted** — never pasted in cleartext.\n\n` +
+      `1. Encrypt your ${defaultProviderId ? `\`KEY=value\` lines for *${defaultProviderId}*` : '`[provider:]KEY=value` lines'} ` +
+      `here: ${buildPgpEncryptUrl(scope)}\n` +
+      '2. Paste the resulting `-----BEGIN PGP MESSAGE-----` block back here.\n\n' +
+      (defaultProviderId ? '' : 'Un-prefixed `ALL_CAPS` env-var names auto-resolve to their provider. ') +
+      '(Lines starting with `#` are ignored.) Or reply `cancel`.',
+    gpgHome: gpgHomeForScope(scope),
+    validate: (plaintext) =>
+      tokenizeImportLines(plaintext).tokens.length > 0
+        ? null
+        : 'No valid `KEY=value` lines found in the decrypted message.',
+  }).then((r) => {
+    if (r.reason !== 'submitted' || !r.text) {
+      ctx.replyText(r.reason === 'cancelled' ? 'Cancelled — nothing imported.' : 'Timed out — nothing imported.');
+      return;
+    }
+    finishImport(r.text);
   });
 }
 

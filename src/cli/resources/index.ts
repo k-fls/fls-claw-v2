@@ -15,3 +15,4 @@ import './dropped-messages.js';
 import './approvals.js';
 import './sessions.js';
 import './broker.js';
+import './tasks.js';

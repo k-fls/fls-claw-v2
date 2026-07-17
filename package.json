@@ -1,6 +1,6 @@
 {
   "name": "nanoclaw",
-  "version": "2.1.23",
+  "version": "2.1.53",
   "description": "Personal Claude assistant. Lightweight, secure, customizable.",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
@@ -9,7 +9,7 @@
     "ncl": "bin/ncl"
   },
   "scripts": {
-    "build": "tsc && node scripts/copy-assets.mjs",
+    "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
@@ -21,8 +21,6 @@
     "setup:auto": "tsx setup/auto.ts",
     "ncl": "tsx src/cli/client.ts",
     "chat": "tsx scripts/chat.ts",
-    "chat:live": "tsx scripts/chat-live.ts",
-    "auth": "tsx src/whatsapp-auth.ts",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
     "test": "vitest run",
@@ -35,14 +33,12 @@
     "better-sqlite3": "11.10.0",
     "chat": "4.29.0",
     "cron-parser": "5.5.0",
-    "kleur": "^4.1.5",
-    "node-forge": "1.4.0"
+    "kleur": "^4.1.5"
   },
   "devDependencies": {
     "@eslint/js": "^9.35.0",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.10.0",
-    "@types/node-forge": "1.3.14",
     "eslint": "^9.35.0",
     "eslint-plugin-no-catch-all": "^1.1.0",
     "globals": "^15.12.0",
