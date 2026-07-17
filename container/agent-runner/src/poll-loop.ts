@@ -176,6 +176,36 @@ export interface PollLoopConfig {
 }
 
 /**
+ * Graceful-stop state. The host stops a container with `docker stop -t N`
+ * (SIGTERM, then SIGKILL after N seconds). A SIGTERM handler (wired in
+ * index.ts) calls `requestGracefulStop`, which aborts any in-flight query and
+ * trips the loop to exit at the next safe point — so a turn ends cleanly (rows
+ * marked, transcript flushed by the SDK's own abort) instead of being torn by
+ * the SIGKILL. An idle container (no active query) just exits the loop. This is
+ * the v2 equivalent of the fork's `_close` sentinel; it works for any provider
+ * because it rides the provider-agnostic `AgentQuery.abort()`.
+ */
+let currentQuery: AgentQuery | null = null;
+let stopRequested = false;
+
+export function requestGracefulStop(): void {
+  stopRequested = true;
+  // End the in-flight turn (provider-specific: Claude ends the SDK stream,
+  // codex/opencode issue their own interrupt/abort). No-op when idle.
+  try {
+    currentQuery?.abort();
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Test seam — reset module state between cases. */
+export function _resetGracefulStopForTesting(): void {
+  currentQuery = null;
+  stopRequested = false;
+}
+
+/**
  * Main poll loop. Runs indefinitely until the process is killed.
  *
  * 1. Poll messages_in for pending rows
