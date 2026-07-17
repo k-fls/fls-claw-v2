@@ -99,6 +99,17 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
       const adapter = getChannelAdapterExact(instance ?? channelType);
       await adapter?.setTyping?.(platformId, threadId);
     },
+    async pulseReaction(
+      channelType: string,
+      platformId: string,
+      messageId: string,
+      emoji: string,
+      on: boolean,
+      instance?: string,
+    ): Promise<void> {
+      const adapter = getChannelAdapterExact(instance ?? channelType);
+      await adapter?.pulseReaction?.(platformId, messageId, emoji, on);
+    },
   };
 }
 

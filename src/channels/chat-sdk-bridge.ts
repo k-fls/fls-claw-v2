@@ -546,6 +546,21 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       await adapter.startTyping(tid);
     },
 
+    async pulseReaction(platformId: string, messageId: string, emoji: string, on: boolean) {
+      // Only used in the non-threaded case, so the chat address IS the thread
+      // id (same `threadId ?? platformId` mapping deliver() uses). Best-effort:
+      // a reaction that's already present/absent, or a message the user
+      // deleted, throws on Slack (already_reacted / no_reaction /
+      // message_not_found) — swallow it. The typing module owns the intended
+      // on/off state, so a dropped toggle just self-corrects on the next tick.
+      try {
+        if (on) await adapter.addReaction(platformId, messageId, emoji);
+        else await adapter.removeReaction(platformId, messageId, emoji);
+      } catch {
+        // swallow — see above
+      }
+    },
+
     async teardown() {
       gatewayAbort?.abort();
       await chat.shutdown();

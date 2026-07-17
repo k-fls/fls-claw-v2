@@ -146,6 +146,22 @@ export interface ChannelAdapter {
 
   // Optional
   setTyping?(platformId: string, threadId: string | null): Promise<void>;
+
+  /**
+   * Toggle a single reaction on a message as a pseudo-typing signal for
+   * platforms that have no native typing indicator in non-threaded chats
+   * (Slack DMs). `on=true` adds the emoji, `on=false` removes it. The typing
+   * module drives this on its refresh interval, flickering the reaction on
+   * the agent's last message to signal "still working."
+   *
+   * Best-effort: the implementation must swallow benign state-drift errors
+   * (already-reacted, no-reaction, message-not-found) so a stale toggle never
+   * surfaces as a delivery or typing failure. `platformId` is the chat address
+   * (the reaction is only used in the non-threaded case, so it doubles as the
+   * thread id). Adapters that omit this leave the caller to fall back to
+   * `setTyping` — a no-op on such platforms.
+   */
+  pulseReaction?(platformId: string, messageId: string, emoji: string, on: boolean): Promise<void>;
   syncConversations?(): Promise<ConversationInfo[]>;
   resolveChannelName?(platformId: string): Promise<string | null>;
 
