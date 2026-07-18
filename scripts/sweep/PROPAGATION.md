@@ -102,13 +102,29 @@ the newest parent commit whose covered height is < N (derived by ancestry probes
 stored refs). If the parent advanced in one big merge and no such historical tip exists,
 the child simply doesn't merge that parent this pass (relevant to DEFERRED, §5).
 
+**Fork-only parent content:** a parent tip that carries new fork commits but no
+upstream progress above the child's coverage still belongs on the eligible line — when
+the height-filtered line would be empty but the parent tip is NOT an ancestor of the
+child, the parent tip itself (at its derived height) is the single candidate head.
+Otherwise a fork fix merged into a parent would not reach descendants until upstream
+next advances (violating the D-032a parent-tip inheritance model). The normal ladder,
+no-op check, and DEFERRED rule apply to that head like any other.
+
 ## 5. DEFERRED — conflicts that belong to an ancestor (D-036)
 
 When the sweep finds branch C's first conflicting height N′ against parent Q, and the
 pass registry records an ancestor P (any transitive inventory ancestor, not only a
 direct parent) HELD at height N with conflicted path set S_P:
 
-- **N′ == N and C's conflicted paths intersect S_P → DEFERRED.** C freezes; NO PR; the
+- **N lies in the conflicting window and C's conflicted paths intersect S_P →
+  DEFERRED.** The conflicting window is `(floor, N′]` where `floor` is the largest
+  clean height below the conflict on C's eligible line (or C's coverage when none) —
+  i.e. the held commit's content is part of what this merge would newly introduce.
+  Exact equality N′ == N is the special case where the eligible line has a head at N;
+  parents-model lines are usually coarser (a parent that advanced in one merge has one
+  head far above N), and the window rule is the faithful generalization: if the merge
+  up to `floor` was clean, the disputed content arrived above `floor`, and an
+  intersecting held height inside the window identifies the ancestor's conflict. C freezes; NO PR; the
   journal entry points at P's HELD record; C auto-unfreezes (re-enters the plan) when
   P's HELD clears. C still merges Q's clean prefix below N when a historical tip of Q
   with coverage < N exists (§4); otherwise it merges nothing from Q this pass.
@@ -185,9 +201,22 @@ propagate run                 # execute plan: CLEAN merges + skips + DEFERRED ma
                               #   other branches (one branch's case never blocks siblings, only
                               #   descendants via the barrier)
 propagate resolve --case ID --tier T   # scope guard + cold-read gate, then merge (MECHANICAL) or
-                              #   prepare PR (JUDGED) or freeze (HELD); resumes descendants
+                              #   prepare PR (JUDGED) or freeze (HELD); reopens the branch
 propagate status              # human-readable pass state from journal + derivation
 ```
+
+`--tier held` is the direct freeze path: no resolution commit required, no scope guard
+or cold-read gate — the driver prepares the D-030 real-diff draft PR at the conflicting
+head and journals HELD. This is how an agent declares "cannot resolve" without a
+resolution attempt.
+
+**Same-pass continuation:** a gated branch is still journaled `arrived` (barrier
+semantics — descendants may proceed on its partial progress), but every `resolve`
+journals a `reopened` entry for the branch AND its transitive inventory descendants.
+Reopened branches are re-processed by the next `run`: live re-derivation continues the
+branch above the resolved height (next case or clean to the watermark) and lets
+descendants pick up the resolution — the pass converges without waiting for a new
+watermark.
 
 `run` after a `resolve` is idempotent: completed branches re-verify as up-to-date and
 are skipped; the plan is re-derived and must match (a mismatch means git moved under
