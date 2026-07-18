@@ -1,0 +1,56 @@
+id: p5-noop-skip-mitm-interactions-helpers
+class: 5 (no-op skip, PROPAGATION.md section 6)
+status: verified
+title: >-
+  Merging inventory parent module/interactions-helpers into
+  feat/mitm-credential-proxy is a no-op - merge-tree result tree equals the
+  child's current tree
+watermark: 082f5c7ea99342fcb324ab78baacb0c4e6894029
+parent:
+  branch: module/interactions-helpers
+  tip: 8fc0ca9e3684485be8e3497cc3bfea272b4649bb
+child:
+  branch: feat/mitm-credential-proxy
+  tip: 4d386dbab63a5204b32117ad6a82b6d100da3c71
+inventory_edge: >-
+  module/interactions-helpers is listed in
+  fork-registry/features/feat.mitm-credential-proxy.yaml parents.
+result_tree: 33315cda261792315ea470bd1f562a136bc5c9da
+current_tree: 33315cda261792315ea470bd1f562a136bc5c9da
+expected:
+  verdict: skip
+  behavior: >-
+    Driver records `skip` in the journal, creates no merge commit. The
+    parent tip is a git ancestor of the child tip, which is why the merge
+    result collapses to the child's own tree.
+probes:
+  - cmd: git merge-tree --write-tree feat/mitm-credential-proxy module/interactions-helpers
+    exit: 0
+    tree: 33315cda261792315ea470bd1f562a136bc5c9da
+  - cmd: git rev-parse feat/mitm-credential-proxy^{tree}
+    result: 33315cda261792315ea470bd1f562a136bc5c9da
+  - cmd: git merge-base --is-ancestor module/interactions-helpers feat/mitm-credential-proxy
+    exit: 0
+additional_verified_instances:
+  - parent: module/agent-group-contributions (f3e947ff56748dbac5a33cdb1b5a41c812d63cbb)
+    child: feat/mitm-credential-proxy (4d386dbab63a5204b32117ad6a82b6d100da3c71)
+    result_tree: 33315cda261792315ea470bd1f562a136bc5c9da
+    current_tree: 33315cda261792315ea470bd1f562a136bc5c9da
+  - parent: module/host-rpc (1386c873c9b0a69f89b11f24d2ecbdf60b385f74)
+    child: module/egress-lockdown (01b10d1c2059a166894cb834b445c83d35caaf50)
+    result_tree: 467d2e58ad3b2b3a380bed56f6d8b378e6031b09
+    current_tree: 467d2e58ad3b2b3a380bed56f6d8b378e6031b09
+  - parent: feat/mitm-credential-proxy (4d386dbab63a5204b32117ad6a82b6d100da3c71)
+    child: feat/onecli-broker (49f6b0720413df20ca6084a39681ebcb13d93b2f)
+    result_tree: e8338c7dc4307178b6e13c263ec09d5096b54ebb
+    current_tree: e8338c7dc4307178b6e13c263ec09d5096b54ebb
+notes: >-
+  Contrast within the same branch: the sibling parent module/credentials
+  also merges with exit 0 but produces tree
+  0f4198ebf155569c524f91a21ceda73cde91179d != child tree - a CLEAN real
+  merge, NOT a skip. A skip test must compare trees, not exit codes. The
+  host-rpc->egress-lockdown and mitm->onecli-broker instances double as
+  leaf/un-skip fixtures: they are exactly the "intermediate merges are
+  no-ops by definition" edges of the D-039 un-skip chain toward
+  edition/fls-ai-bot.
+source: merge-tree probes on fls-claw-v2-clean, 2026-07-18

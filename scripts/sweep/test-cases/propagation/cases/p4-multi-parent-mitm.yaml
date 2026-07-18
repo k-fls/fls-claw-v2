@@ -1,0 +1,136 @@
+id: p4-multi-parent-mitm
+class: 4 (multi-parent barrier / differing parent coverage, PROPAGATION.md sections 2 and 4)
+status: verified
+title: >-
+  feat/mitm-credential-proxy has six inventory parents whose merges bring
+  radically different upstream coverage (height 88 vs height 0) and hit
+  every per-parent verdict class in one branch
+watermark: 082f5c7ea99342fcb324ab78baacb0c4e6894029
+chain:
+  base: cb6e3d117c127054ca5bc5a53645d794d93cc595
+  tip: 082f5c7ea99342fcb324ab78baacb0c4e6894029
+  length: 98
+  enumerate_cmd: git rev-list --first-parent --reverse main..upstream/main
+child:
+  branch: feat/mitm-credential-proxy
+  tip: 4d386dbab63a5204b32117ad6a82b6d100da3c71
+  current_tree: 33315cda261792315ea470bd1f562a136bc5c9da
+  coverage_height: 0
+inventory_edge: >-
+  fork-registry/features/feat.mitm-credential-proxy.yaml (branch
+  maint/fork-registry): parents: [module/container-queue,
+  module/credentials, module/egress-lockdown, module/host-rpc,
+  module/interactions-helpers, module/agent-group-contributions].
+parents:
+  - branch: module/container-queue
+    tip: a13c3e2ccc0a9aeb9d25952cfc82ada2717f4e44
+    coverage_height: 88
+    ancestor_of_child: false
+    merge_vs_child: CONFLICT
+    conflicted_paths:
+      - CLAUDE.md
+      - container/agent-runner/src/index.ts
+      - container/agent-runner/src/poll-loop.test.ts
+      - container/agent-runner/src/poll-loop.ts
+      - docs/SECURITY.md
+      - package.json
+      - src/command-gate.test.ts
+      - src/command-gate.ts
+      - src/config.ts
+      - src/container-runner.ts
+      - src/egress-lockdown.ts
+      - src/host-sweep.ts
+      - src/modules/index.ts
+      - src/modules/mount-security/index.test.ts
+      - src/router.ts
+    automerge_tree: 110a13fb0bbd46092747ba37f642e8a1f90943cf
+  - branch: module/credentials
+    tip: 24663af8ba0969cdaaa632cd8882389df1342194
+    coverage_height: 0
+    ancestor_of_child: false
+    merge_vs_child: CLEAN (real merge, result tree differs from child tree)
+    conflicted_paths: []
+    result_tree: 0f4198ebf155569c524f91a21ceda73cde91179d
+  - branch: module/egress-lockdown
+    tip: 01b10d1c2059a166894cb834b445c83d35caaf50
+    coverage_height: 0
+    ancestor_of_child: false
+    merge_vs_child: CONFLICT (fork-internal, zero upstream content involved)
+    conflicted_paths:
+      - container/Dockerfile
+      - container/agent-runner/src/poll-loop.test.ts
+      - src/config.ts
+      - src/container-runner.ts
+      - src/modules/container-bootstrap/launch-shape.ts
+    automerge_tree: 648520903d86750044708027a5e7e8118de09962
+  - branch: module/host-rpc
+    tip: 1386c873c9b0a69f89b11f24d2ecbdf60b385f74
+    coverage_height: 0
+    ancestor_of_child: false
+    merge_vs_child: CONFLICT (fork-internal)
+    conflicted_paths:
+      - container/agent-runner/src/poll-loop.test.ts
+      - src/config.ts
+      - src/container-runner.ts
+      - src/modules/container-bootstrap/launch-shape.ts
+    automerge_tree: 03b2fbc79e211de7dc478c83018575a54c733ed6
+  - branch: module/interactions-helpers
+    tip: 8fc0ca9e3684485be8e3497cc3bfea272b4649bb
+    coverage_height: 0
+    ancestor_of_child: true
+    merge_vs_child: NO-OP SKIP (result tree == child tree)
+    result_tree: 33315cda261792315ea470bd1f562a136bc5c9da
+  - branch: module/agent-group-contributions
+    tip: f3e947ff56748dbac5a33cdb1b5a41c812d63cbb
+    coverage_height: 0
+    ancestor_of_child: true
+    merge_vs_child: NO-OP SKIP (result tree == child tree)
+    result_tree: 33315cda261792315ea470bd1f562a136bc5c9da
+expected:
+  behavior: >-
+    Breadth-wise barrier: the child is processed only after all six parents
+    arrive this pass. Upstream coverage differs across parents - merging
+    module/container-queue's tip would raise the child's covered height to
+    88, while the other five parents carry zero pending-chain coverage
+    (content-only). Per-parent verdicts this pass: two no-op skips
+    (journal `skip`, no merge commit), one clean real merge
+    (module/credentials), three conflict cases for the agent (container-queue
+    carrying upstream heights 1..88, egress-lockdown and host-rpc purely
+    fork-internal). Note the two conflicting cov-0 parents are also
+    inventory ANCESTORS of other parents in the same list
+    (host-rpc -> egress-lockdown), so HELD ordering among the parents
+    themselves matters.
+probes:
+  - cmd: git merge-tree --write-tree --name-only feat/mitm-credential-proxy module/container-queue
+    exit: 1
+    tree: 110a13fb0bbd46092747ba37f642e8a1f90943cf
+  - cmd: git merge-tree --write-tree --name-only feat/mitm-credential-proxy module/credentials
+    exit: 0
+    tree: 0f4198ebf155569c524f91a21ceda73cde91179d
+  - cmd: git merge-tree --write-tree --name-only feat/mitm-credential-proxy module/egress-lockdown
+    exit: 1
+    tree: 648520903d86750044708027a5e7e8118de09962
+  - cmd: git merge-tree --write-tree --name-only feat/mitm-credential-proxy module/host-rpc
+    exit: 1
+    tree: 03b2fbc79e211de7dc478c83018575a54c733ed6
+  - cmd: git merge-tree --write-tree --name-only feat/mitm-credential-proxy module/interactions-helpers
+    exit: 0
+    tree: 33315cda261792315ea470bd1f562a136bc5c9da
+  - cmd: git merge-tree --write-tree --name-only feat/mitm-credential-proxy module/agent-group-contributions
+    exit: 0
+    tree: 33315cda261792315ea470bd1f562a136bc5c9da
+  - cmd: git rev-parse feat/mitm-credential-proxy^{tree}
+    result: 33315cda261792315ea470bd1f562a136bc5c9da
+notes: >-
+  Coverage heights derived by binary ancestry search over chain.txt
+  (git merge-base --is-ancestor <chain[k]> <parent>). A second, smaller
+  multi-parent instance: feat/ssh-auth with parents
+  [module/container-bootstrap, module/credentials, module/host-rpc,
+  module/interactions-helpers, module/agent-group-contributions].
+  Historical multi-parent merge commits for replay:
+  49f6b0720413df20ca6084a39681ebcb13d93b2f (feat/onecli-broker merges
+  feat/mitm-credential-proxy), 01b10d1c2059a166894cb834b445c83d35caaf50
+  (module/egress-lockdown merges module/host-rpc),
+  703d047e5f708f15910e058a0693fce53f3068b7 (module/container-bootstrap
+  merges module/agent-group-contributions).
+source: merge-tree probes + registry read on fls-claw-v2-clean, 2026-07-18

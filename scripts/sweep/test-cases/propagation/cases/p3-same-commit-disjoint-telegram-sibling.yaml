@@ -1,0 +1,76 @@
+id: p3-same-commit-disjoint-telegram-sibling
+class: 3 (same-commit-disjoint, PROPAGATION.md section 5 negative rule)
+status: not-found-closest-shape
+title: >-
+  Same-commit-DISJOINT with a true inventory ANCESTOR does not exist in this
+  repo; closest real shape is a SIBLING pair at height 1 with fully disjoint
+  conflict sets (fix/channels/telegram-markdown-nesting vs the module family)
+watermark: 082f5c7ea99342fcb324ab78baacb0c4e6894029
+chain:
+  base: cb6e3d117c127054ca5bc5a53645d794d93cc595
+  tip: 082f5c7ea99342fcb324ab78baacb0c4e6894029
+  length: 98
+  enumerate_cmd: git rev-list --first-parent --reverse main..upstream/main
+not_found_evidence: >-
+  Grouping all 44 profiled tips by first-conflict height (FINDINGS.md
+  table): every ancestor/descendant pair (inventory edges from
+  maint/fork-registry:fork-registry/features/*.yaml, all git-verified)
+  that shares a first-conflict height shares it at height 1, and every
+  height-1 conflict set contains src/cli/resources/groups.ts - so all
+  ancestor pairs INTERSECT (they are deferred-positive shapes, class 2).
+  Pairs with disjoint sets (e.g. first-conflict at h3 {src/cli/dispatch.ts*}
+  vs h62 {src/cli/resources/roles.ts} vs h77
+  {container/agent-runner/src/poll-loop.ts} vs h92 vs h96) all have
+  DIFFERENT first-conflict heights, so the N-prime == N precondition never
+  fires disjointly across an ancestry edge today.
+closest_shape:
+  description: >-
+    Two branches conflicting at the SAME chain commit (height 1, #2890) with
+    fully DISJOINT path sets - but they are siblings, not
+    ancestor/descendant, and the telegram branch is sweep-excluded
+    (registry scope.yaml exclude list; 750 commits behind main). Correct
+    driver behavior for the shape is still pinned: were an ancestor
+    recorded HELD at height 1 with S_P = {src/cli/resources/groups.ts},
+    a branch conflicting at height 1 with the disjoint set below must NOT
+    defer - it is its own independent conflict (normal
+    MECHANICAL/JUDGED/HELD ladder).
+  branch_a:
+    branch: module/host-rpc
+    tip: 1386c873c9b0a69f89b11f24d2ecbdf60b385f74
+    first_conflict_height: 1
+    conflicted_paths: [src/cli/resources/groups.ts]
+  branch_b:
+    branch: fix/channels/telegram-markdown-nesting
+    tip: bf35198f079220c50d99049cb2db2acac3c0249e
+    first_conflict_height: 1
+    conflicted_paths:
+      - .claude/skills/add-deltachat/REMOVE.md (add/add)
+      - .claude/skills/add-deltachat/SKILL.md (add/add)
+      - package.json
+      - pnpm-lock.yaml
+      - setup/index.ts
+    automerge_tree: dc2b4844fb815d752aadc42382e57a5fbe38c5de
+heights:
+  1:
+    sha: c87f2e55dc1a46544e8fa5a8098ef99da3745ae1
+    subject: >-
+      Merge pull request #2890 from amit-shafnir/worktree-nanoclaw-templates
+probes:
+  - cmd: git merge-tree --write-tree --name-only module/host-rpc c87f2e55dc1a46544e8fa5a8098ef99da3745ae1
+    exit: 1
+    conflicts: [src/cli/resources/groups.ts]
+    tree: 34b905fca24cedec14b2870fdc7c581766365ec9
+  - cmd: git merge-tree --write-tree --name-only fix/channels/telegram-markdown-nesting c87f2e55dc1a46544e8fa5a8098ef99da3745ae1
+    exit: 1
+    conflicts: [.claude/skills/add-deltachat/REMOVE.md, .claude/skills/add-deltachat/SKILL.md, package.json, pnpm-lock.yaml, setup/index.ts]
+    tree: dc2b4844fb815d752aadc42382e57a5fbe38c5de
+notes: >-
+  The disjointness is structural: telegram-markdown-nesting predates the
+  fork-era module stack (its merge base with the chain is ~750 commits
+  behind main), so its collisions with #2890 land on packaging/setup files
+  instead of the groups resource. Its conflict-set intersection with
+  module/host-rpc's height-1 set is empty (verified above). Because no
+  inventory edge connects them, a driver-level replay must synthesize the
+  registry state (ancestor HELD at h1 with S_P={src/cli/resources/groups.ts})
+  and then assert NOT-deferred for the telegram probe result.
+source: merge-tree probes on fls-claw-v2-clean, 2026-07-18

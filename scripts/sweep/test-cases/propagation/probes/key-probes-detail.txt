@@ -1,0 +1,141 @@
+### module/host-rpc vs c87f2e55dc1a46544e8fa5a8098ef99da3745ae1
+34b905fca24cedec14b2870fdc7c581766365ec9
+100644 e3765c0fb72a74d0515f9bd61439b0a77257b056 1	src/cli/resources/groups.ts
+100644 eeb94a2f4a4e0ee0a9b1d08f85955d2b5c466322 2	src/cli/resources/groups.ts
+100644 27da6417f3359ef70e35a993cacfe56215c52fee 3	src/cli/resources/groups.ts
+
+Auto-merging src/cli/resources/groups.ts
+CONFLICT (content): Merge conflict in src/cli/resources/groups.ts
+Auto-merging src/config.ts
+exit=0
+
+### module/egress-lockdown vs c87f2e55dc1a46544e8fa5a8098ef99da3745ae1
+91b6495f240982af53412b0016b40569b56bfd6e
+100644 e3765c0fb72a74d0515f9bd61439b0a77257b056 1	src/cli/resources/groups.ts
+100644 eeb94a2f4a4e0ee0a9b1d08f85955d2b5c466322 2	src/cli/resources/groups.ts
+100644 27da6417f3359ef70e35a993cacfe56215c52fee 3	src/cli/resources/groups.ts
+
+Auto-merging src/cli/resources/groups.ts
+CONFLICT (content): Merge conflict in src/cli/resources/groups.ts
+Auto-merging src/config.ts
+exit=0
+
+### fix/main/role-grant-scope-clarity vs 1725d86fbd8a841c9202aa61d041c068a79b26d6
+b636a908dd6a80c1325b44daa8843271a7f4d7d7
+100644 9d51815e4611eacae0c393107856410dba7a01b6 1	src/cli/resources/roles.ts
+100644 fce7b2a880c8997cd70d4bb5f1880b5247e3a09b 2	src/cli/resources/roles.ts
+100644 88398cf4deb1345e03fd1e4d8f5c2f8408c57184 3	src/cli/resources/roles.ts
+
+Auto-merging src/cli/resources/roles.ts
+CONFLICT (content): Merge conflict in src/cli/resources/roles.ts
+exit=0
+
+### module/container-queue vs a11ad11ec05b23cedc15ad0ac92c92e1eb9c829b
+ba2cb7b7e1a53f90c84fd1dee67f46af684611eb
+100644 72887f32be8aefe9f853a4f47d14fd3a4c01032e 1	src/index.ts
+100644 84d498c8a63cc6c384cf5e5c0147ed3e9af11933 2	src/index.ts
+100644 7680c3f9f4309056aa377e1d44fdb14da1c48764 3	src/index.ts
+
+Auto-merging container/agent-runner/src/index.ts
+Auto-merging container/agent-runner/src/providers/claude.ts
+Auto-merging src/cli/resources/groups.ts
+Auto-merging src/config.ts
+Auto-merging src/container-runner.ts
+Auto-merging src/index.ts
+CONFLICT (content): Merge conflict in src/index.ts
+exit=0
+
+### main_patched vs a7a0e3d6c4756d6326c93317dcf34c12ca8c85a5
+447e9a379bf6cd8c32df86bd2dfa290b85414c10
+100644 729acc71efab7ff07811c4178de9808a51101451 1	src/cli/resources/groups.ts
+100644 5740fd572423b3a418987350a28afe8c6741ad9a 2	src/cli/resources/groups.ts
+100644 8428ac976e5ea851485cf536dd568d299bb5e9e2 3	src/cli/resources/groups.ts
+
+Auto-merging src/cli/resources/groups.ts
+CONFLICT (content): Merge conflict in src/cli/resources/groups.ts
+exit=0
+
+### feat/mitm-credential-proxy vs module/container-queue
+110a13fb0bbd46092747ba37f642e8a1f90943cf
+100644 0d9952dd1d72f414ccd97bc2f1de5664a6348bcb 1	CLAUDE.md
+100644 718ce449f5229bd8143f29da1546aabffe7a60d8 2	CLAUDE.md
+100644 550b24b7a433d990794524093714067341acf9f3 3	CLAUDE.md
+100644 8f5769769ff8242d3ccd4fd565551ed8691921cb 1	container/agent-runner/src/index.ts
+100644 902d09b972e2d54b6fc3814f37be61a2132246d5 2	container/agent-runner/src/index.ts
+100644 dda975cda0e98d8f77a3a708c8da5f6f3eb0e4a6 3	container/agent-runner/src/index.ts
+100644 37fb59e405f495a2c22991b213122c6df2570131 1	container/agent-runner/src/poll-loop.test.ts
+100644 f9a594768e902d6b4929c6210fa852fcfbf5e411 2	container/agent-runner/src/poll-loop.test.ts
+100644 aac97ce85e7a21b85b68e35ad52ae28b19ccc3b1 3	container/agent-runner/src/poll-loop.test.ts
+100644 c3ad47a18c31dc72c91cd0e4fb56a02286771622 1	container/agent-runner/src/poll-loop.ts
+100644 48cdcaea8a23d475d6d212bd90356982e2bc0d3c 2	container/agent-runner/src/poll-loop.ts
+100644 b2f73e33842467e4feeaf5450994f9a9ce271410 3	container/agent-runner/src/poll-loop.ts
+100644 89152e92f9fa62f20c4f2163e8eb78430e79209a 1	docs/SECURITY.md
+100644 aef53b4d8f208685c525d398f2ee3f3497880d0c 2	docs/SECURITY.md
+100644 19e645e075ea03c4c47a7a2cb71a85776a3c810e 3	docs/SECURITY.md
+100644 8e171fe7511931355396d6f027b8cf992f6c3704 1	package.json
+100644 252b34e21b099f285032e5c68428e6f3490d4d7a 2	package.json
+100644 79214c9bd3312075601fadd0ea5430a07435c94f 3	package.json
+100644 b024692e1d969ad4127b7df52f0491ed2cb8a37c 2	src/command-gate.test.ts
+100644 503034d57d4867c598f888e9653da4d74ea342ec 3	src/command-gate.test.ts
+100644 4f600eb12d26985fad182c9a518e819916fb0e43 1	src/command-gate.ts
+100644 315343195d35c0595e3bf9fe0b208eef9add32d2 2	src/command-gate.ts
+100644 933c39277e824041a0a5d6f599b9694c9ed154a1 3	src/command-gate.ts
+100644 1e622f8e36b5f42fcbdcf5d5124659a2bf6b4e3a 1	src/config.ts
+100644 283edf20ccee8372c8e2307db088c06da63ffce8 2	src/config.ts
+100644 55a075595eba512d2da2807ca131932883102921 3	src/config.ts
+100644 09677c373dfa0f6a57ab2b291a8eba9a9ab45536 1	src/container-runner.ts
+100644 d7f35190651e36f5b43618b0ede0558a8cc93fa3 2	src/container-runner.ts
+100644 a0c9da35e6322471aa815f98739d4117c7be060d 3	src/container-runner.ts
+100644 c05110ba1b2362ba75a6466d470bc1bd7c93c7e7 1	src/egress-lockdown.ts
+100644 ca7e42783aa82bf7f21df9f4ae50f0e99edab6cc 2	src/egress-lockdown.ts
+100644 1e6f6ff215f0726b2ad0d3b75379d062a6a698a2 3	src/egress-lockdown.ts
+100644 59ffb9227685b4059f3c33872b82b16eaf462af9 1	src/host-sweep.ts
+100644 684c36f3cd84841f12eb74f01c3619861eacde5a 2	src/host-sweep.ts
+100644 a9aebd3d3b3412637c7187a7859c316936ccb1fd 3	src/host-sweep.ts
+100644 022850984ec8dd9f670b197da8801bdd469a8469 1	src/modules/index.ts
+100644 6c4d50d95202593fab11271368662b76d8fc1d1a 2	src/modules/index.ts
+100644 2724a53e3802b9063a63662593e16779cc9d5a79 3	src/modules/index.ts
+100644 550dd958a1cc857926fd7079bbf91a8b219ed783 2	src/modules/mount-security/index.test.ts
+exit=0
+
+### fix/channels/telegram-markdown-nesting vs c87f2e55dc1a46544e8fa5a8098ef99da3745ae1
+dc2b4844fb815d752aadc42382e57a5fbe38c5de
+100644 7cb2d3109d69760640d7ccb3e3c7ce437c332d2e 2	.claude/skills/add-deltachat/REMOVE.md
+100644 90f2b89f356b73b4ab8e7592a007b92a10ace186 3	.claude/skills/add-deltachat/REMOVE.md
+100644 45aa41690e46f000312d7483ca1a1f28299d27c7 2	.claude/skills/add-deltachat/SKILL.md
+100644 32b8927d0312f3075ef2d72772ff7db75dfaa46c 3	.claude/skills/add-deltachat/SKILL.md
+100644 ee88d9285a3b5f4b6da9e258a7e423f6f56d171e 1	package.json
+100644 65ffc9d086f75e1ea42e7e2e18839c9a1109a9fb 2	package.json
+100644 8e171fe7511931355396d6f027b8cf992f6c3704 3	package.json
+100644 3f740338e3f1c62a9904362d737b51502e07aae1 1	pnpm-lock.yaml
+100644 0ee4ef82635cc6cd6a71d2aea1d2c844a71656c2 2	pnpm-lock.yaml
+100644 bbe8d700a617a5752ca92be9902dd2b182e80512 3	pnpm-lock.yaml
+100644 200b9e221181c8cfea35e794d8f37197b49c580e 1	setup/index.ts
+100644 8f7009541f9715f94062aba7cb82dbe1516ab13c 2	setup/index.ts
+100644 121eea76644cfb011328f2d76797ad4944d3013e 3	setup/index.ts
+
+Auto-merging .claude/skills/add-deltachat/REMOVE.md
+CONFLICT (add/add): Merge conflict in .claude/skills/add-deltachat/REMOVE.md
+Auto-merging .claude/skills/add-deltachat/SKILL.md
+CONFLICT (add/add): Merge conflict in .claude/skills/add-deltachat/SKILL.md
+Auto-merging .claude/skills/add-whatsapp/SKILL.md
+Auto-merging package.json
+CONFLICT (content): Merge conflict in package.json
+Auto-merging pnpm-lock.yaml
+CONFLICT (content): Merge conflict in pnpm-lock.yaml
+Auto-merging scripts/init-cli-agent.ts
+Auto-merging setup/cli-agent.ts
+Auto-merging setup/index.ts
+CONFLICT (content): Merge conflict in setup/index.ts
+Auto-merging setup/install-discord.sh
+Auto-merging setup/install-gchat.sh
+Auto-merging setup/install-github.sh
+Auto-merging setup/install-linear.sh
+Auto-merging setup/install-node.sh
+Auto-merging setup/install-slack.sh
+Auto-merging setup/install-teams.sh
+Auto-merging setup/install-telegram.sh
+Auto-merging setup/install-whatsapp-cloud.sh
+Auto-merging setup/install-whatsapp.sh
+exit=0
+

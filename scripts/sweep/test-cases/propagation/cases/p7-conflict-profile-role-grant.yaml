@@ -1,0 +1,84 @@
+id: p7-conflict-profile-role-grant
+class: 7 (largest-clean-height / full linear conflict profile, PROPAGATION.md section 3)
+status: verified
+title: >-
+  Full 98-height linear conflict profile of fix/main/role-grant-scope-clarity;
+  largest clean height 61, smallest conflicting height 62, constant
+  single-path conflict set to the watermark
+watermark: 082f5c7ea99342fcb324ab78baacb0c4e6894029
+chain:
+  base: cb6e3d117c127054ca5bc5a53645d794d93cc595
+  tip: 082f5c7ea99342fcb324ab78baacb0c4e6894029
+  length: 98
+  enumerate_cmd: git rev-list --first-parent --reverse main..upstream/main
+branch: fix/main/role-grant-scope-clarity
+tip: a512bc9f57fe3b7b38c0467bde751951ec2589cc
+coverage_height: 0
+profile:
+  # run-length encoding; raw per-height data with tree OIDs in
+  # profiles/fix-main-role-grant-scope-clarity.txt
+  - heights: 1-61
+    result: CLEAN
+  - heights: 62-98
+    result: CONFLICT
+    conflicted_paths: [src/cli/resources/roles.ts]
+expected:
+  largest_clean_height: 61
+  largest_clean_sha: 1ccef326dc8b84656c38690001f8902e1a505311
+  largest_clean_result_tree: ea6cfe4044892aadf7ea040de2dfbbd56891484b
+  smallest_conflicting_height_above: 62
+  smallest_conflicting_sha: 1725d86fbd8a841c9202aa61d041c068a79b26d6
+  smallest_conflicting_subject: >-
+    Merge pull request #3006 from nanocoai/fix/local-time-display
+  case_conflicted_paths: [src/cli/resources/roles.ts]
+  case_automerge_tree: b636a908dd6a80c1325b44daa8843271a7f4d7d7
+  watermark_probe:
+    exit: 1
+    conflicted_paths: [src/cli/resources/roles.ts]
+    automerge_tree: 9b7e86ceb433c829b05cc4f28514c250863107d2
+  sweep_behavior: >-
+    Step 1 full-range probe (vs height 98) conflicts, so the driver sweeps
+    linearly; it merges at height 61 (real upstream progress, coverage was
+    0) and reports height 62 as the case
+    {branch, head: {1725d86f..., 62}, conflictedPaths:
+    [src/cli/resources/roles.ts]}. Because the profile has no clean height
+    above 62, largest-clean == first-conflict - 1 here; the non-degenerate
+    "merge past intermediate conflicts" outcome cannot occur in this repo
+    today (see p1).
+probes:
+  - cmd: git merge-tree --write-tree --name-only fix/main/role-grant-scope-clarity 1ccef326dc8b84656c38690001f8902e1a505311
+    exit: 0
+    tree: ea6cfe4044892aadf7ea040de2dfbbd56891484b
+  - cmd: git merge-tree --write-tree --name-only fix/main/role-grant-scope-clarity 1725d86fbd8a841c9202aa61d041c068a79b26d6
+    exit: 1
+    conflicts: [src/cli/resources/roles.ts]
+    tree: b636a908dd6a80c1325b44daa8843271a7f4d7d7
+  - cmd: git merge-tree --write-tree --name-only fix/main/role-grant-scope-clarity 082f5c7ea99342fcb324ab78baacb0c4e6894029
+    exit: 1
+    conflicts: [src/cli/resources/roles.ts]
+    tree: 9b7e86ceb433c829b05cc4f28514c250863107d2
+  - cmd: >-
+      full profile: for h in $(seq 1 98); do sha=$(sed -n "${h}p" chain.txt);
+      git merge-tree --write-tree --name-only
+      fix/main/role-grant-scope-clarity $sha; done
+    result: see profiles/fix-main-role-grant-scope-clarity.txt
+resolution_ref: >-
+  822f75b17101c8f3930ad1008c1b1d317839651a on main_patched ("Merge branch
+  'fix/main/role-grant-scope-clarity' into main_patched") resolves exactly
+  this roles.ts collision (its first parent
+  73d02022d77bf786dd3110de626004748e349f2e already contained upstream
+  height 91; re-probing 73d02022 x a512bc9f reproduces the conflict) -
+  rerere seed for the height-62 hunk.
+notes: >-
+  Good driver exemplar because coverage is 0 and the merge point (61) is
+  far from both ends of the chain. Alternates with the same shape at other
+  transition points: fix/main/command-gate-mention-prefix (clean 1-11,
+  conflict 12-98 starting on {src/command-gate.test.ts} at
+  6dc25a9b8a951d0cbe172b26724fe056988c17b1, PR #2930),
+  fix/duplicate-result-dispatch (clean 1-76, conflict 77-98 on
+  {container/agent-runner/src/poll-loop.ts} at
+  1e1bd27bddb80d45afd7b720fed80ad3fc4ed07f, PR #2988),
+  module/container-queue (clean 1-95, conflict 96-98 on {src/index.ts} at
+  a11ad11ec05b23cedc15ad0ac92c92e1eb9c829b, PR #3012 - note its coverage
+  is 88, so heights 1-88 are trivially clean and 89-95 genuinely clean).
+source: full linear profile on fls-claw-v2-clean, 2026-07-18

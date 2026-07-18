@@ -1,0 +1,72 @@
+id: p2-deferred-positive-hostrpc-egress
+class: 2 (deferred-positive, PROPAGATION.md section 5)
+status: verified
+title: >-
+  module/host-rpc and its inventory child module/egress-lockdown both
+  first-conflict at chain height 1 on the identical path set
+watermark: 082f5c7ea99342fcb324ab78baacb0c4e6894029
+chain:
+  base: cb6e3d117c127054ca5bc5a53645d794d93cc595
+  tip: 082f5c7ea99342fcb324ab78baacb0c4e6894029
+  length: 98
+  enumerate_cmd: git rev-list --first-parent --reverse main..upstream/main
+parent:
+  branch: module/host-rpc
+  tip: 1386c873c9b0a69f89b11f24d2ecbdf60b385f74
+  coverage_height: 0
+  first_conflict_height: 1
+  conflicted_paths: [src/cli/resources/groups.ts]
+  automerge_tree: 34b905fca24cedec14b2870fdc7c581766365ec9
+child:
+  branch: module/egress-lockdown
+  tip: 01b10d1c2059a166894cb834b445c83d35caaf50
+  coverage_height: 0
+  first_conflict_height: 1
+  conflicted_paths: [src/cli/resources/groups.ts]
+  automerge_tree: 91b6495f240982af53412b0016b40569b56bfd6e
+heights:
+  1:
+    sha: c87f2e55dc1a46544e8fa5a8098ef99da3745ae1
+    subject: >-
+      Merge pull request #2890 from amit-shafnir/worktree-nanoclaw-templates
+inventory_edge: >-
+  fork-registry/features/module.egress-lockdown.yaml (branch
+  maint/fork-registry) lists parents: [module/host-rpc]; the parent tip is
+  also a git ancestor of the child tip (git merge-base --is-ancestor
+  module/host-rpc module/egress-lockdown succeeds), i.e. the child carries
+  the parent's delta.
+expected:
+  deferred_check: >-
+    N-prime == N == 1 and S_C intersects S_P (sets are identical:
+    {src/cli/resources/groups.ts}) -> DEFERRED. Child freezes with no PR,
+    journal points at the parent's HELD record. Conflict kind is a content
+    conflict (CONFLICT (content) in the merge-tree message section), not
+    add/add.
+probes:
+  - cmd: git merge-tree --write-tree --name-only module/host-rpc c87f2e55dc1a46544e8fa5a8098ef99da3745ae1
+    exit: 1
+    conflicts: [src/cli/resources/groups.ts]
+    tree: 34b905fca24cedec14b2870fdc7c581766365ec9
+  - cmd: git merge-tree --write-tree --name-only module/egress-lockdown c87f2e55dc1a46544e8fa5a8098ef99da3745ae1
+    exit: 1
+    conflicts: [src/cli/resources/groups.ts]
+    tree: 91b6495f240982af53412b0016b40569b56bfd6e
+resolution_ref: >-
+  73d02022d77bf786dd3110de626004748e349f2e on main_patched ("Merge upstream
+  ef220b53bc83 into main_patched (sweep)") is the recorded resolution of the
+  same #2890 groups.ts collision for the trunk (it merges chain height 91
+  and everything below it); usable as a rerere seed for this hunk.
+notes: >-
+  Height 1 is trivially the FIRST conflicting height (it is the first head
+  of the eligible line; both branches have coverage_height 0). Additional
+  verified deferred-positive pairs with the same commit/path shape, all
+  first-conflicting at height 1 on exactly {src/cli/resources/groups.ts}:
+  module/agent-group-contributions -> module/host-rpc,
+  module/agent-group-contributions -> module/container-bootstrap,
+  feat/mitm-credential-proxy -> feat/onecli-broker,
+  feat/mitm-credential-proxy -> edition/fls-ai-bot (see
+  profiles/*.txt first-conflict lines). A superset-intersection variant:
+  feat/ops-registry -> feat/autonomy-matrix, both at height 1 with sets
+  {src/cli/resources/groups.ts, src/config.ts} (intersecting -> still
+  DEFERRED per section 5).
+source: merge-tree probes on fls-claw-v2-clean, 2026-07-18

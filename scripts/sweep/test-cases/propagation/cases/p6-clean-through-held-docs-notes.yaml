@@ -1,0 +1,73 @@
+id: p6-clean-through-held-docs-notes
+class: 6 (clean-through-held / annotate-not-gate, PROPAGATION.md section 1 D-002)
+status: verified
+title: >-
+  docs/notes and fix/main/last-owner-guard merge the ENTIRE pending range
+  textually clean, passing through three commits siblings are held on
+  (heights 1, 62, 92)
+watermark: 082f5c7ea99342fcb324ab78baacb0c4e6894029
+chain:
+  base: cb6e3d117c127054ca5bc5a53645d794d93cc595
+  tip: 082f5c7ea99342fcb324ab78baacb0c4e6894029
+  length: 98
+  enumerate_cmd: git rev-list --first-parent --reverse main..upstream/main
+clean_branches:
+  - branch: docs/notes
+    tip: b22148751213656492d9bd9ad025001056e75d59
+    merge_vs_watermark: CLEAN
+    result_tree: a60b6626640639a8d74b45622e108ddefb2d0b39
+    profile: clean at ALL 98 heights (profiles/docs-notes.txt)
+  - branch: fix/main/last-owner-guard
+    tip: 1148dca2bb63134c5c555d78daf4dea260a8a826
+    merge_vs_watermark: CLEAN
+    result_tree: eadcd1160882da90355ffceda6b863468471bd57
+    profile: clean at ALL 98 heights (profiles/fix-main-last-owner-guard.txt)
+held_at_commits_passed_through:
+  - height: 1
+    sha: c87f2e55dc1a46544e8fa5a8098ef99da3745ae1
+    subject: >-
+      Merge pull request #2890 from amit-shafnir/worktree-nanoclaw-templates
+    held_siblings: every module/* branch and most feat/* branches, on
+      {src/cli/resources/groups.ts} (see p2)
+  - height: 62
+    sha: 1725d86fbd8a841c9202aa61d041c068a79b26d6
+    subject: >-
+      Merge pull request #3006 from nanocoai/fix/local-time-display
+    held_siblings: fix/main/role-grant-scope-clarity on
+      {src/cli/resources/roles.ts} (see p7)
+  - height: 92
+    sha: a7a0e3d6c4756d6326c93317dcf34c12ca8c85a5
+    subject: >-
+      Merge pull request #2906 from nanocoai/feat/global-provider-default
+    held_siblings: main_patched on {src/cli/resources/groups.ts}
+expected:
+  behavior: >-
+    Annotate-class, never gated: the clean branch is bulk-merged (CLEAN
+    tier) and the pass report flags that its merge passed through commits
+    other branches are HELD on. The driver must NOT freeze or defer these
+    branches - textual cleanliness wins; the flag exists for the report
+    only (D-002).
+probes:
+  - cmd: git merge-tree --write-tree docs/notes 082f5c7ea99342fcb324ab78baacb0c4e6894029
+    exit: 0
+    tree: a60b6626640639a8d74b45622e108ddefb2d0b39
+  - cmd: git merge-tree --write-tree fix/main/last-owner-guard 082f5c7ea99342fcb324ab78baacb0c4e6894029
+    exit: 0
+    tree: eadcd1160882da90355ffceda6b863468471bd57
+notes: >-
+  Both are sibling shapes (no HELD branch is a git or inventory ancestor of
+  either clean branch). An ancestor-flavored NEAR-instance exists but is
+  not textually clean overall: main_patched CONTAINS the tip of HELD
+  branch fix/main/role-grant-scope-clarity
+  (a512bc9f57fe3b7b38c0467bde751951ec2589cc is an ancestor of main_patched
+  via resolution merge 822f75b17101c8f3930ad1008c1b1d317839651a), and
+  main_patched's probe at heights 92..98 conflicts ONLY on
+  src/cli/resources/groups.ts - it passes through height 62's roles.ts
+  region cleanly thanks to that recorded resolution while its ancestor
+  branch stays held there. Other all-clean-through branches verified:
+  fix/main/chat-sdk-mention-boundary
+  (f40dae8418c7d8d13d70e3ed50fab9170b3786d6), fix/chat-sdk-format-fallback
+  (5857e55d690ed2226fe948f62e990e60a6eeed40),
+  feat/channels/slack-reaction-typing
+  (2e1df50b48b96fc9c01860635d9e98ac7aca07be).
+source: merge-tree probes + full profiles on fls-claw-v2-clean, 2026-07-18
