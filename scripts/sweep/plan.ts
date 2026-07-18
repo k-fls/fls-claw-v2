@@ -122,7 +122,10 @@ async function analyzeParent(
 
   if (sweep.firstConflict) {
     const fc = sweep.firstConflict;
-    const decision = checkDeferred(fc.head.height, fc.conflictedPaths, ancestors, held);
+    // Window floor = largest clean height below the conflict (merge point when
+    // one exists, else the branch's coverage on this eligible line) — §5.
+    const floor = sweep.mergePoint?.height ?? line.coverage;
+    const decision = checkDeferred(fc.head.height, floor, fc.conflictedPaths, ancestors, held);
     if (decision.deferred) {
       pp.deferredTo = decision.ancestor!.branch;
     } else {

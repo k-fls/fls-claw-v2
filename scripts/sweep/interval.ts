@@ -15,7 +15,7 @@
  * `--merge-base=`, never cherry-pick.
  */
 import { deriveCoverage, type Chain } from './heights.js';
-import { firstParentChain, newStyleMergeTree, revParse } from './git.js';
+import { firstParentChain, isAncestor, newStyleMergeTree, revParse } from './git.js';
 import type { Head } from './types.js';
 
 export interface EligibleLine {
@@ -47,6 +47,13 @@ export interface BuildEligibleLineArgs {
  *    parent commit per distinct covered height above the branch's coverage.
  *    If the parent advanced in one big merge, intermediate heights simply do
  *    not exist — the child cannot merge them this pass (relevant to DEFERRED).
+ *  - Fork-only parent content (§4, updated 2026-07-18): when the height-filtered
+ *    line would be EMPTY but the parent tip is NOT an ancestor of the child, the
+ *    parent tip itself (at its derived height, which may equal the child's
+ *    coverage) is the single candidate head — otherwise a fork fix merged into a
+ *    parent would never reach descendants until upstream next advanced. Safe
+ *    because coverage is non-decreasing along the parent's first-parent line, so
+ *    when the filtered map is non-empty its top head already IS the parent tip.
  */
 export async function buildEligibleLine(args: BuildEligibleLineArgs): Promise<EligibleLine> {
   const { repo, branch, branchTip, parent, model, chain } = args;
@@ -66,9 +73,17 @@ export async function buildEligibleLine(args: BuildEligibleLineArgs): Promise<El
     const h = (await deriveCoverage(repo, chain, sha)).height;
     if (h > coverage) byHeight.set(h, sha); // oldest->newest: last write = newest
   }
-  const heads: Head[] = [...byHeight.entries()]
+  let heads: Head[] = [...byHeight.entries()]
     .map(([height, sha]) => ({ sha, height }))
     .sort((a, b) => a.height - b.height);
+
+  // Fork-only parent content: no upstream progress above coverage, but the
+  // parent carries new fork commits the child has not absorbed -> the parent
+  // tip is the single candidate head.
+  if (heads.length === 0 && !(await isAncestor(repo, parentTip, branchTip))) {
+    const h = (await deriveCoverage(repo, chain, parentTip)).height;
+    heads = [{ sha: parentTip, height: h }];
+  }
   return { branch, parent, model, heads, coverage };
 }
 

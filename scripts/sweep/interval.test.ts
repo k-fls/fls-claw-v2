@@ -129,3 +129,55 @@ describe('buildEligibleLine (parents model, §4) — no-historical-tip variant',
     }
   });
 });
+
+describe('buildEligibleLine (parents model, §4) — fork-only parent content', () => {
+  it('a parent with a fork-only commit (no upstream progress) still yields a head', async () => {
+    const r = initFixtureRepo();
+    r.commit('base f', { 'src/f.ts': 'base\n' });
+    const base = r.sha('main');
+    r.commit('U0: upstream', { 'src/u0.ts': '0\n' }); // trunk, height 0
+    // Parent carries a NEW fork commit but no upstream progress above coverage.
+    r.checkout('P', { create: true, at: base });
+    r.commit('P: fork-only fix', { 'src/g.ts': 'g\n' });
+    // Child cut from base; does NOT contain P's fork commit.
+    r.checkout('C', { create: true, at: base });
+    r.checkout('main');
+    try {
+      const chn = await enumerateChain(r.dir, 'main', base);
+      const cTip = await revParse(r.dir, 'C');
+      const line = await buildEligibleLine({
+        repo: r.dir,
+        branch: 'C',
+        branchTip: cTip,
+        parent: 'P',
+        model: 'parents',
+        chain: chn,
+      });
+      // Height-filtered line is empty (P has no upstream progress), but the parent
+      // tip is not an ancestor of C -> the parent tip is the single head.
+      expect(line.heads).toHaveLength(1);
+      expect(line.heads[0].sha).toBe(await revParse(r.dir, 'P'));
+      // The sweep merges it (a real merge — the fork commit adds src/g.ts).
+      const res = await mergePointSweep(r.dir, 'C', line);
+      expect(res.upToDate).toBe(false);
+      expect(res.cleanFullRange).toBe(true);
+      expect(res.mergePoint?.sha).toBe(await revParse(r.dir, 'P'));
+
+      // Contrast: when the parent tip IS an ancestor of the child, nothing to do.
+      r.checkout('C2', { create: true, at: 'P' });
+      r.checkout('main');
+      const c2Tip = await revParse(r.dir, 'C2');
+      const line2 = await buildEligibleLine({
+        repo: r.dir,
+        branch: 'C2',
+        branchTip: c2Tip,
+        parent: 'P',
+        model: 'parents',
+        chain: chn,
+      });
+      expect(line2.heads).toHaveLength(0);
+    } finally {
+      r.destroy();
+    }
+  });
+});

@@ -44,7 +44,7 @@ import { scopeGuard } from './scope-guard.js';
 import { buildStepFile, caseId, readCaseFile, verifyStepFile, writeJsonFile } from './steps.js';
 import { applyFloor, demoteForScopeViolation, isClaimableTier } from './tiers.js';
 import { allParentsSkipped, deriveBranch, derivePlan, plansEquivalent, shortestUnskipChain } from './plan.js';
-import { deriveCoverage, enumerateChain } from './heights.js';
+import { deriveCoverage, enumerateChain, type Chain } from './heights.js';
 import type { BranchPlan, CaseFile, ColdReadVerdict, HeldRecord, PropagationPlan, Tier } from './types.js';
 
 interface Cli {
@@ -185,9 +185,24 @@ export function heldRegistry(journal: JournalEntry[]): HeldRecord[] {
   return [...held.values()];
 }
 
-/** Branches that finished processing this pass (barrier arrival — journal). */
+/**
+ * Branches that finished processing this pass (barrier arrival — journal),
+ * MINUS any branch whose latest `reopened` (a resolve reopened it, §8) is more
+ * recent than its latest `arrived` — those must be re-processed by the next run.
+ */
 export function arrivedSet(journal: JournalEntry[]): Set<string> {
-  return new Set(journal.filter((e) => e.action === 'arrived').map((e) => e.branch as string));
+  const lastArrived = new Map<string, number>();
+  const lastReopened = new Map<string, number>();
+  journal.forEach((e, i) => {
+    if (typeof e.branch !== 'string') return;
+    if (e.action === 'arrived') lastArrived.set(e.branch, i);
+    else if (e.action === 'reopened') lastReopened.set(e.branch, i);
+  });
+  const out = new Set<string>();
+  for (const [branch, ai] of lastArrived) {
+    if (ai > (lastReopened.get(branch) ?? -1)) out.add(branch);
+  }
+  return out;
 }
 
 // --------------------------------------------------------------------------
@@ -201,8 +216,30 @@ async function resolveBase(cli: Cli): Promise<string> {
   return (await git(cli.repo, ['merge-base', anchor, cli.upstream])).stdout.trim();
 }
 
-async function derive(cli: Cli, held: HeldRecord[]): Promise<PropagationPlan> {
-  const base = await resolveBase(cli);
+/**
+ * Per-pass context with a PINNED fork point. The watermark alone identifies the
+ * pass (dir); the fork point (chain base) must be STABLE across every invocation
+ * of the pass — but a live `merge-base(main_patched, upstream)` DRIFTS as
+ * main_patched absorbs upstream during the pass. So once a `plan.json` exists we
+ * reuse its recorded `forkPoint`; the first plan/run pins it.
+ */
+async function passContext(cli: Cli): Promise<{ base: string; chain: Chain; dir: string; watermark12: string }> {
+  const watermark = await revParse(cli.repo, cli.upstream);
+  const watermark12 = watermark.slice(0, 12);
+  const dir = passDir(cli.workspace, watermark12);
+  const planPath = join(dir, 'plan.json');
+  let base: string;
+  if (!cli.base && existsSync(planPath)) {
+    const prev = JSON.parse(readFileSync(planPath, 'utf8')) as PropagationPlan;
+    base = prev.forkPoint ?? (await resolveBase(cli));
+  } else {
+    base = await resolveBase(cli);
+  }
+  const chain = await enumerateChain(cli.repo, cli.upstream, base);
+  return { base, chain, dir, watermark12 };
+}
+
+async function derive(cli: Cli, held: HeldRecord[], base: string): Promise<PropagationPlan> {
   const registry = loadRegistry({
     inventoryDir: cli.inventory,
     scopeFile: cli.scopeFile,
@@ -312,10 +349,9 @@ function emit(cli: Cli, artifact: unknown): void {
 export async function cmdPlan(cli: Cli): Promise<number> {
   // Held registry is empty until a resolve marks something HELD; but if a
   // journal exists (resumed pass) we honour it so DEFERRED re-derivation is stable.
-  const wmChain = await enumerateChain(cli.repo, cli.upstream, await resolveBase(cli));
-  const dir = passDir(cli.workspace, wmChain.watermark.slice(0, 12));
+  const { base, dir } = await passContext(cli);
   const journal = readJournal(dir);
-  const plan = await derive(cli, heldRegistry(journal));
+  const plan = await derive(cli, heldRegistry(journal), base);
 
   const planPath = join(dir, 'plan.json');
   if (existsSync(planPath)) {
@@ -333,11 +369,9 @@ export async function cmdPlan(cli: Cli): Promise<number> {
 }
 
 export async function cmdRun(cli: Cli): Promise<number> {
-  const base = await resolveBase(cli);
-  const chain = await enumerateChain(cli.repo, cli.upstream, base);
-  const dir = passDir(cli.workspace, chain.watermark.slice(0, 12));
+  const { base, chain, dir } = await passContext(cli);
   const journal = readJournal(dir);
-  const plan = await derive(cli, heldRegistry(journal));
+  const plan = await derive(cli, heldRegistry(journal), base);
   const passHasProgress = plan.chainLength > 0;
 
   if (!cli.execute) {
@@ -346,6 +380,10 @@ export async function cmdRun(cli: Cli): Promise<number> {
     return 0;
   }
   writeJsonFile(join(dir, 'plan.json'), plan);
+  // Archive the FIRST derivation of the pass once (plan.json is overwritten each
+  // run as the pass advances; plan-initial.json preserves the opening snapshot).
+  const initialPath = join(dir, 'plan-initial.json');
+  if (!existsSync(initialPath)) writeJsonFile(initialPath, plan);
 
   // Reconstruct the DAG edges + entry set from the snapshot (for live un-skip).
   const edges: Record<string, string[]> = {};
@@ -357,12 +395,24 @@ export async function cmdRun(cli: Cli): Promise<number> {
     plan.branches.filter((b) => (b.parents[0]?.model ?? 'entry') === 'entry').map((b) => b.branch),
   );
   const held = heldRegistry(journal);
+  const heldSet = new Set(held.map((h) => h.branch));
 
   const arrived = arrivedSet(journal);
   let gated = false;
 
   for (const snap of plan.branches) {
     if (arrived.has(snap.branch)) continue; // already processed this pass (resume)
+
+    // A branch still HELD (frozen, awaiting the owner) arrives with an EMPTY
+    // interval — descendants may proceed and DEFERRED re-evaluates, but we do
+    // not re-emit its own case (it is cleared only by a mechanical/judged
+    // resolve, which also reopens it).
+    if (heldSet.has(snap.branch)) {
+      appendJournal(dir, { action: 'skip', branch: snap.branch, reason: 'held' });
+      appendJournal(dir, { action: 'arrived', branch: snap.branch });
+      arrived.add(snap.branch);
+      continue;
+    }
 
     // Re-derive THIS branch against LIVE tips so a child sees its parents'
     // just-merged tips (breadth-wise cascade, like merge.ts probes live sources).
@@ -506,18 +556,65 @@ export async function cmdRun(cli: Cli): Promise<number> {
   return 0;
 }
 
+/** child -> parents-model parents, from a plan snapshot (for descendant reopen). */
+function planEdges(plan: PropagationPlan): Record<string, string[]> {
+  const edges: Record<string, string[]> = {};
+  for (const b of plan.branches) {
+    const ps = b.parents.filter((p) => p.model === 'parents').map((p) => p.parent);
+    if (ps.length) edges[b.branch] = ps;
+  }
+  return edges;
+}
+
+/** Transitive inventory descendants of `branch` in the plan snapshot. */
+function transitiveDescendants(plan: PropagationPlan, branch: string): string[] {
+  const edges = planEdges(plan);
+  const children: Record<string, string[]> = {};
+  for (const [child, parents] of Object.entries(edges)) {
+    for (const p of parents) (children[p] ??= []).push(child);
+  }
+  const out = new Set<string>();
+  const stack = [branch];
+  while (stack.length) {
+    const b = stack.pop()!;
+    for (const c of children[b] ?? []) {
+      if (!out.has(c)) {
+        out.add(c);
+        stack.push(c);
+      }
+    }
+  }
+  return [...out];
+}
+
+/**
+ * Reopen the branch AND its transitive descendants (§8 same-pass continuation):
+ * a later `run` re-processes them so heights above a resolved conflict, and the
+ * resolution itself, propagate without waiting for a new watermark.
+ */
+function reopen(dir: string, targets: string[]): void {
+  for (const b of targets) appendJournal(dir, { action: 'reopened', branch: b });
+}
+
+/** Freeze a branch HELD: prepare the D-030 real-diff draft PR + journal `held`. */
+async function freezeHeld(cli: Cli, dir: string, caseFile: CaseFile, notes: string[]): Promise<void> {
+  await preparePr(cli, dir, caseFile, { tier: 'held', atCommit: caseFile.head.sha });
+  appendJournal(dir, {
+    action: 'held',
+    branch: caseFile.branch,
+    caseId: caseFile.id,
+    height: caseFile.head.height,
+    conflictedPaths: caseFile.conflictedPaths,
+    notes,
+  });
+}
+
 export async function cmdResolve(cli: Cli): Promise<number> {
   if (!cli.caseId || !cli.tier) {
-    console.error('resolve: --case <id> and --tier <mechanical|judged> are required');
+    console.error('resolve: --case <id> and --tier <mechanical|judged|held> are required');
     return 2;
   }
-  if (!isClaimableTier(cli.tier)) {
-    console.error(`resolve: --tier must be 'mechanical' or 'judged' (got '${cli.tier}')`);
-    return 2;
-  }
-  const base = await resolveBase(cli);
-  const chain = await enumerateChain(cli.repo, cli.upstream, base);
-  const dir = passDir(cli.workspace, chain.watermark.slice(0, 12));
+  const { dir } = await passContext(cli);
   const caseDir = join(dir, cli.caseId);
   const casePath = join(caseDir, 'case.json');
   if (!existsSync(casePath)) {
@@ -525,6 +622,33 @@ export async function cmdResolve(cli: Cli): Promise<number> {
     return 2;
   }
   const caseFile = readCaseFile(casePath);
+
+  // Reopen targets = the branch + its transitive descendants (from the snapshot).
+  const planPath = join(dir, 'plan.json');
+  const planSnap = existsSync(planPath) ? (JSON.parse(readFileSync(planPath, 'utf8')) as PropagationPlan) : null;
+  const reopenTargets = planSnap
+    ? [caseFile.branch, ...transitiveDescendants(planSnap, caseFile.branch)]
+    : [caseFile.branch];
+
+  // Direct HELD freeze path (§8): "cannot resolve" — no resolution commit, no
+  // scope guard, no cold-read gate; prepare the real-diff draft PR and freeze.
+  if (cli.tier === 'held') {
+    if (!cli.execute) {
+      console.error('DRY-RUN (no --execute): would freeze HELD and reopen descendants');
+      emit(cli, { case: caseFile.id, tier: 'held', reopen: reopenTargets });
+      return 0;
+    }
+    await freezeHeld(cli, dir, caseFile, ['agent declared cannot-resolve (--tier held)']);
+    reopen(dir, reopenTargets);
+    console.error(`held ${caseFile.id} (direct); branch frozen, real-diff draft PR prepared`);
+    emit(cli, { case: caseFile.id, tier: 'held', reopen: reopenTargets });
+    return 0;
+  }
+
+  if (!isClaimableTier(cli.tier)) {
+    console.error(`resolve: --tier must be 'mechanical', 'judged' or 'held' (got '${cli.tier}')`);
+    return 2;
+  }
   if (!cli.resolvedRef) {
     console.error('resolve: --resolved-ref <ref> (the agent resolution commit) is required');
     return 2;
@@ -557,7 +681,15 @@ export async function cmdResolve(cli: Cli): Promise<number> {
 
   if (!cli.execute) {
     console.error('DRY-RUN (no --execute): resolve decision follows');
-    emit(cli, { case: caseFile.id, claimed: cli.tier, tier, scopeGuard: guard, coldread, notes });
+    emit(cli, {
+      case: caseFile.id,
+      claimed: cli.tier,
+      tier,
+      scopeGuard: guard,
+      coldread,
+      notes,
+      reopen: reopenTargets,
+    });
     return 0;
   }
 
@@ -571,23 +703,17 @@ export async function cmdResolve(cli: Cli): Promise<number> {
     if (tier === 'judged') {
       await preparePr(cli, dir, caseFile, { tier, atCommit: mergeCommit });
     }
+    reopen(dir, reopenTargets);
     console.error(`resolved ${caseFile.id} as ${tier}; merge commit ${mergeCommit.slice(0, 12)}`);
-    emit(cli, { case: caseFile.id, tier, mergeCommit, scopeGuard: guard, notes });
+    emit(cli, { case: caseFile.id, tier, mergeCommit, scopeGuard: guard, notes, reopen: reopenTargets });
     return 0;
   }
 
-  // HELD: real-diff draft PR at the parent conflicting head, freeze, no merge.
-  await preparePr(cli, dir, caseFile, { tier: 'held', atCommit: headSha });
-  appendJournal(dir, {
-    action: 'held',
-    branch: caseFile.branch,
-    caseId: caseFile.id,
-    height: caseFile.head.height,
-    conflictedPaths: caseFile.conflictedPaths,
-    notes,
-  });
+  // HELD via cold-read rejection: real-diff draft PR, freeze, no merge.
+  await freezeHeld(cli, dir, caseFile, notes);
+  reopen(dir, reopenTargets);
   console.error(`held ${caseFile.id}; branch frozen, real-diff draft PR prepared`);
-  emit(cli, { case: caseFile.id, tier: 'held', notes });
+  emit(cli, { case: caseFile.id, tier: 'held', notes, reopen: reopenTargets });
   return 0;
 }
 
@@ -622,9 +748,7 @@ async function preparePr(
 }
 
 export async function cmdStatus(cli: Cli): Promise<number> {
-  const base = await resolveBase(cli);
-  const chain = await enumerateChain(cli.repo, cli.upstream, base);
-  const dir = passDir(cli.workspace, chain.watermark.slice(0, 12));
+  const { chain, dir } = await passContext(cli);
   const journal = readJournal(dir);
   console.log(`repo:       ${cli.repo}`);
   console.log(`watermark:  ${chain.watermark} (${chain.heads.length} trunk heights from ${chain.base.slice(0, 12)})`);

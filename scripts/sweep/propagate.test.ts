@@ -227,3 +227,86 @@ describe('propagate run — no-op skip + leaf un-skip chain (§6, D-039)', () =>
     expect(info.parents.length).toBe(2);
   });
 });
+
+describe('propagate resolve — direct HELD path (§8, FIX 4)', () => {
+  it('--tier held freezes without a resolution commit, scope guard, or cold read', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
+
+    // No --resolved-ref, no coldread-verdict.json: the direct freeze path.
+    const before = repo.sha('main_patched');
+    expect(await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'held' }))).toBe(0);
+    expect(repo.sha('main_patched')).toBe(before); // HELD: no merge
+
+    const journal = readJournal(dir);
+    const heldEntry = journal.find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect(heldEntry).toBeTruthy();
+    expect(heldEntry.branch).toBe('main_patched');
+    expect(heldRegistry(journal).map((h) => h.branch)).toContain('main_patched');
+    // D-030 draft PR mechanics prepared (branch ref + gh commands), never pushed.
+    expect((await import('node:fs')).existsSync(join(dir, caseId, 'pr', 'gh-commands.sh'))).toBe(true);
+    // The branch (and any descendants) are reopened for the next run.
+    expect(journal.some((e) => e.action === 'reopened' && e.branch === 'main_patched')).toBe(true);
+  });
+});
+
+describe('propagate — same-pass continuation after resolve (§8, FIX 3)', () => {
+  it('a resolved branch reaches the watermark and its child picks up the resolution on re-run', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: x = fork', { 'src/x.ts': 'fork\n' });
+    repo.checkout('feat/c', { create: true, at: 'main_patched' });
+    repo.commit('feat/c: own', { 'src/c.ts': 'c\n' });
+    repo.checkout('main');
+    repo.commit('U0: util', { 'src/util.ts': 'u\n' }); // height 0 (clean into mp)
+    repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' }); // height 1 (conflicts mp on x)
+    cleanups.push(() => repo.destroy());
+
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'c', branch: 'feat/c', parents: ['main_patched'] }]);
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const cli = (over: Partial<Cli>): Cli => ({
+      cmd: 'run',
+      repo: repo.dir,
+      workspace: ws,
+      inventory: inv,
+      scopeFile: join(inv, 'no-scope.yaml'),
+      upstream: 'main',
+      execute: true,
+      ...over,
+    });
+
+    // Run 1: main_patched merges the clean prefix (h0) and gates at h1; feat/c
+    // merges main_patched's h0 tip (clean, gets util but not the resolution).
+    expect(await cmdRun(cli({ cmd: 'run' }))).toBe(0);
+    const caseId = readJournal(dir).find((e) => e.action === 'case' && e.branch === 'main_patched')!.caseId as string;
+    const caseFile = JSON.parse((await import('node:fs')).readFileSync(join(dir, caseId, 'case.json'), 'utf8')) as {
+      automergeTree: string;
+    };
+    expect(repo.git('show', 'feat/c:src/x.ts')).toBe('fork'); // child has NOT seen the resolution yet
+
+    // Resolve the main_patched conflict (mechanical) — reaches the watermark.
+    const resolvedRef = await buildResolution(repo, caseFile.automergeTree, 'RESOLVED\n');
+    writeFileSync(join(dir, caseId, 'coldread-verdict.json'), JSON.stringify({ verdict: 'confirm', notes: 'ok' }));
+    expect(await cmdResolve(cli({ cmd: 'resolve', caseId, tier: 'mechanical', resolvedRef }))).toBe(0);
+    expect(await isAncestor(repo.dir, repo.sha('main'), 'main_patched')).toBe(true); // continued to watermark
+    // resolve reopened main_patched AND its descendant feat/c.
+    const j2 = readJournal(dir);
+    expect(
+      j2
+        .filter((e) => e.action === 'reopened')
+        .map((e) => e.branch)
+        .sort(),
+    ).toEqual(['feat/c', 'main_patched']);
+
+    // Run 2 (same watermark): feat/c is re-processed and picks up the resolution.
+    expect(await cmdRun(cli({ cmd: 'run' }))).toBe(0);
+    expect(repo.git('show', 'feat/c:src/x.ts')).toBe('RESOLVED');
+    expect(await isAncestor(repo.dir, repo.sha('main'), 'feat/c')).toBe(true);
+  });
+});
