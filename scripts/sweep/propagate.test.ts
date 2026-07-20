@@ -11,6 +11,7 @@ import {
   cmdResolve,
   cmdRun,
   cmdStatus,
+  cmdUnfreeze,
   cmdVerify,
   heldRegistry,
   passDir,
@@ -36,7 +37,9 @@ function emptyInventory(): string {
   return dir;
 }
 
-function writeInventory(entries: Array<{ id: string; branch: string; kind?: string; parents?: string[] }>): string {
+function writeInventory(
+  entries: Array<{ id: string; branch: string; kind?: string; parents?: string[]; scope_guard?: string }>,
+): string {
   const dir = mkdtempSync(join(tmpdir(), 'prop-inv-'));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   for (const e of entries) {
@@ -46,11 +49,20 @@ function writeInventory(entries: Array<{ id: string; branch: string; kind?: stri
       `kind: ${e.kind ?? 'feat'}`,
       'status: shipped',
       `branch: ${e.branch}`,
+      ...(e.scope_guard ? [`scope_guard: ${e.scope_guard}`] : []),
       ...(e.parents ? ['parents:', ...e.parents.map((p) => `  - ${p}`)] : []),
     ].join('\n');
     writeFileSync(join(dir, `${e.id}.yaml`), yaml + '\n');
   }
   return dir;
+}
+
+/** A routing.yaml carrying a global scope_guard_mode; returns its path. */
+function writeRouting(mode: string): string {
+  const f = join(mkdtempSync(join(tmpdir(), 'prop-rt-')), 'routing.yaml');
+  cleanups.push(() => rmSync(join(f, '..'), { recursive: true, force: true }));
+  writeFileSync(f, `scope_guard_mode: ${mode}\n`);
+  return f;
 }
 
 function baseCli(repo: FixtureRepo, ws: string, inv: string | null, over: Partial<Cli> = {}): Cli {
@@ -562,5 +574,219 @@ describe('propagate verify — §9 gate rolls back a red offender (FIX B)', () =
     expect(journal.some((e) => e.action === 'held' && e.branch === 'feat/off' && e.reason === 'gate')).toBe(true);
     expect(journal.filter((e) => e.action === 'verify').map((e) => e.ok)).toEqual([false, true]);
     expect(readLedger(join(ws, 'sweep-ledger.json')).branches['feat/off']?.status).toBe('frozen');
+  });
+});
+
+// --- CHANGE 1: scope-guard lever ------------------------------------------
+/** main_patched entry with a MULTI-LINE conflict (context lines outside markers). */
+function hunkFixture(): { repo: FixtureRepo } {
+  const repo = initFixtureRepo();
+  repo.commit('base: x', { 'src/x.ts': 'a\nb\nMID\nd\ne\n' });
+  repo.checkout('main_patched', { create: true, at: 'main' });
+  repo.commit('mp: x line3 -> FORK', { 'src/x.ts': 'a\nb\nFORK\nd\ne\n' });
+  repo.checkout('main');
+  repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+  repo.commit('U1: x line3 -> UP1', { 'src/x.ts': 'a\nb\nUP1\nd\ne\n' });
+  cleanups.push(() => repo.destroy());
+  return { repo };
+}
+
+describe('propagate resolve — scope-guard lever (§7, CHANGE 1)', () => {
+  it('conflict-hunks HOLDs an out-of-hunk edit; same-files (default) merges it', async () => {
+    // conflict-hunks via the global routing config.
+    {
+      const { repo } = hunkFixture();
+      const ws = mkWorkspace();
+      const inv = emptyInventory();
+      const routing = writeRouting('conflict-hunks');
+      const dir = passDir(ws, repo.sha('main').slice(0, 12));
+      await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan', routingFile: routing }));
+      await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true, routingFile: routing }));
+      const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
+      const caseFile = readCase(dir, caseId);
+      const postRun = repo.sha('main_patched');
+      // Out-of-hunk: also edits context line 1.
+      const resolvedRef = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'aX\nb\nMERGED\nd\ne\n' });
+      writeVerdict(dir, caseId, repo, resolvedRef);
+      const outFile = join(ws, 'o.json');
+      await cmdResolve(
+        baseCli(repo, ws, inv, {
+          cmd: 'resolve',
+          execute: true,
+          caseId,
+          tier: 'mechanical',
+          resolvedRef,
+          routingFile: routing,
+          out: outFile,
+        }),
+      );
+      const out = JSON.parse(readFileSync(outFile, 'utf8')) as {
+        tier: string;
+        scopeGuard: { mode: string; hunkViolations: string[] };
+      };
+      expect(out.scopeGuard.mode).toBe('conflict-hunks');
+      expect(out.tier).toBe('held');
+      expect(out.scopeGuard.hunkViolations).toEqual(['src/x.ts']);
+      expect(repo.sha('main_patched')).toBe(postRun); // no merge
+    }
+    // same-files (default): the identical out-of-hunk edit merges.
+    {
+      const { repo } = hunkFixture();
+      const ws = mkWorkspace();
+      const inv = emptyInventory();
+      const dir = passDir(ws, repo.sha('main').slice(0, 12));
+      await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+      await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+      const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
+      const caseFile = readCase(dir, caseId);
+      const resolvedRef = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'aX\nb\nMERGED\nd\ne\n' });
+      writeVerdict(dir, caseId, repo, resolvedRef);
+      expect(
+        await cmdResolve(
+          baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef }),
+        ),
+      ).toBe(0);
+      expect(await isAncestor(repo.dir, repo.sha('main'), 'main_patched')).toBe(true); // merged to watermark
+    }
+  });
+
+  it('per-feature override beats the global mode; a mode forged in case.json is ignored', async () => {
+    // feat/z conflicts against main_patched; single-line x so the resolution is
+    // trivially in-hunk (we assert the DERIVED mode, not a hunk violation).
+    function featZ(): FixtureRepo {
+      const repo = initFixtureRepo();
+      repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+      repo.checkout('main_patched', { create: true, at: 'main' });
+      repo.checkout('feat/z', { create: true, at: 'main_patched' });
+      repo.commit('feat/z: x = fork', { 'src/x.ts': 'fork\n' });
+      repo.checkout('main');
+      repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+      repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' });
+      cleanups.push(() => repo.destroy());
+      return repo;
+    }
+
+    // Override: entry says conflict-hunks, global says same-files -> conflict-hunks wins.
+    {
+      const repo = featZ();
+      const ws = mkWorkspace();
+      const inv = writeInventory([
+        { id: 'z', branch: 'feat/z', parents: ['main_patched'], scope_guard: 'conflict-hunks' },
+      ]);
+      const routing = writeRouting('same-files');
+      const dir = passDir(ws, repo.sha('main').slice(0, 12));
+      const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, { routingFile: routing, ...o });
+      await cmdPlan(cli({ cmd: 'plan' }));
+      await cmdRun(cli({ cmd: 'run', execute: true }));
+      const caseId = readJournal(dir).find((e) => e.action === 'case' && e.branch === 'feat/z')!.caseId as string;
+      const caseFile = readCase(dir, caseId);
+      const resolvedRef = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'MERGED\n' });
+      writeVerdict(dir, caseId, repo, resolvedRef);
+      const outFile = join(ws, 'o.json');
+      await cmdResolve(cli({ cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef, out: outFile }));
+      expect((JSON.parse(readFileSync(outFile, 'utf8')) as { scopeGuard: { mode: string } }).scopeGuard.mode).toBe(
+        'conflict-hunks',
+      );
+    }
+
+    // Forged: case.json carries scope_guard: same-files, but config says
+    // conflict-hunks and there is no per-feature override -> config wins.
+    {
+      const repo = featZ();
+      const ws = mkWorkspace();
+      const inv = writeInventory([{ id: 'z', branch: 'feat/z', parents: ['main_patched'] }]);
+      const routing = writeRouting('conflict-hunks');
+      const dir = passDir(ws, repo.sha('main').slice(0, 12));
+      const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, { routingFile: routing, ...o });
+      await cmdPlan(cli({ cmd: 'plan' }));
+      await cmdRun(cli({ cmd: 'run', execute: true }));
+      const caseId = readJournal(dir).find((e) => e.action === 'case' && e.branch === 'feat/z')!.caseId as string;
+      editCase(dir, caseId, (c) => {
+        c.scope_guard = 'same-files';
+      });
+      const caseFile = readCase(dir, caseId);
+      const resolvedRef = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'MERGED\n' });
+      writeVerdict(dir, caseId, repo, resolvedRef);
+      const outFile = join(ws, 'o.json');
+      await cmdResolve(cli({ cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef, out: outFile }));
+      expect((JSON.parse(readFileSync(outFile, 'utf8')) as { scopeGuard: { mode: string } }).scopeGuard.mode).toBe(
+        'conflict-hunks',
+      );
+    }
+  });
+});
+
+// --- CHANGE 2: urging + unfreeze paths ------------------------------------
+describe('propagate — frozen-branch urging (§8, CHANGE 2)', () => {
+  it('urges once per NEW pending head: prepared once, suppressed on identical re-run, re-urged on a new head', async () => {
+    const { repo } = conflictFixture(); // U0 util, U1 x conflict
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
+    // Freeze main_patched (direct held) — records fixBranch + heldHead.
+    await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'held' }));
+
+    // Next run urges once; a second identical run suppresses.
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    const urges1 = readJournal(dir).filter((e) => e.action === 'urge').length;
+    expect(urges1).toBe(1);
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    expect(readJournal(dir).filter((e) => e.action === 'urge').length).toBe(1); // suppressed
+
+    // A NEW pass with new upstream content re-urges.
+    repo.commit('U2: more util', { 'src/util2.ts': 'u2\n' });
+    const dir2 = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    const urgesNew = readJournal(dir2).filter((e) => e.action === 'urge');
+    expect(urgesNew.length).toBe(1);
+    expect(urgesNew[0].head).toBe(repo.sha('main')); // newest head (U2)
+  });
+});
+
+describe('propagate — unfreeze paths (§8, CHANGE 2)', () => {
+  it('DERIVED unfreeze fires when the branch tip comes to contain heldHead', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
+    await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'held' }));
+    const heldHead = readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']!.heldHead!;
+
+    // Simulate the owner merging the freeze resolution: heldHead becomes an
+    // ancestor of main_patched (record it as a merge parent, keep the tree).
+    const mpTip = repo.sha('main_patched');
+    const tree = repo.git('rev-parse', 'main_patched^{tree}');
+    const merged = repo.git('commit-tree', tree, '-p', mpTip, '-p', heldHead, '-m', 'owner merged freeze fix');
+    repo.git('update-ref', 'refs/heads/main_patched', merged);
+
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' })); // deriveUnfreeze at plan time
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.status).toBe('active');
+    expect(
+      readJournal(dir).some((e) => e.action === 'unfrozen' && e.branch === 'main_patched' && e.reason === 'derived'),
+    ).toBe(true);
+  });
+
+  it('MANUAL unfreeze journals + clears the ledger entry', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
+    await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'held' }));
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.status).toBe('frozen');
+
+    expect(await cmdUnfreeze(baseCli(repo, ws, inv, { cmd: 'unfreeze', execute: true, branch: 'main_patched' }))).toBe(
+      0,
+    );
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.status).toBe('active');
+    expect(readJournal(dir).some((e) => e.action === 'unfrozen' && e.reason === 'manual')).toBe(true);
   });
 });

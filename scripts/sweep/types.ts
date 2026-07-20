@@ -103,6 +103,12 @@ export interface LedgerBranch {
   frozenBy: string | null;
   pendingBehindFreeze: number;
   notes: string;
+  /** Conflicting head sha at freeze time (propagation §8 — derived-unfreeze target). */
+  heldHead?: string | null;
+  /** Prepared freeze-PR branch (urge comments target it, cross-pass). */
+  fixBranch?: string | null;
+  /** Newest pending head the owner was last urged about (one urge per new head). */
+  lastUrgedHead?: string | null;
 }
 
 /**
@@ -140,6 +146,8 @@ export interface FeatureEntry {
   design_docs?: string[];
   test_anchors?: string[];
   overlap_hints?: string;
+  /** Per-feature scope-guard override (§7 lever); beats the global default. */
+  scope_guard?: ScopeGuardMode;
   routing?: { keywords?: string[]; always_check_on?: string[] };
   prompt?: { template?: string; extra_context?: string };
   maintenance?: { owner?: string; last_verified?: string; verified_against?: string; notes?: string };
@@ -155,7 +163,17 @@ export interface RoutingConfig {
   /** Scan tuning carried in routing.yaml (single-knob new-file threshold). */
   largeNewFileKb?: number;
   sensitiveSurfaces?: string[];
+  /** Global default scope-guard mode (§7 lever); per-feature `scope_guard` overrides. */
+  scopeGuardMode?: ScopeGuardMode;
 }
+
+/**
+ * Scope-guard mode (§7 lever, owner 2026-07-20). `same-files` (default): the
+ * resolution may touch only the recomputed conflicted FILES. `conflict-hunks`
+ * (strict, opt-in): within those files, changed line regions must lie inside
+ * the automerge tree's conflict-marker regions.
+ */
+export type ScopeGuardMode = 'same-files' | 'conflict-hunks';
 
 /**
  * scripts/sweep/registry/scope.yaml — committed scope POLICY (exclusions are

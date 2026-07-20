@@ -22,7 +22,15 @@ export function emptyLedger(): Ledger {
 }
 
 export function defaultLedgerBranch(): LedgerBranch {
-  return { status: 'active', frozenBy: null, pendingBehindFreeze: 0, notes: '' };
+  return {
+    status: 'active',
+    frozenBy: null,
+    pendingBehindFreeze: 0,
+    notes: '',
+    heldHead: null,
+    fixBranch: null,
+    lastUrgedHead: null,
+  };
 }
 
 export function readLedger(path: string): Ledger {

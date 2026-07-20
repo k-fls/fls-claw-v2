@@ -107,9 +107,25 @@ export interface MergeTreeResult {
 /**
  * New-style merge-tree preview. Full ort merge with virtual multi-base;
  * returns the conflicted file list without touching any worktree or index.
+ *
+ * DETERMINISM (2026-07-20): the written automerge tree must be reproducible
+ * across invocations, clones and user git configs, because the driver records
+ * it and re-verifies against it at resolve. Two sources of nondeterminism are
+ * neutralized here, the single choke point: (a) conflict-marker LINES embed the
+ * command-line labels verbatim, so a ref NAME and its SHA produce different
+ * blobs/trees — we rev-parse both args to full SHAs first; (b) an inherited
+ * `merge.conflictStyle=diff3/zdiff3` adds a `|||||||` base section — we force
+ * `-c merge.conflictStyle=merge`. Clean merges have no markers, so neither
+ * affects clean/no-op trees.
  */
 export async function newStyleMergeTree(repo: string, ours: string, theirs: string): Promise<MergeTreeResult> {
-  const res = await git(repo, ['merge-tree', '--write-tree', '--name-only', ours, theirs], { allowCodes: [1] });
+  const oursSha = await revParse(repo, ours);
+  const theirsSha = await revParse(repo, theirs);
+  const res = await git(
+    repo,
+    ['-c', 'merge.conflictStyle=merge', 'merge-tree', '--write-tree', '--name-only', oursSha, theirsSha],
+    { allowCodes: [1] },
+  );
   const lines = res.stdout.split('\n');
   const treeOid = lines[0]?.trim() ?? '';
   if (res.code === 0) return { clean: true, treeOid, conflictFiles: [] };

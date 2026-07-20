@@ -15,6 +15,7 @@
  *                                 freeze (HELD, --tier held direct)                    (MUTATES)
  *   verify                        §9 gate: everything-rebuild + CI commands, leave-one-out
  *                                 attribution; red -> rollback offender + HELD(gate)   (MUTATES)
+ *   unfreeze --branch <b>         manually clear a ledger freeze (journaled)           (MUTATES)
  *   status                        human-readable pass state from journal + ledger
  *
  * Flags:
@@ -31,6 +32,7 @@
  *   --case <id>              resolve: the case id
  *   --tier <mechanical|judged|held>  resolve: the agent's claimed tier (held = direct freeze)
  *   --resolved-ref <ref>     resolve: commit carrying the agent's resolution (tree source)
+ *   --branch <name>          unfreeze: the branch to clear
  *   --recipe <a,b,c>         verify: everything-rebuild recipe (default: scope.yaml recipe)
  *   --commands-file <file>   verify: CI command list JSON [{cmd,cwd?}] (test injection)
  *   --out <file>             write the subcommand's JSON artifact to a file
@@ -45,7 +47,17 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSy
 import { join, resolve as pathResolve } from 'node:path';
 
 import { DEFAULT_UPSTREAM_REF, FORK_POINT, LEDGER_FILENAME, VERIFY_COMMANDS } from './config.js';
-import { commitTreeMerge, git, isAncestor, resetBranchRef, revParse, refExists, worktreeBranches } from './git.js';
+import {
+  commitInfo,
+  commitTreeMerge,
+  git,
+  isAncestor,
+  newStyleMergeTree,
+  resetBranchRef,
+  revParse,
+  refExists,
+  worktreeBranches,
+} from './git.js';
 import { readLedger, writeLedger, defaultLedgerBranch } from './ledger.js';
 import { loadRegistry } from './registry.js';
 import { scopeGuard } from './scope-guard.js';
@@ -61,6 +73,7 @@ import type {
   FeatureEntry,
   HeldRecord,
   PropagationPlan,
+  ScopeGuardMode,
   Tier,
 } from './types.js';
 
@@ -79,13 +92,14 @@ interface Cli {
   caseId?: string;
   tier?: string;
   resolvedRef?: string;
+  branch?: string;
   recipe?: string[];
   commandsFile?: string;
   out?: string;
 }
 
 const USAGE =
-  'Usage: pnpm exec tsx scripts/sweep/propagate.ts <plan|run|resolve|verify|status> [--repo <path>] [--workspace <dir>] [--ledger <file>] [--pass <wm12>] [--execute] [--case <id>] [--tier <t>] [flags]';
+  'Usage: pnpm exec tsx scripts/sweep/propagate.ts <plan|run|resolve|verify|unfreeze|status> [--repo <path>] [--workspace <dir>] [--ledger <file>] [--pass <wm12>] [--execute] [--case <id>] [--tier <t>] [--branch <b>] [flags]';
 
 function parseCli(argv: string[]): Cli {
   const [cmd, ...rest] = argv;
@@ -150,6 +164,9 @@ function parseCli(argv: string[]): Cli {
         break;
       case '--resolved-ref':
         cli.resolvedRef = need();
+        break;
+      case '--branch':
+        cli.branch = need();
         break;
       case '--recipe':
         cli.recipe = need().split(',').filter(Boolean);
@@ -324,10 +341,23 @@ function frozenBranches(cli: Cli): Set<string> {
   );
 }
 
-function freezeInLedger(cli: Cli, branch: string, frozenBy: string): void {
+function freezeInLedger(
+  cli: Cli,
+  branch: string,
+  frozenBy: string,
+  heldHead: string | null,
+  fixBranch: string | null,
+): void {
   const path = ledgerPathOf(cli);
   const ledger = readLedger(path);
-  ledger.branches[branch] = { ...defaultLedgerBranch(), ...ledger.branches[branch], status: 'frozen', frozenBy };
+  ledger.branches[branch] = {
+    ...defaultLedgerBranch(),
+    ...ledger.branches[branch],
+    status: 'frozen',
+    frozenBy,
+    heldHead,
+    fixBranch,
+  };
   writeLedger(path, ledger);
 }
 
@@ -335,8 +365,77 @@ function unfreezeInLedger(cli: Cli, branch: string): void {
   const path = ledgerPathOf(cli);
   const ledger = readLedger(path);
   if (ledger.branches[branch]) {
-    ledger.branches[branch] = { ...ledger.branches[branch], status: 'active', frozenBy: null };
+    ledger.branches[branch] = { ...ledger.branches[branch], status: 'active', frozenBy: null, heldHead: null };
     writeLedger(path, ledger);
+  }
+}
+
+/**
+ * DERIVED unfreeze (§8): a ledger-frozen branch whose CURRENT tip already
+ * contains its `heldHead` (the resolution landed externally — e.g. the owner
+ * merged the freeze PR) auto-unfreezes, journaled with reason `derived`.
+ */
+async function deriveUnfreeze(cli: Cli, dir: string): Promise<void> {
+  const ledger = readLedger(ledgerPathOf(cli));
+  for (const [branch, b] of Object.entries(ledger.branches)) {
+    if (b.status !== 'frozen' || !b.heldHead) continue;
+    if (!(await refExists(cli.repo, branch))) continue;
+    const tip = await revParse(cli.repo, branch);
+    if (await isAncestor(cli.repo, b.heldHead, tip)) {
+      unfreezeInLedger(cli, branch);
+      appendJournal(dir, { action: 'unfrozen', branch, reason: 'derived', heldHead: b.heldHead });
+    }
+  }
+}
+
+/**
+ * URGING (§8): for each still-frozen branch, if the newest pending trunk head
+ * beyond its coverage on the PINNED chain differs from `lastUrgedHead`, PREPARE
+ * (never execute) a PR comment for the freeze PR — pending count + newest heads
+ * with subjects — and record the new head. One urge per NEW head, not per pass.
+ */
+async function urgeFrozen(cli: Cli, ctx: PassCtx, dir: string): Promise<void> {
+  const path = ledgerPathOf(cli);
+  const ledger = readLedger(path);
+  for (const [branch, b] of Object.entries(ledger.branches)) {
+    if (b.status !== 'frozen') continue;
+    if (!b.fixBranch) continue; // gate holds have no owner-facing freeze PR to nudge
+    if (!(await refExists(cli.repo, branch))) continue;
+    const tip = await revParse(cli.repo, branch);
+    const coverage = (await deriveCoverage(cli.repo, ctx.chain, tip)).height;
+    const pending = ctx.chain.heads.filter((h) => h.height > coverage);
+    if (pending.length === 0) continue;
+    const newest = pending[pending.length - 1];
+    if (newest.sha === b.lastUrgedHead) continue; // already urged about this head
+
+    const newestList = pending.slice(-10);
+    const lines: string[] = [];
+    for (const h of newestList) {
+      const info = await commitInfo(cli.repo, h.sha);
+      lines.push(`- h${h.height} ${h.sha.slice(0, 12)} ${info.subject}`);
+    }
+    // Write into the CURRENT pass dir (freezes are cross-pass; the freeze PR's
+    // original artifacts live in an older pass), targeting the stored fix branch.
+    const urgeDir = join(dir, 'urges', branch.replace(/\//g, '__'));
+    mkdirSync(urgeDir, { recursive: true });
+    const body = [
+      `# Urge — ${branch} still frozen (${b.frozenBy})`,
+      '',
+      `${pending.length} upstream commit(s) now pending beyond this branch's coverage since the freeze.`,
+      `Newest ${newestList.length}:`,
+      ...lines,
+      '',
+      `Resolving the freeze PR (\`${b.fixBranch}\`) unblocks this branch and everything downstream.`,
+    ].join('\n');
+    writeFileSync(join(urgeDir, 'urge-comment.md'), body + '\n');
+    appendFileSync(
+      join(urgeDir, 'urge-commands.sh'),
+      `gh pr comment ${b.fixBranch} --body-file ${join(urgeDir, 'urge-comment.md')}\n`,
+    );
+    appendJournal(dir, { action: 'urge', branch, head: newest.sha, pending: pending.length });
+    const fresh = readLedger(path);
+    fresh.branches[branch] = { ...fresh.branches[branch], lastUrgedHead: newest.sha };
+    writeLedger(path, fresh);
   }
 }
 
@@ -417,22 +516,6 @@ async function journaledResolvedMerge(
 // Case artifacts.
 // --------------------------------------------------------------------------
 
-function caseFileFor(bp: BranchPlan, pp: BranchPlan['parents'][number]): CaseFile {
-  const c = pp.case!;
-  return {
-    schemaVersion: 1,
-    id: caseId(bp.branch, c.head.height),
-    branch: bp.branch,
-    parent: pp.parent,
-    head: c.head,
-    tierFloor: bp.tierFloor,
-    conflictedPaths: c.conflictedPaths,
-    automergeTree: c.automergeTree,
-    reproduction: c.reproduction,
-    deferredCheck: { firstConflictHeight: c.head.height, transitiveAncestors: bp.ancestors },
-  };
-}
-
 const COLD_READ_QUESTIONS = [
   '1. Does the resolution preserve BOTH sides intended behaviour (no silent drop of either delta)?',
   '2. Is every changed hunk explained purely by the conflict, with no unrelated edits?',
@@ -477,6 +560,8 @@ export async function cmdPlan(cli: Cli): Promise<number> {
   // a pass with journal activity legitimately derives differently now (§8).
   const ctx = await openPass(cli);
   const dir = ctx.dir;
+  await deriveUnfreeze(cli, dir); // externally-resolved freezes clear first
+  await urgeFrozen(cli, ctx, dir); // urge still-frozen branches with new pending content
   const journal = readJournal(dir);
   const plan = await derive(cli, heldRegistry(journal), ctx, frozenBranches(cli));
 
@@ -505,6 +590,8 @@ export async function cmdPlan(cli: Cli): Promise<number> {
 export async function cmdRun(cli: Cli): Promise<number> {
   const ctx = await passContext(cli); // attaches to the open pass
   const { chain, dir } = ctx;
+  await deriveUnfreeze(cli, dir); // externally-resolved freezes clear first
+  await urgeFrozen(cli, ctx, dir); // urge still-frozen branches with new pending content
   const journal = readJournal(dir);
   const frozen = frozenBranches(cli);
   const plan = await derive(cli, heldRegistry(journal), ctx, frozen);
@@ -636,11 +723,35 @@ export async function cmdRun(cli: Cli): Promise<number> {
       return 1;
     }
 
-    const emitCase = async (pp: (typeof bp.parents)[number]): Promise<void> => {
-      const caseFile = caseFileFor(bp, pp);
+    /**
+     * Emit a case, RECOMPUTING the automerge tree + conflicted paths against the
+     * branch's CURRENT tip (after any clean-prefix merge this iteration) so the
+     * recorded values match what resolve re-derives — the sha-labelled automerge
+     * tree (§3 determinism) depends on the ours tip, which the prefix merge
+     * advanced. If the conflict has HEALED post-merge, emit no case. Returns
+     * whether a case was emitted (i.e. the branch gates).
+     */
+    const emitCase = async (pp: (typeof bp.parents)[number]): Promise<boolean> => {
+      const nowTip = await revParse(cli.repo, bp.branch);
+      const probe = await newStyleMergeTree(cli.repo, nowTip, pp.case!.head.sha);
+      if (probe.clean) {
+        appendJournal(dir, { action: 'case-healed', branch: bp.branch, parent: pp.parent, head: pp.case!.head });
+        return false;
+      }
+      const caseFile: CaseFile = {
+        schemaVersion: 1,
+        id: caseId(bp.branch, pp.case!.head.height),
+        branch: bp.branch,
+        parent: pp.parent,
+        head: pp.case!.head,
+        tierFloor: bp.tierFloor,
+        conflictedPaths: probe.conflictFiles,
+        automergeTree: probe.treeOid,
+        reproduction: pp.case!.reproduction,
+        deferredCheck: { firstConflictHeight: pp.case!.head.height, transitiveAncestors: bp.ancestors },
+      };
       const caseDir = join(dir, caseFile.id);
       writeJsonFile(join(caseDir, 'case.json'), caseFile);
-      const nowTip = await revParse(cli.repo, bp.branch);
       const diffText = await git(
         cli.repo,
         ['diff', nowTip, caseFile.automergeTree, '--', ...caseFile.conflictedPaths],
@@ -657,6 +768,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
         height: caseFile.head.height,
         conflictedPaths: caseFile.conflictedPaths,
       });
+      return true;
     };
 
     let branchGated = false;
@@ -681,18 +793,18 @@ export async function cmdRun(cli: Cli): Promise<number> {
           appendJournal(dir, { action: 'defer', branch: bp.branch, parent: pp.parent, deferredTo: pp.deferredTo });
         }
         // A clean merge up to the merge point can still leave a conflict ABOVE
-        // it (§3 step 4): emit the case and halt this branch.
-        if (pp.case) {
-          await emitCase(pp);
+        // it (§3 step 4): emit the case (recomputed post-merge) and halt.
+        if (pp.case && (await emitCase(pp))) {
           branchGated = true;
           gated = true;
         }
       } else if (pp.verdict === 'defer') {
         appendJournal(dir, { action: 'defer', branch: bp.branch, parent: pp.parent, deferredTo: pp.deferredTo });
       } else if (pp.verdict === 'case') {
-        await emitCase(pp);
-        branchGated = true;
-        gated = true;
+        if (await emitCase(pp)) {
+          branchGated = true;
+          gated = true;
+        }
       } else {
         appendJournal(dir, {
           action: 'skip',
@@ -797,6 +909,8 @@ interface ResolvedCase {
   automergeTree: string;
   reproduction: { command: string };
   tierFloor: Tier;
+  /** Effective scope-guard mode, re-derived from config (per-feature > global). */
+  scopeGuardMode: ScopeGuardMode;
   /** Trunk heights above the head still pending (PR "behind freeze" count). */
   pendingAbove: number;
 }
@@ -835,7 +949,7 @@ async function reverifyCase(
 
   const branchTip = await revParse(cli.repo, caseFile.branch);
 
-  // (3) re-derive tier floor from the registry (ignore the file's).
+  // (3) re-derive tier floor AND scope-guard mode from config (ignore the file's).
   const registry = loadRegistry({
     inventoryDir: cli.inventory,
     scopeFile: cli.scopeFile,
@@ -845,6 +959,7 @@ async function reverifyCase(
     | (FeatureEntry & { tier_floor?: string })
     | undefined;
   const floor = tierFloor(caseFile.branch, feat);
+  const scopeGuardMode: ScopeGuardMode = feat?.scope_guard ?? registry.routing.scopeGuardMode ?? 'same-files';
 
   // (1)+(2) re-derive the branch LIVE and locate the named parent's conflict.
   const model: 'entry' | 'parents' = snap.parents[0]?.model ?? 'entry';
@@ -909,6 +1024,7 @@ async function reverifyCase(
       automergeTree: rc.automergeTree,
       reproduction: rc.reproduction,
       tierFloor: floor,
+      scopeGuardMode,
       pendingAbove,
     },
   };
@@ -916,7 +1032,7 @@ async function reverifyCase(
 
 /** Freeze a branch HELD: prepare the D-030 real-diff draft PR, journal `held`, ledger-freeze. */
 async function freezeHeld(cli: Cli, dir: string, rc: ResolvedCase, notes: string[]): Promise<void> {
-  await preparePr(cli, dir, rc, { tier: 'held', atCommit: rc.head.sha });
+  const fixBranch = await preparePr(cli, dir, rc, { tier: 'held', atCommit: rc.head.sha });
   appendJournal(dir, {
     action: 'held',
     branch: rc.branch,
@@ -925,7 +1041,7 @@ async function freezeHeld(cli: Cli, dir: string, rc: ResolvedCase, notes: string
     conflictedPaths: rc.conflictedPaths,
     notes,
   });
-  freezeInLedger(cli, rc.branch, rc.id); // durable cross-pass freeze (§8)
+  freezeInLedger(cli, rc.branch, rc.id, rc.head.sha, fixBranch); // durable cross-pass freeze (§8)
 }
 
 export async function cmdResolve(cli: Cli): Promise<number> {
@@ -1013,8 +1129,8 @@ export async function cmdResolve(cli: Cli): Promise<number> {
     return 2;
   }
 
-  // Scope guard (§7, D-038 tightened): recomputed automerge/paths; violation = HELD, no merge.
-  const guard = await scopeGuard(cli.repo, rc.automergeTree, resolvedTree, rc.conflictedPaths);
+  // Scope guard (§7): recomputed automerge/paths + config-derived mode; violation = HELD, no merge.
+  const guard = await scopeGuard(cli.repo, rc.automergeTree, resolvedTree, rc.conflictedPaths, rc.scopeGuardMode);
   const notes: string[] = [];
 
   if (!cli.execute) {
@@ -1030,11 +1146,19 @@ export async function cmdResolve(cli: Cli): Promise<number> {
   // Scope violation -> HELD outright (a one-tier demotion would still land the
   // out-of-scope content, defeating the guard).
   if (!guard.ok) {
-    notes.push(`scope-guard violation: out-of-scope paths [${guard.extraPaths}] -> HELD, no merge`);
-    appendJournal(dir, { action: 'scope-violation', branch: rc.branch, caseId: rc.id, extraPaths: guard.extraPaths });
+    const bad = [...guard.extraPaths, ...guard.hunkViolations.map((p) => `${p} (out-of-hunk)`)];
+    notes.push(`scope-guard violation [${guard.mode}]: out-of-scope [${bad}] -> HELD, no merge`);
+    appendJournal(dir, {
+      action: 'scope-violation',
+      branch: rc.branch,
+      caseId: rc.id,
+      mode: guard.mode,
+      extraPaths: guard.extraPaths,
+      hunkViolations: guard.hunkViolations,
+    });
     await freezeHeld(cli, dir, rc, notes);
     reopen(dir, reopenTargets);
-    console.error(`held ${rc.id}: scope-guard violation (${guard.extraPaths.join(', ')})`);
+    console.error(`held ${rc.id}: scope-guard violation [${guard.mode}] (${bad.join(', ')})`);
     emit(cli, { case: rc.id, tier: 'held', scopeGuard: guard, notes, reopen: reopenTargets });
     return 0;
   }
@@ -1074,7 +1198,7 @@ async function preparePr(
   dir: string,
   rc: ResolvedCase,
   opts: { tier: Tier; atCommit: string },
-): Promise<void> {
+): Promise<string> {
   const date = new Date().toISOString().slice(0, 10);
   const topic = rc.branch.replace(/\//g, '-');
   const fixBranch = `fix/sweep/${date}-${topic}-h${rc.head.height}`;
@@ -1114,6 +1238,7 @@ async function preparePr(
     `gh pr create --base ${rc.branch} --head ${fixBranch} ${draft ? '--draft ' : ''}--title "${opts.tier}: ${rc.branch} sweep (h${rc.head.height})" --body-file ${bodyPath}`,
   ];
   writeFileSync(join(prDir, 'gh-commands.sh'), ghCmds.join('\n') + '\n');
+  return fixBranch;
 }
 
 export async function cmdVerify(cli: Cli): Promise<number> {
@@ -1173,7 +1298,7 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     conflictedPaths: [],
     reason: 'gate',
   });
-  freezeInLedger(cli, offender, 'gate');
+  freezeInLedger(cli, offender, 'gate', null, null); // gate hold has no conflicting head / PR
   const re = await verifyEverything(cli.repo, { recipe, commands });
   appendJournal(dir, { action: 'verify', ok: re.ok, offender, rolledBack: offender });
   console.error(
@@ -1181,6 +1306,30 @@ export async function cmdVerify(cli: Cli): Promise<number> {
   );
   emit(cli, { ok: re.ok, offender, rolledBack: offender, reverify: { ok: re.ok } });
   return re.ok ? 0 : 1;
+}
+
+export async function cmdUnfreeze(cli: Cli): Promise<number> {
+  if (!cli.branch) {
+    console.error('unfreeze: --branch <name> is required');
+    return 2;
+  }
+  const { dir } = await passContext(cli); // attaches to the open pass (for the journal)
+  const ledger = readLedger(ledgerPathOf(cli));
+  const entry = ledger.branches[cli.branch];
+  if (!entry || entry.status !== 'frozen') {
+    console.error(`unfreeze: '${cli.branch}' is not ledger-frozen`);
+    return 2;
+  }
+  if (!cli.execute) {
+    console.error(`DRY-RUN (no --execute): would manually unfreeze ${cli.branch} (frozenBy ${entry.frozenBy})`);
+    emit(cli, { branch: cli.branch, frozenBy: entry.frozenBy });
+    return 0;
+  }
+  unfreezeInLedger(cli, cli.branch);
+  appendJournal(dir, { action: 'unfrozen', branch: cli.branch, reason: 'manual', frozenBy: entry.frozenBy });
+  console.error(`unfroze ${cli.branch} (manual)`);
+  emit(cli, { branch: cli.branch, unfrozen: true, reason: 'manual' });
+  return 0;
 }
 
 export async function cmdStatus(cli: Cli): Promise<number> {
@@ -1217,6 +1366,7 @@ const HANDLERS: Record<string, (cli: Cli) => Promise<number>> = {
   run: cmdRun,
   resolve: cmdResolve,
   verify: cmdVerify,
+  unfreeze: cmdUnfreeze,
   status: cmdStatus,
 };
 

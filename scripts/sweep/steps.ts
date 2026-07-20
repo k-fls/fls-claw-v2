@@ -187,9 +187,20 @@ export async function verifyStepFile(repo: string, step: StepFile, ctx: StepVeri
     }
   }
 
-  // Leaf / always_merge rule (§6): when the pass carries progress such a branch
-  // must land at least one real merge (a forced empty merge counts).
-  if ((step.isLeaf || step.alwaysMerge) && ctx.passHasProgress && step.merges.length > 0 && !landedRealMerge) {
+  // Leaf / always_merge rule (§6): when EVERY parent no-op'd in a pass that
+  // carries progress, such a branch must land at least one real merge (a forced
+  // empty merge counts). A branch that is BLOCKED — a conflict case pending or a
+  // DEFERRED parent — is not no-op'ing and is exempt (it cannot merge yet).
+  const blocked = step.merges.some(
+    (m) => m.action === 'skip' && (m.skipReason === 'conflict-pending' || m.skipReason === 'deferred'),
+  );
+  if (
+    (step.isLeaf || step.alwaysMerge) &&
+    ctx.passHasProgress &&
+    step.merges.length > 0 &&
+    !landedRealMerge &&
+    !blocked
+  ) {
     push(`leaf/always_merge rule: no real merge landed although the pass carries progress`);
   }
 

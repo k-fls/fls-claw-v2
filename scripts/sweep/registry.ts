@@ -87,6 +87,7 @@ export function loadRoutingConfig(routingFile: string = DEFAULT_ROUTING_FILE): {
             catch_all?: { always_include?: string[] };
             large_new_file_kb?: number;
             sensitive_surfaces?: string[];
+            scope_guard_mode?: string;
           })
         | null;
       if (doc && typeof doc === 'object') {
@@ -98,6 +99,8 @@ export function loadRoutingConfig(routingFile: string = DEFAULT_ROUTING_FILE): {
         if (Array.isArray(doc.catch_all?.always_include)) routing.catchAllAlwaysInclude = doc.catch_all.always_include;
         if (typeof doc.large_new_file_kb === 'number') routing.largeNewFileKb = doc.large_new_file_kb;
         if (Array.isArray(doc.sensitive_surfaces)) routing.sensitiveSurfaces = doc.sensitive_surfaces;
+        if (doc.scope_guard_mode === 'same-files' || doc.scope_guard_mode === 'conflict-hunks')
+          routing.scopeGuardMode = doc.scope_guard_mode;
       }
     } catch (err) {
       warnings.push(`${routingFile}: parse error, using defaults: ${(err as Error).message}`);
