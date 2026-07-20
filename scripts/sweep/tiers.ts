@@ -5,9 +5,10 @@
  * Tier decisions are demote-only in the driver:
  *  - CLEAN vs conflict is computed mechanically (new-style merge-tree).
  *  - MECHANICAL vs JUDGED is CLAIMED by the resolving agent but only ever
- *    DEMOTED, never promoted: a scope-guard violation (§7) demotes
- *    MECHANICAL->JUDGED and JUDGED->HELD; a cold-read rejection demotes to HELD;
- *    a red verification gate (§9) demotes any executed tier to HELD.
+ *    DEMOTED, never promoted: a scope-guard violation goes straight to HELD
+ *    with NO merge (§7, tightened 2026-07-20 — a one-tier demotion would still
+ *    land the out-of-scope content); a cold-read rejection demotes to HELD; a
+ *    red verification gate (§9) demotes any executed tier to HELD.
  *  - `edition/*` and entries flagged `tier_floor: judged` never merge below
  *    JUDGED — the floor RAISES the minimum severity (policy, not a promotion of
  *    the agent's claim).
@@ -51,17 +52,11 @@ export function applyFloor(
 }
 
 /**
- * Demotion on a scope-guard violation (§7, D-038): MECHANICAL->JUDGED,
- * JUDGED->HELD, HELD->HELD. CLEAN is not agent-resolved so it has no scope
- * guard and is returned unchanged.
+ * Cold-read rejection, scope-guard violation, or red verification gate all
+ * demote straight to HELD (§1/§7/§9). A scope violation is HELD-with-no-merge:
+ * demoting one tier (to JUDGED) would still land the out-of-scope content, so
+ * the guard would not actually guard (owner may relax this later).
  */
-export function demoteForScopeViolation(tier: Exclude<Tier, 'deferred'>): Exclude<Tier, 'deferred'> {
-  if (tier === 'mechanical') return 'judged';
-  if (tier === 'judged') return 'held';
-  return tier;
-}
-
-/** Cold-read rejection or red verification gate: demote straight to HELD (§1/§9). */
 export function demoteToHeld(): 'held' {
   return 'held';
 }

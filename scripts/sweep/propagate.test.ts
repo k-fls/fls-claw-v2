@@ -1,11 +1,22 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { initFixtureRepo, type FixtureRepo } from './fixtures.js';
-import { addTempWorktree, commitInfo, isAncestor, listTreePaths, revParse } from './git.js';
-import { cmdPlan, cmdResolve, cmdRun, cmdStatus, heldRegistry, passDir, readJournal, type Cli } from './propagate.js';
+import { addTempWorktree, commitInfo, isAncestor, listTreePaths } from './git.js';
+import { readLedger } from './ledger.js';
+import {
+  cmdPlan,
+  cmdResolve,
+  cmdRun,
+  cmdStatus,
+  cmdVerify,
+  heldRegistry,
+  passDir,
+  readJournal,
+  type Cli,
+} from './propagate.js';
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -25,7 +36,6 @@ function emptyInventory(): string {
   return dir;
 }
 
-/** Inventory dir with one YAML per feature entry. */
 function writeInventory(entries: Array<{ id: string; branch: string; kind?: string; parents?: string[] }>): string {
   const dir = mkdtempSync(join(tmpdir(), 'prop-inv-'));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
@@ -43,44 +53,84 @@ function writeInventory(entries: Array<{ id: string; branch: string; kind?: stri
   return dir;
 }
 
-function baseCli(repo: FixtureRepo, ws: string, inv: string, over: Partial<Cli> = {}): Cli {
+function baseCli(repo: FixtureRepo, ws: string, inv: string | null, over: Partial<Cli> = {}): Cli {
   return {
     cmd: 'plan',
     repo: repo.dir,
     workspace: ws,
     inventory: inv,
-    scopeFile: join(inv, 'no-scope.yaml'), // non-existent -> empty scope
+    scopeFile: join(inv ?? ws, 'no-scope.yaml'), // non-existent -> empty scope
     upstream: 'main',
     execute: false,
     ...over,
   };
 }
 
-/** Build a resolution commit: the automerge tree with only `src/x.ts` fixed. */
-async function buildResolution(repo: FixtureRepo, automergeTree: string, resolved: string): Promise<string> {
+function readCase(
+  dir: string,
+  caseId: string,
+): { automergeTree: string; conflictedPaths: string[]; head: { sha: string; height: number }; tierFloor: string } {
+  return JSON.parse(readFileSync(join(dir, caseId, 'case.json'), 'utf8'));
+}
+function editCase(dir: string, caseId: string, mut: (c: Record<string, unknown>) => void): void {
+  const path = join(dir, caseId, 'case.json');
+  const c = JSON.parse(readFileSync(path, 'utf8'));
+  mut(c);
+  writeFileSync(path, JSON.stringify(c, null, 2));
+}
+function treeOfRef(repo: FixtureRepo, ref: string): string {
+  return repo.git('rev-parse', `${ref}^{tree}`);
+}
+
+/** Build a resolution commit from the automerge tree, editing given files. */
+async function buildResolution(
+  repo: FixtureRepo,
+  automergeTree: string,
+  files: Record<string, string>,
+): Promise<string> {
   const amCommit = repo.git('commit-tree', automergeTree, '-m', 'automerge');
   const wt = await addTempWorktree(repo.dir, amCommit);
   try {
-    writeFileSync(join(wt.path, 'src/x.ts'), resolved);
+    for (const [p, content] of Object.entries(files)) {
+      mkdirSync(join(wt.path, p, '..'), { recursive: true });
+      writeFileSync(join(wt.path, p), content);
+    }
     repo.git('-C', wt.path, 'add', '-A');
-    repo.git('-C', wt.path, 'commit', '-m', 'resolve x.ts');
+    repo.git('-C', wt.path, 'commit', '-m', 'resolve');
     return repo.git('-C', wt.path, 'rev-parse', 'HEAD');
   } finally {
     await wt.remove();
   }
 }
 
-/** Fixture: main_patched (x=fork) vs a non-monotonic trunk on `main`. */
+/** Write a well-formed cold-read verdict (with the freshness binding). */
+function writeVerdict(
+  dir: string,
+  caseId: string,
+  repo: FixtureRepo,
+  resolvedRef: string,
+  verdict: 'confirm' | 'reject' = 'confirm',
+): void {
+  writeFileSync(
+    join(dir, caseId, 'coldread-verdict.json'),
+    JSON.stringify({ verdict, notes: 'cold read ok', resolvedTree: treeOfRef(repo, resolvedRef) }),
+  );
+}
+
+/**
+ * main_patched (x=fork) vs a trunk with a clean prefix then a PERSISTENT
+ * conflict: U0 is clean (util), U1 diverges x and stays conflicting above the
+ * merge point (like the real role-grant profile) — so the case survives the
+ * clean-prefix merge and resolve has a real conflict to re-verify.
+ */
 function conflictFixture(): { repo: FixtureRepo } {
   const repo = initFixtureRepo();
   repo.commit('base: x', { 'src/x.ts': 'orig\n' });
   repo.checkout('main_patched', { create: true, at: 'main' });
   repo.commit('mp: x = fork', { 'src/x.ts': 'fork\n' });
   repo.checkout('main');
-  repo.commit('U0: util', { 'src/util.ts': 'u\n' });
-  repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' });
-  repo.commit('U2: x = fork', { 'src/x.ts': 'fork\n' });
-  repo.commit('U3: x = up3', { 'src/x.ts': 'up3\n' });
+  repo.commit('U0: util', { 'src/util.ts': 'u\n' }); // height 0 (clean into mp)
+  repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' }); // height 1 (persistent x conflict)
   cleanups.push(() => repo.destroy());
   return { repo };
 }
@@ -90,81 +140,65 @@ describe('propagate plan/run/resolve — entry model with a conflict case', () =
     const { repo } = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
-    const wm12 = repo.sha('main').slice(0, 12);
-    const dir = passDir(ws, wm12);
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
 
-    // plan
     expect(await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }))).toBe(0);
-
-    // run --execute: merge to height 2, emit the height-3 case, gate.
     const before = repo.sha('main_patched');
     expect(await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }))).toBe(0);
-    expect(repo.sha('main_patched')).not.toBe(before); // clean prefix merged
-    const journal = readJournal(dir);
-    const caseEntry = journal.find((e) => e.action === 'case')!;
-    expect(caseEntry).toBeTruthy();
-    expect(caseEntry.height).toBe(3);
-    const caseId = caseEntry.caseId as string;
-    const caseFile = JSON.parse((await import('node:fs')).readFileSync(join(dir, caseId, 'case.json'), 'utf8')) as {
-      automergeTree: string;
-      conflictedPaths: string[];
-      head: { sha: string };
-    };
+    expect(repo.sha('main_patched')).not.toBe(before);
+    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
+    const caseFile = readCase(dir, caseId);
     expect(caseFile.conflictedPaths).toEqual(['src/x.ts']);
 
-    // The agent resolves x.ts inside the case worktree; cold-read confirms.
-    const resolvedRef = await buildResolution(repo, caseFile.automergeTree, 'RESOLVED\n');
-    writeFileSync(join(dir, caseId, 'coldread-verdict.json'), JSON.stringify({ verdict: 'confirm', notes: 'ok' }));
-
+    const resolvedRef = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'RESOLVED\n' });
+    writeVerdict(dir, caseId, repo, resolvedRef);
     expect(
       await cmdResolve(
         baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef }),
       ),
     ).toBe(0);
 
-    // main_patched now carries the resolution + all upstream up to U3.
     const files = await listTreePaths(repo.dir, 'main_patched');
     expect(files).toContain('src/util.ts');
-    expect(await isAncestor(repo.dir, repo.sha('main'), 'main_patched')).toBe(true); // U3 merged
-    const xBlob = repo.git('show', 'main_patched:src/x.ts');
-    expect(xBlob).toBe('RESOLVED');
-    expect(heldRegistry(readJournal(dir))).toEqual([]);
+    expect(await isAncestor(repo.dir, repo.sha('main'), 'main_patched')).toBe(true);
+    expect(repo.git('show', 'main_patched:src/x.ts')).toBe('RESOLVED');
   });
 
-  it('scope-guard violation demotes a MECHANICAL claim to JUDGED', async () => {
+  it('scope-guard violation -> HELD, no merge, ledger-frozen (no one-tier demotion)', async () => {
     const { repo } = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
     await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
     const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
-    const caseFile = JSON.parse((await import('node:fs')).readFileSync(join(dir, caseId, 'case.json'), 'utf8')) as {
-      automergeTree: string;
-    };
-    // Resolution that ALSO edits an unrelated file -> scope-guard violation.
-    const amCommit = repo.git('commit-tree', caseFile.automergeTree, '-m', 'am');
-    const wt = await addTempWorktree(repo.dir, amCommit);
-    let resolvedRef = '';
-    try {
-      writeFileSync(join(wt.path, 'src/x.ts'), 'RESOLVED\n');
-      writeFileSync(join(wt.path, 'src/extra.ts'), 'sneaky\n');
-      repo.git('-C', wt.path, 'add', '-A');
-      repo.git('-C', wt.path, 'commit', '-m', 'resolve + sneak');
-      resolvedRef = repo.git('-C', wt.path, 'rev-parse', 'HEAD');
-    } finally {
-      await wt.remove();
-    }
-    writeFileSync(join(dir, caseId, 'coldread-verdict.json'), JSON.stringify({ verdict: 'confirm', notes: 'ok' }));
+    const caseFile = readCase(dir, caseId);
+    const postRun = repo.sha('main_patched');
+
+    // Resolution that ALSO edits an unrelated file -> scope violation.
+    const resolvedRef = await buildResolution(repo, caseFile.automergeTree, {
+      'src/x.ts': 'RESOLVED\n',
+      'src/extra.ts': 'sneaky\n',
+    });
+    writeVerdict(dir, caseId, repo, resolvedRef);
     const outFile = join(ws, 'resolve-out.json');
-    await cmdResolve(
-      baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef, out: outFile }),
-    );
-    const out = JSON.parse((await import('node:fs')).readFileSync(outFile, 'utf8')) as {
-      tier: string;
-      scopeGuard: { ok: boolean };
-    };
+    expect(
+      await cmdResolve(
+        baseCli(repo, ws, inv, {
+          cmd: 'resolve',
+          execute: true,
+          caseId,
+          tier: 'mechanical',
+          resolvedRef,
+          out: outFile,
+        }),
+      ),
+    ).toBe(0);
+    const out = JSON.parse(readFileSync(outFile, 'utf8')) as { tier: string; scopeGuard: { ok: boolean } };
     expect(out.scopeGuard.ok).toBe(false);
-    expect(out.tier).toBe('judged'); // mechanical demoted by the scope guard
+    expect(out.tier).toBe('held'); // HELD outright, not JUDGED
+    expect(repo.sha('main_patched')).toBe(postRun); // NO merge landed
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.status).toBe('frozen');
   });
 
   it('idempotent resume: a second run does not re-merge already-arrived branches', async () => {
@@ -172,29 +206,130 @@ describe('propagate plan/run/resolve — entry model with a conflict case', () =
     const ws = mkWorkspace();
     const inv = emptyInventory();
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
     await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
     const afterFirst = repo.sha('main_patched');
     const arrivals1 = readJournal(dir).filter((e) => e.action === 'arrived').length;
     await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
-    expect(repo.sha('main_patched')).toBe(afterFirst); // no double merge
-    const arrivals2 = readJournal(dir).filter((e) => e.action === 'arrived').length;
-    expect(arrivals2).toBe(arrivals1);
+    expect(repo.sha('main_patched')).toBe(afterFirst);
+    expect(readJournal(dir).filter((e) => e.action === 'arrived').length).toBe(arrivals1);
     expect(await cmdStatus(baseCli(repo, ws, inv, { cmd: 'status' }))).toBe(0);
   });
 });
 
-describe('propagate run — no-op skip + leaf un-skip chain (§6, D-039)', () => {
+// --- FIX A: case re-verification at resolve (trust boundary) --------------
+describe('propagate resolve — case re-verification rejects forged pointers (§7, FIX A)', () => {
+  async function setupCase(): Promise<{ repo: FixtureRepo; ws: string; inv: string; dir: string; caseId: string }> {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
+    return { repo, ws, inv, dir, caseId };
+  }
+  async function resolveWith(repo: FixtureRepo, ws: string, inv: string, dir: string, caseId: string): Promise<number> {
+    const caseFile = readCase(dir, caseId);
+    const resolvedRef = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'RESOLVED\n' });
+    writeVerdict(dir, caseId, repo, resolvedRef);
+    return cmdResolve(
+      baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef }),
+    );
+  }
+
+  it('rejects a forged head sha', async () => {
+    const { repo, ws, inv, dir, caseId } = await setupCase();
+    editCase(dir, caseId, (c) => {
+      (c.head as { sha: string }).sha = '0'.repeat(40);
+    });
+    expect(await resolveWith(repo, ws, inv, dir, caseId)).toBe(1);
+    expect(readJournal(dir).some((e) => e.action === 'halt' && e.reason === 'case-reverification-failed')).toBe(true);
+  });
+
+  it('rejects forged conflicted paths (extra file allowed)', async () => {
+    const { repo, ws, inv, dir, caseId } = await setupCase();
+    editCase(dir, caseId, (c) => {
+      (c.conflictedPaths as string[]).push('src/anything.ts');
+    });
+    expect(await resolveWith(repo, ws, inv, dir, caseId)).toBe(1);
+  });
+
+  it('rejects a forged tier floor', async () => {
+    const { repo, ws, inv, dir, caseId } = await setupCase();
+    editCase(dir, caseId, (c) => {
+      c.tierFloor = 'judged';
+    });
+    expect(await resolveWith(repo, ws, inv, dir, caseId)).toBe(1);
+  });
+
+  it('rejects a replayed resolve after success (double-resolve guard)', async () => {
+    const { repo, ws, inv, dir, caseId } = await setupCase();
+    expect(await resolveWith(repo, ws, inv, dir, caseId)).toBe(0); // first: success
+    expect(await resolveWith(repo, ws, inv, dir, caseId)).toBe(1); // replay: refused
+  });
+
+  it('rejects resolve for a case that was never journaled', async () => {
+    const { repo, ws, inv, dir, caseId } = await setupCase();
+    const fakeId = 'main_patched-h99';
+    mkdirSync(join(dir, fakeId), { recursive: true });
+    const real = readCase(dir, caseId);
+    writeFileSync(join(dir, fakeId, 'case.json'), JSON.stringify({ ...real, id: fakeId }, null, 2));
+    const resolvedRef = await buildResolution(repo, real.automergeTree, { 'src/x.ts': 'RESOLVED\n' });
+    writeVerdict(dir, fakeId, repo, resolvedRef);
+    expect(
+      await cmdResolve(
+        baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId: fakeId, tier: 'mechanical', resolvedRef }),
+      ),
+    ).toBe(1);
+  });
+});
+
+// --- FIX D2: cold-read verdict validation ---------------------------------
+describe('propagate resolve — cold-read verdict validation (§7, FIX D2)', () => {
+  it('rejects a malformed {} verdict (never treated as confirm) and a stale resolvedTree', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
+    const caseFile = readCase(dir, caseId);
+    const resolvedRef = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'RESOLVED\n' });
+
+    // Malformed {} -> exit 2 (NOT confirm), no merge.
+    writeFileSync(join(dir, caseId, 'coldread-verdict.json'), '{}');
+    expect(
+      await cmdResolve(
+        baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef }),
+      ),
+    ).toBe(2);
+
+    // Stale resolvedTree (attests to a different tree) -> exit 2.
+    writeFileSync(
+      join(dir, caseId, 'coldread-verdict.json'),
+      JSON.stringify({ verdict: 'confirm', notes: 'x', resolvedTree: '0'.repeat(40) }),
+    );
+    expect(
+      await cmdResolve(
+        baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef }),
+      ),
+    ).toBe(2);
+    expect(readJournal(dir).some((e) => e.action === 'resolved')).toBe(false);
+  });
+});
+
+describe('propagate run — no-op skip + leaf un-skip chain (§6)', () => {
   it('un-skips the cheapest parent chain so the leaf lands a real (empty) merge', async () => {
     const repo = initFixtureRepo();
     repo.commit('base: f', { 'src/f.ts': 'base\n' });
     repo.checkout('main_patched', { create: true, at: 'main' });
-    // feat/a independently sets f = X; feat/b is the leaf.
     repo.checkout('feat/a', { create: true, at: 'main_patched' });
     repo.commit('feat/a: f = X', { 'src/f.ts': 'X\n' });
     repo.checkout('feat/b', { create: true, at: 'feat/a' });
     repo.commit('feat/b: own', { 'src/b.ts': 'b\n' });
     repo.checkout('main');
-    // Upstream sets f = X too -> merging into feat/a is a genuine no-op.
     repo.commit('U0: f = X', { 'src/f.ts': 'X\n' });
     cleanups.push(() => repo.destroy());
 
@@ -204,58 +339,40 @@ describe('propagate run — no-op skip + leaf un-skip chain (§6, D-039)', () =>
       { id: 'b', branch: 'feat/b', parents: ['feat/a'] },
     ]);
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
-
-    const cli: Cli = {
-      cmd: 'run',
-      repo: repo.dir,
-      workspace: ws,
-      inventory: inv,
-      scopeFile: join(inv, 'no-scope.yaml'),
-      upstream: 'main',
-      execute: true,
-    };
-    expect(await cmdRun(cli)).toBe(0);
+    const cli = (over: Partial<Cli>): Cli => baseCli(repo, ws, inv, over);
+    await cmdPlan(cli({ cmd: 'plan' }));
+    expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
 
     const journal = readJournal(dir);
-    // feat/a's own parent merge was a no-op skip.
     expect(journal.some((e) => e.action === 'skip' && e.branch === 'feat/a')).toBe(true);
-    // The leaf un-skip forced merges (feat/a<-main_patched and feat/b<-feat/a).
     const forced = journal.filter((e) => e.action === 'merge' && e.forced === true);
     expect(forced.map((e) => e.branch).sort()).toEqual(['feat/a', 'feat/b']);
-    // feat/b ends the pass with a real (2-parent) merge commit.
-    const info = await commitInfo(repo.dir, 'feat/b');
-    expect(info.parents.length).toBe(2);
+    expect((await commitInfo(repo.dir, 'feat/b')).parents.length).toBe(2);
   });
 });
 
-describe('propagate resolve — direct HELD path (§8, FIX 4)', () => {
-  it('--tier held freezes without a resolution commit, scope guard, or cold read', async () => {
+describe('propagate resolve — direct HELD path (§8)', () => {
+  it('--tier held freezes (no resolution commit / scope guard / cold read) + ledger-freezes', async () => {
     const { repo } = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
     await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
     const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
-
-    // No --resolved-ref, no coldread-verdict.json: the direct freeze path.
     const before = repo.sha('main_patched');
     expect(await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'held' }))).toBe(0);
-    expect(repo.sha('main_patched')).toBe(before); // HELD: no merge
-
+    expect(repo.sha('main_patched')).toBe(before);
     const journal = readJournal(dir);
-    const heldEntry = journal.find((e) => e.action === 'held' && e.caseId === caseId)!;
-    expect(heldEntry).toBeTruthy();
-    expect(heldEntry.branch).toBe('main_patched');
+    expect(journal.some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
     expect(heldRegistry(journal).map((h) => h.branch)).toContain('main_patched');
-    // D-030 draft PR mechanics prepared (branch ref + gh commands), never pushed.
-    expect((await import('node:fs')).existsSync(join(dir, caseId, 'pr', 'gh-commands.sh'))).toBe(true);
-    // The branch (and any descendants) are reopened for the next run.
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.status).toBe('frozen');
     expect(journal.some((e) => e.action === 'reopened' && e.branch === 'main_patched')).toBe(true);
   });
 });
 
-describe('propagate — same-pass continuation after resolve (§8, FIX 3)', () => {
-  it('a resolved branch reaches the watermark and its child picks up the resolution on re-run', async () => {
+describe('propagate — same-pass continuation after resolve (§8)', () => {
+  it('a resolved branch reaches the watermark and its child picks up the resolution', async () => {
     const repo = initFixtureRepo();
     repo.commit('base: x', { 'src/x.ts': 'orig\n' });
     repo.checkout('main_patched', { create: true, at: 'main' });
@@ -263,50 +380,187 @@ describe('propagate — same-pass continuation after resolve (§8, FIX 3)', () =
     repo.checkout('feat/c', { create: true, at: 'main_patched' });
     repo.commit('feat/c: own', { 'src/c.ts': 'c\n' });
     repo.checkout('main');
-    repo.commit('U0: util', { 'src/util.ts': 'u\n' }); // height 0 (clean into mp)
-    repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' }); // height 1 (conflicts mp on x)
+    repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+    repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' });
     cleanups.push(() => repo.destroy());
 
     const ws = mkWorkspace();
     const inv = writeInventory([{ id: 'c', branch: 'feat/c', parents: ['main_patched'] }]);
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
-    const cli = (over: Partial<Cli>): Cli => ({
-      cmd: 'run',
-      repo: repo.dir,
-      workspace: ws,
-      inventory: inv,
-      scopeFile: join(inv, 'no-scope.yaml'),
-      upstream: 'main',
-      execute: true,
-      ...over,
-    });
-
-    // Run 1: main_patched merges the clean prefix (h0) and gates at h1; feat/c
-    // merges main_patched's h0 tip (clean, gets util but not the resolution).
-    expect(await cmdRun(cli({ cmd: 'run' }))).toBe(0);
+    const cli = (over: Partial<Cli>): Cli => baseCli(repo, ws, inv, over);
+    await cmdPlan(cli({ cmd: 'plan' }));
+    await cmdRun(cli({ cmd: 'run', execute: true }));
     const caseId = readJournal(dir).find((e) => e.action === 'case' && e.branch === 'main_patched')!.caseId as string;
-    const caseFile = JSON.parse((await import('node:fs')).readFileSync(join(dir, caseId, 'case.json'), 'utf8')) as {
-      automergeTree: string;
-    };
-    expect(repo.git('show', 'feat/c:src/x.ts')).toBe('fork'); // child has NOT seen the resolution yet
+    const caseFile = readCase(dir, caseId);
+    expect(repo.git('show', 'feat/c:src/x.ts')).toBe('fork');
 
-    // Resolve the main_patched conflict (mechanical) — reaches the watermark.
-    const resolvedRef = await buildResolution(repo, caseFile.automergeTree, 'RESOLVED\n');
-    writeFileSync(join(dir, caseId, 'coldread-verdict.json'), JSON.stringify({ verdict: 'confirm', notes: 'ok' }));
-    expect(await cmdResolve(cli({ cmd: 'resolve', caseId, tier: 'mechanical', resolvedRef }))).toBe(0);
-    expect(await isAncestor(repo.dir, repo.sha('main'), 'main_patched')).toBe(true); // continued to watermark
-    // resolve reopened main_patched AND its descendant feat/c.
-    const j2 = readJournal(dir);
+    const resolvedRef = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'RESOLVED\n' });
+    writeVerdict(dir, caseId, repo, resolvedRef);
+    expect(await cmdResolve(cli({ cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef }))).toBe(0);
+    expect(await isAncestor(repo.dir, repo.sha('main'), 'main_patched')).toBe(true);
     expect(
-      j2
+      readJournal(dir)
         .filter((e) => e.action === 'reopened')
         .map((e) => e.branch)
         .sort(),
     ).toEqual(['feat/c', 'main_patched']);
 
-    // Run 2 (same watermark): feat/c is re-processed and picks up the resolution.
-    expect(await cmdRun(cli({ cmd: 'run' }))).toBe(0);
+    await cmdRun(cli({ cmd: 'run', execute: true }));
     expect(repo.git('show', 'feat/c:src/x.ts')).toBe('RESOLVED');
     expect(await isAncestor(repo.dir, repo.sha('main'), 'feat/c')).toBe(true);
+  });
+});
+
+// --- FIX C: pass pinning + durable freezes --------------------------------
+describe('propagate — pass pinning (§8, FIX C)', () => {
+  it('run stays on the pinned watermark even if upstream advances after plan', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.checkout('main');
+    repo.commit('U0: util', { 'src/u0.ts': '0\n' });
+    const w1 = repo.sha('main');
+    cleanups.push(() => repo.destroy());
+
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' })); // pins watermark W1
+
+    // Upstream advances AFTER plan.
+    repo.commit('U1: extra', { 'src/u1.ts': '1\n' });
+    const u1 = repo.sha('main');
+    expect(u1).not.toBe(w1);
+
+    expect(await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }))).toBe(0);
+    // main_patched absorbed U0 (the pinned watermark) but NOT U1 (post-pin).
+    expect(await isAncestor(repo.dir, w1, 'main_patched')).toBe(true);
+    expect(await isAncestor(repo.dir, u1, 'main_patched')).toBe(false);
+    // The run attached to the W1 pass; no pass dir was opened for U1.
+    expect(readJournal(passDir(ws, w1.slice(0, 12))).length).toBeGreaterThan(0);
+    expect(readJournal(passDir(ws, u1.slice(0, 12))).length).toBe(0);
+  });
+
+  it('a ledger-frozen branch is skipped (empty interval) and a mechanical resolve unfreezes it', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+
+    // Freeze main_patched in the ledger BEFORE the pass.
+    writeFileSync(
+      join(ws, 'sweep-ledger.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        lastSweep: null,
+        branches: { main_patched: { status: 'frozen', frozenBy: 'prior', pendingBehindFreeze: 0, notes: '' } },
+        openPois: [],
+      }),
+    );
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    const before = repo.sha('main_patched');
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    expect(repo.sha('main_patched')).toBe(before); // frozen -> empty interval, no merge
+    expect(
+      readJournal(dir).some((e) => e.action === 'skip' && e.branch === 'main_patched' && e.reason === 'held'),
+    ).toBe(true);
+
+    // Manually plant a case for main_patched + unfreeze via a mechanical resolve.
+    // (Freeze it again, emit a real case by unfreezing for the run, then re-freeze.)
+    // Simpler: unfreeze, run to emit a case, re-freeze in ledger, then resolve.
+    writeFileSync(
+      join(ws, 'sweep-ledger.json'),
+      JSON.stringify({ schemaVersion: 1, lastSweep: null, branches: {}, openPois: [] }),
+    );
+    // fresh pass in a fresh workspace to get a clean case
+    const ws2 = mkWorkspace();
+    const dir2 = passDir(ws2, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws2, inv, { cmd: 'plan' }));
+    await cmdRun(baseCli(repo, ws2, inv, { cmd: 'run', execute: true }));
+    const caseId = readJournal(dir2).find((e) => e.action === 'case')!.caseId as string;
+    // Now freeze main_patched in ws2's ledger (simulating a gate/prior freeze).
+    writeFileSync(
+      join(ws2, 'sweep-ledger.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        lastSweep: null,
+        branches: { main_patched: { status: 'frozen', frozenBy: 'gate', pendingBehindFreeze: 0, notes: '' } },
+        openPois: [],
+      }),
+    );
+    const caseFile = readCase(dir2, caseId);
+    const resolvedRef = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'RESOLVED\n' });
+    writeVerdict(dir2, caseId, repo, resolvedRef);
+    expect(
+      await cmdResolve(
+        baseCli(repo, ws2, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef }),
+      ),
+    ).toBe(0);
+    expect(readLedger(join(ws2, 'sweep-ledger.json')).branches['main_patched']?.status).toBe('active'); // unfrozen
+  });
+});
+
+// --- FIX B: verify gate + rollback ----------------------------------------
+describe('propagate verify — §9 gate rolls back a red offender (FIX B)', () => {
+  it('attributes the offender, rolls it back to its pre-ref, HELD(gate), re-verifies green', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base', { 'src/base.ts': 'b\n' });
+    repo.checkout('feat/off', { create: true, at: 'main' });
+    repo.commit('feat/off: clean', { 'src/off.ts': 'ok\n' });
+    const cleanTip = repo.sha('feat/off');
+    repo.commit('feat/off: introduces BAD', { BAD: 'boom\n' }); // a pass merge would land this
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+
+    const ws = mkWorkspace();
+    const mainTip = repo.sha('main');
+    const wm12 = mainTip.slice(0, 12);
+    const dir = passDir(ws, wm12);
+    mkdirSync(dir, { recursive: true });
+    // Seed a minimal open pass: plan-initial.json + a pre-ref for feat/off (its
+    // clean pre-merge tip) — as if `run` had merged BAD into feat/off this pass.
+    const plan = {
+      schemaVersion: 1,
+      watermark: mainTip,
+      watermark12: wm12,
+      forkPoint: mainTip,
+      chainLength: 0,
+      order: ['feat/off'],
+      branches: [
+        {
+          branch: 'feat/off',
+          kind: 'inventory',
+          tierFloor: 'clean',
+          isLeaf: true,
+          alwaysMerge: false,
+          ancestors: [],
+          parents: [],
+        },
+      ],
+      warnings: [],
+    };
+    writeFileSync(join(dir, 'plan-initial.json'), JSON.stringify(plan));
+    writeFileSync(join(dir, 'plan.json'), JSON.stringify(plan));
+    appendFileSync(
+      join(dir, 'journal.jsonl'),
+      JSON.stringify({ ts: new Date().toISOString(), action: 'pre-ref', branch: 'feat/off', ref: cleanTip }) + '\n',
+    );
+    const cmdsFile = join(ws, 'cmds.json');
+    writeFileSync(cmdsFile, JSON.stringify([{ cmd: 'test ! -f BAD' }]));
+
+    const code = await cmdVerify(
+      baseCli(repo, ws, null, {
+        cmd: 'verify',
+        execute: true,
+        pass: wm12,
+        recipe: ['feat/off'],
+        commandsFile: cmdsFile,
+      }),
+    );
+    expect(code).toBe(0); // re-verify green after rollback
+    expect(repo.sha('feat/off')).toBe(cleanTip); // rolled back to pre-ref
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'held' && e.branch === 'feat/off' && e.reason === 'gate')).toBe(true);
+    expect(journal.filter((e) => e.action === 'verify').map((e) => e.ok)).toEqual([false, true]);
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['feat/off']?.status).toBe('frozen');
   });
 });

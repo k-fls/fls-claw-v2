@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { applyFloor, demoteForScopeViolation, demoteToHeld, isClaimableTier, severity, tierFloor } from './tiers.js';
+import { applyFloor, demoteToHeld, isClaimableTier, severity, tierFloor } from './tiers.js';
 import type { FeatureEntry } from './types.js';
 
 describe('tier floors (D-015)', () => {
@@ -28,15 +28,9 @@ describe('legal transitions are demote-only (D-035)', () => {
     expect(applyFloor('mechanical', 'clean')).toBe('mechanical');
   });
 
-  it('scope-guard violation demotes MECHANICAL->JUDGED, JUDGED->HELD', () => {
-    expect(demoteForScopeViolation('mechanical')).toBe('judged');
-    expect(demoteForScopeViolation('judged')).toBe('held');
-    expect(demoteForScopeViolation('held')).toBe('held');
-    // clean is not agent-resolved -> unchanged.
-    expect(demoteForScopeViolation('clean')).toBe('clean');
-  });
-
-  it('cold-read rejection / red gate demote straight to HELD', () => {
+  it('scope-guard violation / cold-read rejection / red gate all go straight to HELD', () => {
+    // Scope violation is HELD-with-no-merge (2026-07-20): a one-tier demotion
+    // would still land the out-of-scope content.
     expect(demoteToHeld()).toBe('held');
   });
 

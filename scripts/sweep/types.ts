@@ -383,5 +383,13 @@ export interface HeldRecord {
 /** Context-free cold-read verdict the driver requires before accepting MECHANICAL/JUDGED (§7). */
 export interface ColdReadVerdict {
   verdict: 'confirm' | 'reject';
+  /** Non-empty reviewer notes (validated at resolve). */
   notes: string;
+  /**
+   * Freshness binding (§7, tightened 2026-07-20): the tree OID of the
+   * resolution the verdict attests to. Must equal `treeOf(--resolved-ref)` at
+   * resolve, so a stale verdict from an earlier resolution attempt cannot be
+   * replayed against a different tree.
+   */
+  resolvedTree: string;
 }

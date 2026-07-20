@@ -82,6 +82,8 @@ export interface DerivePlanOptions {
   scope: SweepScope;
   /** HELD registry from the pass journal (empty on the first plan). */
   held?: HeldRecord[];
+  /** Branches frozen in the group ledger (cross-pass) — arrive with empty intervals (§8). */
+  frozen?: Set<string>;
 }
 
 async function analyzeParent(
@@ -157,6 +159,8 @@ export interface DeriveBranchArgs {
   isLeaf: boolean;
   alwaysMerge: boolean;
   held: HeldRecord[];
+  /** When true the branch is ledger-frozen: arrives with an empty interval (§8). */
+  frozen?: boolean;
 }
 
 /**
@@ -167,7 +171,20 @@ export interface DeriveBranchArgs {
  * up-front snapshot.
  */
 export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> {
-  const { repo, branch, kind, model, parents, chain, ancestors, tierFloor, isLeaf, alwaysMerge, held } = args;
+  const { repo, branch, kind, model, parents, chain, ancestors, tierFloor, isLeaf, alwaysMerge, held, frozen } = args;
+  // Ledger-frozen: no merges this pass (barrier satisfied by an empty interval).
+  if (frozen) {
+    const parentPlans: ParentPlan[] = parents.map((parent) => ({
+      parent,
+      model,
+      mergePoint: null,
+      verdict: 'skip',
+      case: null,
+      deferredTo: null,
+      skipReason: 'frozen',
+    }));
+    return { branch, kind, tierFloor, isLeaf, alwaysMerge, ancestors, parents: parentPlans };
+  }
   const branchTip = await revParse(repo, branch);
   const branchTree = await treeOf(repo, branchTip);
   const parentPlans: ParentPlan[] = [];
@@ -181,6 +198,7 @@ export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> 
 export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPlan> {
   const { repo, upstreamRef, base, features, scope } = opts;
   const held = opts.held ?? [];
+  const frozen = opts.frozen ?? new Set<string>();
 
   const chain = await enumerateChain(repo, upstreamRef, base);
   const watermark = chain.watermark;
@@ -219,6 +237,7 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
       isLeaf: model === 'parents' && leaves.has(entry.branch),
       alwaysMerge: feat?.always_merge === true,
       held,
+      frozen: frozen.has(entry.branch),
     });
     branches.push(bp);
     byBranch.set(bp.branch, bp);
@@ -230,6 +249,7 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
   // parents" uniform. NO merge-main-directly exception.
   if (passHasProgress) {
     for (const bp of branches) {
+      if (frozen.has(bp.branch)) continue; // frozen leaves stay frozen
       if (!(bp.isLeaf || bp.alwaysMerge)) continue;
       if (!allParentsSkipped(bp)) continue;
       const uchain = shortestUnskipChain(bp.branch, scopeResult.edges, entrySet);
@@ -266,16 +286,33 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
   };
 }
 
+/** Per-branch signature: parents' verdicts + merge points + defers + forced flags. */
+export function branchSignature(bp: BranchPlan): string {
+  return JSON.stringify(
+    bp.parents.map((pp) => [pp.parent, pp.verdict, pp.mergePoint?.sha ?? null, pp.deferredTo, pp.forced ?? false]),
+  );
+}
+
 /** Two plans are equivalent when their branch verdicts + merge points match (idempotency, §8). */
 export function plansEquivalent(a: PropagationPlan, b: PropagationPlan): boolean {
   if (a.watermark !== b.watermark) return false;
   if (a.order.join(',') !== b.order.join(',')) return false;
-  const sig = (p: PropagationPlan) =>
-    JSON.stringify(
-      p.branches.map((bp) => [
-        bp.branch,
-        bp.parents.map((pp) => [pp.parent, pp.verdict, pp.mergePoint?.sha ?? null, pp.deferredTo, pp.forced ?? false]),
-      ]),
-    );
+  const sig = (p: PropagationPlan) => JSON.stringify(p.branches.map((bp) => [bp.branch, branchSignature(bp)]));
   return sig(a) === sig(b);
+}
+
+/**
+ * Branches whose signature differs between `prev` and `cur`, EXCLUDING those in
+ * `exclude` (arrived / reopened / driver-touched). Used by `run` to detect git
+ * moving under us for not-yet-processed branches (§8 plan-equivalence).
+ */
+export function plansDiffer(prev: PropagationPlan, cur: PropagationPlan, exclude: Set<string>): string[] {
+  const prevSig = new Map(prev.branches.map((bp) => [bp.branch, branchSignature(bp)]));
+  const drifted: string[] = [];
+  for (const bp of cur.branches) {
+    if (exclude.has(bp.branch)) continue;
+    const before = prevSig.get(bp.branch);
+    if (before !== undefined && before !== branchSignature(bp)) drifted.push(bp.branch);
+  }
+  return drifted;
 }
