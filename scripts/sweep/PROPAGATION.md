@@ -28,8 +28,8 @@ Every parent→branch merge attempt lands in exactly one tier:
 Tier decisions and constraints:
 - CLEAN vs conflict is computed by the driver (new-style `git merge-tree`, D-001).
 - MECHANICAL vs JUDGED is claimed by the resolving agent but only ever **demoted** by
-  the driver, never promoted: a scope-guard violation (§7) demotes MECHANICAL→JUDGED and
-  JUDGED→HELD; a cold-read rejection demotes to HELD.
+  the driver, never promoted: a scope-guard violation (§7) goes **HELD, no merge**;
+  a cold-read rejection demotes to HELD.
 - `edition/*` (and any inventory entry flagged `tier_floor: judged`) never merges below
   JUDGED — D-015 restated in ladder terms.
 - A red verification gate (§9) demotes any already-executed tier to HELD(gate) with
@@ -292,8 +292,16 @@ head, not per pass — quiet passes stay quiet. As with PRs, the driver prepares
 never calls gh.
 
 **Naming:** resolution/freeze branches are `fix/sweep/<date>-<topic>-h<height>` so two
-cases on one branch in one day cannot collide; case ids are unique per pass by
-construction (branch + height).
+cases on one branch in one day cannot collide; case ids are `branch + parent + height`
+— two parents of one branch conflicting at the same height are distinct cases (with
+branch+height alone, the second would trip the double-resolve guard and deadlock).
+
+**Dry-run purity:** without `--execute`, `run` performs NO state changes at all — no
+merges, no unfreezes, no urge artifacts, no ledger writes, no journal entries.
+
+**Protected refs:** the single ref-write choke point refuses to move `main`,
+`design/*`, `maint/*`, `everything*`, `test/*`, and anything outside the pass's
+resolved scope — regardless of what a step/case file or CLI flag says.
 
 ## 9. Verification gate
 
@@ -337,3 +345,26 @@ annotate flow, unchanged), `scope.ts` (inventory scope + D-032b/D-033 compositio
   checkout-free) mined from the fork + upstream DAG for each taxonomy class above where
   a real instance exists; they double as regression anchors and rerere seeds where a
   recorded resolution exists (D-026/D-029 conventions).
+
+## 12. Trust model — what the driver enforces vs what must sit outside it
+
+The driver's re-verification recomputes VALUES from git, but its POINTERS — the plan,
+journal, ledger, and every `--flag` — live in the agent-writable workspace and are
+supplied by whoever invokes the CLI. Inside a single trust domain the driver is a
+correctness core, not an enforcement boundary. It becomes an enforcement core only
+under an owner-controlled invocation layer, which is the ADOPTION CONDITION, not an
+afterthought:
+
+- a wrapper (or separate OS/service identity) that pins the CLI flags (`--repo`,
+  `--workspace`, `--upstream`, `--ledger`, config paths), owns the pass directory and
+  ledger read-write, and is the only principal allowed to run `run`/`resolve`/`verify`
+  with `--execute`;
+- `unfreeze` gated on owner action (the driver journals reason and requires
+  `--execute`, but cannot distinguish principals — N2);
+- cold-read PROVENANCE attested outside the workspace (the driver validates shape and
+  freshness only);
+- push/PR execution behind the fork's enforcement layer: agent identity separation,
+  branch protection, required CI (2026-07-18 rollback prerequisites).
+
+In-driver, defense-in-depth only: the protected-ref guard at the single ref-write
+choke point (§8) and first-principles re-derivation of everything derivable from git.
