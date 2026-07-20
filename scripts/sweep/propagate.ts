@@ -92,7 +92,13 @@ interface Cli {
   workspace: string;
   ledgerPath?: string;
   pass?: string;
-  inventory: string | null;
+  /**
+   * Live inventory dir. Omitted (undefined) falls back to the committed
+   * bootstrap snapshot via loadRegistry — NEVER to an empty inventory: the
+   * old `null` default meant "explicitly no inventory", silently collapsing
+   * the scope to main_patched alone (2026-07-20 test-drive finding #2).
+   */
+  inventory?: string;
   scopeFile?: string;
   routingFile?: string;
   upstream: string;
@@ -120,7 +126,6 @@ function parseCli(argv: string[]): Cli {
     cmd,
     repo: process.cwd(),
     workspace: process.cwd(),
-    inventory: null,
     upstream: DEFAULT_UPSTREAM_REF,
     execute: false,
   };

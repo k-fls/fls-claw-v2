@@ -48,6 +48,11 @@ report it to the owner.
 1. `gh repo clone k-fls/fls-claw-v2 repo && cd repo`
    `git remote add upstream https://github.com/nanocoai/nanoclaw.git && git fetch upstream`
    `git checkout feat/maintenance-sweep`
+2. Create a LOCAL tracking branch for every inventory branch — the propagation
+   driver reads local refs only (`git branch --list`); remote-only branches are
+   silently dropped from scope (2026-07-20 test-drive finding #3):
+   `for b in $(git branch -r | sed -n 's#^ *origin/\(\(module\|feat\|edition\)/.*\)#\1#p'); do git branch --track "$b" "origin/$b" 2>/dev/null; done`
+   then cross-check the created set against the inventory's `branch:` fields.
 3. `corepack enable && pnpm install --frozen-lockfile` (fall back to `npm i -g pnpm`).
 4. Initialize your group-owned state (all inside this workspace, not the repo):
    - live inventory: copy `repo/scripts/sweep/bootstrap/fork-registry@*/features/` →
@@ -58,7 +63,9 @@ report it to the owner.
 
 ## The sweep loop (on schedule or when the owner says "run a sweep")
 
-1. `git fetch upstream origin` in the clone; then
+1. `git fetch upstream && git fetch origin` in the clone (two calls — `git fetch`
+   takes ONE remote; the old single-call form fails on "couldn't find remote ref");
+   then
    `pnpm exec tsx scripts/sweep/sweep.ts scan --inventory ../inventory --ledger ../sweep-ledger.json`
    Scope: non-inventory branches are IGNORED (no scan, no PRs — at most one digest
    drift line) unless they are part of the transitive edition composition — merged,
@@ -78,9 +85,16 @@ report it to the owner.
    (demotion-only), no-op skips, DEFERRED matching, durable freezes (ledger),
    pass pinning and the journal. You NEVER hand-run `git merge`/`update-ref` on
    inventory branches and never choose merge heads — the old hand-sequenced
-   procedure is retired. Loop (all commands from the clone root):
-   - `pnpm exec tsx scripts/sweep/propagate.ts plan --repo . --workspace ..` —
-     ONLY `plan` opens a pass. Post the plan digest here before executing.
+   procedure is retired. Pass `--inventory ../inventory` on EVERY propagate
+   invocation (plan/run/resolve/verify/status): omitting it falls back to the
+   committed bootstrap snapshot, which drifts from your live inventory.
+   Loop (all commands from the clone root):
+   - `pnpm exec tsx scripts/sweep/propagate.ts plan --repo . --workspace ..
+     --inventory ../inventory` — ONLY `plan` opens a pass. Post the plan digest
+     here before executing. SANITY (rule 7): the plan's branch count must be
+     close to the inventory's sweepable-branch count — a 1-2 branch plan means
+     scope collapse (missing local branches or wrong inventory path): stop and
+     investigate, do not run.
    - `... run` — dry-run first, review, then `--execute`: CLEAN merges, no-op
      skips and DEFERRED marks land mechanically; each conflict emits a case
      file + a driver-created worktree under the pass dir and halts that branch.
