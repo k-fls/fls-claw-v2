@@ -89,6 +89,16 @@ Per branch and per parent, over the parent's *eligible line* (§4):
 Probes are milliseconds (checkout-free); upstream deltas are tens of commits — linear
 cost is negligible and correctness beats O(log n).
 
+**Probe determinism (2026-07-20):** automerge-tree OIDs depend on the literal
+merge-tree invocation — conflict-marker LINES embed the command-line labels verbatim
+(branch name vs sha → different blob → different tree) and `merge.conflictStyle`
+adds/removes the `|||||||` base section. Verified on the real p7 case: identical
+commits produced three distinct trees (branch-name labels / sha labels /
+diff3 style). Every driver probe therefore (a) passes pinned SHAs, never ref names,
+and (b) forces `-c merge.conflictStyle=merge`, making recorded automerge trees
+reproducible across clones and user configs; the resolve-time drift halt then fires
+only on genuine movement.
+
 ## 4. What is mergeable of a parent — eligible line
 
 For entry-point branches (`main_patched`, D-032b edition-composition branches merging
@@ -178,12 +188,20 @@ The driver is the only author of merge parameters. Artifacts live under
   entry with no later `resolved`/`held` for the same id, and the branch tip must not
   already contain the head (double-resolve guard — a crash between ref-update and
   journal append must not allow a second merge). Any mismatch = hard halt, journaled.
-- **Scope guard (D-038, tightened 2026-07-20 post-review):** on resolve, the driver
-  computes `git diff --name-only <automerge-tree> <resolved-tree>`; the set must be a
-  subset of the recomputed conflicted paths. Any extra path → **HELD, no merge** —
-  a demotion to JUDGED would still land the out-of-scope content, defeating the guard
-  (supersedes the earlier demote-one-tier rule; owner may relax). File-level is the
-  enforced check; hunk-level review belongs to the cold reader.
+- **Scope guard (D-038, tightened 2026-07-20 post-review; lever added same day):** on
+  resolve, the driver computes `git diff --name-only <automerge-tree> <resolved-tree>`
+  and enforces the configured mode:
+  - `same-files` (DEFAULT, owner 2026-07-20): the resolution may touch only the
+    recomputed conflicted FILES; edits anywhere inside those files pass (hunk-level
+    review belongs to the cold reader). Any extra file → **HELD, no merge** — a
+    demotion to JUDGED would still land the out-of-scope content, defeating the guard
+    (supersedes the earlier demote-one-tier rule).
+  - `conflict-hunks` (strict, opt-in): additionally, within conflicted files the
+    changed line regions must lie within the conflict-marker regions of the automerge
+    tree; edits elsewhere in the file → HELD.
+  The lever: global default `scope_guard_mode` in `registry/routing.yaml`; per-feature
+  override `scope_guard:` on the inventory entry. Like the tier floor, the effective
+  mode is RE-DERIVED from config at resolve — never read from the case file.
 - **Cold-read artifact:** the driver emits `coldread-request.md` (conflict hunks from
   the automerge tree + resolution diff + the four cold-reader questions of D-031 —
   nothing else, so the resolving agent cannot frame the question) and requires
@@ -252,12 +270,26 @@ in-flight journal and HELD registry. `run` journals `pass-complete` when it fini
 with no open cases and the §9 gate is green.
 
 **Durable freezes (ledger):** HELD outlives the pass. On `held` the driver writes the
-group ledger (`ledger.ts`: status `frozen`, `frozenBy` = case id); `plan`/`run` treat
-ledger-frozen branches as arriving with an empty interval (barrier satisfied, no
-merges) until a `resolve` clears the HELD record AND unfreezes the ledger entry. The
-per-pass journal remains the intra-pass registry; the ledger is the cross-pass one.
-Before ANY ref mutation on a branch, its pre-pass tip is journaled
-(`pre-ref`) — the §9 rollback target.
+group ledger (`ledger.ts`: status `frozen`, `frozenBy` = case id, `heldHead` = the
+conflicting head sha); `plan`/`run` treat ledger-frozen branches as arriving with an
+empty interval (barrier satisfied, no merges). The per-pass journal remains the
+intra-pass registry; the ledger is the cross-pass one. Before ANY ref mutation on a
+branch, its pre-pass tip is journaled (`pre-ref`) — the §9 rollback target.
+
+**Unfreeze paths:** (a) DERIVED — at plan/attach time, a ledger-frozen branch whose
+current tip already CONTAINS its `heldHead` (the resolution landed externally, e.g.
+the owner merged the freeze PR) is auto-unfrozen (journaled, reason `derived`);
+(b) a mechanical/judged `resolve` on the branch unfreezes it; (c) manual override via
+a journaled subcommand. Freezes are never cleared silently.
+
+**Urging (owner 2026-07-20):** the ledger-frozen entry also carries `lastUrgedHead`.
+When a pass finds NEW pending content for a frozen branch beyond what it was last
+urged about (newest eligible head ≠ `lastUrgedHead`), the driver PREPARES a PR
+comment for the freeze PR — pending-commit count since the freeze, the newest heads
+with subjects — as `urge-comment.md` + a `gh pr comment` command next to the case's
+PR artifacts, journals `urge`, and records the new `lastUrgedHead`. One urge per new
+head, not per pass — quiet passes stay quiet. As with PRs, the driver prepares and
+never calls gh.
 
 **Naming:** resolution/freeze branches are `fix/sweep/<date>-<topic>-h<height>` so two
 cases on one branch in one day cannot collide; case ids are unique per pass by
