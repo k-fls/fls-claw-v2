@@ -105,6 +105,13 @@ export interface LedgerBranch {
   notes: string;
   /** Conflicting head sha at freeze time (propagation §8 — derived-unfreeze target). */
   heldHead?: string | null;
+  /**
+   * Conflicted paths at freeze time (§5/N3): with `heldHead` they let a LATER
+   * pass rebuild the HELD registry for DEFERRED matching (the height is
+   * re-derived from `heldHead` against that pass's chain — heights are
+   * pass-relative and never carried numerically). Absent for gate holds.
+   */
+  heldPaths?: string[] | null;
   /** Prepared freeze-PR branch (urge comments target it, cross-pass). */
   fixBranch?: string | null;
   /** Newest pending head the owner was last urged about (one urge per new head). */

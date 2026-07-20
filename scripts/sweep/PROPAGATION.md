@@ -147,6 +147,17 @@ direct parent) HELD at height N with conflicted path set S_P:
   has C merge P (fresh resolution + shared rerere, D-006) *before* re-probing Q, so the
   formerly deferred conflict typically auto-resolves.
 
+**Cross-pass DEFERRED (N3, 2026-07-21):** HELD outlives the pass through the ledger
+(§8), and the ledger freeze carries the conflicting head sha (`heldHead`) and its
+conflicted path set (`heldPaths`); at plan/run/resolve the HELD registry is the pass
+journal's records plus records REBUILT from the ledger for branches the journal does
+not know about. The height is re-derived from `heldHead` against the current pass's
+pinned chain — heights are pass-relative (the fork point moves as branches absorb
+upstream) and are never carried numerically across passes. Degradation is still
+possible and is deliberately in the safe direction: gate holds (§9) and pre-upgrade
+ledger entries carry no head/paths and cannot be matched, so a next-pass descendant of
+such a freeze gets an ORDINARY case instead of DEFERRED — extra review, never less.
+
 ## 6. No-op skips and the leaf must-merge rule (D-039)
 
 - A parent merge whose merge-tree result tree equals the branch's current tree is a
@@ -183,8 +194,12 @@ The driver is the only author of merge parameters. Artifacts live under
   driver re-derives from git + registry everything it is about to act on: the head sha
   must lie on the named parent's eligible line for this pass; the automerge tree and
   conflicted-path set are RECOMPUTED via merge-tree against the branch's current tip
-  (the recorded values are only cross-checked for drift reporting); the tier floor is
-  re-derived from the registry; the case must correspond to an open `case` journal
+  (the recorded values are only cross-checked for drift reporting); the tier floor,
+  the branch's kind/model/parents/ancestors AND the pass scope guarding the ref
+  writes are all re-derived from the registry + scope config — never from
+  `plan.json`, which is agent-writable and serves only as a drift cross-check (N2: a
+  forged parent edge or a branch smuggled into the snapshot must not extend what
+  resolve may merge or move); the case must correspond to an open `case` journal
   entry with no later `resolved`/`held` for the same id, and the branch tip must not
   already contain the head (double-resolve guard — a crash between ref-update and
   journal append must not allow a second merge). Any mismatch = hard halt, journaled.
@@ -202,17 +217,23 @@ The driver is the only author of merge parameters. Artifacts live under
   The lever: global default `scope_guard_mode` in `registry/routing.yaml`; per-feature
   override `scope_guard:` on the inventory entry. Like the tier floor, the effective
   mode is RE-DERIVED from config at resolve — never read from the case file.
-- **Cold-read artifact:** the driver emits `coldread-request.md` (conflict hunks from
-  the automerge tree + resolution diff + the four cold-reader questions of D-031 —
-  nothing else, so the resolving agent cannot frame the question) and requires
+- **Cold-read artifact:** the driver writes `coldread-request.md` at case emission
+  (conflict hunks from the automerge tree + the four cold-reader questions of D-031)
+  and REGENERATES it on every `resolve --execute` attempt, before the verdict is
+  consumed, adding the resolution diff (`git diff <automerge-tree> <resolved-tree>`)
+  recomputed for THIS resolution — conflict hunks + resolution diff + questions,
+  nothing else, so the resolving agent cannot frame the question. It requires
   `coldread-verdict.json` before accepting a MECHANICAL or JUDGED completion. The
   verdict must VALIDATE: `verdict` ∈ {`confirm`,`reject`}, non-empty `notes`, and a
   `resolvedTree` field equal to the tree OID of `--resolved-ref` (freshness binding —
-  the verdict attests to THIS resolution, not an earlier one); malformed or stale
-  verdicts are rejected, never treated as confirm. The verdict is produced by a
-  context-free subagent per D-031/D-034 — the driver can enforce shape and freshness,
-  but provenance (that a context-free reader wrote it) is doctrine-enforced and
-  ultimately needs an enforcement layer outside the agent-writable workspace.
+  the verdict attests to THIS resolution, not an earlier one, so it can only ever
+  attest to the resolution the regenerated request shows); malformed or stale
+  verdicts are rejected, never treated as confirm. A confirming verdict's content
+  (verdict + notes) is journaled on the `resolved` entry for the audit trail. The
+  verdict is produced by a context-free subagent per D-031/D-034 — the driver can
+  enforce shape and freshness, but provenance (that a context-free reader wrote it)
+  is doctrine-enforced and ultimately needs an enforcement layer outside the
+  agent-writable workspace.
 
 After a JUDGED resolution or a HELD freeze the driver **prepares** the PR mechanics but
 does not talk to GitHub: it creates the local `fix/sweep/<date>-<topic>` branch at the
@@ -253,7 +274,12 @@ descendants pick up the resolution — the pass converges without waiting for a 
 watermark.
 
 `run` after a `resolve` is idempotent: completed branches re-verify as up-to-date and
-are skipped. The plan-equivalence "halt loudly" check belongs to `run` — BEFORE
+are skipped. A crash between a resolve's ref-update and its journal append (the
+double-resolve guard's target, §7) is HEALED by the next `run`: an open case whose
+branch tip already contains the case head gets a synthetic `resolved` entry (reason
+`crash-heal`) plus `reopened` for the branch and its descendants — no second merge,
+and the pass converges instead of leaving the case open forever. The
+plan-equivalence "halt loudly" check belongs to `run` — BEFORE
 executing, the live re-derivation must match the pass's last written plan for all
 not-yet-arrived branches (a mismatch means git moved under us); `plan` on a pass with
 journal activity reports rather than halts (post-merge state legitimately differs
@@ -271,7 +297,8 @@ with no open cases and the §9 gate is green.
 
 **Durable freezes (ledger):** HELD outlives the pass. On `held` the driver writes the
 group ledger (`ledger.ts`: status `frozen`, `frozenBy` = case id, `heldHead` = the
-conflicting head sha); `plan`/`run` treat ledger-frozen branches as arriving with an
+conflicting head sha, `heldPaths` = its conflicted paths — the §5 cross-pass DEFERRED
+inputs); `plan`/`run` treat ledger-frozen branches as arriving with an
 empty interval (barrier satisfied, no merges). The per-pass journal remains the
 intra-pass registry; the ledger is the cross-pass one. Before ANY ref mutation on a
 branch, its pre-pass tip is journaled (`pre-ref`) — the §9 rollback target.
@@ -298,6 +325,8 @@ branch+height alone, the second would trip the double-resolve guard and deadlock
 
 **Dry-run purity:** without `--execute`, `run` performs NO state changes at all — no
 merges, no unfreezes, no urge artifacts, no ledger writes, no journal entries.
+`resolve` without `--execute` likewise writes nothing (N7): a re-verification failure
+is reported on stderr only, and the cold-read request is not regenerated.
 
 **Protected refs:** the single ref-write choke point refuses to move `main`,
 `design/*`, `maint/*`, `everything*`, `test/*`, and anything outside the pass's

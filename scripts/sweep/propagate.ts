@@ -60,10 +60,19 @@ import {
 } from './git.js';
 import { readLedger, writeLedger, defaultLedgerBranch } from './ledger.js';
 import { loadRegistry } from './registry.js';
+import { resolveScope } from './scope.js';
 import { scopeGuard } from './scope-guard.js';
 import { buildStepFile, caseId, readCaseFile, slug, verifyStepFile, writeJsonFile } from './steps.js';
 import { applyFloor, isClaimableTier, tierFloor } from './tiers.js';
-import { allParentsSkipped, deriveBranch, derivePlan, plansDiffer, shortestUnskipChain } from './plan.js';
+import {
+  allParentsSkipped,
+  deriveBranch,
+  derivePlan,
+  findLeaves,
+  plansDiffer,
+  shortestUnskipChain,
+  transitiveAncestors,
+} from './plan.js';
 import { deriveCoverage, enumerateChain, type Chain } from './heights.js';
 import { verifyEverything, type VerifyCommand } from './verify.js';
 import type {
@@ -346,6 +355,7 @@ function freezeInLedger(
   branch: string,
   frozenBy: string,
   heldHead: string | null,
+  heldPaths: string[] | null,
   fixBranch: string | null,
 ): void {
   const path = ledgerPathOf(cli);
@@ -356,6 +366,7 @@ function freezeInLedger(
     status: 'frozen',
     frozenBy,
     heldHead,
+    heldPaths,
     fixBranch,
   };
   writeLedger(path, ledger);
@@ -365,9 +376,51 @@ function unfreezeInLedger(cli: Cli, branch: string): void {
   const path = ledgerPathOf(cli);
   const ledger = readLedger(path);
   if (ledger.branches[branch]) {
-    ledger.branches[branch] = { ...ledger.branches[branch], status: 'active', frozenBy: null, heldHead: null };
+    ledger.branches[branch] = {
+      ...ledger.branches[branch],
+      status: 'active',
+      frozenBy: null,
+      heldHead: null,
+      heldPaths: null,
+    };
     writeLedger(path, ledger);
   }
+}
+
+/**
+ * Cross-pass HELD registry from the ledger (§5, N3): a ledger freeze carries
+ * the conflicting head sha (`heldHead`) and its conflicted paths (`heldPaths`),
+ * which is enough to rebuild the DEFERRED-matching record in a LATER pass.
+ * Heights are pass-relative (the chain's fork point moves as branches absorb
+ * upstream), so the height is RE-DERIVED from `heldHead` against THIS pass's
+ * pinned chain, never carried numerically. Entries without head/paths (gate
+ * holds from §9, pre-upgrade ledgers) or whose head fell below the chain
+ * cannot be matched and degrade to an ordinary case for descendants — the safe
+ * direction (extra review, never less).
+ */
+async function ledgerHeldRecords(cli: Cli, chain: Chain): Promise<HeldRecord[]> {
+  const ledger = readLedger(ledgerPathOf(cli));
+  const out: HeldRecord[] = [];
+  for (const [branch, b] of Object.entries(ledger.branches)) {
+    if (b.status !== 'frozen' || !b.heldHead || !b.heldPaths?.length) continue;
+    if (!(await refExists(cli.repo, b.heldHead))) continue;
+    const height = (await deriveCoverage(cli.repo, chain, b.heldHead)).height;
+    if (height < 0) continue; // below this pass's chain — degrades to an ordinary case
+    out.push({ branch, height, conflictedPaths: b.heldPaths, caseId: b.frozenBy ?? '' });
+  }
+  return out;
+}
+
+/**
+ * The effective HELD registry for derivation: the pass journal (intra-pass,
+ * freshest — a `resolved` there clears the record) plus ledger-rebuilt records
+ * for branches the journal does not know about (cross-pass freezes, §5/N3).
+ */
+async function combinedHeld(cli: Cli, ctx: PassCtx, journal: JournalEntry[]): Promise<HeldRecord[]> {
+  const inPass = heldRegistry(journal);
+  const have = new Set(inPass.map((h) => h.branch));
+  const fromLedger = (await ledgerHeldRecords(cli, ctx.chain)).filter((h) => !have.has(h.branch));
+  return [...inPass, ...fromLedger];
 }
 
 /**
@@ -511,7 +564,14 @@ class DriverHalt extends Error {
   }
 }
 
-/** Namespaces the driver never moves, regardless of step/case/flag input (§8/N1). */
+/**
+ * Namespaces the driver never moves, regardless of step/case/flag input (§8/N1).
+ * `main_patched` is deliberately NOT here (N7): it is a legitimate driver merge
+ * TARGET — the structural upstream entry point (§2) — and must accept pass
+ * merges, resolutions and §9 gate rollbacks. It is guarded by the scope check
+ * below instead: movable only when the pass's resolved scope contains it (which
+ * scope.ts grants exactly when the branch exists and is not excluded).
+ */
 const PROTECTED_REF_RE = /^(main|everything.*|design\/.*|maint\/.*|test\/.*)$/;
 
 /**
@@ -530,13 +590,40 @@ function guardRef(branch: string, scope: Set<string>, opts: { fixSweep?: boolean
   }
 }
 
-/** The pass's resolved scope (branch set) from its plan snapshot. */
+/**
+ * The pass's resolved scope (branch set) from its plan snapshot. Used ONLY by
+ * the §9 rollback guard in cmdVerify: there the offender comes from the verify
+ * recipe (registry config / pinned flag, §12), not from the plan, so plan.json
+ * cannot steer WHICH branch rolls back — it can only forbid the write. The
+ * resolve flow derives its scope from the registry instead (N2, reverifyCase):
+ * there plan.json IS attacker-relevant and must not extend the scope.
+ */
 function passScope(dir: string): Set<string> {
   const p = join(dir, 'plan.json');
   const src = existsSync(p) ? p : join(dir, 'plan-initial.json');
   if (!existsSync(src)) return new Set();
   const plan = JSON.parse(readFileSync(src, 'utf8')) as PropagationPlan;
   return new Set(plan.branches.map((b) => b.branch));
+}
+
+/**
+ * N1 — checked-out-branch safety shared by ALL ref writers (journaledMerge,
+ * journaledResolvedMerge, the §9 rollback). A branch checked out in a worktree
+ * must never be moved by raw plumbing without also updating that worktree:
+ * `update-ref` alone silently desyncs its index/working tree (they keep the old
+ * commit while the ref moves). Contract: call this BEFORE the ref write — it
+ * refuses a DIRTY worktree (DriverHalt, journaled by the caller) — and when it
+ * returns a path, hard-reset that worktree to the new commit AFTER the write.
+ * The `git reset --hard` is safe ONLY because this dirty check just passed.
+ */
+async function checkedOutWorktree(repo: string, branch: string): Promise<string | null> {
+  const wt = (await worktreeBranches(repo)).get(branch);
+  if (!wt) return null;
+  const status = await git(repo, ['status', '--porcelain'], { cwd: wt });
+  if (status.stdout.trim() !== '') {
+    throw new DriverHalt('dirty-worktree', `worktree for '${branch}' (${wt}) is dirty — refusing to move its ref`);
+  }
+  return wt;
 }
 
 async function journaledMerge(
@@ -547,14 +634,10 @@ async function journaledMerge(
   scope: Set<string>,
 ): Promise<string> {
   guardRef(branch, scope);
-  const checkedOut = await worktreeBranches(repo);
-  const wt = checkedOut.get(branch);
+  const wt = await checkedOutWorktree(repo, branch); // B6/N1: dirty -> DriverHalt
   if (wt) {
-    // B6: never touch a dirty worktree, and never strand it mid-merge.
-    const status = await git(repo, ['status', '--porcelain'], { cwd: wt });
-    if (status.stdout.trim() !== '') {
-      throw new DriverHalt('dirty-worktree', `worktree for '${branch}' is dirty — refusing to merge`);
-    }
+    // Checked out CLEAN: use a real `git merge` in that worktree so its
+    // index/working tree advance with the ref; never strand it mid-merge.
     const res = await git(repo, ['merge', '--no-edit', '-m', message, headSha], { cwd: wt, allowCodes: [1] });
     if (res.code !== 0) {
       await git(repo, ['merge', '--abort'], { cwd: wt, allowCodes: [1, 128] });
@@ -575,10 +658,14 @@ async function journaledResolvedMerge(
   scope: Set<string>,
 ): Promise<string> {
   guardRef(branch, scope);
+  // N1: same checked-out safety as journaledMerge — a resolved-tree merge is
+  // written via plumbing, so a clean checked-out worktree must FOLLOW the ref.
+  const wt = await checkedOutWorktree(repo, branch);
   const tip = await revParse(repo, branch);
   const theirs = await revParse(repo, headSha);
   const commit = (await git(repo, ['commit-tree', resolvedTree, '-p', tip, '-p', theirs, '-m', message])).stdout.trim();
   await git(repo, ['update-ref', `refs/heads/${branch}`, commit, tip]);
+  if (wt) await git(repo, ['reset', '--hard', commit], { cwd: wt }); // clean-verified above
   return commit;
 }
 
@@ -593,17 +680,36 @@ const COLD_READ_QUESTIONS = [
   '4. Are there follow-on invariants (tests, types, call sites) this resolution must also satisfy?',
 ];
 
-function coldReadRequest(caseFile: CaseFile, diffText: string): string {
+/**
+ * The cold-read request (§7, D-031): conflict hunks + resolution diff + the
+ * four cold-reader questions — NOTHING else, so the resolving agent cannot
+ * frame the question. Written twice: at case emission with the conflict hunks
+ * only (`resolutionDiff === null` — no resolution exists yet), then REGENERATED
+ * by every `resolve --execute` attempt, before the verdict is consumed, with
+ * the resolution diff (`git diff <automerge-tree> <resolved-tree>`) recomputed
+ * for THIS resolution. The verdict freshness binding (resolvedTree) ensures a
+ * verdict can only ever attest to the resolution the regenerated request shows.
+ */
+function coldReadRequest(
+  c: { id: string; branch: string; parent: string; head: { height: number }; conflictedPaths: string[] },
+  conflictDiff: string,
+  resolutionDiff: string | null,
+): string {
   return [
-    `# Cold-read request — ${caseFile.id}`,
+    `# Cold-read request — ${c.id}`,
     '',
-    `Branch: ${caseFile.branch}   Parent: ${caseFile.parent}   Height: ${caseFile.head.height}`,
-    `Conflicted paths: ${caseFile.conflictedPaths.join(', ')}`,
+    `Branch: ${c.branch}   Parent: ${c.parent}   Height: ${c.head.height}`,
+    `Conflicted paths: ${c.conflictedPaths.join(', ')}`,
     '',
-    '## Conflict hunks (automerge tree) + resolution diff',
+    '## Conflict hunks (branch tip -> automerge tree)',
     '```diff',
-    diffText,
+    conflictDiff,
     '```',
+    '',
+    '## Resolution diff (automerge tree -> resolved tree)',
+    ...(resolutionDiff === null
+      ? ['_No resolution attempt yet — `resolve` regenerates this file with the diff before requiring a verdict (§7)._']
+      : ['```diff', resolutionDiff, '```']),
     '',
     '## Cold-reader questions',
     ...COLD_READ_QUESTIONS,
@@ -665,7 +771,7 @@ export async function cmdPlan(cli: Cli): Promise<number> {
   await deriveUnfreeze(cli, dir, true); // externally-resolved freezes clear first
   await urgeFrozen(cli, ctx, dir, true); // urge still-frozen branches with new pending content
   const journal = readJournal(dir);
-  const plan = await derive(cli, heldRegistry(journal), ctx, frozenBranches(cli));
+  const plan = await derive(cli, await combinedHeld(cli, ctx, journal), ctx, frozenBranches(cli));
 
   const initialPath = join(dir, 'plan-initial.json');
   if (!existsSync(initialPath)) {
@@ -698,7 +804,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
   // what WOULD happen (detect-only) and return.
   if (!cli.execute) {
     const journal0 = readJournal(dir);
-    const plan0 = await derive(cli, heldRegistry(journal0), ctx, frozenBranches(cli));
+    const plan0 = await derive(cli, await combinedHeld(cli, ctx, journal0), ctx, frozenBranches(cli));
     const wouldUnfreeze = await deriveUnfreeze(cli, dir, false);
     const wouldUrge = await urgeFrozen(cli, ctx, dir, false);
     console.error('DRY-RUN (no --execute): no state changes; reporting the plan + would-unfreeze/would-urge');
@@ -710,9 +816,13 @@ export async function cmdRun(cli: Cli): Promise<number> {
   // the updated frozen set.
   await deriveUnfreeze(cli, dir, true);
   await urgeFrozen(cli, ctx, dir, true);
+  // B5i crash-heal BEFORE reading pass state: close ref-updated-but-journal-
+  // missing cases (synthetic `resolved` + `reopened`) so the loop below
+  // re-derives the branch instead of leaving it open forever.
+  await crashHeal(cli, dir, readJournal(dir));
   const journal = readJournal(dir);
   const frozen = frozenBranches(cli);
-  const plan = await derive(cli, heldRegistry(journal), ctx, frozen);
+  const plan = await derive(cli, await combinedHeld(cli, ctx, journal), ctx, frozen);
   const passHasProgress = plan.chainLength > 0;
   const scope = new Set(plan.branches.map((b) => b.branch));
 
@@ -744,7 +854,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
   const entrySet = new Set(
     plan.branches.filter((b) => (b.parents[0]?.model ?? 'entry') === 'entry').map((b) => b.branch),
   );
-  const held = heldRegistry(journal);
+  const held = await combinedHeld(cli, ctx, journal); // journal-HELD + ledger-rebuilt (§5/N3)
   const heldSet = new Set([...held.map((h) => h.branch), ...frozen]); // journal-HELD ∪ ledger-frozen
   const preReffed = preReffedSet(journal);
 
@@ -874,12 +984,16 @@ export async function cmdRun(cli: Cli): Promise<number> {
             allowCodes: [1],
           },
         );
-        writeFileSync(join(caseDir, 'coldread-request.md'), coldReadRequest(caseFile, diffText.stdout.slice(0, 60000)));
+        writeFileSync(
+          join(caseDir, 'coldread-request.md'),
+          coldReadRequest(caseFile, diffText.stdout.slice(0, 60000), null), // resolution diff added at resolve (§7)
+        );
         appendJournal(dir, {
           action: 'case',
           branch: bp.branch,
           parent: pp.parent,
           caseId: caseFile.id,
+          head: caseFile.head, // sha recorded for the B5i crash-heal ancestry check
           height: caseFile.head.height,
           conflictedPaths: caseFile.conflictedPaths,
         });
@@ -999,9 +1113,8 @@ function planEdges(plan: PropagationPlan): Record<string, string[]> {
   return edges;
 }
 
-/** Transitive inventory descendants of `branch` in the plan snapshot. */
-function transitiveDescendants(plan: PropagationPlan, branch: string): string[] {
-  const edges = planEdges(plan);
+/** Transitive inventory descendants of `branch` over child->parents edges. */
+function transitiveDescendants(edges: Record<string, string[]>, branch: string): string[] {
   const children: Record<string, string[]> = {};
   for (const [child, parents] of Object.entries(edges)) {
     for (const p of parents) (children[p] ??= []).push(child);
@@ -1030,6 +1143,49 @@ function reopen(dir: string, targets: string[]): void {
 }
 
 /**
+ * B5i crash-heal: a crash between journaledResolvedMerge's ref-update and the
+ * `resolved` journal append leaves the ref MOVED but the case OPEN — the
+ * double-resolve guard then (correctly) refuses a retried resolve, and without
+ * this heal the case would stay open forever with descendants never reopened
+ * (N4 liveness). Detection: an open `case` journal entry whose branch tip
+ * already CONTAINS the case head. Heal: journal a synthetic `resolved` (reason
+ * `crash-heal`) plus `reopened` for the branch and its descendants, so the
+ * pass converges. Trusting the journaled head sha is safe under the derived-
+ * state model: a forged head can at worst close a case spuriously — the reopen
+ * makes `run` re-derive the branch from git, and a still-live conflict simply
+ * re-emits a fresh case; nothing merges here.
+ */
+async function crashHeal(cli: Cli, dir: string, journal: JournalEntry[]): Promise<string[]> {
+  const closed = new Set(
+    journal.filter((e) => e.action === 'resolved' || e.action === 'held').map((e) => e.caseId as string),
+  );
+  const planPath = join(dir, 'plan.json');
+  const edges = existsSync(planPath)
+    ? planEdges(JSON.parse(readFileSync(planPath, 'utf8')) as PropagationPlan)
+    : {};
+  const healed: string[] = [];
+  for (const e of journal) {
+    if (e.action !== 'case' || closed.has(e.caseId as string)) continue;
+    const head = e.head as { sha?: string } | undefined;
+    if (!head?.sha || typeof e.branch !== 'string') continue; // pre-head-journaling entries: not healable
+    if (!(await refExists(cli.repo, e.branch))) continue;
+    const tip = await revParse(cli.repo, e.branch);
+    if (!(await isAncestor(cli.repo, head.sha, tip))) continue; // case genuinely open
+    appendJournal(dir, {
+      action: 'resolved',
+      branch: e.branch,
+      caseId: e.caseId,
+      reason: 'crash-heal',
+      notes: ['ref already contained the case head with no resolved entry — healed synthetically (B5i)'],
+    });
+    reopen(dir, [e.branch, ...transitiveDescendants(edges, e.branch)]);
+    closed.add(e.caseId as string);
+    healed.push(e.caseId as string);
+  }
+  return healed;
+}
+
+/**
  * The re-derived (from git + registry) authority for a case — everything the
  * driver acts on. `case-*.json` is only a POINTER; these values come from
  * merge-tree + the eligible line + the registry, NEVER the file (§7).
@@ -1048,6 +1204,10 @@ interface ResolvedCase {
   scopeGuardMode: ScopeGuardMode;
   /** Trunk heights above the head still pending (PR "behind freeze" count). */
   pendingAbove: number;
+  /** Pass scope (branch set) re-derived from the registry + scope config (N2). */
+  scope: Set<string>;
+  /** Transitive inventory descendants from the registry edges (reopen targets, N2). */
+  descendants: string[];
 }
 
 /**
@@ -1076,14 +1236,6 @@ async function reverifyCase(
     errors.push(`case '${caseFile.id}' already resolved/held this pass (double-resolve)`);
   }
 
-  const planPath = join(dir, 'plan.json');
-  if (!existsSync(planPath)) return { ok: false, errors: [...errors, 'no plan.json in the pass dir'] };
-  const plan = JSON.parse(readFileSync(planPath, 'utf8')) as PropagationPlan;
-  const snap = plan.branches.find((b) => b.branch === caseFile.branch);
-  if (!snap) return { ok: false, errors: [...errors, `branch '${caseFile.branch}' is not in the plan`] };
-
-  const branchTip = await revParse(cli.repo, caseFile.branch);
-
   // (3) re-derive tier floor AND scope-guard mode from config (ignore the file's).
   const registry = loadRegistry({
     inventoryDir: cli.inventory,
@@ -1091,25 +1243,71 @@ async function reverifyCase(
     routingFile: cli.routingFile,
   });
   const feat = registry.features.find((f) => f.branch === caseFile.branch) as
-    | (FeatureEntry & { tier_floor?: string })
+    | (FeatureEntry & { tier_floor?: string; always_merge?: boolean })
     | undefined;
   const floor = tierFloor(caseFile.branch, feat);
   const scopeGuardMode: ScopeGuardMode = feat?.scope_guard ?? registry.routing.scopeGuardMode ?? 'same-files';
 
+  // (N2) AUTHORITY for parent legality + pass scope: the branch's kind/model/
+  // parents/ancestors and the pass's scope set are re-derived from the
+  // REGISTRY + scope config (exactly like the tier floor above), NEVER from
+  // plan.json — the plan is agent-writable, so a forged parent edge or an
+  // extra branch smuggled into the snapshot must not extend what resolve may
+  // merge or move. plan.json is kept only as a drift cross-check below.
+  const scopeResult = await resolveScope(cli.repo, registry.features, registry.scope);
+  const entry = scopeResult.ordered.find((e) => e.branch === caseFile.branch);
+  if (!entry) {
+    return {
+      ok: false,
+      errors: [...errors, `branch '${caseFile.branch}' is not in the registry-derived pass scope (N2)`],
+    };
+  }
+  const model: 'entry' | 'parents' = entry.mergeModel === 'upstream-chain' ? 'entry' : 'parents';
+  const parents = model === 'entry' ? ['main'] : entry.parents;
+  const ancestors = transitiveAncestors(scopeResult.edges)[caseFile.branch] ?? [];
+  const inventoryBranches = scopeResult.ordered.filter((e) => e.mergeModel === 'parents').map((e) => e.branch);
+  const isLeaf = model === 'parents' && findLeaves(inventoryBranches, scopeResult.edges).has(caseFile.branch);
+  const scope = new Set(scopeResult.ordered.map((e) => e.branch));
+  const descendants = transitiveDescendants(scopeResult.edges, caseFile.branch);
+
+  // Drift cross-check against the plan snapshot (report-only source, like the
+  // recorded-vs-recomputed checks below): a mismatch means the plan was edited
+  // or the registry changed mid-pass — either way, halt loudly.
+  const planPath = join(dir, 'plan.json');
+  if (!existsSync(planPath)) return { ok: false, errors: [...errors, 'no plan.json in the pass dir'] };
+  const plan = JSON.parse(readFileSync(planPath, 'utf8')) as PropagationPlan;
+  const snap = plan.branches.find((b) => b.branch === caseFile.branch);
+  if (!snap) {
+    errors.push(`plan drift: branch '${caseFile.branch}' missing from plan.json (registry-derived scope has it)`);
+  } else {
+    const snapModel = snap.parents[0]?.model ?? 'entry';
+    const snapParents = snap.parents.map((p) => p.parent);
+    if (snapModel !== model || JSON.stringify([...snapParents].sort()) !== JSON.stringify([...parents].sort()))
+      errors.push(
+        `plan drift: plan parents [${snapParents.join(', ')}] (${snapModel}) != registry parents [${parents.join(', ')}] (${model})`,
+      );
+    if (snap.kind !== entry.kind) errors.push(`plan drift: plan kind '${snap.kind}' != registry kind '${entry.kind}'`);
+    if (JSON.stringify([...snap.ancestors].sort()) !== JSON.stringify([...ancestors].sort()))
+      errors.push(
+        `plan drift: plan ancestors [${snap.ancestors.join(', ')}] != registry ancestors [${ancestors.join(', ')}]`,
+      );
+  }
+
+  const branchTip = await revParse(cli.repo, caseFile.branch);
+
   // (1)+(2) re-derive the branch LIVE and locate the named parent's conflict.
-  const model: 'entry' | 'parents' = snap.parents[0]?.model ?? 'entry';
   const bp = await deriveBranch({
     repo: cli.repo,
     branch: caseFile.branch,
-    kind: snap.kind,
+    kind: entry.kind,
     model,
-    parents: snap.parents.map((p) => p.parent),
+    parents,
     chain: ctx.chain,
-    ancestors: snap.ancestors,
+    ancestors,
     tierFloor: floor,
-    isLeaf: snap.isLeaf,
-    alwaysMerge: snap.alwaysMerge,
-    held: heldRegistry(journal),
+    isLeaf,
+    alwaysMerge: feat?.always_merge === true,
+    held: await combinedHeld(cli, ctx, journal),
   });
   const pp = bp.parents.find((p) => p.parent === caseFile.parent);
   if (!pp)
@@ -1118,11 +1316,19 @@ async function reverifyCase(
       errors: [...errors, `parent '${caseFile.parent}' is not a legal parent of '${caseFile.branch}'`],
     };
   if (!pp.case) {
+    // Distinguish the §7 double-resolve guard from an ordinary drift: when the
+    // tip already CONTAINS the recorded head, this is a crash-replay (B5i — the
+    // merge landed but the `resolved` entry is missing; `run` heals it), not a
+    // healed conflict.
+    const doubleResolve =
+      typeof caseFile.head?.sha === 'string' && (await isAncestor(cli.repo, caseFile.head.sha, branchTip));
     return {
       ok: false,
       errors: [
         ...errors,
-        `no live conflict for '${caseFile.branch}' <- '${caseFile.parent}' (head off the eligible line, or clean now)`,
+        doubleResolve
+          ? `branch tip already contains recorded head ${caseFile.head.sha.slice(0, 12)} (double-resolve guard / crash-replay — a later \`run\` heals this, B5i)`
+          : `no live conflict for '${caseFile.branch}' <- '${caseFile.parent}' (head off the eligible line, or clean now)`,
       ],
     };
   }
@@ -1161,6 +1367,8 @@ async function reverifyCase(
       tierFloor: floor,
       scopeGuardMode,
       pendingAbove,
+      scope,
+      descendants,
     },
   };
 }
@@ -1176,12 +1384,27 @@ async function freezeHeld(cli: Cli, dir: string, rc: ResolvedCase, notes: string
     conflictedPaths: rc.conflictedPaths,
     notes,
   });
-  freezeInLedger(cli, rc.branch, rc.id, rc.head.sha, fixBranch); // durable cross-pass freeze (§8)
+  // Durable cross-pass freeze (§8); head + paths let a later pass rebuild the
+  // HELD registry for DEFERRED matching (§5/N3).
+  freezeInLedger(cli, rc.branch, rc.id, rc.head.sha, rc.conflictedPaths, fixBranch);
 }
+
+/**
+ * N5: the shape every generated case id has (`slug(branch)--slug(parent)-h<n>`,
+ * steps.ts). `--case` is joined into paths under the pass dir, so anything
+ * outside the slug charset — path separators, dots, `..` traversal — is
+ * refused BEFORE any path join. slug() maps all other characters to `_`, so a
+ * genuine id always matches.
+ */
+const CASE_ID_RE = /^[A-Za-z0-9_-]+-h-?\d+$/;
 
 export async function cmdResolve(cli: Cli): Promise<number> {
   if (!cli.caseId || !cli.tier) {
     console.error('resolve: --case <id> and --tier <mechanical|judged|held> are required');
+    return 2;
+  }
+  if (!CASE_ID_RE.test(cli.caseId)) {
+    console.error(`resolve: --case '${cli.caseId}' does not match the generated case-id shape (N5) — refused`);
     return 2;
   }
   const ctx = await passContext(cli);
@@ -1198,23 +1421,25 @@ export async function cmdResolve(cli: Cli): Promise<number> {
   // §7 case re-verification (trust boundary): treat case.json as a pointer.
   const rv = await reverifyCase(cli, ctx, dir, caseFile, journal);
   if (!rv.ok) {
-    appendJournal(dir, {
-      action: 'halt',
-      branch: caseFile.branch,
-      caseId: caseFile.id,
-      reason: 'case-reverification-failed',
-      errors: rv.errors,
-    });
+    // N7: dry-run stays write-free — report the failure without journaling.
+    if (cli.execute) {
+      appendJournal(dir, {
+        action: 'halt',
+        branch: caseFile.branch,
+        caseId: caseFile.id,
+        reason: 'case-reverification-failed',
+        errors: rv.errors,
+      });
+    }
     console.error(`HALT: case re-verification failed for ${caseFile.id}:\n  ${rv.errors.join('\n  ')}`);
     return 1;
   }
   const rc = rv.rc!;
 
-  // Reopen targets = the branch + its transitive descendants (from the snapshot).
-  const planSnap = JSON.parse(readFileSync(join(dir, 'plan.json'), 'utf8')) as PropagationPlan;
-  const reopenTargets = [rc.branch, ...transitiveDescendants(planSnap, rc.branch)];
+  // Reopen targets = the branch + its transitive descendants (registry-derived, N2).
+  const reopenTargets = [rc.branch, ...rc.descendants];
   const preReffed = preReffedSet(journal);
-  const scope = passScope(dir);
+  const scope = rc.scope; // registry-derived pass scope (N2), never plan.json's
 
   try {
     // Direct HELD freeze path (§8): "cannot resolve" — no resolution commit, no
@@ -1242,6 +1467,24 @@ export async function cmdResolve(cli: Cli): Promise<number> {
       return 2;
     }
     const resolvedTree = await treeOf(cli.repo, cli.resolvedRef);
+
+    // §7 spec promise: the cold-read request contains conflict hunks AND the
+    // resolution diff. REGENERATE it here — BEFORE the verdict is required —
+    // from the recomputed automerge tree and THIS resolution's tree, so the
+    // cold reader always sees the diff its verdict will attest to (a verdict
+    // predating this tree is rejected by the freshness binding below anyway).
+    // Execute-gated so a dry-run resolve stays write-free (N7).
+    if (cli.execute) {
+      const tipNow = await revParse(cli.repo, rc.branch);
+      const conflictDiff = await git(cli.repo, ['diff', tipNow, rc.automergeTree, '--', ...rc.conflictedPaths], {
+        allowCodes: [1],
+      });
+      const resolutionDiff = await git(cli.repo, ['diff', rc.automergeTree, resolvedTree], { allowCodes: [1] });
+      writeFileSync(
+        join(caseDir, 'coldread-request.md'),
+        coldReadRequest(rc, conflictDiff.stdout.slice(0, 60000), resolutionDiff.stdout.slice(0, 60000)),
+      );
+    }
 
     // Cold-read verdict VALIDATION (§7, D2): shape + freshness before it can gate.
     const verdictPath = join(caseDir, 'coldread-verdict.json');
@@ -1318,7 +1561,17 @@ export async function cmdResolve(cli: Cli): Promise<number> {
     const msg = `Merge ${rc.parent} into ${rc.branch} (propagation, ${tier} resolution of ${rc.id})`;
     await recordPreRef(cli, dir, preReffed, rc.branch);
     const mergeCommit = await journaledResolvedMerge(cli.repo, rc.branch, rc.head.sha, resolvedTree, msg, scope);
-    appendJournal(dir, { action: 'resolved', branch: rc.branch, caseId: rc.id, tier, mergeCommit, notes });
+    // §7: the resolved entry carries the confirming verdict's content, so the
+    // audit trail shows WHAT the cold reader attested, not just that it did.
+    appendJournal(dir, {
+      action: 'resolved',
+      branch: rc.branch,
+      caseId: rc.id,
+      tier,
+      mergeCommit,
+      notes,
+      coldread: { verdict: coldread.verdict, notes: coldread.notes },
+    });
     unfreezeInLedger(cli, rc.branch); // clearing a HELD unfreezes the ledger entry
     if (tier === 'judged') await preparePr(cli, dir, rc, { tier, atCommit: mergeCommit }, scope);
     await removeCaseWorktree(cli, dir, rc.id);
@@ -1442,6 +1695,12 @@ export async function cmdVerify(cli: Cli): Promise<number> {
   const current = await revParse(cli.repo, offender);
   try {
     guardRef(offender, passScope(dir)); // protected-ref guard on the rollback write (§8/N1)
+    // N1: same checked-out safety as the merge writers — refuse a dirty
+    // worktree; after the rollback, reset a clean one to the pre-ref so its
+    // index/working tree follow the moved ref instead of silently desyncing.
+    const wt = await checkedOutWorktree(cli.repo, offender);
+    await resetBranchRef(cli.repo, offender, preRef, current);
+    if (wt) await git(cli.repo, ['reset', '--hard', preRef], { cwd: wt }); // clean-verified above
   } catch (e) {
     if (e instanceof DriverHalt) {
       appendJournal(dir, { action: 'halt', branch: offender, reason: e.reason, message: e.message });
@@ -1450,7 +1709,6 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     }
     throw e;
   }
-  await resetBranchRef(cli.repo, offender, preRef, current);
   appendJournal(dir, { action: 'pre-ref-rollback', branch: offender, to: preRef });
   appendJournal(dir, {
     action: 'held',
@@ -1460,7 +1718,7 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     conflictedPaths: [],
     reason: 'gate',
   });
-  freezeInLedger(cli, offender, 'gate', null, null); // gate hold has no conflicting head / PR
+  freezeInLedger(cli, offender, 'gate', null, null, null); // gate hold has no conflicting head / paths / PR
   const re = await verifyEverything(cli.repo, { recipe, commands });
   appendJournal(dir, { action: 'verify', ok: re.ok, offender, rolledBack: offender });
   console.error(

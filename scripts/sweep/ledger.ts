@@ -28,6 +28,7 @@ export function defaultLedgerBranch(): LedgerBranch {
     pendingBehindFreeze: 0,
     notes: '',
     heldHead: null,
+    heldPaths: null,
     fixBranch: null,
     lastUrgedHead: null,
   };

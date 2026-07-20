@@ -31,9 +31,14 @@ async function treeOf(repo: string, commit: string): Promise<string> {
   return (await git(repo, ['rev-parse', `${commit}^{tree}`])).stdout.trim();
 }
 
-/** Sanitize a branch/parent name for use in a case id or path segment. */
+/**
+ * Sanitize a branch/parent name for use in a case id or path segment. Slashes
+ * become `__`; every other character outside [A-Za-z0-9_-] becomes `_` (N5:
+ * `resolve --case` validates against exactly this charset before any path
+ * join, so generated ids must never contain dots or separators).
+ */
 export function slug(name: string): string {
-  return name.replace(/\//g, '__');
+  return name.replace(/\//g, '__').replace(/[^A-Za-z0-9_-]/g, '_');
 }
 
 /**
