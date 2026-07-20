@@ -96,3 +96,16 @@ those branches rebase, **re-mine** the case rather than patch-pin it.
 - Heights below a branch's `coverage_height` probe as trivially CLEAN
   (the head is an ancestor; result tree = branch tree). A "largest clean
   height" at or below coverage means the sweep makes no upstream progress.
+
+## Anchor head (owner-authorized 2026-07-20)
+
+Branch `test/pins/propagation-cases-20260720` (@ 453c746b2d49a07d836077b3fbb9172864c8b564,
+pushed to origin) anchors every case-referenced commit that was not reachable from
+origin/upstream refs: the pre-rebase `fix/main/role-grant-scope-clarity` tip
+`a512bc9f…` (p7), its resolution merge `822f75b1…` (p7 resolution_ref), the local
+`fix/main/last-owner-guard` tip `1148dca2…`, and the 2026-07-18 local main_patched
+tip itself — the single head contains all four. The `test/*` namespace is
+sweep-excluded, so the pin can never enter merge scope. NOTE: this head's ancestry
+includes the owner's local-only main_patched merges and the rolled-back 2026-07-13
+sweep-merge history (objects republished under a pin ref only — no product branch
+points at them). The pin-by-patch fallback and loud skips remain as defense in depth.
