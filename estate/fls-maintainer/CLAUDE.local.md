@@ -25,7 +25,9 @@ mechanics: `scripts/sweep/README.md` + `DESIGN.md` on branch `feat/maintenance-s
    entry points; every other inventory branch merges its parents' tips,
    parents-before-children. Conflicts resolve once at the topmost affected branch;
    descendants inherit the resolution via their parent merges (never re-present a
-   parent's conflict in a child PR).
+   parent's conflict in a child PR). ALL of these invariants are ENFORCED by the
+   propagation driver (sweep-loop step 4, D-041) — you never sequence or execute
+   inventory-branch merges by hand.
 5. If upstream history is force-pushed/rewritten: halt, report, never "fix" it.
 6. Anything ambiguous, security-flagged (sensitive-surface PoIs), or OVERLAP-HIGH goes
    to the owner before action.
@@ -70,44 +72,46 @@ report it to the owner.
 3. Route annotate-PoIs (`route`) and run overlap checks with the registry prompts
    (spawn one subagent per routed feature; prompts are self-contained). Report
    OVERLAP-HIGH findings as high priority.
-4. Merge (dry-run, review the plan, then `--execute`), DAG order, rerere enabled.
-   Merge sources are DAG parents: `main_patched` (and edition-composition branches,
-   which merge `main` only) take the upstream stop point; every other inventory
-   branch merges its parents' updated tips — children never merge main/upstream
-   directly, so upstream content cascades down the parent chain and a gated parent
-   simply holds its children back (they can never overshoot). Conflicts: resolve once
-   at the topmost affected branch on a `fix/sweep/<date>-<topic>` branch; descendants
-   inherit the resolution via their next parent merge — never re-resolve (or re-PR)
-   the same conflict on a child.
-   Result gates (D-034) — verify each output before the next irreversible step;
-   executing the procedure is not evidence it worked:
-   (a) BEFORE pushing a fix branch: `git log <base>..<fix-branch> --first-parent
-   --oneline | wc -l` must match the scan's pending-commit count for that branch
-   (plus your own merge commits). A sweep range is a few to a few dozen commits —
-   an anomalous count (hundreds) means a wrong merge base or wrong merge source:
-   HALT and investigate, never push.
-   (b) BEFORE `gh pr create`: `git diff <base>...<fix-branch> --stat` must be
-   non-empty, AND the changed files must plausibly be the upstream range plus the
-   branch's owned_paths/touch_paths from the inventory. Empty diff = the base is
-   already current: record that in the ledger, delete the fix branch, NO PR.
-   Only then open the PR via `gh pr create` (traceability).
-   Simple resolutions: merge the PR yourself if checks are green. Complex or
-   judgment-needing: leave the PR open with your provisional resolution + rationale.
-   Unresolvable (D-030): push the `fix/sweep/*` branch pointing at the upstream
-   stop-point commit — the pending upstream commits verbatim, NO resolution, NO
-   committed conflict markers, and NEVER a NOTES.md file — and open a DRAFT PR
-   against the affected branch. GitHub shows the real upstream diff and flags the PR
-   unmergeable; that unmergeable state is the conflict exhibit. All analysis
-   (conflict inventory, per-file ours/theirs hunks, options, one-command
-   reproduction) goes in the PR DESCRIPTION. Branch frozen in the ledger. When the
-   owner decides, implement the resolution as a merge commit on the SAME branch —
-   the PR turns mergeable (case-3 shape) with full history.
-   Freeze guards (D-030): before opening any freeze PR, check `fix/sweep/*` PRs for
-   the same branch, open AND closed (`gh pr list --state all`) — a closed freeze PR
-   plus a merged fix PR means the decision was already made: record it (Registry
-   upkeep), never re-open. Never freeze a branch the current scan reports as merging
-   clean. An overlap whose decision is already recorded in the inventory
-   (`prompt.extra_context`) is one digest line, never a new freeze.
+4. Propagate via the MECHANICAL DRIVER (D-041; spec `scripts/sweep/PROPAGATION.md`
+   is authoritative, decisions D-035..D-040). The driver owns ordering
+   (breadth-wise DAG barrier), merge-point selection, tier classification
+   (demotion-only), no-op skips, DEFERRED matching, durable freezes (ledger),
+   pass pinning and the journal. You NEVER hand-run `git merge`/`update-ref` on
+   inventory branches and never choose merge heads — the old hand-sequenced
+   procedure is retired. Loop (all commands from the clone root):
+   - `pnpm exec tsx scripts/sweep/propagate.ts plan --repo . --workspace ..` —
+     ONLY `plan` opens a pass. Post the plan digest here before executing.
+   - `... run` — dry-run first, review, then `--execute`: CLEAN merges, no-op
+     skips and DEFERRED marks land mechanically; each conflict emits a case
+     file + a driver-created worktree under the pass dir and halts that branch.
+   - Per case: resolve ONLY inside the driver's case worktree, commit there,
+     then `... resolve --case <id> --tier mechanical|judged --resolved-ref
+     <commit>` (dry-run first; `--tier held` = cannot-resolve, freezes with a
+     real-diff draft PR prepared, D-030 shape). The first `resolve --execute`
+     regenerates `coldread-request.md` with YOUR resolution diff and exits
+     asking for a verdict: produce `coldread-verdict.json` via a CONTEXT-FREE
+     subagent (D-031 — hand it ONLY the request file; the verdict must carry
+     the resolved tree OID), then re-run resolve. A scope-guard violation or
+     cold-read reject freezes the branch — never argue with the driver;
+     report it in the digest.
+   - `... verify` after the executable portion of the pass and after every
+     landed resolve; red = automatic rollback to the journaled pre-ref +
+     HELD(gate). Nothing is pushed before verify is green.
+   - `... status` for pass state; `... unfreeze` ONLY on explicit owner
+     instruction, journaled.
+   PRs: the driver PREPARES `fix/sweep/*` branches, PR body files and exact
+   `gh` commands under the pass dir (JUDGED and HELD). Pushing branches and
+   creating PRs remain YOUR actions under the existing gates: D-034 result
+   gates before any push, D-031 cold reader on the PR text — enrich the
+   prepared body to the PR-composition standards below before `gh pr create`.
+   Recurring-decision guards stay in force: an overlap or conflict whose
+   decision is already recorded in the inventory (`prompt.extra_context`) is
+   one digest line, never a new freeze PR; check open AND closed `fix/sweep/*`
+   PRs before pushing a freeze PR the driver prepared.
+   **OWNER FREEZE (2026-07-18, still in force):** pushing branches and creating
+   PRs is frozen until the owner lifts it in writing. Local driver passes
+   (plan / run / resolve / verify inside your clone) are allowed when the owner
+   asks for them — nothing leaves the clone.
 5. Verify what you can (`pnpm exec tsc --noEmit`, `pnpm exec vitest run` in the clone;
    container/bun tests may not run in this environment — if a gate cannot run, say so
    explicitly in the PR/digest; a merge is not "verified" until the full matrix ran
