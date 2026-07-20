@@ -168,17 +168,33 @@ The driver is the only author of merge parameters. Artifacts live under
   floor, conflicted paths, automerge tree (conflict markers), one-command reproduction,
   DEFERRED-check inputs. The agent resolves ONLY inside the driver-created worktree for
   that case, commits, and runs `resolve --case <id> --tier mechanical|judged`.
-- **Scope guard (D-038):** on resolve, the driver computes
-  `git diff --name-only <automerge-tree> <resolved-tree>`; the set must be a subset of
-  the case's conflicted paths. Any extra path auto-demotes (MECHANICAL→JUDGED,
-  JUDGED→HELD) — no discussion, journaled. File-level is the enforced check; hunk-level
-  review belongs to the cold reader.
+- **Case re-verification at resolve (trust boundary):** everything under the workspace
+  is agent-writable, so `case-*.json` is a POINTER, never an authority. At resolve the
+  driver re-derives from git + registry everything it is about to act on: the head sha
+  must lie on the named parent's eligible line for this pass; the automerge tree and
+  conflicted-path set are RECOMPUTED via merge-tree against the branch's current tip
+  (the recorded values are only cross-checked for drift reporting); the tier floor is
+  re-derived from the registry; the case must correspond to an open `case` journal
+  entry with no later `resolved`/`held` for the same id, and the branch tip must not
+  already contain the head (double-resolve guard — a crash between ref-update and
+  journal append must not allow a second merge). Any mismatch = hard halt, journaled.
+- **Scope guard (D-038, tightened 2026-07-20 post-review):** on resolve, the driver
+  computes `git diff --name-only <automerge-tree> <resolved-tree>`; the set must be a
+  subset of the recomputed conflicted paths. Any extra path → **HELD, no merge** —
+  a demotion to JUDGED would still land the out-of-scope content, defeating the guard
+  (supersedes the earlier demote-one-tier rule; owner may relax). File-level is the
+  enforced check; hunk-level review belongs to the cold reader.
 - **Cold-read artifact:** the driver emits `coldread-request.md` (conflict hunks from
   the automerge tree + resolution diff + the four cold-reader questions of D-031 —
   nothing else, so the resolving agent cannot frame the question) and requires
-  `coldread-verdict.json` (`confirm|reject`, reviewer notes) before accepting a
-  MECHANICAL or JUDGED completion. The verdict is produced by a context-free subagent
-  per D-031/D-034 (doctrine-enforced); the driver enforces its presence and shape.
+  `coldread-verdict.json` before accepting a MECHANICAL or JUDGED completion. The
+  verdict must VALIDATE: `verdict` ∈ {`confirm`,`reject`}, non-empty `notes`, and a
+  `resolvedTree` field equal to the tree OID of `--resolved-ref` (freshness binding —
+  the verdict attests to THIS resolution, not an earlier one); malformed or stale
+  verdicts are rejected, never treated as confirm. The verdict is produced by a
+  context-free subagent per D-031/D-034 — the driver can enforce shape and freshness,
+  but provenance (that a context-free reader wrote it) is doctrine-enforced and
+  ultimately needs an enforcement layer outside the agent-writable workspace.
 
 After a JUDGED resolution or a HELD freeze the driver **prepares** the PR mechanics but
 does not talk to GitHub: it creates the local `fix/sweep/<date>-<topic>` branch at the
@@ -219,17 +235,43 @@ descendants pick up the resolution — the pass converges without waiting for a 
 watermark.
 
 `run` after a `resolve` is idempotent: completed branches re-verify as up-to-date and
-are skipped; the plan is re-derived and must match (a mismatch means git moved under
-us — halt loudly). All mutations happen via journaled subcommands (D-013); the journal
-is `pass-<watermark12>/journal.jsonl`, append-only.
+are skipped. The plan-equivalence "halt loudly" check belongs to `run` — BEFORE
+executing, the live re-derivation must match the pass's last written plan for all
+not-yet-arrived branches (a mismatch means git moved under us); `plan` on a pass with
+journal activity reports rather than halts (post-merge state legitimately differs
+from the opening snapshot, which is preserved as `plan-initial.json`). All mutations
+happen via journaled subcommands (D-013); the journal is
+`pass-<watermark12>/journal.jsonl`, append-only.
+
+**Pass pinning:** only `plan` may open a pass (creating the pass dir from a freshly
+resolved watermark). `run`/`resolve`/`status` attach to the latest OPEN pass dir
+(no `pass-complete` journal entry) — or `--pass <watermark12>` explicitly — and take
+the watermark and fork point from its `plan-initial.json`, never re-resolving refs.
+A mid-pass `git fetch` therefore cannot silently start a new pass or orphan the
+in-flight journal and HELD registry. `run` journals `pass-complete` when it finishes
+with no open cases and the §9 gate is green.
+
+**Durable freezes (ledger):** HELD outlives the pass. On `held` the driver writes the
+group ledger (`ledger.ts`: status `frozen`, `frozenBy` = case id); `plan`/`run` treat
+ledger-frozen branches as arriving with an empty interval (barrier satisfied, no
+merges) until a `resolve` clears the HELD record AND unfreezes the ledger entry. The
+per-pass journal remains the intra-pass registry; the ledger is the cross-pass one.
+Before ANY ref mutation on a branch, its pre-pass tip is journaled
+(`pre-ref`) — the §9 rollback target.
+
+**Naming:** resolution/freeze branches are `fix/sweep/<date>-<topic>-h<height>` so two
+cases on one branch in one day cannot collide; case ids are unique per pass by
+construction (branch + height).
 
 ## 9. Verification gate
 
-Reuses the existing `verify` stage (everything rebuild + CI command list, leave-one-out
-attribution): runs after `run` completes the executable portion of a pass and after
-each `resolve` that lands a merge. Red result → offending branch rolled back to its
-journaled pre-pass ref and demoted HELD(gate) (D-012); re-verify without it. Nothing is
-pushed before verification passes (D-034 gate 1-2 additionally apply to any push).
+Implemented as `propagate verify` (reusing the existing `verify.ts` everything-rebuild
++ CI command list with leave-one-out attribution): run it after `run` completes the
+executable portion of a pass and after each `resolve` that lands a merge. Red result →
+the offending branch is rolled back to its journaled `pre-ref` (recorded before its
+first mutation this pass) and journaled HELD(gate) + ledger-frozen (D-012); re-verify
+without it. A pass is only `pass-complete` when the gate is green. Nothing is pushed
+before verification passes (D-034 gate 1-2 additionally apply to any push).
 
 ## 10. Module layout (new files, flat per convention; reuse map)
 
