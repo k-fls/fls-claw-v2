@@ -159,3 +159,40 @@ describe('derivePlan — DEFERRED to a HELD ancestor', () => {
     expect(p.parents[0].case?.conflictedPaths).toEqual(['src/x.ts']);
   });
 });
+
+// --- annotate-class detection (§1 D-002, SPEC 2) --------------------------
+describe('derivePlan — annotate-class (clean merge THROUGH a HELD-ancestor height)', () => {
+  // feat/c (coverage -1) merges main_patched cleanly to height 0; main_patched
+  // is a transitive ancestor recorded HELD at height 0 (within the merge window).
+  const repo = initFixtureRepo();
+  repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+  const base = repo.sha('main');
+  repo.checkout('main_patched', { create: true, at: 'main' });
+  repo.checkout('feat/c', { create: true, at: 'main_patched' }); // cut BEFORE the merge -> coverage -1
+  repo.checkout('main');
+  repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+  repo.checkout('main_patched');
+  repo.git('merge', '--no-edit', '-m', 'main_patched merges U0', 'main'); // main_patched covers h0
+  repo.checkout('main');
+  afterAll(() => repo.destroy());
+
+  const features: FeatureEntry[] = [
+    { id: 'c', name: 'c', kind: 'feat', status: 'shipped', branch: 'feat/c', parents: ['main_patched'] },
+  ];
+
+  it('flags annotate when a HELD ancestor height lies in the merge window', async () => {
+    const held = [{ branch: 'main_patched', height: 0, conflictedPaths: ['src/x.ts'], caseId: 'mp' }];
+    const plan = await derivePlan({ repo: repo.dir, upstreamRef: 'main', base, features, scope: {}, held });
+    const c = plan.branches.find((b) => b.branch === 'feat/c')!;
+    expect(c.parents[0].verdict).toBe('merge');
+    expect(c.parents[0].annotate).toEqual({ heldAncestor: 'main_patched', height: 0 });
+  });
+
+  it('no annotate when the HELD ancestor height is outside the merge window', async () => {
+    const held = [{ branch: 'main_patched', height: 5, conflictedPaths: ['src/x.ts'], caseId: 'mp' }];
+    const plan = await derivePlan({ repo: repo.dir, upstreamRef: 'main', base, features, scope: {}, held });
+    const c = plan.branches.find((b) => b.branch === 'feat/c')!;
+    expect(c.parents[0].verdict).toBe('merge');
+    expect(c.parents[0].annotate ?? null).toBeNull();
+  });
+});

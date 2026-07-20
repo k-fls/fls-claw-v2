@@ -319,6 +319,12 @@ export interface ParentPlan {
   skipReason: string | null;
   /** Forced (empty) merge to honour the leaf/always_merge rule (§6). */
   forced?: boolean;
+  /**
+   * Annotate-class flag (§1, D-002): a CLEAN merge whose merged range passes
+   * THROUGH a height at which a transitive ancestor is HELD. Never gates — the
+   * pass report surfaces it. `null` unless it applies.
+   */
+  annotate?: { heldAncestor: string; height: number } | null;
 }
 
 /** A branch's whole-pass plan row (`plan.json`). */

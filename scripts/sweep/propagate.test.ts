@@ -1,11 +1,22 @@
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { initFixtureRepo, type FixtureRepo } from './fixtures.js';
 import { addTempWorktree, commitInfo, isAncestor, listTreePaths } from './git.js';
 import { readLedger } from './ledger.js';
+import { DriverHalt, guardRef } from './propagate.js';
 import {
   cmdPlan,
   cmdResolve,
@@ -788,5 +799,247 @@ describe('propagate — unfreeze paths (§8, CHANGE 2)', () => {
     );
     expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.status).toBe('active');
     expect(readJournal(dir).some((e) => e.action === 'unfrozen' && e.reason === 'manual')).toBe(true);
+  });
+});
+
+// --- B8: multi-parent same-height cases are distinct + both resolvable -----
+describe('propagate — B8: two parents conflicting at the same height are distinct cases', () => {
+  it('does not deadlock: each parent conflict is its own case, resolved sequentially', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base', { 'src/a.ts': 'orig\n', 'src/b.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.checkout('feat/p1', { create: true, at: 'main_patched' });
+    repo.commit('p1: a', { 'src/a.ts': 'P1\n' });
+    repo.checkout('main_patched');
+    repo.checkout('feat/p2', { create: true, at: 'main_patched' });
+    repo.commit('p2: b', { 'src/b.ts': 'P2\n' });
+    repo.checkout('main_patched');
+    repo.checkout('feat/c', { create: true, at: 'main_patched' });
+    repo.commit('c: a+b', { 'src/a.ts': 'C\n', 'src/b.ts': 'C\n' });
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'p1', branch: 'feat/p1', parents: ['main_patched'] },
+      { id: 'p2', branch: 'feat/p2', parents: ['main_patched'] },
+      { id: 'c', branch: 'feat/c', parents: ['feat/p1', 'feat/p2'] },
+    ]);
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, o);
+
+    await cmdPlan(cli({ cmd: 'plan' }));
+    await cmdRun(cli({ cmd: 'run', execute: true }));
+    const case1 = readJournal(dir).find((e) => e.action === 'case' && e.branch === 'feat/c')!.caseId as string;
+    // Resolve case1 (whichever parent came first) within its conflicted files.
+    const cf1 = readCase(dir, case1);
+    const files1 = Object.fromEntries(cf1.conflictedPaths.map((p) => [p, 'MERGED\n']));
+    const rr1 = await buildResolution(repo, cf1.automergeTree, files1);
+    writeVerdict(dir, case1, repo, rr1);
+    expect(
+      await cmdResolve(cli({ cmd: 'resolve', execute: true, caseId: case1, tier: 'mechanical', resolvedRef: rr1 })),
+    ).toBe(0);
+
+    // Re-run surfaces the OTHER parent's case at the SAME height — distinct id.
+    await cmdRun(cli({ cmd: 'run', execute: true }));
+    const cases = readJournal(dir)
+      .filter((e) => e.action === 'case' && e.branch === 'feat/c')
+      .map((e) => e.caseId as string);
+    const case2 = cases.find((c) => c !== case1)!;
+    expect(case2).toBeTruthy();
+    expect(case2).not.toBe(case1); // B8: no collision despite same height
+    const cf2 = readCase(dir, case2);
+    const files2 = Object.fromEntries(cf2.conflictedPaths.map((p) => [p, 'MERGED2\n']));
+    const rr2 = await buildResolution(repo, cf2.automergeTree, files2);
+    writeVerdict(dir, case2, repo, rr2);
+    // The second case is RESOLVABLE (would deadlock under branch+height ids).
+    expect(
+      await cmdResolve(cli({ cmd: 'resolve', execute: true, caseId: case2, tier: 'mechanical', resolvedRef: rr2 })),
+    ).toBe(0);
+    expect(cf1.head.height).toBe(cf2.head.height); // same height, distinct cases
+  });
+});
+
+// --- B6: checked-out worktree dirty-check + abort ---------------------------
+describe('propagate — B6: journaledMerge guards the checked-out worktree', () => {
+  it('halts (does not touch) when the target worktree is dirty', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.checkout('main');
+    repo.commit('U0: util', { 'src/util.ts': 'u\n' }); // clean merge available for main_patched
+    cleanups.push(() => repo.destroy());
+
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    // Check out main_patched in a worktree and dirty it.
+    const wtPath = mkdtempSync(join(tmpdir(), 'b6-wt-'));
+    repo.git('worktree', 'add', wtPath, 'main_patched');
+    writeFileSync(join(wtPath, 'dirty.txt'), 'uncommitted\n');
+    cleanups.push(() => {
+      try {
+        repo.git('worktree', 'remove', '--force', wtPath);
+      } catch {
+        /* ignore */
+      }
+    });
+
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    const before = repo.sha('main_patched');
+    expect(await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }))).toBe(1);
+    expect(repo.sha('main_patched')).toBe(before); // not touched
+    expect(readJournal(dir).some((e) => e.action === 'halt' && e.reason === 'dirty-worktree')).toBe(true);
+    expect(repo.git('-C', wtPath, 'status', '--porcelain')).toContain('dirty.txt'); // worktree not stranded mid-merge
+  });
+});
+
+// --- B7: forced un-skip at coverage -1 (fork-only) --------------------------
+describe('propagate — B7: leaf un-skip completes when the forced parent has no chain coverage', () => {
+  it('a forced merge with height -1 passes step verification', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base: f', { 'src/f.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: f = fork', { 'src/f.ts': 'fork\n' }); // main_patched conflicts with U0 -> stays coverage -1
+    repo.checkout('feat/a', { create: true, at: 'main_patched' });
+    repo.commit('feat/a: own', { 'src/a.ts': 'a\n' });
+    repo.checkout('feat/b', { create: true, at: 'feat/a' });
+    repo.commit('feat/b: own', { 'src/b.ts': 'b\n' });
+    repo.checkout('main');
+    repo.commit('U0: f = up1', { 'src/f.ts': 'up1\n' }); // progress; conflicts main_patched
+    cleanups.push(() => repo.destroy());
+
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'a', branch: 'feat/a', parents: ['main_patched'] },
+      { id: 'b', branch: 'feat/b', parents: ['feat/a'] },
+    ]);
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, o);
+    await cmdPlan(cli({ cmd: 'plan' }));
+    // main_patched gates on its own U0 conflict, but the feat/b leaf un-skip must
+    // still complete (forced merges at height -1, main_patched coverage -1).
+    expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
+    expect(readJournal(dir).some((e) => e.action === 'halt' && e.reason === 'step-verification-failed')).toBe(false);
+    const forced = readJournal(dir).filter((e) => e.action === 'merge' && e.forced === true);
+    expect(forced.map((e) => e.branch).sort()).toEqual(['feat/a', 'feat/b']);
+    expect((await commitInfo(repo.dir, 'feat/b')).parents.length).toBe(2);
+  });
+});
+
+// --- N4: dry-run purity -----------------------------------------------------
+function snapshotTree(root: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!existsSync(root)) return out;
+  const walk = (d: string): void => {
+    for (const name of readdirSync(d)) {
+      const p = join(d, name);
+      if (statSync(p).isDirectory()) walk(p);
+      else out[relative(root, p)] = readFileSync(p, 'utf8');
+    }
+  };
+  walk(root);
+  return out;
+}
+
+describe('propagate — N4: dry-run run makes NO state changes', () => {
+  it('leaves the workspace + ledger byte-identical', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    const before = snapshotTree(ws);
+    // Dry-run run (no --execute): must not write anything.
+    expect(await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: false }))).toBe(0);
+    expect(snapshotTree(ws)).toEqual(before);
+    const mpBefore = repo.sha('main_patched');
+    expect(repo.sha('main_patched')).toBe(mpBefore); // no merges either
+  });
+});
+
+// --- N1: protected-ref guard at the write choke point -----------------------
+describe('propagate — N1: protected-ref guard refuses at the write', () => {
+  it('refuses protected namespaces and out-of-scope branches; allows in-scope + fix/sweep', () => {
+    const scope = new Set(['feat/in', 'main_patched']);
+    for (const bad of ['main', 'design/x', 'maint/y', 'everything', 'test/z']) {
+      expect(() => guardRef(bad, scope)).toThrow(DriverHalt);
+    }
+    expect(() => guardRef('feat/out', scope)).toThrow(/outside the pass/);
+    expect(() => guardRef('feat/in', scope)).not.toThrow();
+    // fix/sweep/* is scope-exempt (new) but still namespace-checked.
+    expect(() => guardRef('fix/sweep/2026-x', new Set(), { fixSweep: true })).not.toThrow();
+    expect(() => guardRef('main', new Set(), { fixSweep: true })).toThrow(/protected/);
+  });
+});
+
+// --- SPEC 1: driver-created resolution worktree -----------------------------
+describe('propagate — SPEC 1: resolution worktree created at case emission, removed on resolve', () => {
+  it('materializes the automerge tree and cleans up', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
+    const wtPath = join(dir, caseId, 'worktree');
+    expect(existsSync(wtPath)).toBe(true);
+    // The conflicted file carries conflict markers (the automerge content).
+    expect(readFileSync(join(wtPath, 'src/x.ts'), 'utf8')).toContain('<<<<<<<');
+    expect(readJournal(dir).some((e) => e.action === 'case-worktree' && e.caseId === caseId)).toBe(true);
+
+    // Resolve -> worktree removed + journaled.
+    const cf = readCase(dir, caseId);
+    const rr = await buildResolution(repo, cf.automergeTree, { 'src/x.ts': 'RESOLVED\n' });
+    writeVerdict(dir, caseId, repo, rr);
+    expect(
+      await cmdResolve(
+        baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef: rr }),
+      ),
+    ).toBe(0);
+    expect(existsSync(wtPath)).toBe(false);
+    expect(readJournal(dir).some((e) => e.action === 'worktree-removed' && e.caseId === caseId)).toBe(true);
+  });
+});
+
+// --- SPEC 2: annotate-class journaled + surfaced ----------------------------
+describe('propagate — SPEC 2: annotate-class run journaling', () => {
+  it('journals annotate when a clean merge passes through a HELD ancestor height', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    const base = repo.sha('main'); // pin the fork point BELOW U0 so U0 is chain height 0
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.checkout('feat/c', { create: true, at: 'main_patched' }); // coverage -1
+    repo.checkout('main');
+    repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+    repo.checkout('main_patched');
+    repo.git('merge', '--no-edit', '-m', 'main_patched merges U0', 'main'); // main_patched covers h0
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'c', branch: 'feat/c', parents: ['main_patched'] }]);
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, { base, ...o });
+    await cmdPlan(cli({ cmd: 'plan' }));
+    // Seed a HELD ancestor (main_patched @ h0) so feat/c's clean merge through h0
+    // is annotate-class; main_patched itself is skipped (frozen-in-journal).
+    appendFileSync(
+      join(dir, 'journal.jsonl'),
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        action: 'held',
+        branch: 'main_patched',
+        caseId: 'mp',
+        height: 0,
+        conflictedPaths: ['src/x.ts'],
+      }) + '\n',
+    );
+    expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
+    const ann = readJournal(dir).find((e) => e.action === 'annotate' && e.branch === 'feat/c');
+    expect(ann).toBeTruthy();
+    expect(ann!.heldAncestor).toBe('main_patched');
+    expect(ann!.height).toBe(0);
+    expect(await cmdStatus(cli({ cmd: 'status' }))).toBe(0);
   });
 });

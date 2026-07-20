@@ -31,8 +31,19 @@ async function treeOf(repo: string, commit: string): Promise<string> {
   return (await git(repo, ['rev-parse', `${commit}^{tree}`])).stdout.trim();
 }
 
-export function caseId(branch: string, height: number): string {
-  return `${branch.replace(/\//g, '__')}-h${height}`;
+/** Sanitize a branch/parent name for use in a case id or path segment. */
+export function slug(name: string): string {
+  return name.replace(/\//g, '__');
+}
+
+/**
+ * Case id = branch + PARENT + height (B8). The parent slug is essential: a
+ * multi-parent branch whose two parents conflict at the SAME height would
+ * otherwise collide on branch+height, and the double-resolve guard would make
+ * the second case unresolvable for the whole pass (deadlock).
+ */
+export function caseId(branch: string, parent: string, height: number): string {
+  return `${slug(branch)}--${slug(parent)}-h${height}`;
 }
 
 export function writeJsonFile(path: string, value: unknown): void {
@@ -132,7 +143,26 @@ export async function verifyStepFile(repo: string, step: StepFile, ctx: StepVeri
         continue;
       }
       const { sha, height } = m.head;
-      if (height < 0 || height >= chainLen) {
+
+      if (m.forced) {
+        // Forced (empty) merge for the leaf rule (§6): the head is the PARENT
+        // TIP, whose derived coverage may be -1 (fork-only pass, no chain commit
+        // is an ancestor). Skip the chain-range/coverage checks — only require
+        // the head sha to be the parent tip (parent legality checked above).
+        const parentTip = await revParse(repo, m.parent);
+        if (sha !== parentTip) {
+          push(`forced merge from '${m.parent}' head ${sha.slice(0, 12)} != parent tip ${parentTip.slice(0, 12)}`);
+        } else {
+          landedRealMerge = true;
+        }
+        continue;
+      }
+
+      // Upper bound only: height must not exceed the watermark. The lower bound
+      // is model-specific — a parents-model fork-only head has derived coverage
+      // -1 (no chain commit is an ancestor), which is legitimate; the entry
+      // sha-check below rejects a negative height for the entry model.
+      if (height >= chainLen) {
         push(`head height ${height} out of range (chain length ${chainLen}) — height > watermark`);
         continue;
       }
@@ -159,12 +189,6 @@ export async function verifyStepFile(repo: string, step: StepFile, ctx: StepVeri
           push(`parents head ${sha.slice(0, 12)} derived coverage ${cov} != claimed height ${height}`);
           continue;
         }
-      }
-
-      if (m.forced) {
-        // Forced (empty) merge for the leaf rule: no skip-claim recompute.
-        landedRealMerge = true;
-        continue;
       }
 
       // A real merge must actually change the branch tree; a no-op should have

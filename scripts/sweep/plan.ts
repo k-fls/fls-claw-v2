@@ -140,6 +140,17 @@ async function analyzeParent(
     }
   }
 
+  // Annotate-class (§1, D-002): a CLEAN merge whose merged range passes THROUGH
+  // a height at which a transitive ancestor is HELD. Never gates — surfaced in
+  // the pass report. Window is (coverage, mergePoint.height].
+  if (realMerge && sweep.mergePoint) {
+    const ancestorSet = new Set(ancestors);
+    const hit = held.find(
+      (h) => ancestorSet.has(h.branch) && h.height > line.coverage && h.height <= sweep.mergePoint!.height,
+    );
+    if (hit) pp.annotate = { heldAncestor: hit.branch, height: hit.height };
+  }
+
   if (realMerge) pp.verdict = 'merge';
   else if (pp.deferredTo) pp.verdict = 'defer';
   else if (pp.case) pp.verdict = 'case';

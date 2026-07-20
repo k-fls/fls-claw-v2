@@ -173,8 +173,10 @@ export async function mergePointSweep(repo: string, branchRef: string, line: Eli
   for (const p of probes)
     if (p.clean && (mergePoint === null || p.head.height > mergePoint.height)) mergePoint = p.head;
 
-  // Step 4: smallest conflicting height ABOVE the merge point.
-  const floor = mergePoint?.height ?? -1;
+  // Step 4: smallest conflicting height ABOVE the merge point. When there is no
+  // clean head the floor is below EVERY head — heights can be -1 (fork-only), so
+  // -Infinity, not -1, or a fork-only conflict at height -1 would be missed.
+  const floor = mergePoint?.height ?? Number.NEGATIVE_INFINITY;
   let firstConflict: MergePointResult['firstConflict'] = null;
   for (const p of probes) {
     if (!p.clean && p.head.height > floor && (firstConflict === null || p.head.height < firstConflict.head.height)) {
