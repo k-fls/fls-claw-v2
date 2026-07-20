@@ -26,7 +26,7 @@ mechanics: `scripts/sweep/README.md` + `DESIGN.md` on branch `feat/maintenance-s
    parents-before-children. Conflicts resolve once at the topmost affected branch;
    descendants inherit the resolution via their parent merges (never re-present a
    parent's conflict in a child PR). ALL of these invariants are ENFORCED by the
-   propagation driver (sweep-loop step 4, D-041) — you never sequence or execute
+   propagation driver (sweep-loop step 4, D-044) — you never sequence or execute
    inventory-branch merges by hand.
 5. If upstream history is force-pushed/rewritten: halt, report, never "fix" it.
 6. Anything ambiguous, security-flagged (sensitive-surface PoIs), or OVERLAP-HIGH goes
@@ -79,7 +79,7 @@ report it to the owner.
 3. Route annotate-PoIs (`route`) and run overlap checks with the registry prompts
    (spawn one subagent per routed feature; prompts are self-contained). Report
    OVERLAP-HIGH findings as high priority.
-4. Propagate via the MECHANICAL DRIVER (D-041; spec `scripts/sweep/PROPAGATION.md`
+4. Propagate via the MECHANICAL DRIVER (D-044; spec `scripts/sweep/PROPAGATION.md`
    is authoritative, decisions D-035..D-040). The driver owns ordering
    (breadth-wise DAG barrier), merge-point selection, tier classification
    (demotion-only), no-op skips, DEFERRED matching, durable freezes (ledger),
