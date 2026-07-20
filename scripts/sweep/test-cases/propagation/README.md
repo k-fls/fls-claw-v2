@@ -63,6 +63,29 @@ New fields needed by the propagation semantics (documented here, used in
   clean/conflict profile over the chain.
 - `resolution_ref:` recorded merge commit that resolved the pinned conflict
   (rerere seed), where one exists.
+- `pin_patch:` (single-commit fork-branch cases only) path under `pins/` to a
+  `git diff --binary main <tip>` patch. When the pinned `tip` sha is unreachable
+  (`git cat-file -e` fails), the replay applies this patch to `main` in a
+  detached temp worktree and `commit-tree`s it, recreating the exact tip tree
+  with merge-base `main` — so all probes reproduce. See "Pin-by-patch" below.
+
+## Pin-by-patch (2026-07-20)
+
+`fix/main/role-grant-scope-clarity` (case `p7`) was **rebased by the owner** on
+2026-07-20; its mined tip `a512bc9f` is now unreachable and will be gc-pruned.
+Rather than re-anchor with a tag/ref (which we deliberately do not create), p7
+carries `pin_patch: pins/p7-fix-main-role-grant-scope-clarity.patch`. Applying it
+to `main` (`cb6e3d11`) yields tree `278894c58d4e067d73be2b9133260ff3a2851446`
+(= `a512bc9f^{tree}`); the merge base with the chain is `main` either way (the
+branch was cut from `main`), so p7's assertions hold identically (conflict-tree
+OIDs are not asserted). The replay `synthesize`s this on demand and also has a
+dedicated FALLBACK test that forces the synthesis path so it cannot rot while
+the live sha still exists. All propagation-case skips are LOUD (`console.warn`
+naming the case + vanished anchor) — a green run can never hide a pruned anchor.
+
+Only SINGLE-commit fork branches are patch-pinned. The multi-commit fork tips
+(`p2`/`p4`/`p5`/`p6`) are NOT: a patch vs `main` would be huge and fragile — if
+those branches rebase, **re-mine** the case rather than patch-pin it.
 
 ## Verification quirks (inherited + new)
 
