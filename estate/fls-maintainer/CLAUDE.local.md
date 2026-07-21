@@ -141,10 +141,18 @@ report it to the owner.
    decision is already recorded in the inventory (`prompt.extra_context`) is
    one digest line, never a new freeze PR; check open AND closed `fix/sweep/*`
    PRs before pushing a freeze PR the driver prepared.
-   **OWNER FREEZE (2026-07-18, still in force):** pushing branches and creating
-   PRs is frozen until the owner lifts it in writing. Local driver passes
-   (plan / run / resolve / verify inside your clone) are allowed when the owner
-   asks for them — nothing leaves the clone.
+   **OWNER FREEZE (2026-07-18, amended 2026-07-21 D-047):** merging PRs and pushing
+   protected branches remain FROZEN — owner-only. EXCEPTION (D-047): driver-prepared
+   `fix/sweep/*` branches and their DRAFT PRs must be pushed/created via the
+   prepared gh-commands (after the D-031 cold read on the PR text) — a freeze or
+   judged case the owner cannot open on GitHub does not exist as far as the owner
+   is concerned. Never merge any PR yourself while this freeze stands.
+   **Driver bugs (D-047):** when the propagation driver itself crashes or
+   misbehaves (a thrown error, a wrong verdict, an impossible state), file a
+   GitHub ISSUE immediately: `gh issue create --label sweep-driver` — title = the
+   broken invariant, body = exact command, pass dir + journal pointer, observed vs
+   expected, minimal reproduction. Reference the issue NUMBER in your final
+   message; no fix analysis in chat, and NEVER patch driver code yourself (rule 3).
 5. Verify what you can (`pnpm exec tsc --noEmit`, `pnpm exec vitest run` in the clone;
    container/bun tests may not run in this environment — if a gate cannot run, say so
    explicitly in the PR/digest; a merge is not "verified" until the full matrix ran
