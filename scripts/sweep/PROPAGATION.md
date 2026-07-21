@@ -1,6 +1,7 @@
 # Mechanical propagation driver — specification
 
-Status: v1 (2026-07-18, owner-settled design). Decision references D-035..D-040 point to
+Status: v1 (2026-07-18, owner-settled design; §13 remote branches + inventory candidates
+added 2026-07-21, D-045). Decision references D-035..D-040 and D-045 point to
 the decision log (`self-maintenance-decisions.md`). Supersedes the agent-sequenced merge
 loop of DESIGN.md §5-6 for propagation ordering, merge execution, and case handling;
 scan/PoI routing/inventory/verify machinery is reused, not replaced.
@@ -119,6 +120,13 @@ child, the parent tip itself (at its derived height) is the single candidate hea
 Otherwise a fork fix merged into a parent would not reach descendants until upstream
 next advances (violating the D-032a parent-tip inheritance model). The normal ladder,
 no-op check, and DEFERRED rule apply to that head like any other.
+
+**Source refs (D-045, §13):** a branch (or parent) that exists only as
+`origin/<name>` is still in scope; every plan-time read — tips, coverage, eligible
+lines, merge-tree probes — uses the origin commit (probes pass pinned SHAs anyway,
+§3), and the plan row is flagged `materialize`. `plan` and dry-run `run` never write
+refs; the local branch is created by `run --execute` before the branch's first
+mutation (§8). A branch present in NEITHER place remains a loud scope-drift warning.
 
 ## 5. DEFERRED — conflicts that belong to an ancestor (D-036)
 
@@ -295,6 +303,18 @@ A mid-pass `git fetch` therefore cannot silently start a new pass or orphan the
 in-flight journal and HELD registry. `run` journals `pass-complete` when it finishes
 with no open cases and the §9 gate is green.
 
+**Origin sync (D-045, §13):** the driver never operates on refs/remotes directly. At
+`run --execute`, before a branch's first mutation this pass, one journaled sync step
+reconciles the LOCAL ref with `origin/<branch>` through the guardRef choke point
+(`plan` and dry-run `run` never write refs): no local ref → create it at the origin
+tip (`branch-materialized`; its §9 rollback target is the creation point); local
+strictly behind origin → fast-forward (`branch-synced`; a checked-out worktree uses
+the N1 dirty-guard + reset pattern); local ahead of origin → unpushed driver work, no
+action, no noise; DIVERGED → journaled DriverHalt for THAT branch only — it is
+skipped this pass (arriving for the barrier with an empty interval, like HELD) and
+reported; siblings keep processing. Diverged branches are owner escalations, never
+force-resolved by the driver or the agent.
+
 **Durable freezes (ledger):** HELD outlives the pass. On `held` the driver writes the
 group ledger (`ledger.ts`: status `frozen`, `frozenBy` = case id, `heldHead` = the
 conflicting head sha, `heldPaths` = its conflicted paths — the §5 cross-pass DEFERRED
@@ -354,6 +374,7 @@ before verification passes (D-034 gate 1-2 additionally apply to any push).
 | `scope-guard.ts` | automerge-vs-resolved subset check (§7) |
 | `steps.ts` | step/case JSON schemas + first-principles re-verification |
 | `propagate.ts` | CLI (`plan/run/resolve/status`), journal, worktree + PR preparation |
+| `candidates.ts` | inventory-candidate discovery + inheritance derivation + report throttle (§13, D-045) |
 
 Reused as-is: `git.ts` (merge-tree, rev-list, worktree helpers), `merge.ts` (merge-tree
 + commit-tree + update-ref execution, rerere install), `scan.ts`/`routing.ts` (PoI
@@ -370,6 +391,16 @@ annotate flow, unchanged), `scope.ts` (inventory scope + D-032b/D-033 compositio
   guard violation demotions; step re-verification rejecting a forged head/parent/height;
   watermark pinning (chain never re-read mid-pass); tier floor for edition-flagged
   entries; idempotent re-run after partial execution.
+- Remote branches + candidates (D-045, §13; fixtures fake `origin` via
+  refs/remotes/origin/* — `FixtureRepo.setOrigin`): all four sync states end-to-end at
+  the cmdRun level (materialize / fast-forward / ahead-no-op / diverged-halt with
+  siblings proceeding); `plan` flags `materialize`; dry-run `run` makes zero ref
+  writes; candidate derivation — clear cut-from an inventory branch, merged-into
+  descendant (`requiresEntryEdit`), ambiguous cut point (two owners → `unclear` +
+  open question), pre-fork branch (`no fork-era ancestry`); report throttle (quiet on
+  an unmoved tip, re-report on movement, `resolved` once on entry gain); candidates
+  never appear in the merge plan; an inventory entry with a parent missing from the
+  inventory/structural set hard-halts `plan` naming the entry.
 - Real cases: pinned-SHA case files in `scripts/sweep/test-cases/` (replay-model,
   checkout-free) mined from the fork + upstream DAG for each taxonomy class above where
   a real instance exists; they double as regression anchors and rerere seeds where a
@@ -397,3 +428,111 @@ afterthought:
 
 In-driver, defense-in-depth only: the protected-ref guard at the single ref-write
 choke point (§8) and first-principles re-derivation of everything derivable from git.
+
+## 13. Remote branches and inventory candidates (D-045)
+
+**Motivation (owner, 2026-07-20 live test):** (a) inventory branches existing only as
+`origin/*` remote-tracking refs were silently dropped from scope (scope read
+`git branch --list` only); (b) brand-new branches surfaced only as one-line
+scope-drift warnings. Directives: the driver must work with remote branches; new
+branches must be auto-discovered with a mechanically derived CANDIDATE record whose
+core is proper inheritance (parent AND descendants); unclear inheritance = ask the
+owner; **the inventory may only contain branches with proper/valid inheritance.**
+
+### 13.1 Remote-branch materialization + sync (code-enforced)
+
+The driver never operates on refs/remotes directly — it reconciles local branches
+with origin, then everything else stays local-ref-only:
+
+- **Scope/plan:** an inventory branch with no local ref but an existing
+  `origin/<branch>` is IN scope, planned normally (probes/coverage read the origin
+  commit — §4 source refs), plan row flagged `materialize: true`. A branch existing
+  in NEITHER place stays a loud drift warning.
+- **Sync step:** at `run --execute`, per in-scope branch BEFORE its first mutation
+  (journaled, through the guardRef choke point, `--execute`-gated — `plan` and
+  dry-run `run` never write refs): no local ref → create at origin tip
+  (`branch-materialized`); strictly behind → fast-forward (`branch-synced`, N1
+  dirty-guard + reset for checked-out worktrees); ahead → unpushed driver work, no
+  action, no noise; DIVERGED → per-branch DriverHalt (journaled): external history
+  the driver cannot reconcile — the branch is skipped this pass (empty-interval
+  barrier arrival) and reported; other branches proceed. Diverged branches are
+  **owner escalations** (agent duty: report, never force-resolve).
+- This supersedes the bootstrap "create a tracking branch for every origin branch"
+  loop in the group doctrine.
+
+### 13.2 Candidate discovery with inheritance derivation
+
+**Detection (code):** branches — local or origin/* — matching the sweepable
+namespaces (`module/**`, `feat/**`, `edition/**`, minus config/scope exclusions), or
+qualified by the D-032b/D-033 edition-composition closure, that have NO inventory
+entry. Candidates are **never merged or planned for propagation** — discovery and
+reporting only.
+
+**Inheritance derivation (code, `candidates.ts`):** mechanical and evidence-backed,
+both directions, every finding recorded with SHAs.
+
+- *Ownership model:* an established branch (inventory + main_patched) owns the
+  commits of its first-parent line that are neither reachable from the pinned trunk
+  nor on a DECLARED ancestor's line — declared inheritance explains sharing;
+  undeclared sharing does not (two entries sharing an undeclared fork-era segment
+  both "own" it — the ambiguous-cut-point case). A candidate owns only commits on no
+  other line.
+- *Fork point:* the candidate's first-parent-line divergence point from the fork
+  ancestry (first non-own commit walking tip-down) + its trunk coverage height
+  (heights.ts; −1 when below the pass chain).
+- *Proposed PARENTS, strongest evidence first:* (1) `cut-from` — the fork point is
+  owned by exactly ONE branch; owned by several → the specific "cut point ambiguous
+  between X@sha and Y@sha — which parent?" question; (2) `merged-from` — P-own
+  commits reachable from the candidate tip off its first-parent line and above the
+  fork point (fork-era reachability à la D-033; commits reachable from the trunk
+  never qualify); (3) `merge-base` — deepest merge-base among inventory branches,
+  ALWAYS an open question (thin evidence), never `clear` by itself.
+- *Proposed DESCENDANTS (the inverse):* `merged-into` — candidate-own commits
+  reachable from D's tip off D's first-parent line; `cut-of` — D's first-parent line
+  contains the candidate (or shares undeclared fork-era history with it; direction is
+  topologically undecidable and becomes an open question). A descendant finding is
+  flagged `requiresEntryEdit`: D's EXISTING entry needs its `parents` amended
+  (owner-approved, like any entry change).
+- *Confidence:* `clear` ONLY when at least one parent is derived and no open
+  question exists — unambiguous parent set, no merge-commit fork point, fork-era
+  ancestry present, no both-direction evidence, proposed edges acyclic (checked
+  against the declared DAG). Everything else is `unclear` and carries the SPECIFIC
+  question(s) for the owner. Never guess; never `clear` on thin evidence.
+- *Known limit:* "c cut from D" and "D cut from c" produce identical DAGs; where
+  both sides continued the driver applies the established-branch prior (candidate cut
+  from the inventory branch). Safe because no entry exists until the owner approves
+  the placement.
+
+**Artifacts + reporting (code):** per candidate,
+`<workspace>/inventory-candidates/<slug>.yaml` — branch, tip, discovered (pass
+watermark), forkPoint {sha,height}, coverage, proposedParents[{branch,evidence[]}],
+proposedDescendants[{branch,evidence[],requiresEntryEdit}], confidence,
+openQuestions[], changedFiles vs the strongest parent (capped at 40;
+`changedFilesTotal` notes the real count), `lastReportedTip`. Pass dir gets
+`candidates.json`. `plan` prints a CANDIDATES section for newly-reported candidates;
+`status` prints the full unresolved set — both end with the standing instruction
+verbatim: *"Report these to the owner. clear → propose the derived placement for
+approval; unclear → ask the owner the open question. The inventory may only contain
+branches with proper/valid inheritance — never add an entry without it."*
+Discovery/movement/resolution appends `candidate` journal entries (append-only audit).
+
+**Throttle (like urging):** a candidate is re-reported only when its tip moved past
+`lastReportedTip` (YAML updated); quiet passes stay quiet. A branch that gains an
+inventory entry stops being a candidate: its stale YAML is marked `resolved`
+(`inventory-entry-added`; `branch-gone` when the branch vanished) and reported once.
+
+**Plan-purity exception (explicit):** writing candidate YAML + `candidates.json` +
+`candidate` journal entries from `plan` is derived REPORT state — reports, never git
+refs. Ref writes remain exclusive to `--execute` paths through the guardRef choke
+point.
+
+**The invariant and where it is enforced:** "the inventory may only contain branches
+with proper/valid inheritance" is code-enforced at plan time —
+`plan.ts validateInventoryInheritance` hard-halts, naming the entry, when an in-scope
+inventory entry declares a parent missing from the inventory/structural set (a
+silently rewired root is never acceptable), and `scope.ts` hard-halts on any DAG
+cycle. What stays AGENT DUTY (doctrine, not code): relaying the CANDIDATES section to
+the owner, proposing `clear` placements for approval, asking the `unclear` open
+questions verbatim, and only ever creating/amending entries (via the
+fork-registry-generate skill + seeds.yaml PR) after owner approval with the approved
+`parents:`.

@@ -48,6 +48,23 @@ export class FixtureRepo {
     return this.git('rev-parse', ref);
   }
 
+  /**
+   * Fake an `origin` remote-tracking ref (refs/remotes/origin/<branch>) at
+   * `at` (default: the branch itself). Lets tests simulate remote-only /
+   * behind / ahead / diverged branch states without a second repo
+   * (PROPAGATION.md §13, D-045).
+   */
+  setOrigin(branch: string, at?: string): string {
+    const sha = this.sha(at ?? branch);
+    this.git('update-ref', `refs/remotes/origin/${branch}`, sha);
+    return sha;
+  }
+
+  /** Delete a local branch ref (keeps any refs/remotes/origin/<branch>). */
+  deleteLocalBranch(branch: string): void {
+    this.git('update-ref', '-d', `refs/heads/${branch}`);
+  }
+
   destroy(): void {
     rmSync(this.dir, { recursive: true, force: true });
   }

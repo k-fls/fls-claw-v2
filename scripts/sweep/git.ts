@@ -98,6 +98,32 @@ export async function localBranches(repo: string): Promise<string[]> {
   return res.stdout.split('\n').filter(Boolean);
 }
 
+/**
+ * Branch names present on a remote (refs/remotes/<remote>/*, HEAD excluded),
+ * WITHOUT the remote prefix. Input to the D-045 remote-branch scope rule
+ * (PROPAGATION.md §13): an inventory branch with no local ref but an existing
+ * origin/<branch> is still in scope.
+ */
+export async function remoteBranches(repo: string, remote = 'origin'): Promise<string[]> {
+  const prefix = `refs/remotes/${remote}/`;
+  const res = await git(repo, ['for-each-ref', '--format=%(refname)', prefix.slice(0, -1)]);
+  return res.stdout
+    .split('\n')
+    .filter((l) => l.startsWith(prefix))
+    .map((l) => l.slice(prefix.length))
+    .filter((b) => b !== '' && b !== 'HEAD');
+}
+
+/**
+ * True when refs/heads/<branch> exists — a LOCAL branch specifically, never a
+ * tag or remote-tracking fallback (rev-parse's ref search order would accept
+ * those). Used by the §13 sync step to decide materialize vs fast-forward.
+ */
+export async function localBranchExists(repo: string, branch: string): Promise<boolean> {
+  const res = await git(repo, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], { allowCodes: [1] });
+  return res.code === 0;
+}
+
 export interface MergeTreeResult {
   clean: boolean;
   treeOid: string;

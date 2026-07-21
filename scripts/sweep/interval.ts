@@ -34,6 +34,12 @@ export interface BuildEligibleLineArgs {
   /** Concrete tip sha of the branch (pinned by the caller for the pass). */
   branchTip: string;
   parent: string;
+  /**
+   * Ref to READ the parent's tip from (D-045, §13): defaults to the parent's
+   * branch name; a remote-only (materialize) parent is read as
+   * `origin/<parent>` — plan-time probes never require a local ref.
+   */
+  parentRef?: string;
   model: 'entry' | 'parents';
   chain: Chain;
 }
@@ -66,7 +72,7 @@ export async function buildEligibleLine(args: BuildEligibleLineArgs): Promise<El
 
   // parents model: walk the parent's own first-parent line, oldest -> newest,
   // deriving each commit's trunk coverage; newest commit wins its height bucket.
-  const parentTip = await revParse(repo, parent);
+  const parentTip = await revParse(repo, args.parentRef ?? parent);
   const lineShas = await firstParentChain(repo, parentTip, chain.base);
   const byHeight = new Map<number, string>();
   for (const sha of lineShas) {

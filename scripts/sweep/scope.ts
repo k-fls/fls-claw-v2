@@ -28,7 +28,7 @@
  */
 import { EXCLUDED_BRANCH_GLOBS, FORK_POINT } from './config.js';
 import { globMatchAny } from './globs.js';
-import { git, isAncestor, localBranches, refExists } from './git.js';
+import { git, isAncestor, localBranches, refExists, remoteBranches } from './git.js';
 import type { FeatureEntry, ScopeEntry, SweepScope } from './types.js';
 
 export interface ScopeResult {
@@ -177,11 +177,19 @@ export function buildScope(
   scope: SweepScope,
   repoBranches: string[],
   editionAncestors: string[] = [],
+  originBranches: string[] = [],
 ): ScopeResult {
   const warnings: string[] = [];
   const exclude = [...EXCLUDED_BRANCH_GLOBS, ...(scope.exclude ?? [])];
   const excluded = (b: string) => globMatchAny(exclude, b);
   const repoSet = new Set(repoBranches);
+  // D-045 (PROPAGATION.md §13): branches present ONLY as origin/* remote-tracking
+  // refs. An inventory branch found here (and not locally) is IN scope, flagged
+  // `materialize` — planned from the origin commit, local ref created by
+  // `run --execute` before its first mutation. A branch in NEITHER place stays
+  // a loud drift warning.
+  const originSet = new Set(originBranches);
+  const materialize = new Set<string>();
 
   // --- inventory branches + DAG edges ---
   const inventory = new Set<string>();
@@ -197,8 +205,14 @@ export function buildScope(
   for (const [branch, e] of byBranch) {
     if (excluded(branch)) continue;
     if (!repoSet.has(branch)) {
-      warnings.push(`scope drift: branch '${branch}' is in scope but missing from the repo; dropped`);
-      continue;
+      if (originSet.has(branch)) {
+        materialize.add(branch);
+      } else {
+        warnings.push(
+          `scope drift: branch '${branch}' is in scope but missing from the repo (no local branch, no origin/${branch}); dropped`,
+        );
+        continue;
+      }
     }
     inventory.add(branch);
     for (const p of e.parents ?? []) if (!excluded(p)) addEdge(branch, p);
@@ -208,7 +222,8 @@ export function buildScope(
     for (const p of parents) if (!excluded(child) && !excluded(p)) addEdge(child, p);
   }
 
-  const hasMainPatched = repoSet.has('main_patched') && !excluded('main_patched');
+  const hasMainPatched = (repoSet.has('main_patched') || originSet.has('main_patched')) && !excluded('main_patched');
+  if (hasMainPatched && !repoSet.has('main_patched')) materialize.add('main_patched');
 
   // Per-branch merge sources: DAG parents restricted to in-scope inventory
   // branches (or main_patched); roots default to [main_patched].
@@ -217,7 +232,7 @@ export function buildScope(
     const raw = [...(edges[b] ?? [])];
     const usable = raw.filter((p) => inventory.has(p) || (p === 'main_patched' && hasMainPatched)).sort();
     for (const p of raw) {
-      if (!usable.includes(p) && repoSet.has(p)) {
+      if (!usable.includes(p) && (repoSet.has(p) || originSet.has(p))) {
         warnings.push(`scope drift: '${b}' parent '${p}' is not in scope; edge dropped`);
       } else if (!usable.includes(p) && !repoSet.has(p)) {
         warnings.push(`scope drift: '${b}' parent '${p}' is missing from the repo; edge dropped`);
@@ -248,7 +263,13 @@ export function buildScope(
   // --- topological order: main_patched, edition-ancestors, inventory DAG ---
   const ordered: ScopeEntry[] = [];
   if (hasMainPatched) {
-    ordered.push({ branch: 'main_patched', kind: 'structural', mergeModel: 'upstream-chain', parents: [] });
+    ordered.push({
+      branch: 'main_patched',
+      kind: 'structural',
+      mergeModel: 'upstream-chain',
+      parents: [],
+      ...(materialize.has('main_patched') ? { materialize: true } : {}),
+    });
   }
   for (const b of editionAncestorsInScope) {
     ordered.push({ branch: b, kind: 'edition-ancestor', mergeModel: 'upstream-chain', parents: [] });
@@ -273,10 +294,14 @@ export function buildScope(
       // fixtures): fall back to the upstream chain.
       mergeModel: parentOf[b].length > 0 ? 'parents' : 'upstream-chain',
       parents: parentOf[b],
+      ...(materialize.has(b) ? { materialize: true } : {}),
     });
   };
   for (const b of [...inventory].sort()) visit(b, []);
-  if (cycle) throw new Error(`scope DAG contains a cycle: ${cycle}`);
+  if (cycle)
+    throw new Error(
+      `scope DAG contains a cycle: ${cycle} — the inventory may only contain branches with proper/valid inheritance (D-045); fix the entries' parents before planning`,
+    );
 
   return {
     ordered,
@@ -286,8 +311,22 @@ export function buildScope(
   };
 }
 
-export async function resolveScope(repo: string, features: FeatureEntry[], scope: SweepScope): Promise<ScopeResult> {
+export async function resolveScope(
+  repo: string,
+  features: FeatureEntry[],
+  scope: SweepScope,
+  opts: {
+    /**
+     * D-045 (§13): also consider origin/* remote-tracking refs so remote-only
+     * inventory branches enter scope (flagged `materialize`). The propagation
+     * driver passes true; the scan flow stays local-only (it probes by branch
+     * name and never materializes refs).
+     */
+    includeRemote?: boolean;
+  } = {},
+): Promise<ScopeResult> {
   const repoBranches = await localBranches(repo);
+  const origin = opts.includeRemote ? await remoteBranches(repo) : [];
   const composition = await editionCompositionBranches(repo, repoBranches);
-  return buildScope(features, scope, repoBranches, composition);
+  return buildScope(features, scope, repoBranches, composition, origin);
 }

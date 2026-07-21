@@ -59,6 +59,13 @@ export interface ScopeEntry {
   mergeModel: MergeModel;
   /** DAG parents (merge sources) for mergeModel 'parents'; empty otherwise. */
   parents: string[];
+  /**
+   * D-045 (PROPAGATION.md §13): the branch has no local ref but exists as
+   * `origin/<branch>` — in scope, planned from the origin commit; `run
+   * --execute` creates the local branch at the origin tip before its first
+   * mutation. Absent/false for locally-present branches.
+   */
+  materialize?: boolean;
 }
 
 export interface BranchScan {
@@ -346,6 +353,12 @@ export interface BranchPlan {
   parents: ParentPlan[];
   /** Cheapest parent chain un-skipped to keep the leaf/always_merge invariant (§6). */
   unskipChain?: string[];
+  /**
+   * D-045 (§13): remote-only branch — probes/coverage in this plan read the
+   * `origin/<branch>` commit; `run --execute` materializes the local ref
+   * before the branch's first mutation. `plan` and dry-run `run` never write refs.
+   */
+  materialize?: boolean;
 }
 
 /** Whole-pass plan artifact (`plan.json`) — pure derivation, idempotent (§7). */

@@ -52,12 +52,20 @@ import {
   commitTreeMerge,
   git,
   isAncestor,
+  localBranchExists,
   newStyleMergeTree,
   resetBranchRef,
   revParse,
   refExists,
   worktreeBranches,
 } from './git.js';
+import {
+  CANDIDATE_STANDING_INSTRUCTION,
+  candidateSectionLines,
+  deriveCandidates,
+  readCandidateFiles,
+  reconcileCandidates,
+} from './candidates.js';
 import { readLedger, writeLedger, defaultLedgerBranch } from './ledger.js';
 import { loadRegistry } from './registry.js';
 import { resolveScope } from './scope.js';
@@ -653,6 +661,62 @@ async function journaledMerge(
   return commitTreeMerge(repo, branch, headSha, message);
 }
 
+/**
+ * D-045 Feature A (§13) — one journaled origin-sync step per in-scope branch,
+ * run by `run --execute` BEFORE the branch's first mutation this pass. The
+ * driver never operates on refs/remotes directly: it reconciles the LOCAL
+ * branch with `origin/<branch>` through the guardRef choke point, then all
+ * merges target the local ref. Four states:
+ *  - no local ref            → create the local branch at the origin tip
+ *                              (journal `branch-materialized`; the §9 rollback
+ *                              target is the creation point);
+ *  - local strictly BEHIND   → fast-forward to origin (journal `branch-synced`;
+ *                              checked-out worktrees use the N1 dirty-guard +
+ *                              reset pattern);
+ *  - local AHEAD of origin   → unpushed driver work: no action, no noise;
+ *  - DIVERGED                → DriverHalt('sync-diverged') — external history
+ *                              the driver cannot reconcile; the caller journals
+ *                              it, skips the branch this pass and continues
+ *                              with the others (owner escalation, doctrine).
+ * `plan` and dry-run `run` never reach this function (no ref writes).
+ */
+async function syncBranchWithOrigin(
+  cli: Cli,
+  dir: string,
+  branch: string,
+  scope: Set<string>,
+  preReffed: Set<string>,
+): Promise<'no-origin' | 'up-to-date' | 'materialized' | 'synced' | 'ahead'> {
+  const originRef = `origin/${branch}`;
+  if (!(await refExists(cli.repo, originRef))) return 'no-origin';
+  const originTip = await revParse(cli.repo, originRef);
+  if (!(await localBranchExists(cli.repo, branch))) {
+    guardRef(branch, scope);
+    // CAS with the zero-oid ('' old value): the ref must not exist yet.
+    await git(cli.repo, ['update-ref', `refs/heads/${branch}`, originTip, '']);
+    appendJournal(dir, { action: 'branch-materialized', branch, tip: originTip });
+    await recordPreRef(cli, dir, preReffed, branch); // §9 rollback target = creation point
+    return 'materialized';
+  }
+  const localTip = await revParse(cli.repo, branch);
+  if (localTip === originTip) return 'up-to-date';
+  if (await isAncestor(cli.repo, originTip, localTip)) return 'ahead'; // unpushed driver work
+  if (await isAncestor(cli.repo, localTip, originTip)) {
+    guardRef(branch, scope);
+    await recordPreRef(cli, dir, preReffed, branch); // pre-pass tip BEFORE the ff (§8)
+    const wt = await checkedOutWorktree(cli.repo, branch); // dirty -> DriverHalt (N1)
+    await git(cli.repo, ['update-ref', `refs/heads/${branch}`, originTip, localTip]);
+    if (wt) await git(cli.repo, ['reset', '--hard', originTip], { cwd: wt }); // clean-verified above
+    appendJournal(dir, { action: 'branch-synced', branch, from: localTip, to: originTip });
+    return 'synced';
+  }
+  throw new DriverHalt(
+    'sync-diverged',
+    `'${branch}': local ${localTip.slice(0, 12)} and origin ${originTip.slice(0, 12)} have DIVERGED — ` +
+      `external history the driver cannot reconcile; skipping the branch this pass (owner escalation)`,
+  );
+}
+
 /** Commit a merge whose tree is the AGENT-RESOLVED tree (scope-guarded). */
 async function journaledResolvedMerge(
   repo: string,
@@ -796,6 +860,41 @@ export async function cmdPlan(cli: Cli): Promise<number> {
     );
   }
   writeJsonFile(join(dir, 'plan.json'), plan);
+
+  // D-045 Feature B (§13): candidate discovery. Writing the per-candidate YAML
+  // + candidates.json + journal `candidate` entries from `plan` is the
+  // documented exception to plan purity — derived REPORT state, never git refs.
+  // Candidates are never planned or merged; the printed section is the agent's
+  // relay duty to the owner (doctrine).
+  const registry = loadRegistry({
+    inventoryDir: cli.inventory,
+    scopeFile: cli.scopeFile,
+    routingFile: cli.routingFile,
+  });
+  const candidateRecords = await deriveCandidates({
+    repo: cli.repo,
+    chain: ctx.chain,
+    features: registry.features,
+    scope: registry.scope,
+  });
+  const entryBranches = new Set(registry.features.filter((f) => f.branch).map((f) => f.branch!));
+  const rec = reconcileCandidates(cli.workspace, candidateRecords, entryBranches, ctx.watermark12);
+  for (const { record, event } of rec.events) {
+    appendJournal(dir, { action: 'candidate', event, branch: record.branch, tip: record.tip, confidence: record.confidence });
+  }
+  for (const r of rec.resolved) {
+    appendJournal(dir, { action: 'candidate', event: 'resolved', branch: r.branch, reason: r.reason });
+  }
+  writeJsonFile(join(dir, 'candidates.json'), {
+    schemaVersion: 1,
+    watermark12: ctx.watermark12,
+    candidates: rec.all,
+    newlyReported: rec.events.map((e) => e.record.branch),
+    resolved: rec.resolved,
+    standingInstruction: CANDIDATE_STANDING_INSTRUCTION,
+  });
+  for (const line of candidateSectionLines(rec.events.map((e) => e.record), rec.resolved)) console.error(line);
+
   emit(cli, plan);
   return 0;
 }
@@ -837,10 +936,17 @@ export async function cmdRun(cli: Cli): Promise<number> {
   // legitimately differ.) Then update the working plan.json.
   const arrived = arrivedSet(journal);
   const reopened = new Set(journal.filter((e) => e.action === 'reopened').map((e) => e.branch as string));
+  // Branches this pass already materialized/ff-synced from origin (§13): their
+  // tips legitimately moved relative to the last written plan.
+  const syncedBranches = new Set(
+    journal
+      .filter((e) => e.action === 'branch-materialized' || e.action === 'branch-synced')
+      .map((e) => e.branch as string),
+  );
   const planPath = join(dir, 'plan.json');
   if (existsSync(planPath)) {
     const prev = JSON.parse(readFileSync(planPath, 'utf8')) as PropagationPlan;
-    const exclude = new Set([...arrived, ...reopened, ...frozen]);
+    const exclude = new Set([...arrived, ...reopened, ...frozen, ...syncedBranches]);
     const drift = plansDiffer(prev, plan, exclude);
     if (drift.length) {
       appendJournal(dir, { action: 'halt', reason: 'plan-drift', branches: drift });
@@ -864,10 +970,30 @@ export async function cmdRun(cli: Cli): Promise<number> {
   const preReffed = preReffedSet(journal);
 
   let gated = false;
+  const diverged: string[] = [];
 
   try {
     for (const snap of plan.branches) {
       if (arrived.has(snap.branch)) continue; // already processed this pass (resume)
+
+      // D-045 Feature A (§13): reconcile the local branch with origin BEFORE its
+      // first mutation this pass. DIVERGED hard-halts THIS branch only (journaled,
+      // skipped, reported) — siblings keep processing; any other DriverHalt
+      // (dirty worktree, protected ref) still halts the whole run below.
+      try {
+        await syncBranchWithOrigin(cli, dir, snap.branch, scope, preReffed);
+      } catch (e) {
+        if (e instanceof DriverHalt && e.reason === 'sync-diverged') {
+          appendJournal(dir, { action: 'halt', branch: snap.branch, reason: e.reason, message: e.message });
+          appendJournal(dir, { action: 'skip', branch: snap.branch, reason: 'diverged' });
+          appendJournal(dir, { action: 'arrived', branch: snap.branch });
+          arrived.add(snap.branch);
+          diverged.push(snap.branch);
+          console.error(`DIVERGED (branch skipped): ${e.message}`);
+          continue;
+        }
+        throw e;
+      }
 
       // A branch still HELD (frozen, awaiting the owner) arrives with an EMPTY
       // interval — descendants may proceed and DEFERRED re-evaluates, but we do
@@ -1087,8 +1213,9 @@ export async function cmdRun(cli: Cli): Promise<number> {
       missing = 'no green `verify` entry for the current merges — run `propagate verify --execute`';
     }
   }
+  if (diverged.length) console.error(`diverged branches skipped this pass (owner escalation): ${diverged.join(', ')}`);
   console.error(sealed ? 'run complete — pass sealed (pass-complete)' : `run complete — ${missing}`);
-  emit(cli, { watermark12: plan.watermark12, gated, sealed, missing, passDir: dir });
+  emit(cli, { watermark12: plan.watermark12, gated, sealed, missing, passDir: dir, diverged });
   return 0;
 }
 
@@ -1259,7 +1386,7 @@ async function reverifyCase(
   // plan.json — the plan is agent-writable, so a forged parent edge or an
   // extra branch smuggled into the snapshot must not extend what resolve may
   // merge or move. plan.json is kept only as a drift cross-check below.
-  const scopeResult = await resolveScope(cli.repo, registry.features, registry.scope);
+  const scopeResult = await resolveScope(cli.repo, registry.features, registry.scope, { includeRemote: true });
   const entry = scopeResult.ordered.find((e) => e.branch === caseFile.branch);
   if (!entry) {
     return {
@@ -1791,6 +1918,15 @@ export async function cmdStatus(cli: Cli): Promise<number> {
   );
   const open = openCases.filter((c) => !resolvedCases.has(c));
   console.log(`open cases: ${open.length}${open.length ? ` — ${open.join(', ')}` : ''}`);
+  const divergedHalts = journal.filter((e) => e.action === 'halt' && e.reason === 'sync-diverged');
+  if (divergedHalts.length) {
+    console.log('diverged branches (§13 sync — skipped this pass, owner escalation):');
+    for (const d of divergedHalts) console.log(`  ${d.branch}: ${d.message}`);
+  }
+  // D-045 (§13): STATUS shows the full current candidate state (a human state
+  // view, unthrottled); `plan` prints only newly-reported candidates.
+  const openCandidates = readCandidateFiles(cli.workspace).filter((c) => !c.resolved);
+  for (const line of candidateSectionLines(openCandidates)) console.log(line);
   return 0;
 }
 

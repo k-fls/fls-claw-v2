@@ -11,11 +11,13 @@
  * run the linear merge-point sweep (interval.ts), then classify the verdict and,
  * for own conflicts, run the DEFERRED check (deferred.ts).
  */
+import { EXCLUDED_BRANCH_GLOBS } from './config.js';
 import { checkDeferred } from './deferred.js';
+import { globMatchAny } from './globs.js';
 import { buildEligibleLine, mergePointSweep } from './interval.js';
 import { deriveCoverage, enumerateChain, type Chain } from './heights.js';
 import { git, revParse } from './git.js';
-import { resolveScope } from './scope.js';
+import { resolveScope, type ScopeResult } from './scope.js';
 import { tierFloor } from './tiers.js';
 import type { BranchPlan, FeatureEntry, HeldRecord, ParentPlan, PropagationPlan, SweepScope } from './types.js';
 
@@ -92,13 +94,16 @@ async function analyzeParent(
   branchTip: string,
   branchTree: string,
   parent: string,
+  parentRef: string,
   model: 'entry' | 'parents',
   chain: Chain,
   ancestors: string[],
   held: HeldRecord[],
 ): Promise<ParentPlan> {
-  const line = await buildEligibleLine({ repo, branch, branchTip, parent, model, chain });
-  const sweep = await mergePointSweep(repo, branch, line);
+  const line = await buildEligibleLine({ repo, branch, branchTip, parent, parentRef, model, chain });
+  // Probe from the pinned branch TIP sha, not the ref name: deterministic
+  // (§3 probe determinism) and valid for remote-only branches (§13, D-045).
+  const sweep = await mergePointSweep(repo, branchTip, line);
 
   const pp: ParentPlan = {
     parent,
@@ -172,6 +177,17 @@ export interface DeriveBranchArgs {
   held: HeldRecord[];
   /** When true the branch is ledger-frozen: arrives with an empty interval (§8). */
   frozen?: boolean;
+  /**
+   * D-045 (§13): the branch is remote-only — read its tip from origin/<branch>
+   * and flag the plan row `materialize`. `run --execute` creates the local ref
+   * (through the guardRef choke point) before the branch's first mutation.
+   */
+  materialize?: boolean;
+  /**
+   * Read-ref resolver for PARENTS (§13): a remote-only parent is read as
+   * `origin/<parent>` at plan time. Defaults to the identity (local refs).
+   */
+  refOf?: (branch: string) => string;
 }
 
 /**
@@ -183,6 +199,8 @@ export interface DeriveBranchArgs {
  */
 export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> {
   const { repo, branch, kind, model, parents, chain, ancestors, tierFloor, isLeaf, alwaysMerge, held, frozen } = args;
+  const refOf = args.refOf ?? ((b: string) => b);
+  const materialize = args.materialize === true;
   // Ledger-frozen: no merges this pass (barrier satisfied by an empty interval).
   if (frozen) {
     const parentPlans: ParentPlan[] = parents.map((parent) => ({
@@ -194,15 +212,66 @@ export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> 
       deferredTo: null,
       skipReason: 'frozen',
     }));
-    return { branch, kind, tierFloor, isLeaf, alwaysMerge, ancestors, parents: parentPlans };
+    return {
+      branch,
+      kind,
+      tierFloor,
+      isLeaf,
+      alwaysMerge,
+      ancestors,
+      parents: parentPlans,
+      ...(materialize ? { materialize: true } : {}),
+    };
   }
-  const branchTip = await revParse(repo, branch);
+  // §13: a remote-only branch is read from origin/<branch> (never a ref write).
+  const branchTip = await revParse(repo, materialize ? `origin/${branch}` : branch);
   const branchTree = await treeOf(repo, branchTip);
   const parentPlans: ParentPlan[] = [];
   for (const parent of parents) {
-    parentPlans.push(await analyzeParent(repo, branch, branchTip, branchTree, parent, model, chain, ancestors, held));
+    parentPlans.push(
+      await analyzeParent(repo, branch, branchTip, branchTree, parent, refOf(parent), model, chain, ancestors, held),
+    );
   }
-  return { branch, kind, tierFloor, isLeaf, alwaysMerge, ancestors, parents: parentPlans };
+  return {
+    branch,
+    kind,
+    tierFloor,
+    isLeaf,
+    alwaysMerge,
+    ancestors,
+    parents: parentPlans,
+    ...(materialize ? { materialize: true } : {}),
+  };
+}
+
+/**
+ * D-045 code enforcement of "the inventory may only contain branches with
+ * proper/valid inheritance" (§13): an in-scope inventory entry whose declared
+ * parent is missing from the inventory/structural set is a HARD HALT naming
+ * the entry — never a silently rewired root. (Cycles already hard-halt in
+ * scope.ts's DAG validation.) Parents dropped by explicit exclusion globs are
+ * deliberate config, not invalid inheritance, and stay allowed.
+ */
+export function validateInventoryInheritance(
+  features: FeatureEntry[],
+  scopeResult: ScopeResult,
+  scope: SweepScope,
+): void {
+  const exclude = [...EXCLUDED_BRANCH_GLOBS, ...(scope.exclude ?? [])];
+  const excluded = (b: string) => globMatchAny(exclude, b);
+  const inventorySet = new Set(scopeResult.ordered.filter((e) => e.kind === 'inventory').map((e) => e.branch));
+  const structuralSet = new Set(scopeResult.ordered.filter((e) => e.kind === 'structural').map((e) => e.branch));
+  for (const e of features) {
+    if (!e.branch || !inventorySet.has(e.branch)) continue;
+    for (const p of e.parents ?? []) {
+      if (excluded(p) || inventorySet.has(p) || structuralSet.has(p)) continue;
+      throw new Error(
+        `inventory inheritance invalid (D-045): entry '${e.id}' (branch '${e.branch}') declares parent '${p}', ` +
+          `which is not in the inventory/structural set — the inventory may only contain branches with ` +
+          `proper/valid inheritance; fix the entry (or add/restore the parent) before planning`,
+      );
+    }
+  }
 }
 
 /** Derive the whole-pass plan (§2/§6). Pure w.r.t. git state — idempotent. */
@@ -216,10 +285,16 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
   const watermark12 = watermark.slice(0, 12);
   const passHasProgress = chain.heads.length > 0;
 
-  // scope.ts validates the DAG (throws on a cycle) and returns topological order.
-  const scopeResult = await resolveScope(repo, features, scope);
+  // scope.ts validates the DAG (throws on a cycle) and returns topological
+  // order; origin/* refs are considered so remote-only inventory branches are
+  // in scope, flagged `materialize` (§13, D-045).
+  const scopeResult = await resolveScope(repo, features, scope, { includeRemote: true });
+  validateInventoryInheritance(features, scopeResult, scope);
   const ordered = scopeResult.ordered;
   const warnings = [...scopeResult.warnings];
+  // §13: remote-only branches are READ from origin/<branch> during derivation.
+  const materializeSet = new Set(ordered.filter((e) => e.materialize).map((e) => e.branch));
+  const refOf = (b: string): string => (materializeSet.has(b) ? `origin/${b}` : b);
 
   const featureByBranch = new Map<string, FeatureEntry>();
   for (const f of features) if (f.branch) featureByBranch.set(f.branch, f);
@@ -249,6 +324,8 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
       alwaysMerge: feat?.always_merge === true,
       held,
       frozen: frozen.has(entry.branch),
+      materialize: entry.materialize === true,
+      refOf,
     });
     branches.push(bp);
     byBranch.set(bp.branch, bp);
@@ -271,7 +348,7 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
         const child = byBranch.get(uchain[i]);
         const parent = uchain[i + 1];
         if (!child) continue;
-        const parentTip = await revParse(repo, parent);
+        const parentTip = await revParse(repo, refOf(parent));
         const height = (await deriveCoverage(repo, chain, parentTip)).height;
         const pp = child.parents.find((p) => p.parent === parent);
         const forcedHead = { sha: parentTip, height };

@@ -48,11 +48,10 @@ report it to the owner.
 1. `gh repo clone k-fls/fls-claw-v2 repo && cd repo`
    `git remote add upstream https://github.com/nanocoai/nanoclaw.git && git fetch upstream`
    `git checkout feat/maintenance-sweep`
-2. Create a LOCAL tracking branch for every inventory branch — the propagation
-   driver reads local refs only (`git branch --list`); remote-only branches are
-   silently dropped from scope (2026-07-20 test-drive finding #3):
-   `for b in $(git branch -r | sed -n 's#^ *origin/\(\(module\|feat\|edition\)/.*\)#\1#p'); do git branch --track "$b" "origin/$b" 2>/dev/null; done`
-   then cross-check the created set against the inventory's `branch:` fields.
+2. No tracking-branch setup is needed: the driver plans remote-only inventory
+   branches from `origin/*` and materializes/syncs the local branches itself at
+   `run --execute` (PROPAGATION.md §13, D-045); a DIVERGED local/origin branch is a
+   driver halt and an owner escalation.
 3. `corepack enable && pnpm install --frozen-lockfile` (fall back to `npm i -g pnpm`).
 4. Initialize your group-owned state (all inside this workspace, not the repo):
    - live inventory: copy `repo/scripts/sweep/bootstrap/fork-registry@*/features/` →
@@ -95,7 +94,22 @@ report it to the owner.
      close to the inventory's sweepable-branch count — a 1-2 branch plan means
      scope collapse (missing local branches or wrong inventory path): stop and
      investigate, do not run.
-   - `... run` — dry-run first, review, then `--execute`: CLEAN merges, no-op
+   - CANDIDATES (D-045): relay the driver's CANDIDATES section (printed by
+     `plan`/`status`; details in the per-candidate YAML under
+     `../inventory-candidates/`) to the owner in the digest — for `clear`
+     candidates propose the derived placement and WAIT for approval; for
+     `unclear` ask the owner the driver's open questions VERBATIM. NEVER add an
+     inventory entry (or edit a descendant entry's `parents:`) without owner
+     approval AND valid inheritance. After approval, add the entry via the
+     fork-registry-generate skill + a seeds.yaml PR carrying the approved
+     `parents:` (and any approved descendant-entry edits), so the next pass
+     picks the branch up.
+   - `... run` — dry-run first, review, then `--execute`: the driver
+     materializes/syncs local branches from origin first (remote-only branches
+     are created locally; behind branches fast-forward); a DIVERGED
+     local/origin branch is a per-branch driver halt (`sync-diverged`) — an
+     owner escalation you report in the digest and NEVER force-resolve (no
+     reset, no force-push). Then CLEAN merges, no-op
      skips and DEFERRED marks land mechanically; each conflict emits a case
      file + a driver-created worktree under the pass dir and halts that branch.
    - Per case: resolve ONLY inside the driver's case worktree, commit there,
