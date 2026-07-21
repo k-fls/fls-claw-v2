@@ -69,7 +69,8 @@ Tier rules:
 - One case at a time per branch (halt at first conflict run); one branch's case never
   blocks siblings, only descendants.
 - Same conflict resolved once at the topmost affected branch; descendants inherit via
-  parent merge + shared rerere (D-006).
+  parent merge + shared rerere (D-006; rerere.enabled set repo-wide in the agent clone
+  — owner (b), 2026-07-22).
 - JUDGED PR closure: push the SAME merge commit → no merge-of-merge commits.
 - Frozen branch: skipped every pass; one posted urge-comment per NEW pending head
   (`lastUrgedHead`), silent otherwise.
@@ -100,7 +101,8 @@ Tier rules:
 - D-004 annotation: a frozen branch's HELD PR carries the count of further pending
   upstream commits (kept current via urge comments).
 - HELD PR text: written by the AGENT from studying the case (materials + worktree);
-  driver provides facts only; text gated by the two-round cold read (hard cap).
+  driver provides facts only; text checks are mechanical (lint + recorded-decision/
+  duplicate gates); the D-031 writing rules apply (D-050).
 
 ## 7. MECHANICAL/resolve qualification (G1)
 

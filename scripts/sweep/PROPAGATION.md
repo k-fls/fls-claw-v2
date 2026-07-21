@@ -255,18 +255,32 @@ The driver is the only author of merge parameters. Artifacts live under
   The lever: global default `scope_guard_mode` in `registry/routing.yaml`; per-feature
   override `scope_guard:` on the inventory entry. Like the tier floor, the effective
   mode is RE-DERIVED from config at resolve — never read from the case file.
-- **Cold-read artifact:** the driver writes `coldread-request.md` at case emission
-  (conflict hunks from the automerge tree + the four cold-reader questions of D-031)
-  and REGENERATES it on every `resolve --execute` attempt, before the verdict is
-  consumed, adding the resolution diff (`git diff <automerge-tree> <resolved-tree>`)
-  recomputed for THIS resolution — conflict hunks + resolution diff + questions,
-  nothing else, so the resolving agent cannot frame the question. It requires
-  `coldread-verdict.json` before accepting a MECHANICAL or JUDGED completion. The
-  verdict must VALIDATE: `verdict` ∈ {`confirm`,`reject`}, non-empty `notes`, and a
-  `resolvedTree` field equal to the tree OID of `--resolved-ref` (freshness binding —
+- **Cold-read artifact (focused, D-050):** the driver writes `coldread-request.md`
+  at case emission (conflict hunks from the automerge tree + the three bounded
+  cold-reader questions) and REGENERATES it on every `resolve --execute` attempt,
+  before the verdict is consumed, adding the resolution diff (`git diff
+  <automerge-tree> <resolved-tree>`) recomputed for THIS resolution — conflict hunks +
+  resolution diff + questions, nothing else, so the resolving agent cannot frame the
+  question. The read is FOCUSED (owner, 2026-07-22: "it should not go researching the
+  universe"): a preamble instructs the reader to **judge ONLY from the materials in
+  this request** — never explore the repo or search beyond them — and to answer
+  `UNVERIFIABLE-FROM-REQUEST` for a point it cannot judge from the request rather than
+  researching it. The three questions: (1) within the conflicted hunks, is each side's
+  behaviour preserved or its loss explicitly justified (name anything silently lost);
+  (2) is every change in the resolution diff explained by the conflict — no content
+  from outside the two sides/base (name any unexplained hunk); (3) does the resolution
+  contradict any record included in this request? (The old open-ended Q4 — follow-on
+  invariants / tests / types / call sites — is deleted; typecheck and tests are the
+  verify gate's job, §9.) It requires `coldread-verdict.json` before accepting a
+  MECHANICAL or JUDGED completion. The verdict must VALIDATE: overall `verdict` ∈
+  {`confirm`,`reject`}, non-empty `notes`, optional per-question `answers` (q1-q3), and
+  a `resolvedTree` field equal to the tree OID of `--resolved-ref` (freshness binding —
   the verdict attests to THIS resolution, not an earlier one, so it can only ever
-  attest to the resolution the regenerated request shows); malformed or stale
-  verdicts are rejected, never treated as confirm. A confirming verdict's content
+  attest to the resolution the regenerated request shows); malformed or stale verdicts
+  are rejected, never treated as confirm. **Fail-closed (D-050):** an
+  `UNVERIFIABLE-FROM-REQUEST` answer on ANY of q1-q3 is treated as a reject even under
+  an overall `confirm` — the reader could not judge that point and researching beyond
+  the request is forbidden, so the case is HELD. A confirming verdict's content
   (verdict + notes) is journaled on the `resolved` entry for the audit trail. The
   verdict is produced by a context-free subagent per D-031/D-034 — the driver can
   enforce shape and freshness, but provenance (that a context-free reader wrote it)
@@ -435,7 +449,7 @@ before verification passes (D-034 gate 1-2 additionally apply to any push):
 | `steps.ts` | step/case JSON schemas + first-principles re-verification |
 | `propagate.ts` | CLI (`plan/run/resolve/publish/push/status`), journal, worktree + PR-materials preparation, pass pushes |
 | `candidates.ts` | inventory-candidate discovery + inheritance derivation + report throttle (§13, D-045) |
-| `publish.ts` | §14 (D-048/D-049): result-id registry + halt-id mapping, PR-text cold-read gate, pre-PR height check, D-004 machine block, GitHub REST transport (injectable) |
+| `publish.ts` | §14 (D-048/D-049/D-050): result-id registry + halt-id mapping, mechanical text checks (ERR08 + lint WARNs + ERR05/ERR06; the PR-text cold read is retired), pre-PR height check, D-004 machine block, GitHub REST transport (injectable) |
 
 Reused as-is: `git.ts` (merge-tree, rev-list, worktree helpers), `merge.ts` (merge-tree
 + commit-tree + update-ref execution, rerere install), `scan.ts`/`routing.ts` (PoI
@@ -616,8 +630,9 @@ commit) returns, with the two failure modes solved structurally instead: HELD PR
 are created only AFTER the pass's target pushes (so the base is current and the
 diff = the case run only — no bloat), and the pre-PR height check plus the
 verify-gated push order keep unpushed protected content out of PR ancestry (no
-back-door). (b) and (c) — the agent-writes-prose principle, the PR-text cold read,
-ERR05/ERR06 — stand unchanged.
+back-door). (b) and (c) — the agent-writes-prose principle, ERR05/ERR06 — stand.
+(The PR-text cold read that D-048 added for (b) is itself retired by D-050 — it never
+caught anything ERR05/ERR06 did not; text checks are now mechanical, §14.2.)
 
 ### 14.1 `propagate publish --case <id>` — the ONLY sanctioned PR-creation path
 
@@ -655,43 +670,30 @@ understanding — and writes `pr/title.txt` + `pr/body.md` itself, then runs
    get_credential output there once per session; `$GITHUB_TOKEN` is never read
    (same flag on every networked subcommand: `publish`, `push`). Journals
    `pr-published {case, url, number, head}`.
-5. **Without `--execute`**: dry-run — the full battery runs and local artifacts
-   (prtext review requests, §14.2) may be written, but there are NO network calls
-   and NO pushes of any kind; the transport is never constructed.
+5. **Without `--execute`**: dry-run — the full battery runs, but there are NO
+   network calls and NO pushes of any kind; the transport is never constructed.
 
 Cross-pass publishes attach like `resolve` (latest open pass, or `--pass <wm12>`).
-The pr/ dir is agent-writable, so — as with the resolution cold read (§7/§12) — the
-tool enforces shape, rounds and hash freshness; provenance (that a context-free
-reader wrote the verdict) is doctrine-enforced.
 
-### 14.2 PR-text cold read — driver-mediated, HARD two-round cap
+### 14.2 PR text — mechanical checks only (the cold read is RETIRED, D-050)
 
-The first publish attempt with text present writes `prtext-review-request.md` into
-the case pr/ dir — title + body + conflictedPaths + the case materials + relevant
-inventory `extra_context` excerpts (the derivability inputs) + the adequacy-first
-question list — stamped `round: N` and `textHash: sha256(<title>\n<body>)`, and
-returns ERR09. The agent runs a CONTEXT-FREE subagent over the request file, which
-writes `prtext-verdict.json` `{round, verdict: publish|rewrite|reject-derivable|
-consolidate, derivedAnswer?, notes[], textHash}` (textHash copied from the request;
-the tool validates shape + hash freshness + round). Questions, adequacy first:
-**Q0** does this PR need to exist — decision already recorded / derivable from code
-or case rules / duplicate of a sibling → `reject-derivable` or `consolidate` WITH the
-answer; **Q1** from the text alone state the one-line decision and what changes if
-the owner answers yes vs no — if impossible, ONE rewrite.
+The PR-text cold read (the driver-mediated, HARD two-round `prtext-*` loop) is
+**RETIRED permanently** (owner, evidence-based, 2026-07-22). Evidence: it caught
+zero unique problems in its entire history — every catch was already caught
+mechanically by ERR05 (recorded decision) or ERR06 (duplicate) — while one batch
+burned ~300k subagent tokens over ~19 min looping on owner-facing prose. Adequacy is
+already mechanical, so the reader added cost and no signal.
 
-Round rules (rounds are consumed by VERDICTS, never by requests): `publish` →
-publish. `rewrite` on round 1 → the agent edits; the next attempt (stale hash) issues
-the round-2 request. **Round 2 is FINAL**: `publish` and `rewrite` both ship, with
-any notes appended to the body under `## Caveats (cold reader)` (WARN04).
-`reject-derivable`/`consolidate` at ANY round block with ERR05/ERR06 semantics,
-surfacing the derivedAnswer. **Round 3 is impossible**: the tool refuses to emit a
-round-3 request (a verdict with round > 2 is invalid shape; editing the text after
-the final round is ERR10). This replaces the unenforceable "after material edits,
-run the gate once more" doctrine rule.
+The agent still writes `pr/title.txt` + `pr/body.md` itself from studying the case
+(unchanged). The checks on that text are now MECHANICAL only: `ERR08_TEXT_MISSING`
+(title/body absent or empty), the advisory lint WARNs (`WARN01_TEMPLATE_TEXT`,
+`WARN02_NO_DECISION_LINE`), and the adequacy gates `ERR05_DECIDED_ALREADY` /
+`ERR06_DUPLICATE_CASE`. The D-031 catch-list (no bare "review needed", describe
+behaviour not line counts, label ours/theirs, no unexplained references) survives as
+WRITING RULES the agent follows — there is no reader loop enforcing them.
 
-Two DISTINCT cold reads exist: the RESOLUTION cold read (`coldread-*.json`,
-driver-enforced at `resolve`, §7) and the PR-TEXT cold read (`prtext-*.json`,
-driver-enforced at `publish`). Neither substitutes for the other.
+The RESOLUTION cold read (`coldread-*.json`, driver-enforced at `resolve`, §7)
+remains the one and only cold read.
 
 ### 14.3 Result-ID registry (single source of truth)
 
@@ -705,8 +707,6 @@ Blocking (any one → no publish/push):
 | `ERR06_DUPLICATE_CASE` | another open case or published PR shares the conflict signature (same path set + same head sha or identical conflict blobs); the topmost case by DAG order is named |
 | `ERR07_PR_EXISTS` | an open PR is already recorded for this case (journal) or found via the API by head branch name |
 | `ERR08_TEXT_MISSING` | pr/title.txt or pr/body.md absent or empty |
-| `ERR09_COLDREAD_PENDING` | a PR-text cold-read round is pending (request written/regenerated; see §14.2) |
-| `ERR10_COLDREAD_EXHAUSTED` | text edited after the FINAL (round-2) verdict; no round-3 request exists — unreachable in normal flow |
 | `ERR11_TOKEN_MISSING` | a networked `--execute` without a readable `--token-file` |
 | `ERR12_ORIGIN_UNRESOLVED` | `--execute` but owner/repo cannot be derived from the origin remote URL |
 | `ERR13_API_FAILED` | a GitHub API call failed during execute (non-2xx / transport error) |
@@ -716,8 +716,10 @@ Blocking (any one → no publish/push):
 | `ERR17_URGE_FAILED` | posting an urge comment / refreshing the D-004 machine block failed (the `lastUrgedHead` is NOT advanced — the urge retries next push) |
 | `ERR18_VERIFY_PENDING` | `push --execute` refused: no green `verify` journal entry after the pass's last mutation (§9, D-012) |
 
-Retired ids — permanently, numbers NEVER reused (D-049): `ERR03_DIFF_EXCEEDS_CONFLICT_SET`,
-`ERR04_UNPUSHED_PARENT` (both belonged to the retired exhibit-head mechanism).
+Retired ids — permanently, numbers NEVER reused: `ERR03_DIFF_EXCEEDS_CONFLICT_SET`,
+`ERR04_UNPUSHED_PARENT` (the retired exhibit-head mechanism, D-049);
+`ERR09_COLDREAD_PENDING`, `ERR10_COLDREAD_EXHAUSTED`, `WARN04_COLDREAD_NOTES` (the
+retired PR-text cold read, D-050 — §14.2).
 
 Advisory (returned in `issues`, never block):
 
@@ -726,7 +728,6 @@ Advisory (returned in `issues`, never block):
 | `WARN01_TEMPLATE_TEXT` | body mentions zero conflictedPaths, or contains a retired driver-template phrase |
 | `WARN02_NO_DECISION_LINE` | the first body line carries no ask/decision |
 | `WARN03_MANY_PRS` | more than 8 PRs published this pass |
-| `WARN04_COLDREAD_NOTES` | round-2 reader notes were appended to the body as Caveats |
 
 DriverHalt reasons, mapped onto the same scheme in `run`/`resolve` CLI output (the
 human text stays in `detail`; the journal keeps the raw reason plus the id):

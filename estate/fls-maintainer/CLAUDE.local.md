@@ -85,7 +85,10 @@ rediscover it the hard way):
    - live inventory: copy `repo/scripts/sweep/bootstrap/fork-registry@*/features/` →
      `./inventory/` (then refresh per the `fork-registry-generate` skill in the repo)
    - ledger: `./sweep-ledger.json` (created by the tooling on first record)
-   - rerere: `cd repo && pnpm exec tsx scripts/sweep/sweep.ts seed-rerere --workspace .. --execute`
+   - rerere: `cd repo && git config rerere.enabled true` (repo-wide in the clone —
+     owner (b), D-050; `run --execute` also sets this idempotently, but a fresh clone
+     should carry it from bootstrap), then
+     `pnpm exec tsx scripts/sweep/sweep.ts seed-rerere --workspace .. --execute`
 5. Read `repo/scripts/sweep/README.md` (M0 runbook) fully before the first sweep.
 
 ## The sweep loop (on schedule or when the owner says "run a sweep")
@@ -153,9 +156,13 @@ rediscover it the hard way):
      regenerates `coldread-request.md` with YOUR resolution diff and exits
      asking for a verdict: produce `coldread-verdict.json` via a CONTEXT-FREE
      subagent (D-031 — hand it ONLY the request file; the verdict must carry
-     the resolved tree OID), then re-run resolve. A scope-guard violation or
-     cold-read reject freezes the branch — never argue with the driver;
-     report it in the digest.
+     the resolved tree OID), then re-run resolve. The cold read is FOCUSED
+     (D-050): three bounded questions (behaviour preserved / every hunk
+     conflict-explained / no contradicted record), judged from the request
+     ALONE — the reader answers `UNVERIFIABLE-FROM-REQUEST` rather than
+     researching, and any such answer on those questions is fail-closed to
+     HELD. A scope-guard violation or cold-read reject freezes the branch —
+     never argue with the driver; report it in the digest.
    - `... verify` after the executable portion of the pass and after every
      landed resolve; red = automatic rollback to the journaled pre-ref +
      HELD(gate). Nothing is pushed before verify is green.
@@ -181,8 +188,9 @@ rediscover it the hard way):
    `pr/body.md` to the PR-composition standards below, then run `... publish
    --case <id>` (dry-run first, then `--execute --token-file <path>`): it
    re-verifies the case, runs the pre-PR height check, asks "should this PR
-   exist" (recorded decisions, duplicates), mediates the PR-text cold read,
-   pushes the fix/sweep ref at the REAL head (git push) and creates the PR
+   exist" (recorded decisions, duplicates), applies the mechanical text checks
+   (ERR08 + lint WARNs — the PR-text cold read is retired, D-050), pushes the
+   fix/sweep ref at the REAL head (git push) and creates the PR
    (HELD draft + D-004 machine block below your prose — never edit that block;
    JUDGED non-draft). Act on its result ids per the "Tool result IDs" table
    below — never argue with a blocking id, never work around it.
@@ -207,11 +215,12 @@ rediscover it the hard way):
 6. `record` the sweep (ledger + report in the workspace), post the final digest:
    merged ranges, open PRs, frozen branches, PoI outcomes, what needs the owner.
 
-## Tool result IDs (PROPAGATION.md §14, D-048/D-049)
+## Tool result IDs (PROPAGATION.md §14, D-048/D-049/D-050)
 
 Driver output carries machine-readable ids: `ERR*` blocks, `WARN*` advises. Do what
 the row says — never argue with or work around a blocking id. (`ERR03`/`ERR04`
-belonged to the retired exhibit mechanism — permanently retired, never reused.)
+belonged to the retired exhibit mechanism; `ERR09`/`ERR10`/`WARN04` belonged to the
+retired PR-text cold read (D-050) — all permanently retired, never reused.)
 
 | id | meaning → your action |
 |----|----------------------|
@@ -221,8 +230,6 @@ belonged to the retired exhibit mechanism — permanently retired, never reused.
 | `ERR06_DUPLICATE_CASE` | same conflict as the named topmost case → resolve/publish THAT case; this one inherits it |
 | `ERR07_PR_EXISTS` | a PR for this case is already open → work with the existing PR, never open a second |
 | `ERR08_TEXT_MISSING` | write pr/title.txt + pr/body.md yourself from the case materials |
-| `ERR09_COLDREAD_PENDING` | run a CONTEXT-FREE subagent over the named request file; it writes prtext-verdict.json |
-| `ERR10_COLDREAD_EXHAUSTED` | text edited after the final round → restore the round-2-reviewed text or take the case back through resolve |
 | `ERR11_TOKEN_MISSING` | write the get_credential output to a file, pass `--token-file <path>` (publish AND push) |
 | `ERR12_ORIGIN_UNRESOLVED` | origin remote is not a github.com URL → fix the clone's origin; report if you cannot |
 | `ERR13_API_FAILED` | GitHub API write failed → retry once; still failing = case-2 report with the detail |
@@ -240,7 +247,6 @@ belonged to the retired exhibit mechanism — permanently retired, never reused.
 | `WARN01_TEMPLATE_TEXT` | your body references none of the conflicted files — rewrite from the case materials |
 | `WARN02_NO_DECISION_LINE` | open the body with the exact decision the owner is being asked to make |
 | `WARN03_MANY_PRS` | >8 PRs this pass — re-check for consolidation before publishing more |
-| `WARN04_COLDREAD_NOTES` | round-2 caveats shipped on the PR — mention them in the digest line for that PR |
 
 ## Registry upkeep
 
@@ -302,17 +308,19 @@ belonged to the retired exhibit mechanism — permanently retired, never reused.
   GitHub permalink to the exact lines; then state explicitly: "everything outside these
   N files is verbatim upstream <range>, already reviewed upstream." Verification status
   (what ran, what could not run here) closes the description.
-- **PR text (D-031, mechanized by D-048).** YOU write `pr/title.txt` + `pr/body.md`
-  from studying the case — the case materials + worktree are the source of
-  understanding; if you cannot explain both sides of the conflict, study the case
-  more — never publish text you don't understand. The cold read is MEDIATED by
-  `propagate publish`: it writes the context-free review request
-  (`prtext-review-request.md`), you run a context-free subagent over that file and
-  nothing else, and the tool enforces a HARD two-round cap — one rewrite maximum;
-  round-2 notes ship on the PR as `## Caveats (cold reader)`. Two distinct cold
-  reads exist (resolution: `coldread-*.json`, driver-enforced at `resolve`;
-  PR text: `prtext-*.json`, driver-enforced at `publish`) — neither substitutes
-  for the other.
+- **PR text (D-031; text cold read retired by D-050).** YOU write `pr/title.txt` +
+  `pr/body.md` from studying the case — the case materials + worktree are the source
+  of understanding; if you cannot explain both sides of the conflict, study the case
+  more — never publish text you don't understand. There is NO PR-text reader loop:
+  the checks `propagate publish` runs on your text are MECHANICAL only — `ERR08` if
+  it is missing, the lint WARNs (`WARN01`/`WARN02`), and the adequacy gates
+  `ERR05`/`ERR06`. The D-031 catch-list stays as WRITING RULES you follow yourself:
+  no bare "review needed" — name the specific decision/risk; describe BEHAVIOUR, not
+  line counts; label each side ours/theirs; no unexplained references. (D-050 killed
+  the two-round `prtext-*` cold read: zero unique catches ever, ~300k tokens/~19 min
+  burned in one batch — adequacy was already caught by ERR05/ERR06.) The RESOLUTION
+  cold read (`coldread-*.json`, driver-enforced at `resolve`) is now the only cold
+  read.
 
 ## Reporting to the owner (D-046 — owner directive; supersedes all digest habits)
 

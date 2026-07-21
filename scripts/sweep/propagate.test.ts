@@ -154,10 +154,11 @@ function writeVerdict(
   repo: FixtureRepo,
   resolvedRef: string,
   verdict: 'confirm' | 'reject' = 'confirm',
+  answers?: Record<string, string>,
 ): void {
   writeFileSync(
     join(dir, caseId, 'coldread-verdict.json'),
-    JSON.stringify({ verdict, notes: 'cold read ok', resolvedTree: treeOfRef(repo, resolvedRef) }),
+    JSON.stringify({ verdict, ...(answers ? { answers } : {}), notes: 'cold read ok', resolvedTree: treeOfRef(repo, resolvedRef) }),
   );
 }
 
@@ -1932,5 +1933,102 @@ describe('propagate run — D-047/B11: stale clean verdict re-probed at executio
     ).toBe(true);
     expect(journal.some((e) => e.action === 'case' && e.branch === 'feat/kid')).toBe(false);
     expect(repo.git('show', 'feat/kid:src/f.ts')).toBe('X');
+  });
+});
+
+// --- D-050: focused resolution cold read + fail-closed UNVERIFIABLE ----------
+describe('propagate resolve — D-050: focused cold-read contract', () => {
+  it('request carries the three bounded questions + the judge-from-request preamble; the open-ended Q4 is gone', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
+
+    const request = readFileSync(join(dir, caseId, 'coldread-request.md'), 'utf8');
+    // Preamble (verbatim intent).
+    expect(request).toContain('Judge ONLY from the materials in this request');
+    expect(request).toContain('UNVERIFIABLE-FROM-REQUEST');
+    // Exactly the three bounded questions.
+    expect(request).toMatch(/^1\. Within the conflicted hunks/m);
+    expect(request).toMatch(/^2\. Is every change in the resolution diff explained by the conflict/m);
+    expect(request).toMatch(/^3\. Does the resolution contradict any record/m);
+    // The universe-researcher Q4 is deleted.
+    expect(request).not.toContain('follow-on invariants');
+    expect(request).not.toMatch(/^4\./m);
+  });
+
+  it('an UNVERIFIABLE-FROM-REQUEST answer on Q1-Q3 fails closed to HELD even under an overall confirm', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
+    const caseFile = readCase(dir, caseId);
+    const resolvedRef = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'RESOLVED\n' });
+    const before = repo.sha('main_patched');
+
+    // Overall confirm, but Q2 could not be judged from the request.
+    writeVerdict(dir, caseId, repo, resolvedRef, 'confirm', {
+      q1: 'both sides preserved',
+      q2: 'UNVERIFIABLE-FROM-REQUEST — cannot tell if the extra hunk is conflict-driven',
+      q3: 'no contradiction',
+    });
+    expect(
+      await cmdResolve(
+        baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef }),
+      ),
+    ).toBe(0);
+    const journal = readJournal(dir);
+    // Frozen, not merged: HELD entry present, no resolved entry, branch tip unchanged.
+    const held = journal.find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect(held).toBeTruthy();
+    expect((held.notes as string[]).some((n) => n.includes('UNVERIFIABLE-FROM-REQUEST on q2'))).toBe(true);
+    expect(journal.some((e) => e.action === 'resolved' && e.caseId === caseId)).toBe(false);
+    expect(repo.sha('main_patched')).toBe(before);
+  });
+
+  it('a plain confirm with all three answers present still merges (the answers are advisory when verifiable)', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
+    const caseFile = readCase(dir, caseId);
+    const resolvedRef = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'RESOLVED\n' });
+    writeVerdict(dir, caseId, repo, resolvedRef, 'confirm', { q1: 'ok', q2: 'ok', q3: 'ok' });
+    expect(
+      await cmdResolve(
+        baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef }),
+      ),
+    ).toBe(0);
+    expect(readJournal(dir).some((e) => e.action === 'resolved' && e.caseId === caseId)).toBe(true);
+  });
+});
+
+// --- D-050 (owner b): rerere.enabled set repo-wide, journaled once -----------
+describe('propagate run — D-050: repo-wide rerere.enabled, idempotent journaling', () => {
+  it('enables rerere.enabled in the clone before the first mutation and journals it exactly once', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    // The clone starts without the config.
+    expect(repo.git('config', '--default', '', '--get', 'rerere.enabled')).toBe('');
+
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    expect(await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }))).toBe(0);
+    expect(repo.git('config', '--default', '', '--get', 'rerere.enabled')).toBe('true');
+    expect(readJournal(dir).filter((e) => e.action === 'rerere-enabled').length).toBe(1);
+
+    // A second execute run (config already true) does NOT re-journal.
+    expect(await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }))).toBe(0);
+    expect(readJournal(dir).filter((e) => e.action === 'rerere-enabled').length).toBe(1);
   });
 });

@@ -1,10 +1,10 @@
 /**
  * scripts/sweep/publish.test.ts — `propagate publish` (PROPAGATION.md §14,
- * D-048/D-049): the pre-PR height check + D-004 machine block, the
- * blocking/advisory check battery, the two-round PR-text cold read, and the
- * networked execute path — real `git push` into a bare fixture origin, PR
- * creation against an injected fake transport (dry-run must make ZERO network
- * calls and ZERO pushes).
+ * D-048/D-049/D-050): the pre-PR height check + D-004 machine block, the
+ * blocking/advisory check battery (text checks MECHANICAL only — the PR-text
+ * cold read is retired, D-050), and the networked execute path — real
+ * `git push` into a bare fixture origin, PR creation against an injected fake
+ * transport (dry-run must make ZERO network calls and ZERO pushes).
  */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -21,8 +21,6 @@ import {
   haltIdFor,
   isBlocking,
   parseGithubSlug,
-  prTextGate,
-  prTextHash,
   renderMachineBlock,
   withMachineBlock,
   type GithubTransport,
@@ -118,21 +116,6 @@ function writeText(prDir: string, title: string, body: string): void {
   writeFileSync(join(prDir, 'body.md'), body + '\n');
 }
 
-/** A shape-valid prtext verdict with a FRESH hash for the given text. */
-function writePrVerdict(
-  prDir: string,
-  round: number,
-  verdict: string,
-  title: string,
-  body: string,
-  extra: Record<string, unknown> = {},
-): void {
-  writeFileSync(
-    join(prDir, 'prtext-verdict.json'),
-    JSON.stringify({ round, verdict, notes: ['cold read note'], textHash: prTextHash(title.trim(), body.trim()), ...extra }),
-  );
-}
-
 function fakeGithub(responses: Record<string, { status: number; body: unknown }> = {}): {
   calls: Array<{ method: string; path: string; body?: unknown }>;
   factories: number;
@@ -211,19 +194,6 @@ async function setupHeldCase(
   if (opts.bareOrigin) repo.git('push', 'origin', 'main_patched');
   else repo.setOrigin('main_patched');
   return { repo, ws, dir, caseId, prDir: join(dir, caseId, 'pr'), bareDir, cli };
-}
-
-/** Approve the text through the round-1 gate (request, then a fresh publish verdict). */
-async function approveRound1(
-  cli: (o: Partial<Cli>) => Cli,
-  ws: string,
-  caseId: string,
-  prDir: string,
-): Promise<void> {
-  const out = join(ws, 'gate-out.json');
-  expect(await cmdPublish(cli({ cmd: 'publish', caseId, out }))).toBe(1);
-  expect(readOut(out).issues.some((i) => i.id === 'ERR09_COLDREAD_PENDING')).toBe(true);
-  writePrVerdict(prDir, 1, 'publish', GOOD_TITLE, GOOD_BODY);
 }
 
 // --- Pre-PR height check (D-049 §5) + D-004 machine block --------------------
@@ -305,117 +275,6 @@ describe('publish — D-004 machine block (D-049 decision 8)', () => {
     expect(refreshed).not.toContain('**3**');
     expect(refreshed.indexOf(MACHINE_BLOCK_BEGIN)).toBe(refreshed.lastIndexOf(MACHINE_BLOCK_BEGIN));
     expect(refreshed.indexOf(MACHINE_BLOCK_END)).toBe(refreshed.lastIndexOf(MACHINE_BLOCK_END));
-  });
-});
-
-// --- prTextGate: two-round cap + freshness (§14) -----------------------------
-
-describe('publish — PR-text cold read gate (two-round HARD cap)', () => {
-  function gateInput(prDir: string, title: string, body: string): Parameters<typeof prTextGate>[0] {
-    return {
-      prDir,
-      caseId: 'case-x',
-      title,
-      body,
-      conflictedPaths: ['src/x.ts'],
-      materials: 'materials',
-      inventoryContext: 'context',
-    };
-  }
-  function mkPrDir(): string {
-    const dir = mkdtempSync(join(tmpdir(), 'pub-pr-'));
-    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-    return dir;
-  }
-
-  it('no verdict -> ERR09 + a round-1 request stamped with the current textHash', () => {
-    const prDir = mkPrDir();
-    const res = prTextGate(gateInput(prDir, 't', 'b'));
-    expect(res.issue?.id).toBe('ERR09_COLDREAD_PENDING');
-    const req = readFileSync(join(prDir, 'prtext-review-request.md'), 'utf8');
-    expect(req).toContain('round: 1');
-    expect(req).toContain(`textHash: ${prTextHash('t', 'b')}`);
-    expect(req).toContain('Q0');
-  });
-
-  it('textHash freshness rejects a stale verdict: round 1 is consumed, round 2 request issued', () => {
-    const prDir = mkPrDir();
-    prTextGate(gateInput(prDir, 't', 'b'));
-    writeFileSync(
-      join(prDir, 'prtext-verdict.json'),
-      JSON.stringify({ round: 1, verdict: 'publish', notes: [], textHash: prTextHash('t', 'OLD') }),
-    );
-    const res = prTextGate(gateInput(prDir, 't', 'b'));
-    expect(res.issue?.id).toBe('ERR09_COLDREAD_PENDING');
-    expect(res.issue?.detail).toContain('stale');
-    expect(readFileSync(join(prDir, 'prtext-review-request.md'), 'utf8')).toContain('round: 2');
-  });
-
-  it('round-1 rewrite -> ERR09; round-2 rewrite ships as publish + WARN04 caveats; round 3 is impossible (ERR10)', () => {
-    const prDir = mkPrDir();
-    prTextGate(gateInput(prDir, 't', 'b1'));
-    writeFileSync(
-      join(prDir, 'prtext-verdict.json'),
-      JSON.stringify({ round: 1, verdict: 'rewrite', notes: ['unclear ask'], textHash: prTextHash('t', 'b1') }),
-    );
-    // Fresh round-1 rewrite: the agent must edit; no new request yet.
-    const r1 = prTextGate(gateInput(prDir, 't', 'b1'));
-    expect(r1.issue?.id).toBe('ERR09_COLDREAD_PENDING');
-    expect(r1.issue?.detail).toContain('rewrite');
-    expect(readFileSync(join(prDir, 'prtext-review-request.md'), 'utf8')).toContain('round: 1');
-
-    // Text edited -> the round-1 verdict goes stale -> round-2 request.
-    const r2req = prTextGate(gateInput(prDir, 't', 'b2'));
-    expect(r2req.issue?.id).toBe('ERR09_COLDREAD_PENDING');
-    expect(readFileSync(join(prDir, 'prtext-review-request.md'), 'utf8')).toContain('round: 2');
-
-    // Round-2 REWRITE verdict is FINAL: treated as publish-with-caveats (WARN04).
-    writeFileSync(
-      join(prDir, 'prtext-verdict.json'),
-      JSON.stringify({ round: 2, verdict: 'rewrite', notes: ['still thin'], textHash: prTextHash('t', 'b2') }),
-    );
-    const final = prTextGate(gateInput(prDir, 't', 'b2'));
-    expect(final.issue).toBeNull();
-    expect(final.caveats).toEqual(['still thin']);
-    expect(final.warnings.some((w) => w.id === 'WARN04_COLDREAD_NOTES')).toBe(true);
-
-    // Editing AFTER the final round: no round-3 request exists or is written — ERR10.
-    const exhausted = prTextGate(gateInput(prDir, 't', 'b3'));
-    expect(exhausted.issue?.id).toBe('ERR10_COLDREAD_EXHAUSTED');
-    expect(readFileSync(join(prDir, 'prtext-review-request.md'), 'utf8')).toContain('round: 2');
-  });
-
-  it('round >2 or malformed verdicts are invalid shape; reject-derivable/consolidate block with ERR05/ERR06 semantics', () => {
-    const prDir = mkPrDir();
-    prTextGate(gateInput(prDir, 't', 'b'));
-    writeFileSync(
-      join(prDir, 'prtext-verdict.json'),
-      JSON.stringify({ round: 3, verdict: 'publish', notes: [], textHash: prTextHash('t', 'b') }),
-    );
-    const bad = prTextGate(gateInput(prDir, 't', 'b'));
-    expect(bad.issue?.id).toBe('ERR09_COLDREAD_PENDING');
-    expect(bad.issue?.detail).toContain('round must be 1 or 2');
-
-    writeFileSync(
-      join(prDir, 'prtext-verdict.json'),
-      JSON.stringify({
-        round: 1,
-        verdict: 'reject-derivable',
-        derivedAnswer: 'decision already recorded: keep fork',
-        notes: [],
-        textHash: prTextHash('t', 'b'),
-      }),
-    );
-    const rejected = prTextGate(gateInput(prDir, 't', 'b'));
-    expect(rejected.issue?.id).toBe('ERR05_DECIDED_ALREADY');
-    expect(rejected.issue?.detail).toContain('keep fork');
-
-    writeFileSync(
-      join(prDir, 'prtext-verdict.json'),
-      JSON.stringify({ round: 1, verdict: 'consolidate', derivedAnswer: 'same as case-y', notes: [], textHash: prTextHash('t', 'b') }),
-    );
-    const consolidated = prTextGate(gateInput(prDir, 't', 'b'));
-    expect(consolidated.issue?.id).toBe('ERR06_DUPLICATE_CASE');
   });
 });
 
@@ -568,6 +427,55 @@ describe('propagate publish — check battery (blocking ids reachable)', () => {
     expect(readOut(out).issues.some((i) => i.id === 'ERR08_TEXT_MISSING')).toBe(true);
   });
 
+  it('ERR06 subset (D-050): a 6-path case whose set is a subset of a 7-path sibling with matching blobs is a duplicate', async () => {
+    // The missed #60 shape: feat/a carries the fork edit on SEVEN files,
+    // feat/b the SAME edit on six of them — b's conflicted set is a strict
+    // subset of a's and the shared conflict blobs are byte-identical.
+    const paths = Array.from({ length: 7 }, (_, i) => `src/f${i + 1}.ts`);
+    const files = (content: string, n: number): Record<string, string> =>
+      Object.fromEntries(paths.slice(0, n).map((p) => [p, `${content}\n`]));
+    const repo = initFixtureRepo();
+    repo.commit('base', files('orig', 7));
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: rewrite all 7', files('mp', 7));
+    repo.checkout('main');
+    repo.checkout('feat/a', { create: true, at: 'main' });
+    repo.commit('a: fork edit on 7', files('fork', 7));
+    repo.checkout('main');
+    repo.checkout('feat/b', { create: true, at: 'main' });
+    repo.commit('b: same fork edit on 6', files('fork', 6));
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'a', branch: 'feat/a', parents: ['main_patched'] },
+      { id: 'b', branch: 'feat/b', parents: ['main_patched'] },
+    ]);
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, o);
+    await cmdPlan(cli({ cmd: 'plan' }));
+    await cmdRun(cli({ cmd: 'run', execute: true }));
+    const cases = readJournal(dir).filter((e) => e.action === 'case');
+    expect(cases.length).toBe(2);
+    const topmost = cases.find((e) => e.branch === 'feat/a')!.caseId as string;
+    const subset = cases.find((e) => e.branch === 'feat/b')!.caseId as string;
+    expect((cases.find((e) => e.branch === 'feat/b')!.conflictedPaths as string[]).length).toBe(6);
+    for (const c of [topmost, subset])
+      expect(await cmdResolve(cli({ cmd: 'resolve', execute: true, caseId: c, tier: 'held' }))).toBe(0);
+
+    const out = join(ws, 'out.json');
+    expect(await cmdPublish(cli({ cmd: 'publish', caseId: subset, out }))).toBe(1);
+    const issue = readOut(out).issues.find((i) => i.id === 'ERR06_DUPLICATE_CASE');
+    expect(issue).toBeTruthy();
+    expect(issue!.detail).toContain(topmost); // still names the topmost case
+
+    // The topmost (superset) case itself gets NO ERR06.
+    expect(await cmdPublish(cli({ cmd: 'publish', caseId: topmost, out }))).toBe(1); // blocked on text only
+    expect(readOut(out).issues.some((i) => i.id === 'ERR06_DUPLICATE_CASE')).toBe(false);
+    expect(readOut(out).issues.some((i) => i.id === 'ERR08_TEXT_MISSING')).toBe(true);
+  });
+
   it('ERR07: a journaled pr-published entry for the case blocks a second publish', async () => {
     const { ws, dir, caseId, prDir, cli } = await setupHeldCase();
     writeText(prDir, GOOD_TITLE, GOOD_BODY);
@@ -582,20 +490,20 @@ describe('propagate publish — check battery (blocking ids reachable)', () => {
     expect(issue!.detail).toContain('#7');
   });
 
-  it('ERR08 (text missing) then ERR09 (cold read pending) with a driver-written round-1 request', async () => {
+  it('ERR08 (text missing); with text present the checks are MECHANICAL only — no reader loop, no prtext artifacts (D-050)', async () => {
     const { ws, caseId, prDir, cli } = await setupHeldCase();
     const out = join(ws, 'out.json');
     expect(await cmdPublish(cli({ cmd: 'publish', caseId, out }))).toBe(1);
     expect(readOut(out).issues.some((i) => i.id === 'ERR08_TEXT_MISSING')).toBe(true);
 
+    // Text present -> straight to green (dry-run): the retired PR-text cold
+    // read never fires and no prtext request/verdict artifact is written.
     writeText(prDir, GOOD_TITLE, GOOD_BODY);
-    expect(await cmdPublish(cli({ cmd: 'publish', caseId, out }))).toBe(1);
-    expect(readOut(out).issues.some((i) => i.id === 'ERR09_COLDREAD_PENDING')).toBe(true);
-    const req = readFileSync(join(prDir, 'prtext-review-request.md'), 'utf8');
-    expect(req).toContain('round: 1');
-    expect(req).toContain(GOOD_TITLE);
-    expect(req).toContain('src/x.ts');
-    expect(req).toContain('## Case materials'); // driver facts embedded
+    expect(await cmdPublish(cli({ cmd: 'publish', caseId, out }))).toBe(0);
+    const res = readOut(out);
+    expect(res.ok).toBe(true);
+    expect(res.issues.every((i) => !i.id.includes('COLDREAD'))).toBe(true);
+    expect(existsSync(join(prDir, 'prtext-review-request.md'))).toBe(false);
   });
 
   it('WARN01/WARN02 are advisory: a template-ish body still publishes (dry-run ok:true)', async () => {
@@ -603,8 +511,6 @@ describe('propagate publish — check battery (blocking ids reachable)', () => {
     const title = 'sweep freeze h1';
     const body = 'This PR was prepared by the sweep.\n\nNo further detail.';
     writeText(prDir, title, body);
-    await cmdPublish(cli({ cmd: 'publish', caseId })); // issues round-1 request
-    writePrVerdict(prDir, 1, 'publish', title, body);
     const out = join(ws, 'out.json');
     expect(await cmdPublish(cli({ cmd: 'publish', caseId, out }))).toBe(0);
     const res = readOut(out);
@@ -618,7 +524,6 @@ describe('propagate publish — check battery (blocking ids reachable)', () => {
   it('ERR11: --execute without a token file blocks before any network call', async () => {
     const { ws, caseId, prDir, cli } = await setupHeldCase();
     writeText(prDir, GOOD_TITLE, GOOD_BODY);
-    await approveRound1(cli, ws, caseId, prDir);
     const gh = fakeGithub();
     const out = join(ws, 'out.json');
     expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, out }), gh.factory)).toBe(1);
@@ -634,7 +539,6 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
   it('dry-run: full battery green, real head reported (the run TOP), transport never constructed, nothing pushed', async () => {
     const { repo, ws, dir, caseId, prDir, bareDir, cli } = await setupHeldCase([], { bareOrigin: true });
     writeText(prDir, GOOD_TITLE, GOOD_BODY);
-    await approveRound1(cli, ws, caseId, prDir);
     const gh = fakeGithub();
     const out = join(ws, 'out.json');
     expect(await cmdPublish(cli({ cmd: 'publish', caseId, out }), gh.factory)).toBe(0);
@@ -657,7 +561,6 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
   it('execute: git push of the fix/sweep ref at the run TOP, then POST /pulls (draft, machine block); journal + ledger prNumber', async () => {
     const { repo, ws, dir, caseId, prDir, bareDir, cli } = await setupHeldCase([], { bareOrigin: true });
     writeText(prDir, GOOD_TITLE, GOOD_BODY);
-    await approveRound1(cli, ws, caseId, prDir);
     const tokenFile = join(ws, 'token.txt');
     writeFileSync(tokenFile, 'substitute-token\n');
     const gh = fakeGithub();
@@ -712,7 +615,6 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
   it('execute: an open PR found via the API by head branch name is ERR07 and nothing is pushed', async () => {
     const { repo, ws, caseId, prDir, bareDir, cli } = await setupHeldCase([], { bareOrigin: true });
     writeText(prDir, GOOD_TITLE, GOOD_BODY);
-    await approveRound1(cli, ws, caseId, prDir);
     const tokenFile = join(ws, 'token.txt');
     writeFileSync(tokenFile, 'substitute-token\n');
     const gh = fakeGithub({
@@ -730,7 +632,6 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
   it('execute: a failing git push is ERR15 (journaled halt, D-046 case-2 report) and no PR is created', async () => {
     const { repo, ws, dir, caseId, prDir, bareDir, cli } = await setupHeldCase([], { bareOrigin: true });
     writeText(prDir, GOOD_TITLE, GOOD_BODY);
-    await approveRound1(cli, ws, caseId, prDir);
     const tokenFile = join(ws, 'token.txt');
     writeFileSync(tokenFile, 'substitute-token\n');
     // Break the transport path: point the insteadOf rewrite at a dead path.
@@ -744,37 +645,5 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
     expect(issue!.detail).toContain('D-046 case 2');
     expect(readJournal(dir).some((e) => e.action === 'halt' && e.id === 'ERR15_PUSH_FAILED')).toBe(true);
     expect(gh.calls.filter((c) => c.method === 'POST').length).toBe(0); // no PR created
-  });
-
-  it('execute: round-2 caveats ship on the PR body under "## Caveats (cold reader)" with WARN04', async () => {
-    const { ws, caseId, prDir, cli } = await setupHeldCase([], { bareOrigin: true });
-    writeText(prDir, GOOD_TITLE, GOOD_BODY);
-    // Round 1: rewrite. Edit. Round 2: rewrite again -> FINAL, publish-with-caveats.
-    await cmdPublish(cli({ cmd: 'publish', caseId }));
-    writePrVerdict(prDir, 1, 'rewrite', GOOD_TITLE, GOOD_BODY);
-    const body2 = GOOD_BODY + '\nClarified per round-1 notes.';
-    writeText(prDir, GOOD_TITLE, body2);
-    expect(await cmdPublish(cli({ cmd: 'publish', caseId }))).toBe(1); // issues the round-2 request
-    writePrVerdict(prDir, 2, 'rewrite', GOOD_TITLE, body2, { notes: ['yes/no consequence still thin'] });
-
-    const tokenFile = join(ws, 'token.txt');
-    writeFileSync(tokenFile, 'substitute-token\n');
-    const gh = fakeGithub();
-    const out = join(ws, 'out.json');
-    expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, tokenFile, out }), gh.factory)).toBe(0);
-    const res = readOut(out);
-    expect(res.ok).toBe(true);
-    expect(res.issues.some((i) => i.id === 'WARN04_COLDREAD_NOTES')).toBe(true);
-    const prCall = gh.calls.find((c) => c.path.endsWith('/pulls') && c.method === 'POST')!;
-    const sent = (prCall.body as { body: string }).body;
-    expect(sent).toContain('## Caveats (cold reader)');
-    expect(sent).toContain('yes/no consequence still thin');
-    // Machine block sits BELOW the caveats (agent prose + caveats first).
-    expect(sent.indexOf(MACHINE_BLOCK_BEGIN)).toBeGreaterThan(sent.indexOf('## Caveats (cold reader)'));
-
-    // Round 3 is impossible: editing after the final round is ERR10.
-    writeText(prDir, GOOD_TITLE, body2 + '\nPost-final edit.');
-    // (new case state: PR already published, so ERR07 fires first — assert the
-    // gate alone via a fresh attempt on the text level.)
   });
 });

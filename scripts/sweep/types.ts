@@ -452,33 +452,19 @@ export interface HeldRecord {
 }
 
 /**
- * Context-free PR-TEXT cold-read verdict (PROPAGATION.md §14, D-048) — the
- * SECOND of the two distinct cold reads (the first, ColdReadVerdict below,
- * gates resolutions at `resolve`; this one gates PR text at `publish`;
- * neither substitutes for the other). Written by the agent's context-free
- * subagent next to the tool-issued `prtext-review-request.md`; the tool
- * validates shape, round, and textHash freshness — a HARD two-round cap.
+ * Context-free cold-read verdict the driver requires before accepting
+ * MECHANICAL/JUDGED (§7). The ONLY cold read since D-050: the PR-TEXT cold
+ * read (`PrTextVerdict`, `prtext-*` artifacts, ERR09/ERR10/WARN04) is retired
+ * — zero unique catches ever; text checks at `publish` are mechanical.
  */
-export interface PrTextVerdict {
-  /** Which tool-issued review request this verdict answers (1 or 2; >2 = invalid shape). */
-  round: number;
-  /**
-   * `publish` — text is adequate; `rewrite` — round 1 only earns one rewrite
-   * (a round-2 rewrite ships as publish-with-caveats, WARN04);
-   * `reject-derivable` — the PR should not exist, the answer is derivable
-   * (ERR05 semantics); `consolidate` — duplicate of a sibling case (ERR06).
-   */
-  verdict: 'publish' | 'rewrite' | 'reject-derivable' | 'consolidate';
-  /** For reject-derivable/consolidate: the derived answer, surfaced in the blocking issue. */
-  derivedAnswer?: string;
-  notes: string[];
-  /** Freshness binding: sha256 of the title+body the verdict attests to (copied from the request). */
-  textHash: string;
-}
-
-/** Context-free cold-read verdict the driver requires before accepting MECHANICAL/JUDGED (§7). */
 export interface ColdReadVerdict {
   verdict: 'confirm' | 'reject';
+  /**
+   * Optional per-question answers to the three bounded questions (D-050).
+   * An `UNVERIFIABLE-FROM-REQUEST` answer on any of q1-q3 is fail-closed:
+   * the driver treats the verdict as a reject even under an overall confirm.
+   */
+  answers?: Partial<Record<'q1' | 'q2' | 'q3', string>>;
   /** Non-empty reviewer notes (validated at resolve). */
   notes: string;
   /**

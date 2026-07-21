@@ -17,10 +17,13 @@
  *    owner report, never worked around.
  *  - the driver's template PR prose could never pass its own text gate (a
  *    3-round rewrite loop); the driver NEVER generates prose — the agent
- *    writes pr/title.txt + pr/body.md itself and prTextGate mediates a
- *    context-free cold read with a HARD two-round cap. The only driver-written
- *    body content is the clearly-delimited D-004 machine block below the
- *    agent's prose (pending-count bookkeeping, refreshed by posted urges).
+ *    writes pr/title.txt + pr/body.md itself. The two-round PR-text cold read
+ *    that once gated this text is RETIRED (D-050: zero unique catches ever;
+ *    ~300k tokens/~19 min burned in one batch) — checks on the agent's text
+ *    are MECHANICAL only (advisory lint WARNs + ERR05/ERR06); the D-031
+ *    catch-list survives as writing rules in the doctrine. The only
+ *    driver-written body content is the clearly-delimited D-004 machine block
+ *    below the agent's prose (pending-count bookkeeping, refreshed by urges).
  *  - no gate asked "should this PR exist": decidedAlready (ERR05) matches the
  *    conflict against decisions recorded in inventory `prompt.extra_context` /
  *    `decided_paths`; duplicate-signature detection (ERR06) lives in the CLI.
@@ -28,8 +31,9 @@
  * Every check returns a machine-readable Issue {id, detail}; ERR* ids block,
  * WARN* ids are advisory. HALT_IDS maps the existing DriverHalt reasons onto
  * the same scheme for run/resolve CLI output. The registry of ids is
- * PROPAGATION.md §14 (single source of truth). ERR03/ERR04 are retired
- * permanently and their numbers are never reused (D-049).
+ * PROPAGATION.md §14 (single source of truth). ERR03/ERR04 (D-049, the exhibit
+ * mechanism) and ERR09/ERR10/WARN04 (D-050, the PR-text cold read) are retired
+ * permanently and their numbers are never reused.
  *
  * Network: the GitHub REST API is used for PR creation/comments only (normal
  * API use). Requests go to api.github.com with `Authorization: Bearer
@@ -38,16 +42,13 @@
  * (GithubTransport) so tests never touch the network, and a dry-run
  * publish/push never constructs one at all.
  */
-import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
-import { join } from 'node:path';
 import { connect as tlsConnect } from 'node:tls';
 import type { Socket } from 'node:net';
 
 import { isAncestor, refExists, revParse } from './git.js';
-import type { FeatureEntry, PrTextVerdict } from './types.js';
+import type { FeatureEntry } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Result ids (§14, D-048). ERR* blocks, WARN* is advisory. The full registry
@@ -212,13 +213,9 @@ export function decidedAlready(features: FeatureEntry[], branch: string, conflic
 }
 
 // ---------------------------------------------------------------------------
-// PR-text cold read (§14, D-048) — driver-mediated, HARD two-round cap.
+// Mechanical text checks (§14). The PR-text cold read (prTextGate, prtext-*
+// artifacts, ERR09/ERR10/WARN04) that used to live here is RETIRED by D-050.
 // ---------------------------------------------------------------------------
-
-/** Freshness binding for prtext verdicts: sha256 over `<title>\n<body>`. */
-export function prTextHash(title: string, body: string): string {
-  return createHash('sha256').update(`${title}\n${body}`, 'utf8').digest('hex');
-}
 
 /**
  * Tautology phrases of the retired driver-generated PR bodies (the templates
@@ -233,251 +230,7 @@ export const TAUTOLOGY_PHRASES = [
   'The unmergeable state IS the conflict exhibit',
 ];
 
-export interface PrTextGateInput {
-  /** The case's pr/ directory (title.txt, body.md, prtext-* artifacts). */
-  prDir: string;
-  caseId: string;
-  title: string;
-  body: string;
-  conflictedPaths: string[];
-  /** Driver-written pr/materials.md content ('' when absent). */
-  materials: string;
-  /** Relevant inventory extra_context excerpts (the derivability inputs for Q0). */
-  inventoryContext: string;
-}
-
-export interface PrTextGateResult {
-  /** Blocking issue (ERR09/ERR10, or ERR05/ERR06 semantics from a verdict), or null = text approved. */
-  issue: Issue | null;
-  /** Advisory issues (WARN04 when round-2 caveats ship). */
-  warnings: Issue[];
-  /** Round-2 reader notes to append to the body under '## Caveats (cold reader)'. */
-  caveats: string[];
-}
-
-const REQUEST_FILE = 'prtext-review-request.md';
-const VERDICT_FILE = 'prtext-verdict.json';
-
-/** Adequacy-first question list for the review request (§14). */
-const PRTEXT_QUESTIONS = [
-  'Q0 (adequacy first). Does this PR need to exist? If the decision is already recorded, derivable from the code',
-  'or the case rules, or this is a duplicate of a sibling case: answer verdict `reject-derivable` (or `consolidate`',
-  'for a duplicate) and put the derived answer in `derivedAnswer` — do not review the prose of a PR that should not exist.',
-  'Q1. From the text alone, state the ONE-LINE decision being asked and what changes if the owner answers yes vs no.',
-  'If that is impossible from the text, answer verdict `rewrite` with concrete notes — there is exactly ONE rewrite.',
-  'Otherwise answer verdict `publish` (notes optional; round-2 notes ship as Caveats on the PR).',
-];
-
-function writePrTextRequest(input: PrTextGateInput, round: number, hash: string): void {
-  mkdirSync(input.prDir, { recursive: true });
-  const lines = [
-    `# PR-text cold read — ${input.caseId}`,
-    '',
-    `round: ${round}`,
-    `textHash: ${hash}`,
-    '',
-    'You are the repository owner opening this pull request COLD — no sweep context, no session history.',
-    'Everything you may use is in this file.',
-    '',
-    '## Title',
-    '',
-    input.title,
-    '',
-    '## Body',
-    '',
-    input.body,
-    '',
-    '## Conflicted paths',
-    '',
-    ...input.conflictedPaths.map((p) => `- ${p}`),
-    '',
-    '## Case materials (driver facts)',
-    '',
-    input.materials || '(none)',
-    '',
-    '## Inventory context (derivability inputs)',
-    '',
-    input.inventoryContext || '(none)',
-    '',
-    '## Questions (answer in order)',
-    '',
-    ...PRTEXT_QUESTIONS,
-    '',
-    '## Verdict',
-    '',
-    `Write \`${VERDICT_FILE}\` next to this file:`,
-    '```json',
-    `{"round": ${round}, "verdict": "publish|rewrite|reject-derivable|consolidate",`,
-    ` "derivedAnswer": "<only for reject-derivable/consolidate>",`,
-    ` "notes": ["..."], "textHash": "${hash}"}`,
-    '```',
-  ];
-  writeFileSync(join(input.prDir, REQUEST_FILE), lines.join('\n') + '\n');
-}
-
-/** Round stamped in the existing review request (0 when none was issued yet). */
-function requestState(prDir: string): { round: number; hash: string | null } {
-  const path = join(prDir, REQUEST_FILE);
-  if (!existsSync(path)) return { round: 0, hash: null };
-  const text = readFileSync(path, 'utf8');
-  const round = Number(/^round: (\d+)$/m.exec(text)?.[1] ?? 0);
-  const hash = /^textHash: ([0-9a-f]{64})$/m.exec(text)?.[1] ?? null;
-  return { round, hash };
-}
-
-function readPrTextVerdict(prDir: string): { verdict?: PrTextVerdict; error?: string } {
-  const path = join(prDir, VERDICT_FILE);
-  if (!existsSync(path)) return {};
-  let doc: unknown;
-  try {
-    doc = JSON.parse(readFileSync(path, 'utf8'));
-  } catch (e) {
-    return { error: `not JSON: ${e instanceof Error ? e.message : String(e)}` };
-  }
-  const v = doc as Partial<PrTextVerdict>;
-  if (!Number.isInteger(v.round) || (v.round as number) < 1 || (v.round as number) > 2) {
-    return { error: `round must be 1 or 2 (got ${JSON.stringify(v.round)}) — round >2 is invalid shape, the cap is HARD` };
-  }
-  if (!['publish', 'rewrite', 'reject-derivable', 'consolidate'].includes(v.verdict as string)) {
-    return { error: `verdict must be publish|rewrite|reject-derivable|consolidate (got ${JSON.stringify(v.verdict)})` };
-  }
-  if (!Array.isArray(v.notes) || v.notes.some((n) => typeof n !== 'string')) {
-    return { error: 'notes must be a string array' };
-  }
-  if (typeof v.textHash !== 'string') return { error: 'textHash missing' };
-  return { verdict: v as PrTextVerdict };
-}
-
-/**
- * The driver-mediated PR-text cold read (§14). State machine over the two
- * agent-writable artifacts in pr/ (the request is TOOL-written; the verdict is
- * agent-written via a context-free subagent — provenance is doctrine-enforced,
- * shape/round/freshness are enforced here):
- *  - text present, no request → write the round-1 request → ERR09.
- *  - request pending, no verdict (or the request's hash went stale before any
- *    verdict) → (re)issue the SAME round with the current hash → ERR09
- *    (rounds are consumed by VERDICTS, never by requests).
- *  - fresh verdict for the current round: publish → pass; rewrite on round 1 →
- *    ERR09 (edit the text; the next attempt issues round 2); rewrite on
- *    round 2 → FINAL, ships as publish-with-caveats (WARN04); round-2 publish
- *    notes also ship as caveats; reject-derivable / consolidate → blocking
- *    with ERR05/ERR06 semantics, surfacing the derivedAnswer.
- *  - stale verdict (text edited after it): round 1 consumed → issue round 2 →
- *    ERR09; round 2 consumed → ERR10_COLDREAD_EXHAUSTED — the tool REFUSES to
- *    emit a round-3 request; restore the reviewed text or take the case back.
- */
-export function prTextGate(input: PrTextGateInput): PrTextGateResult {
-  const none: PrTextGateResult = { issue: null, warnings: [], caveats: [] };
-  const hash = prTextHash(input.title, input.body);
-  const req = requestState(input.prDir);
-  const { verdict, error } = readPrTextVerdict(input.prDir);
-
-  if (error) {
-    return {
-      ...none,
-      issue: {
-        id: 'ERR09_COLDREAD_PENDING',
-        detail: `${VERDICT_FILE} invalid: ${error} — fix the verdict for the pending round-${req.round || 1} request`,
-      },
-    };
-  }
-
-  if (!verdict) {
-    const round = req.round === 0 ? 1 : req.round;
-    if (req.round === 0 || req.hash !== hash) writePrTextRequest(input, round, hash);
-    return {
-      ...none,
-      issue: {
-        id: 'ERR09_COLDREAD_PENDING',
-        detail:
-          `PR-text cold read pending (round ${round}): run a CONTEXT-FREE subagent over ` +
-          `${join(input.prDir, REQUEST_FILE)} and have it write ${VERDICT_FILE}`,
-      },
-    };
-  }
-
-  if (verdict.textHash !== hash) {
-    // Stale verdict: the text changed after this round's read. The round is
-    // consumed; round 2 is the last one, and round 3 is impossible.
-    if (verdict.round >= 2) {
-      return {
-        ...none,
-        issue: {
-          id: 'ERR10_COLDREAD_EXHAUSTED',
-          detail:
-            'the round-2 verdict no longer matches the text (edited after the final read) and the two-round cap is HARD — ' +
-            'restore the reviewed text or take the case back through resolve',
-        },
-      };
-    }
-    writePrTextRequest(input, verdict.round + 1, hash);
-    return {
-      ...none,
-      issue: {
-        id: 'ERR09_COLDREAD_PENDING',
-        detail:
-          `round-${verdict.round} verdict is stale (text edited) — round ${verdict.round + 1} request issued: ` +
-          `run the context-free subagent over ${join(input.prDir, REQUEST_FILE)} (round 2 is FINAL)`,
-      },
-    };
-  }
-
-  if (verdict.round < req.round) {
-    return {
-      ...none,
-      issue: {
-        id: 'ERR09_COLDREAD_PENDING',
-        detail: `verdict answers round ${verdict.round} but round ${req.round} is pending — answer the current request`,
-      },
-    };
-  }
-
-  switch (verdict.verdict) {
-    case 'publish':
-    case 'rewrite': {
-      if (verdict.verdict === 'rewrite' && verdict.round === 1) {
-        return {
-          ...none,
-          issue: {
-            id: 'ERR09_COLDREAD_PENDING',
-            detail: `cold reader requests a rewrite (round 1): ${verdict.notes.join('; ') || '(no notes)'} — edit title/body; the next attempt issues the round-2 request`,
-          },
-        };
-      }
-      // Round-2 rewrite is FINAL and ships as publish-with-caveats; round-2
-      // publish notes ship as caveats too (WARN04).
-      const caveats = verdict.round === 2 ? verdict.notes.filter((n) => n.trim() !== '') : [];
-      const warnings: Issue[] =
-        caveats.length > 0
-          ? [
-              {
-                id: 'WARN04_COLDREAD_NOTES',
-                detail: `round-2 cold-reader notes ship as '## Caveats (cold reader)' on the PR: ${caveats.join('; ')}`,
-              },
-            ]
-          : [];
-      return { issue: null, warnings, caveats };
-    }
-    case 'reject-derivable':
-      return {
-        ...none,
-        issue: {
-          id: 'ERR05_DECIDED_ALREADY',
-          detail: `cold reader: this PR should not exist — the answer is derivable: ${verdict.derivedAnswer ?? verdict.notes.join('; ')}`,
-        },
-      };
-    case 'consolidate':
-      return {
-        ...none,
-        issue: {
-          id: 'ERR06_DUPLICATE_CASE',
-          detail: `cold reader: consolidate with a sibling case: ${verdict.derivedAnswer ?? verdict.notes.join('; ')}`,
-        },
-      };
-  }
-}
-
-/** Advisory text checks (WARN01/WARN02) — returned, never blocking. */
+/** Advisory text checks (WARN01/WARN02) — returned, never blocking (D-050: the only text checks besides ERR08). */
 export function advisoryTextIssues(title: string, body: string, conflictedPaths: string[]): Issue[] {
   const issues: Issue[] = [];
   const mentions = conflictedPaths.filter((p) => body.includes(p) || body.includes(p.split('/').pop() ?? p));
