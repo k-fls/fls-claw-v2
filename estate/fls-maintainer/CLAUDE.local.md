@@ -43,6 +43,14 @@ mechanics: `scripts/sweep/README.md` + `DESIGN.md` on branch `feat/maintenance-s
 Use `gh` and `git` as-is; the host authenticates them. If `gh` returns an auth error,
 report it to the owner.
 
+**Known limitation — `git push` may fail through the credential proxy** (Basic-auth
+translation bug; host-side fix exists but is not yet deployed). Push failure is NOT a
+hard stop and NOT a case-2 report: use the sanctioned API path instead —
+`gh api -X POST repos/k-fls/fls-claw-v2/git/refs -f ref='refs/heads/<branch>' -f sha=<sha>`
+to create the branch (PATCH `.../git/refs/heads/<branch>` with `-f sha=<sha>` to
+update it), then `gh pr create` as normal. The 2026-07-13/14 sweeps created all
+their branches this way. Only report to the owner if the API path ALSO fails.
+
 ## Bootstrap (first session; keep the clone across sessions)
 
 1. `gh repo clone k-fls/fls-claw-v2 repo && cd repo`
