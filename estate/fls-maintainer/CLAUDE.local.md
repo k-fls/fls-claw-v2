@@ -73,11 +73,16 @@ report it to the owner.
    merge `main` ONLY (upstream-PR candidates — never pollute them with
    main_patched/fork content) and must be flagged for an inventory entry ("in edition
    composition but no inventory entry — add one").
-2. Post a short digest here BEFORE acting: pending commit count, per-branch
-   clean/gated verdicts, PoIs by class, anything security-flagged or OVERLAP-suspect.
+2. Progress heartbeat (D-046): while working, send ONE-LINE progress updates via
+   `send_message` — `step <n>: <what you are doing>` (e.g. `step 4: propagate run
+   --execute — 17 branches`, `resolving case module__credentials--module__host-rpc-h91`).
+   Statements only, NEVER questions — you send and keep working, no answer expected.
+   Anything that needs an answer is a STOP and goes through "Reporting to the owner"
+   below. No pre-action digests, no plan posts, no prose.
 3. Route annotate-PoIs (`route`) and run overlap checks with the registry prompts
-   (spawn one subagent per routed feature; prompts are self-contained). Report
-   OVERLAP-HIGH findings as high priority.
+   (spawn one subagent per routed feature; prompts are self-contained).
+   OVERLAP-HIGH findings go into the end-of-sweep report (and any freeze they
+   cause becomes a draft PR) — not into interim chat.
 4. Propagate via the MECHANICAL DRIVER (D-044; spec `scripts/sweep/PROPAGATION.md`
    is authoritative, decisions D-035..D-040). The driver owns ordering
    (breadth-wise DAG barrier), merge-point selection, tier classification
@@ -89,8 +94,8 @@ report it to the owner.
    committed bootstrap snapshot, which drifts from your live inventory.
    Loop (all commands from the clone root):
    - `pnpm exec tsx scripts/sweep/propagate.ts plan --repo . --workspace ..
-     --inventory ../inventory` — ONLY `plan` opens a pass. Post the plan digest
-     here before executing. SANITY (rule 7): the plan's branch count must be
+     --inventory ../inventory` — ONLY `plan` opens a pass. Review the plan
+     YOURSELF — do not post it (D-046). SANITY (rule 7): the plan's branch count must be
      close to the inventory's sweepable-branch count — a 1-2 branch plan means
      scope collapse (missing local branches or wrong inventory path): stop and
      investigate, do not run.
@@ -177,9 +182,11 @@ report it to the owner.
   (unmergeable by construction), conflict inventory + reproduction command in the PR
   description, no resolution, no NOTES.md file (D-030). `edition/*` is always case 3
   minimum.
-- Ask the owner in chat only for genuine policy decisions (scope changes, inventory
-  drift like missing branches, OVERLAP-HIGH follow-ups) — never for permission to do
-  the work the cases already authorize.
+- Ask the owner in chat ONLY in the two cases of "Reporting to the owner" (D-046):
+  new branch candidates, and genuinely bad/unusual failures. Everything else that
+  needs an owner decision travels as a draft PR listed in the end-of-sweep report —
+  never as a chat question, and never ask permission for work the cases already
+  authorize.
 - A "don't do X" instruction in a chat message applies to that occasion only; standing
   policy is this document.
 
@@ -224,14 +231,37 @@ report it to the owner.
     "rerere replay") without one clause of plain language.
   - references to other PRs or prior sessions without saying inline what they are.
 
-## Reporting style
+## Reporting to the owner (D-046 — owner directive; supersedes all digest habits)
 
-**PRs carry the details; digests carry links.** Every statement in a digest must
-reference a concrete artifact the owner can open: a PR URL, a commit SHA, a file path
-inside a PR, or a report file you attach/upload. Never ask the owner to act on detail
-that exists only in your context. Digest first, then bullets: security-surface changes,
-OVERLAP-HIGH, frozen branches, open PRs by case, anything you could not verify.
-Owner: Kirill.
+The owner wants WORK and RESULTS, not talk. The channel rule is one question: do you
+need to stop?
+
+- **You DON'T stop → `send_message`**: the one-line progress heartbeat (sweep-loop
+  step 2). Statements only, never questions.
+- **You DO stop → your FINAL message block.** Exactly three stop cases, no others:
+
+1. **New branch candidates (D-045).** One compact block per candidate: branch, the
+   driver's suggested parent(s) and descendant(s) with evidence SHAs, and YOUR
+   recommended answer. Ask once, STOP, wait for the owner; don't re-ask until the
+   candidate's tip moves. Finish whatever needs no answer first, then ask.
+2. **Something genuinely bad or unusual.** Access/auth failures (gh, git,
+   credentials), tooling errors you cannot fix yourself, diverged branches, upstream
+   history rewrites, verify reds that survive rollback. One message — what broke,
+   what you already did, what you need — then STOP.
+3. **End-of-sweep result — exactly one per sweep.** "Look at these PRs": each PR
+   that needs the owner as `#N — <one line: the exact decision being asked>`. Fold
+   in any pending case-1/2 asks as one line each. If NOTHING needs the owner:
+   exactly one line — `Sweep <date>: done — <n> branches advanced, nothing needs
+   you.` — and stop.
+
+Never duplicate one message across both channels (known double-delivery bug).
+Everything else — plans, dry-run output, case resolutions, cold reads, PoI/overlap
+analyses, reasoning — lives in the pass artifacts, the journal, and PR descriptions.
+Never re-ask a decision already recorded in the inventory (`prompt.extra_context`),
+never ask permission for work this document authorizes. Every pointer you send must
+reference a concrete artifact (PR URL, SHA, file path) the owner can open — never
+detail that exists only in your context. PRs carry the details; your messages carry
+pointers. Owner: Kirill.
 
 **Slack formatting:** follow the slack-formatting skill. Specifically for links: never
 place a URL directly adjacent to backticked text — Slack fuses them into a broken link.
