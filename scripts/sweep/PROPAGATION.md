@@ -2,8 +2,10 @@
 
 Status: v1 (2026-07-18, owner-settled design; §13 remote branches + inventory candidates
 added 2026-07-21, D-045; §14 publish tool + result-ID contract added 2026-07-21,
-D-048). Decision references D-035..D-040, D-045 and D-048 point to
-the decision log (`self-maintenance-decisions.md`). Supersedes the agent-sequenced merge
+D-048; case stacking, driver pushes and PR head shapes aligned to MERGE-POLICY.md
+2026-07-21, D-049 — on conflict, MERGE-POLICY.md wins). Decision references
+D-035..D-040, D-045, D-048 and D-049 point to the decision log
+(`self-maintenance-decisions.md`). Supersedes the agent-sequenced merge
 loop of DESIGN.md §5-6 for propagation ordering, merge execution, and case handling;
 scan/PoI routing/inventory/verify machinery is reused, not replaced.
 
@@ -22,9 +24,9 @@ Every parent→branch merge attempt lands in exactly one tier:
 | Tier | Meaning | Handling |
 |------|---------|----------|
 | **CLEAN** | No textual conflict | Bulk-merged directly, no review |
-| **MECHANICAL** | Trivial conflict (e.g. two disjoint appends); agent-resolved | Cold-read confirmed, merged directly, no PR |
-| **JUDGED** | Non-obvious resolution, agent-resolved | PR for the audit trail, cold-read confirmed, auto-merged (merge commit pushed to target → PR flips to merged) |
-| **HELD** | Unresolved / cold-read rejected / sophisticated | Draft PR via `publish` (exhibit head, §14 D-048), branch frozen for the owner |
+| **MECHANICAL** | Conflict the agent is allowed to resolve (what qualifies is regulated separately — owner rule pending, D-049 G1); agent-resolved | Cold-read confirmed, merged directly, no PR |
+| **JUDGED** | Non-obvious resolution, agent-resolved | NON-draft PR for the audit trail (head = the REAL merge commit), cold-read confirmed, auto-merged: the same merge commit pushed to the target flips the PR to merged (D-040) |
+| **HELD** | Unresolved / cold-read rejected / sophisticated | DRAFT PR via `publish` at the case run's TOP commit (real diff = the run — D-030 head, §14 D-049), branch frozen for the owner |
 | **DEFERRED** | Conflict *belongs to an ancestor* currently HELD | Branch frozen, **no PR**; auto-unfreezes when the ancestor's HELD clears |
 
 Tier decisions and constraints:
@@ -84,9 +86,18 @@ Per branch and per parent, over the parent's *eligible line* (§4):
    candidate head, oldest→newest), recording clean/conflicted per height.
 3. Merge at the **largest clean height** — this may lie beyond intermediate conflicting
    heights (their content lands cleanly at tip level; desirable, fewer conflicts).
-4. Report the **smallest conflicting height above the merge point** as the case for the
-   agent: `{branch, parent, head: {sha, height}, conflictedPaths, automergeTree,
-   reproduction}`.
+4. Report the case for the agent: it STARTS at the smallest conflicting height above
+   the merge point and is STACKED (D-049 §2) into the **maximal run of consecutive
+   conflicting heights whose conflicted path sets intersect** — one logical decision.
+   The run breaks at a clean height, at a disjoint-path conflict (its own case later),
+   and at the cap (`stack_cap`, default 5 — routing.yaml key; per-entry `stack_cap`
+   override on the inventory entry, mirroring the scope-guard lever). The case's
+   `head` is the run's TOP commit; `conflictedPaths`/`automergeTree` are computed at
+   the top, so resolving the case resolves the whole run under ONE cold read:
+   `{branch, parent, head: {sha, height}, run: [{sha, height}…], conflictedPaths,
+   automergeTree, reproduction}`. DEFERRED windows and urge tracking are computed
+   against the run's top. Never stack disjoint-path conflicts; never stack across a
+   clean height.
 
 Probes are milliseconds (checkout-free); upstream deltas are tens of commits — linear
 cost is negligible and correctness beats O(log n).
@@ -148,7 +159,8 @@ mutation (§8). A branch present in NEITHER place remains a loud scope-drift war
 
 ## 5. DEFERRED — conflicts that belong to an ancestor (D-036)
 
-When the sweep finds branch C's first conflicting height N′ against parent Q, and the
+When the sweep finds branch C's first conflicting run against parent Q, with run TOP
+height N′ (D-049 §2 — the window is computed against the run's top), and the
 pass registry records an ancestor P (any transitive inventory ancestor, not only a
 direct parent) HELD at height N with conflicted path set S_P:
 
@@ -262,23 +274,31 @@ The driver is the only author of merge parameters. Artifacts live under
   agent-writable workspace.
 
 After a JUDGED resolution or a HELD freeze the driver **prepares** the PR MATERIALS but
-never PR prose and never a ref: it writes `pr/materials.md` (conflicted paths, per-side
+never PR prose: it writes `pr/materials.md` (conflicted paths, the case run, per-side
 `git log --oneline` over those paths, reproduction command) into the case dir. The agent
 studies the case and writes `pr/title.txt` + `pr/body.md` itself; the PR is then created
-EXCLUSIVELY by `propagate publish --case <id>` (§14, D-048), whose head is an **exhibit
-head**: a synthetic commit parented on the ORIGIN base-branch tip whose tree is the base
-tree with ONLY the case's conflicted paths overlaid (HELD: conflict-marker blobs from
-the recomputed merge-tree; JUDGED: the resolved blobs), hard-asserted so that
-`git diff <origin-base-tip> <exhibit>` equals the conflicted paths EXACTLY. This
-supersedes the D-030 "parent's conflicting head" shape, whose PR diff showed the whole
-pending range (26-60x bloat, 2026-07-21 forensics) and whose pushes back-doored
-unpushed protected-branch commits onto origin. Trade-off, accepted: GitHub no longer
-flags the PR as unmergeable — the conflict markers inside the tiny diff ARE the exhibit.
+EXCLUSIVELY by `propagate publish --case <id>` (§14, D-048/D-049). PR heads are REAL
+commits pushed by the driver via `git push` — never synthetic constructions, never API
+ref fabrication (the 2026-07-21 exhibit-head mechanism is retired by D-049):
 
-JUDGED PR closure (D-040): after cold-read confirmation, the same merge commit is pushed
-to the target branch; GitHub auto-marks the PR merged — history preserved, zero
-merge-of-merge noise, no dependence on the merge button. (Pushing target branches is
-owner-gated; see the doctrine.)
+- **HELD**: the fix/sweep ref is pushed at the case run's TOP commit verbatim (entry
+  and parents models alike — the D-030 head). HELD PRs are published AFTER the pass's
+  target pushes (§14.4 order), so the origin base already carries the clean prefix
+  and the DRAFT PR's diff is the run's real changes (1..cap commits) only — no
+  pending-range bloat. The pre-PR height check (`ERR14_BASE_BEHIND`) blocks a publish
+  whose origin base is behind the expected pass height or diverged; together with the
+  push order it is the guarantee (no per-diff assertions).
+- **JUDGED**: the fix/sweep ref is pushed at the REAL merge commit and the NON-draft
+  PR is created BEFORE the target push; the target push then lands the same commit on
+  the base and GitHub auto-marks the PR merged (D-040) — history preserved, zero
+  merge-of-merge noise, no dependence on the merge button.
+
+The DRIVER pushes; the agent never hand-pushes anything (D-049 §5 — driver-journaled
+pass pushes are the only pushes). Refs move via `git push` ONLY; the API is used for
+PR creation/comments (normal use), never to fabricate refs/commits as a push
+workaround. A failing push (e.g. through the credential proxy) is a hard halt,
+journaled, surfaced as `ERR15_PUSH_FAILED`, and REPORTED to the owner (D-046 case 2)
+— never retried blindly, never worked around.
 
 ## 8. Driver loop
 
@@ -290,9 +310,11 @@ propagate run                 # execute plan: CLEAN merges + skips + DEFERRED ma
                               #   descendants via the barrier)
 propagate resolve --case ID --tier T   # scope guard + cold-read gate, then merge (MECHANICAL) or
                               #   prepare PR materials (JUDGED) or freeze (HELD); reopens the branch
-propagate publish --case ID   # §14 (D-048): the ONLY PR-creation path — exhibit head + check
-                              #   battery; --execute creates the fix/sweep ref + draft PR via
-                              #   the GitHub REST API (the driver's single networked command)
+propagate publish --case ID   # §14 (D-048/D-049): the ONLY PR-creation path — check battery;
+                              #   --execute pushes the fix/sweep ref (git push) and creates
+                              #   the PR via the GitHub API (JUDGED non-draft, HELD draft)
+propagate push                # §14.4 (D-049): verify-gated pass pushes — target branches
+                              #   (flips JUDGED PRs to merged), closure checks, posted urges
 propagate status              # human-readable pass state from journal + derivation
 ```
 
@@ -361,14 +383,18 @@ the owner merged the freeze PR) is auto-unfrozen (journaled, reason `derived`);
 (b) a mechanical/judged `resolve` on the branch unfreezes it; (c) manual override via
 a journaled subcommand. Freezes are never cleared silently.
 
-**Urging (owner 2026-07-20):** the ledger-frozen entry also carries `lastUrgedHead`.
+**Urging (owner 2026-07-20; posting mechanized 2026-07-21, D-049):** the
+ledger-frozen entry also carries `lastUrgedHead` and the freeze PR's `prNumber`.
 When a pass finds NEW pending content for a frozen branch beyond what it was last
-urged about (newest eligible head ≠ `lastUrgedHead`), the driver PREPARES a PR
-comment for the freeze PR — pending-commit count since the freeze, the newest heads
-with subjects — as `urge-comment.md` + a `gh pr comment` command next to the case's
-PR artifacts, journals `urge`, and records the new `lastUrgedHead`. One urge per new
-head, not per pass — quiet passes stay quiet. As with PRs, the driver prepares and
-never calls gh.
+urged about (newest eligible head ≠ `lastUrgedHead` — the pending run's top; a
+frozen branch lands no merges, so that is the newest pending trunk head), `propagate
+push --execute` POSTS the urge as a PR comment on the freeze PR — pending-commit
+count since the freeze, the newest heads with subjects — refreshes the D-004
+machine block in the PR body (§14.4), journals `urge`, and records the new
+`lastUrgedHead` (only after a successful post; a failed post is
+`ERR17_URGE_FAILED`). One urge per new head, not per pass — quiet passes stay
+quiet. `plan`/`run` only DETECT would-urge (no writes, no network); posting lives
+exclusively in the networked `push` stage.
 
 **Naming:** resolution/freeze branches are `fix/sweep/<date>-<topic>-h<height>` so two
 cases on one branch in one day cannot collide; case ids are `branch + parent + height`
@@ -392,7 +418,9 @@ executable portion of a pass and after each `resolve` that lands a merge. Red re
 the offending branch is rolled back to its journaled `pre-ref` (recorded before its
 first mutation this pass) and journaled HELD(gate) + ledger-frozen (D-012); re-verify
 without it. A pass is only `pass-complete` when the gate is green. Nothing is pushed
-before verification passes (D-034 gate 1-2 additionally apply to any push).
+before verification passes (D-034 gate 1-2 additionally apply to any push):
+`propagate push` refuses (`ERR18_VERIFY_PENDING`) unless the journal shows a green
+`verify` after the pass's last mutation (§14.4).
 
 ## 10. Module layout (new files, flat per convention; reuse map)
 
@@ -405,9 +433,9 @@ before verification passes (D-034 gate 1-2 additionally apply to any push).
 | `deferred.ts` | ancestor-HELD matching rule (§5) |
 | `scope-guard.ts` | automerge-vs-resolved subset check (§7) |
 | `steps.ts` | step/case JSON schemas + first-principles re-verification |
-| `propagate.ts` | CLI (`plan/run/resolve/publish/status`), journal, worktree + PR-materials preparation |
+| `propagate.ts` | CLI (`plan/run/resolve/publish/push/status`), journal, worktree + PR-materials preparation, pass pushes |
 | `candidates.ts` | inventory-candidate discovery + inheritance derivation + report throttle (§13, D-045) |
-| `publish.ts` | §14 (D-048): exhibit-head construction, result-id registry + halt-id mapping, PR-text cold-read gate, GitHub REST transport (injectable) |
+| `publish.ts` | §14 (D-048/D-049): result-id registry + halt-id mapping, PR-text cold-read gate, pre-PR height check, D-004 machine block, GitHub REST transport (injectable) |
 
 Reused as-is: `git.ts` (merge-tree, rev-list, worktree helpers), `merge.ts` (merge-tree
 + commit-tree + update-ref execution, rerere install), `scan.ts`/`routing.ts` (PoI
@@ -582,38 +610,54 @@ per-edit re-arm of the gate was unenforceable; (c) no gate anywhere asked "shoul
 this PR exist" — three of six PRs re-raised recorded decisions, three were
 byte-identical duplicates.
 
+**D-049 correction (owner, 2026-07-21, MERGE-POLICY.md):** the synthetic
+exhibit-head answer to (a) is RETIRED. The D-030 head (a real conflicting-height
+commit) returns, with the two failure modes solved structurally instead: HELD PRs
+are created only AFTER the pass's target pushes (so the base is current and the
+diff = the case run only — no bloat), and the pre-PR height check plus the
+verify-gated push order keep unpushed protected content out of PR ancestry (no
+back-door). (b) and (c) — the agent-writes-prose principle, the PR-text cold read,
+ERR05/ERR06 — stand unchanged.
+
 ### 14.1 `propagate publish --case <id>` — the ONLY sanctioned PR-creation path
 
 **Agent-writes-prose principle:** the driver NEVER generates PR prose. At
 resolve/freeze it writes `pr/materials.md` (structured facts only: conflicted paths,
-per-side `git log --oneline` over those paths, reproduction command). The agent
-studies the case — the worktree and materials ARE the source of understanding — and
-writes `pr/title.txt` + `pr/body.md` itself, then runs `publish`. The tool:
+the case run, per-side `git log --oneline` over those paths, reproduction command).
+The agent studies the case — the worktree and materials ARE the source of
+understanding — and writes `pr/title.txt` + `pr/body.md` itself, then runs
+`publish`. The tool:
 
 1. **Re-verifies the case** from the journal + git (the journal is a pointer, git is
    the authority): the case must have an open `held` disposition (live conflict
    recomputed against the current tip, path set unchanged) or a `judged` resolution
    (merge commit still on the branch). Mechanical/crash-heal resolutions get no PR.
-2. **Builds the EXHIBIT HEAD**: synthetic commit parented on the ORIGIN base-branch
-   tip (local-tip fallback only when no origin ref exists) whose tree is the base
-   tree with ONLY the conflicted paths overlaid — conflict-marker blobs for HELD,
-   resolved blobs for JUDGED — then HARD-ASSERTS
-   `git diff --name-only <origin-base-tip> <exhibit>` == conflictedPaths exactly.
+2. **Determines the PR head** (D-049; real commits only, no synthetic construction):
+   HELD — the case run's TOP commit verbatim; JUDGED — the real merge commit. Then
+   runs the **pre-PR height check** (`ERR14_BASE_BEHIND`): the origin base branch
+   must be at least at the expected pass height — for HELD the local tip must be
+   contained in origin (targets pushed first, §14.4 order; higher is fine, someone
+   else committed); for JUDGED origin must not have diverged and must NOT already
+   contain the merge commit (JUDGED PRs are created BEFORE the target push). Lower
+   or diverged = halt.
 3. **Runs the check battery** and emits ONE machine-readable JSON object on stdout:
    `{ok, issues: [{id, detail}], pr?: {url, number}}`. Any ERR* id blocks; WARN* ids
    are advisory and never block.
-4. **On all-clear + `--execute`**: creates the fix/sweep ref AND the draft PR via the
-   GitHub REST API directly from node (blobs → tree → commit → ref → draft PR;
-   origin-parenting makes the base tree remotely constructible). No `gh`, no
-   `python3`, no `git push` — none of those work in the agent container; requests go
-   to api.github.com with `Authorization: Bearer <substitute token>` (the credential
-   proxy swaps the header on the wire), CONNECT-tunnelled through HTTPS_PROXY. The
-   token comes from `--token-file <path>` — the agent writes the get_credential
-   output there once per session; `$GITHUB_TOKEN` is never read. Journals
-   `pr-published {case, url, number}`.
+4. **On all-clear + `--execute`**: pushes the fix/sweep ref at the head commit via
+   `git push` (refs move via git push ONLY — the API is never used to fabricate
+   refs/commits; a failing push is `ERR15_PUSH_FAILED`, journaled, and a D-046
+   case-2 owner report — never worked around), then creates the PR via the GitHub
+   REST API (POST /pulls — normal API use): HELD = draft with the D-004 machine
+   block appended below the agent's body (§14.4), JUDGED = non-draft. API requests
+   go to api.github.com with `Authorization: Bearer <substitute token>` (the
+   credential proxy swaps the header on the wire), CONNECT-tunnelled through
+   HTTPS_PROXY. The token comes from `--token-file <path>` — the agent writes the
+   get_credential output there once per session; `$GITHUB_TOKEN` is never read
+   (same flag on every networked subcommand: `publish`, `push`). Journals
+   `pr-published {case, url, number, head}`.
 5. **Without `--execute`**: dry-run — the full battery runs and local artifacts
-   (prtext review requests, §14.2) may be written, but there are NO network calls of
-   any kind; the transport is never constructed.
+   (prtext review requests, §14.2) may be written, but there are NO network calls
+   and NO pushes of any kind; the transport is never constructed.
 
 Cross-pass publishes attach like `resolve` (latest open pass, or `--pass <wm12>`).
 The pr/ dir is agent-writable, so — as with the resolution cold read (§7/§12) — the
@@ -651,23 +695,29 @@ driver-enforced at `publish`). Neither substitutes for the other.
 
 ### 14.3 Result-ID registry (single source of truth)
 
-Blocking (any one → no publish):
+Blocking (any one → no publish/push):
 
 | id | meaning |
 |----|---------|
 | `ERR01_CASE_NOT_OPEN` | no open journaled held/judged disposition for the case (unresolved, mechanical, or never journaled) |
 | `ERR02_CASE_STALE` | live state moved: resolution landed externally, conflict healed, path set drifted, or the judged merge left the branch |
-| `ERR03_DIFF_EXCEEDS_CONFLICT_SET` | exhibit diff != conflictedPaths exactly (overlay mismatch) |
-| `ERR04_UNPUSHED_PARENT` | exhibit ancestry would carry local-only protected-branch commits (structurally prevented by origin-parenting; asserted anyway) |
 | `ERR05_DECIDED_ALREADY` | a conflictedPath matches a decision recorded in inventory `prompt.extra_context` / `decided_paths` (record quoted in detail) |
-| `ERR06_DUPLICATE_CASE` | another open case or published PR shares the conflict signature (same path set + same head sha or same exhibit tree); the topmost case by DAG order is named |
+| `ERR06_DUPLICATE_CASE` | another open case or published PR shares the conflict signature (same path set + same head sha or identical conflict blobs); the topmost case by DAG order is named |
 | `ERR07_PR_EXISTS` | an open PR is already recorded for this case (journal) or found via the API by head branch name |
 | `ERR08_TEXT_MISSING` | pr/title.txt or pr/body.md absent or empty |
 | `ERR09_COLDREAD_PENDING` | a PR-text cold-read round is pending (request written/regenerated; see §14.2) |
 | `ERR10_COLDREAD_EXHAUSTED` | text edited after the FINAL (round-2) verdict; no round-3 request exists — unreachable in normal flow |
-| `ERR11_TOKEN_MISSING` | `--execute` without a readable `--token-file` |
+| `ERR11_TOKEN_MISSING` | a networked `--execute` without a readable `--token-file` |
 | `ERR12_ORIGIN_UNRESOLVED` | `--execute` but owner/repo cannot be derived from the origin remote URL |
 | `ERR13_API_FAILED` | a GitHub API call failed during execute (non-2xx / transport error) |
+| `ERR14_BASE_BEHIND` | pre-PR height check (D-049 §5): the origin base branch is missing, behind the expected pass height, diverged — or (JUDGED) already contains the merge commit (order violation) |
+| `ERR15_PUSH_FAILED` | a `git push` failed (any push, any stage) — hard halt; report to the owner (D-046 case 2) and STOP; publication is blocked until the infrastructure is fixed; no fallback of any kind |
+| `ERR16_CLOSURE_FAILED` | a JUDGED PR did not flip to merged after its target push (checked via the API) |
+| `ERR17_URGE_FAILED` | posting an urge comment / refreshing the D-004 machine block failed (the `lastUrgedHead` is NOT advanced — the urge retries next push) |
+| `ERR18_VERIFY_PENDING` | `push --execute` refused: no green `verify` journal entry after the pass's last mutation (§9, D-012) |
+
+Retired ids — permanently, numbers NEVER reused (D-049): `ERR03_DIFF_EXCEEDS_CONFLICT_SET`,
+`ERR04_UNPUSHED_PARENT` (both belonged to the retired exhibit-head mechanism).
 
 Advisory (returned in `issues`, never block):
 
@@ -683,9 +733,47 @@ human text stays in `detail`; the journal keeps the raw reason plus the id):
 
 | id | halt reason |
 |----|-------------|
-| `ERR20_BRANCH_DIVERGED` | `sync-diverged` (§13 — owner escalation, never force-resolve) |
+| `ERR20_BRANCH_DIVERGED` | `sync-diverged` (§13 — owner escalation, never force-resolve; also fired when a push target has diverged from origin) |
 | `ERR21_MERGE_FAILED` | `merge-failed` (D-047/B11 backstop — branch-local halt) |
 | `ERR22_DIRTY_WORKTREE` | `dirty-worktree` (N1 checked-out safety) |
 | `ERR23_PROTECTED_REF` | `protected-ref` (§8 choke point) |
 | `ERR24_PLAN_DRIFT` | plan drift — git moved under us (§8) |
 | `ERR25_BAD_CASE_ID` | `--case` does not match the generated case-id shape (N5) |
+
+### 14.4 `propagate push` — the pass publication stage (D-049)
+
+The DRIVER pushes; the agent never hand-pushes anything. Per-pass order (owner,
+D-049): **verify green → JUDGED PRs created (`publish`, non-draft, head = the real
+merge commit on a pushed fix/sweep ref) → `push` pushes the target branches (the
+same commits land on the bases; GitHub auto-flips the JUDGED PRs to merged, D-040)
+→ HELD draft PRs created (`publish`; bases now current, diff = the case run) →
+urge comments posted.** `propagate push --execute [--token-file <path>]`:
+
+1. **Verify gate**: refuses (`ERR18_VERIFY_PENDING`) unless the journal shows a
+   green `verify` after the pass's last `merge`/`resolved` (nothing is pushed
+   before verify is green — §9, D-012).
+2. **Target pushes**: every branch the driver mutated this pass (journaled
+   `merge`/`resolved`), in plan order, is pushed `git push origin <branch>` — ONE
+   push per branch, clean prefix and judged merge commits together. Already
+   up-to-date or origin-ahead branches are skipped (higher is fine); a DIVERGED
+   target is `ERR20_BRANCH_DIVERGED` (owner escalation); a failed push is
+   `ERR15_PUSH_FAILED` — hard halt, journaled, D-046 case-2 report, NO fallback.
+   Every push is journaled (`push {branch, to}`) — driver-journaled pass pushes
+   are the ONLY pushes (rule 3 as amended by D-049).
+3. **JUDGED closure check**: for each published JUDGED PR whose target was pushed,
+   the API is asked whether the PR flipped to merged; a still-open PR is
+   `ERR16_CLOSURE_FAILED` (investigate — the commit on the base and the PR head
+   should be the same object).
+4. **Urge posting** (§8): for each still-frozen branch with NEW pending content and
+   a published freeze PR, POST the urge comment and PATCH the PR body's D-004
+   machine block, then record `lastUrgedHead` (post-first — a failed post is
+   `ERR17_URGE_FAILED` and does not advance the tracking).
+
+Without `--execute`, `push` is a pure report: what would be pushed, flipped and
+urged — no writes, no network.
+
+**D-004 machine block:** every HELD PR body carries a driver-maintained,
+clearly-delimited block (`<!-- sweep:d004 -->` … `<!-- /sweep:d004 -->`) appended
+below the agent-written body at publish and refreshed by every posted urge: the
+count of further pending upstream commits beyond the freeze. The agent never edits
+the machine block; the driver never touches the agent's prose above it.

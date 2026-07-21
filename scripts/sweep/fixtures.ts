@@ -65,8 +65,28 @@ export class FixtureRepo {
     this.git('update-ref', '-d', `refs/heads/${branch}`);
   }
 
+  /**
+   * Attach a REAL, pushable `origin` (D-049 push tests): a bare repo on disk,
+   * while the configured remote URL stays github-shaped (parseGithubSlug must
+   * work) — `url.<bare>.insteadOf` rewrites it for actual git transport, so
+   * `git push origin …` really moves refs into the bare repo and updates the
+   * local remote-tracking refs. Returns the bare repo dir (cleaned up with the
+   * fixture via destroy()).
+   */
+  attachBareOrigin(url = 'https://github.com/k-fls/fixture.git'): string {
+    const bare = mkdtempSync(join(tmpdir(), 'sweep-origin-'));
+    this.bareOrigins.push(bare);
+    execFileSync('git', ['init', '--bare', '-b', 'main', bare], { encoding: 'utf8' });
+    this.git('remote', 'add', 'origin', url);
+    this.git('config', `url.${bare}.insteadOf`, url);
+    return bare;
+  }
+
+  private bareOrigins: string[] = [];
+
   destroy(): void {
     rmSync(this.dir, { recursive: true, force: true });
+    for (const b of this.bareOrigins) rmSync(b, { recursive: true, force: true });
   }
 }
 

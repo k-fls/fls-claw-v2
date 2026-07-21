@@ -403,8 +403,10 @@ features:
       COMPOSITION, not a choice — upstream/main_patched classifiableText mention-prefix
       stripping MUST survive (it fixes this branch's recorded open slash-mention bug)
       AND the host command registry stays. Compose once at module/command-gate vs
-      main_patched (keep /start filtered, isAdmin->hasAdminPrivilege), case-3
-      provisional-resolution draft PR, replay downward via rerere. Never freeze/re-ask.
+      main_patched (keep /start filtered, isAdmin->hasAdminPrivilege), resolve as
+      JUDGED (non-draft history PR, auto-merged via the closure push — D-049 tier
+      wording for the pre-D-049 "case-3 provisional-resolution draft PR"), replay
+      downward via rerere. Never freeze/re-ask.
   module.container-bootstrap:
     name: Container bootstrap (launch shape, network, privilege)
     summary: "Structured container launch pipeline: launch-shape assembly, network setup, privilege

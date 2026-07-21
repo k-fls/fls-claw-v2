@@ -14,9 +14,12 @@ mechanics: `scripts/sweep/README.md` + `DESIGN.md` on branch `feat/maintenance-s
    never touch the live install on this host.
 2. You work with GitHub only — your own clone inside this workspace. No host mounts,
    no other groups' folders, no `~/nanoclaw2`.
-3. Never push to `main`, `main_patched`, `module/*`, `feat/*`, `edition/*`,
-   `design/*` directly. You may push only `sweep/*` and `fix/sweep/*` branches.
-   `edition/*` changes are always PR + explicit owner ack.
+3. **You hand-push NOTHING — ever** (amended by D-049 §5). The DRIVER pushes:
+   verify-gated, journaled pass pushes (`propagate push` for target branches,
+   `propagate publish` for PR heads) are the ONLY pushes that exist. Never run
+   `git push` yourself for any ref, including `fix/sweep/*`. `edition/*` merges
+   floor at JUDGED (auto-merged like any JUDGED case); owner review happens only
+   when a case escalates to HELD.
 4. Merge discipline: new-style `git merge-tree` (never `--merge-base`, never
    cherry-pick); merge unit = upstream first-parent commit; `everything*` branches are
    verification-only; sweep tooling runs dry-run by default — pass `--execute` only
@@ -45,19 +48,26 @@ rediscover it the hard way):
 
 - **No `gh`. No `python3`.** They do not exist here; any procedure written around
   them is stale.
-- **`git fetch`/`git clone` work; `git push` to github FAILS through the credential
-  proxy** (translation bug; host-side fix exists but is undeployed). Never retry
-  pushes, never hand-roll a push workaround.
+- **Refs move via the DRIVER's `git push` ONLY** (D-049 §5): `propagate push`
+  (target branches, after verify green) and `propagate publish` (PR heads). The
+  API is never used to fabricate refs or commits, and you never hand-push. If a
+  driver push fails (e.g. through the credential proxy — a known host-side bug
+  may still be undeployed), the driver halts with `ERR15_PUSH_FAILED`: that is a
+  case-2 REPORT to the owner and a full STOP for publication — infrastructure
+  failures are never your duty to work around, and there is NO fallback of any
+  kind (no API workarounds, no retries-until-it-sticks, no alternate transports).
 - **Raw API calls work**: the proxy swaps the `Authorization` header for
   `api.github.com` on the wire. For GitHub READS (PR/issue lookups, checks) use
   `git fetch` or raw API GETs (curl/node) with the substitute token from
   `get_credential` pasted literally into the header. NEVER trust `$GITHUB_TOKEN` —
-  it is not maintained and publication through it is broken.
-- **All PR-related API WRITES are performed internally by `propagate publish`**
-  (PROPAGATION.md §14, D-048). Once per session, write the `get_credential` output
-  to a file and pass it as `--token-file <path>` on `publish --execute`. You never
-  push a branch or POST a PR yourself — hand-rolled curl/node/gh/git-push PR flows
-  are forbidden.
+  it is not maintained.
+- **All PR-related API WRITES are performed internally by the driver**:
+  `propagate publish` (PR creation, D-004 machine block) and `propagate push`
+  (JUDGED closure checks, urge comments) — PROPAGATION.md §14/§14.4, D-048/D-049.
+  Once per session, write the `get_credential` output to a file and pass it as
+  `--token-file <path>` on every networked `--execute` (publish AND push). You
+  never POST a PR or comment yourself — hand-rolled curl/node/gh/git-push PR
+  flows are forbidden.
 - Auth failures that survive the above are a case-2 report to the owner.
 
 ## Bootstrap (first session; keep the clone across sessions)
@@ -149,27 +159,40 @@ rediscover it the hard way):
    - `... verify` after the executable portion of the pass and after every
      landed resolve; red = automatic rollback to the journaled pre-ref +
      HELD(gate). Nothing is pushed before verify is green.
+   - **Publication order (D-049, fixed):** verify green → `publish` each JUDGED
+     case (non-draft PR, head = the real merge commit) → `... push --execute
+     --token-file <path>` (the DRIVER pushes the target branches, one push per
+     branch; GitHub auto-flips the JUDGED PRs to merged; it also checks those
+     closures and POSTS the urge comments) → `publish` each HELD case (draft
+     PR at the case run's top commit; the base is current, so the diff is the
+     run only). `ERR15_PUSH_FAILED` anywhere = case-2 report + full stop.
    - `... status` for pass state; `... unfreeze` ONLY on explicit owner
      instruction, journaled.
    **Case comprehension (owner directive, D-048):** a case is always something you
    are LOOKING AT — study the case worktree and materials until you can explain
    both sides; the description you publish is YOUR understanding, never a template.
-   If you cannot explain both sides of the conflict, study the case more — never
-   publish text you don't understand.
-   PRs (D-048): the driver NEVER writes PR prose — at resolve/freeze it prepares
-   `pr/materials.md` (facts: conflicted paths, per-side histories, reproduction).
-   YOU study the case and write `pr/title.txt` + `pr/body.md` to the
-   PR-composition standards below, then run `... publish --case <id>` (dry-run
-   first, then `--execute --token-file <path>`): it re-verifies the case, builds
-   the tiny-diff exhibit head, asks "should this PR exist" (recorded decisions,
-   duplicates), mediates the PR-text cold read, and creates the fix/sweep ref +
-   DRAFT PR via the GitHub API itself. Act on its result ids per the "Tool result
-   IDs" table below — never argue with a blocking id, never work around it.
+   A case is a RUN of stacked conflicting heights (D-049 §2, up to `stack_cap`):
+   one logical decision, one resolution, one cold read — the materials list the
+   run. If you cannot explain both sides of the conflict, study the case more —
+   never publish text you don't understand.
+   PRs (D-048/D-049): the driver NEVER writes PR prose — at resolve/freeze it
+   prepares `pr/materials.md` (facts: conflicted paths, the case run, per-side
+   histories, reproduction). YOU study the case and write `pr/title.txt` +
+   `pr/body.md` to the PR-composition standards below, then run `... publish
+   --case <id>` (dry-run first, then `--execute --token-file <path>`): it
+   re-verifies the case, runs the pre-PR height check, asks "should this PR
+   exist" (recorded decisions, duplicates), mediates the PR-text cold read,
+   pushes the fix/sweep ref at the REAL head (git push) and creates the PR
+   (HELD draft + D-004 machine block below your prose — never edit that block;
+   JUDGED non-draft). Act on its result ids per the "Tool result IDs" table
+   below — never argue with a blocking id, never work around it.
    **OWNER FREEZE — LIFTED 2026-07-21** (the 2026-07-18 freeze addressed the
-   pre-refresh agent). Standing rules in its place: pushes only `fix/sweep/*` and
-   ONLY as a side effect of `propagate publish`; PR creation EXCLUSIVELY via
-   `propagate publish` (hand-rolled curl/node/gh/git-push PR flows are forbidden);
-   merging ANY PR remains owner-only until branch protection + required CI exist.
+   pre-refresh agent). Standing rules in its place (as amended by D-049): ALL
+   pushes are the driver's journaled pass pushes (`publish` + `push`) — you
+   hand-push nothing; PR creation EXCLUSIVELY via `propagate publish`
+   (hand-rolled curl/node/gh/git-push PR flows are forbidden); JUDGED PRs
+   auto-merge via the closure push — the ONLY PRs awaiting a human are HELD
+   drafts, which remain owner-only.
    **Driver bugs (D-047):** when the propagation driver itself crashes or
    misbehaves (a thrown error, a wrong verdict, an impossible state), file a
    GitHub ISSUE immediately via the raw API (no `gh` here):
@@ -184,26 +207,30 @@ rediscover it the hard way):
 6. `record` the sweep (ledger + report in the workspace), post the final digest:
    merged ranges, open PRs, frozen branches, PoI outcomes, what needs the owner.
 
-## Tool result IDs (PROPAGATION.md §14, D-048)
+## Tool result IDs (PROPAGATION.md §14, D-048/D-049)
 
 Driver output carries machine-readable ids: `ERR*` blocks, `WARN*` advises. Do what
-the row says — never argue with or work around a blocking id.
+the row says — never argue with or work around a blocking id. (`ERR03`/`ERR04`
+belonged to the retired exhibit mechanism — permanently retired, never reused.)
 
 | id | meaning → your action |
 |----|----------------------|
 | `ERR01_CASE_NOT_OPEN` | case has no held/judged disposition → resolve or freeze it first; mechanical resolutions get no PR |
 | `ERR02_CASE_STALE` | the live state moved since the case → re-run `run`, work from the fresh case |
-| `ERR03_DIFF_EXCEEDS_CONFLICT_SET` | exhibit diff ≠ conflict set → driver bug or moved base; file a driver issue, do not publish |
-| `ERR04_UNPUSHED_PARENT` | exhibit would carry local-only protected commits → do not publish; report (never push protected content) |
 | `ERR05_DECIDED_ALREADY` | the decision is recorded; apply the quoted record as a judged resolution, do not ask the owner |
 | `ERR06_DUPLICATE_CASE` | same conflict as the named topmost case → resolve/publish THAT case; this one inherits it |
 | `ERR07_PR_EXISTS` | a PR for this case is already open → work with the existing PR, never open a second |
 | `ERR08_TEXT_MISSING` | write pr/title.txt + pr/body.md yourself from the case materials |
 | `ERR09_COLDREAD_PENDING` | run a CONTEXT-FREE subagent over the named request file; it writes prtext-verdict.json |
 | `ERR10_COLDREAD_EXHAUSTED` | text edited after the final round → restore the round-2-reviewed text or take the case back through resolve |
-| `ERR11_TOKEN_MISSING` | write the get_credential output to a file, pass `--token-file <path>` |
+| `ERR11_TOKEN_MISSING` | write the get_credential output to a file, pass `--token-file <path>` (publish AND push) |
 | `ERR12_ORIGIN_UNRESOLVED` | origin remote is not a github.com URL → fix the clone's origin; report if you cannot |
 | `ERR13_API_FAILED` | GitHub API write failed → retry once; still failing = case-2 report with the detail |
+| `ERR14_BASE_BEHIND` | pre-PR height check: HELD before the target push → run `propagate push --execute` first; JUDGED after it → order violation, take the case state to the owner if unclear; DIVERGED → owner escalation |
+| `ERR15_PUSH_FAILED` | a driver `git push` failed → case-2 REPORT to the owner and STOP; publication is blocked until the host-side fix deploys; NO fallback, no workaround, no retry loop |
+| `ERR16_CLOSURE_FAILED` | a JUDGED PR did not auto-flip to merged after the target push → investigate (base tip vs PR head), report; do not publish more until understood |
+| `ERR17_URGE_FAILED` | urge comment / D-004 machine-block post failed → it retries next `push`; recurring = case-2 report |
+| `ERR18_VERIFY_PENDING` | `push` before a green verify → run `propagate verify --execute` first; never work around the gate |
 | `ERR20_BRANCH_DIVERGED` | owner escalation, never force-resolve (no reset, no force-push) |
 | `ERR21_MERGE_FAILED` | branch halted, siblings continue → report in the digest; file a driver issue if it recurs |
 | `ERR22_DIRTY_WORKTREE` | clean/commit the named worktree, re-run; never `reset --hard` someone else's work |
@@ -237,14 +264,18 @@ the row says — never argue with or work around a blocking id.
 - **Analysis NEVER waits for permission**: scan, stop-points, routing, overlap-check
   subagents, classification, validator runs, dry-run merge plans. Run them as part of
   every sweep, unprompted.
-- **Mutations follow the case rules, not ad-hoc asking**: case 2 (resolvable) — resolve
-  and, when a PR is due, publish it via `propagate publish`; merging remains owner-only
-  (standing rule above); case 3 (resolvable but judgment-worthy, incl. anything
-  security-flagged or touching an open fork fix) — publish the draft PR with your
-  PROVISIONAL resolution and leave it for the owner; case 4 (unresolvable) —
-  `resolve --tier held` then publish the draft freeze PR (exhibit head: the tiny diff
-  IS the conflict inventory; reproduction lives in the materials), no NOTES.md file
-  (D-030/D-048). `edition/*` is always case 3 minimum.
+- **Mutations follow the TIER rules (MERGE-POLICY.md §1, D-049), not ad-hoc
+  asking** (the old case-2/3/4 ladder is retired; case 3 no longer exists):
+  CLEAN — the driver merges, no review. MECHANICAL — resolve (what qualifies is
+  regulated separately — owner rule pending, D-049 G1), cold-read confirm; no
+  PR. JUDGED — resolve, cold-read confirm, `publish` the non-draft history PR;
+  it AUTO-MERGES via the driver's closure push (this includes the `edition/*`
+  and `tier_floor: judged` floors). HELD — the ONLY review state: anything
+  unresolved, cold-read-rejected, scope-violating, gate-red, or judgment-worthy
+  enough to escalate; `resolve --tier held` then `publish` the draft freeze PR
+  (real diff = the case run; reproduction lives in the materials), no NOTES.md
+  file (D-030/D-048), and the owner decides. When in doubt whether something is
+  review-worthy: escalate to HELD — never invent an intermediate review state.
 - Ask the owner in chat ONLY in the two cases of "Reporting to the owner" (D-046):
   new branch candidates, and genuinely bad/unusual failures. Everything else that
   needs an owner decision travels as a draft PR listed in the end-of-sweep report —
@@ -255,10 +286,12 @@ the row says — never argue with or work around a blocking id.
 
 ## PR composition and review ergonomics
 
-- **Draft = not ready to merge.** Any PR the owner must decide on before it can merge —
-  case 3 provisional resolutions and case 4 freeze/decision PRs — is a **DRAFT**
-  (`propagate publish` creates drafts by design). Never publish a normal open PR whose
-  description says "do not merge".
+- **Draft = needs the owner; non-draft = history.** HELD freeze/decision PRs —
+  the only PRs the owner must act on — are **DRAFTS** (`propagate publish`
+  creates them as drafts, with the driver's D-004 machine block below your
+  prose — never edit that block). JUDGED PRs are NON-draft audit history and
+  auto-flip to merged on the closure push (D-040/D-049). Never publish a normal
+  open PR whose description says "do not merge".
 - **The description must answer WHY in the first line.** Open with one sentence:
   "Decision needed: <the specific choice>" or "Review needed: <the specific risk>".
   If the reviewer can't tell in ten seconds why they were summoned, the PR is wrong.

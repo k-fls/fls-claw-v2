@@ -26,6 +26,11 @@ poi_classes:
 
 large_new_file_kb: 32
 
+# Case stacking (D-049 §2): a case is the maximal run of consecutive
+# path-intersecting conflicting heights, capped here. Per-feature override:
+# `stack_cap:` on the inventory entry (mirrors the scope-guard lever).
+stack_cap: 5
+
 sensitive_surfaces:
   - src/container-runner.ts
   - src/container-runtime.ts

@@ -13,11 +13,15 @@
  *   resolve --case ID --tier T    re-verify the case from git+registry, scope-guard + cold-read
  *                                 gate, then merge (MECHANICAL), prepare PR materials (JUDGED),
  *                                 or freeze (HELD, --tier held direct)                 (MUTATES)
- *   publish --case ID             §14 (D-048): the ONLY sanctioned PR-creation path — verify the
- *                                 case, build the origin-parented EXHIBIT HEAD, run the check
- *                                 battery (machine-readable {ok, issues, pr?}), and with
- *                                 --execute create the fix/sweep ref + DRAFT PR via the GitHub
- *                                 REST API (the one networked subcommand)              (MUTATES)
+ *   publish --case ID             §14 (D-048/D-049): the ONLY sanctioned PR-creation path —
+ *                                 verify the case, run the check battery + pre-PR height check
+ *                                 (machine-readable {ok, issues, pr?}), and with --execute push
+ *                                 the fix/sweep ref (git push) at the REAL head (HELD: the case
+ *                                 run's top; JUDGED: the merge commit) and create the PR via
+ *                                 the GitHub API (HELD draft, JUDGED non-draft)        (MUTATES)
+ *   push                          §14.4 (D-049): verify-gated pass publication — push target
+ *                                 branches (flips JUDGED PRs to merged), closure checks, post
+ *                                 urge comments + D-004 machine-block refresh           (MUTATES)
  *   verify                        §9 gate: everything-rebuild + CI commands, leave-one-out
  *                                 attribution; red -> rollback offender + HELD(gate)   (MUTATES)
  *   unfreeze --branch <b>         manually clear a ledger freeze (journaled)           (MUTATES)
@@ -37,9 +41,10 @@
  *   --case <id>              resolve/publish: the case id
  *   --tier <mechanical|judged|held>  resolve: the agent's claimed tier (held = direct freeze)
  *   --resolved-ref <ref>     resolve: commit carrying the agent's resolution (tree source)
- *   --token-file <path>      publish: file holding the substitute GitHub token (the agent
- *                            writes the get_credential output there once per session; the
- *                            credential proxy swaps the Authorization header on the wire)
+ *   --token-file <path>      publish/push (every networked subcommand, D-049): file holding
+ *                            the substitute GitHub token (the agent writes the get_credential
+ *                            output there once per session; the credential proxy swaps the
+ *                            Authorization header on the wire)
  *   --branch <name>          unfreeze: the branch to clear
  *   --recipe <a,b,c>         verify: everything-rebuild recipe (default: scope.yaml recipe)
  *   --commands-file <file>   verify: CI command list JSON [{cmd,cwd?}] (test injection)
@@ -50,17 +55,20 @@
  *   case-<id>/case.json (+ coldread-request.md, pr/materials.md), journal.jsonl
  *   (append-only). case.json is a POINTER only — resolve re-derives everything from
  *   git+registry (§7 trust boundary). The driver NEVER generates PR prose (D-048): the
- *   agent writes pr/title.txt + pr/body.md from studying the case, and `publish` is the
- *   only subcommand that touches the network (GitHub REST, --execute only — §14).
+ *   agent writes pr/title.txt + pr/body.md from studying the case. `publish` and `push`
+ *   are the only subcommands that touch the network (git push + GitHub REST, --execute
+ *   only — §14/§14.4, D-049); refs move via git push ONLY, and any push failure is a
+ *   hard halt reported to the owner (D-046 case 2), never worked around.
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join, resolve as pathResolve } from 'node:path';
 
-import { DEFAULT_UPSTREAM_REF, FORK_POINT, LEDGER_FILENAME, VERIFY_COMMANDS } from './config.js';
+import { DEFAULT_STACK_CAP, DEFAULT_UPSTREAM_REF, FORK_POINT, LEDGER_FILENAME, RR_CACHE_DIRNAME, VERIFY_COMMANDS } from './config.js';
 import {
   commitInfo,
   commitTreeMerge,
   git,
+  gitPush,
   isAncestor,
   localBranchExists,
   newStyleMergeTree,
@@ -77,22 +85,24 @@ import {
   reconcileCandidates,
 } from './candidates.js';
 import { readLedger, writeLedger, defaultLedgerBranch } from './ledger.js';
+import { installRrCache } from './merge.js';
 import { loadRegistry } from './registry.js';
 import { resolveScope } from './scope.js';
 import { scopeGuard } from './scope-guard.js';
 import {
   advisoryTextIssues,
-  buildExhibit,
-  checkExhibitAncestry,
-  checkExhibitDiff,
+  checkBaseHeight,
+  createPullRequest,
   decidedAlready,
+  getOpenPrByHead,
+  ghExpect,
   haltIdFor,
   isBlocking,
   prTextGate,
-  publishExhibit,
   parseGithubSlug,
   realGithubTransport,
-  type Exhibit,
+  renderMachineBlock,
+  withMachineBlock,
   type GithubTransport,
   type Issue,
 } from './publish.js';
@@ -114,6 +124,7 @@ import type {
   CaseFile,
   ColdReadVerdict,
   FeatureEntry,
+  Head,
   HeldRecord,
   PropagationPlan,
   ScopeGuardMode,
@@ -155,7 +166,7 @@ interface Cli {
 }
 
 const USAGE =
-  'Usage: pnpm exec tsx scripts/sweep/propagate.ts <plan|run|resolve|publish|verify|unfreeze|status> [--repo <path>] [--workspace <dir>] [--ledger <file>] [--pass <wm12>] [--execute] [--case <id>] [--tier <t>] [--token-file <path>] [--branch <b>] [flags]';
+  'Usage: pnpm exec tsx scripts/sweep/propagate.ts <plan|run|resolve|publish|push|verify|unfreeze|status> [--repo <path>] [--workspace <dir>] [--ledger <file>] [--pass <wm12>] [--execute] [--case <id>] [--tier <t>] [--token-file <path>] [--branch <b>] [flags]';
 
 function parseCli(argv: string[]): Cli {
   const [cmd, ...rest] = argv;
@@ -495,21 +506,28 @@ async function deriveUnfreeze(cli: Cli, dir: string, commit: boolean): Promise<s
   return unfrozen;
 }
 
+/** A pending urge for a still-frozen branch (§8; posted by `push`, D-049). */
+interface PendingUrge {
+  branch: string;
+  /** The pending run's top = the newest pending trunk head (a frozen branch lands no merges). */
+  head: string;
+  pending: Head[];
+  fixBranch: string;
+  prNumber: number | null;
+  frozenBy: string | null;
+}
+
 /**
- * URGING (§8): for each still-frozen branch, if the newest pending trunk head
- * beyond its coverage on the PINNED chain differs from `lastUrgedHead`, PREPARE
- * (never execute) a PR comment for the freeze PR — pending count + newest heads
- * with subjects — and record the new head. One urge per NEW head, not per pass.
+ * URGING detection (§8, pure): for each still-frozen branch, if the newest
+ * pending trunk head beyond its coverage on the PINNED chain differs from
+ * `lastUrgedHead`, an urge is DUE. One urge per NEW head, not per pass.
+ * `plan`/`run` only report these; POSTING (PR comment + D-004 machine-block
+ * refresh + `lastUrgedHead` advance) lives exclusively in the networked
+ * `push` stage (D-049 — the driver posts, never prepares gh commands).
  */
-async function urgeFrozen(
-  cli: Cli,
-  ctx: PassCtx,
-  dir: string,
-  commit: boolean,
-): Promise<Array<{ branch: string; head: string }>> {
-  const path = ledgerPathOf(cli);
-  const ledger = readLedger(path);
-  const urged: Array<{ branch: string; head: string }> = [];
+async function detectUrges(cli: Cli, ctx: PassCtx): Promise<PendingUrge[]> {
+  const ledger = readLedger(ledgerPathOf(cli));
+  const due: PendingUrge[] = [];
   for (const [branch, b] of Object.entries(ledger.branches)) {
     if (b.status !== 'frozen') continue;
     if (!b.fixBranch) continue; // gate holds have no owner-facing freeze PR to nudge
@@ -520,39 +538,35 @@ async function urgeFrozen(
     if (pending.length === 0) continue;
     const newest = pending[pending.length - 1];
     if (newest.sha === b.lastUrgedHead) continue; // already urged about this head
-    urged.push({ branch, head: newest.sha });
-    if (!commit) continue;
-
-    const newestList = pending.slice(-10);
-    const lines: string[] = [];
-    for (const h of newestList) {
-      const info = await commitInfo(cli.repo, h.sha);
-      lines.push(`- h${h.height} ${h.sha.slice(0, 12)} ${info.subject}`);
-    }
-    // Write into the CURRENT pass dir (freezes are cross-pass; the freeze PR's
-    // original artifacts live in an older pass), targeting the stored fix branch.
-    const urgeDir = join(dir, 'urges', slug(branch));
-    mkdirSync(urgeDir, { recursive: true });
-    const body = [
-      `# Urge — ${branch} still frozen (${b.frozenBy})`,
-      '',
-      `${pending.length} upstream commit(s) now pending beyond this branch's coverage since the freeze.`,
-      `Newest ${newestList.length}:`,
-      ...lines,
-      '',
-      `Resolving the freeze PR (\`${b.fixBranch}\`) unblocks this branch and everything downstream.`,
-    ].join('\n');
-    writeFileSync(join(urgeDir, 'urge-comment.md'), body + '\n');
-    appendFileSync(
-      join(urgeDir, 'urge-commands.sh'),
-      `gh pr comment ${b.fixBranch} --body-file ${join(urgeDir, 'urge-comment.md')}\n`,
-    );
-    appendJournal(dir, { action: 'urge', branch, head: newest.sha, pending: pending.length });
-    const fresh = readLedger(path);
-    fresh.branches[branch] = { ...fresh.branches[branch], lastUrgedHead: newest.sha };
-    writeLedger(path, fresh);
+    due.push({
+      branch,
+      head: newest.sha,
+      pending,
+      fixBranch: b.fixBranch,
+      prNumber: b.prNumber ?? null,
+      frozenBy: b.frozenBy ?? null,
+    });
   }
-  return urged;
+  return due;
+}
+
+/** Compose the urge-comment body for a due urge (driver facts only). */
+async function urgeCommentBody(cli: Cli, urge: PendingUrge): Promise<string> {
+  const newestList = urge.pending.slice(-10);
+  const lines: string[] = [];
+  for (const h of newestList) {
+    const info = await commitInfo(cli.repo, h.sha);
+    lines.push(`- h${h.height} ${h.sha.slice(0, 12)} ${info.subject}`);
+  }
+  return [
+    `# Urge — ${urge.branch} still frozen (${urge.frozenBy})`,
+    '',
+    `${urge.pending.length} upstream commit(s) now pending beyond this branch's coverage since the freeze.`,
+    `Newest ${newestList.length}:`,
+    ...lines,
+    '',
+    `Resolving this freeze PR unblocks \`${urge.branch}\` and everything downstream.`,
+  ].join('\n');
 }
 
 async function derive(cli: Cli, held: HeldRecord[], ctx: PassCtx, frozen: Set<string>): Promise<PropagationPlan> {
@@ -571,6 +585,7 @@ async function derive(cli: Cli, held: HeldRecord[], ctx: PassCtx, frozen: Set<st
     scope: registry.scope,
     held,
     frozen,
+    stackCap: registry.routing.stackCap, // D-049 §2 lever (per-feature override in derivePlan)
   });
 }
 
@@ -939,7 +954,11 @@ async function createCaseWorktree(cli: Cli, dir: string, caseFile: CaseFile, bas
       await git(cli.repo, ['commit-tree', caseFile.automergeTree, '-p', baseTip, '-m', `automerge for ${caseFile.id}`])
     ).stdout.trim();
     await git(cli.repo, ['worktree', 'add', '--detach', wtPath, amCommit]);
-    appendJournal(dir, { action: 'case-worktree', caseId: caseFile.id, path: wtPath });
+    // Shared rerere (D-006, D-049 §4): install the workspace rr-cache into the
+    // shared .git so rerere-enabled operations in the case worktree see the
+    // recorded resolutions. Best-effort, like the worktree itself.
+    const seeded = await installRrCache(cli.repo, join(cli.workspace, RR_CACHE_DIRNAME));
+    appendJournal(dir, { action: 'case-worktree', caseId: caseFile.id, path: wtPath, rerereSeeded: seeded });
   } catch (e) {
     appendJournal(dir, {
       action: 'warning',
@@ -978,7 +997,11 @@ export async function cmdPlan(cli: Cli): Promise<number> {
   const ctx = await openPass(cli);
   const dir = ctx.dir;
   await deriveUnfreeze(cli, dir, true); // externally-resolved freezes clear first
-  await urgeFrozen(cli, ctx, dir, true); // urge still-frozen branches with new pending content
+  // Urges are only DETECTED here; posting is `push`'s job (D-049, §14.4).
+  const dueUrges = await detectUrges(cli, ctx);
+  if (dueUrges.length) {
+    console.error(`urges due (post via \`propagate push --execute\`): ${dueUrges.map((u) => u.branch).join(', ')}`);
+  }
   const journal = readJournal(dir);
   const plan = await derive(cli, await combinedHeld(cli, ctx, journal), ctx, frozenBranches(cli));
 
@@ -1050,16 +1073,22 @@ export async function cmdRun(cli: Cli): Promise<number> {
     const journal0 = readJournal(dir);
     const plan0 = await derive(cli, await combinedHeld(cli, ctx, journal0), ctx, frozenBranches(cli));
     const wouldUnfreeze = await deriveUnfreeze(cli, dir, false);
-    const wouldUrge = await urgeFrozen(cli, ctx, dir, false);
+    const wouldUrge = (await detectUrges(cli, ctx)).map((u) => ({ branch: u.branch, head: u.head }));
     console.error('DRY-RUN (no --execute): no state changes; reporting the plan + would-unfreeze/would-urge');
     emit(cli, { dryRun: true, plan: plan0, wouldUnfreeze, wouldUrge });
     return 0;
   }
 
-  // EXECUTE. Externally-resolved freezes clear first, then urge; re-derive with
-  // the updated frozen set.
+  // EXECUTE. Externally-resolved freezes clear first; urges are only DETECTED
+  // (posting is `push`'s job — D-049, §14.4); re-derive with the updated
+  // frozen set.
   await deriveUnfreeze(cli, dir, true);
-  await urgeFrozen(cli, ctx, dir, true);
+  {
+    const due = await detectUrges(cli, ctx);
+    if (due.length) {
+      console.error(`urges due (post via \`propagate push --execute\`): ${due.map((u) => u.branch).join(', ')}`);
+    }
+  }
   // B5i crash-heal BEFORE reading pass state: close ref-updated-but-journal-
   // missing cases (synthetic `resolved` + `reopened`) so the loop below
   // re-derives the branch instead of leaving it open forever.
@@ -1189,6 +1218,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
           isLeaf: snap.isLeaf,
           alwaysMerge: snap.alwaysMerge,
           held,
+          stackCap: snap.stackCap, // effective cap resolved at plan derivation (D-049 §2)
         });
       const bp = await deriveLive();
 
@@ -1265,10 +1295,11 @@ export async function cmdRun(cli: Cli): Promise<number> {
         }
         const caseFile: CaseFile = {
           schemaVersion: 1,
-          id: caseId(bp.branch, pp.parent, pp.case!.head.height), // B8: branch+PARENT+height
+          id: caseId(bp.branch, pp.parent, pp.case!.head.height), // B8: branch+PARENT+height (run TOP)
           branch: bp.branch,
           parent: pp.parent,
-          head: pp.case!.head,
+          head: pp.case!.head, // the run's TOP commit (D-049 §2)
+          run: pp.case!.run,
           tierFloor: bp.tierFloor,
           conflictedPaths: probe.conflictFiles,
           automergeTree: probe.treeOid,
@@ -1297,6 +1328,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
           caseId: caseFile.id,
           head: caseFile.head, // sha recorded for the B5i crash-heal ancestry check
           height: caseFile.head.height,
+          run: caseFile.run, // the stacked run (D-049 §2)
           conflictedPaths: caseFile.conflictedPaths,
         });
         await createCaseWorktree(cli, dir, caseFile, nowTip); // SPEC 1: agent resolves here
@@ -1553,7 +1585,10 @@ interface ResolvedCase {
   branch: string;
   parent: string;
   model: 'entry' | 'parents';
+  /** The case run's TOP head (D-049 §2). */
   head: { sha: string; height: number };
+  /** The stacked run (ascending); run[run.length - 1] === head. */
+  run: Head[];
   conflictedPaths: string[];
   automergeTree: string;
   reproduction: { command: string };
@@ -1605,6 +1640,8 @@ async function reverifyCase(
     | undefined;
   const floor = tierFloor(caseFile.branch, feat);
   const scopeGuardMode: ScopeGuardMode = feat?.scope_guard ?? registry.routing.scopeGuardMode ?? 'same-files';
+  // D-049 §2 lever, re-derived from config exactly like the tier floor above.
+  const stackCap = feat?.stack_cap ?? registry.routing.stackCap ?? DEFAULT_STACK_CAP;
 
   // (N2) AUTHORITY for parent legality + pass scope: the branch's kind/model/
   // parents/ancestors and the pass's scope set are re-derived from the
@@ -1666,6 +1703,7 @@ async function reverifyCase(
     isLeaf,
     alwaysMerge: feat?.always_merge === true,
     held: await combinedHeld(cli, ctx, journal),
+    stackCap,
   });
   const pp = bp.parents.find((p) => p.parent === caseFile.parent);
   if (!pp)
@@ -1719,6 +1757,7 @@ async function reverifyCase(
       parent: caseFile.parent,
       model,
       head: rc.head,
+      run: rc.run,
       conflictedPaths: rc.conflictedPaths,
       automergeTree: rc.automergeTree,
       reproduction: rc.reproduction,
@@ -1974,15 +2013,14 @@ function fixBranchName(rc: Pick<ResolvedCase, 'branch' | 'parent' | 'head'>): st
 
 /**
  * Prepare the case's PR MATERIALS (§14, D-048) — structured driver facts ONLY:
- * conflicted paths, per-side one-line histories over those paths, the
- * reproduction command. The driver NEVER generates PR prose (the retired
- * template body/title could not pass the agent's own text gate — 2026-07-21
- * forensic finding): the agent studies the case (worktree + these materials)
- * and writes pr/title.txt + pr/body.md itself, then runs
+ * conflicted paths, the case run, per-side one-line histories over those
+ * paths, the reproduction command. The driver NEVER generates PR prose (the
+ * retired template body/title could not pass the agent's own text gate —
+ * 2026-07-21 forensic finding): the agent studies the case (worktree + these
+ * materials) and writes pr/title.txt + pr/body.md itself, then runs
  * `propagate publish --case <id>` — the ONLY sanctioned PR-creation path.
- * No fix/sweep ref is created here either: publish creates the ref at the
- * origin-parented EXHIBIT HEAD (the D-030 conflicting-head shape is retired —
- * it made GitHub render the whole pending range, 26-60x diff bloat). Returns
+ * No fix/sweep ref is created here either: publish pushes the ref at the REAL
+ * head (D-049 — HELD: the run's top commit; JUDGED: the merge commit). Returns
  * the deterministic fix branch NAME for ledger/urge bookkeeping.
  */
 async function prepareCaseMaterials(cli: Cli, dir: string, rc: ResolvedCase, tier: Tier): Promise<string> {
@@ -1995,6 +2033,7 @@ async function prepareCaseMaterials(cli: Cli, dir: string, rc: ResolvedCase, tie
     `# Case materials — ${rc.id} (${tier})`,
     '',
     `Branch: ${rc.branch}   Parent: ${rc.parent}   Head: ${rc.head.sha.slice(0, 12)} (height ${rc.head.height})`,
+    `Case run (D-049 §2, ${rc.run.length} height(s)): ${rc.run.map((h) => `h${h.height} ${h.sha.slice(0, 12)}`).join(', ')}`,
     `Pending upstream commits above this point: ${rc.pendingAbove}`,
     '',
     '## Conflicted paths',
@@ -2025,6 +2064,18 @@ async function prepareCaseMaterials(cli: Cli, dir: string, rc: ResolvedCase, tie
 // --------------------------------------------------------------------------
 // publish — the ONLY sanctioned PR-creation path (§14, D-048).
 // --------------------------------------------------------------------------
+
+/**
+ * owner/repo parsed from the CONFIGURED origin URL (`git config
+ * remote.origin.url` — `git remote get-url` would apply url.*.insteadOf
+ * rewrites, which fixtures use to make a github-shaped URL locally pushable).
+ */
+async function originSlug(cli: Cli): Promise<{ owner: string; repo: string } | null> {
+  const raw = await git(cli.repo, ['config', '--get', 'remote.origin.url'], { allowCodes: [1] });
+  if (raw.code === 0 && raw.stdout.trim()) return parseGithubSlug(raw.stdout);
+  const rewritten = await git(cli.repo, ['remote', 'get-url', 'origin'], { allowCodes: [1, 2, 128] });
+  return rewritten.code === 0 ? parseGithubSlug(rewritten.stdout) : null;
+}
 
 /** The latest held/resolved disposition for a case id, or null while it is open. */
 function lastDisposition(journal: JournalEntry[], caseId: string): JournalEntry | null {
@@ -2070,18 +2121,19 @@ function journaledCases(journal: JournalEntry[]): Map<string, JournaledCase> {
 }
 
 /**
- * The source tree whose blobs the exhibit overlays (§14): HELD — the
- * recomputed automerge tree against the CURRENT branch tip (the conflict
- * markers ARE the exhibit); JUDGED — the resolved merge commit's tree. Returns
- * an ERR01/ERR02 issue instead when the case has no publishable disposition or
- * its live state moved (staleness re-verification — the journal is a pointer,
- * git is the authority, same trust model as reverifyCase).
+ * The REAL commit a case's PR head is pushed at (§14, D-049): HELD — the case
+ * run's TOP commit (verified live: a conflict with the recorded path set must
+ * still exist against the CURRENT branch tip); JUDGED — the resolved merge
+ * commit (must still be on the branch). Returns an ERR01/ERR02 issue instead
+ * when the case has no publishable disposition or its live state moved
+ * (staleness re-verification — the journal is a pointer, git is the
+ * authority, same trust model as reverifyCase).
  */
-async function publishSourceTree(
+async function publishHead(
   cli: Cli,
   journal: JournalEntry[],
   jc: JournaledCase,
-): Promise<{ sourceTree?: string; mode?: 'held' | 'judged'; issue?: Issue }> {
+): Promise<{ headSha?: string; mode?: 'held' | 'judged'; issue?: Issue }> {
   const disposition = lastDisposition(journal, jc.caseId);
   if (!disposition) {
     return {
@@ -2118,7 +2170,7 @@ async function publishSourceTree(
         },
       };
     }
-    return { sourceTree: probe.treeOid, mode: 'held' };
+    return { headSha: jc.head.sha, mode: 'held' };
   }
   // resolved
   const tier = disposition.tier as string | undefined;
@@ -2139,38 +2191,62 @@ async function publishSourceTree(
       },
     };
   }
-  return { sourceTree: await treeOf(cli.repo, mergeCommit), mode: 'judged' };
+  return { headSha: mergeCommit, mode: 'judged' };
 }
 
 /**
  * ERR06_DUPLICATE_CASE (§14): another open case (no disposition, or held) or an
  * already-published PR shares this case's conflict signature — same conflicted
- * path SET plus the same head sha or the same exhibit tree. Duplicates
- * consolidate into the TOPMOST case by DAG order (run journals cases in DAG
- * order, so first-journaled = topmost); the topmost case itself publishes.
- * Three of the six 2026-07-21 freeze PRs were byte-identical duplicates.
+ * path SET plus the same head sha, or byte-identical conflict blobs (the
+ * automerge-side content at every conflicted path — two branches carrying the
+ * same fork edit against the same upstream rewrite produce identical marker
+ * blobs). Duplicates consolidate into the TOPMOST case by DAG order (run
+ * journals cases in DAG order, so first-journaled = topmost); the topmost case
+ * itself publishes. Three of the six 2026-07-21 freeze PRs were byte-identical
+ * duplicates.
  */
 async function duplicateCaseIssue(
   cli: Cli,
   journal: JournalEntry[],
   cases: Map<string, JournaledCase>,
   self: JournaledCase,
-  selfExhibit: Exhibit,
 ): Promise<Issue | null> {
   const published = new Map<string, JournalEntry>();
   for (const e of journal) if (e.action === 'pr-published' && typeof e.caseId === 'string') published.set(e.caseId, e);
 
+  /** Blob oids of `paths` inside `tree` (null for a path absent there). */
+  const conflictBlobs = async (tree: string, paths: string[]): Promise<Array<string | null>> => {
+    const out: Array<string | null> = [];
+    for (const p of [...paths].sort()) {
+      const res = await git(cli.repo, ['rev-parse', `${tree}:${p}`], { allowCodes: [128] });
+      out.push(res.code === 0 ? res.stdout.trim() : null);
+    }
+    return out;
+  };
+
+  const selfProbe = await (async () => {
+    try {
+      const tip = await revParse(cli.repo, self.branch);
+      const probe = await newStyleMergeTree(cli.repo, tip, self.head.sha);
+      return probe.clean ? null : probe.treeOid;
+    } catch {
+      return null;
+    }
+  })();
+
   const signatureMatches = async (other: JournaledCase): Promise<boolean> => {
     if (!samePathSet(other.conflictedPaths, self.conflictedPaths)) return false;
     if (other.head.sha === self.head.sha) return true;
-    // Same-exhibit-tree comparison: rebuild the sibling's exhibit tree the same
-    // way (best-effort — an unreconstructible sibling simply does not match).
+    // Identical-conflict-blob comparison (best-effort — an unreconstructible
+    // sibling simply does not match).
+    if (!selfProbe) return false;
     try {
       const tip = await revParse(cli.repo, other.branch);
       const probe = await newStyleMergeTree(cli.repo, tip, other.head.sha);
       if (probe.clean) return false;
-      const sib = await buildExhibit(cli.repo, other.branch, probe.treeOid, other.conflictedPaths, other.caseId);
-      return sib.tree === selfExhibit.tree;
+      const a = await conflictBlobs(selfProbe, self.conflictedPaths);
+      const b = await conflictBlobs(probe.treeOid, other.conflictedPaths);
+      return JSON.stringify(a) === JSON.stringify(b);
     } catch {
       return false;
     }
@@ -2201,16 +2277,19 @@ async function duplicateCaseIssue(
 }
 
 /**
- * `propagate publish --case <id>` (§14, D-048) — the ONLY sanctioned
+ * `propagate publish --case <id>` (§14, D-048/D-049) — the ONLY sanctioned
  * PR-creation path. The agent writes pr/title.txt + pr/body.md itself from
- * studying the case; this subcommand re-verifies the case, constructs the
- * origin-parented EXHIBIT HEAD, runs the check battery and emits ONE
+ * studying the case; this subcommand re-verifies the case, determines the REAL
+ * PR head (HELD: the case run's top commit; JUDGED: the merge commit), runs
+ * the check battery incl. the pre-PR height check (ERR14) and emits ONE
  * machine-readable JSON object {ok, issues:[{id, detail}], pr?} on stdout.
  * Blocking ERR* ids stop the publish; WARN* ids ship as advisories. With
- * --execute (and all-clear) it creates the fix/sweep ref and the DRAFT PR via
- * the GitHub REST API (the single networked path in the driver); without
- * --execute it is a dry-run — full battery, local artifacts (prtext review
- * requests) may be written, but NO network calls of any kind.
+ * --execute (and all-clear) it PUSHES the fix/sweep ref via `git push`
+ * (ERR15 on failure — a D-046 case-2 owner report, never worked around) and
+ * creates the PR via the GitHub API (HELD draft with the D-004 machine block,
+ * JUDGED non-draft); without --execute it is a dry-run — full battery, local
+ * artifacts (prtext review requests) may be written, but NO pushes and NO
+ * network calls of any kind.
  */
 export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => GithubTransport): Promise<number> {
   if (!cli.caseId) {
@@ -2239,23 +2318,20 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
     return 1;
   }
 
-  // (1)+(2) disposition + live-state re-verification (ERR01/ERR02).
-  const src = await publishSourceTree(cli, journal, jc);
+  // (1)+(2) disposition + live-state re-verification (ERR01/ERR02), then the
+  // REAL head (D-049) + the pre-PR height check (ERR14).
+  const src = await publishHead(cli, journal, jc);
   if (src.issue) {
     emit(cli, { ok: false, issues: [src.issue] });
     return 1;
   }
   const mode = src.mode!;
-
-  // (3) EXHIBIT HEAD: origin-parented synthetic commit whose diff is exactly
-  // the conflict set (ERR03), with no local-only ancestry (ERR04).
-  const exhibit = await buildExhibit(cli.repo, jc.branch, src.sourceTree!, jc.conflictedPaths, jc.caseId);
+  const headSha = src.headSha!;
   const issues: Issue[] = [];
   const push = (i: Issue | null): void => {
     if (i) issues.push(i);
   };
-  push(await checkExhibitDiff(cli.repo, exhibit, jc.conflictedPaths, mode));
-  push(await checkExhibitAncestry(cli.repo, exhibit, jc.branch));
+  push(await checkBaseHeight(cli.repo, jc.branch, mode, headSha));
 
   // (4) "should this PR exist": recorded decisions (ERR05) + duplicates (ERR06)
   // + already-published (ERR07, journal side).
@@ -2265,7 +2341,7 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
     routingFile: cli.routingFile,
   });
   push(decidedAlready(registry.features, jc.branch, jc.conflictedPaths));
-  push(await duplicateCaseIssue(cli, journal, cases, jc, exhibit));
+  push(await duplicateCaseIssue(cli, journal, cases, jc));
   const priorPr = journal.filter((e) => e.action === 'pr-published' && e.caseId === jc.caseId).pop();
   if (priorPr) {
     push({
@@ -2323,12 +2399,11 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
           'publish --execute needs the substitute GitHub token: write the get_credential output to a file once per session and pass --token-file <path> (never $GITHUB_TOKEN — the proxy swaps the Authorization header on the wire)',
       });
     }
-    const remote = await git(cli.repo, ['remote', 'get-url', 'origin'], { allowCodes: [1, 2, 128] });
-    slugParts = remote.code === 0 ? parseGithubSlug(remote.stdout) : null;
+    slugParts = await originSlug(cli);
     if (!slugParts) {
       push({
         id: 'ERR12_ORIGIN_UNRESOLVED',
-        detail: `cannot derive owner/repo from the origin remote (${remote.stdout.trim() || 'no origin remote'})`,
+        detail: 'cannot derive owner/repo from the origin remote URL',
       });
     }
   }
@@ -2345,72 +2420,97 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
     return 1;
   }
 
-  const exhibitInfo = {
-    commit: exhibit.commit,
-    tree: exhibit.tree,
-    parent: exhibit.parent,
-    parentSource: exhibit.parentSource,
-  };
+  const draft = mode === 'held'; // only HELD is a review state (D-049 §1)
+  const headInfo = { commit: headSha, mode };
   if (!cli.execute) {
     // DRY-RUN: full battery ran, local prtext artifacts may have been written,
-    // but NO network calls — the transport is never even constructed (§14).
-    console.error(`DRY-RUN (no --execute): all checks green — would publish draft PR for ${jc.caseId} (${mode})`);
-    emit(cli, { ok: true, dryRun: true, issues, exhibit: exhibitInfo, wouldCreate: { fixBranch, base: jc.branch, draft: true } });
+    // but NO pushes and NO network calls — the transport is never even
+    // constructed (§14).
+    console.error(
+      `DRY-RUN (no --execute): all checks green — would push ${fixBranch} at ${headSha.slice(0, 12)} and publish ${draft ? 'draft ' : ''}PR for ${jc.caseId} (${mode})`,
+    );
+    emit(cli, { ok: true, dryRun: true, issues, head: headInfo, wouldCreate: { fixBranch, base: jc.branch, draft } });
     return 0;
   }
 
-  // EXECUTE: the one networked path. ERR07 (API side) first — an open PR by
-  // head branch name means an earlier publish already landed.
+  // EXECUTE: ERR07 (API side) first — an open PR by head branch name means an
+  // earlier publish already landed.
   const transport = (makeTransport ?? realGithubTransport)(token!);
-  const api = `/repos/${slugParts!.owner}/${slugParts!.repo}`;
   try {
-    const existing = await transport.request(
-      'GET',
-      `${api}/pulls?head=${encodeURIComponent(`${slugParts!.owner}:${fixBranch}`)}&state=open`,
-    );
-    if (existing.status === 200 && Array.isArray(existing.body) && existing.body.length > 0) {
-      const pr = existing.body[0] as { html_url?: string; number?: number };
+    const existing = await getOpenPrByHead(transport, slugParts!, fixBranch);
+    if (existing) {
       emit(cli, {
         ok: false,
-        issues: [...issues, { id: 'ERR07_PR_EXISTS', detail: `open PR already exists for head '${fixBranch}': ${pr.html_url ?? ''}` }],
+        issues: [...issues, { id: 'ERR07_PR_EXISTS', detail: `open PR already exists for head '${fixBranch}': ${existing.url}` }],
       });
       return 1;
     }
-    const finalBody =
+  } catch (e) {
+    emit(cli, {
+      ok: false,
+      issues: [...issues, { id: 'ERR13_API_FAILED', detail: e instanceof Error ? e.message : String(e) }],
+    });
+    return 1;
+  }
+
+  // The DRIVER pushes the PR head — `git push` is the only way refs move
+  // (D-049 §5). A failure is ERR15: hard halt, journaled, D-046 case-2 owner
+  // report; NO fallback of any kind.
+  try {
+    await gitPush(cli.repo, headSha, fixBranch);
+    appendJournal(dir, { action: 'push', branch: fixBranch, to: headSha, kind: 'pr-head' });
+  } catch (e) {
+    const detail =
+      `git push of '${fixBranch}' at ${headSha.slice(0, 12)} failed: ${e instanceof Error ? e.message : String(e)} — ` +
+      `report to the owner (D-046 case 2) and STOP; publication is blocked until the infrastructure is fixed`;
+    appendJournal(dir, { action: 'halt', reason: 'push-failed', id: 'ERR15_PUSH_FAILED', branch: fixBranch, message: detail });
+    emit(cli, { ok: false, issues: [...issues, { id: 'ERR15_PUSH_FAILED', detail }] });
+    return 1;
+  }
+
+  try {
+    let finalBody =
       caveats.length > 0 ? `${body}\n\n## Caveats (cold reader)\n${caveats.map((c) => `- ${c}`).join('\n')}` : body;
-    const result = await publishExhibit(cli.repo, transport, slugParts!, exhibit, jc.conflictedPaths, fixBranch, {
+    if (mode === 'held') {
+      // D-004 machine block (D-049 decision 8): driver-maintained, delimited,
+      // appended BELOW the agent's prose; posted urges keep it current.
+      const pendingAbove = Math.max(0, ctx.chain.heads.length - 1 - jc.head.height);
+      finalBody = withMachineBlock(finalBody, renderMachineBlock(pendingAbove, ctx.watermark12));
+    }
+    const result = await createPullRequest(transport, slugParts!, {
       title,
       body: finalBody,
+      head: fixBranch,
       base: jc.branch,
+      draft,
     });
-    // Local anchor for the remote ref (content-identical commit; sha normally
-    // equal since author/committer are mirrored). Namespace-checked, scope-exempt.
+    // Local anchor for the pushed ref. Namespace-checked, scope-exempt.
     guardRef(fixBranch, new Set(), { fixSweep: true });
     if (!(await refExists(cli.repo, fixBranch))) {
-      await git(cli.repo, ['update-ref', `refs/heads/${fixBranch}`, exhibit.commit, '']);
+      await git(cli.repo, ['update-ref', `refs/heads/${fixBranch}`, headSha, '']);
     }
     appendJournal(dir, {
       action: 'pr-published',
       caseId: jc.caseId,
       branch: jc.branch,
       mode,
+      draft,
       fixBranch,
       url: result.url,
       number: result.number,
-      exhibit: exhibit.commit,
-      remoteCommit: result.remoteCommit,
+      head: headSha,
     });
     if (mode === 'held') {
-      // Point the ledger freeze at the branch the PR actually lives on (urge target).
+      // Point the ledger freeze at the branch/PR the urges must target.
       const path = ledgerPathOf(cli);
       const ledger = readLedger(path);
       if (ledger.branches[jc.branch]?.frozenBy === jc.caseId) {
-        ledger.branches[jc.branch] = { ...ledger.branches[jc.branch], fixBranch };
+        ledger.branches[jc.branch] = { ...ledger.branches[jc.branch], fixBranch, prNumber: result.number };
         writeLedger(path, ledger);
       }
     }
-    console.error(`published draft PR #${result.number} for ${jc.caseId}: ${result.url}`);
-    emit(cli, { ok: true, issues, pr: { url: result.url, number: result.number }, exhibit: exhibitInfo });
+    console.error(`published ${draft ? 'draft ' : ''}PR #${result.number} for ${jc.caseId}: ${result.url}`);
+    emit(cli, { ok: true, issues, pr: { url: result.url, number: result.number }, head: headInfo });
     return 0;
   } catch (e) {
     emit(cli, {
@@ -2419,6 +2519,241 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
     });
     return 1;
   }
+}
+
+/**
+ * `propagate push` — the pass publication stage (§14.4, D-049). The DRIVER
+ * pushes; the agent never hand-pushes anything (rule 3 as amended by D-049:
+ * driver-journaled pass pushes are the only pushes). Per-pass order: verify
+ * green → JUDGED PRs created (`publish`, non-draft) → THIS command pushes the
+ * target branches — ONE push per branch, clean prefix + judged merge commits
+ * together; GitHub auto-flips the JUDGED PRs to merged (D-040) → HELD draft
+ * PRs created (`publish`; bases now current, ERR14 enforces it) → urge
+ * comments posted (also this command). Verify-gated (ERR18): nothing is
+ * pushed before `verify` is green (§9, D-012). A failed push is ERR15 — hard
+ * halt, journaled, D-046 case-2 owner report, NO fallback. Closure checks and
+ * urge posting are the networked parts and take the same `--token-file` as
+ * `publish`; a dry-run reports intents only (no writes, no network).
+ */
+export async function cmdPush(cli: Cli, makeTransport?: (token: string) => GithubTransport): Promise<number> {
+  const ctx = await passContext(cli); // attaches to the open pass
+  const dir = ctx.dir;
+  const journal = readJournal(dir);
+  const issues: Issue[] = [];
+
+  // Target set: branches the driver mutated this pass, in plan order.
+  const mutated = new Set(
+    journal
+      .filter((e) => (e.action === 'merge' || e.action === 'resolved') && typeof e.branch === 'string')
+      .map((e) => e.branch as string),
+  );
+  const planPath = join(dir, 'plan.json');
+  const order: string[] = existsSync(planPath)
+    ? (JSON.parse(readFileSync(planPath, 'utf8')) as PropagationPlan).order
+    : [...mutated];
+  const targets = order.filter((b) => mutated.has(b));
+  for (const b of mutated) if (!targets.includes(b)) targets.push(b);
+
+  interface PushIntent {
+    branch: string;
+    state: 'push' | 'create' | 'up-to-date' | 'remote-ahead' | 'diverged';
+    localTip: string;
+  }
+  const intents: PushIntent[] = [];
+  for (const branch of targets) {
+    if (!(await refExists(cli.repo, branch))) continue;
+    const localTip = await revParse(cli.repo, branch);
+    const originRef = `origin/${branch}`;
+    if (!(await refExists(cli.repo, originRef))) {
+      intents.push({ branch, state: 'create', localTip });
+      continue;
+    }
+    const originTip = await revParse(cli.repo, originRef);
+    if (originTip === localTip) intents.push({ branch, state: 'up-to-date', localTip });
+    else if (await isAncestor(cli.repo, originTip, localTip)) intents.push({ branch, state: 'push', localTip });
+    // Origin strictly ahead: someone else committed — higher is fine (D-049 §5).
+    else if (await isAncestor(cli.repo, localTip, originTip)) intents.push({ branch, state: 'remote-ahead', localTip });
+    else intents.push({ branch, state: 'diverged', localTip });
+  }
+
+  // JUDGED PRs published this pass — their closure is checked after the pushes.
+  const judgedPrs = journal.filter((e) => e.action === 'pr-published' && e.mode === 'judged');
+  const dueUrges = await detectUrges(cli, ctx);
+
+  // Verify gate (§9, D-012): nothing is pushed before verify is green.
+  const gateOk = canComplete(journal);
+
+  if (!cli.execute) {
+    console.error('DRY-RUN (no --execute): no pushes, no posts; reporting intents');
+    emit(cli, {
+      dryRun: true,
+      verifyGreen: gateOk,
+      wouldPush: intents.filter((i) => i.state === 'push' || i.state === 'create').map((i) => i.branch),
+      skipped: intents.filter((i) => i.state === 'up-to-date' || i.state === 'remote-ahead').map((i) => i.branch),
+      diverged: intents.filter((i) => i.state === 'diverged').map((i) => i.branch),
+      wouldCheckClosure: judgedPrs.map((e) => e.number),
+      wouldUrge: dueUrges.map((u) => ({ branch: u.branch, head: u.head })),
+    });
+    return 0;
+  }
+
+  if (!gateOk) {
+    const detail =
+      "no green `verify` journal entry after the pass's last mutation — run `propagate verify --execute` first (§9, D-012)";
+    console.error(`push [ERR18_VERIFY_PENDING]: ${detail}`);
+    emit(cli, { ok: false, issues: [{ id: 'ERR18_VERIFY_PENDING', detail }] });
+    return 1;
+  }
+
+  // (1) Target pushes — ONE push per branch, plan order (D-049 decision 2).
+  const pushed: string[] = [];
+  for (const intent of intents) {
+    if (intent.state === 'up-to-date' || intent.state === 'remote-ahead') {
+      appendJournal(dir, { action: 'push-skip', branch: intent.branch, reason: intent.state });
+      continue;
+    }
+    if (intent.state === 'diverged') {
+      const detail = `push target '${intent.branch}' has DIVERGED from origin — owner escalation, never force-resolve`;
+      appendJournal(dir, {
+        action: 'halt',
+        reason: 'sync-diverged',
+        id: 'ERR20_BRANCH_DIVERGED',
+        branch: intent.branch,
+        message: detail,
+      });
+      console.error(`push [ERR20_BRANCH_DIVERGED]: ${detail}`);
+      emit(cli, { ok: false, issues: [...issues, { id: 'ERR20_BRANCH_DIVERGED', detail }], pushed });
+      return 1;
+    }
+    try {
+      await gitPush(cli.repo, intent.branch, intent.branch);
+      appendJournal(dir, { action: 'push', branch: intent.branch, to: intent.localTip, kind: 'target' });
+      pushed.push(intent.branch);
+    } catch (e) {
+      const detail =
+        `git push of target '${intent.branch}' failed: ${e instanceof Error ? e.message : String(e)} — ` +
+        `report to the owner (D-046 case 2) and STOP; publication is blocked until the infrastructure is fixed`;
+      appendJournal(dir, {
+        action: 'halt',
+        reason: 'push-failed',
+        id: 'ERR15_PUSH_FAILED',
+        branch: intent.branch,
+        message: detail,
+      });
+      console.error(`push [ERR15_PUSH_FAILED]: ${detail}`);
+      emit(cli, { ok: false, issues: [...issues, { id: 'ERR15_PUSH_FAILED', detail }], pushed });
+      return 1;
+    }
+  }
+
+  // Networked steps (closure checks + urge posting). Only constructed when
+  // there is work; same --token-file contract as publish (D-049 decision 7).
+  const needsNetwork = judgedPrs.length > 0 || dueUrges.length > 0;
+  let transport: GithubTransport | null = null;
+  let slugParts: { owner: string; repo: string } | null = null;
+  if (needsNetwork) {
+    let token: string | null = null;
+    if (cli.tokenFile && existsSync(cli.tokenFile)) token = readFileSync(cli.tokenFile, 'utf8').trim() || null;
+    if (!token) {
+      issues.push({
+        id: 'ERR11_TOKEN_MISSING',
+        detail:
+          'closure checks / urge posting need the substitute GitHub token: write the get_credential output to a file and pass --token-file <path>',
+      });
+    } else {
+      slugParts = await originSlug(cli);
+      if (!slugParts) {
+        issues.push({
+          id: 'ERR12_ORIGIN_UNRESOLVED',
+          detail: 'cannot derive owner/repo from the origin remote URL',
+        });
+      } else {
+        transport = (makeTransport ?? realGithubTransport)(token);
+      }
+    }
+  }
+
+  // (2) JUDGED closure check (D-040): every judged PR must have auto-flipped.
+  const closures: Array<{ number: number; merged: boolean }> = [];
+  if (transport && slugParts) {
+    const api = `/repos/${slugParts.owner}/${slugParts.repo}`;
+    for (const e of judgedPrs) {
+      try {
+        const pr = await ghExpect(transport, 'GET', `${api}/pulls/${e.number}`);
+        const merged = pr.merged === true;
+        closures.push({ number: Number(e.number), merged });
+        if (!merged) {
+          issues.push({
+            id: 'ERR16_CLOSURE_FAILED',
+            detail: `JUDGED PR #${e.number} did not flip to merged after the target push — the base tip and the PR head should be the same commit; investigate before publishing more`,
+          });
+        }
+      } catch (err) {
+        issues.push({
+          id: 'ERR16_CLOSURE_FAILED',
+          detail: `closure check for PR #${e.number} failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    }
+  }
+
+  // (3) Urge posting (§8, D-004): post FIRST — journal/ledger (incl.
+  // lastUrgedHead) advance only after a successful post, so a failed urge
+  // retries on the next push.
+  const urged: Array<{ branch: string; head: string; prNumber: number }> = [];
+  if (transport && slugParts) {
+    const api = `/repos/${slugParts.owner}/${slugParts.repo}`;
+    for (const urge of dueUrges) {
+      try {
+        let prNumber = urge.prNumber;
+        if (!prNumber) {
+          const pr = await getOpenPrByHead(transport, slugParts, urge.fixBranch);
+          prNumber = pr?.number ?? null;
+        }
+        if (!prNumber) {
+          appendJournal(dir, { action: 'urge-skip', branch: urge.branch, reason: 'freeze PR not published yet' });
+          continue;
+        }
+        const commentBody = await urgeCommentBody(cli, urge);
+        // D-004: refresh the machine block on the PR body, then post the comment.
+        const pr = await ghExpect(transport, 'GET', `${api}/pulls/${prNumber}`);
+        const newBody = withMachineBlock(
+          String(pr.body ?? ''),
+          renderMachineBlock(urge.pending.length, ctx.watermark12),
+        );
+        await ghExpect(transport, 'PATCH', `${api}/pulls/${prNumber}`, { body: newBody });
+        await ghExpect(transport, 'POST', `${api}/issues/${prNumber}/comments`, { body: commentBody });
+        const urgeDir = join(dir, 'urges', slug(urge.branch));
+        mkdirSync(urgeDir, { recursive: true });
+        writeFileSync(join(urgeDir, 'urge-comment.md'), commentBody + '\n');
+        appendJournal(dir, {
+          action: 'urge',
+          branch: urge.branch,
+          head: urge.head,
+          pending: urge.pending.length,
+          prNumber,
+        });
+        const path = ledgerPathOf(cli);
+        const fresh = readLedger(path);
+        fresh.branches[urge.branch] = { ...fresh.branches[urge.branch], lastUrgedHead: urge.head, prNumber };
+        writeLedger(path, fresh);
+        urged.push({ branch: urge.branch, head: urge.head, prNumber });
+      } catch (err) {
+        issues.push({
+          id: 'ERR17_URGE_FAILED',
+          detail: `urge for '${urge.branch}' failed: ${err instanceof Error ? err.message : String(err)} — lastUrgedHead not advanced; it retries on the next push`,
+        });
+      }
+    }
+  }
+
+  const ok = !issues.some((i) => isBlocking(i.id));
+  console.error(
+    `push ${ok ? 'complete' : 'FINISHED WITH BLOCKING ISSUES'} — ${pushed.length} branch(es) pushed, ` +
+      `${closures.filter((c) => c.merged).length}/${closures.length} judged closures confirmed, ${urged.length} urge(s) posted`,
+  );
+  emit(cli, { ok, issues, pushed, closures, urged });
+  return ok ? 0 : 1;
 }
 
 export async function cmdVerify(cli: Cli): Promise<number> {
@@ -2554,7 +2889,9 @@ export async function cmdStatus(cli: Cli): Promise<number> {
       console.log(`  ${a.branch} <- ${a.parent}: passes height ${a.height} held by ${a.heldAncestor}`);
   }
   const urges = journal.filter((e) => e.action === 'urge');
-  if (urges.length) console.log(`urges prepared: ${urges.length}`);
+  if (urges.length) console.log(`urges posted: ${urges.length}`);
+  const pushes = journal.filter((e) => e.action === 'push');
+  if (pushes.length) console.log(`pushes (driver-journaled, D-049): ${pushes.length}`);
   const openCases = journal.filter((e) => e.action === 'case').map((e) => e.caseId as string);
   const resolvedCases = new Set(
     journal.filter((e) => e.action === 'resolved' || e.action === 'held').map((e) => e.caseId as string),
@@ -2583,6 +2920,7 @@ const HANDLERS: Record<string, (cli: Cli) => Promise<number>> = {
   run: cmdRun,
   resolve: cmdResolve,
   publish: (cli) => cmdPublish(cli), // real transport unless a test injects one (§14)
+  push: (cli) => cmdPush(cli), // §14.4 (D-049): verify-gated pass pushes + closure checks + urges
   verify: cmdVerify,
   unfreeze: cmdUnfreeze,
   status: cmdStatus,

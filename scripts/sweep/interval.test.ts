@@ -41,8 +41,10 @@ describe('mergePointSweep — linear, non-monotonic window (§3, D-037)', () => 
     // heights 0,2 clean; 1,3 conflict. Largest clean = 2 (past the height-1 conflict).
     expect(res.cleanFullRange).toBe(false);
     expect(res.mergePoint).toEqual({ sha: chain[2], height: 2 });
-    // Smallest conflicting height ABOVE the merge point = 3.
+    // The case run starts at the smallest conflicting height ABOVE the merge
+    // point = 3 (a single-height run here — nothing above it, D-049 §2).
     expect(res.firstConflict?.head.height).toBe(3);
+    expect(res.firstConflict?.run.map((h) => h.height)).toEqual([3]);
     expect(res.firstConflict?.conflictedPaths).toEqual(['src/x.ts']);
     expect(res.firstConflict?.automergeTree).toMatch(/^[0-9a-f]{40}$/);
     // Records clean/conflict per height.
@@ -91,6 +93,116 @@ describe('mergePointSweep — linear, non-monotonic window (§3, D-037)', () => 
     expect(res.upToDate).toBe(true);
     expect(res.probeCount).toBe(0);
     expect(res.mergePoint).toBeNull();
+  });
+});
+
+describe('mergePointSweep — case stacking (D-049 §2)', () => {
+  /**
+   * Trunk with a clean height 0 then consecutive conflicting heights 1..3 on
+   * src/x.ts, plus a DISJOINT conflicting height 4 on src/y.ts. The fork edits
+   * both files, so all of 1..4 conflict against it.
+   */
+  async function stackFixture(): Promise<{ r: ReturnType<typeof initFixtureRepo>; chn: Chain }> {
+    const r = initFixtureRepo();
+    r.commit('base xy', { 'src/x.ts': 'orig\n', 'src/y.ts': 'orig\n' });
+    const b = r.sha('main');
+    r.checkout('fork2', { create: true, at: 'main' });
+    r.commit('fork2: edit x and y', { 'src/x.ts': 'fork\n', 'src/y.ts': 'fork\n' });
+    r.checkout('main');
+    r.commit('U0: clean util', { 'src/u.ts': 'u\n' }); // height 0 — clean
+    r.commit('U1: x = a', { 'src/x.ts': 'a\n' }); // height 1 — x conflict
+    r.commit('U2: x = b', { 'src/x.ts': 'b\n' }); // height 2 — x conflict (intersects)
+    r.commit('U3: x = c', { 'src/x.ts': 'c\n' }); // height 3 — x conflict (intersects)
+    r.commit('U4: y = d', { 'src/y.ts': 'd\n' }); // height 4 — y ALSO x? cumulative: x staying conflicted
+    const chn = await enumerateChain(r.dir, 'main', b);
+    return { r, chn };
+  }
+
+  it('stacks consecutive path-intersecting conflicting heights; head = the run TOP', async () => {
+    const { r, chn } = await stackFixture();
+    try {
+      const tip = await revParse(r.dir, 'fork2');
+      const line = await buildEligibleLine({
+        repo: r.dir,
+        branch: 'fork2',
+        branchTip: tip,
+        parent: 'main',
+        model: 'entry',
+        chain: chn,
+      });
+      const res = await mergePointSweep(r.dir, 'fork2', line);
+      expect(res.mergePoint?.height).toBe(0); // the clean prefix
+      // Heights 1..4 all conflict; cumulative conflict sets intersect on
+      // src/x.ts throughout, so the run stacks to the cap-free top (4 heights
+      // < cap 5) and the head is the TOP.
+      expect(res.firstConflict?.run.map((h) => h.height)).toEqual([1, 2, 3, 4]);
+      expect(res.firstConflict?.head.height).toBe(4);
+      // The top's conflict set is the cumulative one (both files by height 4).
+      expect(res.firstConflict?.conflictedPaths).toContain('src/x.ts');
+    } finally {
+      r.destroy();
+    }
+  });
+
+  it('the cap breaks the run (stack_cap lever, default 5)', async () => {
+    const { r, chn } = await stackFixture();
+    try {
+      const tip = await revParse(r.dir, 'fork2');
+      const line = await buildEligibleLine({
+        repo: r.dir,
+        branch: 'fork2',
+        branchTip: tip,
+        parent: 'main',
+        model: 'entry',
+        chain: chn,
+      });
+      const res = await mergePointSweep(r.dir, 'fork2', line, 2);
+      expect(res.firstConflict?.run.map((h) => h.height)).toEqual([1, 2]);
+      expect(res.firstConflict?.head.height).toBe(2);
+    } finally {
+      r.destroy();
+    }
+  });
+
+  it('a disjoint-path conflict breaks the run (its own case later)', async () => {
+    // Fork edits x only; upstream conflicts on x at height 0, then REPLACES y
+    // wholesale at height 1 in a way that conflicts on y only after the fork
+    // also diverges y — build it directly: height 0 x-conflict, height 1
+    // y-conflict with a DISJOINT set at that head.
+    const r = initFixtureRepo();
+    r.commit('base xy', { 'src/x.ts': 'orig\n', 'src/y.ts': 'orig\n' });
+    const b = r.sha('main');
+    r.checkout('forkd', { create: true, at: 'main' });
+    r.commit('forkd: edit x and y', { 'src/x.ts': 'fork\n', 'src/y.ts': 'fork\n' });
+    r.checkout('main');
+    r.commit('U0: x = a', { 'src/x.ts': 'a\n' }); // height 0 — x conflict
+    // Height 1 resolves x to the FORK content (x heals) but rewrites y: the
+    // cumulative conflict set at height 1 is {src/y.ts} — disjoint from {src/x.ts}.
+    r.commit('U1: x = fork, y = d', { 'src/x.ts': 'fork\n', 'src/y.ts': 'd\n' });
+    try {
+      const chn = await enumerateChain(r.dir, 'main', b);
+      const tip = await revParse(r.dir, 'forkd');
+      const line = await buildEligibleLine({
+        repo: r.dir,
+        branch: 'forkd',
+        branchTip: tip,
+        parent: 'main',
+        model: 'entry',
+        chain: chn,
+      });
+      const res = await mergePointSweep(r.dir, 'forkd', line);
+      expect(res.mergePoint).toBeNull(); // no clean height at all
+      expect(res.probes.map((p) => [p.head.height, p.clean, p.conflictFiles])).toEqual([
+        [0, false, ['src/x.ts']],
+        [1, false, ['src/y.ts']],
+      ]);
+      // Disjoint sets: the run stays at height 0; height 1 is its own case later.
+      expect(res.firstConflict?.run.map((h) => h.height)).toEqual([0]);
+      expect(res.firstConflict?.head.height).toBe(0);
+      expect(res.firstConflict?.conflictedPaths).toEqual(['src/x.ts']);
+    } finally {
+      r.destroy();
+    }
   });
 });
 

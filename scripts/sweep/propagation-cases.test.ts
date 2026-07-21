@@ -150,7 +150,7 @@ describe.skipIf(!AVAILABLE)('propagation real-DAG cases (mined 2026-07-18)', () 
   // p7 — largest-clean-height / linear conflict profile (§3, class 7). VERIFIED.
   // The fork tip was rebased unreachable 2026-07-20 → pin-by-patch fallback.
   const P7_HEIGHTS = [1, 30, 61, 62, 80, 98];
-  it('p7: entry-model sweep merges at height 61, reports the height-62 conflict', () => {
+  it('p7: entry-model sweep merges at height 61; the case run starts at 62 and stacks to the sparse-line top (D-049 §2)', () => {
     const c = loadCase('p7-conflict-profile-role-grant.yaml');
     // Chain commits it probes must be present (loud); the fork tip resolves via
     // the pinned sha or, once rebased away, the pin patch.
@@ -173,8 +173,19 @@ describe.skipIf(!AVAILABLE)('propagation real-DAG cases (mined 2026-07-18)', () 
 
     return mergePointSweep(REPO, branch, line).then((res) => {
       expect(res.mergePoint).toEqual({ sha: c.expected.largest_clean_sha, height: c.expected.largest_clean_height });
-      expect(res.firstConflict?.head.height).toBe(c.expected.smallest_conflicting_height_above);
-      expect(res.firstConflict?.head.sha).toBe(c.expected.smallest_conflicting_sha);
+      // D-049 §2 stacking: the real profile conflicts on the SAME single path
+      // from 62 to the watermark, so on this sparse line the run stacks over
+      // all three conflicting candidate heads (62, 80, 98; below the cap of 5)
+      // and the case head is the run's TOP. The run still STARTS at the
+      // smallest conflicting height above the merge point.
+      expect(res.firstConflict?.run[0]).toEqual({
+        sha: c.expected.smallest_conflicting_sha,
+        height: c.expected.smallest_conflicting_height_above,
+      });
+      expect(res.firstConflict?.run.map((h) => h.height)).toEqual([62, 80, 98]);
+      expect(res.firstConflict?.head.height).toBe(98);
+      expect(res.firstConflict?.head.sha).toBe(heightSha(98));
+      // Constant single-path profile: the top's conflict set is the case's.
       expect(res.firstConflict?.conflictedPaths).toEqual(c.expected.case_conflicted_paths);
     });
   });
@@ -207,8 +218,11 @@ describe.skipIf(!AVAILABLE)('propagation real-DAG cases (mined 2026-07-18)', () 
     };
     return mergePointSweep(REPO, branch, line).then((res) => {
       expect(res.mergePoint).toEqual({ sha: c.expected.largest_clean_sha, height: 61 });
-      expect(res.firstConflict?.head.height).toBe(62);
-      expect(res.firstConflict?.head.sha).toBe(c.expected.smallest_conflicting_sha);
+      // D-049 §2: run starts at 62 and stacks over the sparse line's other
+      // conflicting head (98, same single-path conflict set).
+      expect(res.firstConflict?.run[0]).toEqual({ sha: c.expected.smallest_conflicting_sha, height: 62 });
+      expect(res.firstConflict?.run.map((h) => h.height)).toEqual([62, 98]);
+      expect(res.firstConflict?.head.height).toBe(98);
       expect(res.firstConflict?.conflictedPaths).toEqual(c.expected.case_conflicted_paths);
     });
   });

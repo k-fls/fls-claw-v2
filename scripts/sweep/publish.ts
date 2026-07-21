@@ -1,19 +1,26 @@
 /**
- * scripts/sweep/publish.ts — mechanics for `propagate publish --case <id>`,
- * the ONLY sanctioned PR-creation path (PROPAGATION.md §14, D-048).
+ * scripts/sweep/publish.ts — mechanics for `propagate publish --case <id>`
+ * (the ONLY sanctioned PR-creation path) and the `propagate push` publication
+ * stage (PROPAGATION.md §14, D-048/D-049).
  *
- * Born from the 2026-07-21 forensic reviews of the freeze PRs:
- *  - the D-030 head shape (PR head on the parent's line) made GitHub show the
- *    whole pending range — 26-60x diff bloat — and pushing those heads
- *    back-doored unpushed protected-branch merge commits onto origin. The
- *    replacement is the EXHIBIT HEAD (buildExhibit): a synthetic commit
- *    parented on the ORIGIN base tip whose tree is the base tree with ONLY the
- *    case's conflicted paths overlaid, hard-asserted to diff to exactly the
- *    conflict set (ERR03) with no local-only ancestry (ERR04).
+ * Born from the 2026-07-21 forensic reviews of the freeze PRs, corrected the
+ * same day by D-049 (MERGE-POLICY.md):
+ *  - PR heads are REAL commits pushed by the driver via `git push` (D-049 §5):
+ *    HELD = the case run's TOP commit verbatim (D-030 head), published AFTER
+ *    the pass's target pushes so the base is current and the diff = the run;
+ *    JUDGED = the real merge commit, published BEFORE the target push so the
+ *    push auto-flips the PR to merged (D-040). The 2026-07-21 synthetic
+ *    exhibit-head mechanism (and its ERR03/ERR04 asserts) is RETIRED — the
+ *    pre-PR height check (checkBaseHeight, ERR14) plus the §14.4 push order
+ *    are the guarantees. Refs move via `git push` ONLY; the API is never used
+ *    to fabricate refs/commits, and a failing push is ERR15 — a D-046 case-2
+ *    owner report, never worked around.
  *  - the driver's template PR prose could never pass its own text gate (a
- *    3-round rewrite loop); the driver now NEVER generates prose — the agent
+ *    3-round rewrite loop); the driver NEVER generates prose — the agent
  *    writes pr/title.txt + pr/body.md itself and prTextGate mediates a
- *    context-free cold read with a HARD two-round cap.
+ *    context-free cold read with a HARD two-round cap. The only driver-written
+ *    body content is the clearly-delimited D-004 machine block below the
+ *    agent's prose (pending-count bookkeeping, refreshed by posted urges).
  *  - no gate asked "should this PR exist": decidedAlready (ERR05) matches the
  *    conflict against decisions recorded in inventory `prompt.extra_context` /
  *    `decided_paths`; duplicate-signature detection (ERR06) lives in the CLI.
@@ -21,31 +28,26 @@
  * Every check returns a machine-readable Issue {id, detail}; ERR* ids block,
  * WARN* ids are advisory. HALT_IDS maps the existing DriverHalt reasons onto
  * the same scheme for run/resolve CLI output. The registry of ids is
- * PROPAGATION.md §14 (single source of truth).
+ * PROPAGATION.md §14 (single source of truth). ERR03/ERR04 are retired
+ * permanently and their numbers are never reused (D-049).
  *
- * Network: the GitHub REST API is called directly from node (`gh` and
- * `python3` do not exist in the agent container; `git push` to github fails
- * through the credential proxy). Requests go to api.github.com with
- * `Authorization: Bearer <substitute token>` — the proxy swaps the header on
- * the wire — honouring HTTPS_PROXY via a CONNECT tunnel. The transport is
- * injectable (GithubTransport) so tests never touch the network, and a
- * dry-run publish never constructs one at all.
+ * Network: the GitHub REST API is used for PR creation/comments only (normal
+ * API use). Requests go to api.github.com with `Authorization: Bearer
+ * <substitute token>` — the proxy swaps the header on the wire — honouring
+ * HTTPS_PROXY via a CONNECT tunnel. The transport is injectable
+ * (GithubTransport) so tests never touch the network, and a dry-run
+ * publish/push never constructs one at all.
  */
 import { createHash } from 'node:crypto';
-import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { connect as tlsConnect } from 'node:tls';
 import type { Socket } from 'node:net';
-import { promisify } from 'node:util';
 
-import { git, refExists, revParse } from './git.js';
+import { isAncestor, refExists, revParse } from './git.js';
 import type { FeatureEntry, PrTextVerdict } from './types.js';
-
-const execFileP = promisify(execFile);
 
 // ---------------------------------------------------------------------------
 // Result ids (§14, D-048). ERR* blocks, WARN* is advisory. The full registry
@@ -81,144 +83,95 @@ export function haltIdFor(reason: string): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// Exhibit head (§14; supersedes the D-030 "parent's conflicting head" shape).
+// Pre-PR height check (D-049 §5; replaces the retired exhibit asserts).
 // ---------------------------------------------------------------------------
 
-export interface Exhibit {
-  /** The commit the exhibit is parented on: origin/<branch> tip, or the local tip fallback. */
-  parent: string;
-  parentSource: 'origin' | 'local';
-  /** Tree = base tree with ONLY the conflicted paths overlaid from `sourceTree`. */
-  tree: string;
-  commit: string;
-}
-
-/** `git ls-tree` entry for one path inside a tree, or null when absent. */
-async function lsTreeEntry(
-  repo: string,
-  tree: string,
-  path: string,
-): Promise<{ mode: string; oid: string } | null> {
-  const res = await git(repo, ['ls-tree', tree, '--', path]);
-  const line = res.stdout.split('\n').find(Boolean);
-  if (!line) return null;
-  const m = /^(\d{6}) blob ([0-9a-f]{40})\t/.exec(line);
-  return m ? { mode: m[1], oid: m[2] } : null;
-}
-
 /**
- * Base tree with ONLY `paths` overlaid from `sourceTree` (checkout-free, via a
- * temporary index): a path present in the source tree replaces the base entry;
- * a path absent there (delete/modify conflict resolved by deletion) is removed.
- * This is the sibling of createCaseWorktree's commit-tree technique, restricted
- * to the conflict set so the resulting diff can be hard-asserted (ERR03).
+ * ERR14_BASE_BEHIND — the origin base branch must be AT LEAST at the expected
+ * pass height before a PR is created on it (D-049 §5); higher is fine (someone
+ * else committed), lower or diverged is a halt. In ancestry terms:
+ *  - HELD (published AFTER the pass's target pushes, §14.4 order): the local
+ *    branch tip must be contained in origin/<branch> — the clean prefix was
+ *    pushed, so the draft PR's diff is the case run only.
+ *  - JUDGED (published BEFORE the target push): origin must not have DIVERGED
+ *    from the local branch, and must NOT already contain the merge commit —
+ *    that would mean the target push ran first (order violation; the PR could
+ *    never be created, let alone auto-flip).
  */
-export async function overlayTree(repo: string, baseTree: string, sourceTree: string, paths: string[]): Promise<string> {
-  const tmp = mkdtempSync(join(tmpdir(), 'sweep-exhibit-'));
-  const env = { GIT_INDEX_FILE: join(tmp, 'index') };
-  try {
-    await git(repo, ['read-tree', baseTree], { env });
-    for (const path of paths) {
-      const entry = await lsTreeEntry(repo, sourceTree, path);
-      if (entry) {
-        await git(repo, ['update-index', '--add', '--cacheinfo', `${entry.mode},${entry.oid},${path}`], { env });
-      } else {
-        await git(repo, ['update-index', '--force-remove', '--', path], { env });
-      }
-    }
-    return (await git(repo, ['write-tree'], { env })).stdout.trim();
-  } finally {
-    rmSync(tmp, { recursive: true, force: true });
-  }
-}
-
-/**
- * Construct the exhibit head for a case (§14): parent = the ORIGIN base-branch
- * tip (falling back to the local tip only when no origin ref exists), tree =
- * that base tree with only `conflictedPaths` overlaid from `sourceTree`
- * (HELD: the recomputed automerge tree — the conflict markers ARE the exhibit;
- * JUDGED: the resolved merge commit's tree). Origin-parenting structurally
- * keeps local-only protected-branch commits out of the pushed ancestry (the
- * PR-#58 back-door); checkExhibitAncestry asserts it anyway (ERR04).
- */
-export async function buildExhibit(
+export async function checkBaseHeight(
   repo: string,
   branch: string,
-  sourceTree: string,
-  conflictedPaths: string[],
-  caseId: string,
-): Promise<Exhibit> {
-  const originRef = `origin/${branch}`;
-  const parentSource: Exhibit['parentSource'] = (await refExists(repo, originRef)) ? 'origin' : 'local';
-  const parent = await revParse(repo, parentSource === 'origin' ? originRef : branch);
-  const baseTree = (await git(repo, ['rev-parse', `${parent}^{tree}`])).stdout.trim();
-  const tree = await overlayTree(repo, baseTree, sourceTree, conflictedPaths);
-  const commit = (
-    await git(repo, ['commit-tree', tree, '-p', parent, '-m', `exhibit head for ${caseId} (D-048, PROPAGATION.md §14)`])
-  ).stdout.trim();
-  return { parent, parentSource, tree, commit };
-}
-
-/**
- * ERR03 hard assert on the exhibit diff (`git diff --name-only <parent> <exhibit>`):
- * - HELD: must equal the conflicted paths EXACTLY — markers exist for every
- *   conflicted path by construction, so any deviation is a defect.
- * - JUDGED: must be a NON-EMPTY SUBSET — a resolution may legitimately keep the
- *   origin-base side of a path byte-identical (that path then has nothing to
- *   exhibit and drops out of the diff), but extra paths still mean smuggled
- *   content, and an empty diff is a no-op PR (the #40 disease), both blocked.
- */
-export async function checkExhibitDiff(
-  repo: string,
-  exhibit: Exhibit,
-  conflictedPaths: string[],
-  tier: 'held' | 'judged' = 'held',
+  mode: 'held' | 'judged',
+  headSha: string,
 ): Promise<Issue | null> {
-  const res = await git(repo, ['diff', '--name-only', exhibit.parent, exhibit.commit]);
-  const actual = res.stdout.split('\n').filter(Boolean).sort();
-  const expected = [...conflictedPaths].sort();
-  const expectedSet = new Set(expected);
-  const ok =
-    tier === 'held'
-      ? JSON.stringify(actual) === JSON.stringify(expected)
-      : actual.length > 0 && actual.every((p) => expectedSet.has(p));
-  if (ok) return null;
-  return {
-    id: 'ERR03_DIFF_EXCEEDS_CONFLICT_SET',
-    detail:
-      `exhibit diff [${actual.join(', ')}] vs conflicted paths [${expected.join(', ')}] — ` +
-      (tier === 'held'
-        ? `a held exhibit must show the conflict set exactly`
-        : `a judged exhibit must be a non-empty subset of the conflict set`) +
-      ` (PROPAGATION.md §14)`,
-  };
-}
-
-/**
- * ERR04 assert: the exhibit's pushed ancestry must add NOTHING beyond the
- * origin tip — structurally guaranteed by origin-parenting, asserted anyway.
- * With an origin ref, the parent must BE the origin tip and the only commit
- * above it must be the exhibit itself. Without one, the local-tip fallback is
- * sanctioned and there is no origin baseline to compare against.
- */
-export async function checkExhibitAncestry(repo: string, exhibit: Exhibit, branch: string): Promise<Issue | null> {
   const originRef = `origin/${branch}`;
-  if (!(await refExists(repo, originRef))) return null;
-  const originTip = await revParse(repo, originRef);
-  if (exhibit.parent !== originTip) {
+  if (!(await refExists(repo, originRef))) {
     return {
-      id: 'ERR04_UNPUSHED_PARENT',
-      detail: `exhibit parent ${exhibit.parent.slice(0, 12)} is not the origin tip ${originTip.slice(0, 12)} — pushing it would carry local-only commits`,
+      id: 'ERR14_BASE_BEHIND',
+      detail: `no origin ref for base '${branch}' — the target branch must exist on origin before a PR can be based on it (D-049 §5)`,
     };
   }
-  const extra = (await git(repo, ['rev-list', exhibit.commit, `^${originTip}`])).stdout.split('\n').filter(Boolean);
-  if (extra.length !== 1 || extra[0] !== exhibit.commit) {
+  const originTip = await revParse(repo, originRef);
+  const localTip = await revParse(repo, branch);
+  const originAtOrAbove = await isAncestor(repo, localTip, originTip); // includes equal
+  const originAtOrBelow = await isAncestor(repo, originTip, localTip);
+  if (!originAtOrAbove && !originAtOrBelow) {
     return {
-      id: 'ERR04_UNPUSHED_PARENT',
-      detail: `exhibit ancestry carries ${extra.length - 1} local-only commit(s) beyond origin — refusing to publish`,
+      id: 'ERR14_BASE_BEHIND',
+      detail: `origin/${branch} (${originTip.slice(0, 12)}) has DIVERGED from the local branch (${localTip.slice(0, 12)}) — owner escalation, never force-resolve`,
+    };
+  }
+  if (mode === 'held' && !originAtOrAbove) {
+    return {
+      id: 'ERR14_BASE_BEHIND',
+      detail:
+        `origin/${branch} (${originTip.slice(0, 12)}) is BEHIND the expected pass height (local ${localTip.slice(0, 12)}) — ` +
+        `HELD PRs are published after the pass's target pushes: run \`propagate push --execute\` first (D-049 §5, §14.4)`,
+    };
+  }
+  if (mode === 'judged' && (await isAncestor(repo, headSha, originTip))) {
+    return {
+      id: 'ERR14_BASE_BEHIND',
+      detail:
+        `origin/${branch} already contains the judged merge commit ${headSha.slice(0, 12)} — ` +
+        `JUDGED PRs are created BEFORE the target push (D-049 order); nothing to publish against this base`,
     };
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// D-004 machine block (D-049 decision 8): the ONLY driver-written body content
+// on a HELD PR — appended below the agent's prose at publish, refreshed by
+// every posted urge. The agent never edits it; the driver never touches the
+// prose above it.
+// ---------------------------------------------------------------------------
+
+export const MACHINE_BLOCK_BEGIN = '<!-- sweep:d004 -->';
+export const MACHINE_BLOCK_END = '<!-- /sweep:d004 -->';
+
+/** Render the D-004 machine block for a HELD PR (pending count behind the freeze). */
+export function renderMachineBlock(pendingCount: number, watermark12: string): string {
+  return [
+    MACHINE_BLOCK_BEGIN,
+    '## Sweep status (driver-maintained — do not edit)',
+    `Pending upstream commits beyond this freeze: **${pendingCount}** (as of pass ${watermark12}).`,
+    'Kept current by posted urge comments (D-004, PROPAGATION.md §14.4).',
+    MACHINE_BLOCK_END,
+  ].join('\n');
+}
+
+/**
+ * Body with the machine block set: replaces an existing delimited block, else
+ * appends one below the (agent-written) body. Idempotent on the same block.
+ */
+export function withMachineBlock(body: string, block: string): string {
+  const begin = body.indexOf(MACHINE_BLOCK_BEGIN);
+  const end = body.indexOf(MACHINE_BLOCK_END);
+  if (begin >= 0 && end > begin) {
+    return body.slice(0, begin) + block + body.slice(end + MACHINE_BLOCK_END.length);
+  }
+  return `${body.trimEnd()}\n\n${block}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -639,86 +592,61 @@ export function realGithubTransport(token: string): GithubTransport {
   };
 }
 
-/** Blob content as base64 (raw bytes — git() is utf8-only, blobs may not be). */
-export async function catBlobBase64(repo: string, oid: string): Promise<string> {
-  const res = await execFileP('git', ['-C', repo, 'cat-file', 'blob', oid], {
-    encoding: 'buffer',
-    maxBuffer: 64 * 1024 * 1024,
-  });
-  return (res.stdout as Buffer).toString('base64');
+/**
+ * Throwing request helper for driver API writes (normal API use only —
+ * PR creation, PR body PATCH, comments; NEVER ref/commit fabrication, D-049).
+ */
+export async function ghExpect(
+  transport: GithubTransport,
+  method: string,
+  path: string,
+  body?: unknown,
+): Promise<Record<string, unknown>> {
+  const res = await transport.request(method, path, body);
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error(`${method} ${path} -> HTTP ${res.status}: ${JSON.stringify(res.body).slice(0, 300)}`);
+  }
+  return (res.body ?? {}) as Record<string, unknown>;
 }
 
 export interface RemotePublishResult {
   url: string;
   number: number;
-  remoteCommit: string;
 }
 
 /**
- * Create the fix/sweep ref and the DRAFT PR on GitHub, entirely via the REST
- * API (no `git push` — broken through the proxy). The exhibit's parent is the
- * origin tip, so its tree/commit are buildable remotely: base_tree exists on
- * GitHub already and only the conflicted paths' blobs are uploaded. The
- * author/committer identity+dates mirror the local exhibit commit so the
- * remote sha normally equals the local one; equality is NOT load-bearing.
+ * Create the PR on GitHub for a head branch the DRIVER ALREADY PUSHED via
+ * `git push` (D-049 §5 — the API never moves refs). HELD PRs are drafts;
+ * JUDGED PRs are non-draft history that the target push auto-flips to merged.
  */
-export async function publishExhibit(
-  repo: string,
+export async function createPullRequest(
   transport: GithubTransport,
   slug: { owner: string; repo: string },
-  exhibit: Exhibit,
-  conflictedPaths: string[],
-  fixBranch: string,
-  pr: { title: string; body: string; base: string },
+  pr: { title: string; body: string; head: string; base: string; draft: boolean },
 ): Promise<RemotePublishResult> {
-  const api = `/repos/${slug.owner}/${slug.repo}`;
-  const expect = async (
-    method: string,
-    path: string,
-    body: unknown,
-  ): Promise<Record<string, unknown>> => {
-    const res = await transport.request(method, path, body);
-    if (res.status < 200 || res.status >= 300) {
-      throw new Error(`${method} ${path} -> HTTP ${res.status}: ${JSON.stringify(res.body).slice(0, 300)}`);
-    }
-    return (res.body ?? {}) as Record<string, unknown>;
-  };
-
-  // Blobs for every conflicted path present in the exhibit tree; deletions map
-  // to sha:null tree entries.
-  const treeEntries: Array<{ path: string; mode: string; type: 'blob'; sha: string | null }> = [];
-  for (const path of conflictedPaths) {
-    const entry = await lsTreeEntry(repo, exhibit.tree, path);
-    if (!entry) {
-      treeEntries.push({ path, mode: '100644', type: 'blob', sha: null });
-      continue;
-    }
-    const blob = await expect('POST', `${api}/git/blobs`, {
-      content: await catBlobBase64(repo, entry.oid),
-      encoding: 'base64',
-    });
-    treeEntries.push({ path, mode: entry.mode, type: 'blob', sha: String(blob.sha) });
-  }
-  const baseTree = (await git(repo, ['rev-parse', `${exhibit.parent}^{tree}`])).stdout.trim();
-  const tree = await expect('POST', `${api}/git/trees`, { base_tree: baseTree, tree: treeEntries });
-
-  const idLines = (
-    await git(repo, ['show', '-s', '--format=%an%n%ae%n%aI%n%cn%n%ce%n%cI%n%B', exhibit.commit])
-  ).stdout.split('\n');
-  const commit = await expect('POST', `${api}/git/commits`, {
-    message: idLines.slice(6).join('\n').trimEnd(),
-    tree: String(tree.sha),
-    parents: [exhibit.parent],
-    author: { name: idLines[0], email: idLines[1], date: idLines[2] },
-    committer: { name: idLines[3], email: idLines[4], date: idLines[5] },
-  });
-  await expect('POST', `${api}/git/refs`, { ref: `refs/heads/${fixBranch}`, sha: String(commit.sha) });
-  const created = await expect('POST', `${api}/pulls`, {
+  const created = await ghExpect(transport, 'POST', `/repos/${slug.owner}/${slug.repo}/pulls`, {
     title: pr.title,
     body: pr.body,
-    head: fixBranch,
+    head: pr.head,
     base: pr.base,
-    draft: true,
+    draft: pr.draft,
   });
-  return { url: String(created.html_url), number: Number(created.number), remoteCommit: String(commit.sha) };
+  return { url: String(created.html_url), number: Number(created.number) };
+}
+
+/** The open PR whose head is `headBranch` (owner-qualified), or null. */
+export async function getOpenPrByHead(
+  transport: GithubTransport,
+  slug: { owner: string; repo: string },
+  headBranch: string,
+): Promise<{ url: string; number: number } | null> {
+  const res = await transport.request(
+    'GET',
+    `/repos/${slug.owner}/${slug.repo}/pulls?head=${encodeURIComponent(`${slug.owner}:${headBranch}`)}&state=open`,
+  );
+  if (res.status === 200 && Array.isArray(res.body) && res.body.length > 0) {
+    const pr = res.body[0] as { html_url?: string; number?: number };
+    return { url: String(pr.html_url ?? ''), number: Number(pr.number ?? 0) };
+  }
+  return null;
 }

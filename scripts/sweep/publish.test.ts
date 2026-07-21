@@ -1,8 +1,10 @@
 /**
  * scripts/sweep/publish.test.ts — `propagate publish` (PROPAGATION.md §14,
- * D-048): exhibit-head construction, the blocking/advisory check battery, the
- * two-round PR-text cold read, and the networked execute path against an
- * injected fake transport (dry-run must make ZERO network calls).
+ * D-048/D-049): the pre-PR height check + D-004 machine block, the
+ * blocking/advisory check battery, the two-round PR-text cold read, and the
+ * networked execute path — real `git push` into a bare fixture origin, PR
+ * creation against an injected fake transport (dry-run must make ZERO network
+ * calls and ZERO pushes).
  */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,19 +12,19 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { initFixtureRepo, type FixtureRepo } from './fixtures.js';
-import { isAncestor, newStyleMergeTree } from './git.js';
 import { readLedger } from './ledger.js';
 import {
-  buildExhibit,
-  checkExhibitAncestry,
-  checkExhibitDiff,
+  MACHINE_BLOCK_BEGIN,
+  MACHINE_BLOCK_END,
+  checkBaseHeight,
   decidedAlready,
   haltIdFor,
   isBlocking,
   parseGithubSlug,
   prTextGate,
   prTextHash,
-  type Exhibit,
+  renderMachineBlock,
+  withMachineBlock,
   type GithubTransport,
   type Issue,
 } from './publish.js';
@@ -94,7 +96,7 @@ interface PublishOut {
   dryRun?: boolean;
   issues: Issue[];
   pr?: { url: string; number: number };
-  exhibit?: { commit: string; tree: string; parent: string; parentSource: string };
+  head?: { commit: string; mode: string };
   wouldCreate?: { fixBranch: string; base: string; draft: boolean };
 }
 
@@ -148,11 +150,8 @@ function fakeGithub(responses: Record<string, { status: number; body: unknown }>
             if (path.includes(suffix)) return res;
           }
           if (method === 'GET' && path.includes('/pulls?')) return { status: 200, body: [] };
-          if (path.endsWith('/git/blobs')) return { status: 201, body: { sha: '0'.repeat(40) } };
-          if (path.endsWith('/git/trees')) return { status: 201, body: { sha: '1'.repeat(40) } };
-          if (path.endsWith('/git/commits')) return { status: 201, body: { sha: '2'.repeat(40) } };
-          if (path.endsWith('/git/refs')) return { status: 201, body: { ref: 'ok' } };
-          if (path.endsWith('/pulls')) return { status: 201, body: { html_url: 'https://github.com/k-fls/fixture/pull/58', number: 58 } };
+          if (path.endsWith('/pulls') && method === 'POST')
+            return { status: 201, body: { html_url: 'https://github.com/k-fls/fixture/pull/58', number: 58 } };
           return { status: 404, body: null };
         },
       };
@@ -162,17 +161,24 @@ function fakeGithub(responses: Record<string, { status: number; body: unknown }>
 }
 
 /**
- * main_patched (x=fork, origin at its pre-pass tip) vs a trunk whose U1
- * rewrites x: run merges the U0 prefix, emits the case, and `resolve --tier
- * held` freezes it — the standard held-publish setup.
+ * main_patched (x=fork) vs a trunk whose U1 rewrites x: run merges the U0
+ * prefix, emits the case, and `resolve --tier held` freezes it — the standard
+ * held-publish setup. With `bareOrigin` a REAL pushable origin is attached
+ * (github-shaped URL, insteadOf-rewritten to a bare repo) so `publish
+ * --execute` can actually `git push`. Either way the target push that HELD
+ * publishing requires (D-049 order: targets first, then HELD PRs) is
+ * simulated so the ERR14 height check passes.
  */
-async function setupHeldCase(entries: InvEntry[] = []): Promise<{
+async function setupHeldCase(
+  entries: InvEntry[] = [],
+  opts: { bareOrigin?: boolean } = {},
+): Promise<{
   repo: FixtureRepo;
   ws: string;
   dir: string;
   caseId: string;
   prDir: string;
-  originTip: string;
+  bareDir: string | null;
   cli: (o: Partial<Cli>) => Cli;
 }> {
   const repo = initFixtureRepo();
@@ -182,8 +188,14 @@ async function setupHeldCase(entries: InvEntry[] = []): Promise<{
   repo.checkout('main');
   repo.commit('U0: util', { 'src/util.ts': 'u\n' }); // height 0 (clean prefix)
   repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' }); // height 1 (the conflict)
-  const originTip = repo.setOrigin('main_patched'); // exhibit parents HERE (§14)
-  repo.git('remote', 'add', 'origin', 'https://github.com/k-fls/fixture.git');
+  let bareDir: string | null = null;
+  if (opts.bareOrigin) {
+    bareDir = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched'); // pre-pass tip on origin
+  } else {
+    repo.setOrigin('main_patched'); // pre-pass tip (remote-tracking only)
+    repo.git('remote', 'add', 'origin', 'https://github.com/k-fls/fixture.git');
+  }
   cleanups.push(() => repo.destroy());
 
   const ws = mkWorkspace();
@@ -194,7 +206,11 @@ async function setupHeldCase(entries: InvEntry[] = []): Promise<{
   await cmdRun(cli({ cmd: 'run', execute: true }));
   const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
   expect(await cmdResolve(cli({ cmd: 'resolve', execute: true, caseId, tier: 'held' }))).toBe(0);
-  return { repo, ws, dir, caseId, prDir: join(dir, caseId, 'pr'), originTip, cli };
+  // Simulate the pass's target push (D-049 §14.4 order: targets before HELD
+  // PRs) so origin is at the expected pass height and ERR14 passes.
+  if (opts.bareOrigin) repo.git('push', 'origin', 'main_patched');
+  else repo.setOrigin('main_patched');
+  return { repo, ws, dir, caseId, prDir: join(dir, caseId, 'pr'), bareDir, cli };
 }
 
 /** Approve the text through the round-1 gate (request, then a fresh publish verdict). */
@@ -210,106 +226,85 @@ async function approveRound1(
   writePrVerdict(prDir, 1, 'publish', GOOD_TITLE, GOOD_BODY);
 }
 
-// --- Exhibit head (§14): diff == conflict set, origin-parenting -------------
+// --- Pre-PR height check (D-049 §5) + D-004 machine block --------------------
 
-describe('publish — exhibit head construction (§14, D-048)', () => {
-  function exhibitFixture(): { repo: FixtureRepo; originTip: string } {
+describe('publish — pre-PR height check (ERR14, D-049 §5)', () => {
+  function heightFixture(): { repo: FixtureRepo } {
     const repo = initFixtureRepo();
     repo.commit('base: x', { 'src/x.ts': 'orig\n' });
     repo.checkout('main_patched', { create: true, at: 'main' });
     repo.commit('mp: x = fork', { 'src/x.ts': 'fork\n' });
     repo.checkout('main');
     repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' });
-    const originTip = repo.setOrigin('main_patched');
     cleanups.push(() => repo.destroy());
-    return { repo, originTip };
+    return { repo };
   }
 
-  it('HELD: origin-parented commit whose diff is exactly the conflict set, blobs = conflict markers', async () => {
-    const { repo, originTip } = exhibitFixture();
-    const probe = await newStyleMergeTree(repo.dir, 'main_patched', 'main');
-    expect(probe.clean).toBe(false);
-    const ex = await buildExhibit(repo.dir, 'main_patched', probe.treeOid, probe.conflictFiles, 'case-1');
-    expect(ex.parentSource).toBe('origin');
-    expect(ex.parent).toBe(originTip);
-    expect(repo.git('diff', '--name-only', ex.parent, ex.commit)).toBe('src/x.ts');
-    expect(repo.git('show', `${ex.commit}:src/x.ts`)).toContain('<<<<<<<'); // the markers ARE the exhibit
-    expect(await checkExhibitDiff(repo.dir, ex, probe.conflictFiles)).toBeNull();
-    expect(await checkExhibitAncestry(repo.dir, ex, 'main_patched')).toBeNull();
-  });
-
-  it('JUDGED: resolved blobs overlay; untouched base content stays out of the diff', async () => {
-    const { repo, originTip } = exhibitFixture();
-    // A "resolved" tree: src/x.ts = RESOLVED, plus an unrelated file that must NOT leak.
+  it('HELD: origin missing or behind the local tip is ERR14; at/above passes ("higher is fine")', async () => {
+    const { repo } = heightFixture();
+    const head = repo.sha('main');
+    // No origin ref at all.
+    expect((await checkBaseHeight(repo.dir, 'main_patched', 'held', head))?.id).toBe('ERR14_BASE_BEHIND');
+    // Origin BEHIND the local tip (pre-pass tip while local advanced).
+    const preTip = repo.sha('main_patched');
+    repo.setOrigin('main_patched');
     repo.checkout('main_patched');
-    repo.commit('resolution', { 'src/x.ts': 'RESOLVED\n', 'src/unrelated.ts': 'leak\n' });
+    repo.commit('mp: pass merge', { 'src/util.ts': 'u\n' });
     repo.checkout('main');
-    const ex = await buildExhibit(repo.dir, 'main_patched', repo.sha('main_patched') + '^{tree}', ['src/x.ts'], 'case-2');
-    expect(ex.parent).toBe(originTip);
-    expect(repo.git('show', `${ex.commit}:src/x.ts`)).toBe('RESOLVED');
-    expect(repo.git('diff', '--name-only', ex.parent, ex.commit)).toBe('src/x.ts'); // unrelated.ts excluded
-    expect(await checkExhibitDiff(repo.dir, ex, ['src/x.ts'])).toBeNull();
-  });
-
-  it('#58 scenario: a local-only merge of a protected branch never enters the exhibit ancestry', async () => {
-    const { repo } = exhibitFixture();
-    // Child branch, pushed at C1; then a LOCAL-ONLY merge of protected
-    // main_patched lands on it (the back-door that pushed unpushed protected
-    // commits with the old D-030 heads).
-    repo.checkout('feat/c', { create: true, at: 'main' });
-    repo.commit('c1', { 'src/c.ts': 'c\n' });
-    repo.checkout('main');
-    const cOrigin = repo.setOrigin('feat/c');
-    const localMerge = repo.git(
-      'commit-tree',
-      'main_patched^{tree}',
-      '-p',
-      repo.sha('feat/c'),
-      '-p',
-      repo.sha('main_patched'),
-      '-m',
-      'local-only merge of main_patched',
-    );
-    repo.git('update-ref', 'refs/heads/feat/c', localMerge);
-
-    const probe = await newStyleMergeTree(repo.dir, 'feat/c', 'main');
-    const source = probe.clean ? probe.treeOid : probe.treeOid;
-    const ex = await buildExhibit(repo.dir, 'feat/c', source, ['src/x.ts'], 'case-58');
-    expect(ex.parent).toBe(cOrigin); // NOT the local tip
-    expect(await isAncestor(repo.dir, localMerge, ex.commit)).toBe(false);
-    expect(await checkExhibitAncestry(repo.dir, ex, 'feat/c')).toBeNull();
-  });
-
-  it('ERR03 on overlay mismatch (a claimed path whose blob equals the base) and ERR04 on a forged parent', async () => {
-    const { repo, originTip } = exhibitFixture();
-    const probe = await newStyleMergeTree(repo.dir, 'main_patched', 'main');
-    // README.md is identical in base and source -> diff misses it -> ERR03.
-    const ex = await buildExhibit(repo.dir, 'main_patched', probe.treeOid, ['src/x.ts', 'README.md'], 'case-3');
-    const err03 = await checkExhibitDiff(repo.dir, ex, ['src/x.ts', 'README.md']);
-    expect(err03?.id).toBe('ERR03_DIFF_EXCEEDS_CONFLICT_SET');
-
-    // JUDGED tier: the same dropped-out path is legitimate (non-empty subset)…
-    expect(await checkExhibitDiff(repo.dir, ex, ['src/x.ts', 'README.md'], 'judged')).toBeNull();
-    // …but an ALL-paths-resolved-to-base exhibit (empty diff) is still ERR03
-    // (a no-op PR), and an extra path beyond the conflict set stays blocked.
-    const emptyEx = await buildExhibit(repo.dir, 'main_patched', 'main_patched^{tree}', ['README.md'], 'case-3e');
-    expect((await checkExhibitDiff(repo.dir, emptyEx, ['README.md'], 'judged'))?.id).toBe(
-      'ERR03_DIFF_EXCEEDS_CONFLICT_SET',
-    );
-    expect((await checkExhibitDiff(repo.dir, ex, ['README.md'], 'judged'))?.id).toBe(
-      'ERR03_DIFF_EXCEEDS_CONFLICT_SET',
-    );
-
-    // Forged parent = the local tip while origin exists -> ERR04 (structurally
-    // prevented by buildExhibit; the assert catches a hand-built exhibit).
-    // Advance the local branch past origin first so the tips differ.
+    const behind = await checkBaseHeight(repo.dir, 'main_patched', 'held', head);
+    expect(behind?.id).toBe('ERR14_BASE_BEHIND');
+    expect(behind?.detail).toContain('BEHIND');
+    // Origin at the local tip (targets pushed) -> passes.
+    repo.setOrigin('main_patched');
+    expect(await checkBaseHeight(repo.dir, 'main_patched', 'held', head)).toBeNull();
+    // Origin strictly AHEAD (someone else committed) -> higher is fine.
+    const ahead = repo.git('commit-tree', 'main_patched^{tree}', '-p', repo.sha('main_patched'), '-m', 'owner commit');
+    repo.git('update-ref', 'refs/remotes/origin/main_patched', ahead);
+    expect(await checkBaseHeight(repo.dir, 'main_patched', 'held', head)).toBeNull();
+    // DIVERGED -> ERR14 (owner escalation).
+    repo.git('update-ref', 'refs/remotes/origin/main_patched', preTip);
     repo.checkout('main_patched');
-    repo.commit('mp: local-only', { 'src/local.ts': 'l\n' });
+    repo.commit('mp: local-only 2', { 'src/l2.ts': 'l\n' });
     repo.checkout('main');
-    const forged: Exhibit = { ...ex, parent: repo.sha('main_patched') };
-    expect(forged.parent).not.toBe(originTip);
-    const err04 = await checkExhibitAncestry(repo.dir, forged, 'main_patched');
-    expect(err04?.id).toBe('ERR04_UNPUSHED_PARENT');
+    const forked = repo.git('commit-tree', `${preTip}^{tree}`, '-p', preTip, '-m', 'external');
+    repo.git('update-ref', 'refs/remotes/origin/main_patched', forked);
+    const diverged = await checkBaseHeight(repo.dir, 'main_patched', 'held', head);
+    expect(diverged?.id).toBe('ERR14_BASE_BEHIND');
+    expect(diverged?.detail).toContain('DIVERGED');
+  });
+
+  it('JUDGED: origin already containing the merge commit is ERR14 (order violation); behind-but-contained passes', async () => {
+    const { repo } = heightFixture();
+    repo.setOrigin('main_patched'); // origin at the pre-pass tip
+    // The judged merge commit lands locally (origin now behind — expected for JUDGED).
+    repo.checkout('main_patched');
+    repo.commit('mp: judged resolution', { 'src/x.ts': 'resolved\n' });
+    repo.checkout('main');
+    const mergeCommit = repo.sha('main_patched');
+    expect(await checkBaseHeight(repo.dir, 'main_patched', 'judged', mergeCommit)).toBeNull();
+    // Target push already ran -> origin contains the merge commit -> ERR14.
+    repo.setOrigin('main_patched');
+    const late = await checkBaseHeight(repo.dir, 'main_patched', 'judged', mergeCommit);
+    expect(late?.id).toBe('ERR14_BASE_BEHIND');
+    expect(late?.detail).toContain('BEFORE the target push');
+  });
+});
+
+describe('publish — D-004 machine block (D-049 decision 8)', () => {
+  it('appends below the agent body, replaces idempotently, never touches the prose', () => {
+    const block1 = renderMachineBlock(3, 'abcdef123456');
+    const withBlock = withMachineBlock('Decision needed: keep fork?\n\nDetails.', block1);
+    expect(withBlock).toContain('Decision needed: keep fork?');
+    expect(withBlock).toContain(MACHINE_BLOCK_BEGIN);
+    expect(withBlock).toContain('**3**');
+    // Refresh replaces the delimited block only.
+    const block2 = renderMachineBlock(7, 'abcdef123456');
+    const refreshed = withMachineBlock(withBlock, block2);
+    expect(refreshed).toContain('Decision needed: keep fork?');
+    expect(refreshed).toContain('**7**');
+    expect(refreshed).not.toContain('**3**');
+    expect(refreshed.indexOf(MACHINE_BLOCK_BEGIN)).toBe(refreshed.lastIndexOf(MACHINE_BLOCK_BEGIN));
+    expect(refreshed.indexOf(MACHINE_BLOCK_END)).toBe(refreshed.lastIndexOf(MACHINE_BLOCK_END));
   });
 });
 
@@ -635,9 +630,9 @@ describe('propagate publish — check battery (blocking ids reachable)', () => {
 
 // --- cmdPublish: dry-run purity + execute happy path -------------------------
 
-describe('propagate publish — dry-run makes no network calls; execute creates ref + draft PR via the API', () => {
-  it('dry-run: full battery green, exhibit reported, transport never constructed', async () => {
-    const { repo, ws, caseId, prDir, originTip, cli } = await setupHeldCase();
+describe('propagate publish — dry-run makes no pushes/network; execute pushes the ref + creates the PR (D-049)', () => {
+  it('dry-run: full battery green, real head reported (the run TOP), transport never constructed, nothing pushed', async () => {
+    const { repo, ws, dir, caseId, prDir, bareDir, cli } = await setupHeldCase([], { bareOrigin: true });
     writeText(prDir, GOOD_TITLE, GOOD_BODY);
     await approveRound1(cli, ws, caseId, prDir);
     const gh = fakeGithub();
@@ -647,17 +642,20 @@ describe('propagate publish — dry-run makes no network calls; execute creates 
     expect(res.ok).toBe(true);
     expect(res.dryRun).toBe(true);
     expect(res.issues).toEqual([]);
-    expect(res.exhibit!.parentSource).toBe('origin');
-    expect(res.exhibit!.parent).toBe(originTip);
-    expect(repo.git('diff', '--name-only', res.exhibit!.parent, res.exhibit!.commit)).toBe('src/x.ts');
+    // The head is the case run's TOP commit — a real trunk commit, no synthesis.
+    const caseHead = (readJournal(dir).find((e) => e.action === 'case')!.head as { sha: string }).sha;
+    expect(res.head!.commit).toBe(caseHead);
+    expect(res.head!.mode).toBe('held');
     expect(res.wouldCreate!.fixBranch).toMatch(/^fix\/sweep\//);
     expect(res.wouldCreate!.draft).toBe(true);
     expect(gh.factories).toBe(0); // NO network calls of any kind on dry-run
     expect(gh.calls.length).toBe(0);
+    // NO pushes on dry-run: the bare origin has no fix/sweep ref.
+    expect(repo.git('-C', bareDir!, 'for-each-ref', 'refs/heads/fix')).toBe('');
   });
 
-  it('execute: blobs -> tree -> commit -> ref -> draft PR, journaled pr-published, ledger fixBranch, local ref', async () => {
-    const { repo, ws, dir, caseId, prDir, cli } = await setupHeldCase();
+  it('execute: git push of the fix/sweep ref at the run TOP, then POST /pulls (draft, machine block); journal + ledger prNumber', async () => {
+    const { repo, ws, dir, caseId, prDir, bareDir, cli } = await setupHeldCase([], { bareOrigin: true });
     writeText(prDir, GOOD_TITLE, GOOD_BODY);
     await approveRound1(cli, ws, caseId, prDir);
     const tokenFile = join(ws, 'token.txt');
@@ -669,26 +667,40 @@ describe('propagate publish — dry-run makes no network calls; execute creates 
     expect(res.ok).toBe(true);
     expect(res.pr).toEqual({ url: 'https://github.com/k-fls/fixture/pull/58', number: 58 });
 
-    // API sequence against the parsed origin slug.
+    // API sequence: ERR07 probe + POST /pulls ONLY — no ref/commit fabrication (D-049 §5).
     const paths = gh.calls.map((c) => c.path);
     expect(paths[0]).toContain('/repos/k-fls/fixture/pulls?head=k-fls%3Afix%2Fsweep%2F'); // ERR07 API probe
-    expect(paths.some((p) => p.endsWith('/git/blobs'))).toBe(true);
-    expect(paths.some((p) => p.endsWith('/git/trees'))).toBe(true);
-    expect(paths.some((p) => p.endsWith('/git/commits'))).toBe(true);
-    expect(paths.some((p) => p.endsWith('/git/refs'))).toBe(true);
+    expect(paths.some((p) => p.includes('/git/'))).toBe(false);
+    expect(gh.calls.length).toBe(2);
     const prCall = gh.calls.find((c) => c.path.endsWith('/pulls') && c.method === 'POST')!;
-    expect((prCall.body as { draft: boolean }).draft).toBe(true);
+    expect((prCall.body as { draft: boolean }).draft).toBe(true); // HELD = draft
     expect((prCall.body as { base: string }).base).toBe('main_patched');
     expect((prCall.body as { title: string }).title).toBe(GOOD_TITLE);
+    // D-004 machine block appended below the agent's body.
+    const sentBody = (prCall.body as { body: string }).body;
+    expect(sentBody).toContain(GOOD_BODY.split('\n')[0]);
+    expect(sentBody).toContain(MACHINE_BLOCK_BEGIN);
+    expect(sentBody.indexOf(MACHINE_BLOCK_BEGIN)).toBeGreaterThan(sentBody.indexOf('Decision needed'));
 
-    // Journal + ledger + local anchor ref.
+    // The ref was REALLY pushed (git push into the bare origin) at the case head.
     const published = readJournal(dir).find((e) => e.action === 'pr-published')!;
     expect(published.caseId).toBe(caseId);
     expect(published.number).toBe(58);
+    expect(published.draft).toBe(true);
     const fixBranch = published.fixBranch as string;
     expect(fixBranch).toMatch(/^fix\/sweep\//);
-    expect(repo.sha(fixBranch)).toBe(published.exhibit);
-    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']!.fixBranch).toBe(fixBranch);
+    const caseHead = (readJournal(dir).find((e) => e.action === 'case')!.head as { sha: string }).sha;
+    expect(published.head).toBe(caseHead);
+    expect(repo.git('-C', bareDir!, 'rev-parse', `refs/heads/${fixBranch}`)).toBe(caseHead);
+    // Journaled driver push (rule 3 as amended: the only pushes).
+    expect(readJournal(dir).some((e) => e.action === 'push' && e.branch === fixBranch && e.kind === 'pr-head')).toBe(
+      true,
+    );
+    // Local anchor + ledger freeze pointing at the PR (urge target incl. number).
+    expect(repo.sha(fixBranch)).toBe(caseHead);
+    const lb = readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']!;
+    expect(lb.fixBranch).toBe(fixBranch);
+    expect(lb.prNumber).toBe(58);
 
     // A second publish of the same case is ERR07 (journal side), no network needed.
     const gh2 = fakeGithub();
@@ -697,8 +709,8 @@ describe('propagate publish — dry-run makes no network calls; execute creates 
     expect(gh2.factories).toBe(0);
   });
 
-  it('execute: an open PR found via the API by head branch name is ERR07', async () => {
-    const { ws, caseId, prDir, cli } = await setupHeldCase();
+  it('execute: an open PR found via the API by head branch name is ERR07 and nothing is pushed', async () => {
+    const { repo, ws, caseId, prDir, bareDir, cli } = await setupHeldCase([], { bareOrigin: true });
     writeText(prDir, GOOD_TITLE, GOOD_BODY);
     await approveRound1(cli, ws, caseId, prDir);
     const tokenFile = join(ws, 'token.txt');
@@ -712,10 +724,30 @@ describe('propagate publish — dry-run makes no network calls; execute creates 
     expect(issue).toBeTruthy();
     expect(issue!.detail).toContain('pull/9');
     expect(gh.calls.length).toBe(1); // stopped after the probe — nothing was created
+    expect(repo.git('-C', bareDir!, 'for-each-ref', 'refs/heads/fix')).toBe(''); // …and nothing pushed
+  });
+
+  it('execute: a failing git push is ERR15 (journaled halt, D-046 case-2 report) and no PR is created', async () => {
+    const { repo, ws, dir, caseId, prDir, bareDir, cli } = await setupHeldCase([], { bareOrigin: true });
+    writeText(prDir, GOOD_TITLE, GOOD_BODY);
+    await approveRound1(cli, ws, caseId, prDir);
+    const tokenFile = join(ws, 'token.txt');
+    writeFileSync(tokenFile, 'substitute-token\n');
+    // Break the transport path: point the insteadOf rewrite at a dead path.
+    repo.git('config', 'url.https://github.com/k-fls/fixture.git.insteadOf', 'unused');
+    repo.git('config', '--unset', `url.${bareDir}.insteadOf`);
+    const gh = fakeGithub();
+    const out = join(ws, 'out.json');
+    expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, tokenFile, out }), gh.factory)).toBe(1);
+    const issue = readOut(out).issues.find((i) => i.id === 'ERR15_PUSH_FAILED');
+    expect(issue).toBeTruthy();
+    expect(issue!.detail).toContain('D-046 case 2');
+    expect(readJournal(dir).some((e) => e.action === 'halt' && e.id === 'ERR15_PUSH_FAILED')).toBe(true);
+    expect(gh.calls.filter((c) => c.method === 'POST').length).toBe(0); // no PR created
   });
 
   it('execute: round-2 caveats ship on the PR body under "## Caveats (cold reader)" with WARN04', async () => {
-    const { ws, caseId, prDir, cli } = await setupHeldCase();
+    const { ws, caseId, prDir, cli } = await setupHeldCase([], { bareOrigin: true });
     writeText(prDir, GOOD_TITLE, GOOD_BODY);
     // Round 1: rewrite. Edit. Round 2: rewrite again -> FINAL, publish-with-caveats.
     await cmdPublish(cli({ cmd: 'publish', caseId }));
@@ -737,6 +769,8 @@ describe('propagate publish — dry-run makes no network calls; execute creates 
     const sent = (prCall.body as { body: string }).body;
     expect(sent).toContain('## Caveats (cold reader)');
     expect(sent).toContain('yes/no consequence still thin');
+    // Machine block sits BELOW the caveats (agent prose + caveats first).
+    expect(sent.indexOf(MACHINE_BLOCK_BEGIN)).toBeGreaterThan(sent.indexOf('## Caveats (cold reader)'));
 
     // Round 3 is impossible: editing after the final round is ERR10.
     writeText(prDir, GOOD_TITLE, body2 + '\nPost-final edit.');

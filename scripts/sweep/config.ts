@@ -49,6 +49,14 @@ export const DEFAULT_UPSTREAM_REF = 'upstream/main';
  */
 export const FORK_POINT = 'd85efea229ea63fb0bd4f57a039f4ef73ece563b';
 
+/**
+ * Case-stacking cap (D-049 §2): a case is the maximal run of consecutive
+ * path-intersecting conflicting heights, capped here by default. The lever:
+ * global `stack_cap` in registry/routing.yaml; per-feature `stack_cap` on the
+ * inventory entry (mirroring the scope-guard lever).
+ */
+export const DEFAULT_STACK_CAP = 5;
+
 /** New-file size thresholds (spec D-002; annotate-PoI "large file"). */
 export const LARGE_SOURCE_BYTES = 15 * 1024;
 export const LARGE_ANY_BYTES = 40 * 1024;

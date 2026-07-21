@@ -11,7 +11,7 @@
  * run the linear merge-point sweep (interval.ts), then classify the verdict and,
  * for own conflicts, run the DEFERRED check (deferred.ts).
  */
-import { EXCLUDED_BRANCH_GLOBS } from './config.js';
+import { DEFAULT_STACK_CAP, EXCLUDED_BRANCH_GLOBS } from './config.js';
 import { checkDeferred } from './deferred.js';
 import { globMatchAny } from './globs.js';
 import { buildEligibleLine, mergePointSweep } from './interval.js';
@@ -86,6 +86,8 @@ export interface DerivePlanOptions {
   held?: HeldRecord[];
   /** Branches frozen in the group ledger (cross-pass) — arrive with empty intervals (§8). */
   frozen?: Set<string>;
+  /** Global case-stacking cap (routing.yaml `stack_cap`, D-049 §2); per-feature `stack_cap` overrides. */
+  stackCap?: number;
 }
 
 async function analyzeParent(
@@ -99,11 +101,12 @@ async function analyzeParent(
   chain: Chain,
   ancestors: string[],
   held: HeldRecord[],
+  stackCap: number,
 ): Promise<ParentPlan> {
   const line = await buildEligibleLine({ repo, branch, branchTip, parent, parentRef, model, chain });
   // Probe from the pinned branch TIP sha, not the ref name: deterministic
   // (§3 probe determinism) and valid for remote-only branches (§13, D-045).
-  const sweep = await mergePointSweep(repo, branchTip, line);
+  const sweep = await mergePointSweep(repo, branchTip, line, stackCap);
 
   const pp: ParentPlan = {
     parent,
@@ -130,7 +133,8 @@ async function analyzeParent(
   if (sweep.firstConflict) {
     const fc = sweep.firstConflict;
     // Window floor = largest clean height below the conflict (merge point when
-    // one exists, else the branch's coverage on this eligible line) — §5.
+    // one exists, else the branch's coverage on this eligible line) — §5. The
+    // window's upper bound is the case run's TOP height (D-049 §2).
     const floor = sweep.mergePoint?.height ?? line.coverage;
     const decision = checkDeferred(fc.head.height, floor, fc.conflictedPaths, ancestors, held);
     if (decision.deferred) {
@@ -138,6 +142,7 @@ async function analyzeParent(
     } else {
       pp.case = {
         head: fc.head,
+        run: fc.run,
         conflictedPaths: fc.conflictedPaths,
         automergeTree: fc.automergeTree,
         reproduction: fc.reproduction,
@@ -175,6 +180,8 @@ export interface DeriveBranchArgs {
   isLeaf: boolean;
   alwaysMerge: boolean;
   held: HeldRecord[];
+  /** Effective case-stacking cap (D-049 §2 lever); DEFAULT_STACK_CAP when omitted. */
+  stackCap?: number;
   /** When true the branch is ledger-frozen: arrives with an empty interval (§8). */
   frozen?: boolean;
   /**
@@ -208,6 +215,7 @@ export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> 
   const { repo, branch, kind, model, parents, chain, ancestors, tierFloor, isLeaf, alwaysMerge, held, frozen } = args;
   const refOf = args.refOf ?? ((b: string) => b);
   const materialize = args.materialize === true;
+  const stackCap = args.stackCap ?? DEFAULT_STACK_CAP;
   // Ledger-frozen: no merges this pass (barrier satisfied by an empty interval).
   if (frozen) {
     const parentPlans: ParentPlan[] = parents.map((parent) => ({
@@ -226,6 +234,7 @@ export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> 
       isLeaf,
       alwaysMerge,
       ancestors,
+      stackCap,
       parents: parentPlans,
       ...(materialize ? { materialize: true } : {}),
     };
@@ -236,7 +245,19 @@ export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> 
   const parentPlans: ParentPlan[] = [];
   for (const parent of parents) {
     parentPlans.push(
-      await analyzeParent(repo, branch, branchTip, branchTree, parent, refOf(parent), model, chain, ancestors, held),
+      await analyzeParent(
+        repo,
+        branch,
+        branchTip,
+        branchTree,
+        parent,
+        refOf(parent),
+        model,
+        chain,
+        ancestors,
+        held,
+        stackCap,
+      ),
     );
   }
   return {
@@ -246,6 +267,7 @@ export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> 
     isLeaf,
     alwaysMerge,
     ancestors,
+    stackCap,
     parents: parentPlans,
     ...(materialize ? { materialize: true } : {}),
   };
@@ -330,6 +352,8 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
       isLeaf: model === 'parents' && leaves.has(entry.branch),
       alwaysMerge: feat?.always_merge === true,
       held,
+      // D-049 §2 lever: per-feature `stack_cap` beats the routing.yaml global.
+      stackCap: feat?.stack_cap ?? opts.stackCap ?? DEFAULT_STACK_CAP,
       frozen: frozen.has(entry.branch),
       materialize: entry.materialize === true,
       refOf,

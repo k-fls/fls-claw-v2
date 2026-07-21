@@ -124,9 +124,11 @@ pnpm exec tsx $S status --repo . --workspace $WS --report $WS/sweep-report.json 
 ```
 
 Then the agentic layer takes over: overlap-check subagents per routed
-(feature, sweep) pair, catch-all triage for unrouted PoIs, `fix/sweep/*`
-branches + PRs for gates (cases 2-4 in DESIGN.md §6), pushes per the push
-policy. Nothing here deploys anything.
+(feature, sweep) pair, catch-all triage for unrouted PoIs, and conflict
+handling per the MERGE-POLICY.md tier ladder (CLEAN/MECHANICAL/JUDGED/HELD/
+DEFERRED — D-049; the old DESIGN.md §6 case ladder is retired) driven by
+`propagate.ts` (resolve/publish/push — the driver pushes, verify-gated).
+Nothing here deploys anything.
 
 ## Safety model
 

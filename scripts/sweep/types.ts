@@ -119,9 +119,11 @@ export interface LedgerBranch {
    * pass-relative and never carried numerically). Absent for gate holds.
    */
   heldPaths?: string[] | null;
-  /** Prepared freeze-PR branch (urge comments target it, cross-pass). */
+  /** Freeze-PR branch (urge comments target its PR, cross-pass). */
   fixBranch?: string | null;
-  /** Newest pending head the owner was last urged about (one urge per new head). */
+  /** Freeze-PR number on GitHub (urge posting + D-004 machine-block target, D-049). */
+  prNumber?: number | null;
+  /** Newest pending head the owner was last urged about (one POSTED urge per new head). */
   lastUrgedHead?: string | null;
 }
 
@@ -162,6 +164,8 @@ export interface FeatureEntry {
   overlap_hints?: string;
   /** Per-feature scope-guard override (§7 lever); beats the global default. */
   scope_guard?: ScopeGuardMode;
+  /** Per-feature case-stacking cap override (D-049 §2 lever); beats routing.yaml `stack_cap`. */
+  stack_cap?: number;
   routing?: { keywords?: string[]; always_check_on?: string[] };
   /**
    * `extra_context` carries recorded owner decisions (D-030 write-back);
@@ -186,6 +190,8 @@ export interface RoutingConfig {
   sensitiveSurfaces?: string[];
   /** Global default scope-guard mode (§7 lever); per-feature `scope_guard` overrides. */
   scopeGuardMode?: ScopeGuardMode;
+  /** Global case-stacking cap (D-049 §2, `stack_cap`); per-feature `stack_cap` overrides. */
+  stackCap?: number;
 }
 
 /**
@@ -315,10 +321,19 @@ export type Tier = 'clean' | 'mechanical' | 'judged' | 'held' | 'deferred';
  */
 export type ParentVerdict = 'merge' | 'skip' | 'defer' | 'up-to-date' | 'case';
 
-/** Reported conflict handed to the resolving agent (§3 step 4). */
+/**
+ * Reported conflict handed to the resolving agent (§3 step 4). The case unit is
+ * a STACKED RUN (D-049 §2): the maximal run of consecutive conflicting heights
+ * whose conflicted path sets intersect, capped (`stack_cap`). `head` is the
+ * run's TOP commit — merging it resolves the whole run in one case/cold read;
+ * DEFERRED windows and urge tracking are computed against it.
+ */
 export interface ConflictCase {
-  /** The conflicting head: sha is the commit to merge, height its trunk index. */
+  /** The run's TOP head: sha is the commit to merge, height its trunk index. */
   head: Head;
+  /** The stacked run, ascending by height; run[run.length - 1] === head. */
+  run: Head[];
+  /** Conflicted paths at the run TOP (the cumulative conflict set). */
   conflictedPaths: string[];
   /** Tree oid of the conflicted automerge (conflict markers), from new-style merge-tree. */
   automergeTree: string;
@@ -357,6 +372,8 @@ export interface BranchPlan {
   alwaysMerge: boolean;
   /** Transitive inventory ancestors (for DEFERRED matching). */
   ancestors: string[];
+  /** Effective case-stacking cap for this branch (D-049 §2 lever, resolved at derivation). */
+  stackCap?: number;
   parents: ParentPlan[];
   /** Cheapest parent chain un-skipped to keep the leaf/always_merge invariant (§6). */
   unskipChain?: string[];
@@ -414,12 +431,15 @@ export interface CaseFile {
   id: string;
   branch: string;
   parent: string;
+  /** The case run's TOP head (D-049 §2). */
   head: Head;
+  /** The stacked run (ascending). Optional only for pre-D-049 case files. */
+  run?: Head[];
   tierFloor: Tier;
   conflictedPaths: string[];
   automergeTree: string;
   reproduction: { command: string };
-  /** DEFERRED-check inputs (§5). */
+  /** DEFERRED-check inputs (§5); firstConflictHeight = the run's TOP height. */
   deferredCheck: { firstConflictHeight: number; transitiveAncestors: string[] };
 }
 

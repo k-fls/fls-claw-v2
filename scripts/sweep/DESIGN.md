@@ -1,7 +1,10 @@
 # FLSclaw self-maintenance: upstream-sweep pipeline specification
 
 Status: DRAFT v2 (2026-07-10). Decision references D-001..D-021 point to the decision log
-(`self-maintenance-decisions.md`).
+(`self-maintenance-decisions.md`). SUPERSEDED IN PART (D-049, 2026-07-21): the §6
+case-1..4 ladder and the §8 merge/review policy are replaced by the tier ladder of
+`MERGE-POLICY.md` (authoritative) + `PROPAGATION.md`; §6/§8 below are kept as
+historical record only.
 
 **Relationship to existing design:** this spec is the detailed mechanics of
 `docs/design/02-self-maintaining-flsclaw.md` §5 (flows a+b). Component mapping: stage
@@ -64,8 +67,9 @@ it, agents consume it.
 - Textually clean ≠ done: a sweep batch is only recorded/pushed after the everything
   rebuild + full test matrix passes. Clean-merge-but-red-tests demotes to gate (case 4).
 - No deep PR chains (D-004): a branch with an open conflict PR is **frozen**; the
-  sweeper only annotates the PR with the count of newer pending upstream commits.
-  Exception: case-3 provisional resolutions may be advanced on top of.
+  sweeper only annotates the PR with the count of newer pending upstream commits
+  (D-049: a driver-maintained machine block + posted urge comments). The former
+  case-3 advance-on-top exception is retired with case 3 itself (D-049).
 - Freeze/status is registry-authoritative (D-005): `sweep-state.json` on the
   maintenance branch; cosmetic `sweep-frozen/<branch>` lightweight tags mirror it.
 
@@ -145,6 +149,14 @@ converges — no partial-state corruption):
 
 ## 6. Agentic layer — PoI handling
 
+> **SUPERSEDED (D-049, 2026-07-21).** The case-1..4 ladder below is retired:
+> merge/review handling is the CLEAN/MECHANICAL/JUDGED/HELD/DEFERRED tier ladder
+> of `MERGE-POLICY.md` §1 (authoritative) + `PROPAGATION.md` §1. In particular:
+> case 3 (open provisional PR) no longer exists — HELD is the ONLY review state
+> and anything review-worthy escalates to it; JUDGED (incl. the `edition/*`
+> floor) auto-merges via the D-040 closure push. Case 1 (annotate-PoI overlap
+> checks) remains current. Kept as historical record.
+
 The maintenance group wakes on schedule (e.g. daily; upstream does ~2-15 PRs/month),
 runs `sweep.ts` through stage 7, then processes the report:
 
@@ -209,10 +221,12 @@ registry updates made. HIGH-PRIORITY overlaps are called out on top.
 
 ## 8. Safety rails / policy
 
-- Push policy: `main`, swept branches, `fix/sweep/*`, maintenance branch → push to
-  origin (k-fls) is REQUIRED for the PR flow; owner has approved the PR-based flow.
-  `edition/*` merges are always case-3 minimum (PR + owner ack) — that's what runs in
-  prod. NOTHING is deployed by this procedure; "ready to deploy" is a report line.
+- Push policy (rewritten by D-049 §5): the DRIVER pushes — verify-gated,
+  journaled pass pushes (`propagate push` + `publish`) are the ONLY pushes; the
+  agent never hand-pushes anything. `edition/*` merges floor at JUDGED and
+  AUTO-MERGE (D-049 — owner-gating only by escalation to HELD; supersedes the
+  earlier "case-3 minimum"). NOTHING is deployed by this procedure; "ready to
+  deploy" is a report line.
 - The group never force-pushes, never rebases published branches, never touches
   `everything` except scripted rebuilds in temp worktrees, never writes to `main`
   except FF.

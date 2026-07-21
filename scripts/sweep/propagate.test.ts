@@ -19,6 +19,7 @@ import { readLedger } from './ledger.js';
 import { DriverHalt, guardRef } from './propagate.js';
 import {
   cmdPlan,
+  cmdPush,
   cmdResolve,
   cmdRun,
   cmdStatus,
@@ -29,6 +30,7 @@ import {
   readJournal,
   type Cli,
 } from './propagate.js';
+import type { GithubTransport } from './publish.js';
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -746,33 +748,210 @@ describe('propagate resolve — scope-guard lever (§7, CHANGE 1)', () => {
   });
 });
 
-// --- CHANGE 2: urging + unfreeze paths ------------------------------------
-describe('propagate — frozen-branch urging (§8, CHANGE 2)', () => {
-  it('urges once per NEW pending head: prepared once, suppressed on identical re-run, re-urged on a new head', async () => {
+// --- CHANGE 2 / D-049: urging (posted by `push`) + unfreeze paths -----------
+
+/** Fake GitHub transport for cmdPush tests (closure checks + urge posting). */
+function fakePushGithub(overrides: Record<string, { status: number; body: unknown }> = {}): {
+  calls: Array<{ method: string; path: string; body?: unknown }>;
+  factory: (token: string) => GithubTransport;
+} {
+  const state = {
+    calls: [] as Array<{ method: string; path: string; body?: unknown }>,
+    factory: (_t: string): GithubTransport => ({
+      async request(method, path, body) {
+        state.calls.push({ method, path, body });
+        for (const [key, res] of Object.entries(overrides)) {
+          const [m, suffix] = key.split(' ');
+          if (method === m && path.includes(suffix)) return res;
+        }
+        if (method === 'GET' && path.includes('/pulls?'))
+          return { status: 200, body: [{ html_url: 'https://github.com/k-fls/fixture/pull/12', number: 12 }] };
+        if (method === 'GET' && /\/pulls\/\d+$/.test(path))
+          return { status: 200, body: { number: 12, merged: true, body: 'agent prose' } };
+        if (method === 'PATCH' && /\/pulls\/\d+$/.test(path)) return { status: 200, body: { ok: true } };
+        if (method === 'POST' && path.includes('/comments')) return { status: 201, body: { id: 1 } };
+        return { status: 404, body: null };
+      },
+    }),
+  };
+  return state;
+}
+
+/** Append a fake green `verify` entry (the §9 gate; tests skip the real rebuild). */
+function fakeGreenVerify(dir: string): void {
+  appendFileSync(join(dir, 'journal.jsonl'), JSON.stringify({ ts: new Date().toISOString(), action: 'verify', ok: true }) + '\n');
+}
+
+describe('propagate — frozen-branch urging is POSTED by push, once per NEW pending head (§8, D-049)', () => {
+  it('run only detects; push posts the urge (comment + D-004 refresh + ledger), suppresses, re-urges on a new head', async () => {
     const { repo } = conflictFixture(); // U0 util, U1 x conflict
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
     const ws = mkWorkspace();
     const inv = emptyInventory();
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const tokenFile = join(ws, 'token.txt');
+    writeFileSync(tokenFile, 'tok\n');
     await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
     await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
     const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
     // Freeze main_patched (direct held) — records fixBranch + heldHead.
     await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'held' }));
 
-    // Next run urges once; a second identical run suppresses.
+    // `run` never posts or journals urges any more (posting is push's job).
     await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
-    const urges1 = readJournal(dir).filter((e) => e.action === 'urge').length;
-    expect(urges1).toBe(1);
-    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
-    expect(readJournal(dir).filter((e) => e.action === 'urge').length).toBe(1); // suppressed
+    expect(readJournal(dir).filter((e) => e.action === 'urge').length).toBe(0);
 
-    // A NEW pass with new upstream content re-urges.
+    // push POSTS the urge: PR located by head branch, body PATCHed (D-004
+    // machine block), comment POSTed, ledger advanced.
+    fakeGreenVerify(dir);
+    const gh = fakePushGithub();
+    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, tokenFile }), gh.factory)).toBe(0);
+    const urges1 = readJournal(dir).filter((e) => e.action === 'urge');
+    expect(urges1.length).toBe(1);
+    expect(urges1[0].prNumber).toBe(12);
+    expect(gh.calls.some((c) => c.method === 'PATCH' && c.path.endsWith('/pulls/12'))).toBe(true);
+    const comment = gh.calls.find((c) => c.method === 'POST' && c.path.includes('/comments'))!;
+    expect(String((comment.body as { body: string }).body)).toContain('still frozen');
+    const ledger = readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']!;
+    expect(ledger.lastUrgedHead).toBe(repo.sha('main'));
+    expect(ledger.prNumber).toBe(12);
+
+    // A second push suppresses (no new pending head).
+    const gh2 = fakePushGithub();
+    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, tokenFile }), gh2.factory)).toBe(0);
+    expect(readJournal(dir).filter((e) => e.action === 'urge').length).toBe(1);
+    expect(gh2.calls.filter((c) => c.method === 'POST' && c.path.includes('/comments')).length).toBe(0);
+
+    // A NEW pass with new upstream content re-urges once (posted by push).
     repo.commit('U2: more util', { 'src/util2.ts': 'u2\n' });
     const dir2 = passDir(ws, repo.sha('main').slice(0, 12));
     await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    const gh3 = fakePushGithub();
+    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, tokenFile }), gh3.factory)).toBe(0);
     const urgesNew = readJournal(dir2).filter((e) => e.action === 'urge');
     expect(urgesNew.length).toBe(1);
     expect(urgesNew[0].head).toBe(repo.sha('main')); // newest head (U2)
+  });
+
+  it('a failed urge post is ERR17 and does NOT advance lastUrgedHead (retries next push)', async () => {
+    const { repo } = conflictFixture();
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const tokenFile = join(ws, 'token.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
+    await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'held' }));
+    fakeGreenVerify(dir);
+    const gh = fakePushGithub({ 'POST /comments': { status: 500, body: { message: 'boom' } } });
+    const out = join(ws, 'push-out.json');
+    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, tokenFile, out }), gh.factory)).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> };
+    expect(res.issues.some((i) => i.id === 'ERR17_URGE_FAILED')).toBe(true);
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']!.lastUrgedHead ?? null).toBeNull();
+    expect(readJournal(dir).filter((e) => e.action === 'urge').length).toBe(0);
+  });
+});
+
+describe('propagate push — verify-gated pass pushes (§14.4, D-049)', () => {
+  it('refuses without a green verify (ERR18); with it, pushes mutated targets (one push per branch) and journals them', async () => {
+    const { repo } = conflictFixture();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const preTip = repo.sha('main_patched');
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true })); // merges the U0 prefix, gates on U1
+    const localTip = repo.sha('main_patched');
+    expect(localTip).not.toBe(preTip); // the prefix merge landed locally
+
+    // Dry-run: pure report, no pushes.
+    const outDry = join(ws, 'push-dry.json');
+    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', out: outDry }))).toBe(0);
+    const dry = JSON.parse(readFileSync(outDry, 'utf8')) as { verifyGreen: boolean; wouldPush: string[] };
+    expect(dry.verifyGreen).toBe(false);
+    expect(dry.wouldPush).toEqual(['main_patched']);
+    expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).toBe(preTip); // untouched
+
+    // Execute without green verify: ERR18, nothing pushed.
+    const out1 = join(ws, 'push-1.json');
+    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, out: out1 }))).toBe(1);
+    expect(
+      (JSON.parse(readFileSync(out1, 'utf8')) as { issues: Array<{ id: string }> }).issues.some(
+        (i) => i.id === 'ERR18_VERIFY_PENDING',
+      ),
+    ).toBe(true);
+    expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).toBe(preTip);
+
+    // Green verify -> the target push lands on origin and is journaled.
+    fakeGreenVerify(dir);
+    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true }))).toBe(0);
+    expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).toBe(localTip);
+    const pushes = readJournal(dir).filter((e) => e.action === 'push');
+    expect(pushes.length).toBe(1);
+    expect(pushes[0].branch).toBe('main_patched');
+    expect(pushes[0].kind).toBe('target');
+
+    // A second push is a no-op (up-to-date skip, journaled).
+    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true }))).toBe(0);
+    expect(readJournal(dir).filter((e) => e.action === 'push').length).toBe(1);
+    expect(readJournal(dir).some((e) => e.action === 'push-skip' && e.reason === 'up-to-date')).toBe(true);
+  });
+
+  it('a failing target push is ERR15: journaled halt, hard stop, no fallback (D-046 case 2)', async () => {
+    const { repo } = conflictFixture();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    fakeGreenVerify(dir);
+    // Break the transport (simulates the credential-proxy failure mode).
+    repo.git('config', '--unset', `url.${bare}.insteadOf`);
+    const out = join(ws, 'push-out.json');
+    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, out }))).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string; detail: string }> };
+    const issue = res.issues.find((i) => i.id === 'ERR15_PUSH_FAILED');
+    expect(issue).toBeTruthy();
+    expect(issue!.detail).toContain('D-046 case 2');
+    expect(readJournal(dir).some((e) => e.action === 'halt' && e.id === 'ERR15_PUSH_FAILED')).toBe(true);
+  });
+
+  it('JUDGED closure check: a PR that did not flip to merged after the target push is ERR16', async () => {
+    const { repo } = conflictFixture();
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const tokenFile = join(ws, 'token.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    // Fake a published JUDGED PR for this pass (#21).
+    appendFileSync(
+      join(dir, 'journal.jsonl'),
+      JSON.stringify({ ts: new Date().toISOString(), action: 'pr-published', caseId: 'x', mode: 'judged', number: 21 }) + '\n',
+    );
+    fakeGreenVerify(dir);
+    // merged: true -> ok (closure confirmed).
+    const ghOk = fakePushGithub({ 'GET /pulls/21': { status: 200, body: { number: 21, merged: true } } });
+    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, tokenFile }), ghOk.factory)).toBe(0);
+    // merged: false -> ERR16 (fresh pass state: reuse the journal, drop the green verify staleness by re-adding).
+    const ghOpen = fakePushGithub({ 'GET /pulls/21': { status: 200, body: { number: 21, merged: false, state: 'open' } } });
+    const out = join(ws, 'push-out.json');
+    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, tokenFile, out }), ghOpen.factory)).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> };
+    expect(res.issues.some((i) => i.id === 'ERR16_CLOSURE_FAILED')).toBe(true);
   });
 });
 
@@ -1336,8 +1515,8 @@ describe('propagate resolve — cold-read reject demotes to HELD end-to-end', ()
     expect(entry.status).toBe('frozen');
     expect(entry.heldHead).toBe(caseFile.head.sha);
     expect(entry.heldPaths).toEqual(['src/x.ts']);
-    // D-048: PR MATERIALS prepared (driver facts only — the agent writes
-    // title/body itself and `publish` builds the exhibit head); no local
+    // D-048/D-049: PR MATERIALS prepared (driver facts only — the agent writes
+    // title/body itself and `publish` pushes the real run-top head); no local
     // fix/sweep ref and no driver-generated prose/gh commands exist anymore.
     expect(entry.fixBranch).toMatch(/^fix\/sweep\//);
     expect(repo.git('for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep')).toBe('');

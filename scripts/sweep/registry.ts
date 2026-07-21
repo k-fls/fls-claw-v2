@@ -88,6 +88,7 @@ export function loadRoutingConfig(routingFile: string = DEFAULT_ROUTING_FILE): {
             large_new_file_kb?: number;
             sensitive_surfaces?: string[];
             scope_guard_mode?: string;
+            stack_cap?: number;
           })
         | null;
       if (doc && typeof doc === 'object') {
@@ -101,6 +102,8 @@ export function loadRoutingConfig(routingFile: string = DEFAULT_ROUTING_FILE): {
         if (Array.isArray(doc.sensitive_surfaces)) routing.sensitiveSurfaces = doc.sensitive_surfaces;
         if (doc.scope_guard_mode === 'same-files' || doc.scope_guard_mode === 'conflict-hunks')
           routing.scopeGuardMode = doc.scope_guard_mode;
+        if (typeof doc.stack_cap === 'number' && Number.isInteger(doc.stack_cap) && doc.stack_cap >= 1)
+          routing.stackCap = doc.stack_cap;
       }
     } catch (err) {
       warnings.push(`${routingFile}: parse error, using defaults: ${(err as Error).message}`);

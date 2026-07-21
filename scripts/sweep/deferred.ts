@@ -2,7 +2,8 @@
  * scripts/sweep/deferred.ts — the ancestor-HELD matching rule (PROPAGATION.md
  * §5, D-036).
  *
- * When the sweep finds branch C's first conflicting height N' against parent Q,
+ * When the sweep finds branch C's first conflicting run against parent Q, with
+ * run TOP height N' (D-049 §2 — the window is computed against the run's top),
  * and the pass registry records a TRANSITIVE inventory ancestor P (not only a
  * direct parent) HELD at height N with conflicted path set S_P:
  *   - N lies in the CONFLICTING WINDOW `(floor, N']` AND C's conflicted paths
@@ -36,7 +37,7 @@ function intersects(a: string[], b: string[]): boolean {
 /**
  * Decide whether C's first conflict is DEFERRED to a HELD ancestor.
  *
- * @param firstConflictHeight  C's first conflicting height N' against Q.
+ * @param firstConflictHeight  the TOP height N' of C's conflicting run against Q (D-049 §2).
  * @param floor                largest clean height below the conflict on C's
  *                             eligible line (merge-point height, else coverage);
  *                             the window is the half-open `(floor, N']`.

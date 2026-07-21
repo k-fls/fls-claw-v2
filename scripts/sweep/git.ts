@@ -251,6 +251,18 @@ export async function commitTreeMerge(
   return commit;
 }
 
+/**
+ * Driver push (D-049 §5): move a ref on origin via `git push` — the ONLY way
+ * refs move to the remote (the API is never used to fabricate refs/commits as
+ * a push workaround). `src` is a committish (branch name or sha); `dstBranch`
+ * the remote branch name. Never force. Throws GitError on failure — callers
+ * journal the halt and surface ERR15_PUSH_FAILED (a D-046 case-2 owner report,
+ * no fallback of any kind).
+ */
+export async function gitPush(repo: string, src: string, dstBranch: string): Promise<void> {
+  await git(repo, ['push', 'origin', `${src}:refs/heads/${dstBranch}`]);
+}
+
 /** Reset a branch ref (rollback) with compare-and-swap on the expected current value. */
 export async function resetBranchRef(
   repo: string,

@@ -8,12 +8,20 @@
  * monotonicity assumption, kept for the scan forecast only). Instead: one
  * full-range merge-tree probe first (the common case — clean, one probe); on
  * conflict, a linear oldest->newest sweep, merging at the LARGEST clean height
- * (which may lie beyond intermediate conflicting heights), reporting the
- * SMALLEST conflicting height above the merge point as the agent's case.
+ * (which may lie beyond intermediate conflicting heights).
+ *
+ * Case stacking (D-049 §2): the reported case STARTS at the smallest
+ * conflicting height above the merge point and is the MAXIMAL RUN of
+ * consecutive conflicting heights whose conflicted path sets intersect (one
+ * logical decision), capped (`stack_cap`, default 5). The run breaks at a
+ * clean height, at a disjoint-path conflict (its own case later), and at the
+ * cap. The case's head is the run's TOP commit — conflict set and automerge
+ * tree are taken at the top, so resolving the case resolves the whole run.
  *
  * All probes are new-style `git merge-tree` (git.ts) — never single-base
  * `--merge-base=`, never cherry-pick.
  */
+import { DEFAULT_STACK_CAP } from './config.js';
 import { deriveCoverage, type Chain } from './heights.js';
 import { firstParentChain, isAncestor, newStyleMergeTree, revParse } from './git.js';
 import type { Head } from './types.js';
@@ -110,9 +118,15 @@ export interface MergePointResult {
   cleanFullRange: boolean;
   /** Largest clean head (§3 step 3); null when even the oldest head conflicts. */
   mergePoint: Head | null;
-  /** Smallest conflicting height ABOVE the merge point (§3 step 4). */
+  /**
+   * The stacked conflict run ABOVE the merge point (§3 step 4, D-049 §2):
+   * starts at the smallest conflicting height, extends over consecutive
+   * path-intersecting conflicting heights, capped. `head` is the run's TOP;
+   * paths/tree are the top probe's.
+   */
   firstConflict: {
     head: Head;
+    run: Head[];
     conflictedPaths: string[];
     automergeTree: string;
     reproduction: { command: string };
@@ -128,9 +142,16 @@ function reproCommand(branch: string, headSha: string): { command: string } {
 /**
  * Linear merge-point sweep over an eligible line (§3). One full-range probe;
  * on conflict a linear oldest->newest sweep. Returns the largest clean head as
- * the merge point and the smallest conflicting head above it as the case.
+ * the merge point and the stacked conflict run above it as the case (D-049 §2):
+ * the run starts at the smallest conflicting height and extends over
+ * consecutive path-intersecting conflicting heights up to `stackCap`.
  */
-export async function mergePointSweep(repo: string, branchRef: string, line: EligibleLine): Promise<MergePointResult> {
+export async function mergePointSweep(
+  repo: string,
+  branchRef: string,
+  line: EligibleLine,
+  stackCap: number = DEFAULT_STACK_CAP,
+): Promise<MergePointResult> {
   const { branch, parent, model, heads } = line;
   const base = { branch, parent, model } as const;
   if (heads.length === 0) {
@@ -179,20 +200,36 @@ export async function mergePointSweep(repo: string, branchRef: string, line: Eli
   for (const p of probes)
     if (p.clean && (mergePoint === null || p.head.height > mergePoint.height)) mergePoint = p.head;
 
-  // Step 4: smallest conflicting height ABOVE the merge point. When there is no
-  // clean head the floor is below EVERY head — heights can be -1 (fork-only), so
-  // -Infinity, not -1, or a fork-only conflict at height -1 would be missed.
+  // Step 4 (D-049 §2): the case run. It STARTS at the smallest conflicting
+  // height above the merge point (when there is no clean head the floor is
+  // below EVERY head — heights can be -1 (fork-only), so -Infinity, not -1, or
+  // a fork-only conflict at height -1 would be missed) and STACKS consecutive
+  // conflicting heights whose path sets intersect the run's accumulated set,
+  // breaking at a clean height (defensive — above the LARGEST clean height all
+  // heads conflict by construction), at a disjoint-path conflict (its own case
+  // later), and at the cap.
   const floor = mergePoint?.height ?? Number.NEGATIVE_INFINITY;
+  const above = probes.filter((p) => p.head.height > floor).sort((a, b) => a.head.height - b.head.height);
   let firstConflict: MergePointResult['firstConflict'] = null;
-  for (const p of probes) {
-    if (!p.clean && p.head.height > floor && (firstConflict === null || p.head.height < firstConflict.head.height)) {
-      firstConflict = {
-        head: p.head,
-        conflictedPaths: p.conflictFiles,
-        automergeTree: p.treeOid,
-        reproduction: reproCommand(branchRef, p.head.sha),
-      };
+  const start = above.findIndex((p) => !p.clean);
+  if (start >= 0) {
+    const runProbes: HeadProbe[] = [above[start]];
+    const runPaths = new Set(above[start].conflictFiles);
+    for (let i = start + 1; i < above.length && runProbes.length < stackCap; i++) {
+      const p = above[i];
+      if (p.clean) break; // never stack across a clean height
+      if (!p.conflictFiles.some((f) => runPaths.has(f))) break; // disjoint -> own case later
+      runProbes.push(p);
+      for (const f of p.conflictFiles) runPaths.add(f);
     }
+    const top = runProbes[runProbes.length - 1];
+    firstConflict = {
+      head: top.head,
+      run: runProbes.map((p) => p.head),
+      conflictedPaths: top.conflictFiles,
+      automergeTree: top.treeOid,
+      reproduction: reproCommand(branchRef, top.head.sha),
+    };
   }
 
   return {
