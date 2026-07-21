@@ -1542,3 +1542,151 @@ describe('propagate resolve — N7: dry-run reverify failure journals nothing', 
     expect(readFileSync(join(dir, 'journal.jsonl'), 'utf8')).toBe(before); // no halt entry appended
   });
 });
+
+// --- D-047/B11: multi-parent TOCTOU — execution re-probe + demotion ----------
+describe('propagate run — D-047/B11: stale clean verdict re-probed at execution', () => {
+  /**
+   * The 2026-07-21 crash shape: feat/child has TWO parents whose per-parent
+   * probes both ran against the SAME derivation tip. Parent pa merges first and
+   * advances the tip; parent pb's clean `merge` verdict is then stale — its
+   * merge against the advanced tip conflicts on src/f.ts. Pre-fix, execution
+   * hit commitTreeMerge's conflicted-tree throw (a bare Error) and the whole
+   * run aborted, blocking every remaining branch.
+   */
+  function toctouFixture(): { repo: FixtureRepo } {
+    const repo = initFixtureRepo();
+    repo.commit('base: f', { 'src/f.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.checkout('feat/pa', { create: true, at: 'main_patched' });
+    repo.commit('pa: f = A', { 'src/f.ts': 'A\n' });
+    repo.checkout('main_patched');
+    repo.checkout('feat/pb', { create: true, at: 'main_patched' });
+    repo.commit('pb: f = B', { 'src/f.ts': 'B\n' });
+    repo.checkout('main_patched');
+    repo.checkout('feat/child', { create: true, at: 'main_patched' });
+    repo.commit('child: own file', { 'src/c.ts': 'c\n' });
+    repo.checkout('feat/down', { create: true, at: 'feat/child' });
+    repo.commit('down: own file', { 'src/d.ts': 'd\n' });
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+    return { repo };
+  }
+
+  it('run exits 0: parent A merges, parent B demotes to a case from the CURRENT tip, siblings/descendants proceed; the case resolves', async () => {
+    const { repo } = toctouFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'pa', branch: 'feat/pa', parents: ['main_patched'] },
+      { id: 'pb', branch: 'feat/pb', parents: ['main_patched'] },
+      { id: 'child', branch: 'feat/child', parents: ['feat/pa', 'feat/pb'] },
+      { id: 'down', branch: 'feat/down', parents: ['feat/child'] },
+    ]);
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, o);
+
+    await cmdPlan(cli({ cmd: 'plan' }));
+    // Both child parents probe clean against the derivation tip (the crash setup).
+    const plan = JSON.parse(readFileSync(join(dir, 'plan.json'), 'utf8')) as {
+      branches: Array<{ branch: string; parents: Array<{ parent: string; verdict: string }> }>;
+    };
+    const childRow = plan.branches.find((b) => b.branch === 'feat/child')!;
+    expect(childRow.parents.map((p) => [p.parent, p.verdict])).toEqual([
+      ['feat/pa', 'merge'],
+      ['feat/pb', 'merge'],
+    ]);
+
+    // Pre-fix this REJECTED (commitTreeMerge's bare Error escaped cmdRun);
+    // post-fix the run completes and gates the branch on a proper case.
+    expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
+    const journal = readJournal(dir);
+
+    // Parent A landed; parent B did not.
+    const childMerges = journal.filter((e) => e.action === 'merge' && e.branch === 'feat/child');
+    expect(childMerges.map((e) => e.parent)).toEqual(['feat/pa']);
+    expect(await isAncestor(repo.dir, repo.sha('feat/pa'), 'feat/child')).toBe(true);
+    expect(await isAncestor(repo.dir, repo.sha('feat/pb'), 'feat/child')).toBe(false);
+
+    // The demotion is journaled and a case emitted with the RECOMPUTED conflict
+    // set against the post-merge tip (D-047/B11).
+    const demoted = journal.find((e) => e.action === 'demoted' && e.branch === 'feat/child')!;
+    expect(demoted.parent).toBe('feat/pb');
+    expect(demoted.to).toBe('case');
+    expect(demoted.conflictedPaths).toEqual(['src/f.ts']);
+    const caseEntry = journal.find((e) => e.action === 'case' && e.branch === 'feat/child')!;
+    expect(caseEntry.parent).toBe('feat/pb');
+    expect(caseEntry.conflictedPaths).toEqual(['src/f.ts']);
+    const caseFile = readCase(dir, caseEntry.caseId as string);
+    expect(caseFile.head.sha).toBe(repo.sha('feat/pb'));
+    // Driver worktree materialized with the conflict markers (SPEC 1).
+    expect(readFileSync(join(dir, caseEntry.caseId as string, 'worktree', 'src/f.ts'), 'utf8')).toContain('<<<<<<<');
+
+    // Siblings + descendant unaffected: everyone arrived; the child's barrier
+    // arrival lets feat/down proceed on the PARTIAL (pa-only) progress —
+    // inherited gating keeps pb's content out until the case resolves.
+    const arrivedBranches = journal.filter((e) => e.action === 'arrived').map((e) => e.branch);
+    for (const b of ['main_patched', 'feat/pa', 'feat/pb', 'feat/child', 'feat/down'])
+      expect(arrivedBranches).toContain(b);
+    expect(await isAncestor(repo.dir, repo.sha('feat/pa'), 'feat/down')).toBe(true);
+    expect(await isAncestor(repo.dir, repo.sha('feat/pb'), 'feat/down')).toBe(false);
+
+    // The emitted case is ACTIONABLE: resolve re-derives the same head/tree/paths.
+    const resolvedRef = await buildResolution(repo, caseFile.automergeTree, { 'src/f.ts': 'MERGED\n' });
+    writeVerdict(dir, caseEntry.caseId as string, repo, resolvedRef);
+    expect(
+      await cmdResolve(
+        cli({ cmd: 'resolve', execute: true, caseId: caseEntry.caseId as string, tier: 'mechanical', resolvedRef }),
+      ),
+    ).toBe(0);
+    expect(repo.git('show', 'feat/child:src/f.ts')).toBe('MERGED');
+
+    // Continuation machinery (§8): the reopened descendant picks up the resolution.
+    expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
+    expect(repo.git('show', 'feat/down:src/f.ts')).toBe('MERGED');
+    expect(await isAncestor(repo.dir, repo.sha('feat/pb'), 'feat/child')).toBe(true);
+  });
+
+  it('re-probe that turns NO-OP demotes merge -> skip (§6 tree equality), journaled', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base: f', { 'src/f.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.checkout('feat/qa', { create: true, at: 'main_patched' });
+    repo.commit('qa: f = X', { 'src/f.ts': 'X\n' });
+    repo.checkout('main_patched');
+    repo.checkout('feat/qb', { create: true, at: 'main_patched' });
+    repo.commit('qb: f = X (identical change, distinct commit)', { 'src/f.ts': 'X\n' });
+    repo.checkout('main_patched');
+    repo.checkout('feat/kid', { create: true, at: 'main_patched' });
+    repo.commit('kid: own file', { 'src/k.ts': 'k\n' });
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'qa', branch: 'feat/qa', parents: ['main_patched'] },
+      { id: 'qb', branch: 'feat/qb', parents: ['main_patched'] },
+      { id: 'kid', branch: 'feat/kid', parents: ['feat/qa', 'feat/qb'] },
+    ]);
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, o);
+
+    await cmdPlan(cli({ cmd: 'plan' }));
+    expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
+    const journal = readJournal(dir);
+    // qa landed as the only real merge; qb's verdict (a real merge at derivation)
+    // became a genuine no-op once qa's identical content landed.
+    expect(journal.filter((e) => e.action === 'merge' && e.branch === 'feat/kid').map((e) => e.parent)).toEqual([
+      'feat/qa',
+    ]);
+    const demoted = journal.find((e) => e.action === 'demoted' && e.branch === 'feat/kid')!;
+    expect(demoted.parent).toBe('feat/qb');
+    expect(demoted.to).toBe('skip');
+    expect(demoted.conflictedPaths).toEqual([]); // clean re-probe, just tree-equal
+    expect(
+      journal.some(
+        (e) => e.action === 'skip' && e.branch === 'feat/kid' && e.parent === 'feat/qb' && e.reason === 'no-op',
+      ),
+    ).toBe(true);
+    expect(journal.some((e) => e.action === 'case' && e.branch === 'feat/kid')).toBe(false);
+    expect(repo.git('show', 'feat/kid:src/f.ts')).toBe('X');
+  });
+});

@@ -100,6 +100,23 @@ and (b) forces `-c merge.conflictStyle=merge`, making recorded automerge trees
 reproducible across clones and user configs; the resolve-time drift halt then fires
 only on genuine movement.
 
+**Execution re-probe (D-047/B11, 2026-07-21):** the per-parent probes above are all
+computed against the branch tip AT DERIVATION TIME, but `run` merges a branch's
+parents SEQUENTIALLY — once parent #1's merge advances the tip, parent #2's clean
+verdict is stale, and its merge against the ADVANCED tip can conflict even though it
+probed clean (the 2026-07-21 sweep crashed exactly here: a `merge` verdict for
+`module/credentials` conflicted at execution and the `commitTreeMerge` backstop
+aborted the whole run). `run` therefore re-probes every non-forced merge against the
+branch's CURRENT tip (pinned SHAs, as above) immediately before executing it; on
+staleness it re-derives that parent row live and demotes clean→case/skip as found:
+conflicted → an ordinary case at that point (conflict set + automerge tree recomputed
+from the current tip; the branch's remaining parent merges halt for this run and
+continue via the §8 reopen machinery once the case resolves — siblings are
+unaffected); tree-equal → a journaled no-op skip (§6). Forced (empty) merges are
+exempt — they exist only when every parent no-op'd, so the tip cannot have moved.
+`commitTreeMerge` stays as a backstop, but a failure there now halts THAT BRANCH
+journaled (`halt`, reason `merge-failed`), never the process.
+
 ## 4. What is mergeable of a parent — eligible line
 
 For entry-point branches (`main_patched`, D-032b edition-composition branches merging
@@ -291,7 +308,11 @@ plan-equivalence "halt loudly" check belongs to `run` — BEFORE
 executing, the live re-derivation must match the pass's last written plan for all
 not-yet-arrived branches (a mismatch means git moved under us); `plan` on a pass with
 journal activity reports rather than halts (post-merge state legitimately differs
-from the opening snapshot, which is preserved as `plan-initial.json`). All mutations
+from the opening snapshot, which is preserved as `plan-initial.json`). Branches the
+driver itself already mutated or demoted this pass (journaled `merge`/`case`) are
+excluded like origin-synced branches: the §3 execution re-probe's clean→case/skip
+demotion is a sanctioned transition (D-047/B11), not git moving under us — this also
+covers a crash between the journal entry and the branch's `arrived`. All mutations
 happen via journaled subcommands (D-013); the journal is
 `pass-<watermark12>/journal.jsonl`, append-only.
 

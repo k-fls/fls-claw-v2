@@ -196,6 +196,13 @@ export interface DeriveBranchArgs {
  * during the breadth-wise cascade so a child sees its parents' just-merged tips
  * (like merge.ts probes live source tips); `derivePlan` calls it for the
  * up-front snapshot.
+ *
+ * NOTE (D-047/B11): all per-parent probes here run against the SAME pinned
+ * `branchTip` — the tip at derivation time. Execution merges parents
+ * SEQUENTIALLY, so a later parent's verdict goes stale once an earlier parent's
+ * merge advances the tip; `run` re-probes each merge against the CURRENT tip
+ * immediately before executing it and demotes clean→case/skip as found
+ * (§3 execution re-probe).
  */
 export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> {
   const { repo, branch, kind, model, parents, chain, ancestors, tierFloor, isLeaf, alwaysMerge, held, frozen } = args;

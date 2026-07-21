@@ -658,7 +658,20 @@ async function journaledMerge(
     }
     return revParse(repo, branch);
   }
-  return commitTreeMerge(repo, branch, headSha, message);
+  try {
+    return await commitTreeMerge(repo, branch, headSha, message);
+  } catch (e) {
+    // D-047/B11 backstop: cmdRun re-probes cleanliness against the LIVE tip
+    // immediately before every parent merge (§3 execution re-probe), so a
+    // conflicted tree is unreachable here in normal operation. Anything that
+    // still throws (racing ref movement, update-ref CAS refusal) must surface
+    // as a journaled per-branch halt — never escape as a bare Error and abort
+    // the whole run (the 2026-07-21 crash mode).
+    throw new DriverHalt(
+      'merge-failed',
+      `merge into '${branch}' failed: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
 }
 
 /**
@@ -943,10 +956,21 @@ export async function cmdRun(cli: Cli): Promise<number> {
       .filter((e) => e.action === 'branch-materialized' || e.action === 'branch-synced')
       .map((e) => e.branch as string),
   );
+  // D-047/B11: branches the DRIVER itself already mutated or demoted this pass
+  // (a journaled `merge` or `case`) legitimately derive differently from the
+  // last written plan — the §3 execution re-probe's merge→case/skip demotion
+  // is a sanctioned transition, and a crash between the journal entry and the
+  // branch's `arrived` must not read as "git moved under us" (same rationale
+  // as the branch-synced exclusion above).
+  const driverTouched = new Set(
+    journal
+      .filter((e) => (e.action === 'merge' || e.action === 'case') && typeof e.branch === 'string')
+      .map((e) => e.branch as string),
+  );
   const planPath = join(dir, 'plan.json');
   if (existsSync(planPath)) {
     const prev = JSON.parse(readFileSync(planPath, 'utf8')) as PropagationPlan;
-    const exclude = new Set([...arrived, ...reopened, ...frozen, ...syncedBranches]);
+    const exclude = new Set([...arrived, ...reopened, ...frozen, ...syncedBranches, ...driverTouched]);
     const drift = plansDiffer(prev, plan, exclude);
     if (drift.length) {
       appendJournal(dir, { action: 'halt', reason: 'plan-drift', branches: drift });
@@ -971,6 +995,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
 
   let gated = false;
   const diverged: string[] = [];
+  const mergeFailed: string[] = [];
 
   try {
     for (const snap of plan.branches) {
@@ -1008,20 +1033,24 @@ export async function cmdRun(cli: Cli): Promise<number> {
 
       // Re-derive THIS branch against LIVE tips so a child sees its parents'
       // just-merged tips (breadth-wise cascade, like merge.ts probes live sources).
+      // The same derivation is reused by the §3 execution re-probe below when a
+      // per-parent verdict goes stale mid-branch (D-047/B11).
       const model: 'entry' | 'parents' = snap.parents[0]?.model ?? 'entry';
-      const bp = await deriveBranch({
-        repo: cli.repo,
-        branch: snap.branch,
-        kind: snap.kind,
-        model,
-        parents: snap.parents.map((p) => p.parent),
-        chain,
-        ancestors: snap.ancestors,
-        tierFloor: snap.tierFloor,
-        isLeaf: snap.isLeaf,
-        alwaysMerge: snap.alwaysMerge,
-        held,
-      });
+      const deriveLive = (): Promise<BranchPlan> =>
+        deriveBranch({
+          repo: cli.repo,
+          branch: snap.branch,
+          kind: snap.kind,
+          model,
+          parents: snap.parents.map((p) => p.parent),
+          chain,
+          ancestors: snap.ancestors,
+          tierFloor: snap.tierFloor,
+          isLeaf: snap.isLeaf,
+          alwaysMerge: snap.alwaysMerge,
+          held,
+        });
+      const bp = await deriveLive();
 
       // Leaf / always_merge un-skip (§6): if every parent no-op'd in a pass that
       // carries progress, force (empty) merges along the cheapest parent chain.
@@ -1133,58 +1162,102 @@ export async function cmdRun(cli: Cli): Promise<number> {
       };
 
       let branchGated = false;
-      for (const pp of bp.parents) {
-        if (branchGated) break; // halt at first case needing judgment per branch
-        if (pp.verdict === 'merge') {
-          const label = pp.model === 'entry' ? `main@height${pp.mergePoint!.height}` : pp.parent;
-          const msg = `Merge ${label} into ${bp.branch} (propagation${pp.forced ? ', forced no-op' : ''})`;
-          await recordPreRef(cli, dir, preReffed, bp.branch);
-          const newRef = await journaledMerge(cli.repo, bp.branch, pp.mergePoint!.sha, msg, scope);
-          appendJournal(dir, {
-            action: 'merge',
-            branch: bp.branch,
-            parent: pp.parent,
-            head: pp.mergePoint,
-            forced: pp.forced ?? false,
-            newRef,
-          });
-          // Annotate-class (§1, D-002): a CLEAN merge passing THROUGH a height a
-          // transitive ancestor is HELD on — never gates, surfaced in the report.
-          if (pp.annotate) {
+      try {
+        for (let pi = 0; pi < bp.parents.length; pi++) {
+          let pp = bp.parents[pi];
+          if (branchGated) break; // halt at first case needing judgment per branch
+          // Execution re-probe (§3/§8, D-047/B11): each per-parent verdict above
+          // was probed against the branch tip AT DERIVATION, but parents merge
+          // SEQUENTIALLY — once an earlier parent's merge advances the tip, a
+          // later parent's clean `merge` verdict is stale (executing it blind is
+          // what crashed the 2026-07-21 sweep). Re-probe against the CURRENT tip
+          // (pinned SHAs, §3 determinism); on staleness re-derive the parent row
+          // live and demote as found: conflicted → case (conflict set + automerge
+          // tree recomputed from the current tip), tree-equal → skip (§6 no-op).
+          // Forced (empty) merges are exempt: they exist only when every parent
+          // no-op'd, so the tip has not moved (§6).
+          if (pp.verdict === 'merge' && !pp.forced && pp.mergePoint) {
+            const nowTip = await revParse(cli.repo, bp.branch);
+            const reprobe = await newStyleMergeTree(cli.repo, nowTip, pp.mergePoint.sha);
+            if (!reprobe.clean || reprobe.treeOid === (await treeOf(cli.repo, nowTip))) {
+              const repp = (await deriveLive()).parents.find((p) => p.parent === pp.parent);
+              if (repp) {
+                appendJournal(dir, {
+                  action: 'demoted',
+                  branch: bp.branch,
+                  parent: pp.parent,
+                  from: 'merge',
+                  to: repp.verdict,
+                  staleHead: pp.mergePoint,
+                  conflictedPaths: reprobe.clean ? [] : reprobe.conflictFiles,
+                });
+                bp.parents[pi] = repp;
+                pp = repp; // dispatch the FRESH verdict below (merge/case/defer/skip)
+              }
+            }
+          }
+          if (pp.verdict === 'merge') {
+            const label = pp.model === 'entry' ? `main@height${pp.mergePoint!.height}` : pp.parent;
+            const msg = `Merge ${label} into ${bp.branch} (propagation${pp.forced ? ', forced no-op' : ''})`;
+            await recordPreRef(cli, dir, preReffed, bp.branch);
+            const newRef = await journaledMerge(cli.repo, bp.branch, pp.mergePoint!.sha, msg, scope);
             appendJournal(dir, {
-              action: 'annotate',
+              action: 'merge',
               branch: bp.branch,
               parent: pp.parent,
-              heldAncestor: pp.annotate.heldAncestor,
-              height: pp.annotate.height,
+              head: pp.mergePoint,
+              forced: pp.forced ?? false,
+              newRef,
+            });
+            // Annotate-class (§1, D-002): a CLEAN merge passing THROUGH a height a
+            // transitive ancestor is HELD on — never gates, surfaced in the report.
+            if (pp.annotate) {
+              appendJournal(dir, {
+                action: 'annotate',
+                branch: bp.branch,
+                parent: pp.parent,
+                heldAncestor: pp.annotate.heldAncestor,
+                height: pp.annotate.height,
+              });
+            }
+            // A clean prefix can merge while the conflict ABOVE it is DEFERRED to a
+            // HELD ancestor (§5): record the defer pointer too (was silently dropped).
+            if (pp.deferredTo) {
+              appendJournal(dir, { action: 'defer', branch: bp.branch, parent: pp.parent, deferredTo: pp.deferredTo });
+            }
+            // A clean merge up to the merge point can still leave a conflict ABOVE
+            // it (§3 step 4): emit the case (recomputed post-merge) and halt.
+            if (pp.case && (await emitCase(pp))) {
+              branchGated = true;
+              gated = true;
+            }
+          } else if (pp.verdict === 'defer') {
+            appendJournal(dir, { action: 'defer', branch: bp.branch, parent: pp.parent, deferredTo: pp.deferredTo });
+          } else if (pp.verdict === 'case') {
+            if (await emitCase(pp)) {
+              branchGated = true;
+              gated = true;
+            }
+          } else {
+            appendJournal(dir, {
+              action: 'skip',
+              branch: bp.branch,
+              parent: pp.parent,
+              reason: pp.skipReason ?? pp.verdict,
             });
           }
-          // A clean prefix can merge while the conflict ABOVE it is DEFERRED to a
-          // HELD ancestor (§5): record the defer pointer too (was silently dropped).
-          if (pp.deferredTo) {
-            appendJournal(dir, { action: 'defer', branch: bp.branch, parent: pp.parent, deferredTo: pp.deferredTo });
-          }
-          // A clean merge up to the merge point can still leave a conflict ABOVE
-          // it (§3 step 4): emit the case (recomputed post-merge) and halt.
-          if (pp.case && (await emitCase(pp))) {
-            branchGated = true;
-            gated = true;
-          }
-        } else if (pp.verdict === 'defer') {
-          appendJournal(dir, { action: 'defer', branch: bp.branch, parent: pp.parent, deferredTo: pp.deferredTo });
-        } else if (pp.verdict === 'case') {
-          if (await emitCase(pp)) {
-            branchGated = true;
-            gated = true;
-          }
-        } else {
-          appendJournal(dir, {
-            action: 'skip',
-            branch: bp.branch,
-            parent: pp.parent,
-            reason: pp.skipReason ?? pp.verdict,
-          });
         }
+      } catch (e) {
+        // D-047/B11: a merge write that STILL fails (journaledMerge's backstop —
+        // racing ref movement, CAS refusal; a conflicted tree is unreachable
+        // after the re-probe above) halts THIS branch only, journaled, like
+        // sync-diverged — siblings keep processing and the branch arrives for the
+        // barrier with whatever prefix landed. Every other DriverHalt (dirty
+        // worktree, protected ref) still halts the whole run below.
+        if (!(e instanceof DriverHalt) || e.reason !== 'merge-failed') throw e;
+        appendJournal(dir, { action: 'halt', branch: bp.branch, reason: e.reason, message: e.message });
+        mergeFailed.push(bp.branch);
+        console.error(`MERGE FAILED (branch halted, siblings continue): ${e.message}`);
       }
       appendJournal(dir, { action: 'arrived', branch: bp.branch });
       arrived.add(bp.branch);
@@ -1214,8 +1287,10 @@ export async function cmdRun(cli: Cli): Promise<number> {
     }
   }
   if (diverged.length) console.error(`diverged branches skipped this pass (owner escalation): ${diverged.join(', ')}`);
+  if (mergeFailed.length)
+    console.error(`merge-failed branches halted this pass (journaled, D-047/B11): ${mergeFailed.join(', ')}`);
   console.error(sealed ? 'run complete — pass sealed (pass-complete)' : `run complete — ${missing}`);
-  emit(cli, { watermark12: plan.watermark12, gated, sealed, missing, passDir: dir, diverged });
+  emit(cli, { watermark12: plan.watermark12, gated, sealed, missing, passDir: dir, diverged, mergeFailed });
   return 0;
 }
 
@@ -1922,6 +1997,11 @@ export async function cmdStatus(cli: Cli): Promise<number> {
   if (divergedHalts.length) {
     console.log('diverged branches (§13 sync — skipped this pass, owner escalation):');
     for (const d of divergedHalts) console.log(`  ${d.branch}: ${d.message}`);
+  }
+  const mergeFailedHalts = journal.filter((e) => e.action === 'halt' && e.reason === 'merge-failed');
+  if (mergeFailedHalts.length) {
+    console.log('merge-failed branches (D-047/B11 backstop — halted branch-local, journaled):');
+    for (const m of mergeFailedHalts) console.log(`  ${m.branch}: ${m.message}`);
   }
   // D-045 (§13): STATUS shows the full current candidate state (a human state
   // view, unthrottled); `plan` prints only newly-reported candidates.
