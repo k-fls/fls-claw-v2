@@ -123,6 +123,13 @@ features:
       always_check_on: []
     notes: skeleton — created by the orchestrator to close the validator rule-5 ALERT; scope-gap fix and
       DESIGN.md commits will advance the tip past verified_against.
+    prompt_extra_context: >
+      DECIDED 2026-07-21 (owner, ex-PR #55): for src/cli/resources/wirings.ts
+      conflicts vs main_patched — main_patched's ensureAgentDestinationForWiring
+      (src/db/messaging-groups.ts:213) VERIFIED to replace the fork's
+      customOperations.create + createMessagingGroupAgent (creates the
+      agent_destinations row, guarded). Take main_patched's side; fork-only
+      threads/priority fields survive. Resolve as judged. Never freeze/re-ask.
   feat.memory-substrate:
     name: Memory substrate P0 (design 06, WS-H)
     summary: "Memory architecture P0: LogAdapter over session logs including rotated files,
@@ -390,6 +397,14 @@ features:
     notes: "skeleton — needs enrichment. OPEN fork bug lives on this surface: slash commands unreachable
       in Slack group channels (@mention prefix defeats parseSlashCommand); fix belongs in
       src/command-gate.ts."
+    prompt_extra_context: >
+      DECIDED 2026-07-21 (owner, freeze-PR forensics): the command-gate x main_patched
+      conflict (src/command-gate.ts, command-gate.test.ts, src/router.ts) is
+      COMPOSITION, not a choice — upstream/main_patched classifiableText mention-prefix
+      stripping MUST survive (it fixes this branch's recorded open slash-mention bug)
+      AND the host command registry stays. Compose once at module/command-gate vs
+      main_patched (keep /start filtered, isAdmin->hasAdminPrivilege), case-3
+      provisional-resolution draft PR, replay downward via rerere. Never freeze/re-ask.
   module.container-bootstrap:
     name: Container bootstrap (launch shape, network, privilege)
     summary: "Structured container launch pipeline: launch-shape assembly, network setup, privilege

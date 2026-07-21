@@ -49,7 +49,17 @@ function emptyInventory(): string {
 }
 
 function writeInventory(
-  entries: Array<{ id: string; branch: string; kind?: string; parents?: string[]; scope_guard?: string }>,
+  entries: Array<{
+    id: string;
+    branch: string;
+    kind?: string;
+    parents?: string[];
+    scope_guard?: string;
+    summary?: string;
+    owned_paths?: string[];
+    extra_context?: string;
+    decided_paths?: string[];
+  }>,
 ): string {
   const dir = mkdtempSync(join(tmpdir(), 'prop-inv-'));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
@@ -60,8 +70,17 @@ function writeInventory(
       `kind: ${e.kind ?? 'feat'}`,
       'status: shipped',
       `branch: ${e.branch}`,
+      ...(e.summary ? [`summary: ${JSON.stringify(e.summary)}`] : []),
       ...(e.scope_guard ? [`scope_guard: ${e.scope_guard}`] : []),
       ...(e.parents ? ['parents:', ...e.parents.map((p) => `  - ${p}`)] : []),
+      ...(e.owned_paths ? ['owned_paths:', ...e.owned_paths.map((p) => `  - ${JSON.stringify(p)}`)] : []),
+      ...(e.extra_context || e.decided_paths
+        ? [
+            'prompt:',
+            ...(e.extra_context ? [`  extra_context: ${JSON.stringify(e.extra_context)}`] : []),
+            ...(e.decided_paths ? ['  decided_paths:', ...e.decided_paths.map((p) => `    - ${JSON.stringify(p)}`)] : []),
+          ]
+        : []),
     ].join('\n');
     writeFileSync(join(dir, `${e.id}.yaml`), yaml + '\n');
   }
@@ -1286,7 +1305,7 @@ function parentChildFixture(): { repo: FixtureRepo } {
 }
 
 describe('propagate resolve — cold-read reject demotes to HELD end-to-end', () => {
-  it('reject: no merge, HELD journaled, ledger frozen with head+paths, draft PR prepared, descendants reopened', async () => {
+  it('reject: no merge, HELD journaled, ledger frozen with head+paths, PR materials prepared, descendants reopened', async () => {
     const { repo } = parentChildFixture();
     const ws = mkWorkspace();
     const inv = writeInventory([{ id: 'c', branch: 'feat/c', parents: ['main_patched'] }]);
@@ -1317,11 +1336,16 @@ describe('propagate resolve — cold-read reject demotes to HELD end-to-end', ()
     expect(entry.status).toBe('frozen');
     expect(entry.heldHead).toBe(caseFile.head.sha);
     expect(entry.heldPaths).toEqual(['src/x.ts']);
-    // Real-diff draft PR prepared at the conflicting head (D-030 shape).
+    // D-048: PR MATERIALS prepared (driver facts only — the agent writes
+    // title/body itself and `publish` builds the exhibit head); no local
+    // fix/sweep ref and no driver-generated prose/gh commands exist anymore.
     expect(entry.fixBranch).toMatch(/^fix\/sweep\//);
-    expect(repo.sha(entry.fixBranch!)).toBe(caseFile.head.sha);
-    expect(readFileSync(join(dir, caseId, 'pr', 'body.md'), 'utf8')).toContain('FREEZE');
-    expect(readFileSync(join(dir, caseId, 'pr', 'gh-commands.sh'), 'utf8')).toContain('--draft');
+    expect(repo.git('for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep')).toBe('');
+    const materials = readFileSync(join(dir, caseId, 'pr', 'materials.md'), 'utf8');
+    expect(materials).toContain('src/x.ts');
+    expect(materials).toContain('propagate publish --case');
+    expect(existsSync(join(dir, caseId, 'pr', 'body.md'))).toBe(false);
+    expect(existsSync(join(dir, caseId, 'pr', 'gh-commands.sh'))).toBe(false);
     // Descendants reopened.
     expect(
       journal
@@ -1329,6 +1353,47 @@ describe('propagate resolve — cold-read reject demotes to HELD end-to-end', ()
         .map((e) => e.branch)
         .sort(),
     ).toEqual(['feat/c', 'main_patched']);
+  });
+});
+
+// --- D-048: resolution cold-read context (starvation fix) --------------------
+describe('coldread-request.md — driver-derived case context (D-048)', () => {
+  it('embeds the inventory summary/owned_paths/extra_context and per-side histories over the conflicted paths', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    // The entry matches by owned_paths/extra_context mentioning the conflicted
+    // path (main_patched itself has no inventory entry — structural).
+    const inv = writeInventory([
+      {
+        id: 'x-surface',
+        branch: 'feat/none',
+        summary: 'owns the x surface',
+        owned_paths: ['src/x.ts'],
+        extra_context: 'Decision 2026-07-01: src/x.ts keeps the fork variant (PR #40).',
+      },
+    ]);
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
+
+    const request = readFileSync(join(dir, caseId, 'coldread-request.md'), 'utf8');
+    expect(request).toContain('## Case context (driver-derived — D-048)');
+    expect(request).toContain('owns the x surface');
+    expect(request).toContain('src/x.ts');
+    expect(request).toContain('Decision 2026-07-01');
+    // Per-side `git log --oneline` over the conflicted paths.
+    expect(request).toContain('mp: x = fork'); // ours
+    expect(request).toContain('U1: x = up1'); // theirs
+    // Still regenerated (with the same context) at resolve.
+    const caseFile = readCase(dir, caseId);
+    const resolvedRef = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'RESOLVED\n' });
+    writeVerdict(dir, caseId, repo, resolvedRef);
+    await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef }));
+    const regen = readFileSync(join(dir, caseId, 'coldread-request.md'), 'utf8');
+    expect(regen).toContain('## Case context (driver-derived — D-048)');
+    expect(regen).toContain('## Resolution diff (automerge tree -> resolved tree)');
+    expect(regen).toContain('RESOLVED');
   });
 });
 

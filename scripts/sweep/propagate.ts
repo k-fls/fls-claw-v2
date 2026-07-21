@@ -11,8 +11,13 @@
  *   run                           attach to the open pass; CLEAN merges + skips + DEFERRED;
  *                                 halt at the first case PER BRANCH; emit case files (MUTATES)
  *   resolve --case ID --tier T    re-verify the case from git+registry, scope-guard + cold-read
- *                                 gate, then merge (MECHANICAL), prepare a PR (JUDGED), or
- *                                 freeze (HELD, --tier held direct)                    (MUTATES)
+ *                                 gate, then merge (MECHANICAL), prepare PR materials (JUDGED),
+ *                                 or freeze (HELD, --tier held direct)                 (MUTATES)
+ *   publish --case ID             §14 (D-048): the ONLY sanctioned PR-creation path — verify the
+ *                                 case, build the origin-parented EXHIBIT HEAD, run the check
+ *                                 battery (machine-readable {ok, issues, pr?}), and with
+ *                                 --execute create the fix/sweep ref + DRAFT PR via the GitHub
+ *                                 REST API (the one networked subcommand)              (MUTATES)
  *   verify                        §9 gate: everything-rebuild + CI commands, leave-one-out
  *                                 attribution; red -> rollback offender + HELD(gate)   (MUTATES)
  *   unfreeze --branch <b>         manually clear a ledger freeze (journaled)           (MUTATES)
@@ -29,9 +34,12 @@
  *   --upstream <ref>         upstream ref (plan only)          (default: upstream/main)
  *   --base <ref>             trunk-chain fork point (plan only)(default: FORK_POINT else merge-base)
  *   --execute                perform mutations (run/resolve/verify); without it, dry-run
- *   --case <id>              resolve: the case id
+ *   --case <id>              resolve/publish: the case id
  *   --tier <mechanical|judged|held>  resolve: the agent's claimed tier (held = direct freeze)
  *   --resolved-ref <ref>     resolve: commit carrying the agent's resolution (tree source)
+ *   --token-file <path>      publish: file holding the substitute GitHub token (the agent
+ *                            writes the get_credential output there once per session; the
+ *                            credential proxy swaps the Authorization header on the wire)
  *   --branch <name>          unfreeze: the branch to clear
  *   --recipe <a,b,c>         verify: everything-rebuild recipe (default: scope.yaml recipe)
  *   --commands-file <file>   verify: CI command list JSON [{cmd,cwd?}] (test injection)
@@ -39,9 +47,11 @@
  *
  * Artifacts live under <workspace>/propagation/pass-<watermark12>/:
  *   plan-initial.json (immutable opening snapshot), plan.json (working), step files,
- *   case-<id>/case.json (+ coldread-request.md), journal.jsonl (append-only). case.json is
- *   a POINTER only — resolve re-derives everything from git+registry (§7 trust boundary).
- *   The driver PREPARES PR branches/bodies/gh commands but never calls gh / the network.
+ *   case-<id>/case.json (+ coldread-request.md, pr/materials.md), journal.jsonl
+ *   (append-only). case.json is a POINTER only — resolve re-derives everything from
+ *   git+registry (§7 trust boundary). The driver NEVER generates PR prose (D-048): the
+ *   agent writes pr/title.txt + pr/body.md from studying the case, and `publish` is the
+ *   only subcommand that touches the network (GitHub REST, --execute only — §14).
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join, resolve as pathResolve } from 'node:path';
@@ -70,6 +80,22 @@ import { readLedger, writeLedger, defaultLedgerBranch } from './ledger.js';
 import { loadRegistry } from './registry.js';
 import { resolveScope } from './scope.js';
 import { scopeGuard } from './scope-guard.js';
+import {
+  advisoryTextIssues,
+  buildExhibit,
+  checkExhibitAncestry,
+  checkExhibitDiff,
+  decidedAlready,
+  haltIdFor,
+  isBlocking,
+  prTextGate,
+  publishExhibit,
+  parseGithubSlug,
+  realGithubTransport,
+  type Exhibit,
+  type GithubTransport,
+  type Issue,
+} from './publish.js';
 import { buildStepFile, caseId, readCaseFile, slug, verifyStepFile, writeJsonFile } from './steps.js';
 import { applyFloor, isClaimableTier, tierFloor } from './tiers.js';
 import {
@@ -115,6 +141,13 @@ interface Cli {
   caseId?: string;
   tier?: string;
   resolvedRef?: string;
+  /**
+   * publish: file holding the substitute GitHub token (§14, D-048). The agent
+   * writes the get_credential output there once per session; the credential
+   * proxy swaps the Authorization header for api.github.com on the wire.
+   * $GITHUB_TOKEN is deliberately NOT read (untrustworthy in the container).
+   */
+  tokenFile?: string;
   branch?: string;
   recipe?: string[];
   commandsFile?: string;
@@ -122,7 +155,7 @@ interface Cli {
 }
 
 const USAGE =
-  'Usage: pnpm exec tsx scripts/sweep/propagate.ts <plan|run|resolve|verify|unfreeze|status> [--repo <path>] [--workspace <dir>] [--ledger <file>] [--pass <wm12>] [--execute] [--case <id>] [--tier <t>] [--branch <b>] [flags]';
+  'Usage: pnpm exec tsx scripts/sweep/propagate.ts <plan|run|resolve|publish|verify|unfreeze|status> [--repo <path>] [--workspace <dir>] [--ledger <file>] [--pass <wm12>] [--execute] [--case <id>] [--tier <t>] [--token-file <path>] [--branch <b>] [flags]';
 
 function parseCli(argv: string[]): Cli {
   const [cmd, ...rest] = argv;
@@ -186,6 +219,9 @@ function parseCli(argv: string[]): Cli {
         break;
       case '--resolved-ref':
         cli.resolvedRef = need();
+        break;
+      case '--token-file':
+        cli.tokenFile = pathResolve(need());
         break;
       case '--branch':
         cli.branch = need();
@@ -762,26 +798,117 @@ const COLD_READ_QUESTIONS = [
   '4. Are there follow-on invariants (tests, types, call sites) this resolution must also satisfy?',
 ];
 
+/** Cap for embedded inventory extra_context excerpts (case context, prtext requests). */
+const CONTEXT_EXCERPT_CAP = 2000;
+
+/**
+ * Per-side one-line histories over the conflicted paths: what each side did to
+ * the disputed files since their merge base (`git log --oneline`, capped).
+ * Driver-derived facts used by the case context block (§7, D-048) and
+ * pr/materials.md.
+ */
+async function perSideLog(
+  repo: string,
+  branchTip: string,
+  headSha: string,
+  paths: string[],
+): Promise<{ ours: string; theirs: string }> {
+  const base = (await git(repo, ['merge-base', branchTip, headSha])).stdout.trim();
+  const log = async (to: string): Promise<string> =>
+    (await git(repo, ['log', '--oneline', '-20', `${base}..${to}`, '--', ...paths])).stdout.trimEnd() || '(no commits)';
+  return { ours: await log(branchTip), theirs: await log(headSha) };
+}
+
+/**
+ * Relevant inventory context for a case (D-048; used by BOTH cold reads): the
+ * branch's and parent's entries plus any entry whose owned_paths or
+ * extra_context mention a conflicted path — summary, owned_paths and the
+ * recorded-decision excerpts, capped. Driver-authored from the registry, so
+ * the resolving agent still cannot frame the question.
+ */
+function inventoryContextLines(features: FeatureEntry[], branch: string, parent: string, paths: string[]): string[] {
+  const relevant = features.filter(
+    (f) =>
+      f.branch === branch ||
+      f.branch === parent ||
+      (f.owned_paths ?? []).some((glob) => paths.some((p) => p.startsWith(glob.replace(/\*.*$/, '')))) ||
+      (f.prompt?.extra_context ? paths.some((p) => f.prompt!.extra_context!.includes(p)) : false),
+  );
+  if (relevant.length === 0) return ['(no matching inventory entries)'];
+  const lines: string[] = [];
+  for (const f of relevant) {
+    lines.push(`- entry '${f.id}'${f.branch ? ` (branch ${f.branch})` : ''}: ${f.summary ?? f.name}`);
+    if (f.owned_paths?.length) lines.push(`  owned_paths: ${f.owned_paths.join(', ')}`);
+    const ctx = f.prompt?.extra_context?.trim();
+    if (ctx) lines.push(`  extra_context: ${ctx.length > CONTEXT_EXCERPT_CAP ? `${ctx.slice(0, CONTEXT_EXCERPT_CAP)}…` : ctx}`);
+    if (f.prompt?.decided_paths?.length) lines.push(`  decided_paths: ${f.prompt.decided_paths.join(', ')}`);
+  }
+  return lines;
+}
+
+/**
+ * The driver-derived case context block (D-048 fix for the 2026-07-21
+ * context-starvation reject): the branch's inventory entry summary +
+ * owned_paths + relevant extra_context excerpts, and per-side `git log
+ * --oneline` over the conflicted paths, so the cold reader can answer
+ * ownership questions instead of defaulting to reject. Driver-authored inputs
+ * only — the resolving agent still cannot frame the question.
+ */
+async function caseContextLines(
+  cli: Cli,
+  c: { branch: string; parent: string; head: { sha: string }; conflictedPaths: string[] },
+): Promise<string[]> {
+  const registry = loadRegistry({
+    inventoryDir: cli.inventory,
+    scopeFile: cli.scopeFile,
+    routingFile: cli.routingFile,
+  });
+  const tip = await revParse(cli.repo, c.branch);
+  const sides = await perSideLog(cli.repo, tip, c.head.sha, c.conflictedPaths);
+  return [
+    '## Case context (driver-derived — D-048)',
+    '',
+    '### Inventory',
+    ...inventoryContextLines(registry.features, c.branch, c.parent, c.conflictedPaths),
+    '',
+    `### ours (\`${c.branch}\`) — \`git log --oneline\` over the conflicted paths since the merge base`,
+    '```',
+    sides.ours,
+    '```',
+    '',
+    `### theirs (\`${c.parent}\` head) — same range on the other side`,
+    '```',
+    sides.theirs,
+    '```',
+  ];
+}
+
 /**
  * The cold-read request (§7, D-031): conflict hunks + resolution diff + the
- * four cold-reader questions — NOTHING else, so the resolving agent cannot
- * frame the question. Written twice: at case emission with the conflict hunks
- * only (`resolutionDiff === null` — no resolution exists yet), then REGENERATED
- * by every `resolve --execute` attempt, before the verdict is consumed, with
- * the resolution diff (`git diff <automerge-tree> <resolved-tree>`) recomputed
- * for THIS resolution. The verdict freshness binding (resolvedTree) ensures a
- * verdict can only ever attest to the resolution the regenerated request shows.
+ * driver-derived case context (D-048 — inventory summary/owned_paths/recorded
+ * decisions + per-side histories, so the reader can answer ownership questions
+ * instead of defaulting to reject) + the four cold-reader questions — NOTHING
+ * agent-authored, so the resolving agent cannot frame the question. Written
+ * twice: at case emission with the conflict hunks only (`resolutionDiff ===
+ * null` — no resolution exists yet), then REGENERATED by every `resolve
+ * --execute` attempt, before the verdict is consumed, with the resolution diff
+ * (`git diff <automerge-tree> <resolved-tree>`) recomputed for THIS
+ * resolution. The verdict freshness binding (resolvedTree) ensures a verdict
+ * can only ever attest to the resolution the regenerated request shows.
  */
 function coldReadRequest(
   c: { id: string; branch: string; parent: string; head: { height: number }; conflictedPaths: string[] },
   conflictDiff: string,
   resolutionDiff: string | null,
+  contextLines: string[],
 ): string {
   return [
     `# Cold-read request — ${c.id}`,
     '',
     `Branch: ${c.branch}   Parent: ${c.parent}   Height: ${c.head.height}`,
     `Conflicted paths: ${c.conflictedPaths.join(', ')}`,
+    '',
+    ...contextLines,
     '',
     '## Conflict hunks (branch tip -> automerge tree)',
     '```diff',
@@ -973,8 +1100,12 @@ export async function cmdRun(cli: Cli): Promise<number> {
     const exclude = new Set([...arrived, ...reopened, ...frozen, ...syncedBranches, ...driverTouched]);
     const drift = plansDiffer(prev, plan, exclude);
     if (drift.length) {
-      appendJournal(dir, { action: 'halt', reason: 'plan-drift', branches: drift });
-      console.error(`HALT: git moved under us — plan drift for not-yet-processed branch(es): ${drift.join(', ')}`);
+      // §14 (D-048): DriverHalt reasons surface under the machine-readable id
+      // scheme in CLI output; the human text stays in `detail`/the journal.
+      const detail = `git moved under us — plan drift for not-yet-processed branch(es): ${drift.join(', ')}`;
+      appendJournal(dir, { action: 'halt', reason: 'plan-drift', id: 'ERR24_PLAN_DRIFT', branches: drift });
+      console.error(`HALT [ERR24_PLAN_DRIFT]: ${detail}`);
+      emit(cli, { ok: false, issues: [{ id: 'ERR24_PLAN_DRIFT', detail }] });
       return 1;
     }
   }
@@ -996,6 +1127,8 @@ export async function cmdRun(cli: Cli): Promise<number> {
   let gated = false;
   const diverged: string[] = [];
   const mergeFailed: string[] = [];
+  /** §14 (D-048): this run's per-branch halts under the ERR2x id scheme (CLI output). */
+  const issues: Issue[] = [];
 
   try {
     for (const snap of plan.branches) {
@@ -1009,12 +1142,19 @@ export async function cmdRun(cli: Cli): Promise<number> {
         await syncBranchWithOrigin(cli, dir, snap.branch, scope, preReffed);
       } catch (e) {
         if (e instanceof DriverHalt && e.reason === 'sync-diverged') {
-          appendJournal(dir, { action: 'halt', branch: snap.branch, reason: e.reason, message: e.message });
+          appendJournal(dir, {
+            action: 'halt',
+            branch: snap.branch,
+            reason: e.reason,
+            id: 'ERR20_BRANCH_DIVERGED',
+            message: e.message,
+          });
           appendJournal(dir, { action: 'skip', branch: snap.branch, reason: 'diverged' });
           appendJournal(dir, { action: 'arrived', branch: snap.branch });
           arrived.add(snap.branch);
           diverged.push(snap.branch);
-          console.error(`DIVERGED (branch skipped): ${e.message}`);
+          issues.push({ id: 'ERR20_BRANCH_DIVERGED', detail: e.message });
+          console.error(`DIVERGED [ERR20_BRANCH_DIVERGED] (branch skipped): ${e.message}`);
           continue;
         }
         throw e;
@@ -1146,7 +1286,9 @@ export async function cmdRun(cli: Cli): Promise<number> {
         );
         writeFileSync(
           join(caseDir, 'coldread-request.md'),
-          coldReadRequest(caseFile, diffText.stdout.slice(0, 60000), null), // resolution diff added at resolve (§7)
+          // Resolution diff added at resolve (§7); D-048 context block included
+          // from emission so the reader is never context-starved.
+          coldReadRequest(caseFile, diffText.stdout.slice(0, 60000), null, await caseContextLines(cli, caseFile)),
         );
         appendJournal(dir, {
           action: 'case',
@@ -1255,17 +1397,26 @@ export async function cmdRun(cli: Cli): Promise<number> {
         // barrier with whatever prefix landed. Every other DriverHalt (dirty
         // worktree, protected ref) still halts the whole run below.
         if (!(e instanceof DriverHalt) || e.reason !== 'merge-failed') throw e;
-        appendJournal(dir, { action: 'halt', branch: bp.branch, reason: e.reason, message: e.message });
+        appendJournal(dir, {
+          action: 'halt',
+          branch: bp.branch,
+          reason: e.reason,
+          id: 'ERR21_MERGE_FAILED',
+          message: e.message,
+        });
         mergeFailed.push(bp.branch);
-        console.error(`MERGE FAILED (branch halted, siblings continue): ${e.message}`);
+        issues.push({ id: 'ERR21_MERGE_FAILED', detail: e.message });
+        console.error(`MERGE FAILED [ERR21_MERGE_FAILED] (branch halted, siblings continue): ${e.message}`);
       }
       appendJournal(dir, { action: 'arrived', branch: bp.branch });
       arrived.add(bp.branch);
     }
   } catch (e) {
     if (e instanceof DriverHalt) {
-      appendJournal(dir, { action: 'halt', reason: e.reason, message: e.message });
-      console.error(`HALT: ${e.reason} — ${e.message}`);
+      const id = haltIdFor(e.reason);
+      appendJournal(dir, { action: 'halt', reason: e.reason, ...(id ? { id } : {}), message: e.message });
+      console.error(`HALT${id ? ` [${id}]` : ''}: ${e.reason} — ${e.message}`);
+      if (id) emit(cli, { ok: false, issues: [{ id, detail: e.message }] });
       return 1;
     }
     throw e;
@@ -1290,7 +1441,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
   if (mergeFailed.length)
     console.error(`merge-failed branches halted this pass (journaled, D-047/B11): ${mergeFailed.join(', ')}`);
   console.error(sealed ? 'run complete — pass sealed (pass-complete)' : `run complete — ${missing}`);
-  emit(cli, { watermark12: plan.watermark12, gated, sealed, missing, passDir: dir, diverged, mergeFailed });
+  emit(cli, { watermark12: plan.watermark12, gated, sealed, missing, passDir: dir, diverged, mergeFailed, issues });
   return 0;
 }
 
@@ -1580,9 +1731,9 @@ async function reverifyCase(
   };
 }
 
-/** Freeze a branch HELD: prepare the D-030 real-diff draft PR, journal `held`, ledger-freeze. */
-async function freezeHeld(cli: Cli, dir: string, rc: ResolvedCase, notes: string[], scope: Set<string>): Promise<void> {
-  const fixBranch = await preparePr(cli, dir, rc, { tier: 'held', atCommit: rc.head.sha }, scope);
+/** Freeze a branch HELD: prepare the PR materials (D-048), journal `held`, ledger-freeze. */
+async function freezeHeld(cli: Cli, dir: string, rc: ResolvedCase, notes: string[]): Promise<void> {
+  const fixBranch = await prepareCaseMaterials(cli, dir, rc, 'held');
   appendJournal(dir, {
     action: 'held',
     branch: rc.branch,
@@ -1611,7 +1762,9 @@ export async function cmdResolve(cli: Cli): Promise<number> {
     return 2;
   }
   if (!CASE_ID_RE.test(cli.caseId)) {
-    console.error(`resolve: --case '${cli.caseId}' does not match the generated case-id shape (N5) — refused`);
+    console.error(
+      `resolve [ERR25_BAD_CASE_ID]: --case '${cli.caseId}' does not match the generated case-id shape (N5) — refused`,
+    );
     return 2;
   }
   const ctx = await passContext(cli);
@@ -1657,7 +1810,7 @@ export async function cmdResolve(cli: Cli): Promise<number> {
         emit(cli, { case: rc.id, tier: 'held', reopen: reopenTargets });
         return 0;
       }
-      await freezeHeld(cli, dir, rc, ['agent declared cannot-resolve (--tier held)'], scope);
+      await freezeHeld(cli, dir, rc, ['agent declared cannot-resolve (--tier held)']);
       await removeCaseWorktree(cli, dir, rc.id);
       reopen(dir, reopenTargets);
       console.error(`held ${rc.id} (direct); branch frozen, real-diff draft PR prepared`);
@@ -1689,7 +1842,12 @@ export async function cmdResolve(cli: Cli): Promise<number> {
       const resolutionDiff = await git(cli.repo, ['diff', rc.automergeTree, resolvedTree], { allowCodes: [1] });
       writeFileSync(
         join(caseDir, 'coldread-request.md'),
-        coldReadRequest(rc, conflictDiff.stdout.slice(0, 60000), resolutionDiff.stdout.slice(0, 60000)),
+        coldReadRequest(
+          rc,
+          conflictDiff.stdout.slice(0, 60000),
+          resolutionDiff.stdout.slice(0, 60000),
+          await caseContextLines(cli, rc), // D-048: driver-derived context, regenerated fresh
+        ),
       );
     }
 
@@ -1744,7 +1902,7 @@ export async function cmdResolve(cli: Cli): Promise<number> {
         extraPaths: guard.extraPaths,
         hunkViolations: guard.hunkViolations,
       });
-      await freezeHeld(cli, dir, rc, notes, scope);
+      await freezeHeld(cli, dir, rc, notes);
       await removeCaseWorktree(cli, dir, rc.id);
       reopen(dir, reopenTargets);
       console.error(`held ${rc.id}: scope-guard violation [${guard.mode}] (${bad.join(', ')})`);
@@ -1755,7 +1913,7 @@ export async function cmdResolve(cli: Cli): Promise<number> {
     // Cold-read rejection -> HELD.
     if (coldread.verdict === 'reject') {
       notes.push(`cold-read rejected -> HELD: ${coldread.notes}`);
-      await freezeHeld(cli, dir, rc, notes, scope);
+      await freezeHeld(cli, dir, rc, notes);
       await removeCaseWorktree(cli, dir, rc.id);
       reopen(dir, reopenTargets);
       console.error(`held ${rc.id}: cold-read rejected`);
@@ -1780,7 +1938,7 @@ export async function cmdResolve(cli: Cli): Promise<number> {
       coldread: { verdict: coldread.verdict, notes: coldread.notes },
     });
     unfreezeInLedger(cli, rc.branch); // clearing a HELD unfreezes the ledger entry
-    if (tier === 'judged') await preparePr(cli, dir, rc, { tier, atCommit: mergeCommit }, scope);
+    if (tier === 'judged') await prepareCaseMaterials(cli, dir, rc, tier);
     await removeCaseWorktree(cli, dir, rc.id);
     reopen(dir, reopenTargets);
     console.error(`resolved ${rc.id} as ${tier}; merge commit ${mergeCommit.slice(0, 12)}`);
@@ -1788,8 +1946,16 @@ export async function cmdResolve(cli: Cli): Promise<number> {
     return 0;
   } catch (e) {
     if (e instanceof DriverHalt) {
-      appendJournal(dir, { action: 'halt', branch: rc.branch, caseId: rc.id, reason: e.reason, message: e.message });
-      console.error(`HALT: ${e.reason} — ${e.message}`);
+      const id = haltIdFor(e.reason);
+      appendJournal(dir, {
+        action: 'halt',
+        branch: rc.branch,
+        caseId: rc.id,
+        reason: e.reason,
+        ...(id ? { id } : {}),
+        message: e.message,
+      });
+      console.error(`HALT${id ? ` [${id}]` : ''}: ${e.reason} — ${e.message}`);
       return 1;
     }
     throw e;
@@ -1797,60 +1963,462 @@ export async function cmdResolve(cli: Cli): Promise<number> {
 }
 
 /**
- * Prepare (never execute) the PR mechanics to the fork's D-030/D-031 standard:
- * a `fix/sweep/<date>-<branch>--<parent>-h<height>` branch (branch+PARENT+height
- * so two parents of one branch conflicting at the same height on the same day
- * cannot collide — B8), a labeled ours/theirs body with the concrete owner ask
- * + verification pointers, and the exact `gh` commands.
+ * The deterministic fix/sweep branch name for a case (naming rule of §8:
+ * branch+PARENT+height so two parents of one branch conflicting at the same
+ * height on the same day cannot collide — B8).
  */
-async function preparePr(
-  cli: Cli,
-  dir: string,
-  rc: ResolvedCase,
-  opts: { tier: Tier; atCommit: string },
-  scope: Set<string>,
-): Promise<string> {
+function fixBranchName(rc: Pick<ResolvedCase, 'branch' | 'parent' | 'head'>): string {
   const date = new Date().toISOString().slice(0, 10);
-  const topic = `${slug(rc.branch)}--${slug(rc.parent)}`;
-  const fixBranch = `fix/sweep/${date}-${topic}-h${rc.head.height}`;
-  guardRef(fixBranch, scope, { fixSweep: true }); // namespace-checked, scope-exempt (§8/N1)
-  await git(cli.repo, ['update-ref', `refs/heads/${fixBranch}`, opts.atCommit]);
+  return `fix/sweep/${date}-${slug(rc.branch)}--${slug(rc.parent)}-h${rc.head.height}`;
+}
+
+/**
+ * Prepare the case's PR MATERIALS (§14, D-048) — structured driver facts ONLY:
+ * conflicted paths, per-side one-line histories over those paths, the
+ * reproduction command. The driver NEVER generates PR prose (the retired
+ * template body/title could not pass the agent's own text gate — 2026-07-21
+ * forensic finding): the agent studies the case (worktree + these materials)
+ * and writes pr/title.txt + pr/body.md itself, then runs
+ * `propagate publish --case <id>` — the ONLY sanctioned PR-creation path.
+ * No fix/sweep ref is created here either: publish creates the ref at the
+ * origin-parented EXHIBIT HEAD (the D-030 conflicting-head shape is retired —
+ * it made GitHub render the whole pending range, 26-60x diff bloat). Returns
+ * the deterministic fix branch NAME for ledger/urge bookkeeping.
+ */
+async function prepareCaseMaterials(cli: Cli, dir: string, rc: ResolvedCase, tier: Tier): Promise<string> {
+  const fixBranch = fixBranchName(rc);
   const prDir = join(dir, rc.id, 'pr');
-  const bodyPath = join(prDir, 'body.md');
-  const draft = opts.tier === 'held';
-  const oursLabel = rc.branch;
-  const theirsLabel =
-    rc.model === 'entry' ? `upstream trunk @ height ${rc.head.height} (${rc.head.sha.slice(0, 12)})` : rc.parent;
-  const body = [
-    `# ${draft ? 'FREEZE (unresolved conflict)' : 'JUDGED resolution'} — ${rc.branch} (${rc.id})`,
+  mkdirSync(prDir, { recursive: true });
+  const tip = await revParse(cli.repo, rc.branch);
+  const sides = await perSideLog(cli.repo, tip, rc.head.sha, rc.conflictedPaths);
+  const materials = [
+    `# Case materials — ${rc.id} (${tier})`,
     '',
-    `**ours** = \`${oursLabel}\` (the fork branch)   ·   **theirs** = \`${theirsLabel}\``,
-    '',
-    '## Conflict',
-    `Conflicted paths: ${rc.conflictedPaths.map((p) => `\`${p}\``).join(', ')}`,
+    `Branch: ${rc.branch}   Parent: ${rc.parent}   Head: ${rc.head.sha.slice(0, 12)} (height ${rc.head.height})`,
     `Pending upstream commits above this point: ${rc.pendingAbove}`,
     '',
-    '## Behavior at stake',
-    `- behavior kept: \`${oursLabel}\`'s intent on the conflicted paths must survive.`,
-    `- behavior lost if merged blindly: \`${theirsLabel}\`'s change to the same regions.`,
+    '## Conflicted paths',
+    ...rc.conflictedPaths.map((p) => `- ${p}`),
     '',
-    '## The ask',
-    draft
-      ? `The driver could not mechanically resolve this. **Decision needed:** which side's behavior wins on ${rc.conflictedPaths.join(', ')} (or how to reconcile both)? The unmergeable state IS the conflict exhibit (D-030) — GitHub will flag it.`
-      : `Cold-read confirmed the resolution. **Owner ack requested** before push (D-031): confirm the merged behavior on ${rc.conflictedPaths.join(', ')} is intended.`,
+    `## Reproduction`,
+    '```',
+    rc.reproduction.command,
+    '```',
     '',
-    '## Verification',
-    `- reproduce the conflict: \`${rc.reproduction.command}\``,
-    `- check the resolution is wrong by diffing the resolved tree against each side on the conflicted paths; any silently dropped delta on \`${theirsLabel}\` or \`${oursLabel}\` is a bug.`,
+    `## ours (\`${rc.branch}\`) — \`git log --oneline\` over the conflicted paths since the merge base`,
+    '```',
+    sides.ours,
+    '```',
+    '',
+    `## theirs (\`${rc.parent}\` head) — same range on the other side`,
+    '```',
+    sides.theirs,
+    '```',
+    '',
+    'Write pr/title.txt and pr/body.md YOURSELF from studying the case, then run',
+    `\`propagate publish --case ${rc.id}\` (PROPAGATION.md §14, D-048).`,
   ].join('\n');
-  mkdirSync(prDir, { recursive: true });
-  writeFileSync(bodyPath, body + '\n');
-  const ghCmds = [
-    `git push origin ${fixBranch}`,
-    `gh pr create --base ${rc.branch} --head ${fixBranch} ${draft ? '--draft ' : ''}--title "${opts.tier}: ${rc.branch} sweep (h${rc.head.height})" --body-file ${bodyPath}`,
-  ];
-  writeFileSync(join(prDir, 'gh-commands.sh'), ghCmds.join('\n') + '\n');
+  writeFileSync(join(prDir, 'materials.md'), materials + '\n');
   return fixBranch;
+}
+
+// --------------------------------------------------------------------------
+// publish — the ONLY sanctioned PR-creation path (§14, D-048).
+// --------------------------------------------------------------------------
+
+/** The latest held/resolved disposition for a case id, or null while it is open. */
+function lastDisposition(journal: JournalEntry[], caseId: string): JournalEntry | null {
+  let last: JournalEntry | null = null;
+  for (const e of journal) {
+    if ((e.action === 'held' || e.action === 'resolved') && e.caseId === caseId) last = e;
+  }
+  return last;
+}
+
+function samePathSet(a: string[], b: string[]): boolean {
+  return JSON.stringify([...a].sort()) === JSON.stringify([...b].sort());
+}
+
+/** A journaled case, read from its LAST `case` entry (+ first index for DAG order). */
+interface JournaledCase {
+  caseId: string;
+  branch: string;
+  parent: string;
+  head: { sha: string; height: number };
+  conflictedPaths: string[];
+  /** Index of the case's FIRST journal entry — run emits in DAG order, so this IS the DAG order. */
+  firstIndex: number;
+}
+
+function journaledCases(journal: JournalEntry[]): Map<string, JournaledCase> {
+  const out = new Map<string, JournaledCase>();
+  journal.forEach((e, i) => {
+    if (e.action !== 'case' || typeof e.caseId !== 'string') return;
+    const head = e.head as { sha: string; height: number } | undefined;
+    if (!head?.sha || typeof e.branch !== 'string' || typeof e.parent !== 'string') return;
+    const prev = out.get(e.caseId);
+    out.set(e.caseId, {
+      caseId: e.caseId,
+      branch: e.branch,
+      parent: e.parent,
+      head,
+      conflictedPaths: (e.conflictedPaths as string[]) ?? [],
+      firstIndex: prev?.firstIndex ?? i,
+    });
+  });
+  return out;
+}
+
+/**
+ * The source tree whose blobs the exhibit overlays (§14): HELD — the
+ * recomputed automerge tree against the CURRENT branch tip (the conflict
+ * markers ARE the exhibit); JUDGED — the resolved merge commit's tree. Returns
+ * an ERR01/ERR02 issue instead when the case has no publishable disposition or
+ * its live state moved (staleness re-verification — the journal is a pointer,
+ * git is the authority, same trust model as reverifyCase).
+ */
+async function publishSourceTree(
+  cli: Cli,
+  journal: JournalEntry[],
+  jc: JournaledCase,
+): Promise<{ sourceTree?: string; mode?: 'held' | 'judged'; issue?: Issue }> {
+  const disposition = lastDisposition(journal, jc.caseId);
+  if (!disposition) {
+    return {
+      issue: {
+        id: 'ERR01_CASE_NOT_OPEN',
+        detail: `case '${jc.caseId}' is still unresolved — resolve or freeze it first (publish covers held + judged cases only)`,
+      },
+    };
+  }
+  if (!(await refExists(cli.repo, jc.branch))) {
+    return { issue: { id: 'ERR02_CASE_STALE', detail: `branch '${jc.branch}' no longer exists` } };
+  }
+  const tip = await revParse(cli.repo, jc.branch);
+  if (disposition.action === 'held') {
+    if (await isAncestor(cli.repo, jc.head.sha, tip)) {
+      return {
+        issue: {
+          id: 'ERR02_CASE_STALE',
+          detail: `branch tip already contains held head ${jc.head.sha.slice(0, 12)} — the resolution landed; no freeze PR to publish`,
+        },
+      };
+    }
+    const probe = await newStyleMergeTree(cli.repo, tip, jc.head.sha);
+    if (probe.clean) {
+      return {
+        issue: { id: 'ERR02_CASE_STALE', detail: `no live conflict for '${jc.branch}' <- ${jc.head.sha.slice(0, 12)} — healed` },
+      };
+    }
+    if (!samePathSet(probe.conflictFiles, jc.conflictedPaths)) {
+      return {
+        issue: {
+          id: 'ERR02_CASE_STALE',
+          detail: `conflict set drifted: recorded [${jc.conflictedPaths.join(', ')}] != live [${probe.conflictFiles.join(', ')}]`,
+        },
+      };
+    }
+    return { sourceTree: probe.treeOid, mode: 'held' };
+  }
+  // resolved
+  const tier = disposition.tier as string | undefined;
+  if (tier !== 'judged') {
+    return {
+      issue: {
+        id: 'ERR01_CASE_NOT_OPEN',
+        detail: `case '${jc.caseId}' resolved as '${tier ?? disposition.reason ?? 'unknown'}' — only JUDGED resolutions and HELD freezes get a PR`,
+      },
+    };
+  }
+  const mergeCommit = disposition.mergeCommit as string | undefined;
+  if (!mergeCommit || !(await refExists(cli.repo, mergeCommit)) || !(await isAncestor(cli.repo, mergeCommit, tip))) {
+    return {
+      issue: {
+        id: 'ERR02_CASE_STALE',
+        detail: `judged merge commit ${mergeCommit?.slice(0, 12) ?? '(missing)'} is not on '${jc.branch}' anymore`,
+      },
+    };
+  }
+  return { sourceTree: await treeOf(cli.repo, mergeCommit), mode: 'judged' };
+}
+
+/**
+ * ERR06_DUPLICATE_CASE (§14): another open case (no disposition, or held) or an
+ * already-published PR shares this case's conflict signature — same conflicted
+ * path SET plus the same head sha or the same exhibit tree. Duplicates
+ * consolidate into the TOPMOST case by DAG order (run journals cases in DAG
+ * order, so first-journaled = topmost); the topmost case itself publishes.
+ * Three of the six 2026-07-21 freeze PRs were byte-identical duplicates.
+ */
+async function duplicateCaseIssue(
+  cli: Cli,
+  journal: JournalEntry[],
+  cases: Map<string, JournaledCase>,
+  self: JournaledCase,
+  selfExhibit: Exhibit,
+): Promise<Issue | null> {
+  const published = new Map<string, JournalEntry>();
+  for (const e of journal) if (e.action === 'pr-published' && typeof e.caseId === 'string') published.set(e.caseId, e);
+
+  const signatureMatches = async (other: JournaledCase): Promise<boolean> => {
+    if (!samePathSet(other.conflictedPaths, self.conflictedPaths)) return false;
+    if (other.head.sha === self.head.sha) return true;
+    // Same-exhibit-tree comparison: rebuild the sibling's exhibit tree the same
+    // way (best-effort — an unreconstructible sibling simply does not match).
+    try {
+      const tip = await revParse(cli.repo, other.branch);
+      const probe = await newStyleMergeTree(cli.repo, tip, other.head.sha);
+      if (probe.clean) return false;
+      const sib = await buildExhibit(cli.repo, other.branch, probe.treeOid, other.conflictedPaths, other.caseId);
+      return sib.tree === selfExhibit.tree;
+    } catch {
+      return false;
+    }
+  };
+
+  for (const other of cases.values()) {
+    if (other.caseId === self.caseId) continue;
+    const disposition = lastDisposition(journal, other.caseId);
+    const isOpen = disposition === null || disposition.action === 'held';
+    const isPublished = published.has(other.caseId);
+    if (!isOpen && !isPublished) continue;
+    if (!(await signatureMatches(other))) continue;
+    if (isPublished) {
+      const pr = published.get(other.caseId)!;
+      return {
+        id: 'ERR06_DUPLICATE_CASE',
+        detail: `conflict signature already published as PR #${pr.number} (${pr.url}) for case '${other.caseId}' — consolidate, do not open a second PR`,
+      };
+    }
+    if (other.firstIndex < self.firstIndex) {
+      return {
+        id: 'ERR06_DUPLICATE_CASE',
+        detail: `duplicate of case '${other.caseId}' (topmost by DAG order) — publish/resolve THAT case; this one inherits the resolution`,
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * `propagate publish --case <id>` (§14, D-048) — the ONLY sanctioned
+ * PR-creation path. The agent writes pr/title.txt + pr/body.md itself from
+ * studying the case; this subcommand re-verifies the case, constructs the
+ * origin-parented EXHIBIT HEAD, runs the check battery and emits ONE
+ * machine-readable JSON object {ok, issues:[{id, detail}], pr?} on stdout.
+ * Blocking ERR* ids stop the publish; WARN* ids ship as advisories. With
+ * --execute (and all-clear) it creates the fix/sweep ref and the DRAFT PR via
+ * the GitHub REST API (the single networked path in the driver); without
+ * --execute it is a dry-run — full battery, local artifacts (prtext review
+ * requests) may be written, but NO network calls of any kind.
+ */
+export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => GithubTransport): Promise<number> {
+  if (!cli.caseId) {
+    console.error('publish: --case <id> is required');
+    return 2;
+  }
+  if (!CASE_ID_RE.test(cli.caseId)) {
+    emit(cli, {
+      ok: false,
+      issues: [
+        { id: 'ERR25_BAD_CASE_ID', detail: `--case '${cli.caseId}' does not match the generated case-id shape (N5) — refused` },
+      ],
+    });
+    return 2;
+  }
+  const ctx = await passContext(cli);
+  const dir = ctx.dir;
+  const journal = readJournal(dir);
+  const cases = journaledCases(journal);
+  const jc = cases.get(cli.caseId);
+  if (!jc) {
+    emit(cli, {
+      ok: false,
+      issues: [{ id: 'ERR01_CASE_NOT_OPEN', detail: `case '${cli.caseId}' was never journaled this pass (no 'case' entry)` }],
+    });
+    return 1;
+  }
+
+  // (1)+(2) disposition + live-state re-verification (ERR01/ERR02).
+  const src = await publishSourceTree(cli, journal, jc);
+  if (src.issue) {
+    emit(cli, { ok: false, issues: [src.issue] });
+    return 1;
+  }
+  const mode = src.mode!;
+
+  // (3) EXHIBIT HEAD: origin-parented synthetic commit whose diff is exactly
+  // the conflict set (ERR03), with no local-only ancestry (ERR04).
+  const exhibit = await buildExhibit(cli.repo, jc.branch, src.sourceTree!, jc.conflictedPaths, jc.caseId);
+  const issues: Issue[] = [];
+  const push = (i: Issue | null): void => {
+    if (i) issues.push(i);
+  };
+  push(await checkExhibitDiff(cli.repo, exhibit, jc.conflictedPaths, mode));
+  push(await checkExhibitAncestry(cli.repo, exhibit, jc.branch));
+
+  // (4) "should this PR exist": recorded decisions (ERR05) + duplicates (ERR06)
+  // + already-published (ERR07, journal side).
+  const registry = loadRegistry({
+    inventoryDir: cli.inventory,
+    scopeFile: cli.scopeFile,
+    routingFile: cli.routingFile,
+  });
+  push(decidedAlready(registry.features, jc.branch, jc.conflictedPaths));
+  push(await duplicateCaseIssue(cli, journal, cases, jc, exhibit));
+  const priorPr = journal.filter((e) => e.action === 'pr-published' && e.caseId === jc.caseId).pop();
+  if (priorPr) {
+    push({
+      id: 'ERR07_PR_EXISTS',
+      detail: `PR #${priorPr.number} already published for this case: ${priorPr.url}`,
+    });
+  }
+
+  // (5) agent-written text (ERR08) + advisory checks + the two-round PR-text
+  // cold read (ERR09/ERR10/WARN04). The driver NEVER generates this prose.
+  const prDir = join(dir, jc.caseId, 'pr');
+  const titlePath = join(prDir, 'title.txt');
+  const bodyPath = join(prDir, 'body.md');
+  const title = existsSync(titlePath) ? readFileSync(titlePath, 'utf8').trim() : '';
+  const body = existsSync(bodyPath) ? readFileSync(bodyPath, 'utf8').trim() : '';
+  let caveats: string[] = [];
+  if (title === '' || body === '') {
+    push({
+      id: 'ERR08_TEXT_MISSING',
+      detail: `write ${titlePath} and ${bodyPath} YOURSELF from studying the case (worktree + pr/materials.md) — the driver never generates PR prose (D-048)`,
+    });
+  } else {
+    issues.push(...advisoryTextIssues(title, body, jc.conflictedPaths));
+    const materialsPath = join(prDir, 'materials.md');
+    const gate = prTextGate({
+      prDir,
+      caseId: jc.caseId,
+      title,
+      body,
+      conflictedPaths: jc.conflictedPaths,
+      materials: existsSync(materialsPath) ? readFileSync(materialsPath, 'utf8') : '',
+      inventoryContext: inventoryContextLines(registry.features, jc.branch, jc.parent, jc.conflictedPaths).join('\n'),
+    });
+    push(gate.issue);
+    issues.push(...gate.warnings);
+    caveats = gate.caveats;
+  }
+
+  // (6) throttle advisory (WARN03) + execute-only environment checks.
+  const publishedCount = journal.filter((e) => e.action === 'pr-published').length;
+  if (publishedCount >= 8) {
+    issues.push({
+      id: 'WARN03_MANY_PRS',
+      detail: `${publishedCount} PRs already published this pass — is this sweep really producing ${publishedCount + 1} distinct owner decisions?`,
+    });
+  }
+  let token: string | null = null;
+  let slugParts: { owner: string; repo: string } | null = null;
+  if (cli.execute) {
+    if (cli.tokenFile && existsSync(cli.tokenFile)) token = readFileSync(cli.tokenFile, 'utf8').trim() || null;
+    if (!token) {
+      push({
+        id: 'ERR11_TOKEN_MISSING',
+        detail:
+          'publish --execute needs the substitute GitHub token: write the get_credential output to a file once per session and pass --token-file <path> (never $GITHUB_TOKEN — the proxy swaps the Authorization header on the wire)',
+      });
+    }
+    const remote = await git(cli.repo, ['remote', 'get-url', 'origin'], { allowCodes: [1, 2, 128] });
+    slugParts = remote.code === 0 ? parseGithubSlug(remote.stdout) : null;
+    if (!slugParts) {
+      push({
+        id: 'ERR12_ORIGIN_UNRESOLVED',
+        detail: `cannot derive owner/repo from the origin remote (${remote.stdout.trim() || 'no origin remote'})`,
+      });
+    }
+  }
+
+  const fixBranch =
+    mode === 'held' &&
+    readLedger(ledgerPathOf(cli)).branches[jc.branch]?.frozenBy === jc.caseId &&
+    readLedger(ledgerPathOf(cli)).branches[jc.branch]?.fixBranch
+      ? readLedger(ledgerPathOf(cli)).branches[jc.branch]!.fixBranch!
+      : fixBranchName(jc);
+
+  if (issues.some((i) => isBlocking(i.id))) {
+    emit(cli, { ok: false, issues });
+    return 1;
+  }
+
+  const exhibitInfo = {
+    commit: exhibit.commit,
+    tree: exhibit.tree,
+    parent: exhibit.parent,
+    parentSource: exhibit.parentSource,
+  };
+  if (!cli.execute) {
+    // DRY-RUN: full battery ran, local prtext artifacts may have been written,
+    // but NO network calls — the transport is never even constructed (§14).
+    console.error(`DRY-RUN (no --execute): all checks green — would publish draft PR for ${jc.caseId} (${mode})`);
+    emit(cli, { ok: true, dryRun: true, issues, exhibit: exhibitInfo, wouldCreate: { fixBranch, base: jc.branch, draft: true } });
+    return 0;
+  }
+
+  // EXECUTE: the one networked path. ERR07 (API side) first — an open PR by
+  // head branch name means an earlier publish already landed.
+  const transport = (makeTransport ?? realGithubTransport)(token!);
+  const api = `/repos/${slugParts!.owner}/${slugParts!.repo}`;
+  try {
+    const existing = await transport.request(
+      'GET',
+      `${api}/pulls?head=${encodeURIComponent(`${slugParts!.owner}:${fixBranch}`)}&state=open`,
+    );
+    if (existing.status === 200 && Array.isArray(existing.body) && existing.body.length > 0) {
+      const pr = existing.body[0] as { html_url?: string; number?: number };
+      emit(cli, {
+        ok: false,
+        issues: [...issues, { id: 'ERR07_PR_EXISTS', detail: `open PR already exists for head '${fixBranch}': ${pr.html_url ?? ''}` }],
+      });
+      return 1;
+    }
+    const finalBody =
+      caveats.length > 0 ? `${body}\n\n## Caveats (cold reader)\n${caveats.map((c) => `- ${c}`).join('\n')}` : body;
+    const result = await publishExhibit(cli.repo, transport, slugParts!, exhibit, jc.conflictedPaths, fixBranch, {
+      title,
+      body: finalBody,
+      base: jc.branch,
+    });
+    // Local anchor for the remote ref (content-identical commit; sha normally
+    // equal since author/committer are mirrored). Namespace-checked, scope-exempt.
+    guardRef(fixBranch, new Set(), { fixSweep: true });
+    if (!(await refExists(cli.repo, fixBranch))) {
+      await git(cli.repo, ['update-ref', `refs/heads/${fixBranch}`, exhibit.commit, '']);
+    }
+    appendJournal(dir, {
+      action: 'pr-published',
+      caseId: jc.caseId,
+      branch: jc.branch,
+      mode,
+      fixBranch,
+      url: result.url,
+      number: result.number,
+      exhibit: exhibit.commit,
+      remoteCommit: result.remoteCommit,
+    });
+    if (mode === 'held') {
+      // Point the ledger freeze at the branch the PR actually lives on (urge target).
+      const path = ledgerPathOf(cli);
+      const ledger = readLedger(path);
+      if (ledger.branches[jc.branch]?.frozenBy === jc.caseId) {
+        ledger.branches[jc.branch] = { ...ledger.branches[jc.branch], fixBranch };
+        writeLedger(path, ledger);
+      }
+    }
+    console.error(`published draft PR #${result.number} for ${jc.caseId}: ${result.url}`);
+    emit(cli, { ok: true, issues, pr: { url: result.url, number: result.number }, exhibit: exhibitInfo });
+    return 0;
+  } catch (e) {
+    emit(cli, {
+      ok: false,
+      issues: [...issues, { id: 'ERR13_API_FAILED', detail: e instanceof Error ? e.message : String(e) }],
+    });
+    return 1;
+  }
 }
 
 export async function cmdVerify(cli: Cli): Promise<number> {
@@ -2014,6 +2582,7 @@ const HANDLERS: Record<string, (cli: Cli) => Promise<number>> = {
   plan: cmdPlan,
   run: cmdRun,
   resolve: cmdResolve,
+  publish: (cli) => cmdPublish(cli), // real transport unless a test injects one (§14)
   verify: cmdVerify,
   unfreeze: cmdUnfreeze,
   status: cmdStatus,

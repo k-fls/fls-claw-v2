@@ -163,7 +163,14 @@ export interface FeatureEntry {
   /** Per-feature scope-guard override (§7 lever); beats the global default. */
   scope_guard?: ScopeGuardMode;
   routing?: { keywords?: string[]; always_check_on?: string[] };
-  prompt?: { template?: string; extra_context?: string };
+  /**
+   * `extra_context` carries recorded owner decisions (D-030 write-back);
+   * `decided_paths` (D-048) optionally pins the paths a recorded decision
+   * governs — `propagate publish` blocks (ERR05_DECIDED_ALREADY) a PR whose
+   * conflicted paths hit either the explicit list or a path mentioned in the
+   * `extra_context` text (PROPAGATION.md §14).
+   */
+  prompt?: { template?: string; extra_context?: string; decided_paths?: string[] };
   maintenance?: { owner?: string; last_verified?: string; verified_against?: string; notes?: string };
 }
 
@@ -422,6 +429,31 @@ export interface HeldRecord {
   height: number;
   conflictedPaths: string[];
   caseId: string;
+}
+
+/**
+ * Context-free PR-TEXT cold-read verdict (PROPAGATION.md §14, D-048) — the
+ * SECOND of the two distinct cold reads (the first, ColdReadVerdict below,
+ * gates resolutions at `resolve`; this one gates PR text at `publish`;
+ * neither substitutes for the other). Written by the agent's context-free
+ * subagent next to the tool-issued `prtext-review-request.md`; the tool
+ * validates shape, round, and textHash freshness — a HARD two-round cap.
+ */
+export interface PrTextVerdict {
+  /** Which tool-issued review request this verdict answers (1 or 2; >2 = invalid shape). */
+  round: number;
+  /**
+   * `publish` — text is adequate; `rewrite` — round 1 only earns one rewrite
+   * (a round-2 rewrite ships as publish-with-caveats, WARN04);
+   * `reject-derivable` — the PR should not exist, the answer is derivable
+   * (ERR05 semantics); `consolidate` — duplicate of a sibling case (ERR06).
+   */
+  verdict: 'publish' | 'rewrite' | 'reject-derivable' | 'consolidate';
+  /** For reject-derivable/consolidate: the derived answer, surfaced in the blocking issue. */
+  derivedAnswer?: string;
+  notes: string[];
+  /** Freshness binding: sha256 of the title+body the verdict attests to (copied from the request). */
+  textHash: string;
 }
 
 /** Context-free cold-read verdict the driver requires before accepting MECHANICAL/JUDGED (§7). */

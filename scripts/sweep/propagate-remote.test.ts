@@ -193,8 +193,17 @@ describe('propagate — §13 sync states: behind / ahead / diverged in one pass'
 
     // ...and the OTHER branches still proceeded.
     expect(await isAncestor(repo.dir, repo.sha('main'), 'feat/ok')).toBe(true);
-    const out = JSON.parse(readFileSync(outFile, 'utf8')) as { diverged: string[] };
+    const out = JSON.parse(readFileSync(outFile, 'utf8')) as {
+      diverged: string[];
+      issues: Array<{ id: string; detail: string }>;
+    };
     expect(out.diverged).toEqual(['feat/d']);
+    // §14 (D-048): the sync-diverged DriverHalt surfaces under the ERR2x id
+    // scheme in run output; the human text stays in `detail`.
+    const err20 = out.issues.find((i) => i.id === 'ERR20_BRANCH_DIVERGED');
+    expect(err20).toBeTruthy();
+    expect(err20!.detail).toContain('feat/d');
+    expect(err20!.detail).toContain('DIVERGED');
 
     // Idempotent resume: a second run does not re-halt or re-sync anything.
     expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);

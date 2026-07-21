@@ -40,20 +40,30 @@ mechanics: `scripts/sweep/README.md` + `DESIGN.md` on branch `feat/maintenance-s
 
 ## GitHub
 
-Use `gh` and `git` as-is; the host authenticates them. If `gh` returns an auth error,
-report it to the owner.
+What this container actually provides (verified 2026-07-21 — plan around it, do not
+rediscover it the hard way):
 
-**Known limitation — `git push` may fail through the credential proxy** (Basic-auth
-translation bug; host-side fix exists but is not yet deployed). Push failure is NOT a
-hard stop and NOT a case-2 report: use the sanctioned API path instead —
-`gh api -X POST repos/k-fls/fls-claw-v2/git/refs -f ref='refs/heads/<branch>' -f sha=<sha>`
-to create the branch (PATCH `.../git/refs/heads/<branch>` with `-f sha=<sha>` to
-update it), then `gh pr create` as normal. The 2026-07-13/14 sweeps created all
-their branches this way. Only report to the owner if the API path ALSO fails.
+- **No `gh`. No `python3`.** They do not exist here; any procedure written around
+  them is stale.
+- **`git fetch`/`git clone` work; `git push` to github FAILS through the credential
+  proxy** (translation bug; host-side fix exists but is undeployed). Never retry
+  pushes, never hand-roll a push workaround.
+- **Raw API calls work**: the proxy swaps the `Authorization` header for
+  `api.github.com` on the wire. For GitHub READS (PR/issue lookups, checks) use
+  `git fetch` or raw API GETs (curl/node) with the substitute token from
+  `get_credential` pasted literally into the header. NEVER trust `$GITHUB_TOKEN` —
+  it is not maintained and publication through it is broken.
+- **All PR-related API WRITES are performed internally by `propagate publish`**
+  (PROPAGATION.md §14, D-048). Once per session, write the `get_credential` output
+  to a file and pass it as `--token-file <path>` on `publish --execute`. You never
+  push a branch or POST a PR yourself — hand-rolled curl/node/gh/git-push PR flows
+  are forbidden.
+- Auth failures that survive the above are a case-2 report to the owner.
 
 ## Bootstrap (first session; keep the clone across sessions)
 
-1. `gh repo clone k-fls/fls-claw-v2 repo && cd repo`
+1. `git clone https://github.com/k-fls/fls-claw-v2 repo && cd repo` (no `gh` in this
+   container — see the GitHub section)
    `git remote add upstream https://github.com/nanocoai/nanoclaw.git && git fetch upstream`
    `git checkout feat/maintenance-sweep`
 2. No tracking-branch setup is needed: the driver plans remote-only inventory
@@ -127,8 +137,9 @@ their branches this way. Only report to the owner if the API path ALSO fails.
      file + a driver-created worktree under the pass dir and halts that branch.
    - Per case: resolve ONLY inside the driver's case worktree, commit there,
      then `... resolve --case <id> --tier mechanical|judged --resolved-ref
-     <commit>` (dry-run first; `--tier held` = cannot-resolve, freezes with a
-     real-diff draft PR prepared, D-030 shape). The first `resolve --execute`
+     <commit>` (dry-run first; `--tier held` = cannot-resolve, freezes with
+     PR materials prepared — the draft PR itself goes through `publish`,
+     D-048). The first `resolve --execute`
      regenerates `coldread-request.md` with YOUR resolution diff and exits
      asking for a verdict: produce `coldread-verdict.json` via a CONTEXT-FREE
      subagent (D-031 — hand it ONLY the request file; the verdict must carry
@@ -140,24 +151,29 @@ their branches this way. Only report to the owner if the API path ALSO fails.
      HELD(gate). Nothing is pushed before verify is green.
    - `... status` for pass state; `... unfreeze` ONLY on explicit owner
      instruction, journaled.
-   PRs: the driver PREPARES `fix/sweep/*` branches, PR body files and exact
-   `gh` commands under the pass dir (JUDGED and HELD). Pushing branches and
-   creating PRs remain YOUR actions under the existing gates: D-034 result
-   gates before any push, D-031 cold reader on the PR text — enrich the
-   prepared body to the PR-composition standards below before `gh pr create`.
-   Recurring-decision guards stay in force: an overlap or conflict whose
-   decision is already recorded in the inventory (`prompt.extra_context`) is
-   one digest line, never a new freeze PR; check open AND closed `fix/sweep/*`
-   PRs before pushing a freeze PR the driver prepared.
-   **OWNER FREEZE (2026-07-18, amended 2026-07-21 D-047):** merging PRs and pushing
-   protected branches remain FROZEN — owner-only. EXCEPTION (D-047): driver-prepared
-   `fix/sweep/*` branches and their DRAFT PRs must be pushed/created via the
-   prepared gh-commands (after the D-031 cold read on the PR text) — a freeze or
-   judged case the owner cannot open on GitHub does not exist as far as the owner
-   is concerned. Never merge any PR yourself while this freeze stands.
+   **Case comprehension (owner directive, D-048):** a case is always something you
+   are LOOKING AT — study the case worktree and materials until you can explain
+   both sides; the description you publish is YOUR understanding, never a template.
+   If you cannot explain both sides of the conflict, study the case more — never
+   publish text you don't understand.
+   PRs (D-048): the driver NEVER writes PR prose — at resolve/freeze it prepares
+   `pr/materials.md` (facts: conflicted paths, per-side histories, reproduction).
+   YOU study the case and write `pr/title.txt` + `pr/body.md` to the
+   PR-composition standards below, then run `... publish --case <id>` (dry-run
+   first, then `--execute --token-file <path>`): it re-verifies the case, builds
+   the tiny-diff exhibit head, asks "should this PR exist" (recorded decisions,
+   duplicates), mediates the PR-text cold read, and creates the fix/sweep ref +
+   DRAFT PR via the GitHub API itself. Act on its result ids per the "Tool result
+   IDs" table below — never argue with a blocking id, never work around it.
+   **OWNER FREEZE — LIFTED 2026-07-21** (the 2026-07-18 freeze addressed the
+   pre-refresh agent). Standing rules in its place: pushes only `fix/sweep/*` and
+   ONLY as a side effect of `propagate publish`; PR creation EXCLUSIVELY via
+   `propagate publish` (hand-rolled curl/node/gh/git-push PR flows are forbidden);
+   merging ANY PR remains owner-only until branch protection + required CI exist.
    **Driver bugs (D-047):** when the propagation driver itself crashes or
    misbehaves (a thrown error, a wrong verdict, an impossible state), file a
-   GitHub ISSUE immediately: `gh issue create --label sweep-driver` — title = the
+   GitHub ISSUE immediately via the raw API (no `gh` here):
+   `POST /repos/k-fls/fls-claw-v2/issues` with label `sweep-driver` — title = the
    broken invariant, body = exact command, pass dir + journal pointer, observed vs
    expected, minimal reproduction. Reference the issue NUMBER in your final
    message; no fix analysis in chat, and NEVER patch driver code yourself (rule 3).
@@ -167,6 +183,37 @@ their branches this way. Only report to the owner if the API path ALSO fails.
    somewhere).
 6. `record` the sweep (ledger + report in the workspace), post the final digest:
    merged ranges, open PRs, frozen branches, PoI outcomes, what needs the owner.
+
+## Tool result IDs (PROPAGATION.md §14, D-048)
+
+Driver output carries machine-readable ids: `ERR*` blocks, `WARN*` advises. Do what
+the row says — never argue with or work around a blocking id.
+
+| id | meaning → your action |
+|----|----------------------|
+| `ERR01_CASE_NOT_OPEN` | case has no held/judged disposition → resolve or freeze it first; mechanical resolutions get no PR |
+| `ERR02_CASE_STALE` | the live state moved since the case → re-run `run`, work from the fresh case |
+| `ERR03_DIFF_EXCEEDS_CONFLICT_SET` | exhibit diff ≠ conflict set → driver bug or moved base; file a driver issue, do not publish |
+| `ERR04_UNPUSHED_PARENT` | exhibit would carry local-only protected commits → do not publish; report (never push protected content) |
+| `ERR05_DECIDED_ALREADY` | the decision is recorded; apply the quoted record as a judged resolution, do not ask the owner |
+| `ERR06_DUPLICATE_CASE` | same conflict as the named topmost case → resolve/publish THAT case; this one inherits it |
+| `ERR07_PR_EXISTS` | a PR for this case is already open → work with the existing PR, never open a second |
+| `ERR08_TEXT_MISSING` | write pr/title.txt + pr/body.md yourself from the case materials |
+| `ERR09_COLDREAD_PENDING` | run a CONTEXT-FREE subagent over the named request file; it writes prtext-verdict.json |
+| `ERR10_COLDREAD_EXHAUSTED` | text edited after the final round → restore the round-2-reviewed text or take the case back through resolve |
+| `ERR11_TOKEN_MISSING` | write the get_credential output to a file, pass `--token-file <path>` |
+| `ERR12_ORIGIN_UNRESOLVED` | origin remote is not a github.com URL → fix the clone's origin; report if you cannot |
+| `ERR13_API_FAILED` | GitHub API write failed → retry once; still failing = case-2 report with the detail |
+| `ERR20_BRANCH_DIVERGED` | owner escalation, never force-resolve (no reset, no force-push) |
+| `ERR21_MERGE_FAILED` | branch halted, siblings continue → report in the digest; file a driver issue if it recurs |
+| `ERR22_DIRTY_WORKTREE` | clean/commit the named worktree, re-run; never `reset --hard` someone else's work |
+| `ERR23_PROTECTED_REF` | you asked the driver to move a protected ref → your inputs are wrong; stop and re-check the case |
+| `ERR24_PLAN_DRIFT` | git moved under the pass → investigate what moved; re-plan only if the journal shows no half-done work |
+| `ERR25_BAD_CASE_ID` | the --case value is not a generated case id → copy the id from the journal/case dir |
+| `WARN01_TEMPLATE_TEXT` | your body references none of the conflicted files — rewrite from the case materials |
+| `WARN02_NO_DECISION_LINE` | open the body with the exact decision the owner is being asked to make |
+| `WARN03_MANY_PRS` | >8 PRs this pass — re-check for consolidation before publishing more |
+| `WARN04_COLDREAD_NOTES` | round-2 caveats shipped on the PR — mention them in the digest line for that PR |
 
 ## Registry upkeep
 
@@ -191,13 +238,13 @@ their branches this way. Only report to the owner if the API path ALSO fails.
   subagents, classification, validator runs, dry-run merge plans. Run them as part of
   every sweep, unprompted.
 - **Mutations follow the case rules, not ad-hoc asking**: case 2 (resolvable) — resolve
-  on `fix/sweep/*`, open the PR, merge it yourself when its tests are green; case 3
-  (resolvable but judgment-worthy, incl. anything security-flagged or touching an open
-  fork fix) — open the PR with your PROVISIONAL resolution and leave it for the owner;
-  case 4 (unresolvable) — draft PR whose head is the upstream stop-point commit
-  (unmergeable by construction), conflict inventory + reproduction command in the PR
-  description, no resolution, no NOTES.md file (D-030). `edition/*` is always case 3
-  minimum.
+  and, when a PR is due, publish it via `propagate publish`; merging remains owner-only
+  (standing rule above); case 3 (resolvable but judgment-worthy, incl. anything
+  security-flagged or touching an open fork fix) — publish the draft PR with your
+  PROVISIONAL resolution and leave it for the owner; case 4 (unresolvable) —
+  `resolve --tier held` then publish the draft freeze PR (exhibit head: the tiny diff
+  IS the conflict inventory; reproduction lives in the materials), no NOTES.md file
+  (D-030/D-048). `edition/*` is always case 3 minimum.
 - Ask the owner in chat ONLY in the two cases of "Reporting to the owner" (D-046):
   new branch candidates, and genuinely bad/unusual failures. Everything else that
   needs an owner decision travels as a draft PR listed in the end-of-sweep report —
@@ -209,9 +256,9 @@ their branches this way. Only report to the owner if the API path ALSO fails.
 ## PR composition and review ergonomics
 
 - **Draft = not ready to merge.** Any PR the owner must decide on before it can merge —
-  case 3 provisional resolutions and case 4 freeze/decision PRs — is created as a
-  **DRAFT** (`gh pr create --draft`). Never publish a normal open PR whose description
-  says "do not merge". Case 2 PRs (which you merge yourself when green) are normal PRs.
+  case 3 provisional resolutions and case 4 freeze/decision PRs — is a **DRAFT**
+  (`propagate publish` creates drafts by design). Never publish a normal open PR whose
+  description says "do not merge".
 - **The description must answer WHY in the first line.** Open with one sentence:
   "Decision needed: <the specific choice>" or "Review needed: <the specific risk>".
   If the reviewer can't tell in ten seconds why they were summoned, the PR is wrong.
@@ -222,30 +269,17 @@ their branches this way. Only report to the owner if the API path ALSO fails.
   GitHub permalink to the exact lines; then state explicitly: "everything outside these
   N files is verbatim upstream <range>, already reviewed upstream." Verification status
   (what ran, what could not run here) closes the description.
-- **Cold-reader gate — mandatory before EVERY PR, drafts and case-2 alike (D-031;
-  widened by D-034 after case-2 PR #41 shipped a session-shorthand title).** You
-  write PR text from inside four hours of sweep context; the owner opens it cold —
-  and self-merged case-2 PRs are read cold too, in the git history. Before ANY
-  `gh pr create`, spawn a subagent and hand it ONLY: the draft title, the
-  draft description, the changed-files list, and this section — explicitly NO sweep
-  context, no session history. Its brief: "You are the repo owner opening this PR
-  cold. From the text alone, answer: (1) WHAT does this PR do, to which branch?
-  (2) WHY are you summoned — what specific decision or check is being asked of you?
-  (3) HOW would you verify it — what would make this resolution wrong, and where
-  would you look? If any answer is not derivable from the text, or the text leans on
-  session shorthand, rewrite the title and description so all three are." Apply the
-  rewrite; after material edits, run the gate once more. What the gate must catch
-  (all four occurred in PRs #34/#35, 2026-07-14):
-  - a bare "Review needed" whose body then says "no judgment call / mechanically
-    sound" — that is a contradiction. State the concrete ask: "approve keeping
-    <branch X>'s version of <file> over <branch Y>'s because <behavior>", or for
-    security surfaces, name the property the owner is signing off on.
-  - resolutions described by line counts or diff mechanics ("596 vs 610 lines",
-    "concurrent-insert at line 37") instead of BEHAVIOR: what capability each side
-    carries, what is kept, what would be lost, and the risk if wrong.
-  - ours/theirs/base without branch names, or internal shorthand ("cascade",
-    "rerere replay") without one clause of plain language.
-  - references to other PRs or prior sessions without saying inline what they are.
+- **PR text (D-031, mechanized by D-048).** YOU write `pr/title.txt` + `pr/body.md`
+  from studying the case — the case materials + worktree are the source of
+  understanding; if you cannot explain both sides of the conflict, study the case
+  more — never publish text you don't understand. The cold read is MEDIATED by
+  `propagate publish`: it writes the context-free review request
+  (`prtext-review-request.md`), you run a context-free subagent over that file and
+  nothing else, and the tool enforces a HARD two-round cap — one rewrite maximum;
+  round-2 notes ship on the PR as `## Caveats (cold reader)`. Two distinct cold
+  reads exist (resolution: `coldread-*.json`, driver-enforced at `resolve`;
+  PR text: `prtext-*.json`, driver-enforced at `publish`) — neither substitutes
+  for the other.
 
 ## Reporting to the owner (D-046 — owner directive; supersedes all digest habits)
 
@@ -260,7 +294,7 @@ need to stop?
    driver's suggested parent(s) and descendant(s) with evidence SHAs, and YOUR
    recommended answer. Ask once, STOP, wait for the owner; don't re-ask until the
    candidate's tip moves. Finish whatever needs no answer first, then ask.
-2. **Something genuinely bad or unusual.** Access/auth failures (gh, git,
+2. **Something genuinely bad or unusual.** Access/auth failures (git, the API,
    credentials), tooling errors you cannot fix yourself, diverged branches, upstream
    history rewrites, verify reds that survive rollback. One message — what broke,
    what you already did, what you need — then STOP.

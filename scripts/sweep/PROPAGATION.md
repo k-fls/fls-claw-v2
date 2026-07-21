@@ -1,7 +1,8 @@
 # Mechanical propagation driver — specification
 
 Status: v1 (2026-07-18, owner-settled design; §13 remote branches + inventory candidates
-added 2026-07-21, D-045). Decision references D-035..D-040 and D-045 point to
+added 2026-07-21, D-045; §14 publish tool + result-ID contract added 2026-07-21,
+D-048). Decision references D-035..D-040, D-045 and D-048 point to
 the decision log (`self-maintenance-decisions.md`). Supersedes the agent-sequenced merge
 loop of DESIGN.md §5-6 for propagation ordering, merge execution, and case handling;
 scan/PoI routing/inventory/verify machinery is reused, not replaced.
@@ -23,7 +24,7 @@ Every parent→branch merge attempt lands in exactly one tier:
 | **CLEAN** | No textual conflict | Bulk-merged directly, no review |
 | **MECHANICAL** | Trivial conflict (e.g. two disjoint appends); agent-resolved | Cold-read confirmed, merged directly, no PR |
 | **JUDGED** | Non-obvious resolution, agent-resolved | PR for the audit trail, cold-read confirmed, auto-merged (merge commit pushed to target → PR flips to merged) |
-| **HELD** | Unresolved / cold-read rejected / sophisticated | Real-diff draft PR (D-030 shape), branch frozen for the owner |
+| **HELD** | Unresolved / cold-read rejected / sophisticated | Draft PR via `publish` (exhibit head, §14 D-048), branch frozen for the owner |
 | **DEFERRED** | Conflict *belongs to an ancestor* currently HELD | Branch frozen, **no PR**; auto-unfreezes when the ancestor's HELD clears |
 
 Tier decisions and constraints:
@@ -260,17 +261,24 @@ The driver is the only author of merge parameters. Artifacts live under
   is doctrine-enforced and ultimately needs an enforcement layer outside the
   agent-writable workspace.
 
-After a JUDGED resolution or a HELD freeze the driver **prepares** the PR mechanics but
-does not talk to GitHub: it creates the local `fix/sweep/<date>-<topic>` branch at the
-right commit (JUDGED: the merge commit; HELD: the parent's conflicting head, so the PR
-shows the real pending diff and GitHub itself flags the conflict — D-030 shape) and
-emits the exact `gh` commands + PR body file. Pushing and PR creation remain under the
-push policy / doctrine gates (D-034 result gates, D-031 cold reader) — and stay frozen
-until the owner lifts the 2026-07-18 sweep freeze.
+After a JUDGED resolution or a HELD freeze the driver **prepares** the PR MATERIALS but
+never PR prose and never a ref: it writes `pr/materials.md` (conflicted paths, per-side
+`git log --oneline` over those paths, reproduction command) into the case dir. The agent
+studies the case and writes `pr/title.txt` + `pr/body.md` itself; the PR is then created
+EXCLUSIVELY by `propagate publish --case <id>` (§14, D-048), whose head is an **exhibit
+head**: a synthetic commit parented on the ORIGIN base-branch tip whose tree is the base
+tree with ONLY the case's conflicted paths overlaid (HELD: conflict-marker blobs from
+the recomputed merge-tree; JUDGED: the resolved blobs), hard-asserted so that
+`git diff <origin-base-tip> <exhibit>` equals the conflicted paths EXACTLY. This
+supersedes the D-030 "parent's conflicting head" shape, whose PR diff showed the whole
+pending range (26-60x bloat, 2026-07-21 forensics) and whose pushes back-doored
+unpushed protected-branch commits onto origin. Trade-off, accepted: GitHub no longer
+flags the PR as unmergeable — the conflict markers inside the tiny diff ARE the exhibit.
 
 JUDGED PR closure (D-040): after cold-read confirmation, the same merge commit is pushed
 to the target branch; GitHub auto-marks the PR merged — history preserved, zero
-merge-of-merge noise, no dependence on the merge button.
+merge-of-merge noise, no dependence on the merge button. (Pushing target branches is
+owner-gated; see the doctrine.)
 
 ## 8. Driver loop
 
@@ -281,14 +289,17 @@ propagate run                 # execute plan: CLEAN merges + skips + DEFERRED ma
                               #   other branches (one branch's case never blocks siblings, only
                               #   descendants via the barrier)
 propagate resolve --case ID --tier T   # scope guard + cold-read gate, then merge (MECHANICAL) or
-                              #   prepare PR (JUDGED) or freeze (HELD); reopens the branch
+                              #   prepare PR materials (JUDGED) or freeze (HELD); reopens the branch
+propagate publish --case ID   # §14 (D-048): the ONLY PR-creation path — exhibit head + check
+                              #   battery; --execute creates the fix/sweep ref + draft PR via
+                              #   the GitHub REST API (the driver's single networked command)
 propagate status              # human-readable pass state from journal + derivation
 ```
 
 `--tier held` is the direct freeze path: no resolution commit required, no scope guard
-or cold-read gate — the driver prepares the D-030 real-diff draft PR at the conflicting
-head and journals HELD. This is how an agent declares "cannot resolve" without a
-resolution attempt.
+or cold-read gate — the driver prepares the PR materials (§14) and journals HELD. This
+is how an agent declares "cannot resolve" without a resolution attempt; the freeze PR
+itself is published separately via `publish`.
 
 **Same-pass continuation:** a gated branch is still journaled `arrived` (barrier
 semantics — descendants may proceed on its partial progress), but every `resolve`
@@ -394,8 +405,9 @@ before verification passes (D-034 gate 1-2 additionally apply to any push).
 | `deferred.ts` | ancestor-HELD matching rule (§5) |
 | `scope-guard.ts` | automerge-vs-resolved subset check (§7) |
 | `steps.ts` | step/case JSON schemas + first-principles re-verification |
-| `propagate.ts` | CLI (`plan/run/resolve/status`), journal, worktree + PR preparation |
+| `propagate.ts` | CLI (`plan/run/resolve/publish/status`), journal, worktree + PR-materials preparation |
 | `candidates.ts` | inventory-candidate discovery + inheritance derivation + report throttle (§13, D-045) |
+| `publish.ts` | §14 (D-048): exhibit-head construction, result-id registry + halt-id mapping, PR-text cold-read gate, GitHub REST transport (injectable) |
 
 Reused as-is: `git.ts` (merge-tree, rev-list, worktree helpers), `merge.ts` (merge-tree
 + commit-tree + update-ref execution, rerere install), `scan.ts`/`routing.ts` (PoI
@@ -557,3 +569,123 @@ the owner, proposing `clear` placements for approval, asking the `unclear` open
 questions verbatim, and only ever creating/amending entries (via the
 fork-registry-generate skill + seeds.yaml PR) after owner approval with the approved
 `parents:`.
+
+## 14. Publish tool and result-ID contract (D-048)
+
+**Motivation (owner, 2026-07-21 forensics of the live freeze PRs):** (a) the D-030
+head shape put the PR head on the parent's line, so GitHub rendered the whole pending
+range — 26-60x diff bloat — and pushing those heads back-doored unpushed
+protected-branch merge commits onto origin (PR #58); (b) the driver's prepared PR
+bodies were tautological templates that could never pass the agent's own text gate
+(a 3-round rewrite loop, ~19 min, ~300k subagent tokens), and the doctrine's
+per-edit re-arm of the gate was unenforceable; (c) no gate anywhere asked "should
+this PR exist" — three of six PRs re-raised recorded decisions, three were
+byte-identical duplicates.
+
+### 14.1 `propagate publish --case <id>` — the ONLY sanctioned PR-creation path
+
+**Agent-writes-prose principle:** the driver NEVER generates PR prose. At
+resolve/freeze it writes `pr/materials.md` (structured facts only: conflicted paths,
+per-side `git log --oneline` over those paths, reproduction command). The agent
+studies the case — the worktree and materials ARE the source of understanding — and
+writes `pr/title.txt` + `pr/body.md` itself, then runs `publish`. The tool:
+
+1. **Re-verifies the case** from the journal + git (the journal is a pointer, git is
+   the authority): the case must have an open `held` disposition (live conflict
+   recomputed against the current tip, path set unchanged) or a `judged` resolution
+   (merge commit still on the branch). Mechanical/crash-heal resolutions get no PR.
+2. **Builds the EXHIBIT HEAD**: synthetic commit parented on the ORIGIN base-branch
+   tip (local-tip fallback only when no origin ref exists) whose tree is the base
+   tree with ONLY the conflicted paths overlaid — conflict-marker blobs for HELD,
+   resolved blobs for JUDGED — then HARD-ASSERTS
+   `git diff --name-only <origin-base-tip> <exhibit>` == conflictedPaths exactly.
+3. **Runs the check battery** and emits ONE machine-readable JSON object on stdout:
+   `{ok, issues: [{id, detail}], pr?: {url, number}}`. Any ERR* id blocks; WARN* ids
+   are advisory and never block.
+4. **On all-clear + `--execute`**: creates the fix/sweep ref AND the draft PR via the
+   GitHub REST API directly from node (blobs → tree → commit → ref → draft PR;
+   origin-parenting makes the base tree remotely constructible). No `gh`, no
+   `python3`, no `git push` — none of those work in the agent container; requests go
+   to api.github.com with `Authorization: Bearer <substitute token>` (the credential
+   proxy swaps the header on the wire), CONNECT-tunnelled through HTTPS_PROXY. The
+   token comes from `--token-file <path>` — the agent writes the get_credential
+   output there once per session; `$GITHUB_TOKEN` is never read. Journals
+   `pr-published {case, url, number}`.
+5. **Without `--execute`**: dry-run — the full battery runs and local artifacts
+   (prtext review requests, §14.2) may be written, but there are NO network calls of
+   any kind; the transport is never constructed.
+
+Cross-pass publishes attach like `resolve` (latest open pass, or `--pass <wm12>`).
+The pr/ dir is agent-writable, so — as with the resolution cold read (§7/§12) — the
+tool enforces shape, rounds and hash freshness; provenance (that a context-free
+reader wrote the verdict) is doctrine-enforced.
+
+### 14.2 PR-text cold read — driver-mediated, HARD two-round cap
+
+The first publish attempt with text present writes `prtext-review-request.md` into
+the case pr/ dir — title + body + conflictedPaths + the case materials + relevant
+inventory `extra_context` excerpts (the derivability inputs) + the adequacy-first
+question list — stamped `round: N` and `textHash: sha256(<title>\n<body>)`, and
+returns ERR09. The agent runs a CONTEXT-FREE subagent over the request file, which
+writes `prtext-verdict.json` `{round, verdict: publish|rewrite|reject-derivable|
+consolidate, derivedAnswer?, notes[], textHash}` (textHash copied from the request;
+the tool validates shape + hash freshness + round). Questions, adequacy first:
+**Q0** does this PR need to exist — decision already recorded / derivable from code
+or case rules / duplicate of a sibling → `reject-derivable` or `consolidate` WITH the
+answer; **Q1** from the text alone state the one-line decision and what changes if
+the owner answers yes vs no — if impossible, ONE rewrite.
+
+Round rules (rounds are consumed by VERDICTS, never by requests): `publish` →
+publish. `rewrite` on round 1 → the agent edits; the next attempt (stale hash) issues
+the round-2 request. **Round 2 is FINAL**: `publish` and `rewrite` both ship, with
+any notes appended to the body under `## Caveats (cold reader)` (WARN04).
+`reject-derivable`/`consolidate` at ANY round block with ERR05/ERR06 semantics,
+surfacing the derivedAnswer. **Round 3 is impossible**: the tool refuses to emit a
+round-3 request (a verdict with round > 2 is invalid shape; editing the text after
+the final round is ERR10). This replaces the unenforceable "after material edits,
+run the gate once more" doctrine rule.
+
+Two DISTINCT cold reads exist: the RESOLUTION cold read (`coldread-*.json`,
+driver-enforced at `resolve`, §7) and the PR-TEXT cold read (`prtext-*.json`,
+driver-enforced at `publish`). Neither substitutes for the other.
+
+### 14.3 Result-ID registry (single source of truth)
+
+Blocking (any one → no publish):
+
+| id | meaning |
+|----|---------|
+| `ERR01_CASE_NOT_OPEN` | no open journaled held/judged disposition for the case (unresolved, mechanical, or never journaled) |
+| `ERR02_CASE_STALE` | live state moved: resolution landed externally, conflict healed, path set drifted, or the judged merge left the branch |
+| `ERR03_DIFF_EXCEEDS_CONFLICT_SET` | exhibit diff != conflictedPaths exactly (overlay mismatch) |
+| `ERR04_UNPUSHED_PARENT` | exhibit ancestry would carry local-only protected-branch commits (structurally prevented by origin-parenting; asserted anyway) |
+| `ERR05_DECIDED_ALREADY` | a conflictedPath matches a decision recorded in inventory `prompt.extra_context` / `decided_paths` (record quoted in detail) |
+| `ERR06_DUPLICATE_CASE` | another open case or published PR shares the conflict signature (same path set + same head sha or same exhibit tree); the topmost case by DAG order is named |
+| `ERR07_PR_EXISTS` | an open PR is already recorded for this case (journal) or found via the API by head branch name |
+| `ERR08_TEXT_MISSING` | pr/title.txt or pr/body.md absent or empty |
+| `ERR09_COLDREAD_PENDING` | a PR-text cold-read round is pending (request written/regenerated; see §14.2) |
+| `ERR10_COLDREAD_EXHAUSTED` | text edited after the FINAL (round-2) verdict; no round-3 request exists — unreachable in normal flow |
+| `ERR11_TOKEN_MISSING` | `--execute` without a readable `--token-file` |
+| `ERR12_ORIGIN_UNRESOLVED` | `--execute` but owner/repo cannot be derived from the origin remote URL |
+| `ERR13_API_FAILED` | a GitHub API call failed during execute (non-2xx / transport error) |
+
+Advisory (returned in `issues`, never block):
+
+| id | meaning |
+|----|---------|
+| `WARN01_TEMPLATE_TEXT` | body mentions zero conflictedPaths, or contains a retired driver-template phrase |
+| `WARN02_NO_DECISION_LINE` | the first body line carries no ask/decision |
+| `WARN03_MANY_PRS` | more than 8 PRs published this pass |
+| `WARN04_COLDREAD_NOTES` | round-2 reader notes were appended to the body as Caveats |
+
+DriverHalt reasons, mapped onto the same scheme in `run`/`resolve` CLI output (the
+human text stays in `detail`; the journal keeps the raw reason plus the id):
+
+| id | halt reason |
+|----|-------------|
+| `ERR20_BRANCH_DIVERGED` | `sync-diverged` (§13 — owner escalation, never force-resolve) |
+| `ERR21_MERGE_FAILED` | `merge-failed` (D-047/B11 backstop — branch-local halt) |
+| `ERR22_DIRTY_WORKTREE` | `dirty-worktree` (N1 checked-out safety) |
+| `ERR23_PROTECTED_REF` | `protected-ref` (§8 choke point) |
+| `ERR24_PLAN_DRIFT` | plan drift — git moved under us (§8) |
+| `ERR25_BAD_CASE_ID` | `--case` does not match the generated case-id shape (N5) |
