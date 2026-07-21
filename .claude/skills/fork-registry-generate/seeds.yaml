@@ -130,6 +130,12 @@ features:
       customOperations.create + createMessagingGroupAgent (creates the
       agent_destinations row, guarded). Take main_patched's side; fork-only
       threads/priority fields survive. Resolve as judged. Never freeze/re-ask.
+      RECORDED 2026-07-21 (G1 mining, pre-existing owner-era decisions): (1)
+      container/agent-runner/src/current-batch.ts modify/delete vs upstream —
+      KEEP the fork file (intentional divergence; supervised PR #4, kept through
+      the rollback). (2) src/db/migrations/** numbering collisions — fork uses
+      side-numbering convention NN-fls-MM / flsMigrationNNN (T5a); renumber the
+      fork migration, never upstream's. Both resolve under A1; PoI still fires.
   feat.memory-substrate:
     name: Memory substrate P0 (design 06, WS-H)
     summary: "Memory architecture P0: LogAdapter over session logs including rotated files,

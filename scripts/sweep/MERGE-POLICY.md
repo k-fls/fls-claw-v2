@@ -11,7 +11,7 @@ workaround, "merging remains owner-only".
 | Tier | Trigger | Action | Review | PR |
 |---|---|---|---|---|
 | CLEAN | no textual conflict (merge-tree) | bulk direct merge | none | none |
-| MECHANICAL | conflict the agent is allowed to resolve (what qualifies is regulated separately, not here) | direct merge | cold-read confirm required | none — journal + cold-read artifact only |
+| MECHANICAL | conflict the agent is allowed to resolve (qualification: §7) | direct merge | cold-read confirm required | none — journal + cold-read artifact only |
 | JUDGED | non-obvious conflict, agent-resolved | merge; same commit pushed to target → PR auto-marks merged | cold-read confirm required | yes (history) |
 | HELD | unresolved / cold-read reject / scope-guard violation / red verify gate / escalation | clean prefix merges first; draft PR at the conflicting head | **owner** (the only review state) | draft PR, real diff (D-030 head) |
 | DEFERRED | conflict belongs to a HELD ancestor: held height ∈ (floor, N′] window AND conflicted paths intersect | no merge of that range; freeze; auto-unfreeze when ancestor clears | none | none |
@@ -101,3 +101,76 @@ Tier rules:
   upstream commits (kept current via urge comments).
 - HELD PR text: written by the AGENT from studying the case (materials + worktree);
   driver provides facts only; text gated by the two-round cold read (hard cap).
+
+## 7. MECHANICAL/resolve qualification (G1)
+
+Status: owner-settled 2026-07-21 (evidence corpus: PRs #4-#60, T/p test-case
+registry, pass journals). Regulates WHICH conflicts the agent may resolve
+(MECHANICAL or JUDGED) and which are HELD. G1 governs textual conflicts only;
+floors (§1) apply on top: `edition/*` / `tier_floor` entries never claim MECHANICAL.
+
+### 7.1 ALLOWED — the agent resolves
+
+A case qualifies if EVERY conflicted path falls under ≥1 rule. MECHANICAL only when
+the resolution is byte-derivable; otherwise JUDGED. Driver demote-only.
+
+- **A1 recorded decision** — paths + both-sides shape covered by a recorded decision
+  (seeds `prompt_extra_context` / inventory `extra_context` / rerere seed). Re-apply
+  exactly, never re-ask. MECHANICAL if rerere replays; JUDGED if re-applied to moved
+  code. *(Option A / command-gate composition / wirings records.)*
+- **A2 known-recurring keep-both** — both sides insert adjacent/at the same point;
+  canonical keep-both in rr-cache. MECHANICAL. *(poll-loop T2 family.)*
+- **A3 additive union** — both sides only ADD:
+  (a) list-shaped regions: imports, exports, config knobs, migration barrels, test
+      suites, doc lists — union, no base or side line lost. MECHANICAL when hunks
+      are disjoint-additive; JUDGED when interleaving is needed.
+  (b) function/method PARAMETERS: both sides add params to the same signature —
+      union ALL params and update ALL call sites accordingly. JUDGED.
+  (c) class/struct/interface/data-type FIELDS: union of fields, with constructors/
+      initializers/serializers updated accordingly. JUDGED.
+  For (b)/(c) the resolution's allowed path set extends to the files referencing
+  the unioned symbol (call sites / constructors) — driver computes the extension;
+  anything beyond it is still F5. Union completeness is checkable; call-site
+  completeness is backstopped by the verify gate (typecheck/tests); ordering and
+  initializer semantics belong to the cold read.
+- **A4 verifiable subsumption** — the losing side's commits on the conflicted paths
+  are git-ancestors of the winning side's line, or a verified textual superset.
+  Take the superset. MECHANICAL. *(Negative control: an UNVERIFIED superset claim
+  fails review even when accidentally right — PR #35.)*
+- **A5 verified replacement** — a side removed a fork-relied mechanism but a
+  replacement demonstrably exists on that side: cite symbol + file:line + preserved
+  behavior in the record. JUDGED only. *(wirings: messaging-groups.ts:213.)*
+- **A6 comment/prose-only side** — one side's delta is comments/docs only: keep the
+  code side, fold the text. MECHANICAL for pure-docs paths; JUDGED when folding
+  into code.
+
+Boundary on all of §7.1: only material from the two sides, the base, a cited
+record, or the A3(b/c) computed call-site extension. Third-branch content or edits
+beyond the allowed set → HELD outright *(the PR #34 rollback)*.
+
+### 7.2 FORBIDDEN — always HELD
+
+Any single trigger escalates the whole case.
+
+- **F1 design conflict, no record** — a side removed/reshaped a mechanism the other
+  depends on; A5 fails and A1 fails. Includes modify/delete of fork-modified files
+  (first occurrence) and seam-threatening invariant trips.
+- **F2 security-semantics change** — conflicted hunks alter ENFORCEMENT behavior on
+  a sensitive surface (routing.yaml `sensitive_surfaces` / seeds security
+  invariants) with no covering record. A sensitive PATH alone does not force HELD —
+  it floors the claim at JUDGED.
+- **F3 contradicts a recorded decision** — would drop/invert/re-decide anything a
+  record settles; never re-open a decided question (D-030).
+- **F4 intent not establishable** — owner in-flight fix branches, DIVERGED branches
+  (D-045), unclear candidates; the HELD PR must NAME the underivable premise.
+- **F5 out-of-scope resolution** — beyond the allowed set (incl. A3(b/c) extension)
+  or third-branch content. HELD, no merge.
+- **F6 driver escalations** — cold-read reject, red verify gate, scope-guard trip
+  (§1); G1 never overrides them.
+
+### 7.3 Tie-breaker
+
+1. DERIVE first (the forensics standard): check code, records, structure. A HELD PR
+   that merely asks the owner to do the agent's reading is a defect, not caution.
+2. Any unverifiable premise → HELD, naming that exact premise as the ask.
+3. Qualifying but unsure between tiers → claim JUDGED.

@@ -24,7 +24,7 @@ Every parent→branch merge attempt lands in exactly one tier:
 | Tier | Meaning | Handling |
 |------|---------|----------|
 | **CLEAN** | No textual conflict | Bulk-merged directly, no review |
-| **MECHANICAL** | Conflict the agent is allowed to resolve (what qualifies is regulated separately — owner rule pending, D-049 G1); agent-resolved | Cold-read confirmed, merged directly, no PR |
+| **MECHANICAL** | Conflict the agent is allowed to resolve (qualification: MERGE-POLICY.md §7, owner-settled); agent-resolved | Cold-read confirmed, merged directly, no PR |
 | **JUDGED** | Non-obvious resolution, agent-resolved | NON-draft PR for the audit trail (head = the REAL merge commit), cold-read confirmed, auto-merged: the same merge commit pushed to the target flips the PR to merged (D-040) |
 | **HELD** | Unresolved / cold-read rejected / sophisticated | DRAFT PR via `publish` at the case run's TOP commit (real diff = the run — D-030 head, §14 D-049), branch frozen for the owner |
 | **DEFERRED** | Conflict *belongs to an ancestor* currently HELD | Branch frozen, **no PR**; auto-unfreezes when the ancestor's HELD clears |
