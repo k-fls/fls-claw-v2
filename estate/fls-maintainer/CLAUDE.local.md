@@ -239,20 +239,22 @@ rediscover it the hard way):
    The old flag-based `propagate plan/run/resolve/publish/push` is the driver's
    internal implementation (still present) — it is NOT your surface anymore; do
    not invoke `resolve`/`publish` by hand or hand-manage `coldread-verdict.json`.
-   **Case comprehension — MINIMAL SCOPE (owner directive, D-056):** the driver has
-   ALREADY done all analysis (DAG, scope, merge-point, the per-side history). Your
-   ONLY job per case is to resolve the conflict markers in the SPECIFIC conflicted
-   files the materials name — nothing else. Open and edit ONLY the conflicted paths
-   listed in `materials.md`; do NOT read, grep, `git log`, or explore any other file
-   in the worktree, and do NOT re-derive analysis the driver already did. The two
-   sides (in the conflict markers) plus the per-side summary in `materials.md` ARE
-   the context — they are small and sufficient by design. If you genuinely cannot
-   decide the resolution from the two sides + the materials brief, that is exactly
-   what `--tier held` is for (escalate to the owner): "cannot decide" → HELD, NEVER
-   "explore the repo more" — a resolution you can't make from the conflict + brief is
-   not yours to make. A case is still a RUN of stacked conflicting heights (D-049 §2,
-   up to `stack_cap`): one logical decision, one resolution, one cold read — the
-   materials list the run.
+   **Case comprehension — ROOTED SCOPE (owner directive, D-056):** the driver did the
+   MECHANICAL work only (sequencing/DAG, scope, merge-point, assembling the materials +
+   per-side history) — it did NOT understand the change. Understanding the change is
+   YOUR job. You EDIT only the conflicted paths the materials name, but you MAY and
+   SHOULD read beyond them to understand the change — the functions/symbols in the
+   conflict, their call sites, the relevant tests — whatever it takes to resolve
+   correctly. The bound is ROOTED RELEVANCE, not "conflicted files only": start from
+   the conflict hunks and follow what is reasonably connected to THEM outward. Do NOT
+   do open-ended/global research disconnected from the conflict — no reading the whole
+   tree, no broad `git log`/history or decision-log spelunking, no unrelated branches,
+   and never "keep studying until it makes sense" in a 752-file checkout. Every search
+   must trace back to the conflicted change. If, after rooted research, you still
+   cannot decide, that is exactly what `--tier held` is for (escalate) — "cannot
+   decide" → HELD, never an ever-widening search. A case is a RUN of stacked
+   conflicting heights (D-049 §2, up to `stack_cap`): one logical decision, one
+   resolution, one cold read — the materials list the run.
    PRs (D-048/D-049/D-053): the driver NEVER writes PR prose — at report-case it
    prepares `pr/materials.md` (facts: conflicted paths, the case run, per-side
    histories). YOU study the case and write `pr/title.txt` + `pr/body.md` at that
