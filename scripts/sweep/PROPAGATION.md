@@ -791,6 +791,7 @@ for the owner and journaled `resolve-not-converged`):
 | id | meaning |
 |----|---------|
 | `ERR26_RESOLVE_NOT_CONVERGED` | D-052: the resolution cold-read did not converge in `RESOLVE_COLDREAD_CAP` (3) distinct resolution trees — the anti-thrash cap force-HELD the case rather than looping |
+| `ERR35_COLDREAD_UNAVAILABLE` | D-054: the cold read (`claude -p`) could not RUN — spawn error, non-zero exit, unparseable stdout, or a recognizable auth/login failure. An INFRA error, NOT a content decision: `report-case`/`report-pr` hard-halt (mirrors `ERR15`), the case is NOT frozen HELD, and the command is re-runnable once the tooling is restored. Only a cold read that actually ran and rejected → HELD |
 
 DriverHalt reasons, mapped onto the same scheme in `run`/`resolve` CLI output (the
 human text stays in `detail`; the journal keeps the raw reason plus the id):

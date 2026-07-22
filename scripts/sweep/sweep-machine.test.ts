@@ -20,6 +20,7 @@ import {
   cmdSweepReportCase,
   cmdSweepReportPr,
   cmdSweepStart,
+  parseMachineVerdict,
   passDir,
   readJournal,
   type Cli,
@@ -115,6 +116,13 @@ const rejectDesc: ColdReadInvoker = async () => ({
   verdict: 'reject',
   notes: 'description misrepresents the resolution',
   defect: 'description',
+});
+// D-054: the cold-read TOOLING is broken (spawn/exit/unparseable/auth) — an infra
+// error, distinct from a content reject. Must halt (ERR35), never freeze HELD.
+const infraError: ColdReadInvoker = async () => ({
+  verdict: 'error',
+  notes: '',
+  reason: 'claude -p failed (status 1: Not logged in)',
 });
 
 /** Fake GitHub transport (no existing PR on head-lookup; created PR #7; closures merged). */
@@ -600,5 +608,280 @@ describe('sweep — crash resume (machine-state drives re-entry, D-053 §5)', ()
       ),
     ).toBe(0);
     expect(repo.git('show', 'main_patched:src/x.ts')).toBe('RESOLVED');
+  });
+});
+
+describe('sweep progress — SWEEP-STEP observability (D-054)', () => {
+  // Capture STDOUT faithfully: `progress` goes through process.stdout.write, `emit`
+  // through console.log — both land on fd 1 (interleaved) in production, but under
+  // vitest console.log is intercepted separately, so we swap BOTH into one shared,
+  // call-ordered buffer to reproduce the real interleaving.
+  function captureStdout(): { text: () => string; restore: () => void } {
+    const chunks: string[] = [];
+    const origWrite = process.stdout.write.bind(process.stdout);
+    const origLog = console.log;
+    (process.stdout as unknown as { write: unknown }).write = (chunk: unknown, ...rest: unknown[]): boolean => {
+      chunks.push(typeof chunk === 'string' ? chunk : String(chunk));
+      const cb = rest.find((r) => typeof r === 'function') as ((e?: Error) => void) | undefined;
+      cb?.();
+      return true;
+    };
+    console.log = (...args: unknown[]): void => {
+      chunks.push(args.map((a) => (typeof a === 'string' ? a : String(a))).join(' ') + '\n');
+    };
+    return {
+      text: () => chunks.join(''),
+      restore: () => {
+        (process.stdout as unknown as { write: typeof origWrite }).write = origWrite;
+        console.log = origLog;
+      },
+    };
+  }
+  // The TWO-PREFIX contract (D-054): SWEEP-STEP lines are relayed progress;
+  // SWEEP-RESULT is the SINGLE guidance line (compact JSON) the agent acts on;
+  // any BARE JSON line (a line starting with `{`) would be a nested command that
+  // failed to be silenced — the hazard this closes, so we assert there are none.
+  function splitSweep(raw: string): { steps: string[]; results: unknown[]; bareJson: string[] } {
+    const lines = raw.split('\n');
+    const steps = lines.filter((l) => l.startsWith('SWEEP-STEP: ')).map((l) => l.slice('SWEEP-STEP: '.length));
+    const results = lines
+      .filter((l) => l.startsWith('SWEEP-RESULT: '))
+      .map((l) => JSON.parse(l.slice('SWEEP-RESULT: '.length)) as unknown);
+    const bareJson = lines.filter((l) => l.trimStart().startsWith('{') || l.trimStart().startsWith('['));
+    return { steps, results, bareJson };
+  }
+
+  it('report-case mechanical: interleaved SWEEP-STEP lines, exactly one SWEEP-RESULT line that parses to the guidance', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+
+    const cap = captureStdout();
+    let rc: number;
+    try {
+      rc = await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true }),
+        confirm,
+      );
+    } finally {
+      cap.restore();
+    }
+    expect(rc).toBe(0);
+
+    const { steps, results, bareJson } = splitSweep(cap.text());
+    // MAJOR steps only: the mechanical cold read, then the in-place merge.
+    expect(steps).toContain('cold-read: main_patched');
+    expect(steps).toContain('mechanical resolve: main_patched — merged');
+    // Exactly ONE result line, parsed to the guidance the agent acts on.
+    expect(results).toHaveLength(1);
+    expect((results[0] as { instruction: string; tier: string }).instruction).toBe('merged, take next case');
+    expect((results[0] as { tier: string }).tier).toBe('mechanical');
+    // No SWEEP-STEP text leaked into the parsed result; no un-prefixed JSON blob.
+    expect(JSON.stringify(results[0])).not.toContain('SWEEP-STEP');
+    expect(bareJson).toEqual([]);
+  });
+
+  it('next-case: batched merge summary + case-ready steps, and cmdRun (internal) emits NO JSON — exactly one SWEEP-RESULT', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    await cmdSweepStart(baseCli(repo, ws, inv));
+
+    const cap = captureStdout();
+    let rc: number;
+    try {
+      rc = await cmdSweepNextCase(baseCli(repo, ws, inv));
+    } finally {
+      cap.restore();
+    }
+    expect(rc).toBe(0);
+
+    const { steps, results, bareJson } = splitSweep(cap.text());
+    expect(steps).toContain('scanning upstream');
+    expect(steps.some((s) => /^planning \(\d+ branches\)$/.test(s))).toBe(true);
+    // one batched summary line — never one line per merged branch
+    expect(steps.some((s) => /^merged \d+ clean \/ skipped \d+ \/ deferred \d+$/.test(s))).toBe(true);
+    expect(steps.some((s) => s.startsWith('case ready: main_patched — '))).toBe(true);
+    // the nested cmdRun is silenced: no bare JSON blob, exactly one SWEEP-RESULT.
+    expect(bareJson).toEqual([]);
+    expect(results).toHaveLength(1);
+    expect((results[0] as { status: string }).status).toBe('case-ready');
+  });
+
+  it('next-case on a clean pass: batched summary, `no more cases`, one finalize SWEEP-RESULT, no bare JSON', async () => {
+    const repo = cleanFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    await cmdSweepStart(baseCli(repo, ws, inv));
+
+    const cap = captureStdout();
+    try {
+      expect(await cmdSweepNextCase(baseCli(repo, ws, inv))).toBe(0);
+    } finally {
+      cap.restore();
+    }
+    const { steps, results, bareJson } = splitSweep(cap.text());
+    expect(steps).toContain('no more cases');
+    expect(steps.some((s) => /^merged \d+ clean /.test(s))).toBe(true);
+    expect(bareJson).toEqual([]);
+    expect(results).toHaveLength(1);
+    expect((results[0] as { status: string }).status).toBe('finalize');
+  });
+
+  it('finish: nested verify/publish/push (internal) emit NO JSON — exactly one SWEEP-RESULT for the whole command', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const cmdsFile = join(ws, 'cmds-true.json');
+    writeFileSync(cmdsFile, JSON.stringify([{ cmd: 'true' }]));
+
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true }), confirm);
+    writePr(dir, caseId, 'judged x', 'Decision needed: keep the fork line in src/x.ts.');
+    await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm);
+    await cmdSweepNextCase(baseCli(repo, ws, inv)); // finalize
+
+    const gh = fakeGithub();
+    const cap = captureStdout();
+    let rc: number;
+    try {
+      rc = await cmdSweepFinish(
+        baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, tokenFile, commandsFile: cmdsFile }),
+        gh.factory,
+      );
+    } finally {
+      cap.restore();
+    }
+    expect(rc).toBe(0);
+
+    const { steps, results, bareJson } = splitSweep(cap.text());
+    // the finish major steps show the phases (nested verify/publish/push run, but
+    // ONLY their SWEEP-STEP progress surfaces — never their result JSON).
+    expect(steps).toContain('verify: running');
+    expect(steps).toContain('verify: green');
+    expect(steps.some((s) => /^push: targets \(\d+\)$/.test(s))).toBe(true);
+    expect(steps).toContain('report ready');
+    // the whole multi-step command yields exactly ONE result line, no bare JSON.
+    expect(bareJson).toEqual([]);
+    expect(results).toHaveLength(1);
+    expect((results[0] as { ok: boolean; status: string }).ok).toBe(true);
+    expect((results[0] as { status: string }).status).toBe('complete');
+  });
+});
+
+describe('cold-read infra failure ≠ content reject (D-054, ERR35_COLDREAD_UNAVAILABLE)', () => {
+  it('parseMachineVerdict: a valid confirm/reject is content; unparseable OR auth text is an infra error', () => {
+    expect(parseMachineVerdict('noise\n{"verdict":"confirm","notes":"ok"}\n').verdict).toBe('confirm');
+    expect(parseMachineVerdict('{"verdict":"reject","notes":"drops behaviour"}').verdict).toBe('reject');
+    // no parseable verdict object -> error (NOT reject)
+    const unparseable = parseMachineVerdict('total garbage, no json here');
+    expect(unparseable.verdict).toBe('error');
+    expect(unparseable.reason).toMatch(/no parseable verdict/i);
+    // auth/login failure printed at exit 0 -> error (NOT reject)
+    const auth = parseMachineVerdict('Invalid API key · Please run /login');
+    expect(auth.verdict).toBe('error');
+    expect(auth.reason).toMatch(/auth\/login failure/i);
+  });
+
+  it('report-case mechanical: infra error -> HARD HALT (ERR35), case NOT held, still case-ready', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        infraError,
+      ),
+    ).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> };
+    expect(res.issues.some((i) => i.id === 'ERR35_COLDREAD_UNAVAILABLE')).toBe(true);
+    // NOT a content decision: no freeze, branch unchanged, still the current case.
+    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
+    expect(readJournal(dir).some((e) => e.action === 'resolved' && e.caseId === caseId)).toBe(false);
+    expect(machineState(dir).phase).toBe('case-ready');
+    // journaled as a halt with the id, so a dead session still shows why.
+    expect(readJournal(dir).some((e) => e.action === 'halt' && e.id === 'ERR35_COLDREAD_UNAVAILABLE')).toBe(true);
+  });
+
+  it('report-case mechanical: a cold read that RAN and rejected -> still HELD (content decision preserved)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true }),
+        rejectCode,
+      ),
+    ).toBe(0);
+    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
+    expect(readJournal(dir).some((e) => e.action === 'halt' && e.id === 'ERR35_COLDREAD_UNAVAILABLE')).toBe(false);
+  });
+
+  it('report-case mechanical: confirm -> merges (no halt, no freeze)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true }),
+        confirm,
+      ),
+    ).toBe(0);
+    expect(readJournal(dir).some((e) => e.action === 'resolved' && e.caseId === caseId)).toBe(true);
+    expect(readJournal(dir).some((e) => e.action === 'halt' && e.id === 'ERR35_COLDREAD_UNAVAILABLE')).toBe(false);
+  });
+
+  it('report-pr: infra error -> HARD HALT (ERR35), nothing frozen/published, still awaiting-pr', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    // judged deterministic pass -> awaiting-pr; the cold read is deferred to report-pr.
+    await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true }), confirm);
+    writePr(dir, caseId, 'judged x', 'Decision needed: keep the fork line in src/x.ts.');
+    const out = join(ws, 'pr.json');
+    expect(
+      await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), infraError),
+    ).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> };
+    expect(res.issues.some((i) => i.id === 'ERR35_COLDREAD_UNAVAILABLE')).toBe(true);
+    // nothing published, nothing merged; the case is still awaiting its PR.
+    expect(readJournal(dir).some((e) => e.action === 'pr-published' && e.caseId === caseId)).toBe(false);
+    expect(readJournal(dir).some((e) => e.action === 'resolved' && e.caseId === caseId)).toBe(false);
+    expect(machineState(dir).phase).toBe('awaiting-pr');
+    expect(readJournal(dir).some((e) => e.action === 'halt' && e.id === 'ERR35_COLDREAD_UNAVAILABLE')).toBe(true);
   });
 });

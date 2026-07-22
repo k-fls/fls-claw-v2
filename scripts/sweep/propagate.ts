@@ -72,6 +72,7 @@ import {
   appendFileSync,
 } from 'node:fs';
 import { join, resolve as pathResolve } from 'node:path';
+import { homedir } from 'node:os';
 
 import {
   DEFAULT_STACK_CAP,
@@ -180,6 +181,14 @@ interface Cli {
   recipe?: string[];
   commandsFile?: string;
   out?: string;
+  /**
+   * D-054: set on a nested invocation (a state-machine command driving a flag
+   * command internally — next-case→run, finish→verify/publish/push/report). When
+   * true, `emit` is a no-op and cmdReport skips its `--out` write, so ONLY the
+   * outer state-machine command produces a result line. The nested call still
+   * does its work, journals, and prints its own SWEEP-STEP progress.
+   */
+  internal?: boolean;
 }
 
 const USAGE =
@@ -1107,7 +1116,26 @@ async function removeCaseWorktree(cli: Cli, dir: string, caseId: string): Promis
 // Subcommands.
 // --------------------------------------------------------------------------
 
+/**
+ * D-054: the single machine-readable guidance line for a state-machine command
+ * (SWEEP-STATE-MACHINE.md §2), written to STDOUT with the exact prefix
+ * `SWEEP-RESULT: ` (compact one-line JSON) — mirrors `progress`. The five
+ * commands (+ abort) call this DIRECTLY, so exactly ONE line is produced per
+ * command; the two-prefix contract is then unambiguous for a backgrounded
+ * next-case/finish: `SWEEP-STEP:` = relay, `SWEEP-RESULT:` = parse + act,
+ * anything else = ignore (no "last JSON wins" guessing). `--out` still gets the
+ * pretty JSON for file/machine consumers (and the existing test fixtures).
+ */
+function result(cli: Cli, artifact: unknown): void {
+  process.stdout.write(`SWEEP-RESULT: ${JSON.stringify(artifact)}\n`);
+  if (cli.out) writeFileSync(cli.out, JSON.stringify(artifact, null, 2) + '\n');
+}
+
 function emit(cli: Cli, artifact: unknown): void {
+  // D-054: a flag command run INTERNALLY by a state-machine command
+  // (next-case→run, finish→verify/publish/push) produces no output — only the
+  // outer command emits its single SWEEP-RESULT line.
+  if (cli.internal) return;
   const json = JSON.stringify(artifact, null, 2);
   if (cli.out) {
     writeFileSync(cli.out, json + '\n');
@@ -1115,6 +1143,21 @@ function emit(cli: Cli, artifact: unknown): void {
   } else {
     console.log(json);
   }
+}
+
+/**
+ * D-054 observability: a MAJOR-STEP progress line for a running sweep, written to
+ * STDOUT with the exact prefix `SWEEP-STEP: ` and flushed immediately (never
+ * buffered to exit — `process.stdout.write` emits at the call site so the owner
+ * sees the sweep advance live while a long next-case/finish runs in the
+ * background). Distinct from the single `SWEEP-RESULT:` line (see `result`): the
+ * two prefixes cleanly separate live progress (statements the agent relays) from
+ * the one JSON result the agent parses and acts on. MAJOR transitions ONLY
+ * (~a dozen lines per pass), never per-action/per-file: batch clean merges into
+ * one summary line, keep it low-frequency.
+ */
+function progress(msg: string): void {
+  process.stdout.write(`SWEEP-STEP: ${msg}\n`);
 }
 
 export async function cmdPlan(cli: Cli): Promise<number> {
@@ -3285,7 +3328,10 @@ export async function cmdReport(cli: Cli): Promise<number> {
     staleVerdictsCleared: staleCleared,
     urges,
   };
-  if (cli.out) {
+  // D-054: when driven internally by `finish`, do NOT write --out — that file is
+  // the outer command's result; the human summary above still prints (ignored by
+  // the SWEEP-RESULT/SWEEP-STEP monitor contract, but useful in a foreground run).
+  if (cli.out && !cli.internal) {
     writeFileSync(cli.out, JSON.stringify(summary, null, 2) + '\n');
     console.log(`wrote ${cli.out}`);
   }
@@ -3356,9 +3402,19 @@ function writeMachineState(dir: string, st: MachineState): void {
 
 /** The verdict a cold read returns (parsed from `claude -p` stdout, or injected). */
 export interface MachineVerdict {
-  verdict: 'confirm' | 'reject';
+  /**
+   * `confirm`/`reject` are CONTENT decisions from a cold read that actually RAN.
+   * `error` is an INFRA failure of the tooling (spawn error, non-zero exit,
+   * unparseable stdout, or a recognizable auth/login failure) — NOT a content
+   * decision (D-054). It must NOT collapse to reject/HELD: a broken tool marking
+   * resolutions as content-rejected is the bug this distinguishes. `error` maps
+   * to a hard blocking halt (ERR35_COLDREAD_UNAVAILABLE) at the call sites.
+   */
+  verdict: 'confirm' | 'reject' | 'error';
   answers?: Partial<Record<'q1' | 'q2' | 'q3', string>>;
   notes: string;
+  /** verdict:'error' only — the infra reason (surfaced in the ERR35 halt detail). */
+  reason?: string;
   /**
    * report-pr only: when the RESOLUTION is sound but the PR DESCRIPTION
    * misrepresents it, the reader flags `description` — a description-only
@@ -3368,10 +3424,18 @@ export interface MachineVerdict {
   defect?: 'code' | 'description' | null;
 }
 
+/** Auth/login failure text a broken `claude -p` prints (often at exit 0) — infra, not content. */
+const COLDREAD_AUTH_FAILURE = /not logged in|invalid api key|authentication_error|unauthorized|please run.*login|login expired|credit balance is too low/i;
+
 /** Injectable cold-read invoker: prompt in, verdict out (default shells `claude -p`). */
 export type ColdReadInvoker = (prompt: string) => Promise<MachineVerdict>;
 
-/** Parse the last JSON object printed by `claude -p`; unparseable → fail-closed reject. */
+/**
+ * Parse the last JSON object printed by `claude -p`. A valid confirm/reject is a
+ * content decision. Otherwise → `error` (D-054): recognizable auth/login failure
+ * text (which `claude -p` often prints AT EXIT 0) is an infra error, and so is a
+ * total absence of a parseable verdict — NEITHER is a content reject.
+ */
 export function parseMachineVerdict(stdout: string): MachineVerdict {
   const matches = stdout.match(/\{[\s\S]*\}/g);
   if (matches) {
@@ -3391,17 +3455,35 @@ export function parseMachineVerdict(stdout: string): MachineVerdict {
       }
     }
   }
-  return { verdict: 'reject', notes: 'cold read produced no parseable verdict (fail-closed, D-053)', defect: 'code' };
+  if (COLDREAD_AUTH_FAILURE.test(stdout)) {
+    return { verdict: 'error', notes: '', reason: `cold read auth/login failure: ${stdout.trim().slice(0, 300)}` };
+  }
+  return { verdict: 'error', notes: '', reason: 'cold read produced no parseable verdict (tooling error, D-054)' };
 }
 
-/** Default invoker: a synchronous `claude -p` subprocess, request on stdin. */
+/**
+ * Default invoker: a synchronous `claude -p` subprocess, request on stdin. D-054:
+ * `claude` scrubs env for its own Bash subprocesses, so the spawned `claude -p`
+ * loses CLAUDE_CODE_OAUTH_TOKEN — read it from the credentials file and inject it
+ * (silent if the file is unreadable: fall through to the infra-error path, never
+ * crash). A spawn error / non-zero exit → `error` (infra), never a content reject.
+ */
 export const defaultColdReadInvoker: ColdReadInvoker = async (prompt) => {
-  const res = spawnSync('claude', ['-p'], { input: prompt, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  const env = { ...process.env };
+  if (!env.CLAUDE_CODE_OAUTH_TOKEN) {
+    try {
+      const creds = JSON.parse(readFileSync(join(homedir(), '.claude', '.credentials.json'), 'utf8'));
+      if (creds?.claudeAiOauth?.accessToken) env.CLAUDE_CODE_OAUTH_TOKEN = creds.claudeAiOauth.accessToken;
+    } catch {
+      /* credentials unreadable — fall through to the infra-error path */
+    }
+  }
+  const res = spawnSync('claude', ['-p'], { input: prompt, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env });
   if (res.status !== 0 || typeof res.stdout !== 'string') {
     return {
-      verdict: 'reject',
-      notes: `claude -p failed (status ${res.status ?? 'null'}${res.error ? `: ${res.error.message}` : ''}) — fail-closed (D-053)`,
-      defect: 'code',
+      verdict: 'error',
+      notes: '',
+      reason: `claude -p failed (status ${res.status ?? 'null'}${res.error ? `: ${res.error.message}` : ''})`,
     };
   }
   return parseMachineVerdict(res.stdout);
@@ -3633,14 +3715,14 @@ export async function cmdSweepStart(cli: Cli): Promise<number> {
     if (st && st.phase !== 'complete') {
       const detail = `a pass is already open (${existing.watermark12}, phase ${st.phase}) — run \`finish\` or \`abort\` first`;
       console.error(`sweep start [ERR30_PASS_OPEN]: ${detail}`);
-      emit(cli, { ok: false, issues: [{ id: 'ERR30_PASS_OPEN', detail }] });
+      result(cli, { ok: false, issues: [{ id: 'ERR30_PASS_OPEN', detail }] });
       return 1;
     }
   } catch {
     /* no open pass — proceed */
   }
   // Pin the watermark + open the pass (only `plan` opens a pass, §2).
-  const planRc = await cmdPlan({ ...cli, cmd: 'plan' });
+  const planRc = await cmdPlan({ ...cli, cmd: 'plan', internal: true });
   if (planRc !== 0) return planRc;
   const ctx = await openPass(cli);
   const st: MachineState = {
@@ -3653,7 +3735,7 @@ export async function cmdSweepStart(cli: Cli): Promise<number> {
   writeMachineState(ctx.dir, st);
   appendJournal(ctx.dir, { action: 'sweep-start', watermark: ctx.watermark });
   console.error(`sweep started — pass ${ctx.watermark12} pinned at ${ctx.watermark.slice(0, 12)}`);
-  emit(cli, { status: 'started', watermark: ctx.watermark, watermark12: ctx.watermark12, passDir: ctx.dir });
+  result(cli, { status: 'started', watermark: ctx.watermark, watermark12: ctx.watermark12, passDir: ctx.dir });
   return 0;
 }
 
@@ -3707,7 +3789,7 @@ export async function cmdSweepAbort(cli: Cli): Promise<number> {
     ...(st?.finishStep ? { finishStep: st.finishStep } : {}),
   });
   console.error(`sweep aborted — pass ${ctx.watermark12} discarded (${rolledBack.length} branch(es) rolled back)`);
-  emit(cli, { status: 'aborted', rolledBack });
+  result(cli, { status: 'aborted', rolledBack });
   return 0;
 }
 
@@ -3734,7 +3816,7 @@ export async function cmdSweepNextCase(cli: Cli): Promise<number> {
   if (st.phase === 'awaiting-pr') {
     const detail = `case ${st.currentCase?.caseId} is awaiting its PR description — run \`report-pr\` first`;
     console.error(`next-case [ERR31_AWAITING_PR]: ${detail}`);
-    emit(cli, {
+    result(cli, {
       status: 'awaiting-pr',
       instruction: 'report-pr for the current case first',
       currentCase: st.currentCase,
@@ -3743,38 +3825,61 @@ export async function cmdSweepNextCase(cli: Cli): Promise<number> {
   }
   if (st.phase === 'complete') {
     console.error('next-case: pass is complete — run `sweep start` for a new pass');
-    emit(cli, { status: 'complete' });
+    result(cli, { status: 'complete' });
     return 1;
   }
 
   // Advance the deterministic machinery (idempotent; continues reopened branches
-  // above resolved heights and lands new clean prefixes/skips/defers).
-  const runRc = await cmdRun({ ...cli, cmd: 'run', execute: true });
+  // above resolved heights and lands new clean prefixes/skips/defers). D-054: the
+  // MAJOR transitions cmdRun runs internally, announced as progress; the batched
+  // merge/skip/defer summary comes from the journal delta below.
+  progress('scanning upstream');
+  let planBranches = 0;
+  try {
+    planBranches = (JSON.parse(readFileSync(join(dir, 'plan.json'), 'utf8')) as { branches?: unknown[] }).branches
+      ?.length ?? 0;
+  } catch {
+    /* plan.json unreadable — omit the count */
+  }
+  progress(`planning (${planBranches} branches)`);
+  progress('executing merges');
+  const journalLenBefore = readJournal(dir).length;
+  const runRc = await cmdRun({ ...cli, cmd: 'run', execute: true, internal: true });
   if (runRc !== 0) {
     // A per-branch/whole-run halt (ERR2x) — surface it; the agent reports it.
+    // cmdRun's own emit is suppressed (internal), so next-case emits the single
+    // result itself: the halt is journaled — point the agent at it (D-054).
     console.error('next-case: `run` halted — see the journal');
+    result(cli, { status: 'run-halted', instruction: 'run halted — inspect the journal for the ERR2x halt', passDir: dir });
     return runRc;
   }
 
   const journal = readJournal(dir);
+  const delta = journal.slice(journalLenBefore);
+  const mergedN = delta.filter((e) => e.action === 'merge').length;
+  const skippedN = delta.filter((e) => e.action === 'skip').length;
+  const deferredN = delta.filter((e) => e.action === 'defer').length;
+  progress(`merged ${mergedN} clean / skipped ${skippedN} / deferred ${deferredN}`);
   const open = openCases(journal);
   if (open.length === 0) {
     st = { ...st, phase: 'open', currentCase: null };
     writeMachineState(dir, st);
+    progress('no more cases');
     console.error('next-case: no more cases — finalize (run `finish`)');
-    emit(cli, { status: 'finalize' });
+    result(cli, { status: 'finalize' });
     return 0;
   }
 
   const jc = open[0];
   const caseFile = readCaseFile(join(dir, jc.caseId, 'case.json'));
   const worktree = caseWorktreePath(dir, jc.caseId);
+  progress(`case ready: ${jc.branch} — ${caseFile.conflictedPaths.join(', ')}`);
   const materials = await machineCaseMaterials(cli, jc);
   writeFileSync(join(dir, jc.caseId, 'materials.md'), materials + '\n');
   st = { ...st, phase: 'case-ready', currentCase: { caseId: jc.caseId, branch: jc.branch } };
   writeMachineState(dir, st);
   console.error(`next-case: case ${jc.caseId} ready in ${worktree}`);
-  emit(cli, {
+  result(cli, {
     status: 'case-ready',
     worktree,
     branch: jc.branch,
@@ -3829,7 +3934,7 @@ export async function cmdSweepReportCase(
   const rv = await reverifyCase(cli, ctx, dir, caseFile, journal);
   if (!rv.ok) {
     console.error(`report-case HALT: case re-verification failed:\n  ${rv.errors.join('\n  ')}`);
-    emit(cli, {
+    result(cli, {
       instruction: `case-stale: ${rv.errors[0]}`,
       tier: claimed,
       issues: rv.errors.map((detail) => ({ id: 'ERR02_CASE_STALE', detail })),
@@ -3841,7 +3946,7 @@ export async function cmdSweepReportCase(
 
   const wtPath = caseWorktreePath(dir, caseId);
   if (!existsSync(wtPath)) {
-    emit(cli, {
+    result(cli, {
       instruction: 'case worktree missing — re-run next-case',
       tier: claimed,
       issues: [{ id: 'ERR02_CASE_STALE', detail: `no worktree at ${wtPath}` }],
@@ -3915,7 +4020,7 @@ export async function cmdSweepReportCase(
   // adequacy hit (ERR05/ERR06) means "do not open this; apply/consolidate".
   if (issues.some((i) => i.id === 'ERR05_DECIDED_ALREADY' || i.id === 'ERR06_DUPLICATE_CASE')) {
     const first = issues.find((i) => i.id === 'ERR05_DECIDED_ALREADY' || i.id === 'ERR06_DUPLICATE_CASE')!;
-    emit(cli, {
+    result(cli, {
       instruction: `${first.id === 'ERR05_DECIDED_ALREADY' ? 'apply the recorded decision (judged)' : 'consolidate into the topmost case'}: ${first.detail}`,
       tier: effectiveTier,
       issues,
@@ -3929,12 +4034,12 @@ export async function cmdSweepReportCase(
     const detail = emptyResolution
       ? 'worktree unchanged — resolve the conflict in the worktree first'
       : `unresolved conflict markers remain in [${markers.join(', ')}]`;
-    emit(cli, { instruction: detail, tier: claimed, issues: [{ id: 'ERR32_UNRESOLVED', detail }] });
+    result(cli, { instruction: detail, tier: claimed, issues: [{ id: 'ERR32_UNRESOLVED', detail }] });
     return 1;
   }
 
   if (!cli.execute) {
-    emit(cli, { dryRun: true, instruction: 'dry-run', tier: effectiveTier, claimed, scopeGuard: guard, issues });
+    result(cli, { dryRun: true, instruction: 'dry-run', tier: effectiveTier, claimed, scopeGuard: guard, issues });
     return 0;
   }
 
@@ -3944,8 +4049,9 @@ export async function cmdSweepReportCase(
     await freezeHeld(cli, dir, rc, notes);
     reopen(dir, reopenTargets);
     writeMachineState(dir, { ...st, phase: 'awaiting-pr', currentCase: { caseId, branch: rc.branch, tier: 'held' } });
+    progress(`demoted: ${rc.branch} -> held (${notes.join('; ')})`);
     console.error(`report-case: held ${caseId} (${notes.join('; ')})`);
-    emit(cli, { instruction: 'provide PR description', tier: 'held', issues });
+    result(cli, { instruction: 'provide PR description', tier: 'held', issues });
     return 0;
   }
 
@@ -3963,7 +4069,7 @@ export async function cmdSweepReportCase(
   });
   if (!tests.ok) {
     const detail = `tests failed: ${tests.detail ?? ''}${tests.detailPath ? ` (${tests.detailPath})` : ''}`;
-    emit(cli, {
+    result(cli, {
       instruction: detail,
       tier: effectiveTier,
       issues: [...issues, { id: 'ERR33_BRANCH_TESTS_FAILED', detail }],
@@ -3976,7 +4082,7 @@ export async function cmdSweepReportCase(
     await prepareCaseMaterials(cli, dir, rc, 'judged');
     writeMachineState(dir, { ...st, phase: 'awaiting-pr', currentCase: { caseId, branch: rc.branch, tier: 'judged' } });
     console.error(`report-case: ${caseId} judged — provide PR description`);
-    emit(cli, { instruction: 'provide PR description', tier: 'judged', issues });
+    result(cli, { instruction: 'provide PR description', tier: 'judged', issues });
     return 0;
   }
 
@@ -3996,8 +4102,28 @@ export async function cmdSweepReportCase(
     resolutionDiff: resolutionDiff.slice(0, 60000),
   });
   writeFileSync(join(caseDir, 'coldread-request.md'), prompt);
+  progress(`cold-read: ${rc.branch}`);
   const verdict = await invoke(prompt);
   writeFileSync(join(caseDir, 'coldread-verdict.json'), JSON.stringify(verdict, null, 2) + '\n');
+  // D-054: infra failure of the cold read (spawn/exit/unparseable/auth) is NOT a
+  // content reject — HARD BLOCKING HALT (ERR35), do NOT freeze the case. The
+  // machine state stays `case-ready` so the agent re-runs report-case once the
+  // tooling is fixed; only a cold read that RAN and rejected → HELD (below).
+  if (verdict.verdict === 'error') {
+    const detail = `cold-read tooling unavailable: ${verdict.reason ?? 'unknown'} — report to owner (D-046 case 2) and stop; NOT a content decision`;
+    appendJournal(dir, {
+      action: 'halt',
+      reason: 'coldread-unavailable',
+      id: 'ERR35_COLDREAD_UNAVAILABLE',
+      caseId,
+      branch: rc.branch,
+      phase: 'report-case',
+      message: detail,
+    });
+    console.error(`report-case HALT [ERR35_COLDREAD_UNAVAILABLE]: ${detail}`);
+    result(cli, { instruction: detail, tier: effectiveTier, issues: [...issues, { id: 'ERR35_COLDREAD_UNAVAILABLE', detail }] });
+    return 1;
+  }
   const { rejected, unverifiable } = coldReadRejected(verdict);
   appendJournal(dir, {
     action: 'coldread',
@@ -4015,8 +4141,9 @@ export async function cmdSweepReportCase(
     await freezeHeld(cli, dir, rc, [note]);
     reopen(dir, reopenTargets);
     writeMachineState(dir, { ...st, phase: 'awaiting-pr', currentCase: { caseId, branch: rc.branch, tier: 'held' } });
+    progress(`demoted: ${rc.branch} -> held (cold-read rejected)`);
     console.error(`report-case: held ${caseId} (cold-read rejected)`);
-    emit(cli, { instruction: 'provide PR description', tier: 'held', issues });
+    result(cli, { instruction: 'provide PR description', tier: 'held', issues });
     return 0;
   }
   // Confirm → merge the resolved tree in place.
@@ -4036,8 +4163,9 @@ export async function cmdSweepReportCase(
   await removeCaseWorktree(cli, dir, caseId);
   reopen(dir, reopenTargets);
   writeMachineState(dir, { ...st, phase: 'open', currentCase: null });
+  progress(`mechanical resolve: ${rc.branch} — merged`);
   console.error(`report-case: merged ${caseId} (mechanical) ${mergeCommit.slice(0, 12)}`);
-  emit(cli, { instruction: 'merged, take next case', tier: 'mechanical', mergeCommit, issues });
+  result(cli, { instruction: 'merged, take next case', tier: 'mechanical', mergeCommit, issues });
   return 0;
 }
 
@@ -4223,7 +4351,7 @@ export async function cmdSweepReportPr(
     : '';
   if (!title || !body) {
     const detail = `write ${join(caseDir, 'pr', 'title.txt')} and ${join(caseDir, 'pr', 'body.md')} yourself from the case materials`;
-    emit(cli, { instruction: 'provide PR description', issues: [{ id: 'ERR08_TEXT_MISSING', detail }] });
+    result(cli, { instruction: 'provide PR description', issues: [{ id: 'ERR08_TEXT_MISSING', detail }] });
     return 1;
   }
 
@@ -4240,7 +4368,7 @@ export async function cmdSweepReportPr(
   if (tier === 'judged') {
     const rv = await reverifyCase(cli, ctx, dir, caseFile, journal);
     if (!rv.ok) {
-      emit(cli, {
+      result(cli, {
         instruction: `case-stale: ${rv.errors[0]}`,
         issues: rv.errors.map((detail) => ({ id: 'ERR02_CASE_STALE', detail })),
       });
@@ -4257,7 +4385,7 @@ export async function cmdSweepReportPr(
       await freezeHeld(cli, dir, rc, [note]);
       reopen(dir, [rc.branch, ...rc.descendants]);
       writeMachineState(dir, { ...st, currentCase: { caseId, branch, tier: 'held' } });
-      emit(cli, { instruction: `held: ${note} — re-run report-pr to publish the frozen exhibit`, tier: 'held' });
+      result(cli, { instruction: `held: ${note} — re-run report-pr to publish the frozen exhibit`, tier: 'held' });
       return 1;
     }
     conflictDiff = (
@@ -4294,12 +4422,31 @@ export async function cmdSweepReportPr(
   writeFileSync(join(caseDir, 'coldread-pr-request.md'), prompt);
 
   if (!cli.execute) {
-    emit(cli, { dryRun: true, instruction: 'dry-run', tier });
+    result(cli, { dryRun: true, instruction: 'dry-run', tier });
     return 0;
   }
 
+  progress(`cold-read (resolution+description): ${branch}`);
   const verdict = await invoke(prompt);
   writeFileSync(join(caseDir, 'coldread-pr-verdict.json'), JSON.stringify(verdict, null, 2) + '\n');
+  // D-054: infra failure → HARD BLOCKING HALT (ERR35), NOT a HELD/reject. The
+  // machine state stays `awaiting-pr` (nothing frozen, nothing published) so the
+  // agent re-runs report-pr once the cold-read tooling is restored.
+  if (verdict.verdict === 'error') {
+    const detail = `cold-read tooling unavailable: ${verdict.reason ?? 'unknown'} — report to owner (D-046 case 2) and stop; NOT a content decision`;
+    appendJournal(dir, {
+      action: 'halt',
+      reason: 'coldread-unavailable',
+      id: 'ERR35_COLDREAD_UNAVAILABLE',
+      caseId,
+      branch,
+      phase: 'report-pr',
+      message: detail,
+    });
+    console.error(`report-pr HALT [ERR35_COLDREAD_UNAVAILABLE]: ${detail}`);
+    result(cli, { instruction: detail, tier, issues: [{ id: 'ERR35_COLDREAD_UNAVAILABLE', detail }] });
+    return 1;
+  }
   const { rejected, unverifiable } = coldReadRejected(verdict);
   appendJournal(dir, {
     action: 'coldread',
@@ -4313,7 +4460,7 @@ export async function cmdSweepReportPr(
 
   // A description-only defect on a sound resolution → rewrite (not a freeze).
   if (rejected && verdict.defect === 'description') {
-    emit(cli, {
+    result(cli, {
       instruction: `rewrite: ${verdict.notes}`,
       tier,
       issues: [{ id: 'WARN01_TEMPLATE_TEXT', detail: verdict.notes }],
@@ -4330,11 +4477,11 @@ export async function cmdSweepReportPr(
       await freezeHeld(cli, dir, rc, [note]);
       reopen(dir, [rc.branch, ...rc.descendants]);
       writeMachineState(dir, { ...st, currentCase: { caseId, branch, tier: 'held' } });
-      emit(cli, { instruction: `held: ${note} — re-run report-pr to publish the frozen exhibit`, tier: 'held' });
+      result(cli, { instruction: `held: ${note} — re-run report-pr to publish the frozen exhibit`, tier: 'held' });
       return 1;
     }
     // held: keep frozen + unpublished until the description is accurate.
-    emit(cli, {
+    result(cli, {
       instruction: `rewrite: ${note}`,
       tier: 'held',
       issues: [{ id: 'WARN01_TEMPLATE_TEXT', detail: note }],
@@ -4360,11 +4507,15 @@ export async function cmdSweepReportPr(
     );
     if (!pub.ok) {
       console.error(`report-pr: HELD draft publish for ${caseId} blocked`);
-      emit(cli, { ok: false, tier: 'held', issues: pub.issues });
+      result(cli, { ok: false, tier: 'held', issues: pub.issues });
       return 1;
     }
+    const published = readJournal(dir)
+      .filter((e) => e.action === 'pr-published' && e.caseId === caseId)
+      .pop();
+    progress(`held: ${branch} — draft PR published ${published?.url ?? `#${published?.number ?? '?'}`}`);
     writeMachineState(dir, { ...st, phase: 'open', currentCase: null });
-    emit(cli, { instruction: 'take next case', tier: 'held', published: true, issues: pub.issues });
+    result(cli, { instruction: 'take next case', tier: 'held', published: true, issues: pub.issues });
     return 0;
   }
 
@@ -4386,10 +4537,11 @@ export async function cmdSweepReportPr(
   await removeCaseWorktree(cli, dir, caseId);
   reopen(dir, [rc!.branch, ...rc!.descendants]);
   writeMachineState(dir, { ...st, phase: 'open', currentCase: null });
+  progress(`judged: ${rc!.branch} — recorded`);
   console.error(
     `report-pr: ${caseId} judged — merged ${mergeCommit.slice(0, 12)}, PR intent recorded (created at finish)`,
   );
-  emit(cli, { instruction: 'take next case', tier: 'judged', mergeCommit, prIntent: true });
+  result(cli, { instruction: 'take next case', tier: 'judged', mergeCommit, prIntent: true });
   return 0;
 }
 
@@ -4419,7 +4571,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   if (st.phase === 'awaiting-pr' || openCases(readJournal(dir)).length > 0) {
     const detail = 'cases remain — resolve every case (next-case/report-case/report-pr) before finish';
     console.error(`finish [ERR34_CASES_REMAIN]: ${detail}`);
-    emit(cli, { ok: false, issues: [{ id: 'ERR34_CASES_REMAIN', detail }] });
+    result(cli, { ok: false, issues: [{ id: 'ERR34_CASES_REMAIN', detail }] });
     return 1;
   }
   st = { ...st, phase: 'finishing', finishStep: st.finishStep ?? 'verify' };
@@ -4435,7 +4587,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
         !journal.some((e) => e.action === 'pr-published' && e.caseId === jc.caseId)
       );
     });
-    emit(cli, { dryRun: true, verifyGreen: canComplete(journal), judgedToPublish: judged.map((j) => j.caseId) });
+    result(cli, { dryRun: true, verifyGreen: canComplete(journal), judgedToPublish: judged.map((j) => j.caseId) });
     return 0;
   }
 
@@ -4444,18 +4596,23 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   // HELD(gate) — both HALT finish (report + resumable): re-running finish drops
   // the now-frozen offender from the publishable recipe and proceeds. Pushes
   // never redo; the rollback is not repeated (the offender is already frozen).
+  progress('verify: running');
   const gateBefore = readJournal(dir).filter((e) => e.action === 'held' && e.reason === 'gate').length;
-  const verifyRc = await cmdVerify({ ...cli, cmd: 'verify', execute: true });
-  const gateAfter = readJournal(dir).filter((e) => e.action === 'held' && e.reason === 'gate').length;
+  const verifyRc = await cmdVerify({ ...cli, cmd: 'verify', execute: true, internal: true });
+  const gatesNow = readJournal(dir).filter((e) => e.action === 'held' && e.reason === 'gate');
+  const gateAfter = gatesNow.length;
   if (verifyRc !== 0 || gateAfter > gateBefore) {
+    const offender = gateAfter > gateBefore ? (gatesNow[gatesNow.length - 1].branch as string | undefined) : undefined;
     const detail =
       verifyRc !== 0
         ? 'verify RED (no clean attribution) — investigate, fix, then re-run `finish` from the verify phase'
         : 'verify RED — offender rolled back + HELD(gate); re-run `finish` (the frozen offender drops out of the publishable set)';
+    progress(`verify: RED ${offender ?? '(unattributed)'} — rolled back`);
     console.error(`finish: ${detail}`);
-    emit(cli, { ok: false, issues: [{ id: 'ERR18_VERIFY_PENDING', detail }], halted: 'verify' });
+    result(cli, { ok: false, issues: [{ id: 'ERR18_VERIFY_PENDING', detail }], halted: 'verify' });
     return 1;
   }
+  progress('verify: green');
   writeMachineState(dir, { ...st, finishStep: 'judged-prs' });
 
   // (2) create the JUDGED history PRs (non-draft, before the target push so the
@@ -4466,29 +4623,40 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
       const d = lastDisposition(journal, jc.caseId);
       return d?.action === 'resolved' && d.tier === 'judged';
     });
+    let closuresN = 0;
     for (const jc of judged) {
       if (journal.some((e) => e.action === 'pr-published' && e.caseId === jc.caseId)) continue;
-      const rcPub = await cmdPublish({ ...cli, cmd: 'publish', caseId: jc.caseId, execute: true }, makeTransport);
+      const rcPub = await cmdPublish(
+        { ...cli, cmd: 'publish', caseId: jc.caseId, execute: true, internal: true },
+        makeTransport,
+      );
       if (rcPub !== 0) {
         console.error(`finish: JUDGED publish failed for ${jc.caseId} — re-run finish after fixing`);
-        emit(cli, { ok: false, halted: 'judged-prs', caseId: jc.caseId });
+        result(cli, { ok: false, halted: 'judged-prs', caseId: jc.caseId });
         return 1;
       }
+      closuresN++;
     }
+    progress(`push: judged closures (${closuresN})`);
   }
   writeMachineState(dir, { ...st, finishStep: 'push' });
 
   // (3) push target branches (flips JUDGED PRs to merged) + closure checks + urges.
-  const pushRc = await cmdPush({ ...cli, cmd: 'push', execute: true }, makeTransport);
+  const pushLenBefore = readJournal(dir).length;
+  const pushRc = await cmdPush({ ...cli, cmd: 'push', execute: true, internal: true }, makeTransport);
   if (pushRc !== 0) {
     console.error('finish: push halted (ERR15/ERR16/ERR18) — re-run finish from the push phase; pushes never redo');
-    emit(cli, { ok: false, halted: 'push' });
+    result(cli, { ok: false, halted: 'push' });
     return 1;
   }
+  const pushDelta = readJournal(dir).slice(pushLenBefore);
+  progress(`push: targets (${pushDelta.filter((e) => e.action === 'push' && e.kind === 'target').length})`);
+  progress(`urge comments (${pushDelta.filter((e) => e.action === 'urge').length})`);
   writeMachineState(dir, { ...st, finishStep: 'report' });
 
   // (4) HELD drafts are already published (report-pr). (5) owner report.
-  await cmdReport({ ...cli, cmd: 'report' });
+  await cmdReport({ ...cli, cmd: 'report', internal: true });
+  progress('report ready');
 
   // (6) upstream advanced past the pinned watermark?
   let upstreamAdvanced = false;
@@ -4511,7 +4679,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   });
   const next = upstreamAdvanced ? 'start again' : 'done';
   console.error(`sweep finish complete — ${next}`);
-  emit(cli, { ok: true, status: 'complete', next, upstreamAdvanced });
+  result(cli, { ok: true, status: 'complete', next, upstreamAdvanced });
   return 0;
 }
 

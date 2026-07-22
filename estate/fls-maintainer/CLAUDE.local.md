@@ -147,6 +147,31 @@ rediscover it the hard way):
    finish --execute --token-file <path> --commands-file <cheap-tests.json>
    ```
 
+   RUNNING THEM — the TWO-PREFIX STDOUT CONTRACT (D-054): every state-machine
+   command prints exactly TWO kinds of meaningful lines to STDOUT, cleanly split
+   by prefix — nothing else on stdout matters:
+   - `SWEEP-STEP: <msg>` — a MAJOR-STEP progress line (the driver self-limits to
+     ~a dozen per pass, batched, never per-file). RELAY each one to the owner via
+     `send_message` as interim progress — a statement, never a question
+     (consistent with the D-046 non-stop heartbeat; do NOT stop for it).
+   - `SWEEP-RESULT: <json>` — the SINGLE machine-readable result line (exactly one
+     per command). This is your GUIDANCE: parse it and ACT on it (resolve the
+     served case, provide the PR description, take the next case, finalize, or
+     which id halted). NEVER `send_message` the result as a progress line.
+   - ANY OTHER line (git chatter, the human `report` summary, `claude -p` noise) →
+     IGNORE. There is no "last JSON wins" guessing: the nested commands the driver
+     runs internally (next-case→run, finish→verify/publish/push/report) are
+     silenced, so the stream carries exactly one `SWEEP-RESULT:` line.
+   - `next-case` and `finish` are the long deterministic phases — invoke them in
+     the BACKGROUND and attach a monitor to their output stream with NO filter
+     (the driver self-limits; filtering would drop `SWEEP-STEP:` lines you must
+     relay). `report-case` / `report-pr` are short — keep them FOREGROUND — but
+     they too print `SWEEP-STEP:` lines (cold-read / mechanical resolve / demoted
+     / held draft published / judged recorded) you relay the same way, and one
+     `SWEEP-RESULT:` line you act on.
+   - Why: the owner sees the sweep advance live, and you stay responsive while a
+     long `next-case`/`finish` runs in the background instead of blocking on it.
+
    DO WHAT EACH COMMAND RETURNS — never pass ids, never argue with a blocking id:
    - `start` — refuses if a pass is already open (`ERR30_PASS_OPEN`): run
      `finish` or `abort` first; it never blind-wipes an in-flight pass. Opening
@@ -288,6 +313,7 @@ retired PR-text cold read (D-050) — all permanently retired, never reused.)
 | `ERR32_UNRESOLVED` (D-053) | you have not resolved the case worktree (or conflict markers remain) → resolve it, then re-run `report-case` |
 | `ERR33_BRANCH_TESTS_FAILED` (D-053) | the cheap branch-scoped tests failed → open the named log, fix the resolution, re-report |
 | `ERR34_CASES_REMAIN` (D-053) | `finish` while cases are open/awaiting → finish every case first |
+| `ERR35_COLDREAD_UNAVAILABLE` (D-054) | cold-read tooling unavailable (spawn/exit/unparseable/auth failure — NOT a content decision) → report to owner (D-046 case 2) and stop; the case is NOT frozen and stays put, re-run the command once the tooling is restored |
 | `WARN01_TEMPLATE_TEXT` | your body references none of the conflicted files — rewrite from the case materials |
 | `WARN02_NO_DECISION_LINE` | open the body with the exact decision the owner is being asked to make |
 | `WARN03_MANY_PRS` | >8 PRs this pass — re-check for consolidation before publishing more |
