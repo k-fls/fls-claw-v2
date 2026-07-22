@@ -110,10 +110,11 @@ rediscover it the hard way):
    Statements only, NEVER questions — you send and keep working, no answer expected.
    Anything that needs an answer is a STOP and goes through "Reporting to the owner"
    below. No pre-action digests, no plan posts, no prose.
-3. Route annotate-PoIs (`route`) and run overlap checks with the registry prompts
-   (spawn one subagent per routed feature; prompts are self-contained).
-   OVERLAP-HIGH findings go into the end-of-sweep report (and any freeze they
-   cause becomes a draft PR) — not into interim chat.
+3. Candidate/overlap/PoI analysis is now the DRIVER's job (D-045/D-056): it surfaces
+   candidates (`start` CANDIDATES) and OVERLAP-HIGH findings in its own reports, and
+   any freeze they cause becomes a draft PR. You do NOT run overlap-check subagents or
+   annotate-PoI passes per sweep — that is dead pre-driver work and a context sink; you
+   only RELAY what the driver surfaces, per the reporting rules — not into interim chat.
 4. Propagate via the SWEEP STATE MACHINE (D-053; spec
    `scripts/sweep/SWEEP-STATE-MACHINE.md` is authoritative for the command
    surface, `scripts/sweep/PROPAGATION.md` + `MERGE-POLICY.md` for the internals
@@ -238,13 +239,20 @@ rediscover it the hard way):
    The old flag-based `propagate plan/run/resolve/publish/push` is the driver's
    internal implementation (still present) — it is NOT your surface anymore; do
    not invoke `resolve`/`publish` by hand or hand-manage `coldread-verdict.json`.
-   **Case comprehension (owner directive, D-048):** a case is always something you
-   are LOOKING AT — study the case worktree and materials until you can explain
-   both sides; the description you publish is YOUR understanding, never a template.
-   A case is a RUN of stacked conflicting heights (D-049 §2, up to `stack_cap`):
-   one logical decision, one resolution, one cold read — the materials list the
-   run. If you cannot explain both sides of the conflict, study the case more —
-   never publish text you don't understand.
+   **Case comprehension — MINIMAL SCOPE (owner directive, D-056):** the driver has
+   ALREADY done all analysis (DAG, scope, merge-point, the per-side history). Your
+   ONLY job per case is to resolve the conflict markers in the SPECIFIC conflicted
+   files the materials name — nothing else. Open and edit ONLY the conflicted paths
+   listed in `materials.md`; do NOT read, grep, `git log`, or explore any other file
+   in the worktree, and do NOT re-derive analysis the driver already did. The two
+   sides (in the conflict markers) plus the per-side summary in `materials.md` ARE
+   the context — they are small and sufficient by design. If you genuinely cannot
+   decide the resolution from the two sides + the materials brief, that is exactly
+   what `--tier held` is for (escalate to the owner): "cannot decide" → HELD, NEVER
+   "explore the repo more" — a resolution you can't make from the conflict + brief is
+   not yours to make. A case is still a RUN of stacked conflicting heights (D-049 §2,
+   up to `stack_cap`): one logical decision, one resolution, one cold read — the
+   materials list the run.
    PRs (D-048/D-049/D-053): the driver NEVER writes PR prose — at report-case it
    prepares `pr/materials.md` (facts: conflicted paths, the case run, per-side
    histories). YOU study the case and write `pr/title.txt` + `pr/body.md` at that
@@ -338,8 +346,9 @@ retired PR-text cold read (D-050) — all permanently retired, never reused.)
 
 ## Autonomy boundaries — what needs permission and what never does
 
-- **Analysis NEVER waits for permission**: scan, stop-points, routing, overlap-check
-  subagents, classification, validator runs, dry-run merge plans. Run them as part of
+- **Analysis NEVER waits for permission**: scan, stop-points, classification, validator
+  runs, dry-run merge plans (routing/overlap/PoI analysis is the driver's now, D-056 —
+  you do not spawn overlap subagents). Run them as part of
   every sweep, unprompted.
 - **Mutations follow the TIER rules (MERGE-POLICY.md §1, D-049), not ad-hoc
   asking** (the old case-2/3/4 ladder is retired; case 3 no longer exists):
@@ -381,9 +390,11 @@ retired PR-text cold read (D-050) — all permanently retired, never reused.)
   N files is verbatim upstream <range>, already reviewed upstream." Verification status
   (what ran, what could not run here) closes the description.
 - **PR text (D-031; text cold read retired by D-050).** YOU write `pr/title.txt` +
-  `pr/body.md` from studying the case — the case materials + worktree are the source
-  of understanding; if you cannot explain both sides of the conflict, study the case
-  more — never publish text you don't understand. The single `report-pr` cold
+  `pr/body.md` from the case materials — the two sides in the conflict markers plus
+  the per-side brief in `pr/materials.md` ARE the source of understanding; do NOT
+  explore the repo to write the description (D-056). If those two sides + the brief
+  are not enough to write an honest description, that is `--tier held`, not more
+  exploration — never publish text you don't understand. The single `report-pr` cold
   read judges your description ALONGSIDE the code (a description that
   misrepresents the resolution → `rewrite: <reason>`); the other checks
   `report-pr` runs on your text are MECHANICAL only — `ERR08` if it is missing,
