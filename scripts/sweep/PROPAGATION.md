@@ -278,7 +278,22 @@ The driver is the only author of merge parameters. Artifacts live under
   a `resolvedTree` field equal to the tree OID of `--resolved-ref` (freshness binding —
   the verdict attests to THIS resolution, not an earlier one, so it can only ever
   attest to the resolution the regenerated request shows); malformed or stale verdicts
-  are rejected, never treated as confirm. **Fail-closed (D-050):** an
+  are rejected, never treated as confirm.
+  **Bounded resolve cycle (D-052):** the cycle is `resolve` → (driver regenerates
+  `coldread-request.md`) → write `coldread-verdict.json` → `resolve`, and it TERMINATES.
+  The driver OWNS the request file (rewritten on every `--execute`); the agent NEVER
+  deletes or hand-edits it. When a re-resolve changes the tree, the on-disk verdict now
+  attests to the OLD tree — so on `--execute` the driver AUTO-CLEARS it (retires it to
+  `coldread-verdict.stale.json`, journals `stale-verdict-cleared` / `WARN05_STALE_VERDICT_CLEARED`)
+  and the "produce the verdict" path fires cleanly for the new tree, instead of a "stale"
+  rejection the agent cannot diagnose (the 2026-07-22 clean-run loop: the agent, told
+  "stale", deleted the REQUEST — the wrong file — and regenerated it forever). A verdict
+  whose tree MATCHES is left untouched, so an idempotent re-run confirms in one shot.
+  Defense in depth: a resolution that keeps CHANGING is force-HELD after
+  `RESOLVE_COLDREAD_CAP` (3) distinct resolution trees (journaled `resolve-not-converged` /
+  `ERR26_RESOLVE_NOT_CONVERGED`, owner review) — the driver counts `coldread-attempt`
+  journal entries and never loops.
+  **Fail-closed (D-050):** an
   `UNVERIFIABLE-FROM-REQUEST` answer on ANY of q1-q3 is treated as a reject even under
   an overall `confirm` — the reader could not judge that point and researching beyond
   the request is forbidden, so the case is HELD. A confirming verdict's content
@@ -331,6 +346,11 @@ propagate publish --case ID   # §14 (D-048/D-049): the ONLY PR-creation path �
 propagate push                # §14.4 (D-049): verify-gated pass pushes — target branches
                               #   (flips JUDGED PRs to merged), closure checks, posted urges
 propagate status              # human-readable pass state from journal + derivation
+propagate report              # D-052: journal-ONLY end-of-sweep summary (merged / resolved /
+                              #   held / open-cases / pushed + escalations); no git, no GitHub, so
+                              #   a dead/abnormally-terminated session still leaves a readable
+                              #   status. The D-046 owner message is a thin wrapper over it.
+                              #   --out <file> also writes the summary as JSON
 ```
 
 `--tier held` is the direct freeze path: no resolution commit required, no scope guard
@@ -749,6 +769,14 @@ Advisory (returned in `issues`, never block):
 | `WARN01_TEMPLATE_TEXT` | body mentions zero conflictedPaths, or contains a retired driver-template phrase |
 | `WARN02_NO_DECISION_LINE` | the first body line carries no ask/decision |
 | `WARN03_MANY_PRS` | more than 8 PRs published this pass |
+| `WARN05_STALE_VERDICT_CLEARED` | D-052: `resolve --execute` retired a `coldread-verdict.json` attesting an old tree to `coldread-verdict.stale.json` (a re-resolve); the agent then writes a fresh verdict — advisory, never blocks |
+
+`resolve` outcome id (not a DriverHalt — `resolve` returns 0, the case is frozen HELD
+for the owner and journaled `resolve-not-converged`):
+
+| id | meaning |
+|----|---------|
+| `ERR26_RESOLVE_NOT_CONVERGED` | D-052: the resolution cold-read did not converge in `RESOLVE_COLDREAD_CAP` (3) distinct resolution trees — the anti-thrash cap force-HELD the case rather than looping |
 
 DriverHalt reasons, mapped onto the same scheme in `run`/`resolve` CLI output (the
 human text stays in `detail`; the journal keeps the raw reason plus the id):

@@ -60,7 +60,7 @@
  *   only — §14/§14.4, D-049); refs move via git push ONLY, and any push failure is a
  *   hard halt reported to the owner (D-046 case 2), never worked around.
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, appendFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join, resolve as pathResolve } from 'node:path';
 
 import { DEFAULT_STACK_CAP, DEFAULT_UPSTREAM_REF, FORK_POINT, LEDGER_FILENAME, RR_CACHE_DIRNAME, VERIFY_COMMANDS } from './config.js';
@@ -165,7 +165,7 @@ interface Cli {
 }
 
 const USAGE =
-  'Usage: pnpm exec tsx scripts/sweep/propagate.ts <plan|run|resolve|publish|push|verify|unfreeze|status> [--repo <path>] [--workspace <dir>] [--ledger <file>] [--pass <wm12>] [--execute] [--case <id>] [--tier <t>] [--token-file <path>] [--branch <b>] [flags]';
+  'Usage: pnpm exec tsx scripts/sweep/propagate.ts <plan|run|resolve|publish|push|verify|unfreeze|status|report> [--repo <path>] [--workspace <dir>] [--ledger <file>] [--pass <wm12>] [--execute] [--case <id>] [--tier <t>] [--token-file <path>] [--branch <b>] [flags]';
 
 function parseCli(argv: string[]): Cli {
   const [cmd, ...rest] = argv;
@@ -1024,6 +1024,27 @@ function coldReadRequest(
     'An `UNVERIFIABLE-FROM-REQUEST` answer on any of q1-q3 is treated as a reject (fail-closed, D-050).',
   ].join('\n');
 }
+
+/**
+ * D-052 FIX 2: every verdict error names the artifact to WRITE and forbids
+ * deleting the request. The 2026-07-22 clean-run loop came from an agent told
+ * "stale" deleting `coldread-request.md` (the wrong file — the stale one was the
+ * VERDICT) and regenerating it, so the tree mismatch never cleared and the
+ * delete/regenerate/re-read cycle ran unbounded. Naming the right file in the
+ * message kills that ambiguity at the source.
+ */
+const COLDREAD_VERDICT_GUIDANCE =
+  "Write coldread-verdict.json (attesting THIS resolution's tree). The driver regenerates " +
+  'coldread-request.md automatically on every `resolve --execute`; NEVER delete coldread-request.md yourself.';
+
+/**
+ * D-052 FIX 3: anti-thrash cap (defense in depth, mirroring the kind-2 repro
+ * cap). A resolution whose tree keeps CHANGING between attempts never
+ * converges under cold read; beyond this many DISTINCT resolution trees the
+ * driver stops retrying the case and force-freezes it HELD for the owner
+ * rather than looping. Kept small — a genuine resolve converges in one or two.
+ */
+const RESOLVE_COLDREAD_CAP = 3;
 
 /**
  * Driver-created resolution worktree (SPEC 1): a detached worktree at
@@ -1959,6 +1980,7 @@ export async function cmdResolve(cli: Cli): Promise<number> {
       return 2;
     }
     const resolvedTree = await treeOf(cli.repo, cli.resolvedRef);
+    const verdictPath = join(caseDir, 'coldread-verdict.json');
 
     // §7 spec promise: the cold-read request contains conflict hunks AND the
     // resolution diff. REGENERATE it here — BEFORE the verdict is required —
@@ -1967,6 +1989,71 @@ export async function cmdResolve(cli: Cli): Promise<number> {
     // predating this tree is rejected by the freshness binding below anyway).
     // Execute-gated so a dry-run resolve stays write-free (N7).
     if (cli.execute) {
+      // D-052 FIX 3 (anti-thrash cap): count the DISTINCT resolution trees this
+      // case has been cold-read against (journaled `coldread-attempt`). A case
+      // whose resolution keeps changing never converges — beyond the cap we
+      // STOP retrying and force it HELD for the owner instead of looping (the
+      // 2026-07-22 unbounded cycle). Checked BEFORE regenerating anything.
+      const priorTrees = new Set(
+        journal
+          .filter((e) => e.action === 'coldread-attempt' && e.caseId === rc.id && typeof e.resolvedTree === 'string')
+          .map((e) => e.resolvedTree as string),
+      );
+      const distinctTrees = new Set([...priorTrees, resolvedTree]);
+      if (distinctTrees.size > RESOLVE_COLDREAD_CAP) {
+        const reason =
+          `resolution cold-read did not converge in ${RESOLVE_COLDREAD_CAP} attempts ` +
+          `(${distinctTrees.size} distinct resolution trees) — owner review`;
+        appendJournal(dir, {
+          action: 'resolve-not-converged',
+          id: 'ERR26_RESOLVE_NOT_CONVERGED',
+          branch: rc.branch,
+          caseId: rc.id,
+          distinctTrees: [...distinctTrees],
+        });
+        await freezeHeld(cli, dir, rc, [reason]);
+        await removeCaseWorktree(cli, dir, rc.id);
+        reopen(dir, reopenTargets);
+        console.error(`held ${rc.id} [ERR26_RESOLVE_NOT_CONVERGED]: ${reason}`);
+        emit(cli, { case: rc.id, tier: 'held', notes: [reason], reopen: reopenTargets });
+        return 0;
+      }
+      if (!priorTrees.has(resolvedTree)) {
+        appendJournal(dir, { action: 'coldread-attempt', branch: rc.branch, caseId: rc.id, resolvedTree });
+      }
+
+      // D-052 FIX 1 (root cause): a verdict on disk that attests to a DIFFERENT
+      // resolution tree than THIS --resolved-ref is stale the moment the agent
+      // re-resolves (amend / different --resolved-ref). Retire it to
+      // coldread-verdict.stale.json (RENAMED, not destroyed — a mis-passed
+      // --resolved-ref stays recoverable) and journal it, so the "missing
+      // verdict; produce it" path below fires cleanly for the NEW tree instead
+      // of the "stale" rejection the agent could not diagnose (it deleted the
+      // REQUEST — the wrong file — and looped). A verdict whose tree MATCHES is
+      // left untouched, so an idempotent re-run still confirms in one shot.
+      if (existsSync(verdictPath)) {
+        let priorTree: unknown;
+        try {
+          priorTree = (JSON.parse(readFileSync(verdictPath, 'utf8')) as Partial<ColdReadVerdict>).resolvedTree;
+        } catch {
+          priorTree = undefined; // unparseable -> treat as stale, retire it
+        }
+        if (priorTree !== resolvedTree) {
+          renameSync(verdictPath, join(caseDir, 'coldread-verdict.stale.json'));
+          appendJournal(dir, {
+            action: 'stale-verdict-cleared',
+            id: 'WARN05_STALE_VERDICT_CLEARED',
+            branch: rc.branch,
+            caseId: rc.id,
+            staleTree: typeof priorTree === 'string' ? priorTree : null,
+            resolvedTree,
+          });
+          console.error(
+            `WARN05_STALE_VERDICT_CLEARED: retired stale coldread-verdict.json (attested ${String(priorTree).slice(0, 12)} != this resolution's tree ${resolvedTree.slice(0, 12)}) -> coldread-verdict.stale.json`,
+          );
+        }
+      }
+
       const tipNow = await revParse(cli.repo, rc.branch);
       const conflictDiff = await git(cli.repo, ['diff', tipNow, rc.automergeTree, '--', ...rc.conflictedPaths], {
         allowCodes: [1],
@@ -1984,9 +2071,8 @@ export async function cmdResolve(cli: Cli): Promise<number> {
     }
 
     // Cold-read verdict VALIDATION (§7, D2): shape + freshness before it can gate.
-    const verdictPath = join(caseDir, 'coldread-verdict.json');
     if (!existsSync(verdictPath)) {
-      console.error(`resolve: cold-read verdict missing (${verdictPath}); produce it before resolving`);
+      console.error(`resolve: cold-read verdict missing (${verdictPath}); produce it before resolving. ${COLDREAD_VERDICT_GUIDANCE}`);
       return 2;
     }
     const coldread = JSON.parse(readFileSync(verdictPath, 'utf8')) as Partial<ColdReadVerdict>;
@@ -2001,8 +2087,11 @@ export async function cmdResolve(cli: Cli): Promise<number> {
       return 2;
     }
     if (coldread.resolvedTree !== resolvedTree) {
+      // Reachable only on a dry-run resolve (--execute clears a stale verdict
+      // above, D-052 FIX 1); still name the right artifact so the agent never
+      // goes after the request.
       console.error(
-        `resolve: cold-read verdict is stale — resolvedTree ${String(coldread.resolvedTree).slice(0, 12)} != this resolution's tree ${resolvedTree.slice(0, 12)}`,
+        `resolve: cold-read verdict is stale — resolvedTree ${String(coldread.resolvedTree).slice(0, 12)} != this resolution's tree ${resolvedTree.slice(0, 12)}. ${COLDREAD_VERDICT_GUIDANCE}`,
       );
       return 2;
     }
@@ -3076,6 +3165,78 @@ export async function cmdStatus(cli: Cli): Promise<number> {
   return 0;
 }
 
+/**
+ * D-052 FIX 4: the end-of-sweep owner summary, derived PURELY from the journal
+ * (no git, no GitHub) so a dead or abnormally-terminated session still leaves a
+ * readable status. The D-046 owner message the agent sends at end-of-sweep is a
+ * thin wrapper over this — the harness can always emit it, and "no pass dies
+ * silently" holds even when the agent never composed a message. Prints
+ * merged / resolved / held / open-cases / pushed plus the escalation lines
+ * (diverged, merge-failed, force-HELD-not-converged, stale-verdicts-cleared);
+ * `--out` also writes the same summary as JSON for machine consumers.
+ */
+export async function cmdReport(cli: Cli): Promise<number> {
+  const { dir } = await passContext(cli);
+  const journal = readJournal(dir);
+  const sealed = journal.some((e) => e.action === 'pass-complete');
+
+  const merged = journal.filter((e) => e.action === 'merge');
+  const mergedBranches = [...new Set(merged.map((e) => e.branch as string).filter(Boolean))];
+
+  const resolved: Array<{ caseId: string; branch: string; tier: string }> = [];
+  const held: Array<{ caseId: string; branch: string; reason: string }> = [];
+  const open: Array<{ caseId: string; branch: string }> = [];
+  for (const jc of [...journaledCases(journal).values()].sort((a, b) => a.firstIndex - b.firstIndex)) {
+    const disp = lastDisposition(journal, jc.caseId);
+    if (!disp) open.push({ caseId: jc.caseId, branch: jc.branch });
+    else if (disp.action === 'resolved')
+      resolved.push({ caseId: jc.caseId, branch: jc.branch, tier: (disp.tier as string) ?? 'unknown' });
+    else held.push({ caseId: jc.caseId, branch: jc.branch, reason: Array.isArray(disp.notes) ? (disp.notes as string[]).join('; ') : '' });
+  }
+
+  const pushes = journal.filter((e) => e.action === 'push');
+  const pushedBranches = [...new Set(pushes.map((e) => e.branch as string).filter(Boolean))];
+  const diverged = journal.filter((e) => e.action === 'halt' && e.reason === 'sync-diverged').map((e) => e.branch as string);
+  const mergeFailed = journal.filter((e) => e.action === 'halt' && e.reason === 'merge-failed').map((e) => e.branch as string);
+  const notConverged = journal.filter((e) => e.action === 'resolve-not-converged').map((e) => e.caseId as string);
+  const staleCleared = journal.filter((e) => e.action === 'stale-verdict-cleared').length;
+  const urges = journal.filter((e) => e.action === 'urge').length;
+
+  console.log(`pass ${dir} — ${sealed ? 'COMPLETE (pass-complete)' : 'OPEN'}`);
+  console.log(`merged:   ${merged.length}${mergedBranches.length ? ` (${mergedBranches.join(', ')})` : ''}`);
+  console.log(
+    `resolved: ${resolved.length}${resolved.length ? ` — ${resolved.map((r) => `${r.caseId} [${r.tier}]`).join(', ')}` : ''}`,
+  );
+  console.log(`held:     ${held.length}${held.length ? ` — ${held.map((h) => h.caseId).join(', ')}` : ''}`);
+  console.log(`open:     ${open.length}${open.length ? ` — ${open.map((o) => o.caseId).join(', ')}` : ''}`);
+  console.log(`pushed:   ${pushes.length}${pushedBranches.length ? ` (${pushedBranches.join(', ')})` : ''}`);
+  if (diverged.length) console.log(`diverged (owner escalation): ${diverged.join(', ')}`);
+  if (mergeFailed.length) console.log(`merge-failed (D-047/B11): ${mergeFailed.join(', ')}`);
+  if (notConverged.length) console.log(`resolve-not-converged (force-HELD, ERR26): ${notConverged.join(', ')}`);
+  if (staleCleared) console.log(`stale verdicts cleared (WARN05): ${staleCleared}`);
+
+  const summary = {
+    passDir: dir,
+    sealed,
+    merged: mergedBranches,
+    mergedCount: merged.length,
+    resolved,
+    held,
+    openCases: open,
+    pushed: pushedBranches,
+    diverged,
+    mergeFailed,
+    notConverged,
+    staleVerdictsCleared: staleCleared,
+    urges,
+  };
+  if (cli.out) {
+    writeFileSync(cli.out, JSON.stringify(summary, null, 2) + '\n');
+    console.log(`wrote ${cli.out}`);
+  }
+  return 0;
+}
+
 const HANDLERS: Record<string, (cli: Cli) => Promise<number>> = {
   plan: cmdPlan,
   run: cmdRun,
@@ -3085,6 +3246,7 @@ const HANDLERS: Record<string, (cli: Cli) => Promise<number>> = {
   verify: cmdVerify,
   unfreeze: cmdUnfreeze,
   status: cmdStatus,
+  report: cmdReport, // §14 (D-052 FIX 4): journal-derived end-of-sweep owner summary
 };
 
 // Only run the dispatcher when invoked as a script (not when imported by tests).

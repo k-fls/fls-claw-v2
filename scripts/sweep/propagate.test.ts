@@ -21,6 +21,7 @@ import { DriverHalt, guardRef } from './propagate.js';
 import {
   cmdPlan,
   cmdPush,
+  cmdReport,
   cmdResolve,
   cmdRun,
   cmdStatus,
@@ -366,6 +367,136 @@ describe('propagate resolve — cold-read verdict validation (§7, FIX D2)', () 
       ),
     ).toBe(2);
     expect(readJournal(dir).some((e) => e.action === 'resolved')).toBe(false);
+  });
+});
+
+// --- D-052: bounded resolve cycle (stale-verdict clear + anti-thrash cap) ---
+describe('propagate resolve — stale-verdict auto-clear + convergence cap (D-052)', () => {
+  /** Plan+run a conflict case; return the open caseId and its case file. */
+  async function openCase(repo: FixtureRepo, ws: string, inv: string, dir: string) {
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
+    return { caseId, caseFile: readCase(dir, caseId) };
+  }
+
+  it('(a) a verdict attesting an OLD tree is auto-cleared; the next resolve asks for a fresh one, then merges', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const { caseId, caseFile } = await openCase(repo, ws, inv, dir);
+
+    // The CURRENT resolution (tree B) with a verdict on disk that attests to a
+    // DIFFERENT resolution (tree A) — the classic re-resolve staleness.
+    const refA = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'RES-A\n' });
+    const refB = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'RES-B\n' });
+    writeVerdict(dir, caseId, repo, refA); // stale: attests tree A, we resolve B
+
+    // First resolve of B: the stale verdict is retired (NOT "stale" dead-end),
+    // and the missing-verdict path fires -> exit 2, naming the right artifact.
+    expect(
+      await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef: refB })),
+    ).toBe(2);
+    expect(existsSync(join(dir, caseId, 'coldread-verdict.stale.json'))).toBe(true);
+    expect(existsSync(join(dir, caseId, 'coldread-verdict.json'))).toBe(false);
+    const j1 = readJournal(dir);
+    expect(j1.some((e) => e.action === 'stale-verdict-cleared' && e.id === 'WARN05_STALE_VERDICT_CLEARED')).toBe(true);
+    expect(j1.some((e) => e.action === 'resolved')).toBe(false);
+
+    // Agent writes a FRESH verdict attesting tree B; resolve now merges in one shot.
+    writeVerdict(dir, caseId, repo, refB);
+    expect(
+      await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef: refB })),
+    ).toBe(0);
+    expect(readJournal(dir).some((e) => e.action === 'resolved' && e.caseId === caseId)).toBe(true);
+    expect(repo.git('show', 'main_patched:src/x.ts')).toBe('RES-B');
+  });
+
+  it('(b) an idempotent re-run with a MATCHING verdict still merges in one shot (verdict untouched)', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const { caseId, caseFile } = await openCase(repo, ws, inv, dir);
+
+    const ref = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'RESOLVED\n' });
+    writeVerdict(dir, caseId, repo, ref); // MATCHING (attests this tree)
+    expect(
+      await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef: ref })),
+    ).toBe(0);
+    // The matching verdict was kept (never retired), and no WARN05 fired.
+    expect(existsSync(join(dir, caseId, 'coldread-verdict.stale.json'))).toBe(false);
+    const j = readJournal(dir);
+    expect(j.some((e) => e.action === 'stale-verdict-cleared')).toBe(false);
+    expect(j.filter((e) => e.action === 'resolved' && e.caseId === caseId).length).toBe(1);
+  });
+
+  it('(c) a case cycling through >N distinct resolution trees is force-HELD, not looped', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const { caseId, caseFile } = await openCase(repo, ws, inv, dir);
+    const postRun = repo.sha('main_patched');
+
+    // Three distinct resolution trees, each WITHOUT a matching verdict: every
+    // attempt is journaled (`coldread-attempt`) but returns exit 2 (no merge),
+    // so the case stays open — exactly the thrash the cap must break.
+    for (const body of ['A\n', 'B\n', 'C\n']) {
+      const ref = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': body });
+      expect(
+        await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef: ref })),
+      ).toBe(2);
+    }
+    expect(readJournal(dir).filter((e) => e.action === 'coldread-attempt' && e.caseId === caseId).length).toBe(3);
+
+    // The 4th DISTINCT tree exceeds the cap -> force-HELD (exit 0), no merge,
+    // branch ledger-frozen; the loop is broken.
+    const ref4 = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'D\n' });
+    expect(
+      await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef: ref4 })),
+    ).toBe(0);
+    const j = readJournal(dir);
+    expect(j.some((e) => e.action === 'resolve-not-converged' && e.id === 'ERR26_RESOLVE_NOT_CONVERGED')).toBe(true);
+    expect(j.some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
+    expect(j.some((e) => e.action === 'resolved' && e.caseId === caseId)).toBe(false);
+    expect(repo.sha('main_patched')).toBe(postRun); // NO merge landed
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.status).toBe('frozen');
+  });
+
+  it('(d) `propagate report` prints a journal-derived summary incl. open/unresolved cases', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const { caseId } = await openCase(repo, ws, inv, dir);
+
+    // Case still open: report shows a merged clean prefix + one open case.
+    const out1 = join(ws, 'report-open.json');
+    expect(await cmdReport(baseCli(repo, ws, inv, { cmd: 'report', out: out1 }))).toBe(0);
+    const r1 = JSON.parse(readFileSync(out1, 'utf8')) as {
+      mergedCount: number;
+      openCases: Array<{ caseId: string }>;
+      held: unknown[];
+      resolved: unknown[];
+      sealed: boolean;
+    };
+    expect(r1.mergedCount).toBeGreaterThanOrEqual(1);
+    expect(r1.openCases.map((o) => o.caseId)).toContain(caseId);
+    expect(r1.resolved.length).toBe(0);
+    expect(r1.held.length).toBe(0);
+
+    // Freeze it HELD; report now reflects the disposition (open -> held).
+    expect(await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'held' }))).toBe(0);
+    const out2 = join(ws, 'report-held.json');
+    expect(await cmdReport(baseCli(repo, ws, inv, { cmd: 'report', out: out2 }))).toBe(0);
+    const r2 = JSON.parse(readFileSync(out2, 'utf8')) as {
+      openCases: unknown[];
+      held: Array<{ caseId: string }>;
+    };
+    expect(r2.openCases.length).toBe(0);
+    expect(r2.held.map((h) => h.caseId)).toContain(caseId);
   });
 });
 

@@ -152,11 +152,20 @@ rediscover it the hard way):
      then `... resolve --case <id> --tier mechanical|judged --resolved-ref
      <commit>` (dry-run first; `--tier held` = cannot-resolve, freezes with
      PR materials prepared — the draft PR itself goes through `publish`,
-     D-048). The first `resolve --execute`
-     regenerates `coldread-request.md` with YOUR resolution diff and exits
-     asking for a verdict: produce `coldread-verdict.json` via a CONTEXT-FREE
-     subagent (D-031 — hand it ONLY the request file; the verdict must carry
-     the resolved tree OID), then re-run resolve. The cold read is FOCUSED
+     D-048). The resolve cycle is a BOUNDED sequence (D-052): `resolve
+     --execute` regenerates `coldread-request.md` with YOUR resolution diff
+     (the driver owns that file — it rewrites it on EVERY `--execute`; you
+     NEVER delete or hand-edit `coldread-request.md`) and exits asking for a
+     verdict: produce `coldread-verdict.json` via a CONTEXT-FREE subagent
+     (D-031 — hand it ONLY the request file; the verdict must carry the
+     resolved tree OID), then re-run resolve. If you re-resolve (amend /
+     different `--resolved-ref`), the driver AUTO-CLEARS the now-stale verdict
+     (retires it to `coldread-verdict.stale.json`, `WARN05`) and asks for a
+     fresh `coldread-verdict.json` for the new tree — so there is no "stale"
+     dead-end to fight: write the VERDICT, never touch the request. A
+     resolution that keeps CHANGING and never converges is force-HELD after
+     `RESOLVE_COLDREAD_CAP` (3) distinct trees (`ERR26_RESOLVE_NOT_CONVERGED`,
+     owner review) — the driver never loops. The cold read is FOCUSED
      (D-050): three bounded questions (behaviour preserved / every hunk
      conflict-explained / no contradicted record), judged from the request
      ALONE — the reader answers `UNVERIFIABLE-FROM-REQUEST` rather than
@@ -173,8 +182,11 @@ rediscover it the hard way):
      closures and POSTS the urge comments) → `publish` each HELD case (draft
      PR at the case run's top commit; the base is current, so the diff is the
      run only). `ERR15_PUSH_FAILED` anywhere = case-2 report + full stop.
-   - `... status` for pass state; `... unfreeze` ONLY on explicit owner
-     instruction, journaled.
+   - `... status` for pass state; `... report` (D-052) prints the
+     journal-derived end-of-sweep summary (merged / resolved / held /
+     open-cases / pushed) — your final digest is a thin wrapper over it, so
+     even an abnormally-terminated pass leaves a readable status; `...
+     unfreeze` ONLY on explicit owner instruction, journaled.
    **Case comprehension (owner directive, D-048):** a case is always something you
    are LOOKING AT — study the case worktree and materials until you can explain
    both sides; the description you publish is YOUR understanding, never a template.
@@ -244,9 +256,11 @@ retired PR-text cold read (D-050) — all permanently retired, never reused.)
 | `ERR23_PROTECTED_REF` | you asked the driver to move a protected ref → your inputs are wrong; stop and re-check the case |
 | `ERR24_PLAN_DRIFT` | git moved under the pass → investigate what moved; re-plan only if the journal shows no half-done work |
 | `ERR25_BAD_CASE_ID` | the --case value is not a generated case id → copy the id from the journal/case dir |
+| `ERR26_RESOLVE_NOT_CONVERGED` | resolution cold-read did not converge in 3 distinct trees → the driver force-HELD the case for owner review; STOP re-resolving it, report in the digest |
 | `WARN01_TEMPLATE_TEXT` | your body references none of the conflicted files — rewrite from the case materials |
 | `WARN02_NO_DECISION_LINE` | open the body with the exact decision the owner is being asked to make |
 | `WARN03_MANY_PRS` | >8 PRs this pass — re-check for consolidation before publishing more |
+| `WARN05_STALE_VERDICT_CLEARED` | the driver retired a stale `coldread-verdict.json` (you re-resolved) → write a FRESH verdict for the new tree; NEVER delete `coldread-request.md` |
 
 ## Registry upkeep
 
