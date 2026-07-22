@@ -791,7 +791,7 @@ for the owner and journaled `resolve-not-converged`):
 | id | meaning |
 |----|---------|
 | `ERR26_RESOLVE_NOT_CONVERGED` | D-052: the resolution cold-read did not converge in `RESOLVE_COLDREAD_CAP` (3) distinct resolution trees — the anti-thrash cap force-HELD the case rather than looping |
-| `ERR35_COLDREAD_UNAVAILABLE` | D-054: the cold read (`claude -p`) could not RUN — spawn error, non-zero exit, unparseable stdout, or a recognizable auth/login failure. An INFRA error, NOT a content decision: `report-case`/`report-pr` hard-halt (mirrors `ERR15`), the case is NOT frozen HELD, and the command is re-runnable once the tooling is restored. Only a cold read that actually ran and rejected → HELD |
+| `ERR35_COLDREAD_UNAVAILABLE` | D-054/D-055: a cold-read TOOLING failure — the `claude -p` cold read could not RUN (spawn error, non-zero exit, unparseable stdout, or a recognizable auth/login failure), OR a leftover verdict file that recorded such a failure as a `reject`. An INFRA error, NEVER a content decision: `report-case`, `report-pr` AND the flag-path `resolve` hard-halt (mirrors `ERR15`), report to the owner (D-046 case 2) and STOP; the case is NOT frozen HELD (nor rejected, nor left in the confirm/reject "invalid verdict" ambiguity), and the command is re-runnable once the tooling is restored. Only a cold read that actually RAN and judged the content may reject → HELD |
 
 DriverHalt reasons, mapped onto the same scheme in `run`/`resolve` CLI output (the
 human text stays in `detail`; the journal keeps the raw reason plus the id):

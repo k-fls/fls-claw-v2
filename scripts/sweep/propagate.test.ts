@@ -500,6 +500,85 @@ describe('propagate resolve — stale-verdict auto-clear + convergence cap (D-05
   });
 });
 
+// --- D-055: a cold-read INFRA failure at `resolve` must HALT (ERR35), never HELD -
+describe('propagate resolve — cold-read infra failure ≠ content reject (D-055, ERR35)', () => {
+  async function openCase(repo: FixtureRepo, ws: string, inv: string, dir: string) {
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
+    return { caseId, caseFile: readCase(dir, caseId) };
+  }
+
+  it("an 'error' verdict file -> HARD HALT (ERR35), NOT held, machine state left retryable, no merge", async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const { caseId, caseFile } = await openCase(repo, ws, inv, dir);
+    const postRun = repo.sha('main_patched');
+    const resolvedRef = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'RESOLVED\n' });
+
+    // A verdict file whose shape is `error` (D-054 invoker form): infra, not content.
+    writeFileSync(
+      join(dir, caseId, 'coldread-verdict.json'),
+      JSON.stringify({ verdict: 'error', notes: '', reason: 'claude -p failed (status 1: Not logged in)', resolvedTree: treeOfRef(repo, resolvedRef) }),
+    );
+    const out = join(ws, 'resolve-err.json');
+    expect(
+      await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef, out })),
+    ).toBe(1); // hard halt (NOT the return-2 "invalid verdict" ambiguity, NOT 0-with-HELD)
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues?: Array<{ id: string }> };
+    expect(res.issues?.some((i) => i.id === 'ERR35_COLDREAD_UNAVAILABLE')).toBe(true);
+    const j = readJournal(dir);
+    expect(j.some((e) => e.action === 'halt' && e.id === 'ERR35_COLDREAD_UNAVAILABLE')).toBe(true);
+    expect(j.some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
+    expect(j.some((e) => e.action === 'resolved' && e.caseId === caseId)).toBe(false);
+    expect(repo.sha('main_patched')).toBe(postRun); // nothing merged; retryable
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.status).not.toBe('frozen');
+  });
+
+  it("a STALE reject verdict whose notes read as a `claude -p` failure -> HALT (ERR35), NOT consumed as a fresh HELD", async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const { caseId, caseFile } = await openCase(repo, ws, inv, dir);
+    const resolvedRef = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'RESOLVED\n' });
+
+    // The exact 2026-07-22 leftover: a `reject` verdict attesting THIS tree, whose
+    // notes are actually the infra failure fail-closed to reject (pre-D-054).
+    writeFileSync(
+      join(dir, caseId, 'coldread-verdict.json'),
+      JSON.stringify({ verdict: 'reject', notes: 'claude -p failed (status 1) — fail-closed (D-053)', resolvedTree: treeOfRef(repo, resolvedRef) }),
+    );
+    expect(
+      await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef })),
+    ).toBe(1); // HALT, not a HELD-producing reject
+    const j = readJournal(dir);
+    expect(j.some((e) => e.action === 'halt' && e.id === 'ERR35_COLDREAD_UNAVAILABLE')).toBe(true);
+    expect(j.some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
+  });
+
+  it('a GENUINE content reject (ran fine, real notes) -> still HELD (content decision preserved)', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const { caseId, caseFile } = await openCase(repo, ws, inv, dir);
+    const postRun = repo.sha('main_patched');
+    const resolvedRef = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'RESOLVED\n' });
+    writeVerdict(dir, caseId, repo, resolvedRef, 'reject'); // notes: 'cold read ok' — a real judged reject
+    expect(
+      await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef })),
+    ).toBe(0); // frozen HELD (not a halt)
+    const j = readJournal(dir);
+    expect(j.some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
+    expect(j.some((e) => e.action === 'halt' && e.id === 'ERR35_COLDREAD_UNAVAILABLE')).toBe(false);
+    expect(repo.sha('main_patched')).toBe(postRun); // no merge; frozen
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.status).toBe('frozen');
+  });
+});
+
 describe('propagate run — no-op skip + leaf un-skip chain (§6)', () => {
   it('un-skips the cheapest parent chain so the leaf lands a real (empty) merge', async () => {
     const repo = initFixtureRepo();

@@ -32,6 +32,19 @@ command surface and who-does-what.
   blind-wipe an in-flight pass (that stranded resolved-but-unpushed merges before).
 - Pin the top upstream commit = watermark; ALL downstream work is against it.
 - Reset working state to a known base; initialize the journal.
+- **Clean-slate boundary (D-055):** the pass lives at ONE canonical location
+  `<--workspace>/propagation/pass-<watermark12>`, printed by `start` and `status`.
+  `--workspace` is the GROUP ROOT (parent of the clone), defaulted from `--repo`;
+  `start` REFUSES a workspace that IS `--repo`'s toplevel or a subdirectory of it
+  (ERR37) so the pass never lands in the clone (which split per-pass state from
+  the durable group ledger + rr-cache and killed rerere) — a group root nested in
+  an OUTER git repo (the real server, `~/nanoclaw2`) is accepted. After the
+  open-pass refusal, `start` removes the
+  WHOLE prior pass tree at the canonical location (worktrees + case dirs +
+  `coldread-*` + `pr/`) so no leftover journal/HELD or poisoned
+  `coldread-verdict.json` is ever inherited. `abort` seals the pass with
+  `pass-complete` (like `finish`) so it is never re-attached. The driver owns the
+  lifecycle; teardown runs IN-CONTAINER (host `rm` fails on container-uid files).
 
 ### `sweep next-case`
 - Deterministic, internal, no `claude -p`: fetch, scan, plan (DAG/breadth-wise order),

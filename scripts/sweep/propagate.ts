@@ -29,7 +29,7 @@
  *
  * Flags:
  *   --repo <path>            repo to operate on                (default: cwd)
- *   --workspace <dir>        artifacts root                    (default: cwd)
+ *   --workspace <dir>        artifacts root = GROUP ROOT       (default: parent of --repo; MUST be outside any git work tree, D-055)
  *   --ledger <file>          group-owned ledger JSON           (default: <workspace>/sweep-ledger.json)
  *   --pass <watermark12>     attach to a specific pass         (default: latest OPEN pass)
  *   --inventory <dir>        live feature inventory            (default: latest bootstrap snapshot)
@@ -66,12 +66,14 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
+  rmSync,
   statSync,
   writeFileSync,
   appendFileSync,
 } from 'node:fs';
-import { join, resolve as pathResolve } from 'node:path';
+import { dirname, join, resolve as pathResolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 
 import {
@@ -207,6 +209,7 @@ function parseCli(argv: string[]): Cli {
     upstream: DEFAULT_UPSTREAM_REF,
     execute: false,
   };
+  let workspaceExplicit = false;
   for (let i = 0; i < rest.length; i++) {
     const flag = rest[i];
     const need = (): string => {
@@ -223,6 +226,7 @@ function parseCli(argv: string[]): Cli {
         break;
       case '--workspace':
         cli.workspace = pathResolve(need());
+        workspaceExplicit = true;
         break;
       case '--ledger':
         cli.ledgerPath = pathResolve(need());
@@ -277,6 +281,13 @@ function parseCli(argv: string[]): Cli {
         process.exit(2);
     }
   }
+  // D-055 (C-1): the canonical workspace is the GROUP ROOT — the parent of the
+  // git clone (`repo/`), where the DURABLE `sweep-ledger.json` + `rr-cache` live.
+  // When `--workspace` is not given, derive it from `--repo` so the pass, ledger
+  // and rr-cache never land INSIDE the clone (the 2026-07-22 split that killed
+  // rerere and diverged the freeze ledger). An explicit `--workspace` is honored
+  // but `sweep start` refuses one inside a git working tree (see cmdSweepStart).
+  if (!workspaceExplicit) cli.workspace = dirname(pathResolve(cli.repo));
   return cli;
 }
 
@@ -2149,7 +2160,38 @@ export async function cmdResolve(cli: Cli): Promise<number> {
       );
       return 2;
     }
-    const coldread = JSON.parse(readFileSync(verdictPath, 'utf8')) as Partial<ColdReadVerdict>;
+    const coldread = JSON.parse(readFileSync(verdictPath, 'utf8')) as Partial<ColdReadVerdict> & {
+      verdict?: string;
+      reason?: string;
+    };
+    // D-055 INVARIANT: a COLD-READ INFRA FAILURE must be reported and HALT — it
+    // must NEVER become a HELD (or a reject, or the confirm/reject "invalid
+    // verdict" return-2). A verdict file whose shape is `error` (D-054) OR whose
+    // notes/reason read as a `claude -p` failure (a pre-D-054 leftover that
+    // fail-closed to `reject` — the 2026-07-22 bug journaled `held … "cold-read
+    // rejected -> HELD: claude -p failed (status 1) …"`) is a tooling failure:
+    // hard-halt (ERR35), report to the owner (D-046 case 2), leave the case
+    // retryable. Only a cold read that actually RAN and judged rejects → HELD.
+    if (coldReadInfraFailure(coldread)) {
+      const reason =
+        coldread.reason ??
+        (typeof coldread.notes === 'string' && coldread.notes.trim() ? coldread.notes : 'unknown');
+      const detail = `cold-read tooling unavailable: ${reason} — report to owner (D-046 case 2) and stop; NOT a content decision`;
+      if (cli.execute) {
+        appendJournal(dir, {
+          action: 'halt',
+          reason: 'coldread-unavailable',
+          id: 'ERR35_COLDREAD_UNAVAILABLE',
+          caseId: rc.id,
+          branch: rc.branch,
+          phase: 'resolve',
+          message: detail,
+        });
+      }
+      console.error(`resolve HALT [ERR35_COLDREAD_UNAVAILABLE]: ${detail}`);
+      emit(cli, { case: rc.id, halt: 'coldread-unavailable', issues: [{ id: 'ERR35_COLDREAD_UNAVAILABLE', detail }] });
+      return 1;
+    }
     if (coldread.verdict !== 'confirm' && coldread.verdict !== 'reject') {
       console.error(
         `resolve: invalid cold-read verdict (must be 'confirm' or 'reject', got ${JSON.stringify(coldread.verdict)})`,
@@ -3427,6 +3469,29 @@ export interface MachineVerdict {
 /** Auth/login failure text a broken `claude -p` prints (often at exit 0) — infra, not content. */
 const COLDREAD_AUTH_FAILURE = /not logged in|invalid api key|authentication_error|unauthorized|please run.*login|login expired|credit balance is too low/i;
 
+/**
+ * D-055: the notes/reason a cold-read INFRA failure leaves behind — a `claude -p`
+ * that could not RUN, NOT a content decision. `verdict:'error'` (D-054) is the
+ * canonical shape; this regex ALSO recognizes a pre-D-054 leftover verdict FILE
+ * that fail-closed a `claude -p` failure to `reject` — the 2026-07-22 bug, whose
+ * `coldread-verdict.json` read `{"verdict":"reject","notes":"claude -p failed
+ * (status 1) — fail-closed (D-053)"}`. Either shape MUST hard-halt (ERR35), never
+ * freeze HELD. Only a cold read that actually RAN and judged the content rejects.
+ */
+const COLDREAD_INFRA_NOTE = /claude -p failed|no parseable verdict|tooling (error|unavailable)|cold read auth\/login failure/i;
+
+/**
+ * True when a verdict (parsed `MachineVerdict` OR a `coldread-verdict.json` read
+ * off disk) is an INFRA failure rather than a content decision (D-055). The
+ * `verdict:'error'` form is authoritative; the notes/reason regexes catch a
+ * stale/legacy verdict file that recorded an infra failure as a `reject`.
+ */
+function coldReadInfraFailure(v: { verdict?: unknown; notes?: unknown; reason?: unknown }): boolean {
+  if (v.verdict === 'error') return true;
+  const text = `${typeof v.reason === 'string' ? v.reason : ''} ${typeof v.notes === 'string' ? v.notes : ''}`;
+  return COLDREAD_INFRA_NOTE.test(text) || COLDREAD_AUTH_FAILURE.test(text);
+}
+
 /** Injectable cold-read invoker: prompt in, verdict out (default shells `claude -p`). */
 export type ColdReadInvoker = (prompt: string) => Promise<MachineVerdict>;
 
@@ -3705,22 +3770,111 @@ function branchTestCommands(cli: Cli): VerifyCommand[] {
  * `finish` or `abort` first — never blind-wipe an in-flight pass (that stranded
  * resolved-but-unpushed merges before, §2). Pins the watermark = upstream top
  * commit (via cmdPlan), initializes the journal, and writes the machine state.
+ *
+ * D-055 clean-slate boundary: the pass directory lives at ONE canonical location
+ * — `<--workspace>/propagation/pass-<watermark12>` — logged on every `start` and
+ * `status` so no operator guesses it. `start` REMOVES the WHOLE prior pass tree
+ * (worktrees + case dirs + `coldread-*.json`/`.md` + `pr/`) of any COMPLETE or
+ * STALE prior pass at that location before opening (a still-OPEN pass still
+ * refuses). This closes the 2026-07-22 contamination: a new run at the same
+ * watermark inherited a prior pass's journal (a D-053 HELD leaked into a D-054
+ * run) AND a poisoned `coldread-verdict.json` (an infra failure recorded as a
+ * reject) because `plan` re-attached to the leftover files. The driver OWNS the
+ * pass-dir lifecycle — never rely on an external hand-rm (host `rm` fails on
+ * container-uid-owned files, so teardown MUST run IN-CONTAINER, which `start`
+ * does). C-1: it also refuses a `--workspace` that IS the `--repo` clone or a
+ * subdirectory of it, so the pass never lands inside the clone (splitting it
+ * from the durable group-root ledger + rr-cache, which killed rerere and
+ * diverged the ledger). A group root inside an OUTER git repo is accepted.
  */
 export async function cmdSweepStart(cli: Cli): Promise<number> {
-  // Refuse a still-open pass. attachPass finds the latest OPEN pass dir (no
-  // pass-complete); a machine state that is not `complete` means it is in flight.
+  // C-1 (D-055): the workspace is the GROUP ROOT and MUST NOT be the FORK CLONE
+  // (`--repo`) or a subdirectory of it — the run set --workspace to the clone, so
+  // the pass + a throwaway empty `sweep-ledger.json` + a missing rr-cache all
+  // landed inside the clone, splitting per-pass state from the durable group
+  // ledger/rr-cache and killing rerere. The check is scoped to the CLONE ONLY:
+  // the group root legitimately sits inside an OUTER git work tree (the real
+  // server — `~/nanoclaw2` is a git repo, group root `~/nanoclaw2/groups/<g>`),
+  // so a plain "inside any work tree" test would wrongly refuse the correct
+  // default. Compare against `--repo`'s toplevel (real, absolute) instead.
+  const repoTopRaw = (await git(cli.repo, ['rev-parse', '--show-toplevel'], { allowCodes: [1, 128] })).stdout.trim();
+  if (repoTopRaw) {
+    const realOf = (p: string): string => (existsSync(p) ? realpathSync(p) : pathResolve(p));
+    const repoTop = realOf(repoTopRaw);
+    const ws = realOf(cli.workspace);
+    if (ws === repoTop || ws.startsWith(repoTop + sep)) {
+      const detail =
+        `--workspace ${cli.workspace} is the --repo clone (${repoTop}) or a subdirectory of it — the pass would ` +
+        `land inside the clone, splitting it from the durable group-root ledger + rr-cache. Point --workspace at ` +
+        `the GROUP ROOT (parent of the clone).`;
+      console.error(`sweep start [ERR37_WORKSPACE_IN_CLONE]: ${detail}`);
+      result(cli, { ok: false, issues: [{ id: 'ERR37_WORKSPACE_IN_CLONE', detail }] });
+      return 1;
+    }
+  }
+
+  // D-055: resolve the ONE canonical pass location for this watermark up front.
+  // `--workspace` is the single artifacts root (default: the group root = parent
+  // of --repo); passDir() is the sole path builder, so where the driver WRITES
+  // and what the doctrine names are identical — there is exactly one location.
+  const watermark12 = (await revParse(cli.repo, cli.upstream)).slice(0, 12);
+  const canonicalDir = passDir(cli.workspace, watermark12);
+
+  // Refuse a still-OPEN pass (D-053): a machine state whose phase is not
+  // `complete` is in flight — require `finish`/`abort` first, never blind-wipe.
+  // Check BOTH the canonical dir for THIS watermark AND the latest pass
+  // attachPass would attach to (an in-flight pass at a DIFFERENT watermark
+  // counts too — and guarding the canonical dir directly means a genuinely-open
+  // same-watermark pass is never mistaken for a stale one and cleared below).
+  const openCandidates = new Set<string>();
+  if (existsSync(canonicalDir)) openCandidates.add(canonicalDir);
   try {
-    const existing = await attachPass({ ...cli, cmd: 'status' });
-    const st = readMachineState(existing.dir);
+    openCandidates.add((await attachPass({ ...cli, cmd: 'status' })).dir);
+  } catch {
+    /* no attachable open pass — fine */
+  }
+  for (const d of openCandidates) {
+    const st = readMachineState(d);
     if (st && st.phase !== 'complete') {
-      const detail = `a pass is already open (${existing.watermark12}, phase ${st.phase}) — run \`finish\` or \`abort\` first`;
+      const detail = `a pass is already open (${d}, phase ${st.phase}) — run \`finish\` or \`abort\` first`;
       console.error(`sweep start [ERR30_PASS_OPEN]: ${detail}`);
       result(cli, { ok: false, issues: [{ id: 'ERR30_PASS_OPEN', detail }] });
       return 1;
     }
-  } catch {
-    /* no open pass — proceed */
   }
+
+  // Clean-slate boundary (D-055): the refusal above cleared any in-flight pass,
+  // so anything still at the canonical location is a COMPLETE or STALE prior
+  // pass (or a pre-machine-state leftover with no machine-state.json). Remove the
+  // WHOLE tree — journal + machine-state + every case dir with its
+  // `coldread-*.json`/`.md` + `pr/` — so NOTHING is inherited: not the leaked
+  // HELD journal, and not a poisoned `coldread-verdict.json` (an infra failure
+  // recorded as a reject, the D-055 poison `cmdResolve` would read as authentic).
+  // `start` is the ONLY place this happens; the driver owns the lifecycle.
+  if (existsSync(canonicalDir)) {
+    // De-register the prior pass's worktrees FIRST so removing the tree does not
+    // strand git worktree admin entries; the tree rm then takes the files.
+    for (const c of journaledCases(readJournal(canonicalDir)).keys()) {
+      await removeCaseWorktree(cli, canonicalDir, c);
+    }
+    try {
+      rmSync(canonicalDir, { recursive: true, force: true });
+    } catch (e) {
+      // Pass files are container-uid-owned — a host-side rm fails. The driver
+      // runs IN-CONTAINER, so this normally succeeds; surface a clear halt if not.
+      const detail =
+        `could not clear prior pass dir ${canonicalDir}: ${e instanceof Error ? e.message : String(e)} — ` +
+        `pass files are container-uid-owned; teardown MUST run IN-CONTAINER. Clear it and re-run \`start\`.`;
+      console.error(`sweep start [ERR38_PASS_CLEAR_FAILED]: ${detail}`);
+      result(cli, { ok: false, issues: [{ id: 'ERR38_PASS_CLEAR_FAILED', detail }] });
+      return 1;
+    }
+    // Stale git worktree admin entries (repo/.git/worktrees/*) now point at a
+    // removed tree — prune them so a fresh case can re-register its worktree.
+    await git(cli.repo, ['worktree', 'prune'], { allowCodes: [1, 128] });
+    console.error(`sweep start: cleared prior pass dir ${canonicalDir} (whole tree; clean-slate, D-055)`);
+  }
+
   // Pin the watermark + open the pass (only `plan` opens a pass, §2).
   const planRc = await cmdPlan({ ...cli, cmd: 'plan', internal: true });
   if (planRc !== 0) return planRc;
@@ -3734,7 +3888,9 @@ export async function cmdSweepStart(cli: Cli): Promise<number> {
   };
   writeMachineState(ctx.dir, st);
   appendJournal(ctx.dir, { action: 'sweep-start', watermark: ctx.watermark });
-  console.error(`sweep started — pass ${ctx.watermark12} pinned at ${ctx.watermark.slice(0, 12)}`);
+  console.error(
+    `sweep started — pass ${ctx.watermark12} pinned at ${ctx.watermark.slice(0, 12)} — pass dir: ${ctx.dir}`,
+  );
   result(cli, { status: 'started', watermark: ctx.watermark, watermark12: ctx.watermark12, passDir: ctx.dir });
   return 0;
 }
@@ -3779,6 +3935,14 @@ export async function cmdSweepAbort(cli: Cli): Promise<number> {
   }
   for (const c of journaledCases(journal).keys()) await removeCaseWorktree(cli, dir, c);
   appendJournal(dir, { action: 'pass-aborted', rolledBack });
+  // C-4 (D-055): seal the pass with `pass-complete` too — `attachPass` defines
+  // "open" as (has plan-initial.json AND no pass-complete), so WITHOUT this row an
+  // aborted pass stays the latest "open" pass and next-case/report-*/finish
+  // re-attach to it (the machine-state `complete` alone is invisible to
+  // attachPass). Mirrors cmdSweepFinish. Guarded so a re-abort stays idempotent.
+  if (!readJournal(dir).some((e) => e.action === 'pass-complete')) {
+    appendJournal(dir, { action: 'pass-complete', watermark: ctx.watermark });
+  }
   const st = readMachineState(dir);
   writeMachineState(dir, {
     schemaVersion: 1,

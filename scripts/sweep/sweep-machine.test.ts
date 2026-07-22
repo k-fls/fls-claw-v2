@@ -4,6 +4,7 @@
  * fixtures; the cold read (`claude -p`) and the GitHub transport are injected so
  * nothing spawns a real subprocess or touches the network.
  */
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,6 +21,7 @@ import {
   cmdSweepReportCase,
   cmdSweepReportPr,
   cmdSweepStart,
+  parseCli,
   parseMachineVerdict,
   passDir,
   readJournal,
@@ -883,5 +885,162 @@ describe('cold-read infra failure ≠ content reject (D-054, ERR35_COLDREAD_UNAV
     expect(readJournal(dir).some((e) => e.action === 'resolved' && e.caseId === caseId)).toBe(false);
     expect(machineState(dir).phase).toBe('awaiting-pr');
     expect(readJournal(dir).some((e) => e.action === 'halt' && e.id === 'ERR35_COLDREAD_UNAVAILABLE')).toBe(true);
+  });
+});
+
+describe('sweep start — canonical pass location + clean-slate boundary (D-055)', () => {
+  it('clears a COMPLETE/STALE prior pass at the canonical dir — no inherited journal/machine-state', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    const wm = repo.sha('main');
+
+    // Plant a STALE prior pass at the canonical location: a leftover journal with
+    // a D-053 HELD + a machine-state marked complete (a finished/aborted run at
+    // the same watermark). This is the 2026-07-22 contamination shape.
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'journal.jsonl'),
+      JSON.stringify({ ts: '2026-07-21T00:00:00Z', action: 'held', branch: 'main_patched', caseId: 'stale-case', height: 1 }) + '\n',
+    );
+    writeFileSync(
+      join(dir, 'machine-state.json'),
+      JSON.stringify({ schemaVersion: 1, phase: 'complete', watermark: wm, watermark12: wm.slice(0, 12), currentCase: null }),
+    );
+    writeFileSync(
+      join(dir, 'plan-initial.json'),
+      JSON.stringify({ watermark: wm, watermark12: wm.slice(0, 12), forkPoint: null, branches: [] }),
+    );
+
+    // start at the SAME watermark: the stale pass is CLEARED, not inherited.
+    const out = join(ws, 'start.json');
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { out }))).toBe(0);
+    // The canonical pass-dir path is reported (start owns + logs the ONE location).
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; passDir: string };
+    expect(res.passDir).toBe(dir);
+    const j = readJournal(dir);
+    expect(j.some((e) => e.action === 'held' && e.caseId === 'stale-case')).toBe(false); // leftover HELD gone
+    expect(j.some((e) => e.action === 'sweep-start')).toBe(true); // fresh journal
+    expect(machineState(dir).phase).toBe('open');
+  });
+
+  it('refuses when a pass is still OPEN (phase != complete) — never blind-wipe an in-flight pass', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    expect(await cmdSweepStart(baseCli(repo, ws, inv))).toBe(0); // a real open pass (phase 'open')
+    const startTs = readJournal(dir).find((e) => e.action === 'sweep-start')!.ts;
+
+    const out = join(ws, 'start2.json');
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { out }))).toBe(1); // refuse, do not clear
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { ok: boolean; issues?: Array<{ id: string }> };
+    expect(res.issues?.some((i) => i.id === 'ERR30_PASS_OPEN')).toBe(true);
+    // the in-flight pass's journal is intact (NOT wiped): same first sweep-start entry.
+    expect(readJournal(dir).find((e) => e.action === 'sweep-start')!.ts).toBe(startTs);
+  });
+
+  it('C-1: --workspace defaults to the GROUP ROOT (parent of --repo); an explicit one is honored', () => {
+    expect(parseCli(['status', '--repo', '/srv/grp/repo']).workspace).toBe('/srv/grp');
+    expect(parseCli(['status', '--repo', '/srv/grp/repo', '--workspace', '/srv/grp']).workspace).toBe('/srv/grp');
+  });
+
+  it('C-1: start REFUSES a --workspace that IS the --repo clone (never lands in the clone)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const out = join(ws, 'refuse.json');
+    // workspace === the clone toplevel -> refused, no pass created.
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { workspace: repo.dir, out }))).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> };
+    expect(res.issues.some((i) => i.id === 'ERR37_WORKSPACE_IN_CLONE')).toBe(true);
+    expect(existsSync(join(repo.dir, 'propagation'))).toBe(false); // nothing landed in the clone
+  });
+
+  it('C-1: start REFUSES a --workspace that is a SUBDIRECTORY of the --repo clone', async () => {
+    const repo = conflictFixture();
+    const inv = emptyInventory();
+    const sub = join(repo.dir, 'nested', 'ws');
+    mkdirSync(sub, { recursive: true });
+    const out = join(mkWorkspace(), 'refuse-sub.json');
+    expect(await cmdSweepStart(baseCli(repo, sub, inv, { workspace: sub, out }))).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> };
+    expect(res.issues.some((i) => i.id === 'ERR37_WORKSPACE_IN_CLONE')).toBe(true);
+  });
+
+  it('C-1: a group-root workspace whose ANCESTOR is a git repo (but NOT under --repo) is ACCEPTED (real-server shape)', async () => {
+    // Real server: `~/nanoclaw2` is itself a git repo, group root
+    // `~/nanoclaw2/groups/<g>` = dirname(repo). The guard must key off --repo
+    // ONLY, so a group root nested in an OUTER work tree is accepted.
+    const repo = conflictFixture(); // the fork clone (its own git work tree, elsewhere)
+    const inv = emptyInventory();
+    const outer = mkdtempSync(join(tmpdir(), 'sm-outer-'));
+    cleanups.push(() => rmSync(outer, { recursive: true, force: true }));
+    execFileSync('git', ['-C', outer, 'init', '-q']); // outer is a git work tree
+    const groupRoot = join(outer, 'groups', 'fls-maintainer');
+    mkdirSync(groupRoot, { recursive: true });
+    // workspace = group root: inside the OUTER work tree, but NOT under --repo.
+    expect(await cmdSweepStart(baseCli(repo, groupRoot, inv, { workspace: groupRoot }))).toBe(0);
+    expect(existsSync(join(groupRoot, 'propagation'))).toBe(true); // pass landed in the group root, accepted
+  });
+
+  it('C-1: the DEFAULT workspace (dirname(--repo)) passes the guard even when an ancestor is a git repo', async () => {
+    // Build the fork clone INSIDE an outer git repo at <outer>/groups/<g>/repo,
+    // then start with the parseCli DEFAULT workspace = dirname(repo) = the group
+    // root — which sits inside the outer work tree yet is NOT under the clone.
+    const outer = mkdtempSync(join(tmpdir(), 'sm-outer2-'));
+    cleanups.push(() => rmSync(outer, { recursive: true, force: true }));
+    execFileSync('git', ['-C', outer, 'init', '-q']);
+    const groupRoot = join(outer, 'groups', 'fls-maintainer');
+    const cloneDir = join(groupRoot, 'repo');
+    mkdirSync(cloneDir, { recursive: true });
+    // A minimal fork clone at cloneDir (own git tree): main + main_patched + upstream.
+    const g = (...a: string[]): void => void execFileSync('git', ['-C', cloneDir, ...a], { stdio: 'ignore' });
+    g('init', '-b', 'main');
+    g('config', 'user.email', 'f@t.invalid');
+    g('config', 'user.name', 'f');
+    g('config', 'commit.gpgsign', 'false');
+    writeFileSync(join(cloneDir, 'x.ts'), 'orig\n');
+    g('add', '-A');
+    g('commit', '-m', 'base');
+    g('checkout', '-b', 'main_patched');
+    writeFileSync(join(cloneDir, 'x.ts'), 'fork\n');
+    g('add', '-A');
+    g('commit', '-m', 'mp');
+    g('checkout', 'main');
+    writeFileSync(join(cloneDir, 'util.ts'), 'u\n');
+    g('add', '-A');
+    g('commit', '-m', 'U0');
+
+    // parseCli default: no --workspace -> dirname(repo) = groupRoot.
+    const cli = parseCli(['sweep-start', '--repo', cloneDir]);
+    expect(cli.workspace).toBe(groupRoot);
+    const inv = emptyInventory();
+    const started: Cli = {
+      cmd: 'sweep-start',
+      repo: cloneDir,
+      workspace: groupRoot,
+      inventory: inv,
+      scopeFile: join(inv, 'no-scope.yaml'),
+      upstream: 'main',
+      execute: false,
+    };
+    expect(await cmdSweepStart(started)).toBe(0);
+    expect(existsSync(join(groupRoot, 'propagation'))).toBe(true);
+  });
+
+  it('C-4: abort seals the pass with `pass-complete` so it is not re-attached as the latest open pass', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv)); // merges the U0 prefix, serves the conflict case
+    expect(await cmdSweepAbort(baseCli(repo, ws, inv, { cmd: 'sweep-abort' }))).toBe(0);
+    // WITHOUT this row attachPass ("open" = plan-initial.json AND no pass-complete)
+    // would keep re-attaching to the aborted pass — the C-4 bug.
+    expect(readJournal(dir).some((e) => e.action === 'pass-complete')).toBe(true);
+    expect(machineState(dir).phase).toBe('complete');
   });
 });
