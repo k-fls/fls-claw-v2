@@ -1,5 +1,19 @@
 # Mechanical propagation driver — specification
 
+> **Agent surface (D-053):** the canonical AGENT-facing interface is now the
+> five-command SWEEP STATE MACHINE — `start` / `next-case` / `report-case
+> --tier` / `report-pr` / `finish` (`scripts/sweep/sweep-machine.ts`; spec
+> `SWEEP-STATE-MACHINE.md`). The flag-based `plan`/`run`/`resolve`/`publish`/
+> `push` subcommands described below are UNCHANGED — they are the driver's
+> deterministic INTERNALS, which the state machine wraps (it drives the same
+> merge-tree/heights/DAG/tier/verify/push code). The behavioural differences on
+> the state-machine path: the cold read is run by the driver as a synchronous
+> `claude -p` subprocess (injectable), so there is NO `coldread-verdict.json`
+> file and NO freshness binding there; and HELD draft PRs publish at `report-pr`
+> (they land nothing on a target branch), ahead of the target push. On any
+> conflict of who-does-what, `SWEEP-STATE-MACHINE.md` wins for the command
+> surface.
+
 Status: v1 (2026-07-18, owner-settled design; §13 remote branches + inventory candidates
 added 2026-07-21, D-045; §14 publish tool + result-ID contract added 2026-07-21,
 D-048; case stacking, driver pushes and PR head shapes aligned to MERGE-POLICY.md

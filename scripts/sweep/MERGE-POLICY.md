@@ -2,7 +2,14 @@
 
 Status: owner-settled 2026-07-21. This file is the AUTHORITY on tiers, batching,
 noise, review, and publication. PROPAGATION.md holds driver mechanics; on conflict,
-this file wins. Supersedes: case-1..4 ladder (DESIGN.md §6), doc 02 §5 step-3
+this file wins. The AGENT drives these tiers through the D-053 SWEEP STATE MACHINE
+(`SWEEP-STATE-MACHINE.md`: `start`/`next-case`/`report-case --tier`/`report-pr`/
+`finish`); this file's tier/merge/publication semantics are UNCHANGED — the state
+machine wraps them, with one publication-timing amendment: a HELD draft PR is
+published at `report-pr` the moment the case is frozen (§5's "HELD draft PRs last"
+ordering was about NOT letting a HELD merge onto a target — a HELD draft lands
+nothing on a target branch, so it needs neither the verify gate nor the target
+push, D-053). Supersedes: case-1..4 ladder (DESIGN.md §6), doc 02 §5 step-3
 "one PR per DAG edge batch", D-030 exhibit-commit construction, the API push
 workaround, "merging remains owner-only".
 

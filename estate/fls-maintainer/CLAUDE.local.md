@@ -114,79 +114,105 @@ rediscover it the hard way):
    (spawn one subagent per routed feature; prompts are self-contained).
    OVERLAP-HIGH findings go into the end-of-sweep report (and any freeze they
    cause becomes a draft PR) — not into interim chat.
-4. Propagate via the MECHANICAL DRIVER (D-044; spec `scripts/sweep/PROPAGATION.md`
-   is authoritative, decisions D-035..D-040). The driver owns ordering
-   (breadth-wise DAG barrier), merge-point selection, tier classification
-   (demotion-only), no-op skips, DEFERRED matching, durable freezes (ledger),
-   pass pinning and the journal. You NEVER hand-run `git merge`/`update-ref` on
-   inventory branches and never choose merge heads — the old hand-sequenced
-   procedure is retired. Pass `--inventory ../inventory` on EVERY propagate
-   invocation (plan/run/resolve/verify/status): omitting it falls back to the
-   committed bootstrap snapshot, which drifts from your live inventory.
-   Loop (all commands from the clone root):
-   - `pnpm exec tsx scripts/sweep/propagate.ts plan --repo . --workspace ..
-     --inventory ../inventory` — ONLY `plan` opens a pass. Review the plan
-     YOURSELF — do not post it (D-046). SANITY (rule 7): the plan's branch count must be
-     close to the inventory's sweepable-branch count — a 1-2 branch plan means
-     scope collapse (missing local branches or wrong inventory path): stop and
-     investigate, do not run.
-   - CANDIDATES (D-045): relay the driver's CANDIDATES section (printed by
-     `plan`/`status`; details in the per-candidate YAML under
-     `../inventory-candidates/`) to the owner in the digest — for `clear`
-     candidates propose the derived placement and WAIT for approval; for
-     `unclear` ask the owner the driver's open questions VERBATIM. NEVER add an
-     inventory entry (or edit a descendant entry's `parents:`) without owner
-     approval AND valid inheritance. After approval, add the entry via the
-     fork-registry-generate skill + a seeds.yaml PR carrying the approved
-     `parents:` (and any approved descendant-entry edits), so the next pass
-     picks the branch up.
-   - `... run` — dry-run first, review, then `--execute`: the driver
-     materializes/syncs local branches from origin first (remote-only branches
-     are created locally; behind branches fast-forward); a DIVERGED
-     local/origin branch is a per-branch driver halt (`sync-diverged`) — an
-     owner escalation you report in the digest and NEVER force-resolve (no
-     reset, no force-push). Then CLEAN merges, no-op
-     skips and DEFERRED marks land mechanically; each conflict emits a case
-     file + a driver-created worktree under the pass dir and halts that branch.
-   - Per case: resolve ONLY inside the driver's case worktree, commit there,
-     then `... resolve --case <id> --tier mechanical|judged --resolved-ref
-     <commit>` (dry-run first; `--tier held` = cannot-resolve, freezes with
-     PR materials prepared — the draft PR itself goes through `publish`,
-     D-048). The resolve cycle is a BOUNDED sequence (D-052): `resolve
-     --execute` regenerates `coldread-request.md` with YOUR resolution diff
-     (the driver owns that file — it rewrites it on EVERY `--execute`; you
-     NEVER delete or hand-edit `coldread-request.md`) and exits asking for a
-     verdict: produce `coldread-verdict.json` via a CONTEXT-FREE subagent
-     (D-031 — hand it ONLY the request file; the verdict must carry the
-     resolved tree OID), then re-run resolve. If you re-resolve (amend /
-     different `--resolved-ref`), the driver AUTO-CLEARS the now-stale verdict
-     (retires it to `coldread-verdict.stale.json`, `WARN05`) and asks for a
-     fresh `coldread-verdict.json` for the new tree — so there is no "stale"
-     dead-end to fight: write the VERDICT, never touch the request. A
-     resolution that keeps CHANGING and never converges is force-HELD after
-     `RESOLVE_COLDREAD_CAP` (3) distinct trees (`ERR26_RESOLVE_NOT_CONVERGED`,
-     owner review) — the driver never loops. The cold read is FOCUSED
-     (D-050): three bounded questions (behaviour preserved / every hunk
-     conflict-explained / no contradicted record), judged from the request
-     ALONE — the reader answers `UNVERIFIABLE-FROM-REQUEST` rather than
-     researching, and any such answer on those questions is fail-closed to
-     HELD. A scope-guard violation or cold-read reject freezes the branch —
-     never argue with the driver; report it in the digest.
-   - `... verify` after the executable portion of the pass and after every
-     landed resolve; red = automatic rollback to the journaled pre-ref +
-     HELD(gate). Nothing is pushed before verify is green.
-   - **Publication order (D-049, fixed):** verify green → `publish` each JUDGED
-     case (non-draft PR, head = the real merge commit) → `... push --execute
-     --token-file <path>` (the DRIVER pushes the target branches, one push per
-     branch; GitHub auto-flips the JUDGED PRs to merged; it also checks those
-     closures and POSTS the urge comments) → `publish` each HELD case (draft
-     PR at the case run's top commit; the base is current, so the diff is the
-     run only). `ERR15_PUSH_FAILED` anywhere = case-2 report + full stop.
-   - `... status` for pass state; `... report` (D-052) prints the
-     journal-derived end-of-sweep summary (merged / resolved / held /
-     open-cases / pushed) — your final digest is a thin wrapper over it, so
-     even an abnormally-terminated pass leaves a readable status; `...
-     unfreeze` ONLY on explicit owner instruction, journaled.
+4. Propagate via the SWEEP STATE MACHINE (D-053; spec
+   `scripts/sweep/SWEEP-STATE-MACHINE.md` is authoritative for the command
+   surface, `scripts/sweep/PROPAGATION.md` + `MERGE-POLICY.md` for the internals
+   it wraps). The DRIVER is a resumable state machine that owns ALL state — the
+   pinned watermark, the current case, the phase, the journal — in the pass dir.
+   YOU pass ZERO identifying params: no `--case`, no `--resolved-ref`, no
+   `--branch`, no plan/sha. You only (a) edit code in the driver-prepared
+   worktree, (b) write a PR description at the fixed path, (c) claim one
+   `--tier` word. The driver owns ordering (breadth-wise DAG barrier),
+   merge-point selection, tier classification (demotion-only), no-op skips,
+   DEFERRED matching, durable freezes, pass pinning, verify, push and PR
+   create/close. You NEVER hand-run `git merge`/`update-ref`/`git push`, never
+   choose merge heads, never sequence branches. Pass `--inventory ../inventory`
+   on EVERY invocation (omitting it falls back to the committed bootstrap
+   snapshot, which drifts from your live inventory); mutating commands need
+   `--execute`; networked commands (report-pr for a HELD draft, and finish) take
+   `--token-file <path>` (write the `get_credential` output to a file once per
+   session, §GitHub); branch-scoped tests are opt-in via `--commands-file`.
+
+   THE FIVE-COMMAND FLOW (all from the clone root, binary
+   `scripts/sweep/sweep-machine.ts`):
+
+   ```
+   start                              # opens the pass, pins the watermark
+   loop:
+     next-case                        # -> {status:"case-ready", worktree, branch,
+                                       #     conflictedPaths, materials} OR {status:"finalize"}
+     <edit the conflict in the returned worktree — commit not required>
+     report-case --tier mechanical|judged|held --execute
+     report-pr --execute --token-file <path>   # ONLY when report-case says "provide PR description"
+   finish --execute --token-file <path> --commands-file <cheap-tests.json>
+   ```
+
+   DO WHAT EACH COMMAND RETURNS — never pass ids, never argue with a blocking id:
+   - `start` — refuses if a pass is already open (`ERR30_PASS_OPEN`): run
+     `finish` or `abort` first; it never blind-wipes an in-flight pass. Opening
+     the pass runs `plan` internally — review the printed plan YOURSELF, do not
+     post it (D-046). SANITY (rule 7): a 1-2 branch plan means scope collapse
+     (missing local branches or wrong inventory path) — `abort` and investigate.
+   - CANDIDATES (D-045): `start` prints the driver's CANDIDATES section
+     (details in the per-candidate YAML under `../inventory-candidates/`); relay
+     it in the digest — for `clear` candidates propose the derived placement and
+     WAIT for approval, for `unclear` ask the driver's open questions VERBATIM.
+     NEVER add an inventory entry (or edit a descendant's `parents:`) without
+     owner approval AND valid inheritance; after approval add it via the
+     fork-registry-generate skill + a seeds.yaml PR, so the next pass picks it up.
+   - `next-case` — deterministic (no cold read): fetches/scans/plans, lands the
+     CLEAN merges + no-op skips + DEFERRED freezes, handles the barrier/reopen
+     internally, and either serves the next conflict (`case-ready` — with the
+     worktree to resolve in and the driver-authored materials) or reports
+     `finalize` (→ call `finish`). A DIVERGED local/origin branch halts that
+     branch (`sync-diverged`) — an owner escalation you report and NEVER
+     force-resolve.
+   - `report-case --tier <t>` — `--tier` is your ONLY param (a CLAIM; the driver
+     is demote-only). Resolve the conflict IN THE WORKTREE first; the driver
+     snapshots that worktree — you do not commit or pass a ref. Deterministic
+     checks run first (empty/unresolved-markers, scope guard ⊆ conflicted paths,
+     branch-scoped tests, ERR05/ERR06 adequacy, the per-case attempt cap →
+     force-HELD after `RESOLVE_COLDREAD_CAP` (3) distinct non-converging trees).
+     Then, by tier: **mechanical** runs the FOCUSED cold read HERE (the driver
+     shells `claude -p` itself — you do NOT run a subagent or write a verdict
+     file) over the resolution diff; confirm → merges in place → `merged, take
+     next case`; reject → HELD (fail-closed). **judged/held** defer the cold
+     read → on a deterministic pass return `provide PR description`. Demotions
+     are authoritative (judged-with-conflicts → held, scope violation → held,
+     cap → held) — never argue; a demotion just means you write a HELD PR next.
+     `ERR32_UNRESOLVED` = you have not resolved the worktree yet (or markers
+     remain); resolve and re-report. The cold read is FOCUSED (D-050): three
+     bounded questions (behaviour preserved / every hunk conflict-explained / no
+     contradicted record), judged from the request ALONE.
+   - `report-pr` (judged/held only) — write `pr/title.txt` + `pr/body.md` in the
+     case dir (the PR-composition standards below), then run it. ONE cold read
+     over the resolution diff AND your description together
+     (reject/`UNVERIFIABLE-FROM-REQUEST` → HELD, fail-closed; a
+     description-only defect → `rewrite: <reason>` — fix the text, re-run). On
+     pass: **held** PUBLISHES THE DRAFT PR NOW (it lands nothing on a target, so
+     there is no verify/push dependency — the owner sees the frozen exhibit
+     immediately); **judged** merges locally + RECORDS PR INTENT (the PR is
+     created and auto-merged at `finish`). Then → `take next case`.
+   - `finish` — the ONLY stage that lands code on a target branch, so it runs the
+     full-integration verify first (everything-rebuild, D-051): red on a
+     publishable branch → rollback to pre-ref + HELD(gate) + HALT (re-run
+     `finish` — the frozen offender drops out of the publishable set). Then it
+     creates the JUDGED history PRs (non-draft), pushes the target branches (one
+     per branch; GitHub auto-flips the JUDGED PRs to merged), checks those
+     closures, posts the urge comments, and prints the journal-derived owner
+     report + whether upstream advanced (`start again` / `done`). Multi-step and
+     RESUMABLE: `ERR15_PUSH_FAILED` / `ERR18_VERIFY_PENDING` halt and report —
+     re-run `finish` and it resumes from the stopped phase; pushes never redo.
+     `ERR15_PUSH_FAILED` = case-2 report + full stop.
+   - `abort --execute` — discard an open pass cleanly (rolls every branch this
+     pass mutated back to its journaled pre-ref); the ONLY sanctioned way to
+     drop an in-flight pass. `status` / `report` (on `propagate.ts`) still print
+     pass state and the journal-derived summary; `unfreeze` ONLY on explicit
+     owner instruction.
+
+   The old flag-based `propagate plan/run/resolve/publish/push` is the driver's
+   internal implementation (still present) — it is NOT your surface anymore; do
+   not invoke `resolve`/`publish` by hand or hand-manage `coldread-verdict.json`.
    **Case comprehension (owner directive, D-048):** a case is always something you
    are LOOKING AT — study the case worktree and materials until you can explain
    both sides; the description you publish is YOUR understanding, never a template.
@@ -194,25 +220,25 @@ rediscover it the hard way):
    one logical decision, one resolution, one cold read — the materials list the
    run. If you cannot explain both sides of the conflict, study the case more —
    never publish text you don't understand.
-   PRs (D-048/D-049): the driver NEVER writes PR prose — at resolve/freeze it
+   PRs (D-048/D-049/D-053): the driver NEVER writes PR prose — at report-case it
    prepares `pr/materials.md` (facts: conflicted paths, the case run, per-side
-   histories, reproduction). YOU study the case and write `pr/title.txt` +
-   `pr/body.md` to the PR-composition standards below, then run `... publish
-   --case <id>` (dry-run first, then `--execute --token-file <path>`): it
-   re-verifies the case, runs the pre-PR height check, asks "should this PR
-   exist" (recorded decisions, duplicates), applies the mechanical text checks
-   (ERR08 + lint WARNs — the PR-text cold read is retired, D-050), pushes the
-   fix/sweep ref at the REAL head (git push) and creates the PR
-   (HELD draft + D-004 machine block below your prose — never edit that block;
-   JUDGED non-draft). Act on its result ids per the "Tool result IDs" table
-   below — never argue with a blocking id, never work around it.
+   histories). YOU study the case and write `pr/title.txt` + `pr/body.md` at that
+   fixed path to the PR-composition standards below, then run `report-pr`: it
+   runs the single code+description cold read, asks "should this PR exist"
+   (recorded decisions, duplicates), applies the mechanical text checks (ERR08 +
+   lint WARNs — the PR-text cold read is retired, D-050), and — for HELD —
+   pushes the fix/sweep ref at the case head + creates the draft PR (D-004
+   machine block below your prose — never edit that block); for JUDGED it records
+   the intent and `finish` creates the non-draft PR + auto-merges it via the
+   closure push. Act on its result ids per the "Tool result IDs" table below —
+   never argue with a blocking id, never work around it.
    **OWNER FREEZE — LIFTED 2026-07-21** (the 2026-07-18 freeze addressed the
-   pre-refresh agent). Standing rules in its place (as amended by D-049): ALL
-   pushes are the driver's journaled pass pushes (`publish` + `push`) — you
-   hand-push nothing; PR creation EXCLUSIVELY via `propagate publish`
-   (hand-rolled curl/node/gh/git-push PR flows are forbidden); JUDGED PRs
-   auto-merge via the closure push — the ONLY PRs awaiting a human are HELD
-   drafts, which remain owner-only.
+   pre-refresh agent). Standing rules in its place (D-049/D-053): ALL pushes are
+   the driver's journaled pass pushes (`report-pr` for HELD draft heads, `finish`
+   for JUDGED heads + target branches) — you hand-push nothing; PR creation
+   EXCLUSIVELY via the state machine (hand-rolled curl/node/gh/git-push PR flows
+   are forbidden); JUDGED PRs auto-merge via the closure push — the ONLY PRs
+   awaiting a human are HELD drafts, which remain owner-only.
    **Driver bugs (D-047):** when the propagation driver itself crashes or
    misbehaves (a thrown error, a wrong verdict, an impossible state), file a
    GitHub ISSUE immediately via the raw API (no `gh` here):
@@ -245,7 +271,7 @@ retired PR-text cold read (D-050) — all permanently retired, never reused.)
 | `ERR11_TOKEN_MISSING` | write the get_credential output to a file, pass `--token-file <path>` (publish AND push) |
 | `ERR12_ORIGIN_UNRESOLVED` | origin remote is not a github.com URL → fix the clone's origin; report if you cannot |
 | `ERR13_API_FAILED` | GitHub API write failed → retry once; still failing = case-2 report with the detail |
-| `ERR14_BASE_BEHIND` | pre-PR height check: HELD before the target push → run `propagate push --execute` first; JUDGED after it → order violation, take the case state to the owner if unclear; DIVERGED → owner escalation |
+| `ERR14_BASE_BEHIND` | pre-PR height check (JUDGED history PRs at `finish`): origin already contains the merge commit → order violation, take the case state to the owner if unclear; DIVERGED → owner escalation. (HELD drafts publish at `report-pr` and are exempt — they land nothing on a target, D-053.) |
 | `ERR15_PUSH_FAILED` | a driver `git push` failed → case-2 REPORT to the owner and STOP; publication is blocked until the host-side fix deploys; NO fallback, no workaround, no retry loop |
 | `ERR16_CLOSURE_FAILED` | a JUDGED PR did not auto-flip to merged after the target push → investigate (base tip vs PR head), report; do not publish more until understood |
 | `ERR17_URGE_FAILED` | urge comment / D-004 machine-block post failed → it retries next `push`; recurring = case-2 report |
@@ -257,6 +283,11 @@ retired PR-text cold read (D-050) — all permanently retired, never reused.)
 | `ERR24_PLAN_DRIFT` | git moved under the pass → investigate what moved; re-plan only if the journal shows no half-done work |
 | `ERR25_BAD_CASE_ID` | the --case value is not a generated case id → copy the id from the journal/case dir |
 | `ERR26_RESOLVE_NOT_CONVERGED` | resolution cold-read did not converge in 3 distinct trees → the driver force-HELD the case for owner review; STOP re-resolving it, report in the digest |
+| `ERR30_PASS_OPEN` (D-053) | `start` while a pass is open → run `finish` or `abort` first; never blind-wipe an in-flight pass |
+| `ERR31_AWAITING_PR` (D-053) | `next-case` while the current case awaits its PR → run `report-pr` for it first |
+| `ERR32_UNRESOLVED` (D-053) | you have not resolved the case worktree (or conflict markers remain) → resolve it, then re-run `report-case` |
+| `ERR33_BRANCH_TESTS_FAILED` (D-053) | the cheap branch-scoped tests failed → open the named log, fix the resolution, re-report |
+| `ERR34_CASES_REMAIN` (D-053) | `finish` while cases are open/awaiting → finish every case first |
 | `WARN01_TEMPLATE_TEXT` | your body references none of the conflicted files — rewrite from the case materials |
 | `WARN02_NO_DECISION_LINE` | open the body with the exact decision the owner is being asked to make |
 | `WARN03_MANY_PRS` | >8 PRs this pass — re-check for consolidation before publishing more |
@@ -307,10 +338,11 @@ retired PR-text cold read (D-050) — all permanently retired, never reused.)
 ## PR composition and review ergonomics
 
 - **Draft = needs the owner; non-draft = history.** HELD freeze/decision PRs —
-  the only PRs the owner must act on — are **DRAFTS** (`propagate publish`
-  creates them as drafts, with the driver's D-004 machine block below your
-  prose — never edit that block). JUDGED PRs are NON-draft audit history and
-  auto-flip to merged on the closure push (D-040/D-049). Never publish a normal
+  the only PRs the owner must act on — are **DRAFTS** (`report-pr` creates them
+  as drafts the moment the case is frozen, with the driver's D-004 machine block
+  below your prose — never edit that block). JUDGED PRs are NON-draft audit
+  history created at `finish` and auto-flip to merged on the closure push
+  (D-040/D-049/D-053). Never publish a normal
   open PR whose description says "do not merge".
 - **The description must answer WHY in the first line.** Open with one sentence:
   "Decision needed: <the specific choice>" or "Review needed: <the specific risk>".
@@ -325,10 +357,11 @@ retired PR-text cold read (D-050) — all permanently retired, never reused.)
 - **PR text (D-031; text cold read retired by D-050).** YOU write `pr/title.txt` +
   `pr/body.md` from studying the case — the case materials + worktree are the source
   of understanding; if you cannot explain both sides of the conflict, study the case
-  more — never publish text you don't understand. There is NO PR-text reader loop:
-  the checks `propagate publish` runs on your text are MECHANICAL only — `ERR08` if
-  it is missing, the lint WARNs (`WARN01`/`WARN02`), and the adequacy gates
-  `ERR05`/`ERR06`. The D-031 catch-list stays as WRITING RULES you follow yourself:
+  more — never publish text you don't understand. The single `report-pr` cold
+  read judges your description ALONGSIDE the code (a description that
+  misrepresents the resolution → `rewrite: <reason>`); the other checks
+  `report-pr` runs on your text are MECHANICAL only — `ERR08` if it is missing,
+  the lint WARNs (`WARN01`/`WARN02`), and the adequacy gates `ERR05`/`ERR06`. The D-031 catch-list stays as WRITING RULES you follow yourself:
   no bare "review needed" — name the specific decision/risk; describe BEHAVIOUR, not
   line counts; label each side ours/theirs; no unexplained references. (D-050 killed
   the two-round `prtext-*` cold read: zero unique catches ever, ~300k tokens/~19 min

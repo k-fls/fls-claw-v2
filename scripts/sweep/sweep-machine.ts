@@ -1,0 +1,69 @@
+/**
+ * scripts/sweep/sweep-machine.ts — the AGENT-FACING sweep CLI (D-053,
+ * SWEEP-STATE-MACHINE.md). Five commands, driven by a resumable machine-state
+ * record in the pass dir; the agent passes ZERO identifying params (no --case,
+ * no --resolved-ref, no --branch) — the driver holds the watermark, the current
+ * case, the phase and the journal.
+ *
+ * Usage:
+ *   pnpm exec tsx scripts/sweep/sweep-machine.ts <start|next-case|report-case|report-pr|finish|abort> [flags]
+ *
+ * Commands (do what each RETURNS; never pass ids):
+ *   start                         open a pass, pin the watermark (refuses an open pass — finish/abort first)
+ *   next-case                     advance the deterministic machinery; returns {status:"case-ready",…}
+ *                                 (worktree/branch/conflictedPaths/materials) or {status:"finalize"}
+ *   report-case --tier T          T ∈ mechanical|judged|held (the ONLY agent param); deterministic checks
+ *                                 then the cold read (mechanical: here → merge; judged/held: deferred)
+ *   report-pr                     judged/held only; single cold read over the resolution diff AND the
+ *                                 PR description (pr/title.txt + pr/body.md); held publishes the draft now,
+ *                                 judged records intent (created at finish)
+ *   finish                        verify → JUDGED PRs → push targets → urges → owner report → start-again/done
+ *   abort                         discard the open pass cleanly (rolls mutated branches back to pre-ref)
+ *
+ * Every mutating command needs --execute (dry-run by default). Networked steps
+ * (report-pr held publish, finish) take --token-file <path> like `propagate`.
+ * The cold read is a real `claude -p` subprocess; the branch-scoped test command
+ * list is opt-in via --commands-file. All the deterministic internals are the
+ * `propagate` driver's — this file only wraps them as the five-command surface.
+ */
+import {
+  cmdSweepAbort,
+  cmdSweepFinish,
+  cmdSweepNextCase,
+  cmdSweepReportCase,
+  cmdSweepReportPr,
+  cmdSweepStart,
+  parseCli,
+  type Cli,
+} from './propagate.js';
+
+const SUBCOMMANDS: Record<string, (cli: Cli) => Promise<number>> = {
+  start: (cli) => cmdSweepStart({ ...cli, cmd: 'sweep-start' }),
+  'next-case': (cli) => cmdSweepNextCase({ ...cli, cmd: 'next-case' }),
+  'report-case': (cli) => cmdSweepReportCase({ ...cli, cmd: 'report-case' }),
+  'report-pr': (cli) => cmdSweepReportPr({ ...cli, cmd: 'report-pr' }),
+  finish: (cli) => cmdSweepFinish({ ...cli, cmd: 'sweep-finish' }),
+  abort: (cli) => cmdSweepAbort({ ...cli, cmd: 'sweep-abort' }),
+};
+
+const USAGE =
+  'Usage: pnpm exec tsx scripts/sweep/sweep-machine.ts <start|next-case|report-case|report-pr|finish|abort> [--repo <path>] [--workspace <dir>] [--inventory <dir>] [--tier <t>] [--execute] [--token-file <path>] [--commands-file <file>] [--out <file>]';
+
+const invokedDirectly = process.argv[1] && /sweep-machine\.ts$/.test(process.argv[1]);
+if (invokedDirectly) {
+  const cli = parseCli(process.argv.slice(2));
+  const handler = SUBCOMMANDS[cli.cmd];
+  if (!handler) {
+    console.error(`Unknown sweep command '${cli.cmd}'\n${USAGE}`);
+    process.exit(2);
+  }
+  handler(cli).then(
+    (code) => process.exit(code),
+    (err) => {
+      console.error(err instanceof Error ? err.stack || err.message : String(err));
+      process.exit(1);
+    },
+  );
+}
+
+export { SUBCOMMANDS };
