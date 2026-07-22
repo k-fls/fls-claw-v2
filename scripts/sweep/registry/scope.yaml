@@ -22,8 +22,14 @@ exclude:
 # extra_edges: child -> parents DAG edges not expressible in the inventory.
 extra_edges: {}
 
-# recipe: ordered branch list for the everything rebuild (verify stage).
-# Mirrors the everything-branch rebuild order confirmed 2026-06-28.
+# recipe: PLANLESS FALLBACK ONLY (D-051). `propagate verify` now derives the
+# verify recipe from THIS PASS'S publishable result — the branches that advanced
+# this pass, in the plan's DAG order, minus held/frozen/open-case branches — and
+# rebuilds them on the fork-trunk base (main_patched). This static list is used
+# only when there is no pass plan on disk (e.g. a manual `sweep verify` with no
+# propagation pass), and is NOT the everything-integration order: it starts with
+# a module branch that is frozen most passes, so using it as the primary recipe
+# recreated historical stack conflicts and wedged the gate (the D-051 bug).
 recipe:
   - module/runtime-updater
   - feat/mitm-credential-proxy

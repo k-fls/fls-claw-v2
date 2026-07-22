@@ -14,8 +14,9 @@ import { join, relative } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { initFixtureRepo, type FixtureRepo } from './fixtures.js';
-import { addTempWorktree, commitInfo, isAncestor, listTreePaths } from './git.js';
+import { addTempWorktree, commitInfo, isAncestor, listTreePaths, revParse } from './git.js';
 import { readLedger } from './ledger.js';
+import { exportRrCache, writeRrCacheDir } from './merge.js';
 import { DriverHalt, guardRef } from './propagate.js';
 import {
   cmdPlan,
@@ -27,10 +28,13 @@ import {
   cmdVerify,
   heldRegistry,
   passDir,
+  publishableRecipe,
   readJournal,
   type Cli,
+  type JournalEntry,
 } from './propagate.js';
 import type { GithubTransport } from './publish.js';
+import { verifyEverything } from './verify.js';
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -606,6 +610,291 @@ describe('propagate verify — §9 gate rolls back a red offender (FIX B)', () =
     const journal = readJournal(dir);
     expect(journal.some((e) => e.action === 'held' && e.branch === 'feat/off' && e.reason === 'gate')).toBe(true);
     expect(journal.filter((e) => e.action === 'verify').map((e) => e.ok)).toEqual([false, true]);
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['feat/off']?.status).toBe('frozen');
+  });
+});
+
+// --- D-051: verify gate validates THIS PASS'S PUBLISHABLE RESULT ----------
+/**
+ * Seed a minimal OPEN pass on disk: plan(-initial).json carrying `order`, one
+ * `pre-ref` per advanced branch, plus any extra journal lines (held/case/…).
+ */
+function seedVerifyPass(
+  ws: string,
+  repo: FixtureRepo,
+  order: string[],
+  advanced: Array<{ branch: string; ref: string }>,
+  extra: Array<Record<string, unknown>> = [],
+): { dir: string; wm12: string } {
+  const mainTip = repo.sha('main');
+  const wm12 = mainTip.slice(0, 12);
+  const dir = passDir(ws, wm12);
+  mkdirSync(dir, { recursive: true });
+  const plan = {
+    schemaVersion: 1,
+    watermark: mainTip,
+    watermark12: wm12,
+    forkPoint: mainTip,
+    chainLength: 0,
+    order,
+    branches: order.map((branch) => ({
+      branch,
+      kind: 'inventory',
+      tierFloor: 'clean',
+      isLeaf: true,
+      alwaysMerge: false,
+      ancestors: [],
+      parents: [],
+    })),
+    warnings: [],
+  };
+  writeFileSync(join(dir, 'plan-initial.json'), JSON.stringify(plan));
+  writeFileSync(join(dir, 'plan.json'), JSON.stringify(plan));
+  for (const e of [...advanced.map((a) => ({ action: 'pre-ref', branch: a.branch, ref: a.ref })), ...extra]) {
+    appendFileSync(join(dir, 'journal.jsonl'), JSON.stringify({ ts: new Date().toISOString(), ...e }) + '\n');
+  }
+  return { dir, wm12 };
+}
+
+/**
+ * A branch built on a DIVERGED fork line: `module/held` forks the base commit
+ * and edits line 3 -> FORK; `main` advances the SAME line -> UP1. Merging
+ * module/held onto bare `main` therefore conflicts unresolvably (recreating the
+ * historical module-stack conflict), while `module/good` forks main's tip and
+ * only adds a file (clean). Optionally also builds `main_patched` (fork trunk,
+ * line 3 -> FORK) + `module/m` on it (adds a file, keeps FORK).
+ */
+function divergedFixture(opts: { withMainPatched?: boolean } = {}): { repo: FixtureRepo } {
+  const repo = initFixtureRepo();
+  const baseSha = repo.commit('D-051 base: x', { 'src/x.ts': 'a\nb\nMID\nd\ne\n' });
+  repo.checkout('module/held', { create: true, at: baseSha });
+  repo.commit('module/held: x line3 -> FORK', { 'src/x.ts': 'a\nb\nFORK\nd\ne\n' });
+  if (opts.withMainPatched) {
+    repo.checkout('main_patched', { create: true, at: baseSha });
+    repo.commit('mp: x line3 -> FORK', { 'src/x.ts': 'a\nb\nFORK\nd\ne\n' });
+    repo.checkout('module/m', { create: true, at: 'main_patched' });
+    repo.commit('module/m: add m (keeps FORK)', { 'src/m.ts': 'export const m = 1;\n' });
+  }
+  repo.checkout('main');
+  repo.commit('main advances: x line3 -> UP1', { 'src/x.ts': 'a\nb\nUP1\nd\ne\n' });
+  repo.checkout('module/good', { create: true, at: 'main' });
+  repo.commit('module/good: add good (clean on main)', { 'src/good.ts': 'export const good = 1;\n' });
+  repo.checkout('main');
+  cleanups.push(() => repo.destroy());
+  return { repo };
+}
+
+describe('publishableRecipe (D-051 fix 1 — pure recipe derivation)', () => {
+  it('keeps advanced branches in DAG order, drops held/frozen and open-case branches', () => {
+    const journal: JournalEntry[] = (
+      [
+        { action: 'pre-ref', branch: 'main_patched', ref: 'x' },
+        { action: 'pre-ref', branch: 'module/a', ref: 'x' },
+        { action: 'pre-ref', branch: 'module/b', ref: 'x' }, // advanced but held below
+        { action: 'pre-ref', branch: 'module/c', ref: 'x' }, // advanced but open case below
+        { action: 'held', branch: 'module/b', caseId: 'B1', height: -1, conflictedPaths: [] },
+        { action: 'case', branch: 'module/c', caseId: 'C1' },
+      ] as Array<Record<string, unknown>>
+    ).map((e) => ({ ts: '', ...e }) as JournalEntry);
+    const order = ['main_patched', 'module/a', 'module/b', 'module/c'];
+    // held = heldRegistry ∪ ledger-frozen (module/b via the held entry, plus a
+    // purely ledger-frozen branch that never advanced — never in the recipe).
+    const held = new Set(['module/b', 'module/frozen-elsewhere']);
+    expect(publishableRecipe(journal, order, held)).toEqual(['main_patched', 'module/a']);
+  });
+});
+
+describe('propagate verify — publishable set (D-051)', () => {
+  it('(a1) a held branch that would conflict on the base is EXCLUDED — the pass stays green (fix 1)', async () => {
+    const { repo } = divergedFixture();
+    const ws = mkWorkspace();
+    // module/held is held (journal); module/good advanced cleanly. DAG order lists
+    // the held branch FIRST (like the real recipe whose head was a frozen module).
+    const { wm12 } = seedVerifyPass(
+      ws,
+      repo,
+      ['module/held', 'module/good'],
+      [{ branch: 'module/good', ref: repo.sha('module/good') }],
+      [{ action: 'held', branch: 'module/held', caseId: 'gate-x', height: -1, conflictedPaths: [] }],
+    );
+    const heldTip = repo.sha('module/held');
+    const cmds = join(ws, 'cmds.json');
+    writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }]));
+    // Dry-run first: prove the derived recipe dropped module/held and the base is
+    // bare `main` (no main_patched in this fixture).
+    const out = join(ws, 'dry.json');
+    await cmdVerify(baseCli(repo, ws, null, { cmd: 'verify', pass: wm12, commandsFile: cmds, out }));
+    const dry = JSON.parse(readFileSync(out, 'utf8')) as { recipe: string[]; baseRef: string };
+    expect(dry.recipe).toEqual(['module/good']);
+    expect(dry.baseRef).toBe('main');
+    // Execute: green despite module/held being unresolvable against the base.
+    const code = await cmdVerify(
+      baseCli(repo, ws, null, { cmd: 'verify', execute: true, pass: wm12, commandsFile: cmds }),
+    );
+    expect(code).toBe(0);
+    const journal = readJournal(passDir(ws, wm12));
+    expect(journal.some((e) => e.action === 'verify' && e.ok === true)).toBe(true);
+    expect(journal.some((e) => e.action === 'verify-observation')).toBe(false); // never became an offender
+    expect(repo.sha('module/held')).toBe(heldTip); // untouched — not rolled back
+  });
+
+  it('(a2) an EXPLICIT recipe forcing a held branch to build-conflict is non-blocking, not ERR18 (fix 2)', async () => {
+    const { repo } = divergedFixture();
+    const ws = mkWorkspace();
+    const { wm12 } = seedVerifyPass(
+      ws,
+      repo,
+      ['module/held', 'module/good'],
+      [{ branch: 'module/good', ref: repo.sha('module/good') }],
+      [{ action: 'held', branch: 'module/held', caseId: 'gate-x', height: -1, conflictedPaths: [] }],
+    );
+    const heldTip = repo.sha('module/held');
+    const cmds = join(ws, 'cmds.json');
+    writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }]));
+    const out = join(ws, 'o.json');
+    const code = await cmdVerify(
+      baseCli(repo, ws, null, {
+        cmd: 'verify',
+        execute: true,
+        pass: wm12,
+        recipe: ['module/held', 'module/good'], // force the held branch into the build
+        commandsFile: cmds,
+        out,
+      }),
+    );
+    expect(code).toBe(0); // non-blocking: publishable set (module/good) verifies green
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { ok: boolean; nonBlocking?: boolean; offender?: string };
+    expect(res).toMatchObject({ ok: true, nonBlocking: true, offender: 'module/held' });
+    const journal = readJournal(passDir(ws, wm12));
+    const obs = journal.find((e) => e.action === 'verify-observation');
+    expect(obs).toMatchObject({ offender: 'module/held', held: true });
+    expect(repo.sha('module/held')).toBe(heldTip); // NOT rolled back
+    // The held offender was not ledger-gate-frozen by verify (it is already held).
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['module/held']).toBeUndefined();
+  });
+
+  it('(b) a module branch verifies against main_patched, not bare main (fix 1 base)', async () => {
+    const { repo } = divergedFixture({ withMainPatched: true });
+    const ws = mkWorkspace();
+    const { wm12 } = seedVerifyPass(ws, repo, ['module/m'], [{ branch: 'module/m', ref: repo.sha('module/m') }]);
+    const cmds = join(ws, 'cmds.json');
+    writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }]));
+    // Control: building module/m on BARE main recreates the fork-line conflict.
+    const onMain = await verifyEverything(repo.dir, {
+      recipe: ['module/m'],
+      baseRef: 'main',
+      commands: [{ cmd: 'true' }],
+    });
+    expect(onMain.ok).toBe(false);
+    expect(onMain.build.conflictBranch).toBe('module/m');
+    // cmdVerify picks main_patched (the merge-source base) -> clean -> green.
+    const out = join(ws, 'dry.json');
+    await cmdVerify(baseCli(repo, ws, null, { cmd: 'verify', pass: wm12, commandsFile: cmds, out }));
+    expect((JSON.parse(readFileSync(out, 'utf8')) as { baseRef: string }).baseRef).toBe('main_patched');
+    const code = await cmdVerify(
+      baseCli(repo, ws, null, { cmd: 'verify', execute: true, pass: wm12, commandsFile: cmds }),
+    );
+    expect(code).toBe(0);
+  });
+
+  it('(c) the workspace rr-cache is installed before the rebuild, resolving a would-be conflict', async () => {
+    const repo = initFixtureRepo();
+    cleanups.push(() => repo.destroy());
+    repo.commit('base: x', { 'src/x.ts': 'base\n' });
+    repo.checkout('module/a', { create: true, at: 'main' });
+    repo.commit('a: x -> AAA', { 'src/x.ts': 'AAA\n' });
+    repo.checkout('main');
+    repo.checkout('module/b', { create: true, at: 'main' });
+    repo.commit('b: x -> BBB', { 'src/x.ts': 'BBB\n' });
+    repo.checkout('main');
+    const ws = mkWorkspace();
+    const RESOLUTION = 'RESOLVED\n';
+    const cmds = join(ws, 'cmds.json');
+    writeFileSync(cmds, JSON.stringify([{ cmd: 'grep -q RESOLVED src/x.ts' }]));
+
+    // 1. Record the a-then-b resolution once, by hand, with rerere enabled.
+    const rec = await addTempWorktree(repo.dir, 'main');
+    try {
+      repo.git('-C', rec.path, '-c', 'rerere.enabled=true', 'merge', '--no-edit', 'module/a'); // clean
+      let conflict = false;
+      try {
+        repo.git(
+          '-C',
+          rec.path,
+          '-c',
+          'rerere.enabled=true',
+          '-c',
+          'rerere.autoUpdate=true',
+          'merge',
+          '--no-edit',
+          'module/b',
+        );
+      } catch {
+        conflict = true;
+      }
+      expect(conflict).toBe(true);
+      writeFileSync(join(rec.path, 'src/x.ts'), RESOLUTION);
+      repo.git('-C', rec.path, 'add', 'src/x.ts');
+      repo.git('-C', rec.path, '-c', 'rerere.enabled=true', 'commit', '--no-edit', '--no-verify');
+    } finally {
+      await rec.remove();
+    }
+    // 2. Export the recorded resolution to the workspace rr-cache; drop the local cache.
+    const rrFiles = await exportRrCache(repo.dir, {});
+    expect(writeRrCacheDir(join(ws, 'rr-cache'), rrFiles)).toBeGreaterThan(0);
+    rmSync(join(repo.dir, '.git/rr-cache'), { recursive: true, force: true });
+
+    // 3. Control (no rr-cache): the a-then-b rebuild conflicts on module/b.
+    const control = await verifyEverything(repo.dir, {
+      recipe: ['module/a', 'module/b'],
+      baseRef: 'main',
+      commands: [{ cmd: 'true' }],
+      rrCacheDir: null,
+    });
+    expect(control.ok).toBe(false);
+    expect(control.build.conflictBranch).toBe('module/b');
+
+    // 4. cmdVerify seeds .git/rr-cache from the workspace before the build -> replay.
+    const { wm12 } = seedVerifyPass(
+      ws,
+      repo,
+      ['module/a', 'module/b'],
+      [
+        { branch: 'module/a', ref: repo.sha('module/a') },
+        { branch: 'module/b', ref: repo.sha('module/b') },
+      ],
+    );
+    const code = await cmdVerify(
+      baseCli(repo, ws, null, { cmd: 'verify', execute: true, pass: wm12, commandsFile: cmds }),
+    );
+    expect(code).toBe(0); // rerere replay resolved x -> RESOLVED, command passes
+    expect(readJournal(passDir(ws, wm12)).some((e) => e.action === 'verify' && e.ok === true)).toBe(true);
+  });
+
+  it('(d) a REAL regression on a PUBLISHABLE branch still goes RED, rolls back + freezes (derived recipe)', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base', { 'src/base.ts': 'b\n' });
+    repo.checkout('feat/off', { create: true, at: 'main' });
+    repo.commit('feat/off: clean', { 'src/off.ts': 'ok\n' });
+    const cleanTip = repo.sha('feat/off');
+    repo.commit('feat/off: introduces BAD', { BAD: 'boom\n' }); // as if a pass merge landed BAD
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+
+    const ws = mkWorkspace();
+    // No --recipe: the recipe is DERIVED (feat/off advanced, not held) -> gate bites.
+    const { wm12 } = seedVerifyPass(ws, repo, ['feat/off'], [{ branch: 'feat/off', ref: cleanTip }]);
+    const cmds = join(ws, 'cmds.json');
+    writeFileSync(cmds, JSON.stringify([{ cmd: 'test ! -f BAD' }]));
+    const code = await cmdVerify(
+      baseCli(repo, ws, null, { cmd: 'verify', execute: true, pass: wm12, commandsFile: cmds }),
+    );
+    expect(code).toBe(0); // re-verify green after the offender is rolled back + held
+    const journal = readJournal(passDir(ws, wm12));
+    expect(journal.some((e) => e.action === 'verify-observation')).toBe(false); // blocking gate path, not the non-blocking one
+    expect(journal.filter((e) => e.action === 'verify').map((e) => e.ok)).toEqual([false, true]);
+    expect(journal.some((e) => e.action === 'held' && e.branch === 'feat/off' && e.reason === 'gate')).toBe(true);
+    expect(repo.sha('feat/off')).toBe(cleanTip); // rolled back to its pre-ref
     expect(readLedger(join(ws, 'sweep-ledger.json')).branches['feat/off']?.status).toBe('frozen');
   });
 });

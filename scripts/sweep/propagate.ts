@@ -609,6 +609,44 @@ function lastPreRef(journal: JournalEntry[], branch: string): string | null {
   return ref;
 }
 
+/** Branches with an OPEN case this pass (a `case` not yet `resolved`/`held`). */
+function openCaseBranches(journal: JournalEntry[]): Set<string> {
+  const branchOf = new Map<string, string>(); // caseId -> branch
+  const closed = new Set<string>();
+  for (const e of journal) {
+    if (e.action === 'case' && typeof e.caseId === 'string' && typeof e.branch === 'string') {
+      branchOf.set(e.caseId, e.branch);
+    } else if ((e.action === 'resolved' || e.action === 'held') && typeof e.caseId === 'string') {
+      closed.add(e.caseId);
+    }
+  }
+  const out = new Set<string>();
+  for (const [caseId, branch] of branchOf) if (!closed.has(caseId)) out.add(branch);
+  return out;
+}
+
+/**
+ * D-051 — the verify recipe = THIS PASS'S PUBLISHABLE RESULT: the branches that
+ * ADVANCED this pass (a `pre-ref` was journaled, i.e. they were mutated),
+ * ordered by the plan's DAG order (parents before children), MINUS any branch
+ * that is held/frozen (`held`) or carries an OPEN case. Held/frozen branches are
+ * frozen-by-design and UNPUBLISHED — they carry unresolved conflicts that, when
+ * merged onto a bare base, recreate historical stack conflicts and wrongly abort
+ * the build (the root bug: a permanently-held module branch could never let the
+ * gate go green). They are validated by their own fix/case flow, never here.
+ * Branches missing from `order` (should not happen for a real plan) trail in
+ * pre-ref order so nothing publishable is silently dropped.
+ */
+export function publishableRecipe(journal: JournalEntry[], order: string[], held: Set<string>): string[] {
+  const advanced = preReffedSet(journal);
+  const openCases = openCaseBranches(journal);
+  const publishable = new Set([...advanced].filter((b) => !held.has(b) && !openCases.has(b)));
+  const ordered = order.filter((b) => publishable.has(b));
+  const inOrder = new Set(ordered);
+  const trailing = [...publishable].filter((b) => !inOrder.has(b));
+  return [...ordered, ...trailing];
+}
+
 // --------------------------------------------------------------------------
 // Journaled ref mutations (reuse merge.ts's commit-tree + update-ref technique).
 // --------------------------------------------------------------------------
@@ -667,6 +705,28 @@ function passScope(dir: string): Set<string> {
   if (!existsSync(src)) return new Set();
   const plan = JSON.parse(readFileSync(src, 'utf8')) as PropagationPlan;
   return new Set(plan.branches.map((b) => b.branch));
+}
+
+/** The pass plan's DAG order (parents before children) — verify recipe order (D-051). */
+function passOrder(dir: string): string[] {
+  const p = join(dir, 'plan.json');
+  const src = existsSync(p) ? p : join(dir, 'plan-initial.json');
+  if (!existsSync(src)) return [];
+  const plan = JSON.parse(readFileSync(src, 'utf8')) as PropagationPlan;
+  return plan.order ?? [];
+}
+
+/**
+ * D-051 — the verify rebuild base per the §3 merge-source model: module & feat
+ * branches root at `main_patched` (the fork trunk), NOT bare `main` — merging
+ * them onto `main` recreates the fork-content conflicts they were merged past
+ * and aborts the build. `main_patched` ⊇ `main`, so upstream-chain-from-main
+ * branches (compositions/docs) still integrate cleanly in this THROWAWAY target;
+ * the §3 push-time purity rule (those must not absorb fork content) is enforced
+ * at merge/push against the real refs, never against this discarded rebuild.
+ */
+async function verifyBaseRef(cli: Cli): Promise<string> {
+  return (await refExists(cli.repo, 'main_patched')) ? 'main_patched' : 'main';
 }
 
 /**
@@ -2817,21 +2877,43 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     scopeFile: cli.scopeFile,
     routingFile: cli.routingFile,
   });
-  const recipe = cli.recipe ?? registry.scope.recipe ?? [];
-  if (recipe.length === 0) {
-    console.error('verify: no recipe (pass --recipe a,b,c or add `recipe:` to registry/scope.yaml)');
-    return 2;
-  }
+  // D-051 fix 1: the recipe = THIS PASS'S publishable set (advanced branches, in
+  // the plan's DAG order, minus held/frozen/open-case), built on the fork-trunk
+  // base. An explicit `--recipe` still overrides (manual re-verify / debugging,
+  // §12). The static scope.yaml `recipe` is now only a PLANLESS fallback (no
+  // pass plan on disk): validating publishable branches replaces validating a
+  // fixed config stack that could pin a permanently-held branch at its head.
+  const held = new Set<string>([...heldRegistry(journal).map((h) => h.branch), ...frozenBranches(cli)]);
+  const order = passOrder(dir);
+  const derived = order.length > 0 ? publishableRecipe(journal, order, held) : (registry.scope.recipe ?? []);
+  const recipe = cli.recipe ?? derived;
+  const baseRef = await verifyBaseRef(cli);
+  const rrCacheDir = join(cli.workspace, RR_CACHE_DIRNAME);
   const commands: VerifyCommand[] = cli.commandsFile
     ? (JSON.parse(readFileSync(cli.commandsFile, 'utf8')) as VerifyCommand[])
     : VERIFY_COMMANDS;
+  const verifyOpts = { commands, baseRef, rrCacheDir };
+
+  if (recipe.length === 0) {
+    if (order.length === 0) {
+      console.error('verify: no recipe (pass --recipe a,b,c or add `recipe:` to registry/scope.yaml)');
+      return 2;
+    }
+    // A plan exists but nothing publishable advanced this pass — vacuously green
+    // (nothing to integrate, nothing to push). Everything held is reported, not
+    // gated (D-051): a pass where every branch froze must still complete.
+    appendJournal(dir, { action: 'verify', ok: true, note: 'empty publishable recipe (nothing advanced this pass)' });
+    console.error('verify: green (no publishable branches advanced this pass — nothing to rebuild)');
+    emit(cli, { ok: true, recipe: [], baseRef });
+    return 0;
+  }
   if (!cli.execute) {
     console.error('DRY-RUN (no --execute): would rebuild the recipe + run CI commands in a temp worktree');
-    emit(cli, { recipe, commands });
+    emit(cli, { recipe, commands, baseRef });
     return 0;
   }
 
-  const first = await verifyEverything(cli.repo, { recipe, commands });
+  const first = await verifyEverything(cli.repo, { recipe, ...verifyOpts });
   if (first.ok) {
     appendJournal(dir, { action: 'verify', ok: true });
     console.error('verify: green');
@@ -2846,15 +2928,38 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     emit(cli, { ok: false, attributionFailed: true, commands: first.commands });
     return 1;
   }
-  // Roll the offender back to its journaled pre-ref, HELD(gate), ledger-freeze,
-  // then re-verify (its bad merge is gone) per verify.ts's model.
   const preRef = lastPreRef(journal, offender);
-  if (!preRef) {
-    appendJournal(dir, { action: 'verify', ok: false, offender, note: 'no pre-ref to roll back to' });
-    console.error(`verify: RED offender ${offender} has no journaled pre-ref — cannot roll back`);
-    emit(cli, { ok: false, offender, note: 'no pre-ref' });
-    return 1;
+  // D-051 fix 2: a HELD/FROZEN offender (or any branch with no this-pass pre-ref)
+  // is NOT a publishable failure — it is already frozen and unpublished, so it
+  // must NEVER hard-block (ERR18). fix 1 already excludes held/frozen branches
+  // from the recipe, so this is defense in depth for an explicit `--recipe` (or a
+  // branch frozen after its pre-ref): journal a non-blocking gate OBSERVATION,
+  // re-verify the publishable set WITHOUT it, and let the rest proceed. ERR18
+  // fires ONLY when a branch that WOULD be pushed this pass fails verify.
+  if (held.has(offender) || !preRef) {
+    appendJournal(dir, {
+      action: 'verify-observation',
+      ok: false,
+      offender,
+      held: held.has(offender),
+      note: held.has(offender)
+        ? 'offender is held/frozen — non-blocking (unpublished; validated by its own fix flow)'
+        : 'offender has no pre-ref — non-blocking (not mutated this pass)',
+    });
+    const reduced = recipe.filter((b) => b !== offender);
+    const re = reduced.length > 0 ? await verifyEverything(cli.repo, { recipe: reduced, ...verifyOpts }) : null;
+    const reOk = re ? re.ok : true;
+    appendJournal(dir, { action: 'verify', ok: reOk, offender, excluded: offender, nonBlocking: true });
+    console.error(
+      `verify: RED offender ${offender} is held/unpublished — non-blocking; ` +
+        `${re ? `re-verify without it ${reOk ? 'green' : 'STILL RED'}` : 'no publishable branches remain'}`,
+    );
+    emit(cli, { ok: reOk, offender, nonBlocking: true, excluded: offender, reverify: { ok: reOk } });
+    return reOk ? 0 : 1;
   }
+  // Offender is a PUBLISHABLE branch with a journaled pre-ref → the gate bites:
+  // roll it back to its pre-ref, HELD(gate), ledger-freeze, then re-verify (its
+  // bad merge is gone) per verify.ts's model.
   const current = await revParse(cli.repo, offender);
   try {
     guardRef(offender, passScope(dir)); // protected-ref guard on the rollback write (§8/N1)
@@ -2882,7 +2987,10 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     reason: 'gate',
   });
   freezeInLedger(cli, offender, 'gate', null, null, null); // gate hold has no conflicting head / paths / PR
-  const re = await verifyEverything(cli.repo, { recipe, commands });
+  // Re-verify on the publishable set with the offender now rolled back + held —
+  // it drops out of the recipe (fix 1) so its bad merge is gone (D-051).
+  const reRecipe = recipe.filter((b) => b !== offender);
+  const re = await verifyEverything(cli.repo, { recipe: reRecipe, ...verifyOpts });
   appendJournal(dir, { action: 'verify', ok: re.ok, offender, rolledBack: offender });
   console.error(
     `verify: RED -> rolled back ${offender} to ${preRef.slice(0, 12)}, HELD(gate); re-verify ${re.ok ? 'green' : 'STILL RED'}`,

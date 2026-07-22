@@ -3,8 +3,9 @@
 Status: v1 (2026-07-18, owner-settled design; §13 remote branches + inventory candidates
 added 2026-07-21, D-045; §14 publish tool + result-ID contract added 2026-07-21,
 D-048; case stacking, driver pushes and PR head shapes aligned to MERGE-POLICY.md
-2026-07-21, D-049 — on conflict, MERGE-POLICY.md wins). Decision references
-D-035..D-040, D-045, D-048 and D-049 point to the decision log
+2026-07-21, D-049 — on conflict, MERGE-POLICY.md wins; §9 verify gate validates the
+pass's publishable result on the fork-trunk base, 2026-07-22, D-051). Decision references
+D-035..D-040, D-045, D-048, D-049, D-050 and D-051 point to the decision log
 (`self-maintenance-decisions.md`). Supersedes the agent-sequenced merge
 loop of DESIGN.md §5-6 for propagation ordering, merge execution, and case handling;
 scan/PoI routing/inventory/verify machinery is reused, not replaced.
@@ -435,6 +436,26 @@ without it. A pass is only `pass-complete` when the gate is green. Nothing is pu
 before verification passes (D-034 gate 1-2 additionally apply to any push):
 `propagate push` refuses (`ERR18_VERIFY_PENDING`) unless the journal shows a green
 `verify` after the pass's last mutation (§14.4).
+
+**The recipe = THIS PASS'S PUBLISHABLE RESULT (D-051, 2026-07-22).** The gate must
+validate what will be published, not a static branch list. The recipe is DERIVED from
+the pass: the branches that ADVANCED this pass (a `pre-ref` was journaled), in the
+plan's DAG order (parents before children), **minus** any branch that is held/frozen
+(ledger or journal) or carries an open case — those are unpublished, frozen-by-design,
+and still carry unresolved conflicts, so verifying them would recreate historical stack
+conflicts against the base and wedge the gate (a permanently-held branch could never let
+it go green). The rebuild base is the fork trunk `main_patched` per the §3 merge-source
+model (module/feat branches root there), NOT bare `main` — merging a fork branch onto
+`main` recreates the fork-content conflicts it was merged past; `main_patched ⊇ main`, so
+upstream-chain-from-main branches still integrate cleanly in this throwaway target (the
+§3 push-time purity rule is enforced against the real refs, never this discarded build).
+`verify.ts` seeds the workspace rr-cache into `.git/rr-cache` before the rebuild so
+resolutions recorded this pass replay rather than reappearing as false offenders. A
+build-conflict or leave-one-out offender that is itself held/frozen (or has no this-pass
+`pre-ref`) is a **non-blocking gate observation** — journaled and surfaced to the owner,
+the publishable set proceeds — never `ERR18`; the blocking rollback+freeze path fires
+ONLY for a publishable branch that WOULD be pushed this pass. The static `recipe:` in
+`registry/scope.yaml` degrades to a planless fallback (manual `verify` with no pass).
 
 ## 10. Module layout (new files, flat per convention; reuse map)
 

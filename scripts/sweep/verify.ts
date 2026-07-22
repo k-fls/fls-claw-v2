@@ -2,10 +2,13 @@
  * scripts/sweep/verify.ts — everything-rebuild + test-matrix runner.
  *
  * Rebuilds the throwaway integration target from the recipe (ordered branch
- * list, sweep-scope.yaml `recipe`) in a TEMPORARY worktree: reset --hard to
- * the base ref, then sequential merges with rerere. Then runs the CI command
- * list (injectable — fixture tests use `true`/`false` stubs instead of the
- * real matrix). On failure, attributes the breakage by re-building with one
+ * list) in a TEMPORARY worktree: seed the recorded rerere cache (D-051), reset
+ * --hard to the base ref, then sequential merges with rerere. Then runs the CI
+ * command list (injectable — fixture tests use `true`/`false` stubs instead of
+ * the real matrix). The recipe + base are the caller's (cmdVerify passes THIS
+ * PASS'S publishable set, DAG-ordered, on the fork-trunk base per D-051; the
+ * static sweep-scope.yaml `recipe` is only a planless fallback). On failure,
+ * attributes the breakage by re-building with one
  * recipe branch removed at a time (reverse recipe order); the offender is
  * reported so the caller can roll it back (merge.rollbackBranch) and demote
  * it to a gate-PoI. The `everything` branch itself is NEVER committed to,
@@ -17,6 +20,7 @@ import { promisify } from 'node:util';
 
 import { VERIFY_COMMANDS } from './config.js';
 import { addTempWorktree, git } from './git.js';
+import { installRrCache } from './merge.js';
 
 const execFileP = promisify(execFile);
 
@@ -55,6 +59,13 @@ export interface VerifyOptions {
   commands?: VerifyCommand[];
   /** Attribution rebuild attempts cap (default: recipe length). */
   maxAttribution?: number;
+  /**
+   * Workspace rr-cache directory (D-051): installed into `.git/rr-cache` BEFORE
+   * the recipe build so the rebuild replays the sweep's RECORDED resolutions
+   * (mirrors merge.ts's `executeMerges`), not merely whatever preimages happen
+   * to already live in the shared cache. Null/omitted → no seeding (fixtures).
+   */
+  rrCacheDir?: string | null;
 }
 
 async function runRecipe(repo: string, wtPath: string, baseRef: string, recipe: string[]): Promise<RecipeBuildResult> {
@@ -127,6 +138,11 @@ async function buildAndTest(
 export async function verifyEverything(repo: string, opts: VerifyOptions): Promise<VerifyResult> {
   const baseRef = opts.baseRef ?? 'main';
   const commands = opts.commands ?? VERIFY_COMMANDS;
+  // D-051 defense in depth: seed the shared rerere cache (common git dir, so the
+  // temp worktree's merges see it) with the sweep's recorded resolutions before
+  // the rebuild — otherwise a would-be conflict that WAS resolved this pass
+  // could reappear in the recipe build and mis-attribute a false offender.
+  await installRrCache(repo, opts.rrCacheDir ?? null);
   const wt = await addTempWorktree(repo, baseRef);
   try {
     const first = await buildAndTest(repo, wt.path, baseRef, opts.recipe, commands);
