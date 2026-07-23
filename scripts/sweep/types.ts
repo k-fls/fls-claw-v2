@@ -101,21 +101,15 @@ export interface SweepReport {
 }
 
 /**
- * Per-branch merge status (D-057): exactly three states — PR_ID | DEFERRED |
- * NONE. NONE is represented by an absent/null `merge_status` field; there is
- * no other freeze flag anywhere. The single invariant:
- *
- *     blocked(X)  ⇔  merge_status(X) != NONE,   ALWAYS.
- *
- * NO height is stored: heights are LIVE per-pass values. A PR_ID branch's
- * block height is re-derived from `headSha` against the pass's pinned chain;
- * a DEFERRED branch's block height is re-derived by probing its own conflict
- * live. PR_ID persists from the moment a branch is held until the branch is
- * COMPLETELY resolved (the owner resolves the PR AND the merge has landed on
- * the branch) — never cleared at any intermediate step. DEFERRED is sticky
- * while any DIRECT parent has merge_status != NONE (recomputed from the
- * parents each pass, never independently mutated) and clears only when ALL
- * parents are NONE, at which point the branch re-merges fresh.
+ * Per-branch merge status. D-058 RETIRED this as stored state for the
+ * propagation driver: blockedness is DERIVED — cross-pass from the origin
+ * fix/sweep refs at `sweep start` (an unmerged ref WITH an open PR ⇔ PR_ID),
+ * within a pass from the journal (origin-blocked/held/defer rows); DEFERRED
+ * is recomputed from the parents' PR_ID during derivation, never stored. The
+ * three-state model and the invariant blocked(X) ⇔ merge_status(X) != NONE
+ * (D-057) survive as the DERIVED view's semantics. This type + the ledger
+ * field remain ONLY as a non-authoritative legacy cache read by the old sweep
+ * merge stage (merge.ts) — the propagation driver never reads or writes it.
  */
 export type MergeStatus =
   | {
@@ -139,16 +133,17 @@ export type MergeStatus =
  * Group-owned ledger branch override. Absence of an entry = active.
  * lastMergedUpstream is NOT stored — it is derived as
  * `git merge-base <branch> upstream/main` (see ledger.derivedLastMerged).
- * Blockedness is `merge_status` ONLY (D-057) — the pre-D-057 independent
+ * Blockedness is ORIGIN/JOURNAL-DERIVED (D-058); the pre-D-057 independent
  * freeze fields (status:'frozen', frozenBy, heldHead, heldPaths, fixBranch,
  * pendingBehindFreeze) are retired; readLedger up-converts legacy files.
  */
 export interface LedgerBranch {
   status: 'active' | 'excluded';
-  /** D-057 merge_status; absent/null = NONE (see MergeStatus). */
+  /** Legacy non-authoritative cache (see MergeStatus) — dead to the propagation driver (D-058). */
   merge_status?: MergeStatus | null;
   notes: string;
-  /** Newest pending head the owner was last urged about (one POSTED urge per new head). */
+  /** Newest pending head the owner was last urged about (one POSTED urge per new head).
+   * Kept as a non-authoritative dedup cache (D-058 §3): losing it merely re-urges once. */
   lastUrgedHead?: string | null;
 }
 

@@ -1,6 +1,5 @@
 import {
   appendFileSync,
-  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -16,7 +15,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { initFixtureRepo, type FixtureRepo } from './fixtures.js';
 import { addTempWorktree, commitInfo, isAncestor, listTreePaths, revParse } from './git.js';
-import { defaultLedgerBranch, readLedger, writeLedger } from './ledger.js';
+import { readLedger } from './ledger.js';
 import { exportRrCache, writeRrCacheDir } from './merge.js';
 import { DriverHalt, guardRef } from './propagate.js';
 import {
@@ -32,7 +31,6 @@ import {
   passDir,
   publishableRecipe,
   readJournal,
-  settleAfterResolve,
   type Cli,
   type JournalEntry,
 } from './propagate.js';
@@ -109,7 +107,7 @@ function baseCli(repo: FixtureRepo, ws: string, inv: string | null, over: Partia
     cmd: 'plan',
     repo: repo.dir,
     workspace: ws,
-    inventory: inv,
+    inventory: inv ?? undefined,
     scopeFile: join(inv ?? ws, 'no-scope.yaml'), // non-existent -> empty scope
     upstream: 'main',
     execute: false,
@@ -257,7 +255,9 @@ describe('propagate plan/run/resolve — entry model with a conflict case', () =
     expect(out.scopeGuard.ok).toBe(false);
     expect(out.tier).toBe('held'); // HELD outright, not JUDGED
     expect(repo.sha('main_patched')).toBe(postRun); // NO merge landed
-    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.merge_status?.state).toBe('PR_ID');
+    // Blocked ⇔ the journaled held disposition (D-058: no ledger merge_status).
+    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.merge_status ?? null).toBeNull();
   });
 
   it('idempotent resume: a second run does not re-merge already-arrived branches', async () => {
@@ -471,7 +471,8 @@ describe('propagate resolve — stale-verdict auto-clear + convergence cap (D-05
     expect(j.some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
     expect(j.some((e) => e.action === 'resolved' && e.caseId === caseId)).toBe(false);
     expect(repo.sha('main_patched')).toBe(postRun); // NO merge landed
-    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.merge_status?.state).toBe('PR_ID');
+    // The held disposition IS the block (D-058) — nothing written to the ledger.
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.merge_status ?? null).toBeNull();
   });
 
   it('(d) `propagate report` prints a journal-derived summary incl. open/unresolved cases', async () => {
@@ -594,7 +595,8 @@ describe('propagate resolve — cold-read infra failure ≠ content reject (D-05
     expect(j.some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
     expect(j.some((e) => e.action === 'halt' && e.id === 'ERR35_COLDREAD_UNAVAILABLE')).toBe(false);
     expect(repo.sha('main_patched')).toBe(postRun); // no merge; blocked
-    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.merge_status?.state).toBe('PR_ID');
+    // Blocked ⇔ the journaled held disposition (D-058) — the ledger stays clean.
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.merge_status ?? null).toBeNull();
   });
 });
 
@@ -643,11 +645,12 @@ describe('propagate resolve — direct HELD path (§8)', () => {
     expect(repo.sha('main_patched')).toBe(before);
     const journal = readJournal(dir);
     expect(journal.some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
-    // merge_status PR_ID is THE blocked marker (D-057): head sha recorded for
-    // live height re-derivation + completion detection.
-    const heldMs = readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.merge_status;
-    expect(heldMs?.state).toBe('PR_ID');
-    expect(heldMs?.state === 'PR_ID' && heldMs.caseId).toBe(caseId);
+    // The journaled held disposition IS the blocked marker (D-058): its head
+    // sha anchors the live height re-derivation; the ledger is never written.
+    const heldRow = journal.find((e) => e.action === 'held' && e.caseId === caseId)!;
+    const caseHead = readJournal(dir).find((e) => e.action === 'case' && e.caseId === caseId)!.head as { sha: string };
+    expect(heldRow.headSha).toBe(caseHead.sha);
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.merge_status ?? null).toBeNull();
     expect(journal.some((e) => e.action === 'reopened' && e.branch === 'main_patched')).toBe(true);
   });
 });
@@ -721,62 +724,40 @@ describe('propagate — pass pinning (§8, FIX C)', () => {
     expect(readJournal(passDir(ws, u1.slice(0, 12))).length).toBe(0);
   });
 
-  it('a ledger-frozen branch is skipped (empty interval) and a mechanical resolve unfreezes it', async () => {
+  it('an origin-blocked branch is skipped (empty interval); a fresh pass without the row derives unblocked (D-058)', async () => {
     const { repo } = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
 
-    // Freeze main_patched in the ledger BEFORE the pass.
-    writeFileSync(
-      join(ws, 'sweep-ledger.json'),
-      JSON.stringify({
-        schemaVersion: 1,
-        lastSweep: null,
-        branches: { main_patched: { status: 'frozen', frozenBy: 'prior', pendingBehindFreeze: 0, notes: '' } },
-        openPois: [],
-      }),
-    );
+    // Block main_patched via the journal row `sweep start` would derive from an
+    // unmerged origin fix/sweep ref with an open PR (D-058) — appended BEFORE
+    // plan, exactly where start writes it.
+    appendJournal(dir, {
+      action: 'origin-blocked',
+      branch: 'main_patched',
+      caseId: 'origin:fix/sweep/main_patched--main-h1-deadbeef',
+      fixBranch: 'fix/sweep/main_patched--main-h1-deadbeef',
+      headSha: null,
+      prNumber: 12,
+    });
     await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
     const before = repo.sha('main_patched');
     await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
-    expect(repo.sha('main_patched')).toBe(before); // frozen -> empty interval, no merge
+    expect(repo.sha('main_patched')).toBe(before); // blocked -> empty interval, no merge
     expect(
       readJournal(dir).some((e) => e.action === 'skip' && e.branch === 'main_patched' && e.reason === 'held'),
     ).toBe(true);
 
-    // Manually plant a case for main_patched + unfreeze via a mechanical resolve.
-    // (Freeze it again, emit a real case by unfreezing for the run, then re-freeze.)
-    // Simpler: unfreeze, run to emit a case, re-freeze in ledger, then resolve.
-    writeFileSync(
-      join(ws, 'sweep-ledger.json'),
-      JSON.stringify({ schemaVersion: 1, lastSweep: null, branches: {}, openPois: [] }),
-    );
-    // fresh pass in a fresh workspace to get a clean case
+    // The block is PASS-LOCAL derived state (D-058): a fresh pass whose journal
+    // carries no origin-blocked row (start found no ref / the PR was resolved)
+    // derives main_patched unblocked and processes it normally.
     const ws2 = mkWorkspace();
     const dir2 = passDir(ws2, repo.sha('main').slice(0, 12));
     await cmdPlan(baseCli(repo, ws2, inv, { cmd: 'plan' }));
     await cmdRun(baseCli(repo, ws2, inv, { cmd: 'run', execute: true }));
-    const caseId = readJournal(dir2).find((e) => e.action === 'case')!.caseId as string;
-    // Now freeze main_patched in ws2's ledger (simulating a gate/prior freeze).
-    writeFileSync(
-      join(ws2, 'sweep-ledger.json'),
-      JSON.stringify({
-        schemaVersion: 1,
-        lastSweep: null,
-        branches: { main_patched: { status: 'frozen', frozenBy: 'gate', pendingBehindFreeze: 0, notes: '' } },
-        openPois: [],
-      }),
-    );
-    const caseFile = readCase(dir2, caseId);
-    const resolvedRef = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'RESOLVED\n' });
-    writeVerdict(dir2, caseId, repo, resolvedRef);
-    expect(
-      await cmdResolve(
-        baseCli(repo, ws2, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef }),
-      ),
-    ).toBe(0);
-    expect(readLedger(join(ws2, 'sweep-ledger.json')).branches['main_patched']?.status).toBe('active'); // unfrozen
+    expect(repo.sha('main_patched')).not.toBe(before); // clean prefix (U0) merged
+    expect(readJournal(dir2).some((e) => e.action === 'case' && e.branch === 'main_patched')).toBe(true);
   });
 });
 
@@ -842,8 +823,11 @@ describe('propagate verify — §9 gate rolls back a red offender (FIX B)', () =
     const journal = readJournal(dir);
     expect(journal.some((e) => e.action === 'held' && e.branch === 'feat/off' && e.reason === 'gate')).toBe(true);
     expect(journal.filter((e) => e.action === 'verify').map((e) => e.ok)).toEqual([false, true]);
-    const gateMs = readLedger(join(ws, 'sweep-ledger.json')).branches['feat/off']?.merge_status;
-    expect(gateMs).toMatchObject({ state: 'PR_ID', caseId: 'gate', headSha: null }); // gate hold: no head, no PR
+    // Gate hold (D-058): the journaled held row IS the block — no head, no PR,
+    // nothing written to the ledger.
+    const gateRow = journal.find((e) => e.action === 'held' && e.branch === 'feat/off')!;
+    expect(gateRow.reason).toBe('gate');
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['feat/off']?.merge_status ?? null).toBeNull();
   });
 });
 
@@ -930,8 +914,8 @@ describe('publishableRecipe (D-051 fix 1 — pure recipe derivation)', () => {
       ] as Array<Record<string, unknown>>
     ).map((e) => ({ ts: '', ...e }) as JournalEntry);
     const order = ['main_patched', 'module/a', 'module/b', 'module/c'];
-    // held = the PR_ID-blocked set (merge_status != NONE, D-057): module/b plus
-    // a blocked branch that never advanced — never in the recipe.
+    // held = the PR_ID-blocked set (origin/journal-derived, D-058): module/b
+    // plus a blocked branch that never advanced — never in the recipe.
     const held = new Set(['module/b', 'module/frozen-elsewhere']);
     expect(publishableRecipe(journal, order, held)).toEqual(['main_patched', 'module/a']);
   });
@@ -950,23 +934,8 @@ describe('propagate verify — publishable set (D-051)', () => {
       [{ branch: 'module/good', ref: repo.sha('module/good') }],
       [{ action: 'held', branch: 'module/held', caseId: 'gate-x', height: -1, conflictedPaths: [] }],
     );
-    // Heldness = merge_status PR_ID in the ledger (D-057) — the journal entry
-    // above is audit only.
-    writeFileSync(
-      join(ws, 'sweep-ledger.json'),
-      JSON.stringify({
-        schemaVersion: 1,
-        lastSweep: null,
-        branches: {
-          'module/held': {
-            status: 'active',
-            merge_status: { state: 'PR_ID', caseId: 'gate-x', headSha: null, fixBranch: null, prNumber: null },
-            notes: '',
-          },
-        },
-        openPois: [],
-      }),
-    );
+    // Heldness = the journaled `held` disposition above (D-058) — the derived
+    // blocked view reads the journal; the ledger plays no part.
     const heldTip = repo.sha('module/held');
     const cmds = join(ws, 'cmds.json');
     writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }]));
@@ -998,22 +967,7 @@ describe('propagate verify — publishable set (D-051)', () => {
       [{ branch: 'module/good', ref: repo.sha('module/good') }],
       [{ action: 'held', branch: 'module/held', caseId: 'gate-x', height: -1, conflictedPaths: [] }],
     );
-    // Heldness = merge_status PR_ID in the ledger (D-057) — the journal entry is audit only.
-    writeFileSync(
-      join(ws, 'sweep-ledger.json'),
-      JSON.stringify({
-        schemaVersion: 1,
-        lastSweep: null,
-        branches: {
-          'module/held': {
-            status: 'active',
-            merge_status: { state: 'PR_ID', caseId: 'gate-x', headSha: null, fixBranch: null, prNumber: null },
-            notes: '',
-          },
-        },
-        openPois: [],
-      }),
-    );
+    // Heldness = the journaled `held` disposition above (D-058).
     const heldTip = repo.sha('module/held');
     const cmds = join(ws, 'cmds.json');
     writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }]));
@@ -1035,11 +989,12 @@ describe('propagate verify — publishable set (D-051)', () => {
     const obs = journal.find((e) => e.action === 'verify-observation');
     expect(obs).toMatchObject({ offender: 'module/held', held: true });
     expect(repo.sha('module/held')).toBe(heldTip); // NOT rolled back
-    // The held offender was not gate-frozen by verify (it is already PR_ID-held).
-    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['module/held']?.merge_status).toMatchObject({
-      state: 'PR_ID',
-      caseId: 'gate-x',
-    });
+    // The held offender was not gate-frozen by verify (it is already held —
+    // no NEW gate `held` row was journaled for it).
+    const heldRows = readJournal(passDir(ws, wm12)).filter(
+      (e) => e.action === 'held' && e.branch === 'module/held',
+    );
+    expect(heldRows.length).toBe(1); // only the seeded row; no verify gate hold added
   });
 
   it('(b) a module branch verifies against main_patched, not bare main (fix 1 base)', async () => {
@@ -1164,10 +1119,8 @@ describe('propagate verify — publishable set (D-051)', () => {
     expect(journal.filter((e) => e.action === 'verify').map((e) => e.ok)).toEqual([false, true]);
     expect(journal.some((e) => e.action === 'held' && e.branch === 'feat/off' && e.reason === 'gate')).toBe(true);
     expect(repo.sha('feat/off')).toBe(cleanTip); // rolled back to its pre-ref
-    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['feat/off']?.merge_status).toMatchObject({
-      state: 'PR_ID',
-      caseId: 'gate',
-    });
+    // The journaled gate hold blocks the branch for the rest of the pass (D-058).
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['feat/off']?.merge_status ?? null).toBeNull();
   });
 });
 
@@ -1344,8 +1297,19 @@ function fakeGreenVerify(dir: string): void {
   appendFileSync(join(dir, 'journal.jsonl'), JSON.stringify({ ts: new Date().toISOString(), action: 'verify', ok: true }) + '\n');
 }
 
-describe('propagate — frozen-branch urging is POSTED by push, once per NEW pending head (§8, D-049)', () => {
-  it('run only detects; push posts the urge (comment + D-004 refresh + ledger), suppresses, re-urges on a new head', async () => {
+describe('propagate — blocked-branch urging is POSTED by push, once per NEW pending head (§8, D-049/D-058)', () => {
+  /** The journal row `sweep start` derives from an unmerged origin fix/sweep ref with an open PR. */
+  const originBlockedRow = (fixBranch: string, prNumber: number | null = null): Record<string, unknown> => ({
+    action: 'origin-blocked',
+    branch: 'main_patched',
+    caseId: `origin:${fixBranch}`,
+    fixBranch,
+    headSha: null,
+    prNumber,
+  });
+  const FIX = 'fix/sweep/main_patched--main-h1-deadbeef';
+
+  it('run only detects; push posts the urge (comment + D-004 refresh + lastUrgedHead), suppresses, re-urges on a new head', async () => {
     const { repo } = conflictFixture(); // U0 util, U1 x conflict
     repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
@@ -1354,21 +1318,23 @@ describe('propagate — frozen-branch urging is POSTED by push, once per NEW pen
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
     const tokenFile = join(ws, 'token.txt');
     writeFileSync(tokenFile, 'tok\n');
+    const wm12 = repo.sha('main').slice(0, 12);
+    // Blocked from pass start (origin-derived, D-058): prNumber unknown — push
+    // locates the PR by head branch.
+    appendJournal(dir, originBlockedRow(FIX));
     await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
-    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
-    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
-    // Freeze main_patched (direct held) — records fixBranch + heldHead.
-    await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'held' }));
 
-    // `run` never posts or journals urges any more (posting is push's job).
+    // `run` never posts or journals urges (posting is push's job); the blocked
+    // branch is skipped with an empty interval. Nothing merges, so the run
+    // seals the pass — push attaches to it explicitly via --pass.
     await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
     expect(readJournal(dir).filter((e) => e.action === 'urge').length).toBe(0);
 
     // push POSTS the urge: PR located by head branch, body PATCHed (D-004
-    // machine block), comment POSTed, ledger advanced.
+    // machine block), comment POSTed, lastUrgedHead advanced (dedup cache).
     fakeGreenVerify(dir);
     const gh = fakePushGithub();
-    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, tokenFile }), gh.factory)).toBe(0);
+    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, tokenFile, pass: wm12 }), gh.factory)).toBe(0);
     const urges1 = readJournal(dir).filter((e) => e.action === 'urge');
     expect(urges1.length).toBe(1);
     expect(urges1[0].prNumber).toBe(12);
@@ -1377,20 +1343,25 @@ describe('propagate — frozen-branch urging is POSTED by push, once per NEW pen
     expect(String((comment.body as { body: string }).body)).toContain('still blocked');
     const ledger = readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']!;
     expect(ledger.lastUrgedHead).toBe(repo.sha('main'));
-    expect(ledger.merge_status?.state === 'PR_ID' && ledger.merge_status.prNumber).toBe(12);
+    // D-058: merge_status is never written — lastUrgedHead is the one cache.
+    expect(ledger.merge_status ?? null).toBeNull();
 
     // A second push suppresses (no new pending head).
     const gh2 = fakePushGithub();
-    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, tokenFile }), gh2.factory)).toBe(0);
+    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, tokenFile, pass: wm12 }), gh2.factory)).toBe(0);
     expect(readJournal(dir).filter((e) => e.action === 'urge').length).toBe(1);
     expect(gh2.calls.filter((c) => c.method === 'POST' && c.path.includes('/comments')).length).toBe(0);
 
-    // A NEW pass with new upstream content re-urges once (posted by push).
+    // A NEW pass with new upstream content re-urges once (posted by push). The
+    // block arrives in the new pass's journal exactly as start re-derives it
+    // from the still-unmerged origin ref (this time with the PR number known).
     repo.commit('U2: more util', { 'src/util2.ts': 'u2\n' });
-    const dir2 = passDir(ws, repo.sha('main').slice(0, 12));
+    const wm12b = repo.sha('main').slice(0, 12);
+    const dir2 = passDir(ws, wm12b);
+    appendJournal(dir2, originBlockedRow(FIX, 12));
     await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
     const gh3 = fakePushGithub();
-    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, tokenFile }), gh3.factory)).toBe(0);
+    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, tokenFile, pass: wm12b }), gh3.factory)).toBe(0);
     const urgesNew = readJournal(dir2).filter((e) => e.action === 'urge');
     expect(urgesNew.length).toBe(1);
     expect(urgesNew[0].head).toBe(repo.sha('main')); // newest head (U2)
@@ -1405,17 +1376,19 @@ describe('propagate — frozen-branch urging is POSTED by push, once per NEW pen
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
     const tokenFile = join(ws, 'token.txt');
     writeFileSync(tokenFile, 'tok\n');
+    const wm12 = repo.sha('main').slice(0, 12);
+    appendJournal(dir, originBlockedRow(FIX, 12));
     await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
     await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
-    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
-    await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'held' }));
     fakeGreenVerify(dir);
     const gh = fakePushGithub({ 'POST /comments': { status: 500, body: { message: 'boom' } } });
     const out = join(ws, 'push-out.json');
-    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, tokenFile, out }), gh.factory)).toBe(1);
+    expect(
+      await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, tokenFile, out, pass: wm12 }), gh.factory),
+    ).toBe(1);
     const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> };
     expect(res.issues.some((i) => i.id === 'ERR17_URGE_FAILED')).toBe(true);
-    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']!.lastUrgedHead ?? null).toBeNull();
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.lastUrgedHead ?? null).toBeNull();
     expect(readJournal(dir).filter((e) => e.action === 'urge').length).toBe(0);
   });
 });
@@ -1517,50 +1490,51 @@ describe('propagate push — verify-gated pass pushes (§14.4, D-049)', () => {
   });
 });
 
-describe('propagate — unfreeze paths (§8, CHANGE 2)', () => {
-  it('PR_ID completion: merge_status flips to NONE only when the tip contains the stored head sha', async () => {
+describe('propagate — unfreeze paths (§8, D-058 journal-derived)', () => {
+  // PR_ID COMPLETION is origin's job now (D-058): a fix/sweep ref merged by
+  // the owner is detected at `sweep start` (resolved + ref deleted) — see the
+  // D-058 start tests in sweep-machine.test.ts. Locally there is nothing to
+  // flip: the block simply never re-derives.
+
+  it('MANUAL unfreeze journals `unfrozen` and clears the block for THIS pass (run then processes the branch)', async () => {
     const { repo } = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    // Blocked from pass start (origin-derived row, D-058).
+    appendJournal(dir, {
+      action: 'origin-blocked',
+      branch: 'main_patched',
+      caseId: 'origin:fix/sweep/main_patched--main-h1-deadbeef',
+      fixBranch: 'fix/sweep/main_patched--main-h1-deadbeef',
+      headSha: null,
+      prNumber: 12,
+    });
     await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
-    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
-    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
-    await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'held' }));
-    const msHeld = readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']!.merge_status;
-    expect(msHeld?.state).toBe('PR_ID'); // PR_ID from hold until COMPLETELY resolved (D-057)
-    const headSha = msHeld?.state === 'PR_ID' ? msHeld.headSha! : '';
-
-    // Simulate the owner merging the resolution PR: the stored head sha becomes
-    // an ancestor of main_patched (record it as a merge parent, keep the tree).
-    const mpTip = repo.sha('main_patched');
-    const tree = repo.git('rev-parse', 'main_patched^{tree}');
-    const merged = repo.git('commit-tree', tree, '-p', mpTip, '-p', headSha, '-m', 'owner merged freeze fix');
-    repo.git('update-ref', 'refs/heads/main_patched', merged);
-
-    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' })); // reconcileMergeStatus at plan time
-    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.merge_status ?? null).toBeNull();
-    expect(
-      readJournal(dir).some((e) => e.action === 'unfrozen' && e.branch === 'main_patched' && e.reason === 'derived'),
-    ).toBe(true);
-  });
-
-  it('MANUAL unfreeze journals + clears the ledger entry', async () => {
-    const { repo } = conflictFixture();
-    const ws = mkWorkspace();
-    const inv = emptyInventory();
-    const dir = passDir(ws, repo.sha('main').slice(0, 12));
-    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
-    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
-    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
-    await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'held' }));
-    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.merge_status?.state).toBe('PR_ID');
+    const before = repo.sha('main_patched');
 
     expect(await cmdUnfreeze(baseCli(repo, ws, inv, { cmd: 'unfreeze', execute: true, branch: 'main_patched' }))).toBe(
       0,
     );
-    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.merge_status ?? null).toBeNull();
     expect(readJournal(dir).some((e) => e.action === 'unfrozen' && e.reason === 'manual')).toBe(true);
+    // The ledger is untouched (D-058: no merge_status writes anywhere).
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.merge_status ?? null).toBeNull();
+
+    // The cleared branch processes normally in the SAME pass: clean prefix
+    // merges, the persistent conflict emits a case.
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    expect(repo.sha('main_patched')).not.toBe(before);
+    expect(readJournal(dir).some((e) => e.action === 'case' && e.branch === 'main_patched')).toBe(true);
+  });
+
+  it('unfreeze refuses a branch that is not blocked in the derived view', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    expect(await cmdUnfreeze(baseCli(repo, ws, inv, { cmd: 'unfreeze', execute: true, branch: 'main_patched' }))).toBe(
+      2,
+    );
   });
 });
 
@@ -1809,30 +1783,23 @@ describe('propagate — SPEC 2: annotate-class run journaling', () => {
     const inv = writeInventory([{ id: 'c', branch: 'feat/c', parents: ['main_patched'] }]);
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
     const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, { base, ...o });
-    await cmdPlan(cli({ cmd: 'plan' }));
-    // Seed a HELD ancestor (main_patched blocked at h0) via merge_status PR_ID
-    // (D-057): the stored head sha is a side commit at chain height 0 that
-    // main_patched's tip does NOT contain, so the hold does not auto-complete
-    // and the block height re-derives to 0 live.
+    // Seed a HELD ancestor (main_patched blocked at h0) via the origin-blocked
+    // journal row `sweep start` derives (D-058): the row's headSha is a side
+    // commit at chain height 0 (like a fix/sweep ref head containing the
+    // conflict head), so the block height re-derives to 0 live.
     repo.checkout('held-marker', { create: true, at: 'main' });
     repo.commit('marker: not in main_patched', { 'src/marker.ts': 'm\n' });
     const markerSha = repo.sha('held-marker');
     repo.checkout('main');
-    writeFileSync(
-      join(ws, 'sweep-ledger.json'),
-      JSON.stringify({
-        schemaVersion: 1,
-        lastSweep: null,
-        branches: {
-          main_patched: {
-            status: 'active',
-            merge_status: { state: 'PR_ID', caseId: 'mp', headSha: markerSha, fixBranch: null, prNumber: null },
-            notes: '',
-          },
-        },
-        openPois: [],
-      }),
-    );
+    appendJournal(dir, {
+      action: 'origin-blocked',
+      branch: 'main_patched',
+      caseId: 'origin:fix/sweep/main_patched--main-h0-deadbeef',
+      fixBranch: 'fix/sweep/main_patched--main-h0-deadbeef',
+      headSha: markerSha,
+      prNumber: 12,
+    });
+    await cmdPlan(cli({ cmd: 'plan' }));
     expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
     const ann = readJournal(dir).find((e) => e.action === 'annotate' && e.branch === 'feat/c');
     expect(ann).toBeTruthy();
@@ -2134,17 +2101,14 @@ describe('propagate resolve — cold-read rejections: retry once, HELD (escalate
     // as an ACTIVE PR for owner review, not the raw conflict.
     expect(held!.resolution).toMatchObject({ markerClean: true });
     expect((held!.resolution as { tree: string }).tree).toBe(treeOfRef(repo, resolvedRef));
-    // merge_status PR_ID (D-057): the stored head sha re-derives the block
-    // height per pass and detects completion; no path set is stored (the DEFER
-    // rule is pure height-MIN).
-    const entry = readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']!;
-    expect(entry.merge_status?.state).toBe('PR_ID');
-    const ms = entry.merge_status!;
-    expect(ms.state === 'PR_ID' && ms.headSha).toBe(caseFile.head.sha);
+    // Blocked ⇔ the journaled held disposition (D-058): its head sha anchors
+    // the live height re-derivation; no path set is stored (the DEFER rule is
+    // pure height-MIN) and the ledger is never written.
+    expect(held!.headSha).toBe(caseFile.head.sha);
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.merge_status ?? null).toBeNull();
     // D-048/D-049: PR MATERIALS prepared (driver facts only — the agent writes
     // title/body itself and `publish` pushes the real head); no local
     // fix/sweep ref and no driver-generated prose/gh commands exist anymore.
-    expect(ms.state === 'PR_ID' ? ms.fixBranch : '').toMatch(/^fix\/sweep\//);
     expect(repo.git('for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep')).toBe('');
     const materials = readFileSync(join(dir, caseId, 'pr', 'materials.md'), 'utf8');
     expect(materials).toContain('src/x.ts');
@@ -2235,33 +2199,20 @@ describe('propagate run — B4: clean-prefix merge with a DEFERRED conflict abov
       { id: 'b', branch: 'feat/b', parents: ['main_patched'] },
       { id: 'c', branch: 'feat/c', parents: ['feat/a', 'feat/b'] },
     ]);
-    // Cross-pass block (D-057): feat/a carries merge_status PR_ID with headSha
-    // u1 — the block height is RE-DERIVED from it against this pass's chain
-    // (h1); feat/a's tip lacks u1 so the hold does not auto-complete. feat/c's
-    // h1 conflict (via feat/b) is at height 1 >= MIN(feat/a=1) -> DEFERRED
-    // behind the DIRECT parent feat/a.
-    writeFileSync(
-      join(ws, 'sweep-ledger.json'),
-      JSON.stringify({
-        schemaVersion: 1,
-        lastSweep: null,
-        branches: {
-          'feat/a': {
-            status: 'active',
-            merge_status: {
-              state: 'PR_ID',
-              caseId: 'feat__a--main_patched-h1',
-              headSha: u1,
-              fixBranch: null,
-              prNumber: null,
-            },
-            notes: '',
-          },
-        },
-        openPois: [],
-      }),
-    );
+    // Cross-pass block (D-058): feat/a carries an origin-blocked journal row
+    // whose headSha is u1 (as a fix/sweep ref head would contain it) — the
+    // block height is RE-DERIVED from it against this pass's chain (h1).
+    // feat/c's h1 conflict (via feat/b) is at height 1 >= MIN(feat/a=1) ->
+    // DEFERRED behind the DIRECT parent feat/a.
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    appendJournal(dir, {
+      action: 'origin-blocked',
+      branch: 'feat/a',
+      caseId: 'origin:fix/sweep/feat__a--main_patched-h1-deadbeef',
+      fixBranch: 'fix/sweep/feat__a--main_patched-h1-deadbeef',
+      headSha: u1,
+      prNumber: 12,
+    });
     const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, o);
     await cmdPlan(cli({ cmd: 'plan' }));
     expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
@@ -2670,13 +2621,14 @@ describe('propagate run — D-050: repo-wide rerere.enabled, idempotent journali
   });
 });
 
-// --- D-057: merge_status model — BECOME / STAY(sticky) / CLEAR end-to-end ----
-describe('merge_status model (D-057) — blocked ⇔ merge_status != NONE', () => {
-  it('BECOME defer → DEFERRED; sticky across a new pass; parent completion cascades → re-merge fresh (own PR)', async () => {
+// --- D-058: derived merge_status — BECOME re-runs / release cascade E2E ------
+describe('derived merge_status (D-058) — blocked view from origin rows + journal', () => {
+  it('defer behind an origin-blocked parent; re-derives (BECOME re-runs) next pass; a resolved block releases C to its own case', async () => {
     // Same shape as B4: C = A + B; A is PR_ID-blocked at h1 (u1), B advanced
     // through u1, so C's conflict (via B) at h1 defers behind A.
     const repo = initFixtureRepo();
     repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    const base = repo.sha('main'); // pinned fork point: heights stay comparable across passes
     repo.checkout('main_patched', { create: true, at: 'main' });
     repo.checkout('feat/a', { create: true, at: 'main_patched' });
     repo.checkout('feat/b', { create: true, at: 'main_patched' });
@@ -2700,47 +2652,40 @@ describe('merge_status model (D-057) — blocked ⇔ merge_status != NONE', () =
       { id: 'b', branch: 'feat/b', parents: ['main_patched'] },
       { id: 'c', branch: 'feat/c', parents: ['feat/a', 'feat/b'] },
     ]);
-    writeFileSync(
-      ledgerPath,
-      JSON.stringify({
-        schemaVersion: 1,
-        lastSweep: null,
-        branches: {
-          'feat/a': {
-            status: 'active',
-            merge_status: { state: 'PR_ID', caseId: 'a-case', headSha: u1, fixBranch: null, prNumber: null },
-            notes: '',
-          },
-        },
-        openPois: [],
-      }),
-    );
-    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, o);
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, { base, ...o });
+    const blockRow = {
+      action: 'origin-blocked',
+      branch: 'feat/a',
+      caseId: 'origin:fix/sweep/feat__a--main_patched-h1-deadbeef',
+      fixBranch: 'fix/sweep/feat__a--main_patched-h1-deadbeef',
+      headSha: u1, // ref head contains the conflict head -> height re-derives to 1
+      prNumber: 12,
+    };
 
-    // PASS 1: C hits its conflict at h1 >= MIN(A@h1) → BECOME DEFERRED; the
-    // ledger flips at once (blocked ⇔ merge_status != NONE, no intermediate).
+    // PASS 1: A blocked (origin row); C hits its conflict at h1 >= MIN(A@h1)
+    // -> DEFER (journal row = the state; the ledger is NEVER written, D-058).
+    const dir1 = passDir(ws, repo.sha('main').slice(0, 12));
+    appendJournal(dir1, blockRow);
     await cmdPlan(cli({ cmd: 'plan' }));
     expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
-    const dir1 = passDir(ws, repo.sha('main').slice(0, 12));
     expect(readJournal(dir1).some((e) => e.action === 'defer' && e.branch === 'feat/c')).toBe(true);
-    expect(readLedger(ledgerPath).branches['feat/c']?.merge_status).toEqual({ state: 'DEFERRED' });
-    expect(readLedger(ledgerPath).branches['feat/a']?.merge_status?.state).toBe('PR_ID'); // untouched
+    expect(readLedger(ledgerPath).branches['feat/c']?.merge_status ?? null).toBeNull();
+    expect(readLedger(ledgerPath).branches['feat/a']?.merge_status ?? null).toBeNull();
     // No case/PR for the deferred branch.
     expect(readJournal(dir1).some((e) => e.action === 'case' && e.branch === 'feat/c')).toBe(false);
     const cTipDeferred = repo.sha('feat/c');
 
-    // PASS 2 (new upstream head): C STAYS DEFERRED while A is blocked — no
-    // merges, no case, skip 'deferred' journaled; height plays no role in STAY.
+    // PASS 2 (new upstream head): nothing is stored — start re-derives A's
+    // block from the still-unmerged origin ref, and C's BECOME re-runs: the
+    // same conflict re-probes and re-defers. C takes nothing, emits no case.
     repo.commit('U2: more util', { 'src/util2.ts': 'u2\n' });
+    const dir2 = passDir(ws, repo.sha('main').slice(0, 12));
+    appendJournal(dir2, blockRow);
     await cmdPlan(cli({ cmd: 'plan' }));
     expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
-    const dir2 = passDir(ws, repo.sha('main').slice(0, 12));
-    expect(
-      readJournal(dir2).some((e) => e.action === 'skip' && e.branch === 'feat/c' && e.reason === 'deferred'),
-    ).toBe(true);
+    expect(readJournal(dir2).some((e) => e.action === 'defer' && e.branch === 'feat/c')).toBe(true);
     expect(readJournal(dir2).some((e) => e.action === 'case' && e.branch === 'feat/c')).toBe(false);
-    expect(repo.sha('feat/c')).toBe(cTipDeferred); // took NOTHING while sticky
-    expect(readLedger(ledgerPath).branches['feat/c']?.merge_status).toEqual({ state: 'DEFERRED' });
+    expect(repo.sha('feat/c')).toBe(cTipDeferred); // took NOTHING while deferred
 
     // OWNER completes A: its tip comes to contain u1 (the PR merge landed),
     // resolving x to owner-chosen content that CONFLICTS with C's cfork — so
@@ -2754,67 +2699,88 @@ describe('merge_status model (D-057) — blocked ⇔ merge_status != NONE', () =
     repo.git('reset', '--hard', aMerged);
     repo.checkout('main');
 
-    // PASS 3: reconcile completes A (PR_ID → NONE) AND cascades C's DEFERRED
-    // clear (all parents NONE); C re-merges FRESH and hits its own conflict vs
-    // the resolved content → its own case this time ("gets hit another PR").
-    await cmdPlan(cli({ cmd: 'plan' }));
+    // PASS 3: start would find the fix ref MERGED into origin/feat/a ->
+    // resolved + deleted -> NO origin-blocked row this pass. A derives
+    // unblocked; C re-merges FRESH and hits its own conflict vs the resolved
+    // content -> its own case this time ("gets hit another PR").
+    repo.commit('U3: even more util', { 'src/util3.ts': 'u3\n' });
     const dir3 = passDir(ws, repo.sha('main').slice(0, 12));
-    expect(readLedger(ledgerPath).branches['feat/a']?.merge_status ?? null).toBeNull();
-    expect(readLedger(ledgerPath).branches['feat/c']?.merge_status ?? null).toBeNull();
-    expect(
-      readJournal(dir3).some((e) => e.action === 'unfrozen' && e.branch === 'feat/a' && e.reason === 'derived'),
-    ).toBe(true);
-    expect(
-      readJournal(dir3).some((e) => e.action === 'undeferred' && e.branch === 'feat/c' && e.reason === 'parents-clear'),
-    ).toBe(true);
+    await cmdPlan(cli({ cmd: 'plan' }));
     expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
     const cCase = readJournal(dir3).find((e) => e.action === 'case' && e.branch === 'feat/c');
-    expect(cCase).toBeTruthy(); // fresh re-merge → own conflict → own PR path
-    // BECOME flips the freshly-conflicted branch... a case alone does not block;
-    // only held/defer do. C is mid-case (open) — merge_status stays NONE until a
-    // disposition; the OPEN CASE gates the pass instead.
+    expect(cCase).toBeTruthy(); // fresh re-merge -> own conflict -> own PR path
+    expect(readJournal(dir3).some((e) => e.action === 'skip' && e.branch === 'feat/a' && e.reason === 'held')).toBe(
+      false,
+    ); // A is unblocked
+    // A case alone does not block; only held/defer do. C is mid-case (open) —
+    // the OPEN CASE gates the pass; the ledger stays untouched throughout.
     expect(readLedger(ledgerPath).branches['feat/c']?.merge_status ?? null).toBeNull();
   });
 
 });
 
-// --- settleAfterResolve: D-057 STAY rule over ALL direct parents -------------
-describe('settleAfterResolve — DEFERRED stays while ANY direct parent is blocked (D-057 STAY)', () => {
-  it('does not clear DEFERRED when the journaled deferredTo parent cleared but a sibling parent is still blocked', async () => {
-    const { repo } = conflictFixture(); // repo content is irrelevant here
-    const ws = mkWorkspace();
-    const inv = writeInventory([
+// --- D-057 STAY rule over ALL direct parents (D-058 fixpoint view) -----------
+describe('derived DEFERRED — stays while ANY direct parent is blocked (D-057 STAY as a journal fixpoint)', () => {
+  /** feat/a + feat/b -> feat/x, all cut from main_patched with no divergence. */
+  function dagFixture(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.checkout('feat/a', { create: true, at: 'main_patched' });
+    repo.checkout('feat/b', { create: true, at: 'main_patched' });
+    repo.checkout('feat/x', { create: true, at: 'main_patched' });
+    repo.checkout('main');
+    repo.commit('U0: util', { 'src/util.ts': 'u\n' }); // pass progress
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+  const inventory = (): string =>
+    writeInventory([
       { id: 'a', branch: 'feat/a', parents: ['main_patched'] },
       { id: 'b', branch: 'feat/b', parents: ['main_patched'] },
       { id: 'x', branch: 'feat/x', parents: ['feat/a', 'feat/b'] },
     ]);
-    const cli = baseCli(repo, ws, inv);
-    const ledgerPath = join(ws, 'sweep-ledger.json');
-    // feat/a (the parent X deferred to, at h1) has since CLEARED (NONE);
-    // feat/b (h5) is STILL blocked; X is DEFERRED and its own low conflict
-    // just resolved.
-    const ledger = readLedger(ledgerPath);
-    ledger.branches['feat/b'] = {
-      ...defaultLedgerBranch(),
-      merge_status: { state: 'PR_ID', caseId: 'b-case', headSha: null, fixBranch: null, prNumber: null },
-    };
-    ledger.branches['feat/x'] = { ...defaultLedgerBranch(), merge_status: { state: 'DEFERRED' } };
-    writeLedger(ledgerPath, ledger);
-    const dir = passDir(ws, 'deadbeef0000');
+
+  it('a journaled defer keeps X DEFERRED while a SIBLING parent (not the recorded deferredTo) is still blocked', async () => {
+    const repo = dagFixture();
+    const ws = mkWorkspace();
+    const inv = inventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    // X deferred earlier this pass behind feat/a; feat/a has NO blocked row
+    // (cleared), but the SIBLING parent feat/b is origin-blocked — the fixpoint
+    // view keeps X DEFERRED off ALL direct parents, not the recorded pointer.
+    appendJournal(dir, {
+      action: 'origin-blocked',
+      branch: 'feat/b',
+      caseId: 'origin:fix/sweep/feat__b--main_patched-h5-deadbeef',
+      fixBranch: 'fix/sweep/feat__b--main_patched-h5-deadbeef',
+      headSha: null,
+      prNumber: 12,
+    });
     appendJournal(dir, { action: 'defer', branch: 'feat/x', parent: 'feat/a', deferredTo: 'feat/a' });
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    const xTip = repo.sha('feat/x');
+    expect(await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }))).toBe(0);
+    expect(
+      readJournal(dir).some((e) => e.action === 'skip' && e.branch === 'feat/x' && e.reason === 'deferred'),
+    ).toBe(true);
+    expect(readJournal(dir).some((e) => e.action === 'merge' && e.branch === 'feat/x')).toBe(false);
+    expect(repo.sha('feat/x')).toBe(xTip); // took nothing while sticky
+  });
 
-    // The STAY rule is a function of ALL direct parents (same check as
-    // reconcileMergeStatus), NOT of the journaled defer set — feat/b keeps X
-    // DEFERRED even though feat/a (the recorded deferredTo) is NONE.
-    settleAfterResolve(cli, dir, 'feat/x');
-    expect(readLedger(ledgerPath).branches['feat/x']?.merge_status?.state).toBe('DEFERRED');
-
-    // Once ALL parents are NONE the settle clears X.
-    const l2 = readLedger(ledgerPath);
-    l2.branches['feat/b'].merge_status = null;
-    writeLedger(ledgerPath, l2);
-    settleAfterResolve(cli, dir, 'feat/x');
-    expect(readLedger(ledgerPath).branches['feat/x']?.merge_status ?? null).toBeNull();
+  it('with NO blocked parent the stale defer row clears in the fixpoint and X processes normally', async () => {
+    const repo = dagFixture();
+    const ws = mkWorkspace();
+    const inv = inventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    appendJournal(dir, { action: 'defer', branch: 'feat/x', parent: 'feat/a', deferredTo: 'feat/a' });
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    expect(await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }))).toBe(0);
+    // No sticky suppression: X is processed (merges its parents' fresh tips).
+    expect(
+      readJournal(dir).some((e) => e.action === 'skip' && e.branch === 'feat/x' && e.reason === 'deferred'),
+    ).toBe(false);
+    expect(readJournal(dir).some((e) => e.action === 'merge' && e.branch === 'feat/x')).toBe(true);
   });
 });
 
@@ -2839,14 +2805,18 @@ describe('propagate run — un-skip never force-merges into/through a blocked br
       { id: 'l', branch: 'feat/l', parents: ['feat/d'] },
     ]);
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
-    const ledgerPath = join(ws, 'sweep-ledger.json');
-    const ledger = readLedger(ledgerPath);
-    ledger.branches['main_patched'] = {
-      ...defaultLedgerBranch(),
-      merge_status: { state: 'PR_ID', caseId: 'gate', headSha: null, fixBranch: null, prNumber: null },
-    };
-    ledger.branches['feat/d'] = { ...defaultLedgerBranch(), merge_status: { state: 'DEFERRED' } };
-    writeLedger(ledgerPath, ledger);
+    // D-058 journal-derived blocks: main_patched PR_ID (origin row, gate-like —
+    // no head/PR), feat/d DEFERRED (a journaled defer behind the blocked parent;
+    // the fixpoint view keeps it sticky while main_patched is blocked).
+    appendJournal(dir, {
+      action: 'origin-blocked',
+      branch: 'main_patched',
+      caseId: 'origin:fix/sweep/main_patched--main-h0-deadbeef',
+      fixBranch: 'fix/sweep/main_patched--main-h0-deadbeef',
+      headSha: null,
+      prNumber: 12,
+    });
+    appendJournal(dir, { action: 'defer', branch: 'feat/d', parent: 'main_patched', deferredTo: 'main_patched' });
 
     await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
     const dTip = repo.sha('feat/d');
@@ -2869,35 +2839,32 @@ describe('propagate run — un-skip never force-merges into/through a blocked br
   });
 });
 
-// --- freezeHeld crash ordering (D-057 invariant) -----------------------------
-describe('propagate freezeHeld — ledger PR_ID lands BEFORE the journal held entry', () => {
-  it('a failed ledger write leaves NO held disposition (never "held with merge_status NONE"); the re-run completes the freeze', async () => {
+// --- freeze publishes NOTHING (D-058 invariant) ------------------------------
+describe('propagate freeze — a hold publishes nothing and leaves no state outside the pass dir (D-058)', () => {
+  it('resolve --tier held: journal held row only — no origin ref, no PR journal, ledger byte-identical', async () => {
     const { repo } = conflictFixture();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
     const ws = mkWorkspace();
     const inv = emptyInventory();
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
     await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
     await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
     const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
-
-    // Make the ledger unwritable: the freeze's merge_status write throws at
-    // exactly the point a crash between the two writes would hit.
     const ledgerPath = join(ws, 'sweep-ledger.json');
-    writeLedger(ledgerPath, readLedger(ledgerPath));
-    chmodSync(ledgerPath, 0o444);
-    cleanups.push(() => chmodSync(ledgerPath, 0o644));
-    await expect(
-      cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'held' })),
-    ).rejects.toThrow();
-    // Invariant direction that matters: NO journaled held disposition without
-    // merge_status PR_ID (blocked(X) ⇔ merge_status != NONE, D-057).
-    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
-    expect(readLedger(ledgerPath).branches['main_patched']?.merge_status ?? null).toBeNull();
+    const ledgerBefore = existsSync(ledgerPath) ? readFileSync(ledgerPath, 'utf8') : null;
 
-    // The half-written freeze is recoverable: restore the ledger and re-run.
-    chmodSync(ledgerPath, 0o644);
     expect(await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'held' }))).toBe(0);
-    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
-    expect(readLedger(ledgerPath).branches['main_patched']?.merge_status?.state).toBe('PR_ID');
+
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
+    // NOTHING published at freeze time (all PRs are created at finish, D-058):
+    // no pr-published row, no pushed pr-head, no fix/sweep ref on origin.
+    expect(journal.some((e) => e.action === 'pr-published')).toBe(false);
+    expect(journal.some((e) => e.action === 'push' && e.kind === 'pr-head')).toBe(false);
+    expect(repo.git('-C', bare, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep')).toBe('');
+    // No durable local state either: the ledger is byte-identical.
+    const ledgerAfter = existsSync(ledgerPath) ? readFileSync(ledgerPath, 'utf8') : null;
+    expect(ledgerAfter).toBe(ledgerBefore);
   });
 });

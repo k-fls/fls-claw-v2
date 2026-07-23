@@ -27,7 +27,8 @@
  *                                 urge comments + D-004 machine-block refresh           (MUTATES)
  *   verify                        §9 gate: everything-rebuild + CI commands, leave-one-out
  *                                 attribution; red -> rollback offender + HELD(gate)   (MUTATES)
- *   unfreeze --branch <b>         manually clear a branch's merge_status (journaled)   (MUTATES)
+ *   unfreeze --branch <b>         manually clear a branch's block for THIS pass (journaled;
+ *                                 origin re-derives at the next start, D-058)          (MUTATES)
  *   status                        human-readable pass state from journal + ledger
  *
  * Flags:
@@ -44,10 +45,11 @@
  *   --case <id>              resolve/publish: the case id
  *   --tier <mechanical|judged|held>  resolve: the agent's claimed tier (held = direct freeze)
  *   --resolved-ref <ref>     resolve: commit carrying the agent's resolution (tree source)
- *   --token-file <path>      publish/push (every networked subcommand, D-049): file holding
- *                            the substitute GitHub token (the agent writes the get_credential
- *                            output there once per session; the credential proxy swaps the
- *                            Authorization header on the wire)
+ *   --token-file <path>      every networked subcommand (publish/push, and sweep start's
+ *                            origin PR checks — D-049/D-058): file holding the substitute
+ *                            GitHub token (the agent writes the get_credential output there
+ *                            once per session; the credential proxy swaps the Authorization
+ *                            header on the wire)
  *   --branch <name>          unfreeze: the branch to clear
  *   --recipe <a,b,c>         verify: everything-rebuild recipe (default: scope.yaml recipe)
  *   --commands-file <file>   verify: CI command list JSON [{cmd,cwd?}] (test injection)
@@ -58,10 +60,15 @@
  *   case-<id>/case.json (+ coldread-request.md, pr/materials.md), journal.jsonl
  *   (append-only). case.json is a POINTER only — resolve re-derives everything from
  *   git+registry (§7 trust boundary). The driver NEVER generates PR prose (D-048): the
- *   agent writes pr/title.txt + pr/body.md from studying the case. `publish` and `push`
- *   are the only subcommands that touch the network (git push + GitHub REST, --execute
- *   only — §14/§14.4, D-049); refs move via git push ONLY, and any push failure is a
- *   hard halt reported to the owner (D-046 case 2), never worked around.
+ *   agent writes pr/title.txt + pr/body.md from studying the case. `publish`, `push`
+ *   and `sweep start` are the only subcommands that touch the network (git push/fetch +
+ *   GitHub REST — §14/§14.4, D-049/D-058); refs move via git push ONLY, and any push
+ *   failure is a hard halt reported to the owner (D-046 case 2), never worked around.
+ *
+ *   D-058: NOTHING is published before `finish` — report-pr records intent only, and
+ *   finish's single post-verify publish phase creates every PR (judged + held). The
+ *   blocked (merge_status) picture is derived from ORIGIN at `sweep start`, never from
+ *   local state: the ledger's merge_status field is dead to this driver.
  */
 import { spawnSync } from 'node:child_process';
 import {
@@ -150,7 +157,6 @@ import type {
   FeatureEntry,
   Head,
   HeldRecord,
-  MergeStatus,
   PropagationPlan,
   ScopeGuardMode,
   Tier,
@@ -421,140 +427,138 @@ function ledgerPathOf(cli: Cli): string {
 }
 
 /**
- * merge_status accessors (D-057). The ledger's per-branch `merge_status` is
- * the ONE blocked marker: blocked(X) ⇔ merge_status(X) != NONE, always. It is
- * a reconciled function of (own live PR state) + (parents' merge_status) —
- * never an independently-mutated freeze bool — so every read goes through
- * these and every write goes through `setMergeStatus` (the single writer).
+ * Blocked state (D-058): merge_status is NO LONGER stored anywhere local — it
+ * is DERIVED. Cross-pass authority is ORIGIN: `sweep start` reconstructs the
+ * PR_ID set from the origin `fix/sweep/*` refs (an unmerged ref WITH an open
+ * PR ⇔ blocked) and journals one `origin-blocked` row per blocked branch into
+ * the fresh pass dir. Within a pass the journal is the working view:
+ * `origin-blocked` rows + this-pass `held` dispositions are PR_ID; `defer`
+ * rows are DEFERRED while a direct parent is still blocked; a manual
+ * `unfrozen` row clears a branch for the rest of the pass. The ledger's
+ * `merge_status` field survives only as a non-authoritative legacy cache for
+ * the old sweep merge stage — the propagation driver never reads or writes it.
  */
-function mergeStatuses(cli: Cli): Map<string, MergeStatus> {
-  const ledger = readLedger(ledgerPathOf(cli));
-  const out = new Map<string, MergeStatus>();
-  for (const [name, b] of Object.entries(ledger.branches)) {
-    if (b.merge_status) out.set(name, b.merge_status);
-  }
-  return out;
-}
-
-function getMergeStatus(cli: Cli, branch: string): MergeStatus | null {
-  return readLedger(ledgerPathOf(cli)).branches[branch]?.merge_status ?? null;
-}
-
-/** THE single merge_status writer (D-057): null = NONE (unblocked). */
-function setMergeStatus(cli: Cli, branch: string, status: MergeStatus | null): void {
-  const path = ledgerPathOf(cli);
-  const ledger = readLedger(path);
-  ledger.branches[branch] = { ...defaultLedgerBranch(), ...ledger.branches[branch], merge_status: status };
-  writeLedger(path, ledger);
-}
-
-/** PR_ID-blocked branches (own open PR / §9 gate hold): empty intervals + run skips. */
-function prBlockedBranches(cli: Cli): Set<string> {
-  return new Set([...mergeStatuses(cli).entries()].filter(([, s]) => s.state === 'PR_ID').map(([b]) => b));
-}
-
-/** merge_status view for plan derivation (branch → state; absence = NONE). */
-function mergeStatusView(cli: Cli): Map<string, 'PR_ID' | 'DEFERRED'> {
-  return new Map([...mergeStatuses(cli).entries()].map(([b, s]) => [b, s.state]));
+interface BlockedRow {
+  branch: string;
+  /** Blocking case id ('origin:<ref>' for start-derived rows, 'gate*' for §9 holds). */
+  caseId: string;
+  /**
+   * Height-bearing sha: for an origin row the fix/sweep REF HEAD (it contains
+   * the conflict head as a parent, so deriveCoverage lands on the conflict
+   * height); for a this-pass hold the case's conflict head. Null for gate holds.
+   */
+  headSha: string | null;
+  /** fix/sweep head branch on origin (urge target); null until a PR exists. */
+  fixBranch: string | null;
+  prNumber: number | null;
 }
 
 /**
- * LIVE block-height records for the PR_ID branches (D-057): merge_status
- * stores NO height — heights are pass-relative (the chain's fork point moves
- * as branches absorb upstream), so each PR_ID branch's block height is
- * RE-DERIVED from its stored `headSha` against THIS pass's pinned chain.
- * Entries without a head (gate holds from §9) or whose head fell below the
- * chain cannot be height-matched and degrade to an ordinary case for
- * descendants — the safe direction (extra review, never less). DEFERRED
- * branches are not here: their heights are re-probed live during derivation
- * (plan.ts sticky rows).
+ * PR_ID rows derived from the pass journal, last-writer-wins per branch:
+ * `origin-blocked` (start) and `held` (this pass) set a row, a later manual
+ * `unfrozen` clears it, and a `pr-published` (mode held) enriches the row with
+ * its fix branch + PR number.
  */
-async function prBlockedRecords(cli: Cli, chain: Chain): Promise<HeldRecord[]> {
-  const out: HeldRecord[] = [];
-  for (const [branch, st] of mergeStatuses(cli)) {
-    if (st.state !== 'PR_ID' || !st.headSha) continue;
-    if (!(await refExists(cli.repo, st.headSha))) continue;
-    const height = (await deriveCoverage(cli.repo, chain, st.headSha)).height;
-    if (height < 0) continue; // below this pass's chain — degrades to an ordinary case
-    out.push({ branch, height, conflictedPaths: [], caseId: st.caseId });
-  }
-  return out;
-}
-
-/**
- * merge_status reconciliation (D-057) — the pass-start sweep over the ledger:
- *
- *  1. PR_ID COMPLETION: a PR_ID branch whose CURRENT tip contains its stored
- *     `headSha` is COMPLETELY resolved — the owner resolved the PR AND the
- *     merge landed on the branch — so merge_status finally flips to NONE
- *     (journaled `unfrozen`/`derived`). PR_ID is never cleared at any earlier
- *     step; the open PR is the guaranteed eventual trigger.
- *  2. DEFERRED CASCADE: a DEFERRED branch stays sticky while ANY direct parent
- *     has merge_status != NONE (recomputed here, never trusted stored); once
- *     ALL parents are NONE it clears (journaled `undeferred`) and this pass
- *     re-merges it fresh. Fixpoint iteration = the topological cascade, so a
- *     parent completed in step 1 releases its whole deferred chain at once.
- *
- * Every cleared branch (and its transitive inventory descendants) is REOPENED
- * in the pass journal so a same-watermark `run` re-processes it — without this
- * a branch that already `arrived` would stay skipped and the fresh re-merge
- * would wait for the next watermark.
- *
- * `commit=false` reports without writing (dry-run purity, N4).
- */
-async function reconcileMergeStatus(
-  cli: Cli,
-  dir: string,
-  commit: boolean,
-): Promise<{ completed: string[]; undeferred: string[] }> {
-  const statuses = mergeStatuses(cli);
-  const completed: string[] = [];
-  for (const [branch, st] of statuses) {
-    if (st.state !== 'PR_ID' || !st.headSha) continue;
-    if (!(await refExists(cli.repo, branch))) continue;
-    const tip = await revParse(cli.repo, branch);
-    if (await isAncestor(cli.repo, st.headSha, tip)) {
-      completed.push(branch);
-      statuses.delete(branch);
-      if (commit) {
-        setMergeStatus(cli, branch, null);
-        appendJournal(dir, { action: 'unfrozen', branch, reason: 'derived', headSha: st.headSha });
+function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow> {
+  const cases = journaledCases(journal);
+  const out = new Map<string, BlockedRow>();
+  for (const e of journal) {
+    if (typeof e.branch !== 'string') continue;
+    if (e.action === 'origin-blocked') {
+      out.set(e.branch, {
+        branch: e.branch,
+        caseId: typeof e.caseId === 'string' ? e.caseId : 'origin',
+        headSha: typeof e.headSha === 'string' ? e.headSha : null,
+        fixBranch: typeof e.fixBranch === 'string' ? e.fixBranch : null,
+        prNumber: typeof e.prNumber === 'number' ? e.prNumber : null,
+      });
+    } else if (e.action === 'held') {
+      const jc = typeof e.caseId === 'string' ? cases.get(e.caseId) : undefined;
+      out.set(e.branch, {
+        branch: e.branch,
+        caseId: typeof e.caseId === 'string' ? e.caseId : 'held',
+        headSha: jc?.head.sha ?? null,
+        fixBranch: null, // no PR until `finish` publishes (D-058)
+        prNumber: null,
+      });
+    } else if (e.action === 'pr-published' && e.mode === 'held') {
+      const row = out.get(e.branch);
+      if (row && row.caseId === e.caseId) {
+        row.fixBranch = typeof e.fixBranch === 'string' ? e.fixBranch : row.fixBranch;
+        row.prNumber = typeof e.number === 'number' ? e.number : row.prNumber;
       }
+    } else if (e.action === 'unfrozen') {
+      out.delete(e.branch);
     }
   }
-  // Direct-parent edges from the registry (features + scope extra_edges) — the
-  // DEFERRED stay-condition is a function of the parents, never a stored flag.
+  return out;
+}
+
+/**
+ * The pass's merge_status view (branch → PR_ID | DEFERRED; absence = NONE),
+ * derived from the journal alone (D-058):
+ *  - PR_ID: `blockedRows` (origin-derived rows + this-pass holds).
+ *  - DEFERRED: branches with a journaled `defer` this pass, kept only while a
+ *    DIRECT parent (registry edges) is still blocked — the D-057 STAY rule as
+ *    a fixpoint over the journal instead of a stored flag, so a cleared
+ *    parent releases its whole deferred chain on the next derivation. Across
+ *    passes nothing is stored: DEFERRED is simply recomputed from the
+ *    parents' PR_ID during derivation (the BECOME height-MIN rule re-runs).
+ */
+function passStatusView(cli: Cli, journal: JournalEntry[]): Map<string, 'PR_ID' | 'DEFERRED'> {
+  const pr = blockedRows(journal);
   const parentsOf = directParentEdges(cli);
-  const undeferred: string[] = [];
+  const deferred = new Set(
+    journal
+      .filter((e) => e.action === 'defer' && typeof e.branch === 'string')
+      .map((e) => e.branch as string)
+      .filter((b) => !pr.has(b)),
+  );
   let changed = true;
   while (changed) {
     changed = false;
-    for (const [branch, st] of statuses) {
-      if (st.state !== 'DEFERRED') continue;
-      const parents = parentsOf.get(branch) ?? [];
-      if (parents.some((p) => statuses.has(p))) continue; // sticky: a parent is still blocked
-      statuses.delete(branch);
-      undeferred.push(branch);
-      changed = true;
-      if (commit) {
-        setMergeStatus(cli, branch, null);
-        appendJournal(dir, { action: 'undeferred', branch, reason: 'parents-clear' });
+    for (const b of [...deferred]) {
+      const parents = parentsOf.get(b) ?? [];
+      if (!parents.some((p) => pr.has(p) || deferred.has(p))) {
+        deferred.delete(b);
+        changed = true;
       }
     }
   }
-  // Reopen every cleared branch + its transitive descendants so a same-pass
-  // `run` re-processes them (the completed parent's tip changed under them).
-  const cleared = [...completed, ...undeferred];
-  if (commit && cleared.length > 0) {
-    const edges: Record<string, string[]> = Object.fromEntries(parentsOf);
-    const targets = new Set<string>();
-    for (const b of cleared) {
-      targets.add(b);
-      for (const d of transitiveDescendants(edges, b)) targets.add(d);
-    }
-    reopen(dir, [...targets]);
+  const out = new Map<string, 'PR_ID' | 'DEFERRED'>();
+  for (const b of pr.keys()) out.set(b, 'PR_ID');
+  for (const b of deferred) out.set(b, 'DEFERRED');
+  return out;
+}
+
+/** PR_ID-blocked branches (own open PR / §9 gate hold): empty intervals + run skips. */
+function prBlockedBranches(journal: JournalEntry[]): Set<string> {
+  return new Set(blockedRows(journal).keys());
+}
+
+/**
+ * LIVE block-height records for the PR_ID branches (D-057 heights, D-058
+ * source): no height is stored anywhere — heights are pass-relative (the
+ * chain's fork point moves as branches absorb upstream), so each blocked
+ * branch's height is RE-DERIVED against THIS pass's pinned chain from the
+ * row's sha: an origin row's fix/sweep ref head CONTAINS the conflict head
+ * (it is a parent of the driver-built PR-head commit) and nothing above it,
+ * so its coverage IS the conflict height; a this-pass hold carries the
+ * conflict head itself. Rows without a sha (gate holds) or whose sha fell
+ * below the chain cannot be height-matched and degrade to an ordinary case
+ * for descendants — the safe direction (extra review, never less). DEFERRED
+ * branches are not here: their heights are re-probed live during derivation.
+ */
+async function prBlockedRecords(cli: Cli, journal: JournalEntry[], chain: Chain): Promise<HeldRecord[]> {
+  const out: HeldRecord[] = [];
+  for (const row of blockedRows(journal).values()) {
+    if (!row.headSha) continue;
+    if (!(await refExists(cli.repo, row.headSha))) continue;
+    const height = (await deriveCoverage(cli.repo, chain, row.headSha)).height;
+    if (height < 0) continue; // below this pass's chain — degrades to an ordinary case
+    out.push({ branch: row.branch, height, conflictedPaths: [], caseId: row.caseId });
   }
-  return { completed, undeferred };
+  return out;
 }
 
 /**
@@ -570,24 +574,6 @@ function directParentEdges(cli: Cli): Map<string, string[]> {
     parentsOf.set(child, [...(parentsOf.get(child) ?? []), ...ps]);
   }
   return parentsOf;
-}
-
-/**
- * After a resolve LANDS on a branch: its PR_ID clears — the merge is complete
- * — unless the branch ALSO deferred this pass, in which case the D-057 STAY
- * rule applies: DEFERRED is sticky while ANY direct parent has merge_status !=
- * NONE (the SAME direct-parent check `reconcileMergeStatus` runs — NOT the
- * journaled `deferredTo` set, which only names the single lowest blocked
- * parent at defer time and would wrongly clear when that one parent completes
- * while a sibling parent is still blocked). Either way blocked(X) ⇔
- * merge_status != NONE holds at every step (D-057).
- */
-function settleAfterResolve(cli: Cli, dir: string, branch: string): void {
-  const journal = readJournal(dir);
-  const deferredThisPass = journal.some((e) => e.action === 'defer' && e.branch === branch);
-  const parents = directParentEdges(cli).get(branch) ?? [];
-  const stillBlocked = deferredThisPass && parents.some((p) => getMergeStatus(cli, p) !== null);
-  setMergeStatus(cli, branch, stillBlocked ? { state: 'DEFERRED' } : null);
 }
 
 /** A pending urge for a still-PR_ID-blocked branch (§8; posted by `push`, D-049). */
@@ -609,28 +595,32 @@ interface PendingUrge {
  * `plan`/`run` only report these; POSTING (PR comment + D-004 machine-block
  * refresh + `lastUrgedHead` advance) lives exclusively in the networked
  * `push` stage (D-049 — the driver posts, never prepares gh commands).
+ * Blocked rows come from the journal (D-058: origin-derived at start);
+ * `lastUrgedHead` stays a non-authoritative ledger cache — losing it merely
+ * re-urges once.
  */
-async function detectUrges(cli: Cli, ctx: PassCtx): Promise<PendingUrge[]> {
+async function detectUrges(cli: Cli, ctx: PassCtx, journal: JournalEntry[]): Promise<PendingUrge[]> {
   const ledger = readLedger(ledgerPathOf(cli));
   const due: PendingUrge[] = [];
-  for (const [branch, b] of Object.entries(ledger.branches)) {
-    const st = b.merge_status;
-    if (st?.state !== 'PR_ID') continue; // DEFERRED branches have no PR of their own to nudge
-    if (!st.fixBranch) continue; // gate holds have no owner-facing freeze PR to nudge
-    if (!(await refExists(cli.repo, branch))) continue;
-    const tip = await revParse(cli.repo, branch);
+  for (const row of blockedRows(journal).values()) {
+    // Rows without a fix branch have no owner-facing PR to nudge: gate holds,
+    // and this-pass holds whose PR is only created at `finish` (D-058) — those
+    // become origin-derived rows (with a PR) by the next pass.
+    if (!row.fixBranch) continue;
+    if (!(await refExists(cli.repo, row.branch))) continue;
+    const tip = await revParse(cli.repo, row.branch);
     const coverage = (await deriveCoverage(cli.repo, ctx.chain, tip)).height;
     const pending = ctx.chain.heads.filter((h) => h.height > coverage);
     if (pending.length === 0) continue;
     const newest = pending[pending.length - 1];
-    if (newest.sha === b.lastUrgedHead) continue; // already urged about this head
+    if (newest.sha === ledger.branches[row.branch]?.lastUrgedHead) continue; // already urged about this head
     due.push({
-      branch,
+      branch: row.branch,
       head: newest.sha,
       pending,
-      fixBranch: st.fixBranch,
-      prNumber: st.prNumber ?? null,
-      caseId: st.caseId,
+      fixBranch: row.fixBranch,
+      prNumber: row.prNumber,
+      caseId: row.caseId,
     });
   }
   return due;
@@ -1367,17 +1357,16 @@ export async function cmdPlan(cli: Cli): Promise<number> {
   // a pass with journal activity legitimately derives differently now (§8).
   const ctx = await openPass(cli);
   const dir = ctx.dir;
-  // merge_status reconciliation first (D-057): externally-completed PR_ID holds
-  // flip to NONE, then the DEFERRED cascade clears branches whose parents all
-  // cleared — this pass re-merges those fresh.
-  await reconcileMergeStatus(cli, dir, true);
+  // Blocked state is journal-derived (D-058): `sweep start` reconstructs the
+  // PR_ID set from origin and journals `origin-blocked` rows BEFORE plan runs;
+  // there is no local reconcile step anymore — origin is the authority.
+  const journal = readJournal(dir);
   // Urges are only DETECTED here; posting is `push`'s job (D-049, §14.4).
-  const dueUrges = await detectUrges(cli, ctx);
+  const dueUrges = await detectUrges(cli, ctx, journal);
   if (dueUrges.length) {
     console.error(`urges due (post via \`propagate push --execute\`): ${dueUrges.map((u) => u.branch).join(', ')}`);
   }
-  const journal = readJournal(dir);
-  const plan = await derive(cli, await prBlockedRecords(cli, ctx.chain), ctx, mergeStatusView(cli));
+  const plan = await derive(cli, await prBlockedRecords(cli, journal, ctx.chain), ctx, passStatusView(cli, journal));
 
   const initialPath = join(dir, 'plan-initial.json');
   if (!existsSync(initialPath)) {
@@ -1451,15 +1440,14 @@ export async function cmdRun(cli: Cli): Promise<number> {
   const { chain, dir } = ctx;
 
   // DRY-RUN PURITY (N4): without --execute, NO state changes of ANY kind — no
-  // unfreezes, no urge artifacts, no ledger/journal writes, no merges. Report
-  // what WOULD happen (detect-only) and return.
+  // urge artifacts, no ledger/journal writes, no merges. Report what WOULD
+  // happen (detect-only) and return.
   if (!cli.execute) {
-    const plan0 = await derive(cli, await prBlockedRecords(cli, ctx.chain), ctx, mergeStatusView(cli));
-    const reconcile = await reconcileMergeStatus(cli, dir, false);
-    const wouldUnfreeze = [...reconcile.completed, ...reconcile.undeferred];
-    const wouldUrge = (await detectUrges(cli, ctx)).map((u) => ({ branch: u.branch, head: u.head }));
-    console.error('DRY-RUN (no --execute): no state changes; reporting the plan + would-unfreeze/would-urge');
-    emit(cli, { dryRun: true, plan: plan0, wouldUnfreeze, wouldUrge });
+    const journal0 = readJournal(dir);
+    const plan0 = await derive(cli, await prBlockedRecords(cli, journal0, ctx.chain), ctx, passStatusView(cli, journal0));
+    const wouldUrge = (await detectUrges(cli, ctx, journal0)).map((u) => ({ branch: u.branch, head: u.head }));
+    console.error('DRY-RUN (no --execute): no state changes; reporting the plan + would-urge');
+    emit(cli, { dryRun: true, plan: plan0, wouldUrge });
     return 0;
   }
 
@@ -1472,12 +1460,11 @@ export async function cmdRun(cli: Cli): Promise<number> {
     await git(cli.repo, ['config', 'rerere.enabled', 'true']);
     appendJournal(dir, { action: 'rerere-enabled', repo: cli.repo });
   }
-  // merge_status reconciliation first (D-057): completed PR_ID holds → NONE,
-  // then the DEFERRED cascade; urges are only DETECTED (posting is `push`'s
-  // job — D-049, §14.4); re-derive with the updated statuses.
-  await reconcileMergeStatus(cli, dir, true);
+  // Blocked state is journal-derived (D-058): the origin-derived PR_ID rows
+  // were journaled by `sweep start`; there is no local reconcile step. Urges
+  // are only DETECTED (posting is `push`'s job — D-049, §14.4).
   {
-    const due = await detectUrges(cli, ctx);
+    const due = await detectUrges(cli, ctx, readJournal(dir));
     if (due.length) {
       console.error(`urges due (post via \`propagate push --execute\`): ${due.map((u) => u.branch).join(', ')}`);
     }
@@ -1487,9 +1474,9 @@ export async function cmdRun(cli: Cli): Promise<number> {
   // re-derives the branch instead of leaving it open forever.
   await crashHeal(cli, dir, readJournal(dir));
   const journal = readJournal(dir);
-  const statusView = mergeStatusView(cli);
+  const statusView = passStatusView(cli, journal);
   const blockedSet = new Set(statusView.keys()); // merge_status != NONE (PR_ID ∪ DEFERRED)
-  const held = await prBlockedRecords(cli, ctx.chain); // PR_ID block heights, live-derived (§5/N3 → D-057)
+  const held = await prBlockedRecords(cli, journal, ctx.chain); // PR_ID block heights, live-derived (§5/N3 → D-058)
   const plan = await derive(cli, held, ctx, statusView);
   const passHasProgress = plan.chainLength > 0;
   const scope = new Set(plan.branches.map((b) => b.branch));
@@ -1521,12 +1508,12 @@ export async function cmdRun(cli: Cli): Promise<number> {
   const planPath = join(dir, 'plan.json');
   if (existsSync(planPath)) {
     const prev = JSON.parse(readFileSync(planPath, 'utf8')) as PropagationPlan;
-    // merge_status transitions are sanctioned derivation changes (D-057): a
-    // branch whose PR completed / DEFERRED cleared this pass legitimately
-    // derives differently from the last written plan.
+    // merge_status transitions are sanctioned derivation changes (D-058): a
+    // branch manually unfrozen this pass legitimately derives differently
+    // from the last written plan.
     const statusCleared = new Set(
       journal
-        .filter((e) => (e.action === 'unfrozen' || e.action === 'undeferred') && typeof e.branch === 'string')
+        .filter((e) => e.action === 'unfrozen' && typeof e.branch === 'string')
         .map((e) => e.branch as string),
     );
     const exclude = new Set([...arrived, ...reopened, ...blockedSet, ...statusCleared, ...syncedBranches, ...driverTouched]);
@@ -1610,15 +1597,16 @@ export async function cmdRun(cli: Cli): Promise<number> {
         throw e;
       }
 
-      // Live merge_status dispatch (D-057; the ledger is re-read per branch so a
-      // mid-pass resolve is visible).
-      const stNow = getMergeStatus(cli, snap.branch);
+      // Live merge_status dispatch (D-058; the JOURNAL is re-read per branch so
+      // a mid-loop hold/defer of an earlier sibling is visible).
+      const viewNow = passStatusView(cli, readJournal(dir));
+      const stNow = viewNow.get(snap.branch) ?? null;
 
       // PR_ID (held, awaiting the owner) arrives with an EMPTY interval —
       // descendants may proceed and DEFERRED re-evaluates, but we do not
-      // re-emit its own case (it is cleared only by a mechanical/judged
-      // resolve, or by PR completion at the next reconcile).
-      if (heldSet.has(snap.branch) || stNow?.state === 'PR_ID') {
+      // re-emit its own case (the block clears only when the owner's PR merge
+      // lands on origin — the next `start` derives it unblocked).
+      if (heldSet.has(snap.branch) || stNow === 'PR_ID') {
         appendJournal(dir, { action: 'skip', branch: snap.branch, reason: 'held' });
         appendJournal(dir, { action: 'arrived', branch: snap.branch });
         arrived.add(snap.branch);
@@ -1648,15 +1636,14 @@ export async function cmdRun(cli: Cli): Promise<number> {
           mergeBlocked,
         });
 
-      // DEFERRED (D-057): sticky while ANY direct parent has merge_status !=
-      // NONE — the branch takes nothing this pass; its own conflict height is
-      // re-probed live so its children's height-MIN keeps working. Once every
-      // parent is NONE it clears (journaled `undeferred`) and falls through to
-      // a fresh re-merge — which may hit a new conflict (its own PR) or land.
-      if (stNow?.state === 'DEFERRED') {
-        const blockedParents = snap.parents
-          .map((p) => p.parent)
-          .filter((p) => getMergeStatus(cli, p) !== null);
+      // DEFERRED (D-057 STAY, D-058 source): sticky while ANY direct parent is
+      // still blocked — the branch takes nothing this pass; its own conflict
+      // height is re-probed live so its children's height-MIN keeps working.
+      // The journal-fixpoint view (`passStatusView`) already dropped branches
+      // whose parents all cleared, so a DEFERRED verdict here always has a
+      // blocked parent; a cleared branch simply derives fresh below.
+      if (stNow === 'DEFERRED') {
+        const blockedParents = snap.parents.map((p) => p.parent).filter((p) => viewNow.has(p));
         if (blockedParents.length > 0) {
           const behind = blockedParents.reduce((lo, p) =>
             (blockHeightOf.get(p) ?? Infinity) < (blockHeightOf.get(lo) ?? Infinity) ? p : lo,
@@ -1672,8 +1659,6 @@ export async function cmdRun(cli: Cli): Promise<number> {
           arrived.add(snap.branch);
           continue;
         }
-        setMergeStatus(cli, snap.branch, null);
-        appendJournal(dir, { action: 'undeferred', branch: snap.branch, reason: 'parents-clear' });
       }
 
       const bp = await deriveLive();
@@ -1686,7 +1671,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
       // intermediate aborts the un-skip instead of being force-merged past its
       // block. No unblocked chain = the leaf stays skipped this pass.
       if ((bp.isLeaf || bp.alwaysMerge) && passHasProgress && allParentsSkipped(bp)) {
-        const blockedLive = new Set(mergeStatuses(cli).keys());
+        const blockedLive = new Set(passStatusView(cli, readJournal(dir)).keys());
         const uchain = shortestUnskipChain(bp.branch, edges, entrySet, blockedLive);
         if (uchain.length < 2 && shortestUnskipChain(bp.branch, edges, entrySet).length >= 2) {
           // An entry IS reachable, but only through blocked hops: the un-skip
@@ -1865,13 +1850,12 @@ export async function cmdRun(cli: Cli): Promise<number> {
               });
             }
             // A clean prefix can merge while the conflict ABOVE it is DEFERRED to a
-            // blocked DIRECT parent (§5): record the defer pointer too, and flip the
-            // branch's merge_status to DEFERRED at once — blocked(X) ⇔ merge_status
-            // != NONE holds at every step (D-057).
+            // blocked DIRECT parent (§5): record the defer pointer — the journaled
+            // `defer` row IS the DEFERRED state (D-058), so blocked(X) holds in the
+            // derived view from this moment.
             if (pp.deferredTo) {
               appendJournal(dir, { action: 'defer', branch: bp.branch, parent: pp.parent, deferredTo: pp.deferredTo });
               recordDefer(bp.branch, pp.deferHeight);
-              if (getMergeStatus(cli, bp.branch) === null) setMergeStatus(cli, bp.branch, { state: 'DEFERRED' });
             }
             // A clean merge up to the merge point can still leave a conflict ABOVE
             // it (§3 step 4): emit the case (recomputed post-merge) and halt.
@@ -1880,10 +1864,10 @@ export async function cmdRun(cli: Cli): Promise<number> {
               gated = true;
             }
           } else if (pp.verdict === 'defer') {
+            // BECOME DEFERRED (D-057): the journaled `defer` row is the state
+            // (D-058) — the branch is blocked in the derived view from now on.
             appendJournal(dir, { action: 'defer', branch: bp.branch, parent: pp.parent, deferredTo: pp.deferredTo });
             recordDefer(bp.branch, pp.deferHeight);
-            // BECOME DEFERRED (D-057): the branch is blocked from this moment.
-            if (getMergeStatus(cli, bp.branch) === null) setMergeStatus(cli, bp.branch, { state: 'DEFERRED' });
           } else if (pp.verdict === 'case') {
             if (await emitCase(pp)) {
               branchGated = true;
@@ -2177,7 +2161,7 @@ async function reverifyCase(
     tierFloor: floor,
     isLeaf,
     alwaysMerge: feat?.always_merge === true,
-    held: await prBlockedRecords(cli, ctx.chain),
+    held: await prBlockedRecords(cli, journal, ctx.chain),
     stackCap,
   });
   const pp = bp.parents.find((p) => p.parent === caseFile.parent);
@@ -2246,9 +2230,12 @@ async function reverifyCase(
 }
 
 /**
- * Freeze a branch HELD: prepare the PR materials (D-048), journal `held`, set
- * merge_status PR_ID. The journal entry records what the UNIFIED publish needs
- * (D-057):
+ * Freeze a branch HELD: prepare the PR materials (D-048) and journal `held` —
+ * the journaled disposition IS the blocked state for the rest of the pass
+ * (D-058: blockedRows/passStatusView read it; nothing is written to the
+ * ledger, and NOTHING is pushed or published here — the PR is created at
+ * `finish`, after verify). The journal entry records what the UNIFIED publish
+ * needs (D-057):
  *  - `resolution`: the agent's last resolution tree + whether it is
  *    MARKER-CLEAN — the publish decision key (marker-clean → ACTIVE PR at the
  *    resolved merge commit; otherwise → DRAFT PR from the pristine conflict).
@@ -2263,7 +2250,7 @@ async function freezeHeld(
   notes: string[],
   opts: { resolvedTree?: string | null; escalation?: HeldEscalation | null } = {},
 ): Promise<void> {
-  const fixBranch = await prepareCaseMaterials(cli, dir, rc, 'held');
+  await prepareCaseMaterials(cli, dir, rc, 'held');
   let resolution: { tree: string; markerClean: boolean; baseTip: string } | null = null;
   if (opts.resolvedTree && opts.resolvedTree !== rc.automergeTree) {
     // markerClean scans EVERY file the resolution changed vs the automerge tree
@@ -2282,26 +2269,12 @@ async function freezeHeld(
     const baseTip = await revParse(cli.repo, rc.branch);
     resolution = { tree: opts.resolvedTree, markerClean: markers.length === 0, baseTip };
   }
-  // CRASH ORDERING: the ledger PR_ID write lands BEFORE the journal `held`
-  // disposition. A crash between the two leaves "blocked without disposition"
-  // (harmless — re-running the freeze is idempotent and completes it), never
-  // "held disposition with merge_status NONE", which breaks the invariant
-  // blocked(X) ⇔ merge_status != NONE (D-057). Durable PR_ID: kept until the
-  // branch is COMPLETELY resolved (owner resolves the PR AND the merge lands)
-  // — the stored head sha re-derives the block height each pass and detects
-  // completion.
-  setMergeStatus(cli, rc.branch, {
-    state: 'PR_ID',
-    caseId: rc.id,
-    headSha: rc.head.sha,
-    fixBranch,
-    prNumber: null,
-  });
   appendJournal(dir, {
     action: 'held',
     branch: rc.branch,
     caseId: rc.id,
     height: rc.head.height,
+    headSha: rc.head.sha, // conflict head — the derived block height's anchor (D-058)
     conflictedPaths: rc.conflictedPaths,
     notes,
     resolution,
@@ -2673,9 +2646,9 @@ export async function cmdResolve(cli: Cli): Promise<number> {
       notes,
       coldread: { verdict: coldread.verdict, notes: coldread.notes },
     });
-    // The resolve LANDED: PR_ID clears (→ NONE), unless a still-blocked defer
-    // keeps the branch DEFERRED (multi-parent, D-057).
-    settleAfterResolve(cli, dir, rc.branch);
+    // The resolve LANDED. Blockedness is derived (D-058): a still-blocked
+    // defer this pass keeps the branch DEFERRED via its journaled `defer`
+    // rows + the fixpoint view — no stored flag to settle.
     if (tier === 'judged') await prepareCaseMaterials(cli, dir, rc, tier);
     await removeCaseWorktree(cli, dir, rc.id);
     reopen(dir, reopenTargets);
@@ -3269,11 +3242,10 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
     }
   }
 
-  const stPub = getMergeStatus(cli, jc.branch);
-  const fixBranch =
-    mode === 'held' && stPub?.state === 'PR_ID' && stPub.caseId === jc.caseId && stPub.fixBranch
-      ? stPub.fixBranch
-      : fixBranchName(jc);
+  // Deterministic fix branch (D-057 naming, D-058: no pinned copy anywhere —
+  // the name derives from the case identity alone, so a retried publish and
+  // the next pass's origin scan agree on it).
+  const fixBranch = fixBranchName(jc);
 
   if (issues.some((i) => isBlocking(i.id))) {
     emit(cli, { ok: false, issues });
@@ -3378,13 +3350,9 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
       number: result.number,
       head: headSha,
     });
-    if (mode === 'held') {
-      // Point the PR_ID hold at the branch/PR the urges must target (D-057).
-      const st = getMergeStatus(cli, jc.branch);
-      if (st?.state === 'PR_ID' && st.caseId === jc.caseId) {
-        setMergeStatus(cli, jc.branch, { ...st, fixBranch, prNumber: result.number });
-      }
-    }
+    // No stored pointer to update (D-058): the `pr-published` journal row
+    // above enriches the pass's blocked view (urge target), and the next
+    // pass rediscovers the PR from origin at `start`.
     console.error(`published ${draft ? 'draft ' : ''}PR #${result.number} for ${jc.caseId}: ${result.url}`);
     emit(cli, { ok: true, issues, pr: { url: result.url, number: result.number }, head: headInfo });
     return 0;
@@ -3403,9 +3371,9 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
  * driver-journaled pass pushes are the only pushes). Per-pass order: verify
  * green → JUDGED PRs created (`publish`, non-draft) → THIS command pushes the
  * target branches — ONE push per branch, clean prefix + judged merge commits
- * together; GitHub auto-flips the JUDGED PRs to merged (D-040) → HELD draft
- * PRs created (`publish`; bases now current, ERR14 enforces it) → urge
- * comments posted (also this command). Verify-gated (ERR18): nothing is
+ * together; GitHub auto-flips the JUDGED PRs to merged (D-040) → HELD PRs
+ * created (`publish`, active/draft — D-058: bases now current, ERR14 enforces
+ * it) → urge comments posted (also this command). Verify-gated (ERR18): nothing is
  * pushed before `verify` is green (§9, D-012). A failed push is ERR15 — hard
  * halt, journaled, D-046 case-2 owner report, NO fallback. Closure checks and
  * urge posting are the networked parts and take the same `--token-file` as
@@ -3454,7 +3422,7 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
 
   // JUDGED PRs published this pass — their closure is checked after the pushes.
   const judgedPrs = journal.filter((e) => e.action === 'pr-published' && e.mode === 'judged');
-  const dueUrges = await detectUrges(cli, ctx);
+  const dueUrges = await detectUrges(cli, ctx, journal);
 
   // Verify gate (§9, D-012): nothing is pushed before verify is green.
   const gateOk = canComplete(journal);
@@ -3609,11 +3577,13 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
           pending: urge.pending.length,
           prNumber,
         });
+        // lastUrgedHead is the ONE surviving ledger write: a non-authoritative
+        // dedup cache (D-058 §3 — losing it merely re-urges once). merge_status
+        // is never written; blockedness is origin/journal-derived.
         const path = ledgerPathOf(cli);
         const fresh = readLedger(path);
         const cur = fresh.branches[urge.branch] ?? defaultLedgerBranch();
-        const ms = cur.merge_status?.state === 'PR_ID' ? { ...cur.merge_status, prNumber } : cur.merge_status;
-        fresh.branches[urge.branch] = { ...cur, merge_status: ms, lastUrgedHead: urge.head };
+        fresh.branches[urge.branch] = { ...cur, lastUrgedHead: urge.head };
         writeLedger(path, fresh);
         urged.push({ branch: urge.branch, head: urge.head, prNumber });
       } catch (err) {
@@ -3651,7 +3621,7 @@ export async function cmdVerify(cli: Cli): Promise<number> {
   // PR_ID-blocked branches are unpublished-by-design (their unresolved conflicts
   // would recreate stack conflicts in the rebuild); DEFERRED branches carry only
   // their clean prefix and stay publishable (D-057).
-  const held = prBlockedBranches(cli);
+  const held = prBlockedBranches(journal);
   const order = passOrder(dir);
   const derived = order.length > 0 ? publishableRecipe(journal, order, held) : (registry.scope.recipe ?? []);
   const recipe = cli.recipe ?? derived;
@@ -3754,9 +3724,11 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     conflictedPaths: [],
     reason: 'gate',
   });
-  // Gate hold (D-057): PR_ID with no conflicting head / PR — blocked until the
-  // owner intervenes (manual unfreeze); it cannot auto-complete (headSha null).
-  setMergeStatus(cli, offender, { state: 'PR_ID', caseId: 'gate', headSha: null, fixBranch: null, prNumber: null });
+  // Gate hold (D-057/D-058): the journaled `held` row above IS the PR_ID state
+  // for the rest of the pass — no conflicting head / PR (blockedRows keeps
+  // headSha null), so it cannot auto-complete; the owner clears it manually.
+  // Cross-pass a gate hold leaves nothing on origin, so the next `start`
+  // re-derives the branch unblocked and the offending merge is simply retried.
   // Re-verify on the publishable set with the offender now rolled back + held —
   // it drops out of the recipe (fix 1) so its bad merge is gone (D-051).
   const reRecipe = recipe.filter((b) => b !== offender);
@@ -3775,20 +3747,24 @@ export async function cmdUnfreeze(cli: Cli): Promise<number> {
     return 2;
   }
   const { dir } = await passContext(cli); // attaches to the open pass (for the journal)
-  const st = getMergeStatus(cli, cli.branch);
+  const journal = readJournal(dir);
+  const view = passStatusView(cli, journal);
+  const st = view.get(cli.branch) ?? null;
   if (!st) {
     console.error(`unfreeze: '${cli.branch}' is not blocked (merge_status is NONE)`);
     return 2;
   }
-  const blockedBy = st.state === 'PR_ID' ? st.caseId : 'deferred';
+  const blockedBy = st === 'PR_ID' ? (blockedRows(journal).get(cli.branch)?.caseId ?? 'held') : 'deferred';
   if (!cli.execute) {
     console.error(`DRY-RUN (no --execute): would manually unfreeze ${cli.branch} (blocked by ${blockedBy})`);
     emit(cli, { branch: cli.branch, blockedBy });
     return 0;
   }
-  setMergeStatus(cli, cli.branch, null);
+  // The journaled row clears the block for THIS pass only (D-058): an origin
+  // fix/sweep ref with an open PR re-derives the branch blocked at the next
+  // `start` — the durable unfreeze is resolving/closing that PR on origin.
   appendJournal(dir, { action: 'unfrozen', branch: cli.branch, reason: 'manual', blockedBy });
-  console.error(`unfroze ${cli.branch} (manual)`);
+  console.error(`unfroze ${cli.branch} (manual — this pass only; origin re-derives at the next start)`);
   emit(cli, { branch: cli.branch, unfrozen: true, reason: 'manual' });
   return 0;
 }
@@ -3805,18 +3781,20 @@ export async function cmdStatus(cli: Cli): Promise<number> {
   const counts: Record<string, number> = {};
   for (const e of journal) counts[e.action] = (counts[e.action] ?? 0) + 1;
   for (const [action, n] of Object.entries(counts).sort()) console.log(`  ${action.padEnd(12)} ${n}`);
-  // merge_status view (D-057): PR_ID (own PR pending) and DEFERRED (sticky
-  // behind a blocked parent) — heights are live-derived, never stored/shown here.
-  const statuses = mergeStatuses(cli);
-  const prBlocked = [...statuses.entries()].filter(([, s]) => s.state === 'PR_ID');
+  // merge_status view (D-058): derived from origin rows + this-pass journal —
+  // PR_ID (own PR pending) and DEFERRED (sticky behind a blocked parent);
+  // heights are live-derived, never stored/shown here.
+  const view = passStatusView(cli, journal);
+  const rows = blockedRows(journal);
+  const prBlocked = [...view.entries()].filter(([, s]) => s === 'PR_ID').map(([b]) => b);
   if (prBlocked.length) {
-    console.log('merge_status PR_ID (blocked on their own PR):');
-    for (const [branch, s] of prBlocked) {
-      if (s.state !== 'PR_ID') continue;
-      console.log(`  ${branch} (${s.caseId})${s.fixBranch ? ` PR head ${s.fixBranch}` : ''}${s.prNumber ? ` #${s.prNumber}` : ''}`);
+    console.log('merge_status PR_ID (blocked on their own PR; origin/journal-derived):');
+    for (const branch of prBlocked) {
+      const r = rows.get(branch);
+      console.log(`  ${branch} (${r?.caseId ?? 'held'})${r?.fixBranch ? ` PR head ${r.fixBranch}` : ''}${r?.prNumber ? ` #${r.prNumber}` : ''}`);
     }
   }
-  const deferred = [...statuses.entries()].filter(([, s]) => s.state === 'DEFERRED').map(([b]) => b);
+  const deferred = [...view.entries()].filter(([, s]) => s === 'DEFERRED').map(([b]) => b);
   if (deferred.length) console.log(`merge_status DEFERRED (sticky behind a blocked parent): ${deferred.join(', ')}`);
   const annotates = journal.filter((e) => e.action === 'annotate');
   if (annotates.length) {
@@ -3964,7 +3942,7 @@ interface MachineState {
   /** The case the agent is currently editing/reporting (driver-held, D-053). */
   currentCase: { caseId: string; branch: string; tier?: 'mechanical' | 'judged' | 'held' } | null;
   /** Resumable `finish` sub-phase (finishing only). */
-  finishStep?: 'verify' | 'judged-prs' | 'push' | 'report' | 'done';
+  finishStep?: 'verify' | 'judged-prs' | 'push' | 'held-prs' | 'report' | 'done';
 }
 
 function machineStatePath(dir: string): string {
@@ -4342,11 +4320,184 @@ function branchTestCommands(cli: Cli): VerifyCommand[] {
 // --------------------------------------------------------------------------
 
 /**
+ * D-058 §2 — reconstruct the blocked (PR_ID) set from ORIGIN alone. For every
+ * `origin/fix/sweep/*` ref (post-fetch), parse the TARGET branch out of the
+ * ref name (fix/sweep/<slug(branch)>--<slug(parent)>-h<n>-<sha8>; matched
+ * against the registry scope's branch slugs, longest match wins) and then:
+ *  - ref IS an ancestor of origin/<target>  → RESOLVED (the owner merged the
+ *    PR / it landed): not blocked; delete the origin ref (cleanup).
+ *  - unmerged + an OPEN PR exists for head=ref (GitHub) → PR_ID: journal an
+ *    `origin-blocked` row {branch, fixBranch, headSha, prNumber} — the pass's
+ *    blocked view + block-height source (`prBlockedRecords`).
+ *  - unmerged + NO open PR (create failed / owner closed without merging) →
+ *    ORPHAN: delete the origin ref and do NOT block — otherwise the branch is
+ *    stuck blocked forever with nothing the owner can see or act on.
+ * A ref whose slug matches no scope branch is journaled `origin-ref-unknown`
+ * and left alone (unknown provenance: never deleted, never blocking).
+ *
+ * The PR existence check is FAIL-CLOSED: any non-200 lookup is an ERR13 halt —
+ * a flaky API must never read as "no PR" and delete a ref with a live PR.
+ * Ref deletions go through `git push origin --delete` (refs move via git only,
+ * D-049); a failed delete is journaled and non-fatal (the ref is re-examined
+ * at the next start).
+ */
+async function deriveOriginMergeStatus(
+  cli: Cli,
+  dir: string,
+  makeTransport?: (token: string) => GithubTransport,
+): Promise<{ ok: boolean; issues: Issue[]; blocked: string[] }> {
+  const prefix = 'refs/remotes/origin/';
+  const res = await git(cli.repo, ['for-each-ref', '--format=%(refname) %(objectname)', `${prefix}fix/sweep`], {
+    allowCodes: [1],
+  });
+  const refs = res.stdout
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => {
+      const [name, sha] = l.split(' ');
+      return { ref: name.slice(prefix.length), sha };
+    });
+  if (refs.length === 0) return { ok: true, issues: [], blocked: [] };
+
+  // slug(branch) → branch over the registry-derived scope, longest slug first
+  // (slug() is lossy, so the ref name is matched against KNOWN branches, never
+  // un-slugged).
+  const registry = loadRegistry({ inventoryDir: cli.inventory, scopeFile: cli.scopeFile, routingFile: cli.routingFile });
+  const scopeResult = await resolveScope(cli.repo, registry.features, registry.scope, { includeRemote: true });
+  const candidates = scopeResult.ordered
+    .map((e) => ({ branch: e.branch, slug: slug(e.branch) }))
+    .sort((a, b) => b.slug.length - a.slug.length);
+
+  // Split by disposition first so the transport is only required when an
+  // unmerged ref actually needs a PR lookup.
+  const merged: Array<{ ref: string; sha: string; branch: string }> = [];
+  const unmerged: Array<{ ref: string; sha: string; branch: string }> = [];
+  for (const r of refs) {
+    const rest = r.ref.slice('fix/sweep/'.length);
+    const target = candidates.find((c) => rest.startsWith(`${c.slug}--`))?.branch ?? null;
+    if (!target) {
+      appendJournal(dir, { action: 'origin-ref-unknown', ref: r.ref, headSha: r.sha });
+      console.error(`sweep start: origin ref '${r.ref}' matches no scope branch — left alone (not blocking)`);
+      continue;
+    }
+    const originTarget = `origin/${target}`;
+    if ((await refExists(cli.repo, originTarget)) && (await isAncestor(cli.repo, r.sha, originTarget))) {
+      merged.push({ ...r, branch: target });
+    } else {
+      unmerged.push({ ...r, branch: target });
+    }
+  }
+
+  const deleteOriginRef = async (ref: string): Promise<string | null> => {
+    try {
+      await git(cli.repo, ['push', 'origin', '--delete', ref]);
+      return null;
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
+    }
+  };
+
+  for (const m of merged) {
+    const deleteFailed = await deleteOriginRef(m.ref);
+    appendJournal(dir, {
+      action: 'origin-ref-resolved',
+      ref: m.ref,
+      branch: m.branch,
+      headSha: m.sha,
+      ...(deleteFailed ? { deleteFailed } : {}),
+    });
+    console.error(`sweep start: '${m.ref}' merged into origin/${m.branch} — resolved${deleteFailed ? ' (cleanup delete failed)' : ', ref deleted'}`);
+  }
+
+  const blocked: string[] = [];
+  if (unmerged.length > 0) {
+    // Networked part (D-058 §4): start takes --token-file like publish/push.
+    let token: string | null = null;
+    if (cli.tokenFile && existsSync(cli.tokenFile)) token = readFileSync(cli.tokenFile, 'utf8').trim() || null;
+    if (!token) {
+      return {
+        ok: false,
+        issues: [
+          {
+            id: 'ERR11_TOKEN_MISSING',
+            detail: `origin carries ${unmerged.length} unmerged fix/sweep ref(s) — start must check their PRs: pass --token-file <path> (substitute GitHub token)`,
+          },
+        ],
+        blocked,
+      };
+    }
+    const slugParts = await originSlug(cli);
+    if (!slugParts) {
+      return {
+        ok: false,
+        issues: [{ id: 'ERR12_ORIGIN_UNRESOLVED', detail: 'cannot derive owner/repo from the origin remote URL' }],
+        blocked,
+      };
+    }
+    const transport = (makeTransport ?? realGithubTransport)(token);
+    for (const u of unmerged) {
+      let pr: { url: string; number: number } | null;
+      try {
+        // FAIL-CLOSED lookup: only an authoritative 200 may decide blocked-vs-
+        // orphan (getOpenPrByHead's null-on-any-status would read an API
+        // failure as "no PR" and delete a ref with a live PR).
+        const lookup = await transport.request(
+          'GET',
+          `/repos/${slugParts.owner}/${slugParts.repo}/pulls?head=${encodeURIComponent(`${slugParts.owner}:${u.ref}`)}&state=open`,
+        );
+        if (lookup.status !== 200 || !Array.isArray(lookup.body)) {
+          throw new Error(`open-PR lookup for '${u.ref}' -> HTTP ${lookup.status}`);
+        }
+        const first = lookup.body[0] as { html_url?: string; number?: number } | undefined;
+        pr = first ? { url: String(first.html_url ?? ''), number: Number(first.number ?? 0) } : null;
+      } catch (e) {
+        return {
+          ok: false,
+          issues: [{ id: 'ERR13_API_FAILED', detail: e instanceof Error ? e.message : String(e) }],
+          blocked,
+        };
+      }
+      if (pr) {
+        appendJournal(dir, {
+          action: 'origin-blocked',
+          branch: u.branch,
+          caseId: `origin:${u.ref}`,
+          fixBranch: u.ref,
+          headSha: u.sha,
+          prNumber: pr.number,
+          prUrl: pr.url,
+        });
+        blocked.push(u.branch);
+        console.error(`sweep start: ${u.branch} blocked — open PR #${pr.number} on '${u.ref}' (origin-derived)`);
+      } else {
+        const deleteFailed = await deleteOriginRef(u.ref);
+        appendJournal(dir, {
+          action: 'origin-ref-orphaned',
+          ref: u.ref,
+          branch: u.branch,
+          headSha: u.sha,
+          ...(deleteFailed ? { deleteFailed } : {}),
+        });
+        console.error(`sweep start: '${u.ref}' has no open PR — orphan${deleteFailed ? ' (delete failed)' : ' deleted'}; ${u.branch} NOT blocked`);
+      }
+    }
+  }
+  return { ok: true, issues: [], blocked };
+}
+
+/**
  * `sweep start` — open a pass and pin its watermark. Refuses if a pass is
  * already open (a machine state that is not `complete`): the agent must
  * `finish` or `abort` first — never blind-wipe an in-flight pass (that stranded
  * resolved-but-unpushed merges before, §2). Pins the watermark = upstream top
  * commit (via cmdPlan), initializes the journal, and writes the machine state.
+ *
+ * D-058: start is NETWORKED — it fetches origin (+ upstream) and reconstructs
+ * the blocked set from the origin fix/sweep refs (`deriveOriginMergeStatus`)
+ * BEFORE planning; the ledger's merge_status is no longer read, so the local
+ * pass dir is disposable and `start` is idempotent on origin. A pass that
+ * crashed before `finish` published NOTHING, so the re-derived picture is
+ * clean and the pass is simply redone.
  *
  * D-055 clean-slate boundary: the pass directory lives at ONE canonical location
  * — `<--workspace>/propagation/pass-<watermark12>` — logged on every `start` and
@@ -4364,7 +4515,7 @@ function branchTestCommands(cli: Cli): VerifyCommand[] {
  * from the durable group-root ledger + rr-cache, which killed rerere and
  * diverged the ledger). A group root inside an OUTER git repo is accepted.
  */
-export async function cmdSweepStart(cli: Cli): Promise<number> {
+export async function cmdSweepStart(cli: Cli, makeTransport?: (token: string) => GithubTransport): Promise<number> {
   // C-1 (D-055): the workspace is the GROUP ROOT and MUST NOT be the FORK CLONE
   // (`--repo`) or a subdirectory of it — the run set --workspace to the clone, so
   // the pass + a throwaway empty `sweep-ledger.json` + a missing rr-cache all
@@ -4387,6 +4538,31 @@ export async function cmdSweepStart(cli: Cli): Promise<number> {
       console.error(`sweep start [ERR37_WORKSPACE_IN_CLONE]: ${detail}`);
       result(cli, { ok: false, issues: [{ id: 'ERR37_WORKSPACE_IN_CLONE', detail }] });
       return 1;
+    }
+  }
+
+  // D-058: FETCH FIRST — the pass derives everything from origin, so the
+  // remote-tracking view (and the upstream watermark) must be current before
+  // anything is pinned. Only remotes that exist are fetched (fixtures often
+  // have none — their refs/remotes/origin/* are read as-is). The fix/sweep
+  // namespace is fetched with --prune under its OWN refspec so a ref another
+  // clone deleted cannot linger locally and re-derive as blocked.
+  {
+    const remotes = (await git(cli.repo, ['remote'])).stdout.split('\n').filter(Boolean);
+    for (const remote of ['origin', 'upstream'].filter((r) => remotes.includes(r))) {
+      try {
+        await git(cli.repo, ['fetch', remote]);
+        if (remote === 'origin') {
+          await git(cli.repo, ['fetch', '--prune', 'origin', '+refs/heads/fix/sweep/*:refs/remotes/origin/fix/sweep/*']);
+        }
+      } catch (e) {
+        const detail =
+          `git fetch ${remote} failed: ${e instanceof Error ? e.message : String(e)} — ` +
+          `start derives the blocked set from origin (D-058) and must not open a pass on a stale view`;
+        console.error(`sweep start [ERR39_FETCH_FAILED]: ${detail}`);
+        result(cli, { ok: false, issues: [{ id: 'ERR39_FETCH_FAILED', detail }] });
+        return 1;
+      }
     }
   }
 
@@ -4450,6 +4626,21 @@ export async function cmdSweepStart(cli: Cli): Promise<number> {
     // removed tree — prune them so a fresh case can re-register its worktree.
     await git(cli.repo, ['worktree', 'prune'], { allowCodes: [1, 128] });
     console.error(`sweep start: cleared prior pass dir ${canonicalDir} (whole tree; clean-slate, D-055)`);
+  }
+
+  // D-058 §2: reconstruct the blocked set from ORIGIN into the fresh journal
+  // BEFORE planning (plan/run read `origin-blocked` rows; the ledger's
+  // merge_status is dead). Blocking issues (token missing, API failure) leave
+  // no plan-initial.json, so a re-run start clears + re-derives cleanly.
+  progress('deriving merge status from origin');
+  const originDerive = await deriveOriginMergeStatus(cli, canonicalDir, makeTransport);
+  if (!originDerive.ok) {
+    console.error(`sweep start [${originDerive.issues[0]?.id}]: ${originDerive.issues[0]?.detail}`);
+    result(cli, { ok: false, issues: originDerive.issues });
+    return 1;
+  }
+  if (originDerive.blocked.length) {
+    progress(`origin-derived blocked: ${originDerive.blocked.join(', ')}`);
   }
 
   // Pin the watermark + open the pass (only `plan` opens a pass, §2).
@@ -4951,7 +5142,6 @@ export async function cmdSweepReportCase(
     mergeCommit,
     coldread: { verdict: verdict.verdict, notes: verdict.notes },
   });
-  settleAfterResolve(cli, dir, rc.branch);
   await removeCaseWorktree(cli, dir, caseId);
   reopen(dir, reopenTargets);
   writeMachineState(dir, { ...st, phase: 'open', currentCase: null });
@@ -4966,171 +5156,22 @@ export async function cmdSweepReportCase(
 // --------------------------------------------------------------------------
 
 /**
- * Publish a HELD case's PR NOW (D-053 report-pr; unified active/draft, D-057):
- * publishHead decides the head + draftness — a MARKER-CLEAN resolution ships
- * an ACTIVE PR at the resolved merge commit (owner reviews & merges; the
- * driver never auto-merges it), anything else a DRAFT PR from the pristine
- * conflict. The head is pushed via `git push`; the PR carries the D-004
- * machine block and, for escalated holds, the warning prefix + reviewer
- * feedback. UNLIKE `cmdPublish`'s held path this does NOT run checkBaseHeight
- * (ERR14): a HELD PR lands nothing on a target branch until the OWNER merges
- * it, so origin base currency is irrelevant — it publishes the moment the case
- * is frozen, before any target push (SWEEP-STATE-MACHINE.md §report-pr).
- * Reuses publishHead (live conflict re-verify), the mechanical adequacy checks
- * (ERR05/ERR06/ERR08) and the real PR-creation path. Returns {ok, issues}.
- *
- * OPEN QUESTION (pending owner policy decision — do not change without it):
- * an ACTIVE held PR's resolved merge commit ships here without the verify
- * battery / ERR14 ordering that gates cmdPublish; behavior intentionally
- * left as-is.
- */
-async function publishHeldPrNow(
-  cli: Cli,
-  dir: string,
-  jc: JournaledCase,
-  journal: JournalEntry[],
-  watermark12: string,
-  chainLen: number,
-  makeTransport?: (token: string) => GithubTransport,
-): Promise<{ ok: boolean; issues: Issue[] }> {
-  const issues: Issue[] = [];
-  const src = await publishHead(cli, dir, journal, jc);
-  if (src.issue) return { ok: false, issues: [src.issue] };
-  if (src.mode !== 'held') {
-    return {
-      ok: false,
-      issues: [
-        { id: 'ERR01_CASE_NOT_OPEN', detail: `case '${jc.caseId}' is not HELD — report-pr held expects a frozen case` },
-      ],
-    };
-  }
-  const headSha = src.headSha!;
-  const draft = src.draft === true;
-  const escalation = src.escalation ?? null;
-  const registry = loadRegistry({
-    inventoryDir: cli.inventory,
-    scopeFile: cli.scopeFile,
-    routingFile: cli.routingFile,
-  });
-  const decided = decidedAlready(registry.features, jc.branch, jc.conflictedPaths);
-  if (decided) issues.push(decided);
-  const dup = await duplicateCaseIssue(cli, journal, journaledCases(journal), jc);
-  if (dup) issues.push(dup);
-  if (journal.some((e) => e.action === 'pr-published' && e.caseId === jc.caseId)) {
-    const prior = journal.filter((e) => e.action === 'pr-published' && e.caseId === jc.caseId).pop()!;
-    issues.push({ id: 'ERR07_PR_EXISTS', detail: `PR #${prior.number} already published for this case: ${prior.url}` });
-  }
-  const prDir = join(dir, jc.caseId, 'pr');
-  const title = existsSync(join(prDir, 'title.txt')) ? readFileSync(join(prDir, 'title.txt'), 'utf8').trim() : '';
-  const body = existsSync(join(prDir, 'body.md')) ? readFileSync(join(prDir, 'body.md'), 'utf8').trim() : '';
-  if (!title || !body) {
-    issues.push({
-      id: 'ERR08_TEXT_MISSING',
-      detail: `write ${join(prDir, 'title.txt')} and ${join(prDir, 'body.md')} yourself`,
-    });
-  } else {
-    issues.push(...advisoryTextIssues(title, body, jc.conflictedPaths));
-  }
-  const stHeld = getMergeStatus(cli, jc.branch);
-  const fixBranch =
-    stHeld?.state === 'PR_ID' && stHeld.caseId === jc.caseId && stHeld.fixBranch ? stHeld.fixBranch : fixBranchName(jc);
-  let token: string | null = null;
-  if (cli.tokenFile && existsSync(cli.tokenFile)) token = readFileSync(cli.tokenFile, 'utf8').trim() || null;
-  if (!token) issues.push({ id: 'ERR11_TOKEN_MISSING', detail: 'report-pr held publish needs --token-file <path>' });
-  const slugParts = await originSlug(cli);
-  if (!slugParts) issues.push({ id: 'ERR12_ORIGIN_UNRESOLVED', detail: 'cannot derive owner/repo from origin' });
-  if (issues.some((i) => isBlocking(i.id))) return { ok: false, issues };
-
-  const transport = (makeTransport ?? realGithubTransport)(token!);
-  try {
-    const existing = await getOpenPrByHead(transport, slugParts!, fixBranch);
-    if (existing)
-      return {
-        ok: false,
-        issues: [
-          ...issues,
-          { id: 'ERR07_PR_EXISTS', detail: `open PR already exists for head '${fixBranch}': ${existing.url}` },
-        ],
-      };
-  } catch (e) {
-    return {
-      ok: false,
-      issues: [...issues, { id: 'ERR13_API_FAILED', detail: e instanceof Error ? e.message : String(e) }],
-    };
-  }
-  try {
-    await gitPush(cli.repo, headSha, fixBranch);
-    appendJournal(dir, { action: 'push', branch: fixBranch, to: headSha, kind: 'pr-head' });
-  } catch (e) {
-    const detail = `git push of '${fixBranch}' at ${headSha.slice(0, 12)} failed: ${e instanceof Error ? e.message : String(e)} — report to the owner (D-046 case 2) and STOP`;
-    appendJournal(dir, {
-      action: 'halt',
-      reason: 'push-failed',
-      id: 'ERR15_PUSH_FAILED',
-      branch: fixBranch,
-      message: detail,
-    });
-    return { ok: false, issues: [...issues, { id: 'ERR15_PUSH_FAILED', detail }] };
-  }
-  try {
-    let prBody = body;
-    // Escalated hold (D-057): warning prefix + reviewer feedback above the prose.
-    if (escalation) prBody = `${escalation.tag}${escalation.feedback ? ` — ${escalation.feedback}` : ''}\n\n${prBody}`;
-    const pendingAbove = Math.max(0, chainLen - 1 - jc.head.height);
-    const finalBody = withMachineBlock(prBody, renderMachineBlock(pendingAbove, watermark12));
-    const result = await createPullRequest(transport, slugParts!, {
-      title,
-      body: finalBody,
-      head: fixBranch,
-      base: jc.branch,
-      draft,
-    });
-    guardRef(fixBranch, new Set(), { fixSweep: true });
-    if (!(await refExists(cli.repo, fixBranch)))
-      await git(cli.repo, ['update-ref', `refs/heads/${fixBranch}`, headSha, '']);
-    appendJournal(dir, {
-      action: 'pr-published',
-      caseId: jc.caseId,
-      branch: jc.branch,
-      mode: 'held',
-      draft,
-      fixBranch,
-      url: result.url,
-      number: result.number,
-      head: headSha,
-    });
-    const stAfter = getMergeStatus(cli, jc.branch);
-    if (stAfter?.state === 'PR_ID' && stAfter.caseId === jc.caseId) {
-      setMergeStatus(cli, jc.branch, { ...stAfter, fixBranch, prNumber: result.number });
-    }
-    console.error(`report-pr: published ${draft ? 'draft ' : ''}PR #${result.number} for ${jc.caseId}: ${result.url}`);
-    return { ok: true, issues: [...issues, ...[]] };
-  } catch (e) {
-    return {
-      ok: false,
-      issues: [...issues, { id: 'ERR13_API_FAILED', detail: e instanceof Error ? e.message : String(e) }],
-    };
-  }
-}
-
-/**
  * `report-pr` — reads the agent's PR description from the FIXED path
  * (pr/title.txt + pr/body.md), runs the SINGLE cold read over the resolution
  * diff AND the description together (kept kind-1 read with the description in
  * view). Verdict handling (D-057): a description-only defect → `rewrite:
  * <reason>`; a resolution rejection → first strike returns the reviewer's
  * feedback for a revise-and-retry, the second strike escalates to HELD;
- * confirm + scope-exceeded → HELD publishing the resolution (active PR,
- * escalated). Then by tier: held → PUBLISH THE PR NOW via the unified path
- * (active for a marker-clean resolution, draft for the pristine conflict — it
- * lands nothing on a target until the OWNER merges, so there is no verify
- * dependency, D-047/D-053); judged → merge in place + RECORD PR INTENT only
- * (create+close deferred to `finish`).
+ * confirm + scope-exceeded → HELD with the resolution recorded (active review
+ * PR at finish, escalated). Then by tier — PUBLISHING NOTHING either way
+ * (D-058: every PR is created at `finish`, after verify is green): held →
+ * RECORD PR INTENT (the recorded `held` disposition already carries the
+ * resolution/escalation the unified publish needs); judged → merge in place +
+ * RECORD PR INTENT. `report-pr` pushes no ref and calls no API.
  */
 export async function cmdSweepReportPr(
   cli: Cli,
   invoke: ColdReadInvoker = defaultColdReadInvoker,
-  makeTransport?: (token: string) => GithubTransport,
 ): Promise<number> {
   const ctx = await attachPass(cli);
   const dir = ctx.dir;
@@ -5358,35 +5399,34 @@ export async function cmdSweepReportPr(
 
   // Confirm.
   if (tier === 'held') {
-    // PUBLISH THE HELD PR NOW (§2): it lands nothing on a target branch until
-    // the OWNER merges it, so there is no verify dependency and no target-push
-    // ordering (D-053) — publish the moment the case is frozen, via the
-    // unified held path (active for a marker-clean resolution, draft for the
-    // pristine conflict — D-057; skips the ERR14 origin-currency check that
-    // gates cmdPublish's D-049 held-after-push).
-    const jc = journaledCases(readJournal(dir)).get(caseId)!;
-    const pub = await publishHeldPrNow(
-      cli,
-      dir,
-      jc,
-      readJournal(dir),
-      ctx.watermark12,
-      ctx.chain.heads.length,
-      makeTransport,
-    );
-    if (!pub.ok) {
-      console.error(`report-pr: HELD publish for ${caseId} blocked`);
-      result(cli, { ok: false, tier: 'held', issues: pub.issues });
-      return 1;
-    }
-    const published = readJournal(dir)
-      .filter((e) => e.action === 'pr-published' && e.caseId === caseId)
-      .pop();
-    progress(
-      `held: ${branch} — ${published?.draft ? 'draft' : 'review'} PR published ${published?.url ?? `#${published?.number ?? '?'}`}`,
-    );
+    // RECORD INTENT, PUBLISH NOTHING (D-058): the held PR — active for a
+    // marker-clean resolution, draft for the pristine conflict — is created at
+    // `finish`, AFTER verify is green, so even a held review PR sits on the
+    // verified tip and a pass that crashes before finish leaves no PR on
+    // origin. The `held` disposition already carries the resolution +
+    // escalation the unified publish re-derives from; this row records the
+    // remaining intent fields (tier, draft-vs-active, target, conflict head).
+    const heldJournal = readJournal(dir);
+    const heldDisp = lastDisposition(heldJournal, caseId);
+    const heldResolution = heldDisp?.resolution as { tree: string; markerClean: boolean } | null | undefined;
+    const draft = heldResolution?.markerClean !== true;
+    const jc = journaledCases(heldJournal).get(caseId) ?? null;
+    appendJournal(dir, {
+      action: 'pr-intent',
+      caseId,
+      branch,
+      mode: 'held',
+      tier: 'held',
+      draft,
+      markerClean: heldResolution?.markerClean === true,
+      resolvedTree: heldResolution?.tree ?? null,
+      escalation: heldDisp?.escalation ?? null,
+      conflictHead: jc?.head ?? null,
+    });
+    progress(`held: ${branch} — ${draft ? 'draft' : 'review'} PR intent recorded (created at finish)`);
     writeMachineState(dir, { ...st, phase: 'open', currentCase: null });
-    result(cli, { instruction: 'take next case', tier: 'held', published: true, issues: pub.issues });
+    console.error(`report-pr: ${caseId} held — PR intent recorded (created at finish)`);
+    result(cli, { instruction: 'take next case', tier: 'held', prIntent: true });
     return 0;
   }
 
@@ -5404,7 +5444,6 @@ export async function cmdSweepReportPr(
     coldread: { verdict: verdict.verdict, notes: verdict.notes },
   });
   appendJournal(dir, { action: 'pr-intent', caseId, branch: rc!.branch, mode: 'judged', mergeCommit });
-  settleAfterResolve(cli, dir, rc!.branch);
   await removeCaseWorktree(cli, dir, caseId);
   reopen(dir, [rc!.branch, ...rc!.descendants]);
   writeMachineState(dir, { ...st, phase: 'open', currentCase: null });
@@ -5421,15 +5460,19 @@ export async function cmdSweepReportPr(
 // --------------------------------------------------------------------------
 
 /**
- * `sweep finish` — the ONLY stage that lands code on a target branch (needs the
- * full-integration verify, D-012). Steps, in order (MERGE-POLICY §5): verify the
- * publishable set (full rebuild) → create JUDGED history PRs (publish, non-draft)
- * → push target branches (flips JUDGED PRs to merged) + closure checks + urges →
- * (HELD drafts already published at report-pr) → journal-derived owner report →
- * check upstream advanced past the pinned watermark. Multi-step and resumable: a
- * red verify (offender rolled back + HELD(gate)) or ERR15/ERR18 halts, reports,
- * and re-runs from the stopped phase; pushes never redo (cmdPush skips
- * up-to-date; cmdPublish guards ERR07).
+ * `sweep finish` — the ONLY stage that publishes ANYTHING (D-058: all PRs are
+ * created here, after the full-integration verify, D-012). Steps, in order:
+ * verify the publishable set (full rebuild) → create JUDGED history PRs
+ * (publish, non-draft) → push target branches (flips JUDGED PRs to merged) +
+ * closure checks + urges → create the HELD PRs (unified active/draft — push
+ * the fix/sweep ref + review PR; NOT merged, the owner decides; bases are now
+ * current so the ERR14 held ordering holds) → journal-derived owner report →
+ * check upstream advanced past the pinned watermark. Multi-step and resumable:
+ * a red verify (offender rolled back + HELD(gate)) or ERR15/ERR18 halts,
+ * reports, and re-runs from the stopped phase; pushes/PR-creates never redo
+ * (cmdPush skips up-to-date; cmdPublish guards ERR07 journal- and API-side).
+ * A pass that crashes BEFORE this stage has published nothing — the next
+ * `start` sees a clean origin picture and redoes the pass.
  */
 export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) => GithubTransport): Promise<number> {
   const ctx = await attachPass(cli);
@@ -5450,15 +5493,21 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
 
   if (!cli.execute) {
     const journal = readJournal(dir);
+    const unpublished = (jc: JournaledCase): boolean =>
+      !journal.some((e) => e.action === 'pr-published' && e.caseId === jc.caseId);
     const judged = [...journaledCases(journal).values()].filter((jc) => {
       const d = lastDisposition(journal, jc.caseId);
-      return (
-        d?.action === 'resolved' &&
-        d.tier === 'judged' &&
-        !journal.some((e) => e.action === 'pr-published' && e.caseId === jc.caseId)
-      );
+      return d?.action === 'resolved' && d.tier === 'judged' && unpublished(jc);
     });
-    result(cli, { dryRun: true, verifyGreen: canComplete(journal), judgedToPublish: judged.map((j) => j.caseId) });
+    const held = [...journaledCases(journal).values()].filter(
+      (jc) => lastDisposition(journal, jc.caseId)?.action === 'held' && unpublished(jc),
+    );
+    result(cli, {
+      dryRun: true,
+      verifyGreen: canComplete(journal),
+      judgedToPublish: judged.map((j) => j.caseId),
+      heldToPublish: held.map((j) => j.caseId),
+    });
     return 0;
   }
 
@@ -5523,9 +5572,38 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   const pushDelta = readJournal(dir).slice(pushLenBefore);
   progress(`push: targets (${pushDelta.filter((e) => e.action === 'push' && e.kind === 'target').length})`);
   progress(`urge comments (${pushDelta.filter((e) => e.action === 'urge').length})`);
+  writeMachineState(dir, { ...st, finishStep: 'held-prs' });
+
+  // (4) create the HELD PRs (D-058: the ONE publish phase for held cases —
+  // push the fix/sweep ref + review PR, active for a marker-clean resolution,
+  // draft for the pristine conflict; NEVER merged by the driver). After the
+  // target pushes so cmdPublish's ERR14 held ordering holds (origin bases are
+  // current). ERR07 (journal + open-PR-by-head) makes a resumed finish skip
+  // already-created PRs; gate holds have no case and are never published.
+  {
+    const journal = readJournal(dir);
+    const held = [...journaledCases(journal).values()].filter(
+      (jc) => lastDisposition(journal, jc.caseId)?.action === 'held',
+    );
+    let heldN = 0;
+    for (const jc of held) {
+      if (journal.some((e) => e.action === 'pr-published' && e.caseId === jc.caseId)) continue;
+      const rcPub = await cmdPublish(
+        { ...cli, cmd: 'publish', caseId: jc.caseId, execute: true, internal: true },
+        makeTransport,
+      );
+      if (rcPub !== 0) {
+        console.error(`finish: HELD publish failed for ${jc.caseId} — re-run finish after fixing`);
+        result(cli, { ok: false, halted: 'held-prs', caseId: jc.caseId });
+        return 1;
+      }
+      heldN++;
+    }
+    progress(`held PRs (${heldN})`);
+  }
   writeMachineState(dir, { ...st, finishStep: 'report' });
 
-  // (4) HELD drafts are already published (report-pr). (5) owner report.
+  // (5) owner report.
   await cmdReport({ ...cli, cmd: 'report', internal: true });
   progress('report ready');
 
@@ -5565,7 +5643,7 @@ const HANDLERS: Record<string, (cli: Cli) => Promise<number>> = {
   status: cmdStatus,
   report: cmdReport, // §14 (D-052 FIX 4): journal-derived end-of-sweep owner summary
   // D-053 state machine (SWEEP-STATE-MACHINE.md) — the agent-facing surface.
-  'sweep-start': cmdSweepStart,
+  'sweep-start': (cli) => cmdSweepStart(cli), // real transport unless a test injects one (D-058)
   'sweep-abort': cmdSweepAbort,
   'next-case': cmdSweepNextCase,
   'report-case': (cli) => cmdSweepReportCase(cli),
@@ -5591,5 +5669,5 @@ if (invokedDirectly) {
   );
 }
 
-export { parseCli, guardRef, DriverHalt, settleAfterResolve };
+export { parseCli, guardRef, DriverHalt };
 export type { Cli };

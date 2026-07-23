@@ -30,7 +30,11 @@ export function defaultLedgerBranch(): LedgerBranch {
   };
 }
 
-/** blocked(X) ⇔ merge_status(X) != NONE (D-057) — the ONLY blocked predicate. */
+/**
+ * Legacy blocked predicate over the ledger CACHE — used by the old sweep merge
+ * stage only. The propagation driver derives blockedness from origin + the
+ * pass journal instead (D-058) and never consults this.
+ */
 export function isBlocked(b: LedgerBranch | undefined): boolean {
   return (b?.merge_status ?? null) !== null;
 }
@@ -50,7 +54,7 @@ interface LegacyLedgerBranch {
   pendingBehindFreeze?: number;
 }
 
-function upconvertLegacyBranch(raw: LedgerBranch & LegacyLedgerBranch): LedgerBranch {
+function upconvertLegacyBranch(raw: Omit<LedgerBranch, 'status'> & LegacyLedgerBranch): LedgerBranch {
   const { frozenBy, heldHead, heldPaths, fixBranch, prNumber, pendingBehindFreeze, ...rest } = raw;
   void heldPaths; // retired: DEFER is pure height-MIN (D-057) — paths are never matched
   void pendingBehindFreeze; // retired: pending counts are derived live per pass
@@ -73,7 +77,7 @@ export function readLedger(path: string): Ledger {
   const parsed = JSON.parse(readFileSync(path, 'utf8')) as Ledger;
   if (parsed.schemaVersion !== 1) throw new Error(`ledger schemaVersion ${parsed.schemaVersion} unsupported`);
   for (const [name, b] of Object.entries(parsed.branches ?? {})) {
-    parsed.branches[name] = upconvertLegacyBranch(b as LedgerBranch & LegacyLedgerBranch);
+    parsed.branches[name] = upconvertLegacyBranch(b as Omit<LedgerBranch, 'status'> & LegacyLedgerBranch);
   }
   return parsed;
 }

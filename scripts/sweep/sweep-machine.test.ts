@@ -316,7 +316,10 @@ describe('sweep report-case (D-053 §2)', () => {
     expect(res.tier).toBe('held');
     expect(res.instruction).toBe('provide PR description');
     expect(repo.sha('main_patched')).toBe(postRun); // no merge
-    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.merge_status?.state).toBe('PR_ID');
+    // Blocked ⇔ the journaled held disposition; nothing is published here and
+    // the ledger is never written (D-058).
+    expect(readJournal(dir).some((e) => e.action === 'pr-published')).toBe(false);
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.merge_status ?? null).toBeNull();
     // The cold read RAN (not demoted before it) and the held entry carries the
     // marker-clean resolution + the scope escalation for the unified publish.
     expect(readJournal(dir).some((e) => e.action === 'coldread' && e.caseId === caseId)).toBe(true);
@@ -430,39 +433,65 @@ describe('sweep report-pr (D-053 §2)', () => {
     return { dir, caseId };
   }
 
-  it('held: single cold read over code+desc -> publishes the draft PR now (before any target push)', async () => {
+  it('held: single cold read over code+desc -> records intent, PUBLISHES NOTHING; finish creates the draft PR post-verify (D-058)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
-    repo.attachBareOrigin();
-    repo.git('push', 'origin', 'main_patched'); // origin BEHIND local (prefix not pushed)
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
     const tokenFile = join(ws, 'tok.txt');
     writeFileSync(tokenFile, 'tok\n');
     const { dir, caseId } = await toAwaiting(repo, ws, inv, 'held');
-    const gh = fakeGithub();
     const out = join(ws, 'pr.json');
+    // report-pr: NO transport, NO token needed — it publishes nothing.
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), confirm)).toBe(0);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; prIntent: boolean };
+    expect(res.instruction).toBe('take next case');
+    expect(res.prIntent).toBe(true);
+    const intent = readJournal(dir).find((e) => e.action === 'pr-intent' && e.caseId === caseId)!;
+    expect(intent.mode).toBe('held');
+    expect(intent.draft).toBe(true); // pristine conflict -> draft
+    expect(readJournal(dir).some((e) => e.action === 'pr-published')).toBe(false);
+    expect(readJournal(dir).some((e) => e.action === 'push')).toBe(false);
+    expect(repo.git('-C', bare, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep')).toBe('');
+    expect(machineState(dir).phase).toBe('open');
+
+    // finish: verify green -> push targets -> the ONE publish phase creates the
+    // held DRAFT PR (fix/sweep ref pushed + PR, never merged by the driver).
+    await cmdSweepNextCase(baseCli(repo, ws, inv)); // finalize
+    const cmds = join(ws, 'cmds.json');
+    writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }]));
+    const gh = fakeGithub();
     expect(
-      await cmdSweepReportPr(
-        baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, tokenFile, out }),
-        confirm,
+      await cmdSweepFinish(
+        baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, tokenFile, commandsFile: cmds }),
         gh.factory,
       ),
     ).toBe(0);
-    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; published: boolean };
-    expect(res.instruction).toBe('take next case');
-    expect(res.published).toBe(true);
-    const pub = readJournal(dir).find((e) => e.action === 'pr-published' && e.caseId === caseId)!;
+    const journal = readJournal(dir);
+    const pub = journal.find((e) => e.action === 'pr-published' && e.caseId === caseId)!;
     expect(pub.mode).toBe('held');
     expect(pub.draft).toBe(true);
+    // Ordering: the held PR is created AFTER the pass's target push and AFTER
+    // the green verify (all PRs at finish, post-verify — D-058).
+    const pubIdx = journal.findIndex((e) => e.action === 'pr-published' && e.caseId === caseId);
+    const pushIdx = journal.findIndex((e) => e.action === 'push' && e.kind === 'target');
+    const verifyIdx = journal.findIndex((e) => e.action === 'verify' && e.ok === true);
+    expect(pushIdx).toBeGreaterThanOrEqual(0);
+    expect(pubIdx).toBeGreaterThan(pushIdx);
+    expect(pubIdx).toBeGreaterThan(verifyIdx);
+    // The fix/sweep ref is REALLY on origin now, at the pushed head.
+    const fixBranch = pub.fixBranch as string;
+    expect(repo.git('-C', bare, 'rev-parse', `refs/heads/${fixBranch}`)).toBe(pub.head as string);
+    // The target branch tip does NOT contain the held head (nothing landed).
     expect(gh.calls.some((c) => c.method === 'POST' && c.path.endsWith('/pulls'))).toBe(true);
-    expect(machineState(dir).phase).toBe('open');
   });
 
-  it('held with a MARKER-CLEAN resolution (scope-exceeded confirm) -> publishes an ACTIVE (non-draft) PR with the prefix', async () => {
+  it('held with a MARKER-CLEAN resolution (scope-exceeded confirm) -> intent (active) at report-pr; finish creates the ACTIVE PR with the prefix', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
-    repo.attachBareOrigin();
+    const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     const tokenFile = join(ws, 'tok.txt');
     writeFileSync(tokenFile, 'tok\n');
@@ -476,12 +505,24 @@ describe('sweep report-pr (D-053 §2)', () => {
       await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true }), confirm),
     ).toBe(0);
     writePr(dir, caseId, `held case ${caseId}`, 'Decision needed: resolution of src/x.ts — study before merge.');
-    const gh = fakeGithub();
     const out = join(ws, 'pr.json');
+    // report-pr records the ACTIVE intent (marker-clean) — publishes nothing.
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), confirm)).toBe(0);
+    const intent = readJournal(dir).find((e) => e.action === 'pr-intent' && e.caseId === caseId)!;
+    expect(intent.draft).toBe(false); // marker-clean -> ACTIVE review PR at finish
+    expect(intent.markerClean).toBe(true);
+    expect(readJournal(dir).some((e) => e.action === 'pr-published')).toBe(false);
+    expect(machineState(dir).phase).toBe('open');
+
+    // finish creates the ACTIVE (non-draft) review PR at the resolved merge
+    // commit, with the escalation prefix — the owner reviews & MERGES it.
+    await cmdSweepNextCase(baseCli(repo, ws, inv)); // finalize
+    const cmds = join(ws, 'cmds.json');
+    writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }]));
+    const gh = fakeGithub();
     expect(
-      await cmdSweepReportPr(
-        baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, tokenFile, out }),
-        confirm,
+      await cmdSweepFinish(
+        baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, tokenFile, commandsFile: cmds }),
         gh.factory,
       ),
     ).toBe(0);
@@ -494,13 +535,15 @@ describe('sweep report-pr (D-053 §2)', () => {
     expect(sentBody.startsWith('[AUTO-ESCALATED: scope exceeded]')).toBe(true);
     expect(sentBody).toContain('src/extra.ts');
     // The pushed head is the RESOLVED merge commit: the agent's tree, parented
-    // on the branch tip + the conflict head (owner merge completes PR_ID).
+    // on the branch tip + the conflict head (owner merge completes the block).
     const head = pub.head as string;
     const caseHead = (readJournal(dir).find((e) => e.action === 'case')!.head as { sha: string }).sha;
     expect(repo.git('rev-parse', `${head}^2`)).toBe(caseHead);
     expect(repo.git('show', `${head}:src/x.ts`)).toBe('RESOLVED');
     expect(repo.git('show', `${head}:src/extra.ts`)).toBe('sneaky');
-    expect(machineState(dir).phase).toBe('open');
+    // The held content did NOT land on the target: origin main_patched does not
+    // contain the resolved merge commit (NOT merged — the owner decides).
+    expect(() => repo.git('-C', bare, 'merge-base', '--is-ancestor', head, 'refs/heads/main_patched')).toThrow();
   });
 
   it('judged: records PR intent + merges locally, NO push / NO PR created', async () => {
@@ -565,7 +608,6 @@ describe('sweep report-pr (D-053 §2)', () => {
       await cmdSweepReportPr(
         baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, tokenFile, out }),
         rejectDesc,
-        gh.factory,
       ),
     ).toBe(1);
     expect((JSON.parse(readFileSync(out, 'utf8')) as { instruction: string }).instruction).toContain('rewrite:');
@@ -1046,6 +1088,176 @@ describe('cold-read infra failure ≠ content reject (D-054, ERR35_COLDREAD_UNAV
     expect(readJournal(dir).some((e) => e.action === 'resolved' && e.caseId === caseId)).toBe(false);
     expect(machineState(dir).phase).toBe('awaiting-pr');
     expect(readJournal(dir).some((e) => e.action === 'halt' && e.id === 'ERR35_COLDREAD_UNAVAILABLE')).toBe(true);
+  });
+});
+
+describe('sweep start — origin-derived merge_status (D-058)', () => {
+  /**
+   * Manufacture an UNMERGED origin fix/sweep ref for main_patched: a driver-
+   * shaped PR-head commit (2nd parent = the conflict head U1, so the block
+   * height re-derives to h1) pushed to the deterministic fix branch name.
+   */
+  function pushFixRef(repo: FixtureRepo, content = 'OWNER-RESOLVED\n'): { fixBranch: string; fixHead: string } {
+    const u1 = repo.sha('main'); // the conflicting trunk head (U1)
+    const mpTip = repo.sha('main_patched');
+    // Resolution tree: main_patched's tree with src/x.ts swapped.
+    repo.checkout('tmp-resolution', { create: true, at: 'main_patched' });
+    repo.commit('tmp: resolution content', { 'src/x.ts': content });
+    const tree = repo.git('rev-parse', 'tmp-resolution^{tree}');
+    repo.checkout('main');
+    repo.git('branch', '-D', 'tmp-resolution');
+    const fixHead = repo.git('commit-tree', tree, '-p', mpTip, '-p', u1, '-m', 'Resolution for owner review');
+    const fixBranch = `fix/sweep/main_patched--main-h1-${u1.slice(0, 8)}`;
+    repo.git('push', 'origin', `${fixHead}:refs/heads/${fixBranch}`);
+    return { fixBranch, fixHead };
+  }
+
+  it('unmerged ref + open PR -> PR_ID: the branch derives blocked (origin-blocked journal row), takes nothing', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { fixBranch, fixHead } = pushFixRef(repo);
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = fakeGithub({
+      'GET /pulls?': { status: 200, body: [{ html_url: 'https://github.com/k-fls/fixture/pull/12', number: 12 }] },
+    });
+    const out = join(ws, 'start.json');
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile, out }), gh.factory)).toBe(0);
+    const dir = dirOf(repo, ws);
+    const row = readJournal(dir).find((e) => e.action === 'origin-blocked')!;
+    expect(row.branch).toBe('main_patched');
+    expect(row.fixBranch).toBe(fixBranch);
+    expect(row.headSha).toBe(fixHead);
+    expect(row.prNumber).toBe(12);
+    // The ref survives (a live PR — the owner can act on it).
+    expect(repo.git('-C', bare, 'rev-parse', `refs/heads/${fixBranch}`)).toBe(fixHead);
+    // The blocked branch takes NOTHING this pass: no case, no merge, finalize.
+    const before = repo.sha('main_patched');
+    const nc = join(ws, 'nc.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: nc }))).toBe(0);
+    expect((JSON.parse(readFileSync(nc, 'utf8')) as { status: string }).status).toBe('finalize');
+    expect(repo.sha('main_patched')).toBe(before);
+    expect(readJournal(dir).some((e) => e.action === 'skip' && e.branch === 'main_patched' && e.reason === 'held')).toBe(
+      true,
+    );
+  });
+
+  it('merged ref -> RESOLVED: not blocked, the origin ref is deleted (cleanup)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { fixBranch, fixHead } = pushFixRef(repo);
+    // The owner merged the PR: origin/main_patched advances to a merge commit
+    // CONTAINING the fix head.
+    const mergedTip = repo.git(
+      'commit-tree',
+      `${fixHead}^{tree}`,
+      '-p',
+      repo.sha('main_patched'),
+      '-p',
+      fixHead,
+      '-m',
+      'owner merged the review PR',
+    );
+    repo.git('push', 'origin', `${mergedTip}:refs/heads/main_patched`);
+    // No unmerged refs remain -> no PR lookup -> no token needed.
+    expect(await cmdSweepStart(baseCli(repo, ws, inv))).toBe(0);
+    const dir = dirOf(repo, ws);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'origin-blocked')).toBe(false);
+    const resolved = journal.find((e) => e.action === 'origin-ref-resolved')!;
+    expect(resolved.ref).toBe(fixBranch);
+    expect(resolved.branch).toBe('main_patched');
+    expect(resolved.deleteFailed ?? undefined).toBeUndefined();
+    // The origin ref is GONE (cleanup).
+    expect(repo.git('-C', bare, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep')).toBe('');
+    // The branch is unblocked: next-case ff-syncs to the owner's merge and
+    // processes normally (U1 landed via the owner resolution -> clean pass).
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv))).toBe(0);
+    expect(readJournal(dir).some((e) => e.action === 'skip' && e.branch === 'main_patched' && e.reason === 'held')).toBe(
+      false,
+    );
+  });
+
+  it('unmerged ref with NO open PR -> ORPHAN: the ref is deleted and the branch is NOT blocked', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { fixBranch } = pushFixRef(repo);
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = fakeGithub(); // default: GET /pulls? -> [] (no open PR)
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile }), gh.factory)).toBe(0);
+    const dir = dirOf(repo, ws);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'origin-blocked')).toBe(false);
+    const orphaned = journal.find((e) => e.action === 'origin-ref-orphaned')!;
+    expect(orphaned.ref).toBe(fixBranch);
+    expect(orphaned.deleteFailed ?? undefined).toBeUndefined();
+    // The stuck-forever hazard is gone: ref deleted, branch NOT blocked — the
+    // pass re-derives the conflict as an ordinary case.
+    expect(repo.git('-C', bare, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep')).toBe('');
+    const nc = join(ws, 'nc.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: nc }))).toBe(0);
+    expect((JSON.parse(readFileSync(nc, 'utf8')) as { status: string }).status).toBe('case-ready');
+  });
+
+  it('unmerged refs REQUIRE the token (fail-closed): no --token-file -> ERR11, no pass opened, nothing deleted', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { fixBranch, fixHead } = pushFixRef(repo);
+    const out = join(ws, 'start.json');
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { out }))).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> };
+    expect(res.issues[0].id).toBe('ERR11_TOKEN_MISSING');
+    expect(repo.git('-C', bare, 'rev-parse', `refs/heads/${fixBranch}`)).toBe(fixHead); // untouched
+    expect(existsSync(join(dirOf(repo, ws), 'plan-initial.json'))).toBe(false); // no pass opened
+  });
+
+  it('a pass aborted before finish leaves NO PR on origin; a re-start re-derives a clean picture and redoes the pass', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const dir = dirOf(repo, ws);
+
+    // Pass 1: hold the case, provide the PR text, record the intent — then the
+    // pass dies before finish (abort = the sanctioned crash-equivalent).
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const caseId = currentCaseId(dir);
+    await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true }), confirm);
+    writePr(dir, caseId, 'held x', 'Decision needed: resolution of src/x.ts — study before merge.');
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
+    expect(readJournal(dir).some((e) => e.action === 'pr-intent' && e.caseId === caseId)).toBe(true);
+    expect(await cmdSweepAbort(baseCli(repo, ws, inv, { cmd: 'sweep-abort' }))).toBe(0);
+
+    // NOTHING was published: no PR journal row, no fix/sweep ref on origin,
+    // origin main_patched untouched.
+    expect(readJournal(dir).some((e) => e.action === 'pr-published')).toBe(false);
+    expect(repo.git('-C', bare, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep')).toBe('');
+
+    // Re-start: the origin picture is CLEAN (no refs -> no PR checks -> no
+    // token), nothing is blocked, and the pass simply redoes the work — the
+    // same conflict is served fresh.
+    expect(await cmdSweepStart(baseCli(repo, ws, inv))).toBe(0);
+    expect(readJournal(dir).some((e) => e.action === 'origin-blocked')).toBe(false);
+    const nc = join(ws, 'nc.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: nc }))).toBe(0);
+    const res = JSON.parse(readFileSync(nc, 'utf8')) as { status: string; caseId: string };
+    expect(res.status).toBe('case-ready');
+    expect(res.caseId).toBe(caseId); // deterministic re-derivation of the same case
   });
 });
 

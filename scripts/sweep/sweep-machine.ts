@@ -9,20 +9,24 @@
  *   pnpm exec tsx scripts/sweep/sweep-machine.ts <start|next-case|report-case|report-pr|finish|abort> [flags]
  *
  * Commands (do what each RETURNS; never pass ids):
- *   start                         open a pass, pin the watermark (refuses an open pass — finish/abort first)
+ *   start                         fetch origin/upstream, derive the blocked set from the origin
+ *                                 fix/sweep refs (D-058; needs --token-file when unmerged refs
+ *                                 exist), then open a pass and pin the watermark (refuses an
+ *                                 open pass — finish/abort first)
  *   next-case                     advance the deterministic machinery; returns {status:"case-ready",…}
  *                                 (worktree/branch/conflictedPaths/materials) or {status:"finalize"}
  *   report-case --tier T          T ∈ mechanical|judged|held (the ONLY agent param); deterministic checks
  *                                 then the cold read (mechanical: here → merge; judged/held: deferred)
  *   report-pr                     judged/held only; single cold read over the resolution diff AND the
- *                                 PR description (pr/title.txt + pr/body.md); held publishes its PR now
- *                                 (active for a marker-clean resolution, draft for the pristine conflict),
- *                                 judged records intent (created at finish)
- *   finish                        verify → JUDGED PRs → push targets → urges → owner report → start-again/done
+ *                                 PR description (pr/title.txt + pr/body.md); records PR intent and
+ *                                 PUBLISHES NOTHING — every PR is created at finish (D-058)
+ *   finish                        verify → JUDGED PRs → push targets → urges → HELD PRs (active for a
+ *                                 marker-clean resolution, draft for the pristine conflict) → owner
+ *                                 report → start-again/done
  *   abort                         discard the open pass cleanly (rolls mutated branches back to pre-ref)
  *
  * Every mutating command needs --execute (dry-run by default). Networked steps
- * (report-pr held publish, finish) take --token-file <path> like `propagate`.
+ * (start's origin PR checks, finish) take --token-file <path> like `propagate`.
  * The cold read is a real `claude -p` subprocess; the branch-scoped test command
  * list is opt-in via --commands-file. All the deterministic internals are the
  * `propagate` driver's — this file only wraps them as the five-command surface.

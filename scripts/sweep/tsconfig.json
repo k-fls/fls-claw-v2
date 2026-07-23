@@ -1,0 +1,14 @@
+{
+  "//": "Typecheck gate for the sweep driver. The root tsconfig only includes src/**, so `tsc --noEmit` there NEVER type-checks scripts/sweep (vitest only type-strips). Run `tsc -p scripts/sweep` (or `--noEmit`) as the real gate for this dir.",
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "../..",
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    "composite": false
+  },
+  "include": ["**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

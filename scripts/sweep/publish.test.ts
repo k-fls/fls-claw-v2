@@ -565,7 +565,7 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
     expect(repo.git('-C', bareDir!, 'for-each-ref', 'refs/heads/fix')).toBe('');
   });
 
-  it('execute: git push of the fix/sweep ref at the pristine-conflict head, then POST /pulls (draft, machine block); journal + ledger prNumber', async () => {
+  it('execute: git push of the fix/sweep ref at the pristine-conflict head, then POST /pulls (draft, machine block); journaled (no ledger writes, D-058)', async () => {
     const { repo, ws, dir, caseId, prDir, bareDir, cli } = await setupHeldCase([], { bareOrigin: true });
     writeText(prDir, GOOD_TITLE, GOOD_BODY);
     const tokenFile = join(ws, 'token.txt');
@@ -610,10 +610,11 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
     expect(readJournal(dir).some((e) => e.action === 'push' && e.branch === fixBranch && e.kind === 'pr-head')).toBe(
       true,
     );
-    // Local anchor + PR_ID hold pointing at the PR (urge target incl. number).
+    // Local anchor; the pr-published journal row (not the ledger, D-058)
+    // carries the fix branch + PR number the pass's blocked view enriches
+    // urge targets from — the ledger is never written.
     expect(repo.sha(fixBranch)).toBe(pushedHead);
-    const lbMs = readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']!.merge_status;
-    expect(lbMs).toMatchObject({ state: 'PR_ID', fixBranch, prNumber: 58 });
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.merge_status ?? null).toBeNull();
 
     // A second publish of the same case is ERR07 (journal side), no network needed.
     const gh2 = fakeGithub();
