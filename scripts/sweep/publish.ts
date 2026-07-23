@@ -441,17 +441,30 @@ export function renderSweepAddressed(id: number): string {
  * The sweep-addressed id carried by `body`, or null when no LINE of the body
  * is exactly the marker (hardened detection: an embedded/quoted occurrence
  * does not count). Multiple marker lines take the MAX.
+ *
+ * `maxRealReviewId` bounds the marker TO REALITY (D-059 FINAL finding 4): the
+ * driver only ever posts 0 or a review id actually present on the PR, so a
+ * marker value ABOVE the max real review id cannot be driver-posted — it is a
+ * human paste (which would otherwise permanently silence the review loop) and
+ * is IGNORED per line. Pass the max submitted-review id when reviews are
+ * known; null (default) skips the bound.
  */
-export function extractSweepAddressed(body: string): number | null {
+export function extractSweepAddressed(body: string, maxRealReviewId: number | null = null): number | null {
   let max: number | null = null;
   for (const line of body.split('\n')) {
     const m = SWEEP_ADDRESSED_LINE_RE.exec(line.trim());
     if (m) {
       const v = Number(m[1]);
+      if (maxRealReviewId !== null && v > maxRealReviewId) continue; // not a value the driver could have posted
       if (max === null || v > max) max = v;
     }
   }
   return max;
+}
+
+/** The max id over a PR's submitted reviews (0 when none) — the marker's reality bound. */
+export function maxRealReviewId(reviews: PrReview[]): number {
+  return reviews.reduce((m, r) => Math.max(m, r.id), 0);
 }
 
 /** Marker lines removed (the agent's own prior message, served back tag-stripped). */
@@ -480,8 +493,16 @@ export interface PrComment {
  *  - `driver`: comments WITH the marker (the agent's own prior messages);
  *  - `markerId`: the effective sweep-addressed REVIEW id — MAX over every
  *    marker occurrence (null when no marker was ever posted).
+ *
+ * `maxRealReviewId` (finding 4): when the PR's reviews are known, pass their
+ * max id — marker values above it are IGNORED (see extractSweepAddressed), so
+ * a human pasting `<!-- sweep-addressed: 999999999 -->` neither silences the
+ * loop nor gets their comment mislabeled as an agent turn.
  */
-export function classifyComments(comments: PrComment[]): {
+export function classifyComments(
+  comments: PrComment[],
+  maxRealReviewId: number | null = null,
+): {
   humans: PrComment[];
   driver: PrComment[];
   markerId: number | null;
@@ -490,7 +511,7 @@ export function classifyComments(comments: PrComment[]): {
   const driver: PrComment[] = [];
   let markerId: number | null = null;
   for (const c of comments) {
-    const v = extractSweepAddressed(c.body);
+    const v = extractSweepAddressed(c.body, maxRealReviewId);
     if (v !== null) {
       driver.push(c);
       if (markerId === null || v > markerId) markerId = v;
@@ -517,15 +538,23 @@ export interface PrReview {
  * (or any such review exists and no marker was ever posted). `latest` is the
  * newest such review — its STATE drives the action table (APPROVED → land /
  * re-resolve; CHANGES_REQUESTED / COMMENTED / other → reissue, forced HELD).
- * `*[bot]`-authored reviews never trigger. The marker value is bounded by
- * construction (the driver only ever posts real review ids, or 0), so a marker
- * at/above the newest review id simply reads as "nothing new".
+ * `*[bot]`-authored reviews never trigger, and neither do DISMISSED ones (a
+ * dismissal has nothing actionable — the start loop advances the marker past
+ * it instead of reissuing; an earlier non-dismissed review above the marker
+ * still triggers normally).
+ *
+ * The marker value is bounded by construction on the WRITE side (the driver
+ * only ever posts real review ids, or 0) — but comments are world-writable, so
+ * the bound is also ENFORCED on the READ side: the caller derives `markerId`
+ * via classifyComments with the max real review id, which ignores any pasted
+ * marker above it. A (real) marker at/above the newest review id then simply
+ * reads as "nothing new".
  */
 export function classifyReviewTrigger(
   reviews: PrReview[],
   markerId: number | null,
 ): { latest: PrReview | null; maxReviewId: number | null; reissueDue: boolean } {
-  const human = reviews.filter((r) => r.state !== 'PENDING' && !r.author.endsWith('[bot]'));
+  const human = reviews.filter((r) => r.state !== 'PENDING' && r.state !== 'DISMISSED' && !r.author.endsWith('[bot]'));
   if (human.length === 0) return { latest: null, maxReviewId: null, reissueDue: false };
   const latest = human.reduce((a, b) => (b.id > a.id ? b : a));
   return { latest, maxReviewId: latest.id, reissueDue: markerId === null || latest.id > markerId };

@@ -1450,8 +1450,9 @@ describe('propagate push — verify-gated pass pushes (§14.4, D-049)', () => {
     await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
     await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
     fakeGreenVerify(dir);
-    // Break the transport (simulates the credential-proxy failure mode).
-    repo.git('config', '--unset', `url.${bare}.insteadOf`);
+    // Break the transport (simulates the credential-proxy failure mode)
+    // DETERMINISTICALLY: a dead local path — never the real github.com.
+    repo.breakOriginTransport(bare);
     const out = join(ws, 'push-out.json');
     expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, out }))).toBe(1);
     const res = JSON.parse(readFileSync(out, 'utf8')) as {
@@ -1464,16 +1465,51 @@ describe('propagate push — verify-gated pass pushes (§14.4, D-049)', () => {
     // Per-branch categorized failure, ERR15 as the LABEL — never a stop.
     expect(res.failed.length).toBe(1);
     expect(res.failed[0].branch).toBe('main_patched');
-    expect(['transient', 'auth', 'diverged']).toContain(res.failed[0].category);
+    expect(res.failed[0].category).toBe('transient'); // dead local path -> deterministic category
     const journal = readJournal(dir);
     expect(
       journal.some((e) => e.action === 'push-failed' && e.branch === 'main_patched' && e.id === 'ERR15_PUSH_FAILED'),
     ).toBe(true);
     expect(journal.some((e) => e.action === 'halt' && e.id === 'ERR15_PUSH_FAILED')).toBe(false);
     // RESUMABLE: fix the transport, re-push -> the failed branch lands.
-    repo.git('config', `url.${bare}.insteadOf`, 'https://github.com/k-fls/fixture.git');
+    repo.healOriginTransport(bare);
     expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true }))).toBe(0);
     expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).toBe(repo.sha('main_patched'));
+  });
+
+  it('a pre-receive-hook / branch-protection rejection is categorized `rejected` (NOT `diverged`) and journals the owner-escalation row (finding 3)', async () => {
+    const { repo } = conflictFixture();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    fakeGreenVerify(dir);
+    // A REAL declining pre-receive hook on the bare origin (the branch-
+    // protection shape): git reports "[remote rejected] … (pre-receive hook
+    // declined)" AND "failed to push some refs" — which the old categorizer
+    // mislabeled `diverged`.
+    writeFileSync(join(bare, 'hooks', 'pre-receive'), '#!/bin/sh\necho "protected branch: main_patched" >&2\nexit 1\n', {
+      mode: 0o755,
+    });
+    const out = join(ws, 'push-out.json');
+    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, out }))).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      failed: Array<{ branch: string; category: string; detail: string }>;
+    };
+    expect(res.failed.length).toBe(1);
+    expect(res.failed[0].branch).toBe('main_patched');
+    expect(res.failed[0].category).toBe('rejected');
+    expect(res.failed[0].detail).toContain('cannot heal by retrying');
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'push-failed' && e.branch === 'main_patched' && e.category === 'rejected')).toBe(true);
+    // Owner-action-required: the DISTINCT escalation row (surfaced by finish
+    // as needsOwner) — and never a halt, never a force-resolve.
+    expect(journal.some((e) => e.action === 'push-escalated' && e.branch === 'main_patched' && e.category === 'rejected')).toBe(true);
+    expect(journal.some((e) => e.action === 'halt')).toBe(false);
+    expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).not.toBe(repo.sha('main_patched')); // origin untouched
   });
 
   it('JUDGED closure check: a PR that did not flip to merged after the target push is ERR16', async () => {

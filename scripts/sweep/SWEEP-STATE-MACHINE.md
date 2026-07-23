@@ -35,6 +35,30 @@ GitHub for those PRs). The ledger `merge_status` authority (and the D-057
 reconcile/settle machinery) is retired: the local pass dir is disposable, so `start`
 always re-derives a clean picture from origin.
 
+D-059 amendment (2026-07-24): held PRs become a review-driven loop; `finish` is
+per-branch push-resilient. Supersedes the D-058 orphan-delete.
+(a) `start` re-classifies every origin `fix/sweep/*` ref (`deriveOriginMergeStatus`):
+merged / squash-rebase-merged → resolved + delete (the ONLY delete; NEVER a reopen);
+closed-unmerged → REOPEN → PR_ID; ref-present-no-PR → recover (create PR from the ref) →
+PR_ID; ref-absent → re-derive fresh. For an OPEN held PR the driver reads its SUBMITTED
+reviews (not comments): a reissue is due iff a non-`*[bot]` review exists beyond the
+`<!-- sweep-addressed: <review_id> -->` marker. APPROVED + still-clean → the driver LANDS
+it (merges into the local target; `finish` verifies + pushes → the PR auto-flips merged);
+APPROVED + stale, CHANGES_REQUESTED, COMMENTED, other → REISSUE. Loose issue/inline
+comments never trigger — they only feed the dialog.
+(b) A REISSUE case is manufactured at `start` (`materializeReissueCase`): the conflict is
+re-probed live against `origin/<target>`, the worktree is materialized FROM the prior
+resolution (owner-pushed edits rebuilt from the current ref head), and the FULL
+time-ordered review dialog is stored for the materials. `report-case` ALWAYS forces the
+reissue HELD; `report-pr` records intent; `finish` republishes to the SAME PR
+(force-with-lease onto the existing fix ref) — never a second PR.
+(c) `finish` pushes per-branch (`cmdPush`): a failure is categorized + journaled
+(`ERR15` a per-branch LABEL, not a stop); a partial finish is not sealed and is
+RESUMABLE (landed branches skip, failed retry). The one success/partial `SWEEP-RESULT`
+carries `pullRequests` + `stats` (landed/failed by category, PRs created/reissued/
+reopened/recovered) + an instruction to report landed-vs-conflicted to the owner. Only a
+GLOBAL failure (verify/token/closure) halts. See MERGE-POLICY.md D-059 for the semantics.
+
 ## 1. Principle
 
 - The DRIVER is a resumable state machine owning ALL state (pinned watermark, current
@@ -62,13 +86,24 @@ always re-derives a clean picture from origin.
 - Reset working state to a known base; initialize the journal.
 - **NETWORKED + origin-derived (D-058):** `start` first `git fetch`es origin and
   upstream (a fetch failure is `ERR39`, so a pass never opens on a stale view), then
-  reconstructs the blocked set from the origin `fix/sweep/*` refs BEFORE planning:
-  merged into `origin/<target>` → resolved (delete the ref); unmerged WITH an open PR →
-  blocked; unmerged WITHOUT an open PR → an orphan ref, deleted (a branch is never stuck
-  blocked-but-invisible). It takes `--token-file` (it queries GitHub for those PRs;
-  token missing while unmerged refs exist = `ERR11`). The ledger's `merge_status` is no
-  longer read — the pass dir is disposable and `start` is idempotent on origin; a pass
-  that crashed before `finish` published nothing, so the re-derived picture is clean.
+  reconstructs the blocked set from the origin `fix/sweep/*` refs BEFORE planning
+  (D-059 FINAL — the orphan-delete of D-058 is RETIRED, a MERGED ref is now the ONLY
+  delete): merged / squash-rebase-merged into `origin/<target>` → resolved, delete the
+  ref (NEVER a reopen on a merged PR); closed-unmerged PR → REOPEN it → blocked;
+  ref-present-with-NO-PR (crashed publish) → RECOVER — create the PR from the ref head →
+  blocked; ref-absent → re-derive the conflict fresh. For an OPEN held PR the driver
+  reads its SUBMITTED reviews and reissues iff a non-`*[bot]` review exists beyond the
+  `<!-- sweep-addressed: <review_id> -->` marker (`classifyReviewTrigger`): APPROVED +
+  still merges cleanly → the driver LANDS it (`landApproved` — merges into the local
+  target now, journals `origin-approved` + `resolved` tier `approved`, leaves the branch
+  UNBLOCKED; `finish` verifies + pushes → the PR auto-flips merged); APPROVED-but-stale /
+  CHANGES_REQUESTED / COMMENTED / other → REISSUE (`materializeReissueCase`). Loose
+  issue/inline comments never trigger; they only feed the reissue dialog. It takes
+  `--token-file` (it queries GitHub for those PRs; token missing while unmerged refs
+  exist = `ERR11`), and every lookup/write is fail-closed (non-200 = `ERR13`). The
+  ledger's `merge_status` is no longer read — the pass dir is disposable and `start` is
+  idempotent on origin; a pass that crashed before `finish` published nothing, so the
+  re-derived picture is clean.
 - **Clean-slate boundary (D-055):** the pass lives at ONE canonical location
   `<--workspace>/propagation/pass-<watermark12>`, printed by `start` and `status`.
   `--workspace` is the GROUP ROOT (parent of the clone), defaulted from `--repo`;
@@ -97,6 +132,15 @@ always re-derives a clean picture from origin.
 
 ### `report-case --tier mechanical|judged|held`
 - `--tier` is the ONLY agent param — a CLAIM; the driver is demote-only.
+- **REISSUE case (D-059 FINAL):** when `next-case` served a reissue (a held PR got a new
+  review), the worktree already holds the PRIOR RESOLUTION as the pending files and the
+  case materials carry the FULL time-ordered review dialog. The agent REVISES that
+  resolution to address the review — it does NOT restart, and edits stay in the
+  conflicted paths. `report-case` ALWAYS forces the reissue to HELD (whatever the claimed
+  `--tier`) so a revision never merges in place and bypasses the open review; the sole
+  exception is the APPROVED-still-clean case, which the driver already LANDED at `start`
+  (no reissue served). The revision then flows `report-pr` → `finish`, which republishes
+  to the SAME PR (force-with-lease onto the existing fix ref) — never a second PR.
 - Driver, blocking, internal (deterministic first): snapshot the worktree tree →
   uncommitted/empty check → scope guard (resolution diff ⊆ conflicted paths; a
   violation no longer demotes to HELD here — `scopeExceeded` is CARRIED forward to
@@ -178,10 +222,28 @@ always re-derives a clean picture from origin.
      driver NEVER auto-merges a held PR.
   5. journal-derived owner report (which PRs need the owner, or the done-line).
   6. check upstream advanced past the pinned watermark → `start again` or `done`.
-- Multi-step and resumable: a red verify or `ERR15_PUSH_FAILED` (proxy) → report +
-  HALT + re-runnable from the stopped phase; pushes and PR-creates never redo. A pass
-  that crashes BEFORE `finish` has published nothing — the next `start` re-derives a
-  clean origin picture and redoes the pass.
+- **PUSH RESILIENCE (D-059 FINAL):** step 3 pushes each target branch INDEPENDENTLY —
+  a failure is categorized (diverged / transient / auth) and journaled per branch, and
+  the remaining branches proceed. `ERR15_PUSH_FAILED` is now a PER-BRANCH LABEL, NOT a
+  hard stop; a failed held publish (step 4) is likewise per-case and non-fatal. Only a
+  GLOBAL failure with no per-branch rows (red verify, missing token, closure check)
+  still HALTS `finish`. A partial finish is NOT sealed (machine state stays `finishing`),
+  so re-running `finish` retries exactly the failed pushes/publishes — landed branches
+  skip as up-to-date, verify re-gates, pushes/PR-creates never redo.
+- **The one `SWEEP-RESULT` carries the pass summary (D-059 FINAL):** `status`
+  (`complete` | `partial`), `pullRequests` (every PR the pass touched — open-at-start /
+  reopened / recovered / judged-history / held-review / held-review-reissued /
+  approved-landed — each with number, url, title, live status, `kind`, and a
+  landed/failureCategory annotation), `branches` (per-branch landed vs failed),
+  `failedPushes` / `failedPublishes`, a `stats` block (branches in scope, clean merges,
+  resolved mechanical/judged, approved-landed, held, deferred branches, PRs created-judged
+  / created-held / reissued / reopened / recovered / open-at-start, targets landed/failed
+  by category, upstream-advanced, watermark), and an `instruction` telling the agent to
+  REPORT the landed-vs-conflicted branches + the PR list + stats to the owner.
+- Multi-step and resumable: a red verify or a GLOBAL `finish` halt → report + HALT +
+  re-runnable from the stopped phase; pushes and PR-creates never redo. A pass that
+  crashes BEFORE `finish` has published nothing — the next `start` re-derives a clean
+  origin picture and redoes the pass.
 
 ## 3. Publish-timing rule (the reasoning, one line)
 

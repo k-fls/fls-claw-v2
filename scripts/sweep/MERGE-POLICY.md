@@ -43,6 +43,64 @@ passes now lives in origin's refs, so the local pass dir is disposable and `star
 re-derives a clean picture every time. A fetch failure at `start` is ERR39 (never open
 a pass on a stale view).
 
+D-059 amendment (2026-07-24): held PRs are a two-way REVIEW loop, and `finish`
+publishing is per-branch resilient. Supersedes the D-058 (b) orphan-delete rule and any
+comment-trigger wording.
+
+(a) **Trigger = SUBMITTED REVIEWS ONLY.** A held PR is re-served this pass (a REISSUE)
+iff a submitted, non-`*[bot]` review exists whose id is above the driver's
+`<!-- sweep-addressed: <review_id> -->` marker (or ≥1 such review and no marker yet).
+The marker is a driver comment recognized ONLY when it is a line by itself, id-bounded;
+bot/human split is by CONTENT (the shared PAT authors both), and the effective addressed
+id is the MAX over all marker occurrences (monotonic — a re-asserted value never
+regresses). Loose issue comments and standalone inline comments NEVER trigger a
+reissue — they feed the reissue dialog and nothing else. PENDING (unsubmitted) reviews
+are ignored.
+
+(b) **Review-state → action (all landing verify-gated at `finish`).** For an open held
+PR whose newest review is beyond the marker:
+- **APPROVED + still merges cleanly into the CURRENT target** → the DRIVER lands it: the
+  fix-ref head is merged into the local target now (journaled `origin-approved` +
+  `resolved` tier `approved`, pre-ref recorded so `abort` rolls back), the branch is
+  left UNBLOCKED, and `finish` verifies + pushes the target — the push auto-flips the PR
+  to merged (D-040). NO reissue, and the driver still never hand-merges the PR on GitHub.
+- **APPROVED + STALE** (the target advanced so the head no longer merges cleanly) →
+  REISSUE: the agent re-resolves against the new base, keeping the approved intent.
+- **CHANGES_REQUESTED / COMMENTED / other** → REISSUE → forced HELD (the revision stays
+  in the review loop; it never merges in place and bypasses the open review).
+
+(c) **`start` per-ref classification (orphan-delete RETIRED — a MERGED ref is the ONLY
+delete).** Per origin `fix/sweep/*` ref: merged into `origin/<target>` (head is an
+ancestor) OR the PR reports `merged_at` (squash/rebase-merged) → resolved + delete the
+ref, NEVER a reopen; closed-unmerged PR → REOPEN it (PATCH `state=open`) → PR_ID;
+ref present with NO PR (crashed publish) → recover — create the PR from the ref head,
+the ref resolution authoritative, never re-derived → PR_ID; ref ABSENT → re-derive the
+conflict fresh (new case → new PR at `finish`); a ref whose slug matches no scope branch
+is journaled `origin-ref-unknown` and left alone. Every lookup/write is fail-closed
+(non-200 = ERR13; missing token while unmerged refs exist = ERR11) — an API failure
+never reads as "no PR" nor deletes a ref with a live PR. This SUPERSEDES the D-058 (b)
+"unmerged WITHOUT an open PR → orphan, delete it" rule.
+
+(d) **Reissue feed = the FULL time-ordered dialog** (PR description + issue comments +
+inline review comments + review bodies): the agent's own prior turns are served
+tag-stripped and marked `you (prior)`; every other turn is keyed by its GitHub @login;
+the PR description is the opening turn. The agent REVISES the prior resolution to address
+the review — it never restarts (edits stay in the conflicted paths) — and the revision
+republishes to the SAME PR (force-with-lease onto the existing fix ref, PATCH the same
+PR, a fresh marker at the triggering review id). Owner-pushed commits on the fix branch →
+the case is rebuilt from the CURRENT ref head (the owner's edit is the revision base).
+
+(e) **Push resilience at `finish`.** `finish` pushes each target branch INDEPENDENTLY; a
+failure is categorized (diverged / transient / auth) and journaled — `ERR15` is a
+PER-BRANCH label, NOT a hard stop, and the remaining branches proceed. A held-publish
+failure is likewise per-case and non-fatal. A partial finish is RESUMABLE: the pass is
+not sealed, so re-running `finish` retries exactly the failed pushes/publishes (landed
+branches skip as up-to-date, verify re-gates); pushes and PR-creates never redo. The
+success/partial `SWEEP-RESULT` reports `pullRequests` (every PR the pass touched) and a
+`stats` block (landed/failed branches by category, PRs created/reissued/reopened/
+recovered) with an instruction to report landed-vs-conflicted to the owner. Only a GLOBAL
+failure with no per-branch rows (red verify gate, missing token, closure check) halts.
+
 ## 1. Merge tiers (per parent→branch merge attempt)
 
 | Tier | Trigger | Action | Review | PR |

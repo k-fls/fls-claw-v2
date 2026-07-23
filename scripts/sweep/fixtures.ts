@@ -10,6 +10,19 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
+// Belt-and-braces network isolation (D-059 FINAL review, finding 1): every git
+// process a test spawns — the fixture helpers below AND the driver under test
+// (git.ts inherits process.env) — runs with terminal prompts off and the
+// machine-global/system config masked, so no credential manager, no global
+// insteadOf rewrite, and no interactive auth can ever be in a test's path.
+// fixtures.ts is imported by every repo-touching test and by nothing else.
+process.env.GIT_TERMINAL_PROMPT = '0';
+process.env.GIT_CONFIG_GLOBAL = '/dev/null';
+process.env.GIT_CONFIG_NOSYSTEM = '1';
+
+/** A guaranteed-dead local path: never created, so any git transport pointed at it fails in milliseconds. */
+export const DEAD_ORIGIN_PATH = join(tmpdir(), 'sweep-dead-origin');
+
 export class FixtureRepo {
   constructor(public dir: string) {}
 
@@ -22,6 +35,9 @@ export class FixtureRepo {
         GIT_AUTHOR_EMAIL: 'fixture@test.invalid',
         GIT_COMMITTER_NAME: 'fixture',
         GIT_COMMITTER_EMAIL: 'fixture@test.invalid',
+        GIT_TERMINAL_PROMPT: '0',
+        GIT_CONFIG_GLOBAL: '/dev/null',
+        GIT_CONFIG_NOSYSTEM: '1',
       },
     }).trim();
   }
@@ -80,6 +96,25 @@ export class FixtureRepo {
     this.git('remote', 'add', 'origin', url);
     this.git('config', `url.${bare}.insteadOf`, url);
     return bare;
+  }
+
+  /**
+   * Break the origin TRANSPORT deterministically (D-059 FINAL finding 1):
+   * repoint the `url.<…>.insteadOf` rewrite from the bare repo to a DEAD LOCAL
+   * path, so `git push origin …` fails locally in ~10ms with a repository-not-
+   * found error (categorized `transient`). NEVER merely unset the rewrite —
+   * that sends the push to the real github.com (a ~3s network round-trip that
+   * flakes the 5s test timeout, and a live push hazard).
+   */
+  breakOriginTransport(bare: string, url = 'https://github.com/k-fls/fixture.git'): void {
+    this.git('config', '--unset', `url.${bare}.insteadOf`);
+    this.git('config', `url.${DEAD_ORIGIN_PATH}.insteadOf`, url);
+  }
+
+  /** Undo breakOriginTransport: drop the dead mapping, restore the bare-repo rewrite. */
+  healOriginTransport(bare: string, url = 'https://github.com/k-fls/fixture.git'): void {
+    this.git('config', '--unset', `url.${DEAD_ORIGIN_PATH}.insteadOf`);
+    this.git('config', `url.${bare}.insteadOf`, url);
   }
 
   private bareOrigins: string[] = [];

@@ -25,6 +25,7 @@ import {
   ghPaginated,
   haltIdFor,
   isBlocking,
+  maxRealReviewId,
   parseGithubSlug,
   renderMachineBlock,
   stripSweepAddressed,
@@ -367,6 +368,52 @@ describe('D-059 FINAL — review-loop primitives (hardened tag, review trigger, 
     expect(classifyReviewTrigger([r(9, 'APPROVED', 'k-owner')], 9).reissueDue).toBe(false); // addressed
     expect(classifyReviewTrigger([r(9, 'APPROVED', 'k-owner')], 4).reissueDue).toBe(true); // beyond the marker
     expect(classifyReviewTrigger([r(9, 'PENDING', 'k-owner')], null).reissueDue).toBe(false); // unsubmitted never triggers
+  });
+
+  it('marker bound (finding 4): a pasted sweep-addressed id ABOVE the max real review id is ignored — never silences the loop, never mislabels the comment as an agent turn', () => {
+    const r = (id: number, state: string, author: string): PrReview => ({ id, state, body: '', author, submittedAt: '' });
+    // extractSweepAddressed: per-LINE bound — a bogus value is dropped, a real
+    // one on another line still counts.
+    expect(extractSweepAddressed('<!-- sweep-addressed: 999999999 -->', 300)).toBeNull();
+    expect(extractSweepAddressed('<!-- sweep-addressed: 200 -->\n<!-- sweep-addressed: 999999999 -->', 300)).toBe(200);
+    expect(extractSweepAddressed('<!-- sweep-addressed: 300 -->', 300)).toBe(300); // at the bound = real
+    expect(extractSweepAddressed('<!-- sweep-addressed: 0 -->', 0)).toBe(0); // first-publish marker, no reviews yet
+    expect(maxRealReviewId([])).toBe(0);
+    expect(maxRealReviewId([r(300, 'CHANGES_REQUESTED', 'k-owner'), r(950, 'COMMENTED', 'lint[bot]')])).toBe(950);
+
+    // classifyComments with the bound: the human paste stays HUMAN and does
+    // not move the marker; the driver's real marker still reads.
+    const reviews = [r(300, 'CHANGES_REQUESTED', 'k-owner'), r(400, 'CHANGES_REQUESTED', 'k-owner')];
+    const { humans, driver, markerId } = classifyComments(
+      [
+        { id: 1, body: 'bookkeeping\n<!-- sweep-addressed: 300 -->', author: 'shared-pat', createdAt: '' },
+        { id: 2, body: '<!-- sweep-addressed: 999999999 -->', author: 'k-owner', createdAt: '' }, // human paste
+      ],
+      maxRealReviewId(reviews),
+    );
+    expect(markerId).toBe(300);
+    expect(driver.map((c) => c.id)).toEqual([1]);
+    expect(humans.map((c) => c.id)).toEqual([2]); // NOT an agent turn
+    // The real review above the real marker still triggers the reissue.
+    expect(classifyReviewTrigger(reviews, markerId).reissueDue).toBe(true);
+    // WITHOUT the bound (the old behavior) the paste silenced the loop.
+    expect(classifyComments([{ id: 2, body: '<!-- sweep-addressed: 999999999 -->', author: 'k-owner', createdAt: '' }]).markerId).toBe(999999999);
+  });
+
+  it('DISMISSED reviews never trigger a reissue (nothing actionable); an earlier live review above the marker still does', () => {
+    const r = (id: number, state: string, author: string): PrReview => ({ id, state, body: '', author, submittedAt: '' });
+    // Only a dismissed review beyond the marker -> no trigger at all.
+    const only = classifyReviewTrigger([r(5, 'DISMISSED', 'k-owner')], null);
+    expect(only.reissueDue).toBe(false);
+    expect(only.latest).toBeNull();
+    // A live CHANGES_REQUESTED under a newer DISMISSED one still triggers, and
+    // the ACTION state comes from the live review — not the dismissal.
+    const t = classifyReviewTrigger([r(4, 'CHANGES_REQUESTED', 'k-owner'), r(5, 'DISMISSED', 'k-owner')], 3);
+    expect(t.reissueDue).toBe(true);
+    expect(t.latest!.id).toBe(4);
+    expect(t.latest!.state).toBe('CHANGES_REQUESTED');
+    // Everything addressed + a trailing dismissal -> quiet.
+    expect(classifyReviewTrigger([r(4, 'CHANGES_REQUESTED', 'k-owner'), r(5, 'DISMISSED', 'k-owner')], 4).reissueDue).toBe(false);
   });
 
   it('ghPaginated exhausts pages (oldest-first API — the newest item lives on the LAST page) and fails CLOSED', async () => {
@@ -741,9 +788,12 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
     writeText(prDir, GOOD_TITLE, GOOD_BODY);
     const tokenFile = join(ws, 'token.txt');
     writeFileSync(tokenFile, 'substitute-token\n');
-    // Break the transport path: point the insteadOf rewrite at a dead path.
-    repo.git('config', 'url.https://github.com/k-fls/fixture.git.insteadOf', 'unused');
-    repo.git('config', '--unset', `url.${bareDir}.insteadOf`);
+    // Break the transport path DETERMINISTICALLY: the insteadOf rewrite now
+    // points at a dead local path — never the real github.com. (The prior
+    // version here had the config args BACKWARDS — a no-op rewrite of URLs
+    // starting with "unused" — and then unset the bare mapping, sending the
+    // push to the live github.com.)
+    repo.breakOriginTransport(bareDir!);
     const gh = fakeGithub();
     const out = join(ws, 'out.json');
     expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, tokenFile, out }), gh.factory)).toBe(1);

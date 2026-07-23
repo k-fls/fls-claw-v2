@@ -137,6 +137,7 @@ import {
   listIssueComments,
   listReviewComments,
   listReviews,
+  maxRealReviewId,
   parseGithubSlug,
   postSweepAddressed,
   realGithubTransport,
@@ -3763,15 +3764,30 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
   // independently, so a partial land is safe; landed branches are up-to-date
   // (skipped) on the next push, failed ones retry.
   const pushed: string[] = [];
-  const pushFailed: Array<{ branch: string; category: 'diverged' | 'transient' | 'auth'; detail: string }> = [];
-  const categorize = (msg: string): 'diverged' | 'transient' | 'auth' => {
+  type PushFailCategory = 'diverged' | 'transient' | 'auth' | 'rejected';
+  const pushFailed: Array<{ branch: string; category: PushFailCategory; detail: string }> = [];
+  const categorize = (msg: string): PushFailCategory => {
+    // A pre-receive-hook / permission rejection is NOT divergence (finding 3):
+    // its git output also says "[remote rejected] … failed to push some refs",
+    // but no history diverged — re-pushing can never succeed until the owner
+    // changes the hook/branch protection. Checked FIRST so the diverged
+    // patterns below cannot shadow it.
+    if (/pre-receive hook declined|protected branch|\b403\b|permission.*denied to/i.test(msg)) return 'rejected';
     if (/non-fast-forward|fetch first|stale info|\[rejected\]|failed to push some refs/i.test(msg)) return 'diverged';
-    if (/401|403|denied|authentication|could not read username|invalid credentials|terminal prompts disabled|bad credentials/i.test(msg))
+    if (/401|denied|authentication|could not read username|invalid credentials|terminal prompts disabled|bad credentials/i.test(msg))
       return 'auth';
     return 'transient';
   };
-  const failBranch = (branch: string, category: 'diverged' | 'transient' | 'auth', detail: string): void => {
+  // Categories that can NEVER self-heal by retrying (finding 3): the owner must
+  // act. Journaled as a DISTINCT escalation row so `finish` can surface them as
+  // needs-owner (not merely a category) and an autonomous re-run loop can stop
+  // re-trying the branch.
+  const NEEDS_OWNER: ReadonlySet<PushFailCategory> = new Set(['diverged', 'rejected']);
+  const failBranch = (branch: string, category: PushFailCategory, detail: string): void => {
     appendJournal(dir, { action: 'push-failed', id: 'ERR15_PUSH_FAILED', branch, category, message: detail });
+    if (NEEDS_OWNER.has(category)) {
+      appendJournal(dir, { action: 'push-escalated', branch, category, detail });
+    }
     issues.push({ id: 'ERR15_PUSH_FAILED', detail });
     pushFailed.push({ branch, category, detail });
     console.error(`push [ERR15_PUSH_FAILED/${category}]: ${detail}`);
@@ -3802,14 +3818,30 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
         `git push of target '${intent.branch}' failed (${category}): ${msg} — ` +
           (category === 'diverged'
             ? 'owner escalation (D-046 case 2), never force-resolve; the other targets proceed'
-            : 'report to the owner (D-046 case 2); the other targets proceed and this branch retries on the next finish'),
+            : category === 'rejected'
+              ? 'owner escalation (D-046 case 2): a hook/branch-protection rejection cannot heal by retrying; the other targets proceed'
+              : 'report to the owner (D-046 case 2); the other targets proceed and this branch retries on the next finish'),
       );
     }
   }
 
-  // Networked steps (closure checks + urge posting). Only constructed when
-  // there is work; same --token-file contract as publish (D-049 decision 7).
-  const needsNetwork = judgedPrs.length > 0 || dueUrges.length > 0;
+  // APPROVED-landing rollback escalations pending a post (finding 2): the
+  // verify stage journals `approved-rollback` offline; THIS stage owns the
+  // networked comment. One post per rollback — an `approved-escalated` row
+  // marks it done, so re-runs never re-post.
+  const pendingApprovedEscalations = journal.filter(
+    (e) =>
+      e.action === 'approved-rollback' &&
+      typeof e.prNumber === 'number' &&
+      !journal.some(
+        (d) => d.action === 'approved-escalated' && d.branch === e.branch && d.reviewId === e.reviewId,
+      ),
+  );
+
+  // Networked steps (closure checks + urge posting + approved-rollback
+  // escalations). Only constructed when there is work; same --token-file
+  // contract as publish (D-049 decision 7).
+  const needsNetwork = judgedPrs.length > 0 || dueUrges.length > 0 || pendingApprovedEscalations.length > 0;
   let transport: GithubTransport | null = null;
   let slugParts: { owner: string; repo: string } | null = null;
   if (needsNetwork) {
@@ -3857,6 +3889,42 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
         issues.push({
           id: 'ERR16_CLOSURE_FAILED',
           detail: `closure check for PR #${e.number} failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    }
+  }
+
+  // (2b) APPROVED-landing rollback escalations (finding 2): tell the owner
+  // their approved resolution fails the integration build, WITH the marker
+  // advanced to the approving review id — the next `start` then reads the
+  // review as addressed and neither re-lands nor re-serves it (a NEW review
+  // re-triggers). Journaled `approved-escalated` on success (post-once); a
+  // failed post is blocking (fail-closed) and retries on the next push.
+  if (transport && slugParts) {
+    const api = `/repos/${slugParts.owner}/${slugParts.repo}`;
+    for (const esc of pendingApprovedEscalations) {
+      const reviewId = typeof esc.reviewId === 'number' ? esc.reviewId : 0;
+      const body = [
+        `Sweep escalation (driver-posted): the APPROVED resolution on this PR (review ${reviewId}) was landed on \`${String(esc.branch)}\` but FAILED the pass's integration build (verify) and was ROLLED BACK — the approved fix breaks the build.`,
+        `Owner action needed on \`${String(esc.ref ?? '')}\`: revise the resolution. This advances the sweep-addressed marker to review ${reviewId}, so the sweep will NOT re-land or re-serve this case until a NEW review is submitted — after revising, SUBMIT A NEW REVIEW on this PR to re-trigger the loop.`,
+        renderSweepAddressed(reviewId),
+      ].join('\n');
+      try {
+        await ghExpect(transport, 'POST', `${api}/issues/${esc.prNumber}/comments`, { body });
+        appendJournal(dir, {
+          action: 'approved-escalated',
+          branch: esc.branch,
+          ref: esc.ref ?? null,
+          prNumber: esc.prNumber,
+          reviewId: esc.reviewId ?? null,
+        });
+        console.error(
+          `push: APPROVED-rollback escalation posted on PR #${esc.prNumber} (${String(esc.branch)}, marker -> review ${reviewId})`,
+        );
+      } catch (err) {
+        issues.push({
+          id: 'ERR13_API_FAILED',
+          detail: `approved-rollback escalation for '${String(esc.branch)}' (PR #${esc.prNumber}) failed: ${err instanceof Error ? err.message : String(err)} — retries on the next push`,
         });
       }
     }
@@ -3916,6 +3984,15 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
     }
   }
 
+  // Blocking NON-push issues (ERR16/ERR17/token/API) are journaled as
+  // `push-issue` rows (finding 3): `finish` reads only the journal delta, so
+  // without these rows a partial finish silently DROPPED them from the
+  // SWEEP-RESULT whenever per-branch push failures also occurred.
+  for (const i of issues) {
+    if (isBlocking(i.id) && i.id !== 'ERR15_PUSH_FAILED') {
+      appendJournal(dir, { action: 'push-issue', id: i.id, detail: i.detail });
+    }
+  }
   const ok = !issues.some((i) => isBlocking(i.id));
   console.error(
     `push ${ok ? 'complete' : 'FINISHED WITH BLOCKING ISSUES'} — ${pushed.length} branch(es) pushed, ` +
@@ -4046,6 +4123,29 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     conflictedPaths: [],
     reason: 'gate',
   });
+  // APPROVED-LANDING offender (D-059 FINAL finding 2): the rolled-back merge
+  // was an owner-APPROVED resolution landed at `start`. Without a signal the
+  // loop is silent and infinite — every later pass re-derives the still-open
+  // approved PR, re-lands it, re-fails verify, re-rolls back, and the owner
+  // never learns their approved fix breaks the build. Journal the escalation
+  // here (verify is offline); `push` (networked) posts the PR comment WITH the
+  // marker advanced to the approving review id, so the next `start` reads the
+  // review as addressed and does NOT re-land (escalate-once semantics).
+  const approvedRow = journal.find((e) => e.action === 'origin-approved' && e.branch === offender);
+  if (approvedRow) {
+    appendJournal(dir, {
+      action: 'approved-rollback',
+      branch: offender,
+      ref: typeof approvedRow.ref === 'string' ? approvedRow.ref : null,
+      prNumber: typeof approvedRow.prNumber === 'number' ? approvedRow.prNumber : null,
+      reviewId: typeof approvedRow.reviewId === 'number' ? approvedRow.reviewId : null,
+      detail:
+        'the APPROVED landing failed the integration build and was rolled back — owner escalation pending (comment posted by the push stage)',
+    });
+    console.error(
+      `verify: offender ${offender} was an APPROVED landing — escalation journaled (the owner is notified at push; the marker advance stops the re-land loop)`,
+    );
+  }
   // Gate hold (D-057/D-058): the journaled `held` row above IS the PR_ID state
   // for the rest of the pass — no conflicting head / PR (blockedRows keeps
   // headSha null), so it cannot auto-complete; the owner clears it manually.
@@ -4672,7 +4772,9 @@ function buildReviewDialog(args: {
   if (description) {
     items.push({ role: 'agent', author: '', kind: 'pr-description', id: null, at: args.pr.createdAt, body: description });
   }
-  const { humans, driver } = classifyComments(args.issueComments);
+  // Finding 4: same reality bound as the trigger — a human comment pasting an
+  // out-of-range marker stays a REVIEWER turn, never `you (prior)`.
+  const { humans, driver } = classifyComments(args.issueComments, maxRealReviewId(args.reviews));
   for (const c of driver) {
     const stripped = stripSweepAddressed(c.body);
     if (!stripped) continue; // marker-only bookkeeping — not a dialog turn
@@ -4829,6 +4931,7 @@ async function materializeReissueCase(
     const body = [
       `Sweep escalation (driver-posted): the review on this PR cannot be served as a revision case — ${reason}.`,
       `Owner action needed on \`${args.ref}\` (target \`${args.branch}\`); the branch stays blocked meanwhile.`,
+      `Note: this advances the sweep-addressed marker to review ${args.latestReview.id}, so the sweep will NOT re-serve this until a NEW review arrives — after fixing the ref, SUBMIT A NEW REVIEW on this PR to re-trigger the loop.`,
       renderSweepAddressed(args.latestReview.id),
     ].join('\n');
     await ghExpect(transport, 'POST', `/repos/${slugParts.owner}/${slugParts.repo}/issues/${args.pr.number}/comments`, {
@@ -5173,6 +5276,38 @@ async function deriveOriginMergeStatus(
         throw e;
       }
       const localTip = await revParse(cli.repo, u.branch);
+      if (await isAncestor(cli.repo, u.sha, localTip)) {
+        // Already contained: a prior pass landed the approved head locally but
+        // its push failed/crashed before origin saw it (which is why the ref
+        // still classifies unmerged). Re-merging would create a DUPLICATE
+        // empty merge — journal the landing rows instead, so verify re-gates
+        // it and the target push finally lands the existing merge.
+        await recordPreRef(cli, dir, preReffed, u.branch);
+        appendJournal(dir, {
+          action: 'origin-approved',
+          branch: u.branch,
+          ref: u.ref,
+          headSha: u.sha,
+          prNumber: open.number,
+          prUrl: open.url,
+          reviewId: latest.id,
+          alreadyContained: true,
+        });
+        appendJournal(dir, {
+          action: 'resolved',
+          branch: u.branch,
+          caseId: `origin:${u.ref}`,
+          tier: 'approved',
+          mergeCommit: localTip,
+          prNumber: open.number,
+          reviewId: latest.id,
+          alreadyContained: true,
+        });
+        console.error(
+          `sweep start: ${u.branch} — review PR #${open.number} APPROVED (review ${latest.id}) and its head is ALREADY CONTAINED in the local tip (a prior landing whose push never arrived): no duplicate merge; pushed + auto-flipped at finish; not blocked`,
+        );
+        return true;
+      }
       const probe = localTip === originTip ? originProbe : await newStyleMergeTree(cli.repo, localTip, u.sha);
       if (!probe.clean) return false;
       await recordPreRef(cli, dir, preReffed, u.branch);
@@ -5234,14 +5369,41 @@ async function deriveOriginMergeStatus(
           // comments are fetched for the marker watermark (+ dialog); loose
           // comments/inline comments never trigger. All lists paginated.
           const comments = await listIssueComments(transport!, slugParts!, open.number);
-          const { markerId } = classifyComments(comments);
           const reviews = await listReviews(transport!, slugParts!, open.number);
+          // Finding 4: the marker is bounded TO REALITY — a pasted
+          // sweep-addressed id above the max real review id is ignored, so a
+          // human comment can never silence the review loop.
+          const { markerId } = classifyComments(comments, maxRealReviewId(reviews));
           const trigger = classifyReviewTrigger(reviews, markerId);
           if (!trigger.reissueDue) {
-            journalBlocked(open, markerId);
-            console.error(
-              `sweep start: ${u.branch} blocked — open PR #${open.number} on '${u.ref}' (origin-derived; no review beyond the marker)`,
-            );
+            // DISMISSED reviews never reissue (nothing actionable —
+            // classifyReviewTrigger excludes them), but a dismissal BEYOND the
+            // marker ADVANCES it (posted once), so the state reads as current.
+            const dismissedBeyond = reviews
+              .filter(
+                (r) =>
+                  r.state === 'DISMISSED' && !r.author.endsWith('[bot]') && (markerId === null || r.id > markerId),
+              )
+              .reduce((m, r) => Math.max(m, r.id), 0);
+            if (dismissedBeyond > 0) {
+              await postSweepAddressed(transport!, slugParts!, open.number, dismissedBeyond);
+              appendJournal(dir, {
+                action: 'review-dismissed',
+                branch: u.branch,
+                ref: u.ref,
+                prNumber: open.number,
+                reviewId: dismissedBeyond,
+              });
+              journalBlocked(open, dismissedBeyond);
+              console.error(
+                `sweep start: ${u.branch} blocked — open PR #${open.number} on '${u.ref}'; review ${dismissedBeyond} was DISMISSED (nothing actionable) — marker advanced, NO reissue`,
+              );
+            } else {
+              journalBlocked(open, markerId);
+              console.error(
+                `sweep start: ${u.branch} blocked — open PR #${open.number} on '${u.ref}' (origin-derived; no review beyond the marker)`,
+              );
+            }
           } else if (trigger.latest!.state === 'APPROVED' && (await landApproved(u, open, trigger.latest!))) {
             // landed — logged inside; the branch is NOT blocked.
           } else {
@@ -6577,6 +6739,17 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   progress(`urge comments (${pushDelta.filter((e) => e.action === 'urge').length})`);
   writeMachineState(dir, { ...st, finishStep: 'held-prs' });
 
+  // SYSTEMIC OUTAGE short-circuit (D-059 FINAL finding 3): when EVERY push
+  // this run failed `transient` and nothing landed, the network itself is
+  // down — attempting every held publish (each of which starts with a `git
+  // push` of its fix ref) over the same dead transport would just burn a
+  // timeout per case for identical failures. Bail to the partial report; the
+  // held cases have no `pr-published` rows and retry on the next finish.
+  const systemicOutage =
+    pushFailures.length > 0 &&
+    !pushDelta.some((e) => e.action === 'push') &&
+    pushFailures.every((f) => f.category === 'transient');
+
   // (4) create the HELD PRs (D-058: the ONE publish phase for held cases —
   // push the fix/sweep ref + review PR, active for a marker-clean resolution,
   // draft for the pristine conflict; NEVER merged by the driver). After the
@@ -6584,7 +6757,22 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   // current). ERR07 (journal + open-PR-by-head) makes a resumed finish skip
   // already-created PRs; gate holds have no case and are never published.
   const publishFailures: Array<{ caseId: string; branch: string }> = [];
-  {
+  let heldPublishesSkipped = 0;
+  if (systemicOutage) {
+    const journal = readJournal(dir);
+    heldPublishesSkipped = [...journaledCases(journal).values()].filter(
+      (jc) =>
+        lastDisposition(journal, jc.caseId)?.action === 'held' &&
+        !journal.some((e) => e.action === 'pr-published' && e.caseId === jc.caseId),
+    ).length;
+    appendJournal(dir, {
+      action: 'publish-phase-skipped',
+      reason: 'systemic-outage',
+      heldPending: heldPublishesSkipped,
+      detail: 'every target push failed transient (network down) — held publishes not attempted; they retry on the next finish',
+    });
+    progress(`held PRs SKIPPED (${heldPublishesSkipped} pending) — systemic transient outage; re-run finish when the network heals`);
+  } else {
     const journal = readJournal(dir);
     const held = [...journaledCases(journal).values()].filter(
       (jc) => lastDisposition(journal, jc.caseId)?.action === 'held',
@@ -6711,11 +6899,25 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   });
   const resolvedRows = journalFinal.filter((e) => e.action === 'resolved');
   const publishedRows = journalFinal.filter((e) => e.action === 'pr-published');
-  const failedByCategory = { diverged: 0, transient: 0, auth: 0 };
+  const failedByCategory = { diverged: 0, transient: 0, auth: 0, rejected: 0 };
   for (const f of pushFailures) {
     failedByCategory[(f.category as keyof typeof failedByCategory) ?? 'transient'] =
       (failedByCategory[(f.category as keyof typeof failedByCategory) ?? 'transient'] ?? 0) + 1;
   }
+  // Finding 3: owner-action-required failures (diverged / hook-rejected) and
+  // blocking non-push issues (ERR16/ERR17/token/API) from THIS run's push
+  // phase — surfaced as their own SWEEP-RESULT fields, not merely categories,
+  // so an autonomous re-run loop can stop re-trying what only the owner can fix.
+  const needsOwner = pushDelta
+    .filter((e) => e.action === 'push-escalated')
+    .map((e) => ({
+      branch: String(e.branch),
+      category: String(e.category ?? 'diverged'),
+      detail: String(e.detail ?? ''),
+    }));
+  const pushBlockingIssues = pushDelta
+    .filter((e) => e.action === 'push-issue')
+    .map((e) => ({ id: String(e.id), detail: String(e.detail) }));
   const stats = {
     branchesInScope: passOrder(dir).length,
     cleanMerges: journalFinal.filter((e) => e.action === 'merge').length,
@@ -6742,7 +6944,8 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   };
   if (anyFailures) {
     console.error(
-      `sweep finish PARTIAL — ${pushFailures.length} push failure(s), ${publishFailures.length} publish failure(s); re-run finish`,
+      `sweep finish PARTIAL — ${pushFailures.length} push failure(s), ${publishFailures.length} publish failure(s)` +
+        `${needsOwner.length ? `, ${needsOwner.length} OWNER-ACTION-REQUIRED` : ''}${systemicOutage ? ' (systemic outage — held publishes skipped)' : ''}; re-run finish`,
     );
     result(cli, {
       ok: false,
@@ -6753,12 +6956,20 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
       branches,
       failedPushes: pushFailures,
       failedPublishes: publishFailures,
+      // Finding 3: needs-owner failures are a FIRST-CLASS field — a re-run
+      // loop must stop re-trying these branches and hand them to the owner.
+      needsOwner,
+      blockingIssues: pushBlockingIssues,
+      ...(systemicOutage ? { systemicOutage: true, heldPublishesSkipped } : {}),
       stats,
       instruction:
         `REPORT to the owner FACTUALLY: which branches LANDED (${branches.filter((b) => b.landed).map((b) => b.branch).join(', ') || 'none'}) ` +
         `and which FAILED with their categories (${pushFailures.map((f) => `${f.branch}: ${f.category}`).join('; ') || 'none'}${publishFailures.length ? `; held publishes: ${publishFailures.map((p) => p.caseId).join(', ')}` : ''}), ` +
-        `plus every PR in pullRequests (number, title, status) and the stats. DIVERGED branches need the owner (never force-resolve); ` +
-        `then re-run \`finish\` — landed branches skip, failed ones retry.`,
+        `plus every PR in pullRequests (number, title, status) and the stats.` +
+        `${pushBlockingIssues.length ? ` Blocking push-phase issues: ${pushBlockingIssues.map((i) => i.id).join(', ')}.` : ''} ` +
+        `${needsOwner.length ? `OWNER ACTION REQUIRED (do NOT just re-run for these): ${needsOwner.map((n) => `${n.branch} (${n.category})`).join('; ')} — never force-resolve. ` : 'DIVERGED branches need the owner (never force-resolve); '}` +
+        `${systemicOutage ? `Network outage: ${heldPublishesSkipped} held publish(es) were skipped, not attempted. ` : ''}` +
+        `then re-run \`finish\` — landed branches skip, transient failures retry.`,
     });
     return 1;
   }

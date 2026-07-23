@@ -17,9 +17,12 @@ channel. Architecture: `docs/design/02-self-maintaining-flsclaw.md` (branch
 3. **All pushes and PR writes are the DRIVER's — you hand-push and hand-post
    NOTHING, ever.** Never `git push` any ref (including `fix/sweep/*`); never
    create a PR or comment via curl/node/gh. The driver creates every PR (and moves
-   every ref) inside `finish`; `start` also touches origin (it deletes stale
-   `fix/sweep/*` refs). A failed driver push is a stop-case 2 report and a full
-   publication stop — no fallback, no workaround, no retry loop.
+   every ref) inside `finish`; `start` also touches origin (it reconciles the
+   `fix/sweep/*` refs — resolving/reopening/recovering PRs). You NEVER push or
+   force-push a ref, and you NEVER work around a driver push failure by hand. A
+   push failure is the driver's to categorize and retry: per-branch failures let
+   the rest of the pass finish (report landed-vs-failed, re-run `finish`); only a
+   GLOBAL halt or a DIVERGED branch is a stop-case 2 report.
 4. Merge discipline (ENFORCED by the driver — you never sequence or execute
    inventory-branch merges by hand): new-style `git merge-tree`, never
    cherry-pick; merge unit = upstream first-parent commit; `everything*` branches
@@ -150,6 +153,15 @@ branch is a driver halt and an owner escalation.
      the driver publishes your last resolution as an active PR flagged
      `[AUTO-ESCALATED: …]` with the feedback in the description; stop
      re-resolving and take the next case.
+   - REISSUED CASE — sometimes `next-case` hands you a case that says REISSUE:
+     the owner REVIEWED one of your open held PRs and left a review. The worktree
+     already holds your PRIOR RESOLUTION as the pending files, and the materials
+     carry the FULL PR dialog, time-ordered — turns marked `you (prior)` are your
+     own earlier messages, every other turn names its author by GitHub @login.
+     REVISE the existing resolution to address the review (edit only the
+     conflicted paths); do NOT start over. `report-case` forces it to HELD and
+     `finish` republishes to the SAME PR — you never open a second PR for the
+     same review, and you never touch the PR on GitHub yourself.
    - `report-pr` (judged/held only) — write `pr/title.txt` + `pr/body.md` in the
      case dir (standards below), then run it. ONE cold read over the resolution
      diff AND your description together; a description-only defect → `rewrite:
@@ -163,9 +175,22 @@ branch is a driver halt and an owner escalation.
      pushed (auto-flipping the JUDGED PRs to merged), closures checked, urge
      comments posted, then the HELD PRs created (active or draft; bases now
      current), journal-derived owner report printed + whether upstream advanced
-     (`start again` / `done`). RESUMABLE: after any halt, re-run `finish` — it
-     resumes from the stopped phase, pushes and PR-creates never redo (a push
-     failure is still `ERR15`: report first).
+     (`start again` / `done`).
+   - `finish` SWEEP-RESULT — the ONE success/partial result line carries
+     `pullRequests` (EVERY PR the pass touched — found-open, reopened, recovered,
+     created, reissued, approved-landed — with number, url, title, live status)
+     plus a `stats` block (branches advanced, merges, PRs by kind, and per-branch
+     landed-vs-failed by failure category) and an `instruction`. You MUST relay
+     that to the owner in your end-of-sweep result: which branches LANDED vs which
+     are still conflicted/failed, the PR list, and the stats.
+   - PARTIAL FINISH IS NORMAL, not a hard stop — `finish` pushes each branch
+     INDEPENDENTLY: a per-branch push/publish failure (`ERR15` etc.) is journaled
+     and the rest of the pass FINISHES; the result comes back `status:"partial"`.
+     Report the landed-vs-failed split factually (diverged branches need the owner
+     — never force-resolve) and then simply RE-RUN `finish`: landed branches skip,
+     failed ones retry, verify re-gates, nothing double-publishes. Only a GLOBAL
+     halt (verify red, missing token, closure check) is a true stop — those, and
+     a diverged branch, are the report-and-stop cases.
    - `abort --execute` — the ONLY sanctioned way to drop an in-flight pass
      (rolls every mutated branch back to its journaled pre-ref). `status` /
      `report` print pass state and the journal-derived summary.
@@ -219,7 +244,7 @@ the row says — never argue with or work around a blocking id.
 | `ERR12_ORIGIN_UNRESOLVED` | origin is not a github.com URL → fix the clone's origin; report if you cannot |
 | `ERR13_API_FAILED` | GitHub API write failed → retry once; still failing = stop-case 2 report |
 | `ERR14_BASE_BEHIND` | `finish` height check: origin already contains the merge commit → order violation; unclear → owner |
-| `ERR15_PUSH_FAILED` | driver push failed → stop-case 2 report, STOP publication; no fallback or workaround; re-running `finish` later resumes the non-pushed phases |
+| `ERR15_PUSH_FAILED` | a driver push failed on THAT branch (categorized diverged/transient/auth) — a PER-BRANCH label, NOT a full stop: the rest of the pass finishes and the result is `status:"partial"`. Report landed-vs-failed, then re-run `finish` (landed skip, failed retry); a diverged branch needs the owner (never force-resolve). No hand-push, ever |
 | `ERR16_CLOSURE_FAILED` | a JUDGED PR did not auto-flip merged after the target push → investigate, report; publish nothing more until understood |
 | `ERR17_URGE_FAILED` | urge comment failed → retries next `finish`; recurring = stop-case 2 report |
 | `ERR18_VERIFY_PENDING` | push attempted before green verify → re-run `finish` (verify runs first); never work around the gate |
@@ -319,10 +344,12 @@ you need to stop?
    driver's suggested parent(s)/descendant(s) with evidence SHAs, and YOUR
    recommended answer. Ask once, STOP, wait; don't re-ask until the candidate's
    tip moves. Finish whatever needs no answer first.
-2. **Something genuinely bad or unusual.** Access/auth failures, driver push
-   failures, tooling errors you cannot fix, diverged branches, upstream history
-   rewrites, verify reds that survive rollback. One message — what broke, what
-   you already did, what you need — then STOP.
+2. **Something genuinely bad or unusual.** Access/auth failures, a GLOBAL `finish`
+   halt (verify red that survives rollback, missing token, closure check), tooling
+   errors you cannot fix, diverged branches, upstream history rewrites. One message
+   — what broke, what you already did, what you need — then STOP. (A per-branch push
+   failure / partial finish is NOT this case: report it in the end-of-sweep result
+   and re-run `finish`.)
 3. **End-of-sweep result — exactly one per sweep.** Each PR that needs the owner
    as `#N — <one line: the exact decision being asked>`; fold in pending
    case-1/2 asks as one line each. If NOTHING needs the owner: exactly one line —
