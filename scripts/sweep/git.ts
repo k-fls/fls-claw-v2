@@ -255,12 +255,24 @@ export async function commitTreeMerge(
  * Driver push (D-049 §5): move a ref on origin via `git push` — the ONLY way
  * refs move to the remote (the API is never used to fabricate refs/commits as
  * a push workaround). `src` is a committish (branch name or sha); `dstBranch`
- * the remote branch name. Never force. Throws GitError on failure — callers
- * journal the halt and surface ERR15_PUSH_FAILED (a D-046 case-2 owner report,
- * no fallback of any kind).
+ * the remote branch name. Never force — with ONE compare-and-swap exception
+ * (D-059): a reissue republish replaces the prior resolution head on the
+ * fix/sweep ref (non-fast-forward by construction), so the caller passes the
+ * EXPECTED old sha as `forceWithLease` and the push succeeds only if the
+ * remote ref is still exactly there (no blind force, ever). Throws GitError on
+ * failure — callers journal the halt and surface ERR15_PUSH_FAILED (a D-046
+ * case-2 owner report, no fallback of any kind).
  */
-export async function gitPush(repo: string, src: string, dstBranch: string): Promise<void> {
-  await git(repo, ['push', 'origin', `${src}:refs/heads/${dstBranch}`]);
+export async function gitPush(
+  repo: string,
+  src: string,
+  dstBranch: string,
+  opts: { forceWithLease?: string } = {},
+): Promise<void> {
+  const args = ['push'];
+  if (opts.forceWithLease) args.push(`--force-with-lease=refs/heads/${dstBranch}:${opts.forceWithLease}`);
+  args.push('origin', `${src}:refs/heads/${dstBranch}`);
+  await git(repo, args);
 }
 
 /** Reset a branch ref (rollback) with compare-and-swap on the expected current value. */

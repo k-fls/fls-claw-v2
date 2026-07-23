@@ -124,18 +124,25 @@ import { scopeGuard } from './scope-guard.js';
 import {
   advisoryTextIssues,
   checkBaseHeight,
+  classifyComments,
   createPullRequest,
   decidedAlready,
   getOpenPrByHead,
+  getPrsByHead,
   ghExpect,
   haltIdFor,
   isBlocking,
+  listIssueComments,
   parseGithubSlug,
+  postSweepAddressed,
   realGithubTransport,
   renderMachineBlock,
+  renderSweepAddressed,
+  reopenPullRequest,
   withMachineBlock,
   type GithubTransport,
   type Issue,
+  type PrComment,
 } from './publish.js';
 import { buildStepFile, caseId, readCaseFile, slug, verifyStepFile, writeJsonFile } from './steps.js';
 import { applyFloor, isClaimableTier, tierFloor } from './tiers.js';
@@ -451,6 +458,12 @@ interface BlockedRow {
   /** fix/sweep head branch on origin (urge target); null until a PR exists. */
   fixBranch: string | null;
   prNumber: number | null;
+  /**
+   * The PR's effective sweep-addressed id at classification time (D-059; null
+   * when unknown/no marker). Urge comments re-assert it so every driver
+   * comment carries the marker (the content-based bot exclusion).
+   */
+  markerId: number | null;
 }
 
 /**
@@ -482,6 +495,7 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
         headSha: typeof e.headSha === 'string' ? e.headSha : null,
         fixBranch: typeof e.fixBranch === 'string' ? e.fixBranch : null,
         prNumber: typeof e.prNumber === 'number' ? e.prNumber : null,
+        markerId: typeof e.markerId === 'number' ? e.markerId : null,
       });
     } else if (e.action === 'held') {
       const jc = typeof e.caseId === 'string' ? cases.get(e.caseId) : undefined;
@@ -491,6 +505,7 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
         headSha: jc?.head.sha ?? null,
         fixBranch: null, // no PR until `finish` publishes (D-058)
         prNumber: null,
+        markerId: null,
       });
     } else if (e.action === 'pr-published' && e.mode === 'held') {
       const row = (out.get(e.branch) ?? []).find((r) => r.caseId === e.caseId);
@@ -616,6 +631,8 @@ interface PendingUrge {
   prNumber: number | null;
   /** The blocking case id (merge_status PR_ID caseId, D-057). */
   caseId: string;
+  /** Current sweep-addressed id re-asserted by the urge comment (D-059). */
+  markerId: number | null;
 }
 
 /**
@@ -651,6 +668,7 @@ async function detectUrges(cli: Cli, ctx: PassCtx, journal: JournalEntry[]): Pro
       fixBranch: row.fixBranch,
       prNumber: row.prNumber,
       caseId: row.caseId,
+      markerId: row.markerId,
     });
   }
   return due;
@@ -672,6 +690,11 @@ async function urgeCommentBody(cli: Cli, urge: PendingUrge): Promise<string> {
     ...lines,
     '',
     `Resolving this PR unblocks \`${urge.branch}\` and everything downstream.`,
+    '',
+    // D-059: every driver comment carries the sweep-addressed marker (the
+    // content-based bot exclusion — same PAT as the human). The urge RE-ASSERTS
+    // the current value; classification takes the MAX, so this never regresses.
+    renderSweepAddressed(urge.markerId ?? 0),
   ].join('\n');
 }
 
@@ -1267,8 +1290,21 @@ async function cleanPrefixTree(
  * `automergeTree`) are unaffected — only what is committed vs pending changes.
  * Best-effort — on failure journal a warning and continue (the case is still
  * resolvable via an agent-made worktree).
+ *
+ * D-059 (reissue): `contentSource` overrides WHERE the pending files' on-disk
+ * content comes from (default: the automerge tree — the fresh conflict with
+ * markers). A REISSUE case passes the origin fix/sweep ref head so the agent
+ * edits the PRIOR RESOLUTION (revises it per the owner's PR comments) instead
+ * of re-resolving the raw conflict. Everything else (prefix HEAD, pending
+ * status, snapshot/scope-guard vs automergeTree) is identical.
  */
-async function createCaseWorktree(cli: Cli, dir: string, caseFile: CaseFile, baseTip: string): Promise<void> {
+async function createCaseWorktree(
+  cli: Cli,
+  dir: string,
+  caseFile: CaseFile,
+  baseTip: string,
+  contentSource?: string,
+): Promise<void> {
   const wtPath = join(dir, caseFile.id, 'worktree');
   try {
     const prefixTree = await cleanPrefixTree(cli.repo, caseFile.automergeTree, baseTip, caseFile.conflictedPaths);
@@ -1295,9 +1331,10 @@ async function createCaseWorktree(cli: Cli, dir: string, caseFile: CaseFile, bas
     // automerge (marker) blob to disk without staging, or delete the file when the
     // automerge tree dropped it (delete/modify conflict), so `git status` = exactly
     // the conflict. The index still holds the prefix (ours) version — hence pending.
+    const source = contentSource ?? caseFile.automergeTree;
     for (const p of caseFile.conflictedPaths) {
       const abs = join(wtPath, p);
-      const blob = await git(cli.repo, ['cat-file', '-p', `${caseFile.automergeTree}:${p}`], { allowCodes: [128] });
+      const blob = await git(cli.repo, ['cat-file', '-p', `${source}:${p}`], { allowCodes: [128] });
       if (blob.code === 0) {
         mkdirSync(dirname(abs), { recursive: true });
         writeFileSync(abs, blob.stdout);
@@ -1315,6 +1352,7 @@ async function createCaseWorktree(cli: Cli, dir: string, caseFile: CaseFile, bas
       path: wtPath,
       rerereSeeded: seeded,
       pendingPaths: caseFile.conflictedPaths,
+      ...(contentSource ? { contentSource } : {}),
     });
   } catch (e) {
     appendJournal(dir, {
@@ -1947,9 +1985,13 @@ export async function cmdRun(cli: Cli): Promise<number> {
 
   // pass-complete only when no open cases AND the §9 gate is green for the
   // current set of merges (a green `verify` journal entry after the last merge).
+  // "Open cases" covers MORE than this run's own gating (D-059): a REISSUE case
+  // journaled at `start` (undispositioned, never emitted by run — its branch is
+  // PR_ID) must keep the pass open, or run would seal a pass with a case still
+  // to serve and report-*/finish could no longer attach.
   let sealed = false;
   let missing: string | null = null;
-  if (gated) {
+  if (gated || openCases(readJournal(dir)).length > 0) {
     missing = 'open cases remain';
   } else {
     const after = readJournal(dir);
@@ -2250,6 +2292,108 @@ async function reverifyCase(
       conflictedPaths: rc.conflictedPaths,
       automergeTree: rc.automergeTree,
       reproduction: rc.reproduction,
+      tierFloor: floor,
+      scopeGuardMode,
+      pendingAbove,
+      scope,
+      descendants,
+    },
+  };
+}
+
+/**
+ * D-059 — re-verification for a REISSUE case (a revision of a published-and-
+ * commented resolution). `reverifyCase` cannot apply: it re-derives the case
+ * from the live plan sweep, but a reissue branch is PR_ID-blocked (empty
+ * interval — the sweep never probes it) and the recorded head may sit below a
+ * since-advanced upstream run top. The trust anchor here is the JOURNAL row
+ * the DRIVER wrote at `start` from the origin fix ref (agent-unwritable), and
+ * the conflict is re-probed DIRECTLY against the live branch tip — the same
+ * staleness model as `publishHead`'s held path. case.json stays a pointer:
+ * conflict set + automerge tree are RECOMPUTED, recorded values cross-checked.
+ */
+async function reverifyReissueCase(
+  cli: Cli,
+  ctx: PassCtx,
+  caseFile: CaseFile,
+  journal: JournalEntry[],
+  caseRow: JournalEntry,
+): Promise<{ ok: boolean; errors: string[]; rc?: ResolvedCase }> {
+  const errors: string[] = [];
+  if (journal.some((e) => (e.action === 'resolved' || e.action === 'held') && e.caseId === caseFile.id)) {
+    errors.push(`case '${caseFile.id}' already resolved/held this pass (double-resolve)`);
+  }
+  const rowHead = caseRow.head as { sha: string; height: number } | undefined;
+  if (!rowHead?.sha || typeof caseRow.parent !== 'string') {
+    return { ok: false, errors: [...errors, `reissue journal row for '${caseFile.id}' is malformed`] };
+  }
+  if (caseFile.head.sha !== rowHead.sha || caseFile.parent !== caseRow.parent) {
+    errors.push(
+      `case.json drift: head/parent differ from the driver-journaled reissue row (${rowHead.sha.slice(0, 12)}, '${caseRow.parent}')`,
+    );
+  }
+
+  // Registry-derived floor/scope/descendants — same authority as reverifyCase.
+  const registry = loadRegistry({
+    inventoryDir: cli.inventory,
+    scopeFile: cli.scopeFile,
+    routingFile: cli.routingFile,
+  });
+  const feat = registry.features.find((f) => f.branch === caseFile.branch) as
+    | (FeatureEntry & { tier_floor?: string })
+    | undefined;
+  const floor = tierFloor(caseFile.branch, feat);
+  const scopeGuardMode: ScopeGuardMode = feat?.scope_guard ?? registry.routing.scopeGuardMode ?? 'same-files';
+  const scopeResult = await resolveScope(cli.repo, registry.features, registry.scope, { includeRemote: true });
+  const entry = scopeResult.ordered.find((e) => e.branch === caseFile.branch);
+  if (!entry) {
+    return {
+      ok: false,
+      errors: [...errors, `branch '${caseFile.branch}' is not in the registry-derived pass scope (N2)`],
+    };
+  }
+  const model: 'entry' | 'parents' = entry.mergeModel === 'upstream-chain' ? 'entry' : 'parents';
+  const scope = new Set(scopeResult.ordered.map((e) => e.branch));
+  const descendants = transitiveDescendants(scopeResult.edges, caseFile.branch);
+
+  // Direct live-conflict re-probe (git is the authority).
+  if (!(await refExists(cli.repo, caseFile.branch))) {
+    return { ok: false, errors: [...errors, `branch '${caseFile.branch}' no longer exists`] };
+  }
+  const tip = await revParse(cli.repo, caseFile.branch);
+  if (await isAncestor(cli.repo, rowHead.sha, tip)) {
+    return {
+      ok: false,
+      errors: [...errors, `branch tip already contains head ${rowHead.sha.slice(0, 12)} — the resolution landed`],
+    };
+  }
+  const probe = await newStyleMergeTree(cli.repo, tip, rowHead.sha);
+  if (probe.clean) {
+    return {
+      ok: false,
+      errors: [...errors, `no live conflict for '${caseFile.branch}' <- ${rowHead.sha.slice(0, 12)} (healed)`],
+    };
+  }
+  if (!samePathSet(probe.conflictFiles, caseFile.conflictedPaths)) {
+    errors.push(
+      `conflicted-paths drift: recorded [${caseFile.conflictedPaths.join(', ')}] != recomputed [${probe.conflictFiles.join(', ')}]`,
+    );
+  }
+
+  const pendingAbove = Math.max(0, ctx.chain.heads.length - 1 - rowHead.height);
+  return {
+    ok: errors.length === 0,
+    errors,
+    rc: {
+      id: caseFile.id,
+      branch: caseFile.branch,
+      parent: caseFile.parent,
+      model,
+      head: rowHead,
+      run: [rowHead],
+      conflictedPaths: probe.conflictFiles,
+      automergeTree: probe.treeOid,
+      reproduction: caseFile.reproduction,
       tierFloor: floor,
       scopeGuardMode,
       pendingAbove,
@@ -3286,8 +3430,13 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
 
   // Deterministic fix branch (D-057 naming, D-058: no pinned copy anywhere —
   // the name derives from the case identity alone, so a retried publish and
-  // the next pass's origin scan agree on it).
-  const fixBranch = fixBranchName(jc);
+  // the next pass's origin scan agree on it). A REISSUE case (D-059) prefers
+  // the ORIGIN ref name the driver recorded at start (it IS the existing PR's
+  // head branch — the identity-derived name must and does match it).
+  const caseRow = journal.find((e) => e.action === 'case' && e.caseId === jc.caseId) ?? null;
+  const reissue = caseRow?.reissue === true;
+  const fixBranch =
+    reissue && typeof caseRow!.fixBranch === 'string' ? (caseRow!.fixBranch as string) : fixBranchName(jc);
 
   if (issues.some((i) => isBlocking(i.id))) {
     emit(cli, { ok: false, issues });
@@ -3312,11 +3461,15 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
   }
 
   // EXECUTE: ERR07 (API side) first — an open PR by head branch name means an
-  // earlier publish already landed.
+  // earlier publish already landed. For a REISSUE (D-059) the open PR is the
+  // EXPECTED state: it is republished to below, never reconciled-and-skipped.
   const transport = (makeTransport ?? realGithubTransport)(token!);
+  let reissueTarget: { url: string; number: number } | null = null;
   try {
     const existing = await getOpenPrByHead(transport, slugParts!, fixBranch);
-    if (existing) {
+    if (existing && reissue) {
+      reissueTarget = existing;
+    } else if (existing) {
       // RECONCILE, never a livelock (finding #1): reaching here means the
       // journal carries NO `pr-published` row for this case (a journal-side row
       // is blocking ERR07 above), yet the PR exists on the API side — the
@@ -3328,6 +3481,10 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
       if (!(await refExists(cli.repo, fixBranch))) {
         await git(cli.repo, ['update-ref', `refs/heads/${fixBranch}`, headSha, '']);
       }
+      // D-059: the crashed run may have died between PR create and the marker
+      // post — re-assert the sweep-addressed marker (0: first publish; readers
+      // take the MAX, so a duplicate is harmless).
+      if (mode === 'held') await postSweepAddressed(transport, slugParts!, existing.number, 0);
       appendJournal(dir, {
         action: 'pr-published',
         caseId: jc.caseId,
@@ -3362,10 +3519,19 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
 
   // The DRIVER pushes the PR head — `git push` is the only way refs move
   // (D-049 §5). A failure is ERR15: hard halt, journaled, D-046 case-2 owner
-  // report; NO fallback of any kind.
+  // report; NO fallback of any kind. A REISSUE replaces the prior resolution
+  // head on the SAME ref (non-fast-forward by construction), so it pushes with
+  // a compare-and-swap lease on the start-classified old head — never blind.
+  const priorHead = reissue && typeof caseRow!.priorHead === 'string' ? (caseRow!.priorHead as string) : null;
   try {
-    await gitPush(cli.repo, headSha, fixBranch);
-    appendJournal(dir, { action: 'push', branch: fixBranch, to: headSha, kind: 'pr-head' });
+    await gitPush(cli.repo, headSha, fixBranch, priorHead ? { forceWithLease: priorHead } : {});
+    appendJournal(dir, {
+      action: 'push',
+      branch: fixBranch,
+      to: headSha,
+      kind: 'pr-head',
+      ...(priorHead ? { replaced: priorHead, reissue: true } : {}),
+    });
   } catch (e) {
     const detail =
       `git push of '${fixBranch}' at ${headSha.slice(0, 12)} failed: ${e instanceof Error ? e.message : String(e)} — ` +
@@ -3395,17 +3561,39 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
       const pendingAbove = Math.max(0, ctx.chain.heads.length - 1 - jc.head.height);
       finalBody = withMachineBlock(finalBody, renderMachineBlock(pendingAbove, ctx.watermark12));
     }
-    const result = await createPullRequest(transport, slugParts!, {
-      title,
-      body: finalBody,
-      head: fixBranch,
-      base: jc.branch,
-      draft,
-    });
-    // Local anchor for the pushed ref. Namespace-checked, scope-exempt.
+    let result: { url: string; number: number };
+    if (reissueTarget) {
+      // D-059 REISSUE: the revision replaces the EXISTING PR's head (the ref
+      // push above); refresh the PR's title/body from the agent's revised
+      // prose — never a second PR for the same review.
+      await ghExpect(transport, 'PATCH', `/repos/${slugParts!.owner}/${slugParts!.repo}/pulls/${reissueTarget.number}`, {
+        title,
+        body: finalBody,
+      });
+      result = reissueTarget;
+    } else {
+      result = await createPullRequest(transport, slugParts!, {
+        title,
+        body: finalBody,
+        head: fixBranch,
+        base: jc.branch,
+        draft,
+      });
+    }
+    // D-059: record the review-loop state on the PR — the sweep-addressed
+    // marker names the highest human comment id this publish addressed (0 on a
+    // first publish; the reissue's id was classified at start). Held PRs only:
+    // JUDGED history PRs auto-flip to merged and carry no review loop.
+    const addressedCommentId =
+      reissue && typeof caseRow!.addressedCommentId === 'number' ? (caseRow!.addressedCommentId as number) : 0;
+    if (mode === 'held') await postSweepAddressed(transport, slugParts!, result.number, addressedCommentId);
+    // Local anchor for the pushed ref. Namespace-checked, scope-exempt. A
+    // reissue MOVES an existing anchor to the revised head.
     guardRef(fixBranch, new Set(), { fixSweep: true });
     if (!(await refExists(cli.repo, fixBranch))) {
       await git(cli.repo, ['update-ref', `refs/heads/${fixBranch}`, headSha, '']);
+    } else if (reissue) {
+      await git(cli.repo, ['update-ref', `refs/heads/${fixBranch}`, headSha]);
     }
     appendJournal(dir, {
       action: 'pr-published',
@@ -3417,12 +3605,21 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
       url: result.url,
       number: result.number,
       head: headSha,
+      ...(reissue ? { reissued: true, addressedCommentId } : {}),
     });
     // No stored pointer to update (D-058): the `pr-published` journal row
     // above enriches the pass's blocked view (urge target), and the next
     // pass rediscovers the PR from origin at `start`.
-    console.error(`published ${draft ? 'draft ' : ''}PR #${result.number} for ${jc.caseId}: ${result.url}`);
-    emit(cli, { ok: true, issues, pr: { url: result.url, number: result.number }, head: headInfo });
+    console.error(
+      `published ${draft ? 'draft ' : ''}PR #${result.number} for ${jc.caseId}: ${result.url}${reissueTarget ? ' (reissued — existing PR updated)' : ''}`,
+    );
+    emit(cli, {
+      ok: true,
+      issues,
+      pr: { url: result.url, number: result.number },
+      head: headInfo,
+      ...(reissueTarget ? { reissued: true } : {}),
+    });
     return 0;
   } catch (e) {
     emit(cli, {
@@ -4382,6 +4579,39 @@ async function machineCaseMaterials(cli: Cli, jc: JournaledCase): Promise<string
   ].join('\n');
 }
 
+/**
+ * Driver-authored materials for a REISSUE case (D-059): the owner reviewed the
+ * published resolution and commented — the agent REVISES it (the worktree's
+ * pending files already carry the prior resolution), it never starts over.
+ * Carries ALL human PR comments VERBATIM (stored at start in pr-comments.json).
+ */
+function reissueCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEntry): string {
+  const humansPath = join(dir, jc.caseId, 'pr-comments.json');
+  const humans: PrComment[] = existsSync(humansPath)
+    ? (JSON.parse(readFileSync(humansPath, 'utf8')) as PrComment[])
+    : [];
+  return [
+    `# Case materials — ${jc.caseId} (REISSUE — revise the published resolution)`,
+    '',
+    `The owner reviewed your prior resolution on PR #${caseRow.prNumber} and left the comments below —`,
+    'REVISE the resolution accordingly; do not start over. The case worktree already contains your PRIOR',
+    'RESOLUTION as the pending files (`git status` shows exactly them): edit those files to address every',
+    'comment, changing nothing outside them. When done, run `report-case --tier held` — the driver',
+    'republishes the revision to the SAME PR at finish (never a new PR, never a local merge).',
+    '',
+    '## Owner PR comments (ALL human comments, verbatim — newest last)',
+    ...humans.flatMap((c) => ['', `### comment ${c.id}`, c.body]),
+    '',
+    '## Conflicted paths (the pending files — your edit scope)',
+    ...jc.conflictedPaths.map((p) => `- ${p}`),
+    '',
+    `Branch: ${jc.branch}   Parent: ${jc.parent}   Head: ${jc.head.sha.slice(0, 12)} (height ${jc.head.height})`,
+    `Existing PR: #${caseRow.prNumber}${typeof caseRow.prUrl === 'string' ? ` (${caseRow.prUrl})` : ''} — the revision replaces its head (fix ref '${caseRow.fixBranch}').`,
+    '',
+    'Revise the resolution in the worktree above, then run `report-case --tier held`.',
+  ].join('\n');
+}
+
 /** Undispositioned cases this pass, topmost-first (DAG order = journal order). */
 function openCases(journal: JournalEntry[]): JournaledCase[] {
   const cases = journaledCases(journal);
@@ -4400,23 +4630,178 @@ function branchTestCommands(cli: Cli): VerifyCommand[] {
 // --------------------------------------------------------------------------
 
 /**
- * D-058 §2 — reconstruct the blocked (PR_ID) set from ORIGIN alone. For every
- * `origin/fix/sweep/*` ref (post-fetch), parse the TARGET branch out of the
- * ref name (fix/sweep/<slug(branch)>--<slug(parent)>-h<n>-<sha8>; matched
- * against the registry scope's branch slugs, longest match wins) and then:
- *  - ref IS an ancestor of origin/<target>  → RESOLVED (the owner merged the
- *    PR / it landed): not blocked; delete the origin ref (cleanup).
- *  - unmerged + an OPEN PR exists for head=ref (GitHub) → PR_ID: journal an
- *    `origin-blocked` row {branch, fixBranch, headSha, prNumber} — the pass's
- *    blocked view + block-height source (`prBlockedRecords`).
- *  - unmerged + NO open PR (create failed / owner closed without merging) →
- *    ORPHAN: delete the origin ref and do NOT block — otherwise the branch is
- *    stuck blocked forever with nothing the owner can see or act on.
+ * D-059 (REISSUE case-serving mechanics): an open PR whose newest HUMAN
+ * comment id is beyond the sweep-addressed marker gets its case served THIS
+ * pass as a REVISION of the published resolution, not a fresh resolve. The
+ * case is driver-manufactured here at `start` (run skips the PR_ID branch, so
+ * it would never emit one): the conflict head is the fix ref head's 2nd parent
+ * (driver-built PR heads are `[tip|prefix, conflictHead]` merges), parent +
+ * height come from the deterministic ref name (`fixBranchName`), the conflict
+ * set/automerge tree are RE-PROBED live against origin/<target>, and the case
+ * worktree is materialized FROM THE PRIOR RESOLUTION (the ref head content) so
+ * the agent edits the existing resolution. All human PR comments are stored
+ * verbatim (pr-comments.json) for the materials. A ref that is not
+ * driver-shaped (or whose conflict healed) degrades to a plain PR_ID block —
+ * journaled warning, never a wrong case. The revised resolution then flows
+ * report-case (forced HELD) → report-pr (intent) → finish, where cmdPublish
+ * force-with-lease updates the fix ref and posts the new marker.
+ */
+async function materializeReissueCase(
+  cli: Cli,
+  dir: string,
+  args: {
+    ref: string;
+    refSha: string;
+    branch: string;
+    pr: { number: number; url: string };
+    humans: PrComment[];
+    addressedCommentId: number;
+    markerId: number | null;
+    parentCandidates: Array<{ branch: string; slug: string }>;
+    ancestors: string[];
+    features: FeatureEntry[];
+  },
+): Promise<void> {
+  const warn = (message: string): void => {
+    appendJournal(dir, { action: 'warning', ref: args.ref, branch: args.branch, message });
+    console.error(`sweep start: ${message} — '${args.ref}' stays blocked WITHOUT a reissue case`);
+  };
+  // (a) driver-shaped PR head: the 2nd parent IS the conflict head.
+  const info = await commitInfo(cli.repo, args.refSha);
+  const conflictHead = info.parents[1];
+  if (!conflictHead) {
+    return warn(`reissue: ref head ${args.refSha.slice(0, 12)} has no 2nd parent (not a driver-built PR head)`);
+  }
+  // (b) parent + height from the deterministic ref name (fixBranchName shape).
+  const rest = args.ref.slice('fix/sweep/'.length).slice(slug(args.branch).length + 2); // past '<slug(branch)>--'
+  const parentEntry = args.parentCandidates.find((c) => rest.startsWith(`${c.slug}-h`));
+  const hm = /-h(-?\d+)-([0-9a-f]{8})$/.exec(rest);
+  if (!parentEntry || !hm) return warn(`reissue: cannot parse parent/height from ref name '${args.ref}'`);
+  if (hm[2] !== conflictHead.slice(0, 8)) {
+    return warn(`reissue: ref-name sha8 '${hm[2]}' does not match the conflict head ${conflictHead.slice(0, 12)}`);
+  }
+  const parent = parentEntry.branch;
+  const height = Number(hm[1]);
+  // (c) live conflict, probed against the ORIGIN tip (the authority; run
+  // ff-syncs the local branch to it before the case is acted on).
+  if (!(await refExists(cli.repo, `origin/${args.branch}`))) {
+    return warn(`reissue: origin/${args.branch} does not exist — cannot probe the conflict`);
+  }
+  const tip = await revParse(cli.repo, `origin/${args.branch}`);
+  const probe = await newStyleMergeTree(cli.repo, tip, conflictHead);
+  if (probe.clean) return warn(`reissue: no live conflict for '${args.branch}' <- ${conflictHead.slice(0, 12)} (healed)`);
+  const cid = caseId(args.branch, parent, height);
+  const head = { sha: conflictHead, height };
+  const feat = args.features.find((f) => f.branch === args.branch) as
+    | (FeatureEntry & { tier_floor?: string })
+    | undefined;
+  const caseFile: CaseFile = {
+    schemaVersion: 1,
+    id: cid,
+    branch: args.branch,
+    parent,
+    head,
+    run: [head],
+    tierFloor: tierFloor(args.branch, feat),
+    conflictedPaths: probe.conflictFiles,
+    automergeTree: probe.treeOid,
+    reproduction: { command: `git merge-tree --write-tree --name-only ${tip} ${conflictHead}` },
+    deferredCheck: { firstConflictHeight: height, transitiveAncestors: args.ancestors },
+  };
+  writeJsonFile(join(dir, cid, 'case.json'), caseFile);
+  writeJsonFile(join(dir, cid, 'pr-comments.json'), args.humans);
+  appendJournal(dir, {
+    action: 'case',
+    branch: args.branch,
+    parent,
+    caseId: cid,
+    head,
+    height,
+    run: caseFile.run,
+    conflictedPaths: caseFile.conflictedPaths,
+    reissue: true,
+    fixBranch: args.ref,
+    priorHead: args.refSha,
+    prNumber: args.pr.number,
+    prUrl: args.pr.url,
+    addressedCommentId: args.addressedCommentId,
+    markerId: args.markerId,
+  });
+  await createCaseWorktree(cli, dir, caseFile, tip, args.refSha); // pending files = the PRIOR RESOLUTION
+  console.error(
+    `sweep start: REISSUE ${cid} — PR #${args.pr.number} carries ${args.humans.length} human comment(s) beyond the sweep-addressed marker; serving a revision case this pass`,
+  );
+}
+
+/**
+ * D-059 case 5 — crashed publish (ref pushed, PR never created): the ref's
+ * resolution is AUTHORITATIVE, so `start` COMPLETES the publish by creating
+ * the missing PR on the existing head — nothing is re-derived and the ref is
+ * never deleted. Draft-vs-active re-derives from the ref content itself
+ * (conflict markers anywhere in its own diff → the pristine-conflict DRAFT;
+ * marker-clean → the ACTIVE review PR). The title is the ref head's commit
+ * subject; the body is driver BOOKKEEPING prose only (like the D-004 block —
+ * the agent prose of the crashed pass is gone with its pass dir), and the
+ * sweep-addressed marker is posted at 0 (nothing addressed yet). Throws on any
+ * API failure — the caller maps it to ERR13 (fail-closed).
+ */
+async function createRecoveryPr(
+  cli: Cli,
+  transport: GithubTransport,
+  slugParts: { owner: string; repo: string },
+  u: { ref: string; sha: string; branch: string },
+): Promise<{ number: number; url: string; draft: boolean }> {
+  const info = await commitInfo(cli.repo, u.sha);
+  const changed = (await git(cli.repo, ['diff', '--name-only', `${u.sha}^`, u.sha], { allowCodes: [1, 128] })).stdout
+    .split('\n')
+    .filter(Boolean);
+  const markers = await unresolvedMarkers(cli.repo, u.sha, changed);
+  const draft = markers.length > 0;
+  const title = info.subject || `Sweep resolution for ${u.branch} (recovered publish)`;
+  const body = [
+    `Recovered publish (D-059): the resolution ref \`${u.ref}\` was pushed by an earlier pass, but its PR was`,
+    'never created (crashed publish). The resolution on the ref is authoritative — this PR completes that',
+    'publish; nothing was re-derived.',
+    '',
+    draft
+      ? `The head carries the pristine conflict (markers in place) — a DRAFT: resolve fresh, then merge into \`${u.branch}\`.`
+      : `Review the resolution and merge it into \`${u.branch}\` to unblock propagation.`,
+  ].join('\n');
+  const created = await createPullRequest(transport, slugParts, { title, body, head: u.ref, base: u.branch, draft });
+  await postSweepAddressed(transport, slugParts, created.number, 0);
+  return { ...created, draft };
+}
+
+/**
+ * D-058 §2 → D-059 — reconstruct the blocked (PR_ID) set from ORIGIN alone.
+ * For every `origin/fix/sweep/*` ref (post-fetch), parse the TARGET branch out
+ * of the ref name (fix/sweep/<slug(branch)>--<slug(parent)>-h<n>-<sha8>;
+ * matched against the registry scope's branch slugs, longest match wins) and
+ * classify (D-059 — `start` deletes a ref ONLY when it is MERGED; the D-058
+ * orphan-delete is retired):
+ *  1. ref IS an ancestor of origin/<target> → RESOLVED (the owner merged the
+ *     PR / it landed): not blocked; delete the origin ref (cleanup).
+ *  2. unmerged + OPEN PR + newest human comment id <= the sweep-addressed
+ *     marker (or no human comments) → PR_ID: journal an `origin-blocked` row
+ *     {branch, fixBranch, headSha, prNumber, markerId} — the pass's blocked
+ *     view + block-height source (`prBlockedRecords`).
+ *  3. unmerged + OPEN PR + newest human comment id > the marker (or ≥1 human
+ *     comment and no marker yet) → REISSUE: still PR_ID (row as in 2), PLUS a
+ *     revision case served THIS pass (`materializeReissueCase`).
+ *  4. unmerged + PR CLOSED (not merged) → REOPEN the PR (driver PATCH
+ *     state=open) → PR_ID. Replaces the D-058 delete.
+ *  5. unmerged + NO PR at all (crashed publish) → (re)create the PR from the
+ *     ref (`createRecoveryPr`) → PR_ID. The ref's resolution is authoritative;
+ *     never re-derived, never deleted.
+ *  6. ref ABSENT entirely (nothing on origin, not merged) → nothing here: the
+ *     resolution is lost, so the pass re-derives the conflict fresh (a normal
+ *     new case → new PR at finish).
  * A ref whose slug matches no scope branch is journaled `origin-ref-unknown`
  * and left alone (unknown provenance: never deleted, never blocking).
  *
- * The PR existence check is FAIL-CLOSED: any non-200 lookup is an ERR13 halt —
- * a flaky API must never read as "no PR" and delete a ref with a live PR.
+ * Every GitHub check is FAIL-CLOSED: any non-200 on a needed lookup/write is
+ * an ERR13 halt — never a wrongful mutation. Start's origin WRITES (merged-ref
+ * delete, reopen, recovery PR create) all run AFTER the token/slug gate.
  * Ref deletions go through `git push origin --delete` (refs move via git only,
  * D-049); a failed delete is journaled and non-fatal (the ref is re-examined
  * at the next start).
@@ -4524,29 +4909,19 @@ async function deriveOriginMergeStatus(
   }
 
   if (unmerged.length > 0) {
+    // Parent-name candidates for the reissue ref-name parse: scope branches +
+    // the literal entry parent 'main' (entry-model cases record parent 'main').
+    const parentCandidates = [...candidates];
+    if (!parentCandidates.some((c) => c.branch === 'main')) {
+      parentCandidates.push({ branch: 'main', slug: slug('main') });
+    }
+    parentCandidates.sort((a, b) => b.slug.length - a.slug.length);
+    const ancestorsOf = transitiveAncestors(scopeResult.edges);
+
     for (const u of unmerged) {
-      let pr: { url: string; number: number } | null;
-      try {
-        // FAIL-CLOSED lookup: only an authoritative 200 may decide blocked-vs-
-        // orphan (getOpenPrByHead's null-on-any-status would read an API
-        // failure as "no PR" and delete a ref with a live PR).
-        const lookup = await transport!.request(
-          'GET',
-          `/repos/${slugParts!.owner}/${slugParts!.repo}/pulls?head=${encodeURIComponent(`${slugParts!.owner}:${u.ref}`)}&state=open`,
-        );
-        if (lookup.status !== 200 || !Array.isArray(lookup.body)) {
-          throw new Error(`open-PR lookup for '${u.ref}' -> HTTP ${lookup.status}`);
-        }
-        const first = lookup.body[0] as { html_url?: string; number?: number } | undefined;
-        pr = first ? { url: String(first.html_url ?? ''), number: Number(first.number ?? 0) } : null;
-      } catch (e) {
-        return {
-          ok: false,
-          issues: [{ id: 'ERR13_API_FAILED', detail: e instanceof Error ? e.message : String(e) }],
-          blocked,
-        };
-      }
-      if (pr) {
+      // journal the PR_ID row (shared by cases 2-5; every unmerged ref with a
+      // live/reissued/recovered PR blocks its branch).
+      const journalBlocked = (pr: { number: number; url: string }, markerId: number | null): void => {
         appendJournal(dir, {
           action: 'origin-blocked',
           branch: u.branch,
@@ -4555,20 +4930,80 @@ async function deriveOriginMergeStatus(
           headSha: u.sha,
           prNumber: pr.number,
           prUrl: pr.url,
+          markerId,
         });
         blocked.push(u.branch);
-        console.error(`sweep start: ${u.branch} blocked — open PR #${pr.number} on '${u.ref}' (origin-derived)`);
-      } else {
-        // OPEN OWNER QUESTION (review finding #5, pending): whether `start` may delete an unmerged orphan ref at all (vs. quarantine/report-only) is an owner policy decision.
-        const deleteFailed = await deleteOriginRef(u.ref);
-        appendJournal(dir, {
-          action: 'origin-ref-orphaned',
-          ref: u.ref,
-          branch: u.branch,
-          headSha: u.sha,
-          ...(deleteFailed ? { deleteFailed } : {}),
-        });
-        console.error(`sweep start: '${u.ref}' has no open PR — orphan${deleteFailed ? ' (delete failed)' : ' deleted'}; ${u.branch} NOT blocked`);
+      };
+      try {
+        // FAIL-CLOSED lookup across ALL states (D-059): only an authoritative
+        // 200 may classify — an API failure must never read as "no PR".
+        const prs = await getPrsByHead(transport!, slugParts!, u.ref);
+        const open = prs.find((p) => p.state === 'open');
+        if (open) {
+          // Cases 2/3: awaiting review — is there a human comment beyond the
+          // sweep-addressed marker? (Comment list is fail-closed too.)
+          const comments = await listIssueComments(transport!, slugParts!, open.number);
+          const { humans, lastHumanId, markerId } = classifyComments(comments);
+          journalBlocked(open, markerId);
+          const reissueDue = lastHumanId !== null && (markerId === null || lastHumanId > markerId);
+          if (reissueDue) {
+            console.error(
+              `sweep start: ${u.branch} blocked — open PR #${open.number} on '${u.ref}' has NEW human comments (REISSUE)`,
+            );
+            await materializeReissueCase(cli, dir, {
+              ref: u.ref,
+              refSha: u.sha,
+              branch: u.branch,
+              pr: open,
+              humans,
+              addressedCommentId: lastHumanId,
+              markerId,
+              parentCandidates,
+              ancestors: ancestorsOf[u.branch] ?? [],
+              features: registry.features,
+            });
+          } else {
+            console.error(`sweep start: ${u.branch} blocked — open PR #${open.number} on '${u.ref}' (origin-derived)`);
+          }
+        } else if (prs.length > 0) {
+          // Case 4: CLOSED (not merged — merged refs never reach here) →
+          // REOPEN. The resolution + review thread stay owner-visible.
+          const closed = prs[0];
+          await reopenPullRequest(transport!, slugParts!, closed.number);
+          appendJournal(dir, {
+            action: 'origin-pr-reopened',
+            ref: u.ref,
+            branch: u.branch,
+            headSha: u.sha,
+            prNumber: closed.number,
+            prUrl: closed.url,
+          });
+          journalBlocked(closed, null);
+          console.error(`sweep start: ${u.branch} blocked — closed PR #${closed.number} on '${u.ref}' REOPENED (D-059)`);
+        } else {
+          // Case 5: NO PR at all (crashed publish) → complete the publish from
+          // the authoritative ref; never delete, never re-derive.
+          const created = await createRecoveryPr(cli, transport!, slugParts!, u);
+          appendJournal(dir, {
+            action: 'origin-pr-created',
+            ref: u.ref,
+            branch: u.branch,
+            headSha: u.sha,
+            prNumber: created.number,
+            prUrl: created.url,
+            draft: created.draft,
+          });
+          journalBlocked(created, 0);
+          console.error(
+            `sweep start: '${u.ref}' had NO PR — ${created.draft ? 'draft ' : ''}PR #${created.number} created from the ref (recovered publish); ${u.branch} blocked`,
+          );
+        }
+      } catch (e) {
+        return {
+          ok: false,
+          issues: [{ id: 'ERR13_API_FAILED', detail: e instanceof Error ? e.message : String(e) }],
+          blocked,
+        };
       }
     }
   }
@@ -4895,12 +5330,19 @@ export async function cmdSweepNextCase(cli: Cli): Promise<number> {
   const jc = open[0];
   const caseFile = readCaseFile(join(dir, jc.caseId, 'case.json'));
   const worktree = caseWorktreePath(dir, jc.caseId);
-  progress(`case ready: ${jc.branch} — ${caseFile.conflictedPaths.join(', ')}`);
-  const materials = await machineCaseMaterials(cli, jc);
+  // D-059: a REISSUE case (driver-journaled at start) is served as a REVISION —
+  // the worktree carries the prior published resolution and the materials carry
+  // ALL human PR comments verbatim, never the fresh-conflict briefing.
+  const caseRow = journal.find((e) => e.action === 'case' && e.caseId === jc.caseId) ?? null;
+  const isReissue = caseRow?.reissue === true;
+  progress(
+    `case ready: ${jc.branch} — ${caseFile.conflictedPaths.join(', ')}${isReissue ? ' (REISSUE — revise the published resolution)' : ''}`,
+  );
+  const materials = isReissue ? reissueCaseMaterials(dir, jc, caseRow!) : await machineCaseMaterials(cli, jc);
   writeFileSync(join(dir, jc.caseId, 'materials.md'), materials + '\n');
   st = { ...st, phase: 'case-ready', currentCase: { caseId: jc.caseId, branch: jc.branch } };
   writeMachineState(dir, st);
-  console.error(`next-case: case ${jc.caseId} ready in ${worktree}`);
+  console.error(`next-case: case ${jc.caseId} ready in ${worktree}${isReissue ? ' (reissue)' : ''}`);
   result(cli, {
     status: 'case-ready',
     worktree,
@@ -4908,6 +5350,7 @@ export async function cmdSweepNextCase(cli: Cli): Promise<number> {
     caseId: jc.caseId,
     conflictedPaths: caseFile.conflictedPaths,
     run: caseFile.run ?? [caseFile.head],
+    ...(isReissue ? { reissue: true, prNumber: caseRow!.prNumber ?? null } : {}),
     materials,
     materialsPath: join(dir, jc.caseId, 'materials.md'),
   });
@@ -4954,9 +5397,18 @@ export async function cmdSweepReportCase(
   const caseFile = readCaseFile(join(caseDir, 'case.json'));
   const journal = readJournal(dir);
 
+  // D-059: a REISSUE case (driver-journaled at start with `reissue: true`) is a
+  // revision of a published resolution — verified against the journal-anchored
+  // conflict head + a direct live probe, and ALWAYS routed through HELD (the
+  // revision republishes to the EXISTING PR at finish; it never merges here).
+  const caseRow = journal.find((e) => e.action === 'case' && e.caseId === caseId) ?? null;
+  const isReissue = caseRow?.reissue === true;
+
   // §7 trust boundary: re-derive the case from git + registry (case.json is only
   // a pointer). Reuses the flag-path's reverifyCase verbatim.
-  const rv = await reverifyCase(cli, ctx, dir, caseFile, journal);
+  const rv = isReissue
+    ? await reverifyReissueCase(cli, ctx, caseFile, journal, caseRow!)
+    : await reverifyCase(cli, ctx, dir, caseFile, journal);
   if (!rv.ok) {
     console.error(`report-case HALT: case re-verification failed:\n  ${rv.errors.join('\n  ')}`);
     result(cli, {
@@ -4994,10 +5446,14 @@ export async function cmdSweepReportCase(
     scopeFile: cli.scopeFile,
     routingFile: cli.routingFile,
   });
-  const decided = decidedAlready(registry.features, rc.branch, rc.conflictedPaths);
-  if (decided) issues.push(decided);
-  const dup = await duplicateCaseIssue(cli, journal, journaledCases(journal), journaledCases(journal).get(caseId)!);
-  if (dup) issues.push(dup);
+  // (Skipped for a REISSUE: its PR already exists — adequacy was settled at the
+  // original publish; ERR05/ERR06 would wrongly re-litigate the open review.)
+  if (!isReissue) {
+    const decided = decidedAlready(registry.features, rc.branch, rc.conflictedPaths);
+    if (decided) issues.push(decided);
+    const dup = await duplicateCaseIssue(cli, journal, journaledCases(journal), journaledCases(journal).get(caseId)!);
+    if (dup) issues.push(dup);
+  }
 
   // Per-case attempt cap (D-052 force-HELD): count DISTINCT resolved trees this
   // case has been reported with; beyond the cap the driver force-freezes rather
@@ -5036,6 +5492,15 @@ export async function cmdSweepReportCase(
   if (capExceeded) {
     effectiveTier = 'held';
     demoteReasons.push(`resolution did not converge in ${RESOLVE_COLDREAD_CAP} distinct trees -> held (ERR26)`);
+  }
+  // D-059: a reissue revision NEVER merges in place — whatever the claim, it is
+  // HELD so the revision republishes to the EXISTING review PR at finish (the
+  // owner's review continues; merging locally would bypass it).
+  if (isReissue) {
+    effectiveTier = 'held';
+    demoteReasons.push(
+      `reissue revision for PR #${caseRow!.prNumber ?? '?'} — republished to the existing review PR at finish (D-059)`,
+    );
   }
 
   // Hard blocks that are NOT a freeze: the agent must fix + re-report. An
@@ -5564,6 +6029,101 @@ export async function cmdSweepReportPr(
  * A pass that crashes BEFORE this stage has published nothing — the next
  * `start` sees a clean origin picture and redoes the pass.
  */
+/** One related PR in a finished pass's owner-facing summary (D-059 owner request). */
+interface PassPrSummary {
+  number: number;
+  url: string;
+  title: string | null;
+  status: string;
+  kind: string;
+}
+
+/**
+ * EVERY PR this pass touched, journal-derived (D-059 owner request): the open
+ * review PRs `start` found (origin-blocked rows), PRs reopened/recovered at
+ * start, and the JUDGED/HELD PRs created (or reissued) at finish. Titles come
+ * from the recorded intent (pr/title.txt); where a transport is available each
+ * PR's live title/status is refreshed from GitHub — best-effort per PR, a
+ * lookup failure silently keeps the journal-derived values (the summary must
+ * never fail a green finish).
+ */
+async function collectPassPullRequests(
+  cli: Cli,
+  dir: string,
+  journal: JournalEntry[],
+  makeTransport?: (token: string) => GithubTransport,
+): Promise<PassPrSummary[]> {
+  const byNumber = new Map<number, PassPrSummary>();
+  const put = (row: PassPrSummary): void => {
+    const prev = byNumber.get(row.number);
+    byNumber.set(row.number, { ...row, title: row.title ?? prev?.title ?? null });
+  };
+  for (const e of journal) {
+    if (e.action === 'origin-blocked' && typeof e.prNumber === 'number') {
+      put({
+        number: e.prNumber,
+        url: typeof e.prUrl === 'string' ? e.prUrl : '',
+        title: null,
+        status: 'open',
+        kind: 'review-open-at-start',
+      });
+    } else if (e.action === 'origin-pr-reopened' && typeof e.prNumber === 'number') {
+      put({
+        number: e.prNumber,
+        url: typeof e.prUrl === 'string' ? e.prUrl : '',
+        title: null,
+        status: 'open',
+        kind: 'reopened',
+      });
+    } else if (e.action === 'origin-pr-created' && typeof e.prNumber === 'number') {
+      put({
+        number: e.prNumber,
+        url: typeof e.prUrl === 'string' ? e.prUrl : '',
+        title: null,
+        status: e.draft === true ? 'draft' : 'open',
+        kind: 'recovered-publish',
+      });
+    } else if (e.action === 'pr-published' && typeof e.number === 'number') {
+      const titlePath = join(dir, String(e.caseId ?? ''), 'pr', 'title.txt');
+      put({
+        number: e.number,
+        url: typeof e.url === 'string' ? e.url : '',
+        title: existsSync(titlePath) ? readFileSync(titlePath, 'utf8').trim() || null : null,
+        status: e.mode === 'judged' ? 'merged' : e.draft === true ? 'draft' : 'open',
+        kind: e.mode === 'judged' ? 'judged-history' : e.reissued === true ? 'held-review-reissued' : 'held-review',
+      });
+    }
+  }
+  // Live refresh (best-effort): title + open/draft/merged from GitHub.
+  try {
+    let token: string | null = null;
+    if (cli.tokenFile && existsSync(cli.tokenFile)) token = readFileSync(cli.tokenFile, 'utf8').trim() || null;
+    const slugParts = token ? await originSlug(cli) : null;
+    if (token && slugParts) {
+      const transport = (makeTransport ?? realGithubTransport)(token);
+      for (const row of byNumber.values()) {
+        try {
+          const pr = await ghExpect(transport, 'GET', `/repos/${slugParts.owner}/${slugParts.repo}/pulls/${row.number}`);
+          if (typeof pr.title === 'string' && pr.title) row.title = pr.title;
+          row.status =
+            pr.merged === true
+              ? 'merged'
+              : pr.draft === true
+                ? 'draft'
+                : typeof pr.state === 'string' && pr.state
+                  ? pr.state
+                  : row.status;
+        } catch {
+          /* keep the journal-derived row */
+        }
+      }
+    }
+  } catch {
+    /* summary must never fail a green finish */
+  }
+  return [...byNumber.values()].sort((a, b) => a.number - b.number);
+}
+
 export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) => GithubTransport): Promise<number> {
   const ctx = await attachPass(cli);
   const dir = ctx.dir;
@@ -5739,8 +6299,45 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     finishStep: 'done',
   });
   const next = upstreamAdvanced ? 'start again' : 'done';
+
+  // Owner-facing pass summary on the ONE success SWEEP-RESULT (D-059 owner
+  // request): every related PR (found-open at start / reopened / recovered /
+  // created / reissued) + journal-derived stats, with an explicit cue to
+  // REPORT them — the agent relays numbers/titles/status to the owner.
+  const journalFinal = readJournal(dir);
+  const pullRequests = await collectPassPullRequests(cli, dir, journalFinal, makeTransport);
+  const resolvedRows = journalFinal.filter((e) => e.action === 'resolved');
+  const publishedRows = journalFinal.filter((e) => e.action === 'pr-published');
+  const stats = {
+    branchesInScope: passOrder(dir).length,
+    cleanMerges: journalFinal.filter((e) => e.action === 'merge').length,
+    resolvedMechanical: resolvedRows.filter((e) => e.tier === 'mechanical').length,
+    resolvedJudged: resolvedRows.filter((e) => e.tier === 'judged').length,
+    held: journalFinal.filter((e) => e.action === 'held').length,
+    deferredBranches: new Set(journalFinal.filter((e) => e.action === 'defer').map((e) => e.branch)).size,
+    prsCreatedJudged: publishedRows.filter((e) => e.mode === 'judged').length,
+    prsCreatedHeld: publishedRows.filter((e) => e.mode === 'held' && e.reissued !== true).length,
+    prsReissued: publishedRows.filter((e) => e.reissued === true).length,
+    prsReopened: journalFinal.filter((e) => e.action === 'origin-pr-reopened').length,
+    prsRecovered: journalFinal.filter((e) => e.action === 'origin-pr-created').length,
+    prsOpenAtStart: new Set(
+      journalFinal.filter((e) => e.action === 'origin-blocked' && typeof e.prNumber === 'number').map((e) => e.prNumber),
+    ).size,
+    upstreamAdvanced,
+    watermark12: ctx.watermark12,
+  };
   console.error(`sweep finish complete — ${next}`);
-  result(cli, { ok: true, status: 'complete', next, upstreamAdvanced });
+  result(cli, {
+    ok: true,
+    status: 'complete',
+    next,
+    upstreamAdvanced,
+    pullRequests,
+    stats,
+    instruction:
+      `REPORT to the owner: every PR in pullRequests (number, title, status) and the stats summary; then ` +
+      (upstreamAdvanced ? 'run `sweep start` again (upstream advanced past the pinned watermark)' : 'stop — the sweep is done'),
+  });
   return 0;
 }
 

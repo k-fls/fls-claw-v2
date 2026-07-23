@@ -136,6 +136,8 @@ function fakeGithub(responses: Record<string, { status: number; body: unknown }>
           if (method === 'GET' && path.includes('/pulls?')) return { status: 200, body: [] };
           if (path.endsWith('/pulls') && method === 'POST')
             return { status: 201, body: { html_url: 'https://github.com/k-fls/fixture/pull/58', number: 58 } };
+          // D-059: held publishes post the sweep-addressed marker comment.
+          if (method === 'POST' && path.includes('/comments')) return { status: 201, body: {} };
           return { status: 404, body: null };
         },
       };
@@ -577,11 +579,14 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
     expect(res.ok).toBe(true);
     expect(res.pr).toEqual({ url: 'https://github.com/k-fls/fixture/pull/58', number: 58 });
 
-    // API sequence: ERR07 probe + POST /pulls ONLY — no ref/commit fabrication (D-049 §5).
+    // API sequence: ERR07 probe + POST /pulls + the D-059 sweep-addressed
+    // marker comment — no ref/commit fabrication (D-049 §5).
     const paths = gh.calls.map((c) => c.path);
     expect(paths[0]).toContain('/repos/k-fls/fixture/pulls?head=k-fls%3Afix%2Fsweep%2F'); // ERR07 API probe
     expect(paths.some((p) => p.includes('/git/'))).toBe(false);
-    expect(gh.calls.length).toBe(2);
+    expect(gh.calls.length).toBe(3);
+    const markerCall = gh.calls.find((c) => c.method === 'POST' && c.path.includes('/issues/58/comments'))!;
+    expect(String((markerCall.body as { body: string }).body)).toContain('<!-- sweep-addressed: 0 -->');
     const prCall = gh.calls.find((c) => c.path.endsWith('/pulls') && c.method === 'POST')!;
     expect((prCall.body as { draft: boolean }).draft).toBe(true); // HELD = draft
     expect((prCall.body as { base: string }).base).toBe('main_patched');
@@ -638,8 +643,11 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
     const res = readOut(out);
     expect(res.ok).toBe(true);
     expect(res.pr).toEqual({ url: 'https://github.com/k-fls/fixture/pull/9', number: 9 });
-    expect(gh.calls.length).toBe(1); // stopped after the probe — no SECOND PR created
-    expect(gh.calls.filter((c) => c.method === 'POST').length).toBe(0);
+    // Probe + the D-059 marker re-assert only — no SECOND PR created.
+    expect(gh.calls.length).toBe(2);
+    expect(gh.calls.filter((c) => c.method === 'POST' && c.path.endsWith('/pulls')).length).toBe(0);
+    const markerCall = gh.calls.find((c) => c.method === 'POST' && c.path.includes('/issues/9/comments'))!;
+    expect(String((markerCall.body as { body: string }).body)).toContain('<!-- sweep-addressed: 0 -->');
     expect(repo.git('-C', bareDir!, 'for-each-ref', 'refs/heads/fix')).toBe(''); // …and nothing pushed
     // The reconciling journal row has the normal pr-published shape.
     const row = readJournal(dir).find((e) => e.action === 'pr-published')!;
