@@ -623,8 +623,10 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
     expect(gh2.factories).toBe(0);
   });
 
-  it('execute: an open PR found via the API by head branch name is ERR07 and nothing is pushed', async () => {
-    const { repo, ws, caseId, prDir, bareDir, cli } = await setupHeldCase([], { bareOrigin: true });
+  it('execute: an open PR found via the API by head branch name RECONCILES (crash-window heal, finding #1) — journals pr-published, creates no second PR, pushes nothing', async () => {
+    // The PR exists API-side but the journal has NO pr-published row: the
+    // crash window between a prior run's PR create and its journal append.
+    const { repo, ws, dir, caseId, prDir, bareDir, cli } = await setupHeldCase([], { bareOrigin: true });
     writeText(prDir, GOOD_TITLE, GOOD_BODY);
     const tokenFile = join(ws, 'token.txt');
     writeFileSync(tokenFile, 'substitute-token\n');
@@ -632,12 +634,27 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
       '/pulls?': { status: 200, body: [{ html_url: 'https://github.com/k-fls/fixture/pull/9', number: 9 }] },
     });
     const out = join(ws, 'out.json');
-    expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, tokenFile, out }), gh.factory)).toBe(1);
-    const issue = readOut(out).issues.find((i) => i.id === 'ERR07_PR_EXISTS');
-    expect(issue).toBeTruthy();
-    expect(issue!.detail).toContain('pull/9');
-    expect(gh.calls.length).toBe(1); // stopped after the probe — nothing was created
+    expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, tokenFile, out }), gh.factory)).toBe(0);
+    const res = readOut(out);
+    expect(res.ok).toBe(true);
+    expect(res.pr).toEqual({ url: 'https://github.com/k-fls/fixture/pull/9', number: 9 });
+    expect(gh.calls.length).toBe(1); // stopped after the probe — no SECOND PR created
+    expect(gh.calls.filter((c) => c.method === 'POST').length).toBe(0);
     expect(repo.git('-C', bareDir!, 'for-each-ref', 'refs/heads/fix')).toBe(''); // …and nothing pushed
+    // The reconciling journal row has the normal pr-published shape.
+    const row = readJournal(dir).find((e) => e.action === 'pr-published')!;
+    expect(row.caseId).toBe(caseId);
+    expect(row.number).toBe(9);
+    expect(row.url).toBe('https://github.com/k-fls/fixture/pull/9');
+    expect(row.mode).toBe('held');
+    expect(typeof row.fixBranch).toBe('string');
+    expect(typeof row.head).toBe('string');
+    expect(row.reconciled).toBe(true);
+    // A retried publish now stops at the journal-side ERR07 — no network.
+    const gh2 = fakeGithub();
+    expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, tokenFile, out }), gh2.factory)).toBe(1);
+    expect(readOut(out).issues.some((i) => i.id === 'ERR07_PR_EXISTS')).toBe(true);
+    expect(gh2.factories).toBe(0);
   });
 
   it('execute: a failing git push is ERR15 (journaled halt, D-046 case-2 report) and no PR is created', async () => {

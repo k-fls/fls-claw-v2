@@ -454,18 +454,29 @@ interface BlockedRow {
 }
 
 /**
- * PR_ID rows derived from the pass journal, last-writer-wins per branch:
- * `origin-blocked` (start) and `held` (this pass) set a row, a later manual
- * `unfrozen` clears it, and a `pr-published` (mode held) enriches the row with
- * its fix branch + PR number.
+ * PR_ID rows derived from the pass journal, keyed branch → ALL of its rows
+ * (last-writer-wins per branch+caseId): a multi-parent branch can carry
+ * SEVERAL concurrent blocks (one per held case / origin fix ref), and every
+ * one matters — collapsing to one row weakened the descendants' DEFER
+ * height-MIN when the survivor was the HIGHER block (finding #4).
+ * `origin-blocked` (start) and `held` (this pass) add a row, a later manual
+ * `unfrozen` clears the branch's rows, and a `pr-published` (mode held)
+ * enriches its case's row with the fix branch + PR number.
  */
-function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow> {
+function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
   const cases = journaledCases(journal);
-  const out = new Map<string, BlockedRow>();
+  const out = new Map<string, BlockedRow[]>();
+  const put = (row: BlockedRow): void => {
+    const rows = out.get(row.branch) ?? [];
+    const i = rows.findIndex((r) => r.caseId === row.caseId);
+    if (i >= 0) rows[i] = row;
+    else rows.push(row);
+    out.set(row.branch, rows);
+  };
   for (const e of journal) {
     if (typeof e.branch !== 'string') continue;
     if (e.action === 'origin-blocked') {
-      out.set(e.branch, {
+      put({
         branch: e.branch,
         caseId: typeof e.caseId === 'string' ? e.caseId : 'origin',
         headSha: typeof e.headSha === 'string' ? e.headSha : null,
@@ -474,7 +485,7 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow> {
       });
     } else if (e.action === 'held') {
       const jc = typeof e.caseId === 'string' ? cases.get(e.caseId) : undefined;
-      out.set(e.branch, {
+      put({
         branch: e.branch,
         caseId: typeof e.caseId === 'string' ? e.caseId : 'held',
         headSha: jc?.head.sha ?? null,
@@ -482,8 +493,8 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow> {
         prNumber: null,
       });
     } else if (e.action === 'pr-published' && e.mode === 'held') {
-      const row = out.get(e.branch);
-      if (row && row.caseId === e.caseId) {
+      const row = (out.get(e.branch) ?? []).find((r) => r.caseId === e.caseId);
+      if (row) {
         row.fixBranch = typeof e.fixBranch === 'string' ? e.fixBranch : row.fixBranch;
         row.prNumber = typeof e.number === 'number' ? e.number : row.prNumber;
       }
@@ -508,10 +519,22 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow> {
 function passStatusView(cli: Cli, journal: JournalEntry[]): Map<string, 'PR_ID' | 'DEFERRED'> {
   const pr = blockedRows(journal);
   const parentsOf = directParentEdges(cli);
+  // A manual `unfrozen` clears a DEFERRED branch too (finding #2a): `defer`
+  // rows OLDER than the branch's latest `unfrozen` are dropped, so an
+  // unfreeze actually takes effect for DEFERRED (not just PR_ID). A later
+  // re-defer (a fresh `defer` row after the unfreeze) re-blocks normally.
+  const lastUnfrozen = new Map<string, number>();
+  journal.forEach((e, i) => {
+    if (e.action === 'unfrozen' && typeof e.branch === 'string') lastUnfrozen.set(e.branch, i);
+  });
   const deferred = new Set(
     journal
-      .filter((e) => e.action === 'defer' && typeof e.branch === 'string')
-      .map((e) => e.branch as string)
+      .map((e, i) => ({ e, i }))
+      .filter(
+        ({ e, i }) =>
+          e.action === 'defer' && typeof e.branch === 'string' && i > (lastUnfrozen.get(e.branch as string) ?? -1),
+      )
+      .map(({ e }) => e.branch as string)
       .filter((b) => !pr.has(b)),
   );
   let changed = true;
@@ -551,12 +574,19 @@ function prBlockedBranches(journal: JournalEntry[]): Set<string> {
  */
 async function prBlockedRecords(cli: Cli, journal: JournalEntry[], chain: Chain): Promise<HeldRecord[]> {
   const out: HeldRecord[] = [];
-  for (const row of blockedRows(journal).values()) {
-    if (!row.headSha) continue;
-    if (!(await refExists(cli.repo, row.headSha))) continue;
-    const height = (await deriveCoverage(cli.repo, chain, row.headSha)).height;
-    if (height < 0) continue; // below this pass's chain — degrades to an ordinary case
-    out.push({ branch: row.branch, height, conflictedPaths: [], caseId: row.caseId });
+  for (const [branch, rows] of blockedRows(journal)) {
+    // Multiple concurrent blocks per branch (finding #4): contribute the
+    // MINIMUM height-matched block — the safest DEFER for descendants (a
+    // higher survivor would let a child below it wrongly take its own case).
+    let best: HeldRecord | null = null;
+    for (const row of rows) {
+      if (!row.headSha) continue;
+      if (!(await refExists(cli.repo, row.headSha))) continue;
+      const height = (await deriveCoverage(cli.repo, chain, row.headSha)).height;
+      if (height < 0) continue; // below this pass's chain — degrades to an ordinary case
+      if (!best || height < best.height) best = { branch, height, conflictedPaths: [], caseId: row.caseId };
+    }
+    if (best) out.push(best);
   }
   return out;
 }
@@ -602,7 +632,7 @@ interface PendingUrge {
 async function detectUrges(cli: Cli, ctx: PassCtx, journal: JournalEntry[]): Promise<PendingUrge[]> {
   const ledger = readLedger(ledgerPathOf(cli));
   const due: PendingUrge[] = [];
-  for (const row of blockedRows(journal).values()) {
+  for (const row of [...blockedRows(journal).values()].flat()) {
     // Rows without a fix branch have no owner-facing PR to nudge: gate holds,
     // and this-pass holds whose PR is only created at `finish` (D-058) — those
     // become origin-derived rows (with a PR) by the next pass.
@@ -3027,12 +3057,23 @@ async function publishHead(
  * itself publishes. Three of the six 2026-07-21 freeze PRs were byte-identical
  * duplicates.
  */
+/**
+ * ERR06 with a machine-readable pointer when the matched sibling's PR is
+ * ALREADY PUBLISHED — `finish`'s held phase skips such a case (journaled
+ * `held-duplicate`) instead of wedging on an unpublishable duplicate
+ * (finding #3); absent for the still-open topmost-sibling arm, which remains
+ * a consolidate-first error.
+ */
+interface DuplicateIssue extends Issue {
+  duplicateOf?: { caseId: string; url: string; number: number };
+}
+
 async function duplicateCaseIssue(
   cli: Cli,
   journal: JournalEntry[],
   cases: Map<string, JournaledCase>,
   self: JournaledCase,
-): Promise<Issue | null> {
+): Promise<DuplicateIssue | null> {
   const published = new Map<string, JournalEntry>();
   for (const e of journal) if (e.action === 'pr-published' && typeof e.caseId === 'string') published.set(e.caseId, e);
 
@@ -3101,6 +3142,7 @@ async function duplicateCaseIssue(
       return {
         id: 'ERR06_DUPLICATE_CASE',
         detail: `conflict signature already published as PR #${pr.number} (${pr.url}) for case '${other.caseId}' — consolidate, do not open a second PR`,
+        duplicateOf: { caseId: other.caseId, url: String(pr.url ?? ''), number: Number(pr.number ?? 0) },
       };
     }
     if (other.firstIndex < self.firstIndex) {
@@ -3275,14 +3317,40 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
   try {
     const existing = await getOpenPrByHead(transport, slugParts!, fixBranch);
     if (existing) {
-      emit(cli, {
-        ok: false,
-        issues: [
-          ...issues,
-          { id: 'ERR07_PR_EXISTS', detail: `open PR already exists for head '${fixBranch}': ${existing.url}` },
-        ],
+      // RECONCILE, never a livelock (finding #1): reaching here means the
+      // journal carries NO `pr-published` row for this case (a journal-side row
+      // is blocking ERR07 above), yet the PR exists on the API side — the
+      // crash window between the prior run's PR create and its journal append.
+      // The head branch name is deterministic per case identity, so this IS
+      // this case's PR: journal the reconciling row (same shape as the normal
+      // path) and succeed, so a resumed `finish` continues instead of halting.
+      guardRef(fixBranch, new Set(), { fixSweep: true });
+      if (!(await refExists(cli.repo, fixBranch))) {
+        await git(cli.repo, ['update-ref', `refs/heads/${fixBranch}`, headSha, '']);
+      }
+      appendJournal(dir, {
+        action: 'pr-published',
+        caseId: jc.caseId,
+        branch: jc.branch,
+        mode,
+        draft,
+        fixBranch,
+        url: existing.url,
+        number: existing.number,
+        head: headSha,
+        reconciled: true,
       });
-      return 1;
+      console.error(
+        `reconciled: open PR #${existing.number} already exists for head '${fixBranch}' (${existing.url}) — journaled pr-published (crash-window heal), no new PR created`,
+      );
+      emit(cli, {
+        ok: true,
+        issues,
+        pr: { url: existing.url, number: existing.number },
+        head: headInfo,
+        reconciled: true,
+      });
+      return 0;
     }
   } catch (e) {
     emit(cli, {
@@ -3754,7 +3822,10 @@ export async function cmdUnfreeze(cli: Cli): Promise<number> {
     console.error(`unfreeze: '${cli.branch}' is not blocked (merge_status is NONE)`);
     return 2;
   }
-  const blockedBy = st === 'PR_ID' ? (blockedRows(journal).get(cli.branch)?.caseId ?? 'held') : 'deferred';
+  const blockedBy =
+    st === 'PR_ID'
+      ? (blockedRows(journal).get(cli.branch) ?? []).map((r) => r.caseId).join(', ') || 'held'
+      : 'deferred';
   if (!cli.execute) {
     console.error(`DRY-RUN (no --execute): would manually unfreeze ${cli.branch} (blocked by ${blockedBy})`);
     emit(cli, { branch: cli.branch, blockedBy });
@@ -3764,6 +3835,12 @@ export async function cmdUnfreeze(cli: Cli): Promise<number> {
   // fix/sweep ref with an open PR re-derives the branch blocked at the next
   // `start` — the durable unfreeze is resolving/closing that PR on origin.
   appendJournal(dir, { action: 'unfrozen', branch: cli.branch, reason: 'manual', blockedBy });
+  // Reopen the branch + its transitive inventory descendants (finding #2b,
+  // as the retired reconcileMergeStatus did): an unfreeze AFTER the branch
+  // already `arrived` this pass must re-process it — arrivedSet honors the
+  // later `reopened` rows, so the next `run` re-derives them.
+  const edges: Record<string, string[]> = Object.fromEntries(directParentEdges(cli));
+  reopen(dir, [cli.branch, ...transitiveDescendants(edges, cli.branch)]);
   console.error(`unfroze ${cli.branch} (manual — this pass only; origin re-derives at the next start)`);
   emit(cli, { branch: cli.branch, unfrozen: true, reason: 'manual' });
   return 0;
@@ -3790,8 +3867,11 @@ export async function cmdStatus(cli: Cli): Promise<number> {
   if (prBlocked.length) {
     console.log('merge_status PR_ID (blocked on their own PR; origin/journal-derived):');
     for (const branch of prBlocked) {
-      const r = rows.get(branch);
-      console.log(`  ${branch} (${r?.caseId ?? 'held'})${r?.fixBranch ? ` PR head ${r.fixBranch}` : ''}${r?.prNumber ? ` #${r.prNumber}` : ''}`);
+      const rs = rows.get(branch) ?? [];
+      if (rs.length === 0) console.log(`  ${branch} (held)`);
+      for (const r of rs) {
+        console.log(`  ${branch} (${r.caseId})${r.fixBranch ? ` PR head ${r.fixBranch}` : ''}${r.prNumber ? ` #${r.prNumber}` : ''}`);
+      }
     }
   }
   const deferred = [...view.entries()].filter(([, s]) => s === 'DEFERRED').map(([b]) => b);
@@ -4397,19 +4477,13 @@ async function deriveOriginMergeStatus(
     }
   };
 
-  for (const m of merged) {
-    const deleteFailed = await deleteOriginRef(m.ref);
-    appendJournal(dir, {
-      action: 'origin-ref-resolved',
-      ref: m.ref,
-      branch: m.branch,
-      headSha: m.sha,
-      ...(deleteFailed ? { deleteFailed } : {}),
-    });
-    console.error(`sweep start: '${m.ref}' merged into origin/${m.branch} — resolved${deleteFailed ? ' (cleanup delete failed)' : ', ref deleted'}`);
-  }
-
   const blocked: string[] = [];
+  // TOKEN/TRANSPORT GATE FIRST (finding #6, fail-closed): when unmerged refs
+  // need PR lookups, a missing token/slug must abort start BEFORE any origin
+  // mutation — the merged-ref cleanup below runs only once the gate passes
+  // (or is not needed: merged-only starts stay token-free).
+  let transport: GithubTransport | null = null;
+  let slugParts: { owner: string; repo: string } | null = null;
   if (unmerged.length > 0) {
     // Networked part (D-058 §4): start takes --token-file like publish/push.
     let token: string | null = null;
@@ -4426,7 +4500,7 @@ async function deriveOriginMergeStatus(
         blocked,
       };
     }
-    const slugParts = await originSlug(cli);
+    slugParts = await originSlug(cli);
     if (!slugParts) {
       return {
         ok: false,
@@ -4434,16 +4508,31 @@ async function deriveOriginMergeStatus(
         blocked,
       };
     }
-    const transport = (makeTransport ?? realGithubTransport)(token);
+    transport = (makeTransport ?? realGithubTransport)(token);
+  }
+
+  for (const m of merged) {
+    const deleteFailed = await deleteOriginRef(m.ref);
+    appendJournal(dir, {
+      action: 'origin-ref-resolved',
+      ref: m.ref,
+      branch: m.branch,
+      headSha: m.sha,
+      ...(deleteFailed ? { deleteFailed } : {}),
+    });
+    console.error(`sweep start: '${m.ref}' merged into origin/${m.branch} — resolved${deleteFailed ? ' (cleanup delete failed)' : ', ref deleted'}`);
+  }
+
+  if (unmerged.length > 0) {
     for (const u of unmerged) {
       let pr: { url: string; number: number } | null;
       try {
         // FAIL-CLOSED lookup: only an authoritative 200 may decide blocked-vs-
         // orphan (getOpenPrByHead's null-on-any-status would read an API
         // failure as "no PR" and delete a ref with a live PR).
-        const lookup = await transport.request(
+        const lookup = await transport!.request(
           'GET',
-          `/repos/${slugParts.owner}/${slugParts.repo}/pulls?head=${encodeURIComponent(`${slugParts.owner}:${u.ref}`)}&state=open`,
+          `/repos/${slugParts!.owner}/${slugParts!.repo}/pulls?head=${encodeURIComponent(`${slugParts!.owner}:${u.ref}`)}&state=open`,
         );
         if (lookup.status !== 200 || !Array.isArray(lookup.body)) {
           throw new Error(`open-PR lookup for '${u.ref}' -> HTTP ${lookup.status}`);
@@ -4470,6 +4559,7 @@ async function deriveOriginMergeStatus(
         blocked.push(u.branch);
         console.error(`sweep start: ${u.branch} blocked — open PR #${pr.number} on '${u.ref}' (origin-derived)`);
       } else {
+        // OPEN OWNER QUESTION (review finding #5, pending): whether `start` may delete an unmerged orphan ref at all (vs. quarantine/report-only) is an owner policy decision.
         const deleteFailed = await deleteOriginRef(u.ref);
         appendJournal(dir, {
           action: 'origin-ref-orphaned',
@@ -5588,6 +5678,28 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     let heldN = 0;
     for (const jc of held) {
       if (journal.some((e) => e.action === 'pr-published' && e.caseId === jc.caseId)) continue;
+      // Cross-tier duplicate (finding #3): a held case whose conflict signature
+      // matches an ALREADY-PUBLISHED sibling (e.g. a JUDGED PR created in
+      // phase 2, or an earlier held PR from this loop) can never publish —
+      // ERR06 would wedge finish forever. The published PR already carries the
+      // resolution: journal the skip and CONTINUE. Journal re-read per case so
+      // this-loop publishes are visible to the signature match.
+      const jNow = readJournal(dir);
+      const jcNow = journaledCases(jNow).get(jc.caseId) ?? jc;
+      const dup = await duplicateCaseIssue(cli, jNow, journaledCases(jNow), jcNow);
+      if (dup?.duplicateOf) {
+        appendJournal(dir, {
+          action: 'held-duplicate',
+          caseId: jc.caseId,
+          branch: jc.branch,
+          duplicateOf: dup.duplicateOf.caseId,
+          url: dup.duplicateOf.url,
+          number: dup.duplicateOf.number,
+          detail: dup.detail,
+        });
+        progress(`held PR skipped — duplicate of published PR #${dup.duplicateOf.number} (${jc.caseId})`);
+        continue;
+      }
       const rcPub = await cmdPublish(
         { ...cli, cmd: 'publish', caseId: jc.caseId, execute: true, internal: true },
         makeTransport,

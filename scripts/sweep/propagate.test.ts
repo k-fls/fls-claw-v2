@@ -1536,6 +1536,93 @@ describe('propagate — unfreeze paths (§8, D-058 journal-derived)', () => {
       2,
     );
   });
+
+  it('unfreeze of a DEFERRED branch takes effect: defer rows older than the unfrozen row drop from the derived view (finding #2a)', async () => {
+    // feat/x (parents feat/a + feat/b) journaled a defer; the sibling parent
+    // feat/b is PR_ID-blocked, so the fixpoint view keeps X DEFERRED. A manual
+    // unfreeze of X must CLEAR that — before the fix the `unfrozen` row only
+    // cleared PR_ID rows and X stayed sticky-deferred forever.
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.checkout('feat/a', { create: true, at: 'main_patched' });
+    repo.commit('a: own file', { 'src/a.ts': 'a\n' }); // X has a REAL pending merge from feat/a
+    repo.checkout('feat/b', { create: true, at: 'main_patched' });
+    repo.checkout('feat/x', { create: true, at: 'main_patched' });
+    repo.checkout('main');
+    repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+    cleanups.push(() => repo.destroy());
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'a', branch: 'feat/a', parents: ['main_patched'] },
+      { id: 'b', branch: 'feat/b', parents: ['main_patched'] },
+      { id: 'x', branch: 'feat/x', parents: ['feat/a', 'feat/b'] },
+    ]);
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    appendJournal(dir, {
+      action: 'origin-blocked',
+      branch: 'feat/b',
+      caseId: 'origin:fix/sweep/feat__b--main_patched-h5-deadbeef',
+      fixBranch: 'fix/sweep/feat__b--main_patched-h5-deadbeef',
+      headSha: null,
+      prNumber: 12,
+    });
+    appendJournal(dir, { action: 'defer', branch: 'feat/x', parent: 'feat/a', deferredTo: 'feat/a' });
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+
+    expect(await cmdUnfreeze(baseCli(repo, ws, inv, { cmd: 'unfreeze', execute: true, branch: 'feat/x' }))).toBe(0);
+    expect(readJournal(dir).some((e) => e.action === 'unfrozen' && e.branch === 'feat/x')).toBe(true);
+
+    // Next derivation: X is no longer DEFERRED — it processes normally (merges
+    // its parents' fresh tips) instead of the sticky deferred skip.
+    expect(await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }))).toBe(0);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'skip' && e.branch === 'feat/x' && e.reason === 'deferred')).toBe(false);
+    expect(journal.some((e) => e.action === 'merge' && e.branch === 'feat/x')).toBe(true);
+  });
+
+  it('unfreeze AFTER the branch already arrived reopens it + its inventory descendants for re-processing (finding #2b)', async () => {
+    const { repo } = conflictFixture();
+    repo.checkout('feat/k', { create: true, at: 'main_patched' });
+    repo.checkout('main');
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'k', branch: 'feat/k', parents: ['main_patched'] }]);
+    const wm12 = repo.sha('main').slice(0, 12);
+    const dir = passDir(ws, wm12);
+    appendJournal(dir, {
+      action: 'origin-blocked',
+      branch: 'main_patched',
+      caseId: 'origin:fix/sweep/main_patched--main-h1-deadbeef',
+      fixBranch: 'fix/sweep/main_patched--main-h1-deadbeef',
+      headSha: null,
+      prNumber: 12,
+    });
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    // The blocked branch takes nothing, so this run seals the pass — the
+    // unfreeze + re-run attach explicitly via --pass (like push does).
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    const journal1 = readJournal(dir);
+    expect(journal1.some((e) => e.action === 'skip' && e.branch === 'main_patched' && e.reason === 'held')).toBe(true);
+    expect(journal1.some((e) => e.action === 'arrived' && e.branch === 'main_patched')).toBe(true);
+    const before = repo.sha('main_patched');
+
+    expect(
+      await cmdUnfreeze(baseCli(repo, ws, inv, { cmd: 'unfreeze', execute: true, branch: 'main_patched', pass: wm12 })),
+    ).toBe(0);
+    // The unfreeze REOPENED the branch and its transitive inventory descendant
+    // — without this the already-`arrived` branch stays skipped all pass.
+    const reopened = readJournal(dir)
+      .filter((e) => e.action === 'reopened')
+      .map((e) => e.branch as string);
+    expect(reopened).toContain('main_patched');
+    expect(reopened).toContain('feat/k');
+
+    // The SAME pass re-processes the branch: the clean prefix lands and the
+    // persistent conflict emits a case.
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true, pass: wm12 }));
+    expect(repo.sha('main_patched')).not.toBe(before);
+    expect(readJournal(dir).some((e) => e.action === 'case' && e.branch === 'main_patched')).toBe(true);
+  });
 });
 
 // --- B8: multi-parent same-height cases are distinct + both resolvable -----
@@ -2717,6 +2804,65 @@ describe('derived merge_status (D-058) — blocked view from origin rows + journ
     expect(readLedger(ledgerPath).branches['feat/c']?.merge_status ?? null).toBeNull();
   });
 
+  it('a branch with TWO concurrent blocks contributes its LOWEST height to descendants (finding #4 — no last-row collapse)', async () => {
+    // feat/a carries TWO origin-blocked rows (multi-parent → several concurrent
+    // held PRs): one at h0 (u0) and one at h1 (u1), journaled in that order so
+    // a last-writer-wins map would keep the HIGHER h1 row. feat/c's conflict
+    // (via either parent line) sits at h0: the DEFER height-MIN must compare
+    // against MIN(h0, h1) = h0 — with the collapsed h1 row the h0 conflict
+    // would wrongly pass as C's own case instead of deferring behind A.
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    const base = repo.sha('main');
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.checkout('feat/a', { create: true, at: 'main_patched' });
+    repo.checkout('feat/b', { create: true, at: 'main_patched' });
+    repo.checkout('feat/c', { create: true, at: 'main_patched' });
+    repo.commit('c: x = cfork', { 'src/x.ts': 'cfork\n' });
+    repo.checkout('main');
+    const u0 = repo.commit('U0: x = up0', { 'src/x.ts': 'up0\n' }); // h0 — the conflicting height
+    const u1 = repo.commit('U1: util', { 'src/util.ts': 'u\n' }); // h1 — clean
+    repo.checkout('feat/a');
+    repo.git('merge', '--no-edit', '-m', 'a merges U0', u0);
+    repo.checkout('feat/b');
+    repo.git('merge', '--no-edit', '-m', 'b merges U0', u0);
+    repo.git('merge', '--no-edit', '-m', 'b merges U1', u1);
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'a', branch: 'feat/a', parents: ['main_patched'] },
+      { id: 'b', branch: 'feat/b', parents: ['main_patched'] },
+      { id: 'c', branch: 'feat/c', parents: ['feat/a', 'feat/b'] },
+    ]);
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, { base, ...o });
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    appendJournal(dir, {
+      action: 'origin-blocked',
+      branch: 'feat/a',
+      caseId: 'origin:fix/sweep/feat__a--main_patched-h0-cafecafe',
+      fixBranch: 'fix/sweep/feat__a--main_patched-h0-cafecafe',
+      headSha: u0, // block at h0 — the LOWER (safest) height
+      prNumber: 12,
+    });
+    appendJournal(dir, {
+      action: 'origin-blocked',
+      branch: 'feat/a',
+      caseId: 'origin:fix/sweep/feat__a--main_patched-h1-deadbeef',
+      fixBranch: 'fix/sweep/feat__a--main_patched-h1-deadbeef',
+      headSha: u1, // block at h1 — the LATER journal row (the old collapse survivor)
+      prNumber: 13,
+    });
+    await cmdPlan(cli({ cmd: 'plan' }));
+    expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
+
+    const journal = readJournal(dir);
+    // C DEFERS behind A (its h0 conflict >= MIN(h0, h1)) — it does NOT get its
+    // own case (with the collapsed h1 row it wrongly would).
+    expect(journal.some((e) => e.action === 'defer' && e.branch === 'feat/c')).toBe(true);
+    expect(journal.some((e) => e.action === 'case' && e.branch === 'feat/c')).toBe(false);
+  });
 });
 
 // --- D-057 STAY rule over ALL direct parents (D-058 fixpoint view) -----------

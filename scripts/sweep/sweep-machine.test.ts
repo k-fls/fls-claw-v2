@@ -45,6 +45,23 @@ function emptyInventory(): string {
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   return dir;
 }
+/** Minimal inventory writer (id/branch/parents) — mirrors propagate.test.ts. */
+function writeInventory(entries: Array<{ id: string; branch: string; parents?: string[] }>): string {
+  const dir = mkdtempSync(join(tmpdir(), 'sm-inv-'));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  for (const e of entries) {
+    const yaml = [
+      `id: ${e.id}`,
+      `name: ${e.id}`,
+      'kind: feat',
+      'status: shipped',
+      `branch: ${e.branch}`,
+      ...(e.parents ? ['parents:', ...e.parents.map((p) => `  - ${p}`)] : []),
+    ].join('\n');
+    writeFileSync(join(dir, `${e.id}.yaml`), yaml + '\n');
+  }
+  return dir;
+}
 function baseCli(repo: FixtureRepo, ws: string, inv: string, over: Partial<Cli> = {}): Cli {
   return {
     cmd: 'plan',
@@ -761,6 +778,122 @@ describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
     expect(readJournal(dir).filter((e) => e.action === 'push' && e.kind === 'target').length).toBe(1);
     expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).toBe(repo.sha('main_patched'));
   });
+
+  it('held publish crash window (finding #1): PR exists API-side but the pr-published row was lost -> finish RECONCILES and completes, no duplicate PR, no halt', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const caseId = currentCaseId(dir);
+    await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true }), confirm);
+    writePr(dir, caseId, 'held x', 'Decision needed: resolution of src/x.ts — study before merge.');
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv)); // finalize
+
+    // Simulate the prior-run crash: GitHub already has the open PR for the
+    // deterministic head branch (created just before the crash), while the
+    // journal carries NO `pr-published` row for the case.
+    const gh = fakeGithub({
+      'GET /pulls?': { status: 200, body: [{ html_url: 'https://github.com/k-fls/fixture/pull/12', number: 12 }] },
+    });
+    const out = join(ws, 'finish.json');
+    expect(
+      await cmdSweepFinish(
+        baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, tokenFile, commandsFile: passCmds(ws), out }),
+        gh.factory,
+      ),
+    ).toBe(0); // NO halt — the loop reconciles and continues
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { ok: boolean; status: string };
+    expect(res.ok).toBe(true);
+    expect(res.status).toBe('complete');
+    expect(machineState(dir).phase).toBe('complete');
+    // The reconciling row has the normal pr-published shape (journal healed).
+    const pub = readJournal(dir).find((e) => e.action === 'pr-published' && e.caseId === caseId)!;
+    expect(pub.number).toBe(12);
+    expect(pub.url).toBe('https://github.com/k-fls/fixture/pull/12');
+    expect(pub.mode).toBe('held');
+    expect(pub.branch).toBe('main_patched');
+    expect(typeof pub.fixBranch).toBe('string');
+    expect(typeof pub.head).toBe('string');
+    expect(pub.reconciled).toBe(true);
+    // NO duplicate PR was created and no pr-head push happened.
+    expect(gh.calls.some((c) => c.method === 'POST' && c.path.endsWith('/pulls'))).toBe(false);
+    expect(readJournal(dir).some((e) => e.action === 'push' && e.kind === 'pr-head')).toBe(false);
+  });
+
+  it('cross-tier duplicate (finding #3): a held case matching a published JUDGED sibling is journaled held-duplicate and finish completes (no ERR06 wedge)', async () => {
+    // feat/a (judged) and feat/b (held) carry the SAME fork edit and conflict
+    // identically against the same main_patched tip: same paths + same head.
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: disjoint', { 'src/mp.ts': 'mp\n' });
+    repo.checkout('feat/a', { create: true, at: 'main_patched' });
+    repo.commit('a: x = fork', { 'src/x.ts': 'fork\n' });
+    repo.checkout('feat/b', { create: true, at: 'main_patched' });
+    repo.commit('b: x = fork', { 'src/x.ts': 'fork\n' });
+    repo.checkout('main');
+    repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' });
+    cleanups.push(() => repo.destroy());
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'a', branch: 'feat/a', parents: ['main_patched'] },
+      { id: 'b', branch: 'feat/b', parents: ['main_patched'] },
+    ]);
+    const dir = dirOf(repo, ws);
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched', 'feat/a', 'feat/b');
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    // Case 1 (feat/a): resolve JUDGED — merged locally at report-pr, PR at finish.
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const caseA = currentCaseId(dir);
+    resolveWorktree(dir, caseA, { 'src/x.ts': 'RESOLVED\n' });
+    await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true }), confirm);
+    writePr(dir, caseA, 'judged x', 'Decision needed: keep the fork line in src/x.ts.');
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
+    // Case 2 (feat/b): the SAME conflict signature — freeze it HELD. This
+    // passes report-case (the judged sibling is resolved, not yet published).
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const caseB = currentCaseId(dir);
+    expect(caseB).not.toBe(caseA);
+    await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true }), confirm);
+    writePr(dir, caseB, 'held x', 'Decision needed: resolution of src/x.ts — study before merge.');
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv)); // finalize
+
+    const gh = fakeGithub();
+    const out = join(ws, 'finish.json');
+    expect(
+      await cmdSweepFinish(
+        baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, tokenFile, commandsFile: passCmds(ws), out }),
+        gh.factory,
+      ),
+    ).toBe(0); // completes — the duplicate held case never wedges phase 4
+    expect(machineState(dir).phase).toBe('complete');
+    const journal = readJournal(dir);
+    // The judged sibling published; the held duplicate did NOT (skip journaled).
+    expect(journal.some((e) => e.action === 'pr-published' && e.caseId === caseA && e.mode === 'judged')).toBe(true);
+    expect(journal.some((e) => e.action === 'pr-published' && e.caseId === caseB)).toBe(false);
+    const dup = journal.find((e) => e.action === 'held-duplicate' && e.caseId === caseB)!;
+    expect(dup).toBeTruthy();
+    expect(dup.duplicateOf).toBe(caseA);
+    expect(dup.number).toBe(7);
+    // Exactly ONE PR was created (the judged one) — never a second for the dup.
+    expect(gh.calls.filter((c) => c.method === 'POST' && c.path.endsWith('/pulls')).length).toBe(1);
+    // No fix/sweep ref was pushed for the duplicate (only the judged case's).
+    const fixRefs = repo.git('-C', bare, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep');
+    expect(fixRefs).not.toContain('feat__b');
+    expect(fixRefs).toContain('feat__a');
+  });
 });
 
 describe('sweep — crash resume (machine-state drives re-entry, D-053 §5)', () => {
@@ -1216,11 +1349,18 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     const { fixBranch, fixHead } = pushFixRef(repo);
+    // A MERGED fix ref is also present (its head is on origin/main_patched):
+    // start must NOT delete it before the token gate — the gate fails closed
+    // BEFORE any origin mutation (finding #6).
+    const mergedRef = 'fix/sweep/main_patched--main-h0-cafecafe';
+    const mergedHead = repo.git('rev-parse', 'refs/remotes/origin/main_patched');
+    repo.git('push', 'origin', `${mergedHead}:refs/heads/${mergedRef}`);
     const out = join(ws, 'start.json');
     expect(await cmdSweepStart(baseCli(repo, ws, inv, { out }))).toBe(1);
     const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> };
     expect(res.issues[0].id).toBe('ERR11_TOKEN_MISSING');
     expect(repo.git('-C', bare, 'rev-parse', `refs/heads/${fixBranch}`)).toBe(fixHead); // untouched
+    expect(repo.git('-C', bare, 'rev-parse', `refs/heads/${mergedRef}`)).toBe(mergedHead); // merged ref untouched too
     expect(existsSync(join(dirOf(repo, ws), 'plan-initial.json'))).toBe(false); // no pass opened
   });
 

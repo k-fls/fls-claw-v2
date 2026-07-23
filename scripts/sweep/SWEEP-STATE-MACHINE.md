@@ -20,6 +20,21 @@ Blockedness is the `merge_status ∈ {PR_ID | DEFERRED | NONE}` block model (inv
 `blocked ⇔ merge_status != NONE`), replacing the independent freeze fields. See
 MERGE-POLICY.md §1 for the full semantics.
 
+D-058 amendment (2026-07-23): publish timing + a stateless origin-derived `start`.
+(a) EVERY PR is now created at `finish`, after the full-integration verify — JUDGED
+history AND HELD (active/draft). `report-pr` publishes NOTHING; it records the publish
+intent (tier, resolved commit, active-vs-draft, escalation prefix + feedback) into the
+journal, and `finish` creates all PRs from it. So even an ACTIVE held-review PR sits on
+the verified tip (it can no longer bypass the verify gate), and a pass that crashes
+before `finish` leaves no PR on origin.
+(b) `sweep start` is NETWORKED and origin-derived. It fetches origin+upstream (fetch
+failure = ERR39), then reconstructs the blocked set from the origin `fix/sweep/*` refs
+— merged into `origin/<target>` → resolved + delete the ref; unmerged WITH an open PR →
+blocked; unmerged WITHOUT a PR → orphan, delete it. It takes `--token-file` (it queries
+GitHub for those PRs). The ledger `merge_status` authority (and the D-057
+reconcile/settle machinery) is retired: the local pass dir is disposable, so `start`
+always re-derives a clean picture from origin.
+
 ## 1. Principle
 
 - The DRIVER is a resumable state machine owning ALL state (pinned watermark, current
@@ -45,6 +60,15 @@ MERGE-POLICY.md §1 for the full semantics.
   blind-wipe an in-flight pass (that stranded resolved-but-unpushed merges before).
 - Pin the top upstream commit = watermark; ALL downstream work is against it.
 - Reset working state to a known base; initialize the journal.
+- **NETWORKED + origin-derived (D-058):** `start` first `git fetch`es origin and
+  upstream (a fetch failure is `ERR39`, so a pass never opens on a stale view), then
+  reconstructs the blocked set from the origin `fix/sweep/*` refs BEFORE planning:
+  merged into `origin/<target>` → resolved (delete the ref); unmerged WITH an open PR →
+  blocked; unmerged WITHOUT an open PR → an orphan ref, deleted (a branch is never stuck
+  blocked-but-invisible). It takes `--token-file` (it queries GitHub for those PRs;
+  token missing while unmerged refs exist = `ERR11`). The ledger's `merge_status` is no
+  longer read — the pass dir is disposable and `start` is idempotent on origin; a pass
+  that crashed before `finish` published nothing, so the re-derived picture is clean.
 - **Clean-slate boundary (D-055):** the pass lives at ONE canonical location
   `<--workspace>/propagation/pass-<watermark12>`, printed by `start` and `status`.
   `--workspace` is the GROUP ROOT (parent of the clone), defaulted from `--repo`;
@@ -114,25 +138,24 @@ MERGE-POLICY.md §1 for the full semantics.
     accurate.
   - Confirm on a `judged` claim but scope-exceeded → HELD publishing the resolution
     as an ACTIVE PR (owner reviews & merges; escalation prefix + reviewer feedback).
-- On pass, by tier:
-  - `held`: PUBLISH THE HELD PR NOW via the UNIFIED publish (D-057) — push the
-    `fix/sweep` branch and open the PR. Active-vs-draft is decided by whether a
+- On pass, by tier — RECORD PR INTENT, PUBLISH NOTHING (D-058). Every PR is created at
+  `finish`, after verify; `report-pr` only journals what to create:
+  - `judged`: merge the resolution in place on the branch, then record the PR intent —
+    the JUDGED history PR is created at `finish`, before the target push that
+    auto-flips it to merged. (A JUDGED PR auto-merges when its merge commit reaches the
+    target branch, and that push must clear the full-integration verify, so it cannot
+    happen mid-pass.)
+  - `held`: record the held PR intent — active-vs-draft decided by whether a
     MARKER-CLEAN resolution exists: marker-clean (the agent actually resolved) → an
     ACTIVE (non-draft) PR at the RESOLVED merge commit, which the OWNER reviews &
-    MERGES (the driver NEVER auto-merges a HELD PR — auto-merge stays JUDGED);
-    markers remain / no valid resolution → a DRAFT PR built from the PRISTINE
-    conflict (clean-prefix commit + the original upstream-vs-ours conflict, ZERO
-    agent edits, so the owner resolves fresh rather than the agent's mangled try).
-    Escalated holds (scope-exceeded / cold-read-rejected-2x / non-convergence cap)
-    prepend an `[AUTO-ESCALATED: …]` prefix + the reviewer feedback to the
-    description. Reason: the driver auto-merges nothing here, so publishing it lands
-    nothing on a target branch by itself, and the owner should see the held case the
-    moment it is frozen (D-047: a prepared-but-unpublished PR is useless).
-  - `judged`: RECORD PR INTENT ONLY; the PR is created and closed at `finish` (§finish).
-    Reason: a JUDGED PR is history that AUTO-MERGES when its merge commit is pushed to
-    the target branch — that push must clear the full-integration verify (below), so it
-    cannot happen mid-pass. It is a record nobody acts on early; create-early/merge-late
-    would be two-phase complexity for no owner benefit.
+    MERGES (the driver NEVER auto-merges a HELD PR — auto-merge stays JUDGED); markers
+    remain / no valid resolution → a DRAFT PR built from the PRISTINE conflict
+    (clean-prefix commit + the original upstream-vs-ours conflict, ZERO agent edits, so
+    the owner resolves fresh rather than the agent's mangled try). Escalated holds
+    (scope-exceeded / cold-read-rejected-2x / non-convergence cap) prepend an
+    `[AUTO-ESCALATED: …]` prefix + the reviewer feedback to the description. `finish`
+    creates it AFTER verify + the target pushes, so the base is current (the HELD diff =
+    the case run only) and the ERR14 held-ordering holds for every held PR.
 - Then → `take next case`.
 
 ### `sweep finish`
@@ -140,26 +163,34 @@ MERGE-POLICY.md §1 for the full semantics.
   the full-integration verify (everything-rebuild, D-012) is the only gate that catches
   semantically-broken-but-clean cross-branch merges, and it cannot run until all cases
   are resolved (the integrated tree is incomplete before then).
-- Steps, in order (MERGE-POLICY §5):
+- The ONLY stage that publishes ANYTHING (D-058: all PRs are created here, after
+  verify). Steps, in order (MERGE-POLICY §5):
   1. verify the publishable set (full rebuild, D-051 semantics: this pass's advanced
      branches on main_patched; held/frozen excluded; red on a publishable branch →
      rollback to pre-ref + HELD(gate); red on a non-publishable branch → non-blocking).
-  2. push target branches (CLEAN / MECHANICAL / prefix merges).
-  3. push JUDGED closures (same merge commit → PR auto-flips merged); create the JUDGED
-     history PRs.
-  4. (HELD PRs — active or draft, D-057 — are already published from `report-pr`.)
-  5. post urge comments (D-004 pending-count) on frozen branches with new pending heads.
-  6. journal-derived owner report (which PRs need the owner, or the done-line).
-  7. check upstream advanced past the pinned watermark → `start again` or `done`.
+  2. create the JUDGED history PRs (non-draft), before the target push.
+  3. push target branches (CLEAN / MECHANICAL / prefix merges) + JUDGED closure pushes
+     (same merge commit → the JUDGED PRs auto-flip merged) + closure checks + urge
+     comments (D-004 pending-count) on frozen branches with new pending heads.
+  4. create the HELD PRs — active (marker-clean resolution, owner merges) or draft
+     (pristine conflict, owner resolves), D-057 — from the recorded intent. AFTER the
+     target pushes so the bases are current and the ERR14 held-ordering holds; the
+     driver NEVER auto-merges a held PR.
+  5. journal-derived owner report (which PRs need the owner, or the done-line).
+  6. check upstream advanced past the pinned watermark → `start again` or `done`.
 - Multi-step and resumable: a red verify or `ERR15_PUSH_FAILED` (proxy) → report +
-  HALT + re-runnable from the stopped phase; pushes never redo.
+  HALT + re-runnable from the stopped phase; pushes and PR-creates never redo. A pass
+  that crashes BEFORE `finish` has published nothing — the next `start` re-derives a
+  clean origin picture and redoes the pass.
 
 ## 3. Publish-timing rule (the reasoning, one line)
 
-Postpone iff the DRIVER's action LANDS CODE ON A TARGET BRANCH (needs the
-full-integration verify): CLEAN / MECHANICAL / JUDGED-closure → `finish`. A HELD PR
-(active or draft, D-057) is published at `report-pr`: the driver never auto-merges a
-HELD PR, so publishing it lands nothing on a target branch by itself.
+ALL publication happens at `finish`, after the full-integration verify (D-058): CLEAN /
+MECHANICAL / JUDGED-closure land code on a target branch, so they need the verify gate;
+and HELD PRs (active or draft) are created there too — even though a HELD PR lands
+nothing on a target branch itself, creating it at `finish` keeps it on the verified tip
+and off origin when a pass crashes mid-way. `report-pr` records the publish intent;
+`finish` is the single publish point.
 
 ## 4. Division of labor
 

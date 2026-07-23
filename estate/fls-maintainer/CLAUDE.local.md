@@ -16,9 +16,10 @@ channel. Architecture: `docs/design/02-self-maintaining-flsclaw.md` (branch
    mounts, no other groups' folders, no `~/nanoclaw2`.
 3. **All pushes and PR writes are the DRIVER's — you hand-push and hand-post
    NOTHING, ever.** Never `git push` any ref (including `fix/sweep/*`); never
-   create a PR or comment via curl/node/gh. The driver pushes and creates PRs
-   inside `report-pr` and `finish`; a failed driver push is a stop-case 2 report
-   and a full publication stop — no fallback, no workaround, no retry loop.
+   create a PR or comment via curl/node/gh. The driver creates every PR (and moves
+   every ref) inside `finish`; `start` also touches origin (it deletes stale
+   `fix/sweep/*` refs). A failed driver push is a stop-case 2 report and a full
+   publication stop — no fallback, no workaround, no retry loop.
 4. Merge discipline (ENFORCED by the driver — you never sequence or execute
    inventory-branch merges by hand): new-style `git merge-tree`, never
    cherry-pick; merge unit = upstream first-parent commit; `everything*` branches
@@ -44,7 +45,8 @@ channel. Architecture: `docs/design/02-self-maintaining-flsclaw.md` (branch
   literally into the header. NEVER trust `$GITHUB_TOKEN` — it is not maintained.
 - **All ref moves and PR/comment WRITES are the driver's** (rule 3). Once per
   session, write the `get_credential` output to a file and pass it as
-  `--token-file <path>` on every networked `--execute` (`report-pr`, `finish`).
+  `--token-file <path>` on every networked command (`start` queries GitHub +
+  deletes stale `fix/sweep/*` refs; `finish` creates every PR).
 - Auth failures that survive the above are a stop-case 2 report.
 
 ## Bootstrap
@@ -77,7 +79,7 @@ branch is a driver halt and an owner escalation.
    only (a) edit code in the driver-prepared worktree, (b) write a PR description
    at the fixed path, (c) claim one `--tier` word. Pass `--inventory ../inventory`
    on EVERY invocation (omitting it falls back to the stale bootstrap snapshot);
-   mutating commands need `--execute`; networked commands (`report-pr`, `finish`)
+   mutating commands need `--execute`; networked commands (`start`, `finish`)
    take `--token-file <path>` (§GitHub); branch-scoped tests are opt-in via
    `--commands-file`.
 
@@ -85,14 +87,16 @@ branch is a driver halt and an owner escalation.
    `scripts/sweep/sweep-machine.ts`):
 
    ```
-   start                              # opens the pass, pins the watermark
+   start --token-file <path>          # opens the pass, pins the watermark; derives blocked
+                                       #   state from the origin fix/sweep refs (networked)
    loop:
      next-case                        # -> {status:"case-ready", worktree, branch,
                                        #     conflictedPaths, materials} OR {status:"finalize"}
      <resolve the pending files (`git status`) in the returned worktree — commit not required>
      report-case --tier mechanical|judged|held --execute
-     report-pr --execute --token-file <path>   # ONLY when report-case says "provide PR description"
-   finish --execute --token-file <path> --commands-file <cheap-tests.json>
+     report-pr --execute              # ONLY when report-case says "provide PR description";
+                                       #   records PR intent, publishes nothing
+   finish --execute --token-file <path> --commands-file <cheap-tests.json>   # creates ALL PRs, after verify
    ```
 
    THE TWO-PREFIX STDOUT CONTRACT — only two kinds of lines matter:
@@ -110,8 +114,11 @@ branch is a driver halt and an owner escalation.
      `SWEEP-STEP:` lines the same way.
 
    DO WHAT EACH COMMAND RETURNS — never pass ids, never argue with a blocking id:
-   - `start` — refuses while a pass is open (`ERR30_PASS_OPEN`: `finish` or
-     `abort` first). Review the printed plan YOURSELF, do not post it. SANITY
+   - `start` — networked: fetches origin+upstream, then rebuilds the blocked set
+     from the origin `fix/sweep/*` refs (merged → resolved + ref deleted; unmerged
+     with an open PR → blocked; unmerged with no PR → orphan ref deleted), so pass
+     the `--token-file`. Refuses while a pass is open (`ERR30_PASS_OPEN`: `finish`
+     or `abort` first). Review the printed plan YOURSELF, do not post it. SANITY
      (rule 7): a 1-2 branch plan means scope collapse (missing local branches or
      wrong inventory path) — `abort` and investigate. CANDIDATES: relay in the
      digest — `clear`: propose the derived placement, WAIT for approval;
@@ -146,17 +153,18 @@ branch is a driver halt and an owner escalation.
    - `report-pr` (judged/held only) — write `pr/title.txt` + `pr/body.md` in the
      case dir (standards below), then run it. ONE cold read over the resolution
      diff AND your description together; a description-only defect → `rewrite:
-     <reason>` — fix the text, re-run. On pass: **held** PUBLISHES NOW (lands
-     nothing on a target branch — the owner sees it immediately; active vs draft
-     per the PR section); **judged** merges locally and records PR intent (PR
-     created and auto-merged at `finish`). Then → `take next case`.
-   - `finish` — the ONLY stage that lands code on a target branch, so it runs
-     the full-integration verify first (red on a publishable branch → rollback +
+     <reason>` — fix the text, re-run. It PUBLISHES NOTHING: on pass it records the
+     PR intent — **judged** merges locally, **held** records active-vs-draft (per
+     the PR section) — and EVERY PR is created later at `finish`, after verify.
+     Then → `take next case`.
+   - `finish` — the ONLY stage that publishes anything, so it runs the
+     full-integration verify first (red on a publishable branch → rollback +
      HELD(gate) + halt). Then: JUDGED history PRs created, target branches
      pushed (auto-flipping the JUDGED PRs to merged), closures checked, urge
-     comments posted, journal-derived owner report printed + whether upstream
-     advanced (`start again` / `done`). RESUMABLE: after any halt, re-run
-     `finish` — it resumes from the stopped phase, pushes never redo (a push
+     comments posted, then the HELD PRs created (active or draft; bases now
+     current), journal-derived owner report printed + whether upstream advanced
+     (`start again` / `done`). RESUMABLE: after any halt, re-run `finish` — it
+     resumes from the stopped phase, pushes and PR-creates never redo (a push
      failure is still `ERR15`: report first).
    - `abort --execute` — the ONLY sanctioned way to drop an in-flight pass
      (rolls every mutated branch back to its journaled pre-ref). `status` /
@@ -226,6 +234,7 @@ the row says — never argue with or work around a blocking id.
 | `ERR33_BRANCH_TESTS_FAILED` | branch-scoped tests failed → open the named log, fix the resolution, re-report |
 | `ERR34_CASES_REMAIN` | `finish` while cases are open/awaiting → finish every case first |
 | `ERR35_COLDREAD_UNAVAILABLE` | cold-read tooling failure (spawn/exit/auth — NOT a content decision) → stop-case 2 report; the case stays put, re-run once restored |
+| `ERR39_FETCH_FAILED` | `start` could not fetch origin/upstream (it derives blocked state from origin) → fix connectivity/creds, re-run `start`; never open a pass on a stale view |
 | `WARN01_TEMPLATE_TEXT` | body references none of the conflicted files — rewrite from the case materials |
 | `WARN02_NO_DECISION_LINE` | open the body with the exact decision the owner is asked to make |
 | `WARN03_MANY_PRS` | >8 PRs this pass — re-check for consolidation before publishing more |
@@ -257,8 +266,8 @@ the row says — never argue with or work around a blocking id.
     auto-merged like any JUDGED case; owner review only on escalation to HELD.
   - HELD — the ONLY review state: anything unresolved, twice-cold-read-rejected,
     scope-exceeded, gate-red, or judgment-worthy enough to escalate. Published at
-    `report-pr`; the owner decides. When in doubt: escalate to HELD — never
-    invent an intermediate review state.
+    `finish` (after verify); the owner decides. When in doubt: escalate to HELD —
+    never invent an intermediate review state.
 - Ask the owner in chat ONLY in the stop cases below. Every other owner decision
   travels as a HELD PR in the end-of-sweep report — never a chat question; never
   ask permission for work this document authorizes.

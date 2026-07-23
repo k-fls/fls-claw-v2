@@ -5,11 +5,11 @@ noise, review, and publication. PROPAGATION.md holds driver mechanics; on confli
 this file wins. The AGENT drives these tiers through the D-053 SWEEP STATE MACHINE
 (`SWEEP-STATE-MACHINE.md`: `start`/`next-case`/`report-case --tier`/`report-pr`/
 `finish`); this file's tier/merge/publication semantics are UNCHANGED — the state
-machine wraps them, with one publication-timing amendment: a HELD PR (active or
-draft, per D-057 §1) is published at `report-pr` the moment the case is held (§5's
-"HELD PRs last" ordering was about NOT letting a HELD merge onto a target — a HELD PR lands
-nothing on a target branch, so it needs neither the verify gate nor the target
-push, D-053). Supersedes: case-1..4 ladder (DESIGN.md §6), doc 02 §5 step-3
+machine wraps them, with one publication-timing rule (D-058): EVERY PR — JUDGED
+history and HELD (active or draft) alike — is created at `finish`, AFTER the
+full-integration verify is green. `report-pr` publishes NOTHING; it records the
+publish intent (tier, resolved commit, active-vs-draft, escalation prefix +
+feedback) into the journal, and `finish` creates all PRs from that. Supersedes: case-1..4 ladder (DESIGN.md §6), doc 02 §5 step-3
 "one PR per DAG edge batch", D-030 exhibit-commit construction, the API push
 workaround, "merging remains owner-only".
 
@@ -23,6 +23,25 @@ it) or a DRAFT PR at the pristine conflict when unresolved; scope-exceeded-but-
 cold-read-agreed and twice-cold-read-rejected escalate to a flagged HELD PR; the
 case worktree is a pending diff (clean prefix committed, agent sees only the
 conflicting delta). §1 carries the detail.
+
+D-058 amendment (2026-07-23): publish timing + blocked-state persistence.
+(a) ALL PRs are created at `finish`, after verify (§5) — JUDGED history PRs AND
+HELD PRs (active and draft). `report-pr` no longer publishes anything; it records the
+publish intent (tier, resolved merge commit, active-vs-draft, any escalation prefix +
+reviewer feedback) into the journal. This SUBSUMES the D-057 open item on held ordering
+— an ACTIVE HELD-review PR can no longer bypass the verify gate; the ERR14 held-
+ordering (bases current) now applies to every held PR. A pass that crashes before
+`finish` has published NOTHING.
+(b) Blocked state is ORIGIN-DERIVED, not ledger-persisted. `sweep start` (now
+networked, `--token-file`) reconstructs the blocked set from the origin `fix/sweep/*`
+refs: a ref merged into `origin/<target>` → resolved, delete the ref; unmerged WITH an
+open PR → blocked (PR_ID); unmerged WITHOUT an open PR → an orphan, delete it (so a
+branch is never stuck blocked-but-invisible). The ledger's `merge_status` field is no
+longer the authority (the D-057 reconcile/settle machinery is retired) — the block-
+model semantics in §1 still describe within-pass blockedness, but persistence across
+passes now lives in origin's refs, so the local pass dir is disposable and `start`
+re-derives a clean picture every time. A fetch failure at `start` is ERR39 (never open
+a pass on a stale view).
 
 ## 1. Merge tiers (per parent→branch merge attempt)
 
@@ -45,7 +64,11 @@ Tier rules:
   resolves the PR AND the merge lands on the branch), never cleared at any
   intermediate step; DEFERRED is sticky while any direct parent is blocked. This one
   block replaces the retired independent freeze fields (status:'frozen', frozenBy,
-  heldHead, heldPaths, fixBranch, pendingBehindFreeze); legacy ledgers up-convert on read.
+  heldHead, heldPaths, fixBranch, pendingBehindFreeze). D-058: this is the WITHIN-PASS
+  model; the block set is no longer PERSISTED in the ledger's `merge_status` — `sweep
+  start` re-derives it from the origin `fix/sweep/*` refs each pass (see the D-058
+  amendment), so PR_ID persistence is carried by the live ref + its open PR, not a
+  stored field.
 - Case worktree = a PENDING DIFF (D-057): the driver commits the CLEAN PREFIX (the
   automerge tree with the conflicted paths reset to base/ours) as the case worktree's
   HEAD and writes ONLY the conflicting delta (marker content) into the working tree, so
@@ -137,10 +160,14 @@ Tier rules:
 
 - The DRIVER pushes; the agent NEVER hand-pushes anything (rule 3 amended: driver-
   journaled pass pushes are the only pushes).
-- Nothing is pushed before `propagate verify` is green for the pass (D-012).
-- Per-pass push order, per branch: target branches (CLEAN/MECHANICAL/prefix merges) →
-  JUDGED closure pushes (PR flips to merged) → HELD PRs (active or draft; base is then
-  current, so the HELD diff = the case run only).
+- Nothing is pushed OR published before `propagate verify` is green for the pass
+  (D-012; extended to all PR creation by D-058).
+- ALL PRs are created at `finish`, after verify is green (D-058); nothing is published
+  at `report-pr` (it records intent only). Per-pass order at `finish`: create the
+  JUDGED history PRs → push target branches (CLEAN/MECHANICAL/prefix merges) + the
+  JUDGED closure push (same merge commit → those PRs flip to merged) → create the HELD
+  PRs (active or draft; bases are then current, so the HELD diff = the case run only,
+  and the ERR14 held-ordering holds for every held PR).
 - Pre-PR height check (blocking ID): the origin base branch must be AT LEAST at the
   expected pass height; higher is fine (someone else committed); lower/diverged = halt.
 - All GitHub writes go through the driver tooling with the ERR/WARN ID contract
