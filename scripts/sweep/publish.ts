@@ -407,94 +407,220 @@ export async function getOpenPrByHead(
 }
 
 // ---------------------------------------------------------------------------
-// D-059 — interactive PR review loop primitives.
+// D-059 — interactive PR review loop primitives (REVIEW-trigger model).
 //
 // The `sweep-addressed` marker is the STATELESS record of the review loop
 // (solves the shared-PAT problem): a driver comment on the held PR carrying
-// `<!-- sweep-addressed: <comment-id> -->` — the highest HUMAN PR-comment id
-// the currently-published resolution has addressed. A HUMAN comment is a PR
-// issue-comment whose body does NOT contain the marker: bot comments (authored
-// by the SAME PAT as the human) are excluded by CONTENT, never by author — so
-// EVERY driver-posted comment (marker posts AND urge comments) must carry the
-// marker. Because urge comments re-assert the CURRENT value while a later
-// republish posts a HIGHER one, the effective addressed id is the MAX across
-// all marker occurrences (monotonic — a re-asserted old value never regresses
-// the state).
+// `<!-- sweep-addressed: <review-id> -->` — the highest SUBMITTED REVIEW id
+// the currently-published resolution has addressed (0 before any review; the
+// posted value is always a review id actually present on the PR, or 0). The
+// trigger is REVIEWS ONLY: a reissue is due iff a submitted non-bot review
+// exists with an id above the marker — loose issue comments and standalone
+// inline comments NEVER trigger (they feed the reissue dialog, nothing else).
+//
+// A DRIVER comment is a PR issue-comment carrying the marker AS ITS OWN LINE
+// (bot comments are authored by the SAME PAT as the human, so exclusion is by
+// CONTENT, never by author) — every driver-posted comment (marker posts AND
+// urge comments) must carry it. A quote-reply that merely EMBEDS the marker
+// (e.g. "> <!-- sweep-addressed: 3 -->") stays human: only a line that IS the
+// marker counts. Because urge comments re-assert the CURRENT value while a
+// later republish posts a HIGHER one, the effective addressed id is the MAX
+// across all marker occurrences (monotonic — a re-asserted old value never
+// regresses the state).
 // ---------------------------------------------------------------------------
 
-export const SWEEP_ADDRESSED_RE = /<!--\s*sweep-addressed:\s*(\d+)\s*-->/;
+/** The marker recognized ONLY as its own line (a quote-reply embedding it stays human). */
+export const SWEEP_ADDRESSED_LINE_RE = /^<!--\s*sweep-addressed:\s*(\d+)\s*-->$/;
 
 /** Render the sweep-addressed marker for a driver comment (D-059). */
 export function renderSweepAddressed(id: number): string {
   return `<!-- sweep-addressed: ${id} -->`;
 }
 
+/**
+ * The sweep-addressed id carried by `body`, or null when no LINE of the body
+ * is exactly the marker (hardened detection: an embedded/quoted occurrence
+ * does not count). Multiple marker lines take the MAX.
+ */
+export function extractSweepAddressed(body: string): number | null {
+  let max: number | null = null;
+  for (const line of body.split('\n')) {
+    const m = SWEEP_ADDRESSED_LINE_RE.exec(line.trim());
+    if (m) {
+      const v = Number(m[1]);
+      if (max === null || v > max) max = v;
+    }
+  }
+  return max;
+}
+
+/** Marker lines removed (the agent's own prior message, served back tag-stripped). */
+export function stripSweepAddressed(body: string): string {
+  return body
+    .split('\n')
+    .filter((line) => !SWEEP_ADDRESSED_LINE_RE.test(line.trim()))
+    .join('\n')
+    .trim();
+}
+
 export interface PrComment {
   id: number;
   body: string;
+  /** GitHub login of the comment author ('' when unknown). */
+  author: string;
+  /** ISO created_at ('' when unknown) — the dialog sort key. */
+  createdAt: string;
+  /** Inline review comments only: the file path the comment anchors to. */
+  path?: string;
 }
 
 /**
  * Split a PR's issue comments into the review-loop inputs (D-059, pure):
- *  - `humans`: comments WITHOUT the marker (content-based bot exclusion);
- *  - `lastHumanId`: the newest human comment id (null when none);
- *  - `markerId`: the effective sweep-addressed id — MAX over every marker
- *    occurrence (null when no marker was ever posted).
+ *  - `humans`: comments WITHOUT an own-line marker (content-based bot exclusion);
+ *  - `driver`: comments WITH the marker (the agent's own prior messages);
+ *  - `markerId`: the effective sweep-addressed REVIEW id — MAX over every
+ *    marker occurrence (null when no marker was ever posted).
  */
 export function classifyComments(comments: PrComment[]): {
   humans: PrComment[];
-  lastHumanId: number | null;
+  driver: PrComment[];
   markerId: number | null;
 } {
   const humans: PrComment[] = [];
-  let lastHumanId: number | null = null;
+  const driver: PrComment[] = [];
   let markerId: number | null = null;
   for (const c of comments) {
-    const m = SWEEP_ADDRESSED_RE.exec(c.body);
-    if (m) {
-      const v = Number(m[1]);
+    const v = extractSweepAddressed(c.body);
+    if (v !== null) {
+      driver.push(c);
       if (markerId === null || v > markerId) markerId = v;
     } else {
       humans.push(c);
-      if (lastHumanId === null || c.id > lastHumanId) lastHumanId = c.id;
     }
   }
-  return { humans, lastHumanId, markerId };
+  return { humans, driver, markerId };
+}
+
+/** A submitted PR review (D-059 trigger unit). */
+export interface PrReview {
+  id: number;
+  /** APPROVED | CHANGES_REQUESTED | COMMENTED | DISMISSED | ... */
+  state: string;
+  body: string;
+  author: string;
+  submittedAt: string;
 }
 
 /**
- * FAIL-CLOSED list of a PR's issue comments (D-059): any non-200 (or a
- * non-array body) THROWS — the caller maps it to ERR13. A flaky API must never
- * read as "no comments" and mis-classify a commented PR as review-quiet.
+ * The review-trigger classification (D-059 FINAL, pure): reissue is due iff a
+ * SUBMITTED non-bot review exists whose id is above the sweep-addressed marker
+ * (or any such review exists and no marker was ever posted). `latest` is the
+ * newest such review — its STATE drives the action table (APPROVED → land /
+ * re-resolve; CHANGES_REQUESTED / COMMENTED / other → reissue, forced HELD).
+ * `*[bot]`-authored reviews never trigger. The marker value is bounded by
+ * construction (the driver only ever posts real review ids, or 0), so a marker
+ * at/above the newest review id simply reads as "nothing new".
  */
+export function classifyReviewTrigger(
+  reviews: PrReview[],
+  markerId: number | null,
+): { latest: PrReview | null; maxReviewId: number | null; reissueDue: boolean } {
+  const human = reviews.filter((r) => r.state !== 'PENDING' && !r.author.endsWith('[bot]'));
+  if (human.length === 0) return { latest: null, maxReviewId: null, reissueDue: false };
+  const latest = human.reduce((a, b) => (b.id > a.id ? b : a));
+  return { latest, maxReviewId: latest.id, reissueDue: markerId === null || latest.id > markerId };
+}
+
+/**
+ * FAIL-CLOSED paginated GET of a list endpoint: follows pages (per_page=100)
+ * until exhausted — GitHub returns oldest-first, so stopping at page 1 would
+ * TRUNCATE THE NEWEST items (the review-loop truncation bug). Any non-200 (or
+ * a non-array body) THROWS — the caller maps it to ERR13; a flaky API must
+ * never read as "no items".
+ */
+export async function ghPaginated(transport: GithubTransport, path: string): Promise<unknown[]> {
+  const items: unknown[] = [];
+  const sep = path.includes('?') ? '&' : '?';
+  for (let page = 1; ; page++) {
+    const res = await transport.request('GET', `${path}${sep}per_page=100&page=${page}`);
+    if (res.status !== 200 || !Array.isArray(res.body)) {
+      throw new Error(`paginated GET ${path} (page ${page}) -> HTTP ${res.status}`);
+    }
+    items.push(...res.body);
+    if (res.body.length < 100) return items;
+  }
+}
+
+/** FAIL-CLOSED, PAGINATED list of a PR's issue comments (D-059). Throws on failure (ERR13). */
 export async function listIssueComments(
   transport: GithubTransport,
   slug: { owner: string; repo: string },
   prNumber: number,
 ): Promise<PrComment[]> {
-  const res = await transport.request(
-    'GET',
-    `/repos/${slug.owner}/${slug.repo}/issues/${prNumber}/comments?per_page=100`,
-  );
-  if (res.status !== 200 || !Array.isArray(res.body)) {
-    throw new Error(`comment list for PR #${prNumber} -> HTTP ${res.status}`);
-  }
-  return (res.body as Array<{ id?: number; body?: string }>).map((c) => ({
+  const raw = await ghPaginated(transport, `/repos/${slug.owner}/${slug.repo}/issues/${prNumber}/comments`);
+  return (raw as Array<{ id?: number; body?: string; user?: { login?: string }; created_at?: string }>).map((c) => ({
     id: Number(c.id ?? 0),
     body: String(c.body ?? ''),
+    author: String(c.user?.login ?? ''),
+    createdAt: String(c.created_at ?? ''),
   }));
+}
+
+/** FAIL-CLOSED, PAGINATED list of a PR's INLINE review comments (D-059 dialog feed). */
+export async function listReviewComments(
+  transport: GithubTransport,
+  slug: { owner: string; repo: string },
+  prNumber: number,
+): Promise<PrComment[]> {
+  const raw = await ghPaginated(transport, `/repos/${slug.owner}/${slug.repo}/pulls/${prNumber}/comments`);
+  return (raw as Array<{ id?: number; body?: string; user?: { login?: string }; created_at?: string; path?: string }>).map(
+    (c) => ({
+      id: Number(c.id ?? 0),
+      body: String(c.body ?? ''),
+      author: String(c.user?.login ?? ''),
+      createdAt: String(c.created_at ?? ''),
+      ...(c.path ? { path: String(c.path) } : {}),
+    }),
+  );
+}
+
+/**
+ * FAIL-CLOSED, PAGINATED list of a PR's SUBMITTED reviews (D-059 trigger).
+ * PENDING (unsubmitted) reviews are dropped here; bot exclusion is the
+ * trigger's job (`classifyReviewTrigger` — bots stay visible to the dialog).
+ */
+export async function listReviews(
+  transport: GithubTransport,
+  slug: { owner: string; repo: string },
+  prNumber: number,
+): Promise<PrReview[]> {
+  const raw = await ghPaginated(transport, `/repos/${slug.owner}/${slug.repo}/pulls/${prNumber}/reviews`);
+  return (raw as Array<{ id?: number; state?: string; body?: string; user?: { login?: string }; submitted_at?: string }>)
+    .map((r) => ({
+      id: Number(r.id ?? 0),
+      state: String(r.state ?? ''),
+      body: String(r.body ?? ''),
+      author: String(r.user?.login ?? ''),
+      submittedAt: String(r.submitted_at ?? ''),
+    }))
+    .filter((r) => r.state !== 'PENDING');
 }
 
 export interface PrByHead {
   number: number;
   url: string;
   state: string;
+  /** Set when the PR was merged (state is 'closed' for merged PRs too — NEVER reopen these). */
+  mergedAt: string | null;
+  /** The PR description (the agent's own opening turn in the reissue dialog). */
+  body: string;
+  createdAt: string;
 }
 
 /**
  * FAIL-CLOSED PR lookup by head branch across ALL states (D-059 start
- * classification needs open vs closed vs none): non-200 / non-array THROWS
- * (ERR13 at the caller) — never "no PR" on an API failure.
+ * classification needs open vs closed-unmerged vs merged vs none): non-200 /
+ * non-array THROWS (ERR13 at the caller) — never "no PR" on an API failure.
  */
 export async function getPrsByHead(
   transport: GithubTransport,
@@ -508,14 +634,47 @@ export async function getPrsByHead(
   if (res.status !== 200 || !Array.isArray(res.body)) {
     throw new Error(`PR lookup (state=all) for '${headBranch}' -> HTTP ${res.status}`);
   }
-  return (res.body as Array<{ number?: number; html_url?: string; state?: string }>).map((pr) => ({
+  return (
+    res.body as Array<{
+      number?: number;
+      html_url?: string;
+      state?: string;
+      merged_at?: string | null;
+      body?: string | null;
+      created_at?: string;
+    }>
+  ).map((pr) => ({
     number: Number(pr.number ?? 0),
     url: String(pr.html_url ?? ''),
     state: String(pr.state ?? ''),
+    mergedAt: pr.merged_at ? String(pr.merged_at) : null,
+    body: String(pr.body ?? ''),
+    createdAt: String(pr.created_at ?? ''),
   }));
 }
 
-/** Reopen a closed-not-merged PR (D-059 case 4 — replaces the D-058 ref delete). Throws on failure (ERR13). */
+/** LIVE single-PR state (finish re-checks before landing/publishing). Throws on failure (ERR13). */
+export async function getPullRequest(
+  transport: GithubTransport,
+  slug: { owner: string; repo: string },
+  prNumber: number,
+): Promise<{ number: number; url: string; state: string; merged: boolean; draft: boolean; title: string }> {
+  const pr = await ghExpect(transport, 'GET', `/repos/${slug.owner}/${slug.repo}/pulls/${prNumber}`);
+  return {
+    number: Number(pr.number ?? prNumber),
+    url: String(pr.html_url ?? ''),
+    state: String(pr.state ?? ''),
+    merged: pr.merged === true,
+    draft: pr.draft === true,
+    title: String(pr.title ?? ''),
+  };
+}
+
+/**
+ * Reopen a closed-NOT-MERGED PR (D-059 case 4 — replaces the D-058 ref delete).
+ * The caller MUST have excluded merged PRs (GitHub 422s a reopen of a merged
+ * PR — the ERR13 halt this guard retired). Throws on failure (ERR13).
+ */
 export async function reopenPullRequest(
   transport: GithubTransport,
   slug: { owner: string; repo: string },
@@ -526,10 +685,11 @@ export async function reopenPullRequest(
 
 /**
  * Post the sweep-addressed marker comment (D-059): the driver records the
- * highest human comment id the just-published resolution addressed (0 for a
- * first publish — nothing addressed yet). Append-only: a fresh comment is
- * posted each (re)publish and readers take the MAX (`classifyComments`), so no
- * comment-id bookkeeping is needed. Throws on failure (ERR13 at the caller).
+ * highest SUBMITTED REVIEW id the just-published resolution addressed (0 for a
+ * first publish — no review yet; otherwise always a review id actually present
+ * on the PR at classification time). Append-only: a fresh comment is posted
+ * each (re)publish and readers take the MAX (`classifyComments`), so no
+ * review-id bookkeeping is needed. Throws on failure (ERR13 at the caller).
  */
 export async function postSweepAddressed(
   transport: GithubTransport,
@@ -538,7 +698,7 @@ export async function postSweepAddressed(
   addressedId: number,
 ): Promise<void> {
   const body = [
-    `Sweep bookkeeping (driver-posted): the published resolution addresses PR comments up to id ${addressedId}.`,
+    `Sweep bookkeeping (driver-posted): the published resolution addresses PR reviews up to id ${addressedId}.`,
     renderSweepAddressed(addressedId),
   ].join('\n');
   await ghExpect(transport, 'POST', `/repos/${slug.owner}/${slug.repo}/issues/${prNumber}/comments`, { body });

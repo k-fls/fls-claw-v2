@@ -125,24 +125,31 @@ import {
   advisoryTextIssues,
   checkBaseHeight,
   classifyComments,
+  classifyReviewTrigger,
   createPullRequest,
   decidedAlready,
   getOpenPrByHead,
   getPrsByHead,
+  getPullRequest,
   ghExpect,
   haltIdFor,
   isBlocking,
   listIssueComments,
+  listReviewComments,
+  listReviews,
   parseGithubSlug,
   postSweepAddressed,
   realGithubTransport,
   renderMachineBlock,
   renderSweepAddressed,
   reopenPullRequest,
+  stripSweepAddressed,
   withMachineBlock,
   type GithubTransport,
   type Issue,
+  type PrByHead,
   type PrComment,
+  type PrReview,
 } from './publish.js';
 import { buildStepFile, caseId, readCaseFile, slug, verifyStepFile, writeJsonFile } from './steps.js';
 import { applyFloor, isClaimableTier, tierFloor } from './tiers.js';
@@ -3461,15 +3468,43 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
   }
 
   // EXECUTE: ERR07 (API side) first — an open PR by head branch name means an
-  // earlier publish already landed. For a REISSUE (D-059) the open PR is the
-  // EXPECTED state: it is republished to below, never reconciled-and-skipped.
+  // earlier publish already landed. For a REISSUE (D-059) the KNOWN PR's LIVE
+  // state is re-checked first: the owner may have merged/closed it MID-PASS —
+  // then the republish is SKIPPED (journaled), never a clobber of the owner's
+  // action and never a second PR (the next start re-derives the truth).
   const transport = (makeTransport ?? realGithubTransport)(token!);
   let reissueTarget: { url: string; number: number } | null = null;
   try {
-    const existing = await getOpenPrByHead(transport, slugParts!, fixBranch);
-    if (existing && reissue) {
-      reissueTarget = existing;
-    } else if (existing) {
+    if (reissue && typeof caseRow!.prNumber === 'number') {
+      const live = await getPullRequest(transport, slugParts!, caseRow!.prNumber as number);
+      if (live.state === 'open' && !live.merged) {
+        reissueTarget = { url: live.url, number: live.number };
+      } else {
+        const liveState = live.merged ? 'merged' : live.state;
+        appendJournal(dir, {
+          action: 'publish-skipped-live',
+          caseId: jc.caseId,
+          branch: jc.branch,
+          prNumber: live.number,
+          prUrl: live.url,
+          liveState,
+          detail: `reissue target PR #${live.number} is ${liveState} (owner acted mid-pass) — republish skipped; no second PR, no clobber`,
+        });
+        console.error(
+          `publish: reissue target PR #${live.number} is ${liveState} (owner acted mid-pass) — SKIPPED (no push, no PR write)`,
+        );
+        emit(cli, {
+          ok: true,
+          issues,
+          skipped: true,
+          liveState,
+          pr: { url: live.url, number: live.number },
+        });
+        return 0;
+      }
+    }
+    const existing = reissue ? null : await getOpenPrByHead(transport, slugParts!, fixBranch);
+    if (existing) {
       // RECONCILE, never a livelock (finding #1): reaching here means the
       // journal carries NO `pr-published` row for this case (a journal-side row
       // is blocking ERR07 above), yet the PR exists on the API side — the
@@ -3581,12 +3616,14 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
       });
     }
     // D-059: record the review-loop state on the PR — the sweep-addressed
-    // marker names the highest human comment id this publish addressed (0 on a
-    // first publish; the reissue's id was classified at start). Held PRs only:
-    // JUDGED history PRs auto-flip to merged and carry no review loop.
-    const addressedCommentId =
-      reissue && typeof caseRow!.addressedCommentId === 'number' ? (caseRow!.addressedCommentId as number) : 0;
-    if (mode === 'held') await postSweepAddressed(transport, slugParts!, result.number, addressedCommentId);
+    // marker names the highest SUBMITTED REVIEW id this publish addressed
+    // (0 on a first publish — no review yet; a reissue posts the triggering
+    // review id classified at start — always a review id actually present on
+    // the PR). Held PRs only: JUDGED history PRs auto-flip to merged and
+    // carry no review loop.
+    const addressedReviewId =
+      reissue && typeof caseRow!.addressedReviewId === 'number' ? (caseRow!.addressedReviewId as number) : 0;
+    if (mode === 'held') await postSweepAddressed(transport, slugParts!, result.number, addressedReviewId);
     // Local anchor for the pushed ref. Namespace-checked, scope-exempt. A
     // reissue MOVES an existing anchor to the revised head.
     guardRef(fixBranch, new Set(), { fixSweep: true });
@@ -3605,7 +3642,7 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
       url: result.url,
       number: result.number,
       head: headSha,
-      ...(reissue ? { reissued: true, addressedCommentId } : {}),
+      ...(reissue ? { reissued: true, addressedReviewId } : {}),
     });
     // No stored pointer to update (D-058): the `pr-published` journal row
     // above enriches the pass's blocked view (urge target), and the next
@@ -3639,10 +3676,14 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
  * together; GitHub auto-flips the JUDGED PRs to merged (D-040) → HELD PRs
  * created (`publish`, active/draft — D-058: bases now current, ERR14 enforces
  * it) → urge comments posted (also this command). Verify-gated (ERR18): nothing is
- * pushed before `verify` is green (§9, D-012). A failed push is ERR15 — hard
- * halt, journaled, D-046 case-2 owner report, NO fallback. Closure checks and
- * urge posting are the networked parts and take the same `--token-file` as
- * `publish`; a dry-run reports intents only (no writes, no network).
+ * pushed before `verify` is green (§9, D-012). PUSH RESILIENCE (D-059 FINAL):
+ * each target pushes INDEPENDENTLY — a failed push is journaled per branch
+ * (`push-failed` with a diverged/transient/auth category; ERR15 stays the
+ * per-branch LABEL) and the remaining targets still land; landed branches are
+ * up-to-date (skipped) on the next run, failed ones retry — the stage is
+ * resumable, never force-resolved. Closure checks and urge posting are the
+ * networked parts and take the same `--token-file` as `publish`; a dry-run
+ * reports intents only (no writes, no network).
  */
 export async function cmdPush(cli: Cli, makeTransport?: (token: string) => GithubTransport): Promise<number> {
   const ctx = await passContext(cli); // attaches to the open pass
@@ -3715,43 +3756,54 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
   }
 
   // (1) Target pushes — ONE push per branch, plan order (D-049 decision 2).
+  // PUSH RESILIENCE (D-059 FINAL): each target pushes INDEPENDENTLY — a
+  // failure is journaled per branch (`push-failed`, categorized) and the loop
+  // FINISHES THE REST; ERR15 stays the per-branch failure LABEL but is no
+  // longer a stop. Verify already validated each publishable branch
+  // independently, so a partial land is safe; landed branches are up-to-date
+  // (skipped) on the next push, failed ones retry.
   const pushed: string[] = [];
+  const pushFailed: Array<{ branch: string; category: 'diverged' | 'transient' | 'auth'; detail: string }> = [];
+  const categorize = (msg: string): 'diverged' | 'transient' | 'auth' => {
+    if (/non-fast-forward|fetch first|stale info|\[rejected\]|failed to push some refs/i.test(msg)) return 'diverged';
+    if (/401|403|denied|authentication|could not read username|invalid credentials|terminal prompts disabled|bad credentials/i.test(msg))
+      return 'auth';
+    return 'transient';
+  };
+  const failBranch = (branch: string, category: 'diverged' | 'transient' | 'auth', detail: string): void => {
+    appendJournal(dir, { action: 'push-failed', id: 'ERR15_PUSH_FAILED', branch, category, message: detail });
+    issues.push({ id: 'ERR15_PUSH_FAILED', detail });
+    pushFailed.push({ branch, category, detail });
+    console.error(`push [ERR15_PUSH_FAILED/${category}]: ${detail}`);
+  };
   for (const intent of intents) {
     if (intent.state === 'up-to-date' || intent.state === 'remote-ahead') {
       appendJournal(dir, { action: 'push-skip', branch: intent.branch, reason: intent.state });
       continue;
     }
     if (intent.state === 'diverged') {
-      const detail = `push target '${intent.branch}' has DIVERGED from origin — owner escalation, never force-resolve`;
-      appendJournal(dir, {
-        action: 'halt',
-        reason: 'sync-diverged',
-        id: 'ERR20_BRANCH_DIVERGED',
-        branch: intent.branch,
-        message: detail,
-      });
-      console.error(`push [ERR20_BRANCH_DIVERGED]: ${detail}`);
-      emit(cli, { ok: false, issues: [...issues, { id: 'ERR20_BRANCH_DIVERGED', detail }], pushed });
-      return 1;
+      failBranch(
+        intent.branch,
+        'diverged',
+        `push target '${intent.branch}' has DIVERGED from origin — owner escalation (D-046 case 2), never force-resolve; the other targets proceed`,
+      );
+      continue;
     }
     try {
       await gitPush(cli.repo, intent.branch, intent.branch);
       appendJournal(dir, { action: 'push', branch: intent.branch, to: intent.localTip, kind: 'target' });
       pushed.push(intent.branch);
     } catch (e) {
-      const detail =
-        `git push of target '${intent.branch}' failed: ${e instanceof Error ? e.message : String(e)} — ` +
-        `report to the owner (D-046 case 2) and STOP; publication is blocked until the infrastructure is fixed`;
-      appendJournal(dir, {
-        action: 'halt',
-        reason: 'push-failed',
-        id: 'ERR15_PUSH_FAILED',
-        branch: intent.branch,
-        message: detail,
-      });
-      console.error(`push [ERR15_PUSH_FAILED]: ${detail}`);
-      emit(cli, { ok: false, issues: [...issues, { id: 'ERR15_PUSH_FAILED', detail }], pushed });
-      return 1;
+      const msg = e instanceof Error ? e.message : String(e);
+      const category = categorize(msg);
+      failBranch(
+        intent.branch,
+        category,
+        `git push of target '${intent.branch}' failed (${category}): ${msg} — ` +
+          (category === 'diverged'
+            ? 'owner escalation (D-046 case 2), never force-resolve; the other targets proceed'
+            : 'report to the owner (D-046 case 2); the other targets proceed and this branch retries on the next finish'),
+      );
     }
   }
 
@@ -3783,10 +3835,14 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
   }
 
   // (2) JUDGED closure check (D-040): every judged PR must have auto-flipped.
+  // PRs whose target push FAILED this run are skipped (their flip is pending
+  // the retried push — an ERR16 for them would be noise, not signal).
+  const failedBranches = new Set(pushFailed.map((f) => f.branch));
   const closures: Array<{ number: number; merged: boolean }> = [];
   if (transport && slugParts) {
     const api = `/repos/${slugParts.owner}/${slugParts.repo}`;
     for (const e of judgedPrs) {
+      if (typeof e.branch === 'string' && failedBranches.has(e.branch)) continue;
       try {
         const pr = await ghExpect(transport, 'GET', `${api}/pulls/${e.number}`);
         const merged = pr.merged === true;
@@ -3863,9 +3919,10 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
   const ok = !issues.some((i) => isBlocking(i.id));
   console.error(
     `push ${ok ? 'complete' : 'FINISHED WITH BLOCKING ISSUES'} — ${pushed.length} branch(es) pushed, ` +
+      `${pushFailed.length} failed (${pushFailed.map((f) => `${f.branch}:${f.category}`).join(', ') || 'none'}), ` +
       `${closures.filter((c) => c.merged).length}/${closures.length} judged closures confirmed, ${urged.length} urge(s) posted`,
   );
-  emit(cli, { ok, issues, pushed, closures, urged });
+  emit(cli, { ok, issues, pushed, failed: pushFailed, closures, urged });
   return ok ? 0 : 1;
 }
 
@@ -4580,27 +4637,119 @@ async function machineCaseMaterials(cli: Cli, jc: JournaledCase): Promise<string
 }
 
 /**
- * Driver-authored materials for a REISSUE case (D-059): the owner reviewed the
- * published resolution and commented — the agent REVISES it (the worktree's
- * pending files already carry the prior resolution), it never starts over.
- * Carries ALL human PR comments VERBATIM (stored at start in pr-comments.json).
+ * One turn of the reissue DIALOG (D-059 FINAL): the FULL review conversation —
+ * issue comments + inline review comments + review bodies + the PR description
+ * — merged time-ordered. The agent's OWN prior messages (driver-posted,
+ * marker-bearing; plus the PR description it wrote) are served back
+ * TAG-STRIPPED and marked `agent`; every other message keeps the author's
+ * GitHub login so the agent can address them. Marker-only messages (empty
+ * after the strip) are dropped.
  */
+interface DialogItem {
+  role: 'agent' | 'reviewer';
+  /** GitHub login for reviewer turns; '' for the agent's own turns. */
+  author: string;
+  kind: 'pr-description' | 'comment' | 'inline-comment' | 'review';
+  id: number | null;
+  /** ISO timestamp (created_at / submitted_at) — the sort key. */
+  at: string;
+  body: string;
+  /** inline-comment only: the anchored file path. */
+  path?: string;
+  /** review only: APPROVED / CHANGES_REQUESTED / COMMENTED / ... */
+  reviewState?: string;
+}
+
+/** Assemble the time-ordered reissue dialog (pure; see DialogItem). */
+function buildReviewDialog(args: {
+  pr: Pick<PrByHead, 'body' | 'createdAt'>;
+  issueComments: PrComment[];
+  inlineComments: PrComment[];
+  reviews: PrReview[];
+}): DialogItem[] {
+  const items: DialogItem[] = [];
+  const description = stripSweepAddressed(args.pr.body);
+  if (description) {
+    items.push({ role: 'agent', author: '', kind: 'pr-description', id: null, at: args.pr.createdAt, body: description });
+  }
+  const { humans, driver } = classifyComments(args.issueComments);
+  for (const c of driver) {
+    const stripped = stripSweepAddressed(c.body);
+    if (!stripped) continue; // marker-only bookkeeping — not a dialog turn
+    items.push({ role: 'agent', author: '', kind: 'comment', id: c.id, at: c.createdAt, body: stripped });
+  }
+  for (const c of humans) {
+    items.push({ role: 'reviewer', author: c.author, kind: 'comment', id: c.id, at: c.createdAt, body: c.body.trim() });
+  }
+  for (const c of args.inlineComments) {
+    items.push({
+      role: 'reviewer',
+      author: c.author,
+      kind: 'inline-comment',
+      id: c.id,
+      at: c.createdAt,
+      body: c.body.trim(),
+      ...(c.path ? { path: c.path } : {}),
+    });
+  }
+  for (const r of args.reviews) {
+    items.push({
+      role: 'reviewer',
+      author: r.author,
+      kind: 'review',
+      id: r.id,
+      at: r.submittedAt,
+      body: r.body.trim(),
+      reviewState: r.state,
+    });
+  }
+  // Time-ordered; the PR description (the opening turn) pinned first.
+  return items.sort((a, b) => {
+    if (a.kind === 'pr-description') return -1;
+    if (b.kind === 'pr-description') return 1;
+    return a.at < b.at ? -1 : a.at > b.at ? 1 : (a.id ?? 0) - (b.id ?? 0);
+  });
+}
+
+/** Render one dialog turn for the reissue materials. */
+function renderDialogItem(item: DialogItem): string[] {
+  const who = item.role === 'agent' ? 'you (prior)' : `@${item.author || 'unknown'}`;
+  const what =
+    item.kind === 'pr-description'
+      ? 'PR description'
+      : item.kind === 'review'
+        ? `review ${item.id} — ${item.reviewState ?? ''}`.trim()
+        : item.kind === 'inline-comment'
+          ? `inline comment ${item.id}${item.path ? ` on ${item.path}` : ''}`
+          : `comment ${item.id}`;
+  return ['', `### ${who} — ${what}${item.at ? ` (${item.at})` : ''}`, item.body || '(no text)'];
+}
+
 function reissueCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEntry): string {
-  const humansPath = join(dir, jc.caseId, 'pr-comments.json');
-  const humans: PrComment[] = existsSync(humansPath)
-    ? (JSON.parse(readFileSync(humansPath, 'utf8')) as PrComment[])
+  const dialogPath = join(dir, jc.caseId, 'dialog.json');
+  const dialog: DialogItem[] = existsSync(dialogPath)
+    ? (JSON.parse(readFileSync(dialogPath, 'utf8')) as DialogItem[])
     : [];
+  const latestState = typeof caseRow.reviewState === 'string' ? caseRow.reviewState : 'CHANGES_REQUESTED';
+  const approvedStale = latestState === 'APPROVED';
   return [
     `# Case materials — ${jc.caseId} (REISSUE — revise the published resolution)`,
     '',
-    `The owner reviewed your prior resolution on PR #${caseRow.prNumber} and left the comments below —`,
-    'REVISE the resolution accordingly; do not start over. The case worktree already contains your PRIOR',
-    'RESOLUTION as the pending files (`git status` shows exactly them): edit those files to address every',
-    'comment, changing nothing outside them. When done, run `report-case --tier held` — the driver',
-    'republishes the revision to the SAME PR at finish (never a new PR, never a local merge).',
+    approvedStale
+      ? `Your prior resolution on PR #${caseRow.prNumber} was APPROVED, but the target branch advanced and it no`
+      : `A reviewer SUBMITTED A REVIEW (${latestState}) on your prior resolution on PR #${caseRow.prNumber} —`,
+    approvedStale
+      ? 'longer merges cleanly — RE-RESOLVE it against the new base; keep the approved intent intact.'
+      : 'REVISE the resolution accordingly; do not start over.',
+    'The case worktree already contains the PRIOR RESOLUTION as the pending files (`git status` shows exactly',
+    'them): edit those files to address every reviewer point, changing nothing outside them. When done, run',
+    '`report-case --tier held` — the driver republishes the revision to the SAME PR at finish (never a new PR,',
+    'never a local merge).',
     '',
-    '## Owner PR comments (ALL human comments, verbatim — newest last)',
-    ...humans.flatMap((c) => ['', `### comment ${c.id}`, c.body]),
+    '## Review dialog (FULL thread, time-ordered — oldest first)',
+    'Turns marked `you (prior)` are YOUR OWN earlier messages (PR description / replies you posted through the',
+    'driver). Every other turn names its author by GitHub login — address them by that @login in your reply.',
+    ...dialog.flatMap(renderDialogItem),
     '',
     '## Conflicted paths (the pending files — your edit scope)',
     ...jc.conflictedPaths.map((p) => `- ${p}`),
@@ -4630,66 +4779,124 @@ function branchTestCommands(cli: Cli): VerifyCommand[] {
 // --------------------------------------------------------------------------
 
 /**
- * D-059 (REISSUE case-serving mechanics): an open PR whose newest HUMAN
- * comment id is beyond the sweep-addressed marker gets its case served THIS
- * pass as a REVISION of the published resolution, not a fresh resolve. The
- * case is driver-manufactured here at `start` (run skips the PR_ID branch, so
- * it would never emit one): the conflict head is the fix ref head's 2nd parent
- * (driver-built PR heads are `[tip|prefix, conflictHead]` merges), parent +
+ * D-059 (REISSUE case-serving mechanics, FINAL review-trigger model): an open
+ * PR with a SUBMITTED review beyond the sweep-addressed marker gets its case
+ * served THIS pass as a REVISION of the published resolution, not a fresh
+ * resolve. The case is driver-manufactured here at `start` (run skips the
+ * PR_ID branch, so it would never emit one): the conflict head is the fix ref
+ * head's 2nd parent (driver-built PR heads are `[tip|prefix, conflictHead]`
+ * merges) — and when the OWNER PUSHED onto the fix ref (head no longer
+ * driver-shaped / sha8 mismatch) the case is REBUILT from the CURRENT ref
+ * head: the conflict head re-derives from the ref name's sha8 and the owner's
+ * edit is served as the revision base (journaled `reissue-rebuilt`). Parent +
  * height come from the deterministic ref name (`fixBranchName`), the conflict
  * set/automerge tree are RE-PROBED live against origin/<target>, and the case
- * worktree is materialized FROM THE PRIOR RESOLUTION (the ref head content) so
- * the agent edits the existing resolution. All human PR comments are stored
- * verbatim (pr-comments.json) for the materials. A ref that is not
- * driver-shaped (or whose conflict healed) degrades to a plain PR_ID block —
- * journaled warning, never a wrong case. The revised resolution then flows
- * report-case (forced HELD) → report-pr (intent) → finish, where cmdPublish
+ * worktree is materialized FROM THE CURRENT REF HEAD so the agent edits the
+ * existing resolution (owner edits included). The FULL review dialog
+ * (description + comments + inline comments + reviews, time-ordered) is
+ * stored (dialog.json) for the materials. A ref that is TRULY UNUSABLE
+ * (unparseable name, unrecoverable conflict head, healed conflict, missing
+ * origin base) is ESCALATED ONCE: a driver comment on the PR names the
+ * problem and carries the marker at the triggering review id, so the next
+ * pass does NOT re-trigger — no per-pass warn-loop; the branch stays blocked.
+ * The revised resolution then flows report-case (forced HELD) → report-pr
+ * (intent) → finish, where cmdPublish re-checks the PR's LIVE state,
  * force-with-lease updates the fix ref and posts the new marker.
  */
 async function materializeReissueCase(
   cli: Cli,
   dir: string,
+  transport: GithubTransport,
+  slugParts: { owner: string; repo: string },
   args: {
     ref: string;
     refSha: string;
     branch: string;
-    pr: { number: number; url: string };
-    humans: PrComment[];
-    addressedCommentId: number;
+    pr: PrByHead;
+    dialog: DialogItem[];
+    latestReview: PrReview;
     markerId: number | null;
     parentCandidates: Array<{ branch: string; slug: string }>;
     ancestors: string[];
     features: FeatureEntry[];
   },
 ): Promise<void> {
-  const warn = (message: string): void => {
-    appendJournal(dir, { action: 'warning', ref: args.ref, branch: args.branch, message });
-    console.error(`sweep start: ${message} — '${args.ref}' stays blocked WITHOUT a reissue case`);
+  // ESCALATE ONCE (D-059 FINAL): post the problem to the PR WITH the marker at
+  // the triggering review id — the owner is notified exactly once and the next
+  // pass reads the marker as current (no re-trigger, no warn-loop). Throws on
+  // API failure (the caller maps it to ERR13 — fail-closed).
+  const escalateOnce = async (reason: string): Promise<void> => {
+    const body = [
+      `Sweep escalation (driver-posted): the review on this PR cannot be served as a revision case — ${reason}.`,
+      `Owner action needed on \`${args.ref}\` (target \`${args.branch}\`); the branch stays blocked meanwhile.`,
+      renderSweepAddressed(args.latestReview.id),
+    ].join('\n');
+    await ghExpect(transport, 'POST', `/repos/${slugParts.owner}/${slugParts.repo}/issues/${args.pr.number}/comments`, {
+      body,
+    });
+    appendJournal(dir, {
+      action: 'origin-ref-escalated',
+      ref: args.ref,
+      branch: args.branch,
+      prNumber: args.pr.number,
+      reviewId: args.latestReview.id,
+      reason,
+    });
+    console.error(
+      `sweep start: ESCALATED once on PR #${args.pr.number} — ${reason}; '${args.ref}' stays blocked WITHOUT a reissue case (marker advanced to review ${args.latestReview.id})`,
+    );
   };
-  // (a) driver-shaped PR head: the 2nd parent IS the conflict head.
-  const info = await commitInfo(cli.repo, args.refSha);
-  const conflictHead = info.parents[1];
-  if (!conflictHead) {
-    return warn(`reissue: ref head ${args.refSha.slice(0, 12)} has no 2nd parent (not a driver-built PR head)`);
-  }
-  // (b) parent + height from the deterministic ref name (fixBranchName shape).
+  // (a) parent + height + conflict-head sha8 from the deterministic ref name
+  // (fixBranchName shape) — the identity survives owner pushes onto the ref.
   const rest = args.ref.slice('fix/sweep/'.length).slice(slug(args.branch).length + 2); // past '<slug(branch)>--'
   const parentEntry = args.parentCandidates.find((c) => rest.startsWith(`${c.slug}-h`));
   const hm = /-h(-?\d+)-([0-9a-f]{8})$/.exec(rest);
-  if (!parentEntry || !hm) return warn(`reissue: cannot parse parent/height from ref name '${args.ref}'`);
-  if (hm[2] !== conflictHead.slice(0, 8)) {
-    return warn(`reissue: ref-name sha8 '${hm[2]}' does not match the conflict head ${conflictHead.slice(0, 12)}`);
+  if (!parentEntry || !hm) {
+    return escalateOnce(`cannot parse parent/height from the ref name '${args.ref}'`);
   }
   const parent = parentEntry.branch;
   const height = Number(hm[1]);
+  const sha8 = hm[2];
+  // (b) the conflict head: the ref head's 2nd parent when driver-shaped;
+  // otherwise (owner pushed a commit onto fix/sweep — head not driver-shaped /
+  // sha8 mismatch) REBUILD from the ref name's sha8 and serve the owner's edit
+  // as the revision base.
+  const info = await commitInfo(cli.repo, args.refSha);
+  let conflictHead = info.parents[1] && info.parents[1].startsWith(sha8) ? info.parents[1] : null;
+  if (!conflictHead) {
+    const resolved = await git(cli.repo, ['rev-parse', '--verify', '--quiet', `${sha8}^{commit}`], {
+      allowCodes: [1, 128],
+    });
+    if (resolved.code !== 0 || !resolved.stdout.trim()) {
+      return escalateOnce(
+        `the ref head ${args.refSha.slice(0, 12)} is not driver-shaped and its conflict head '${sha8}' cannot be resolved`,
+      );
+    }
+    conflictHead = resolved.stdout.trim();
+    appendJournal(dir, {
+      action: 'reissue-rebuilt',
+      ref: args.ref,
+      branch: args.branch,
+      ownerHead: args.refSha,
+      conflictHead,
+      detail: 'owner pushed onto the fix ref — case rebuilt from the CURRENT ref head (owner edit served as the base)',
+    });
+    console.error(
+      `sweep start: '${args.ref}' head ${args.refSha.slice(0, 12)} is not driver-shaped (owner push) — rebuilding the reissue case from the current ref head`,
+    );
+  }
   // (c) live conflict, probed against the ORIGIN tip (the authority; run
   // ff-syncs the local branch to it before the case is acted on).
   if (!(await refExists(cli.repo, `origin/${args.branch}`))) {
-    return warn(`reissue: origin/${args.branch} does not exist — cannot probe the conflict`);
+    return escalateOnce(`origin/${args.branch} does not exist — cannot probe the conflict`);
   }
   const tip = await revParse(cli.repo, `origin/${args.branch}`);
   const probe = await newStyleMergeTree(cli.repo, tip, conflictHead);
-  if (probe.clean) return warn(`reissue: no live conflict for '${args.branch}' <- ${conflictHead.slice(0, 12)} (healed)`);
+  if (probe.clean) {
+    return escalateOnce(
+      `no live conflict remains for '${args.branch}' <- ${conflictHead.slice(0, 12)} (healed) — the PR may be obsolete`,
+    );
+  }
   const cid = caseId(args.branch, parent, height);
   const head = { sha: conflictHead, height };
   const feat = args.features.find((f) => f.branch === args.branch) as
@@ -4709,7 +4916,7 @@ async function materializeReissueCase(
     deferredCheck: { firstConflictHeight: height, transitiveAncestors: args.ancestors },
   };
   writeJsonFile(join(dir, cid, 'case.json'), caseFile);
-  writeJsonFile(join(dir, cid, 'pr-comments.json'), args.humans);
+  writeJsonFile(join(dir, cid, 'dialog.json'), args.dialog);
   appendJournal(dir, {
     action: 'case',
     branch: args.branch,
@@ -4724,12 +4931,13 @@ async function materializeReissueCase(
     priorHead: args.refSha,
     prNumber: args.pr.number,
     prUrl: args.pr.url,
-    addressedCommentId: args.addressedCommentId,
+    reviewState: args.latestReview.state,
+    addressedReviewId: args.latestReview.id,
     markerId: args.markerId,
   });
-  await createCaseWorktree(cli, dir, caseFile, tip, args.refSha); // pending files = the PRIOR RESOLUTION
+  await createCaseWorktree(cli, dir, caseFile, tip, args.refSha); // pending files = the CURRENT ref head (prior resolution / owner edit)
   console.error(
-    `sweep start: REISSUE ${cid} — PR #${args.pr.number} carries ${args.humans.length} human comment(s) beyond the sweep-addressed marker; serving a revision case this pass`,
+    `sweep start: REISSUE ${cid} — PR #${args.pr.number} carries review ${args.latestReview.id} (${args.latestReview.state}) beyond the sweep-addressed marker; serving a revision case this pass`,
   );
 }
 
@@ -4773,23 +4981,37 @@ async function createRecoveryPr(
 }
 
 /**
- * D-058 §2 → D-059 — reconstruct the blocked (PR_ID) set from ORIGIN alone.
- * For every `origin/fix/sweep/*` ref (post-fetch), parse the TARGET branch out
- * of the ref name (fix/sweep/<slug(branch)>--<slug(parent)>-h<n>-<sha8>;
- * matched against the registry scope's branch slugs, longest match wins) and
- * classify (D-059 — `start` deletes a ref ONLY when it is MERGED; the D-058
- * orphan-delete is retired):
+ * D-058 §2 → D-059 FINAL — reconstruct the blocked (PR_ID) set from ORIGIN
+ * alone. For every `origin/fix/sweep/*` ref (post-fetch), parse the TARGET
+ * branch out of the ref name (fix/sweep/<slug(branch)>--<slug(parent)>-h<n>-
+ * <sha8>; matched against the registry scope's branch slugs, longest match
+ * wins) and classify (`start` deletes a ref ONLY when its PR/head MERGED; the
+ * D-058 orphan-delete is retired):
  *  1. ref IS an ancestor of origin/<target> → RESOLVED (the owner merged the
  *     PR / it landed): not blocked; delete the origin ref (cleanup).
- *  2. unmerged + OPEN PR + newest human comment id <= the sweep-addressed
- *     marker (or no human comments) → PR_ID: journal an `origin-blocked` row
+ *  2. unmerged + OPEN PR + NO submitted non-bot review above the
+ *     sweep-addressed marker → PR_ID: journal an `origin-blocked` row
  *     {branch, fixBranch, headSha, prNumber, markerId} — the pass's blocked
- *     view + block-height source (`prBlockedRecords`).
- *  3. unmerged + OPEN PR + newest human comment id > the marker (or ≥1 human
- *     comment and no marker yet) → REISSUE: still PR_ID (row as in 2), PLUS a
- *     revision case served THIS pass (`materializeReissueCase`).
- *  4. unmerged + PR CLOSED (not merged) → REOPEN the PR (driver PATCH
- *     state=open) → PR_ID. Replaces the D-058 delete.
+ *     view + block-height source (`prBlockedRecords`). Loose issue comments
+ *     and standalone inline comments NEVER trigger anything.
+ *  3. unmerged + OPEN PR + a submitted non-bot REVIEW above the marker →
+ *     the review-state table (all landing verify-gated at finish):
+ *       - APPROVED and the ref head still merges CLEANLY into the CURRENT
+ *         target → LAND: merge it into the local target now (journaled
+ *         `origin-approved` + `resolved` tier 'approved'; pre-ref recorded),
+ *         NOT blocked — finish verifies and pushes the target, the push
+ *         auto-flips the PR to merged (D-040); no reissue.
+ *       - APPROVED but the target advanced so it no longer merges cleanly →
+ *         REISSUE (the agent re-resolves against the new base): PR_ID row +
+ *         a revision case (`materializeReissueCase`).
+ *       - CHANGES_REQUESTED / COMMENTED / other → REISSUE, forced HELD
+ *         downstream (stays in the review loop, never auto-merged).
+ *  4. unmerged + PR CLOSED:
+ *       - merged_at set (squash/rebase-merged — head not an ancestor) →
+ *         RESOLVED: delete the ref; NEVER attempt a reopen on a merged PR
+ *         (GitHub 422s it — the retired ERR13 halt).
+ *       - genuinely closed unmerged → REOPEN the PR (driver PATCH state=open)
+ *         → PR_ID. Replaces the D-058 delete.
  *  5. unmerged + NO PR at all (crashed publish) → (re)create the PR from the
  *     ref (`createRecoveryPr`) → PR_ID. The ref's resolution is authoritative;
  *     never re-derived, never deleted.
@@ -4799,12 +5021,13 @@ async function createRecoveryPr(
  * A ref whose slug matches no scope branch is journaled `origin-ref-unknown`
  * and left alone (unknown provenance: never deleted, never blocking).
  *
- * Every GitHub check is FAIL-CLOSED: any non-200 on a needed lookup/write is
- * an ERR13 halt — never a wrongful mutation. Start's origin WRITES (merged-ref
- * delete, reopen, recovery PR create) all run AFTER the token/slug gate.
- * Ref deletions go through `git push origin --delete` (refs move via git only,
- * D-049); a failed delete is journaled and non-fatal (the ref is re-examined
- * at the next start).
+ * Every GitHub list is PAGINATED to exhaustion (GitHub returns oldest-first —
+ * page-1-only truncated the newest reviews) and FAIL-CLOSED: any non-200 on a
+ * needed lookup/write is an ERR13 halt — never a wrongful mutation. Start's
+ * origin WRITES (merged-ref delete, reopen, recovery PR create, escalation
+ * comment) all run AFTER the token/slug gate. Ref deletions go through
+ * `git push origin --delete` (refs move via git only, D-049); a failed delete
+ * is journaled and non-fatal (the ref is re-examined at the next start).
  */
 async function deriveOriginMergeStatus(
   cli: Cli,
@@ -4917,10 +5140,77 @@ async function deriveOriginMergeStatus(
     }
     parentCandidates.sort((a, b) => b.slug.length - a.slug.length);
     const ancestorsOf = transitiveAncestors(scopeResult.edges);
+    const scopeSet = new Set(scopeResult.ordered.map((e) => e.branch));
+    const preReffed = preReffedSet(readJournal(dir));
+
+    /**
+     * APPROVED landing (D-059 FINAL): the ref head still merges CLEANLY into
+     * the current target → merge it into the LOCAL branch now (pre-ref
+     * recorded — abort can roll back), journal `origin-approved` + `resolved`
+     * (tier 'approved'), leave the branch UNBLOCKED. Finish verifies the merge
+     * (the `resolved` row re-arms the §9 gate) and its target push lands it —
+     * GitHub auto-flips the review PR to merged/closed (D-040). Returns false
+     * when it cannot land (target advanced / diverged local) — the caller
+     * falls through to the reissue arm.
+     */
+    const landApproved = async (
+      u: { ref: string; sha: string; branch: string },
+      open: PrByHead,
+      latest: PrReview,
+    ): Promise<boolean> => {
+      if (!(await refExists(cli.repo, `origin/${u.branch}`))) return false;
+      const originTip = await revParse(cli.repo, `origin/${u.branch}`);
+      const originProbe = await newStyleMergeTree(cli.repo, originTip, u.sha);
+      if (!originProbe.clean) return false; // target advanced — no longer merges cleanly
+      try {
+        await syncBranchWithOrigin(cli, dir, u.branch, scopeSet, preReffed);
+      } catch (e) {
+        if (e instanceof DriverHalt) {
+          appendJournal(dir, { action: 'halt', branch: u.branch, reason: e.reason, message: e.message });
+          console.error(`sweep start: cannot land APPROVED '${u.ref}' — ${e.message}`);
+          return false;
+        }
+        throw e;
+      }
+      const localTip = await revParse(cli.repo, u.branch);
+      const probe = localTip === originTip ? originProbe : await newStyleMergeTree(cli.repo, localTip, u.sha);
+      if (!probe.clean) return false;
+      await recordPreRef(cli, dir, preReffed, u.branch);
+      const mergeCommit = await journaledResolvedMerge(
+        cli.repo,
+        u.branch,
+        u.sha,
+        probe.treeOid,
+        `Merge ${u.ref} into ${u.branch} (review PR #${open.number} APPROVED — landed by the sweep, verify-gated at finish)`,
+        scopeSet,
+      );
+      appendJournal(dir, {
+        action: 'origin-approved',
+        branch: u.branch,
+        ref: u.ref,
+        headSha: u.sha,
+        prNumber: open.number,
+        prUrl: open.url,
+        reviewId: latest.id,
+      });
+      appendJournal(dir, {
+        action: 'resolved',
+        branch: u.branch,
+        caseId: `origin:${u.ref}`,
+        tier: 'approved',
+        mergeCommit,
+        prNumber: open.number,
+        reviewId: latest.id,
+      });
+      console.error(
+        `sweep start: ${u.branch} — review PR #${open.number} APPROVED (review ${latest.id}) and still merges cleanly: LANDED locally as ${mergeCommit.slice(0, 12)} (pushed + auto-flipped at finish); not blocked`,
+      );
+      return true;
+    };
 
     for (const u of unmerged) {
-      // journal the PR_ID row (shared by cases 2-5; every unmerged ref with a
-      // live/reissued/recovered PR blocks its branch).
+      // journal the PR_ID row (shared by the blocked arms; every unmerged ref
+      // with a live/reissued/recovered PR blocks its branch).
       const journalBlocked = (pr: { number: number; url: string }, markerId: number | null): void => {
         appendJournal(dir, {
           action: 'origin-blocked',
@@ -4940,34 +5230,64 @@ async function deriveOriginMergeStatus(
         const prs = await getPrsByHead(transport!, slugParts!, u.ref);
         const open = prs.find((p) => p.state === 'open');
         if (open) {
-          // Cases 2/3: awaiting review — is there a human comment beyond the
-          // sweep-addressed marker? (Comment list is fail-closed too.)
+          // Cases 2/3: REVIEWS are the only trigger (D-059 FINAL). Issue
+          // comments are fetched for the marker watermark (+ dialog); loose
+          // comments/inline comments never trigger. All lists paginated.
           const comments = await listIssueComments(transport!, slugParts!, open.number);
-          const { humans, lastHumanId, markerId } = classifyComments(comments);
-          journalBlocked(open, markerId);
-          const reissueDue = lastHumanId !== null && (markerId === null || lastHumanId > markerId);
-          if (reissueDue) {
+          const { markerId } = classifyComments(comments);
+          const reviews = await listReviews(transport!, slugParts!, open.number);
+          const trigger = classifyReviewTrigger(reviews, markerId);
+          if (!trigger.reissueDue) {
+            journalBlocked(open, markerId);
             console.error(
-              `sweep start: ${u.branch} blocked — open PR #${open.number} on '${u.ref}' has NEW human comments (REISSUE)`,
+              `sweep start: ${u.branch} blocked — open PR #${open.number} on '${u.ref}' (origin-derived; no review beyond the marker)`,
             );
-            await materializeReissueCase(cli, dir, {
+          } else if (trigger.latest!.state === 'APPROVED' && (await landApproved(u, open, trigger.latest!))) {
+            // landed — logged inside; the branch is NOT blocked.
+          } else {
+            // APPROVED-but-stale, CHANGES_REQUESTED, COMMENTED, other →
+            // REISSUE (report-case forces the revision to HELD downstream).
+            journalBlocked(open, markerId);
+            console.error(
+              `sweep start: ${u.branch} blocked — open PR #${open.number} on '${u.ref}' has a NEW review (${trigger.latest!.state}) — REISSUE`,
+            );
+            const inlineComments = await listReviewComments(transport!, slugParts!, open.number);
+            const dialog = buildReviewDialog({ pr: open, issueComments: comments, inlineComments, reviews });
+            await materializeReissueCase(cli, dir, transport!, slugParts!, {
               ref: u.ref,
               refSha: u.sha,
               branch: u.branch,
               pr: open,
-              humans,
-              addressedCommentId: lastHumanId,
+              dialog,
+              latestReview: trigger.latest!,
               markerId,
               parentCandidates,
               ancestors: ancestorsOf[u.branch] ?? [],
               features: registry.features,
             });
-          } else {
-            console.error(`sweep start: ${u.branch} blocked — open PR #${open.number} on '${u.ref}' (origin-derived)`);
           }
+        } else if (prs.some((p) => p.mergedAt !== null)) {
+          // Case 4a: the PR was MERGED (squash/rebase — the head is not an
+          // ancestor of the target, which is why the ref classified unmerged).
+          // The owner's decision LANDED: resolved + ref cleanup. NEVER attempt
+          // a reopen on a merged PR (GitHub 422 — the retired ERR13 halt).
+          const mergedPr = prs.find((p) => p.mergedAt !== null)!;
+          const deleteFailed = await deleteOriginRef(u.ref);
+          appendJournal(dir, {
+            action: 'origin-ref-resolved',
+            ref: u.ref,
+            branch: u.branch,
+            headSha: u.sha,
+            prNumber: mergedPr.number,
+            via: 'pr-merged',
+            ...(deleteFailed ? { deleteFailed } : {}),
+          });
+          console.error(
+            `sweep start: PR #${mergedPr.number} on '${u.ref}' was MERGED (squash/rebase — head not an ancestor) — resolved${deleteFailed ? ' (cleanup delete failed)' : ', ref deleted'}; never reopened`,
+          );
         } else if (prs.length > 0) {
-          // Case 4: CLOSED (not merged — merged refs never reach here) →
-          // REOPEN. The resolution + review thread stay owner-visible.
+          // Case 4b: genuinely CLOSED and unmerged → REOPEN. The resolution +
+          // review thread stay owner-visible.
           const closed = prs[0];
           await reopenPullRequest(transport!, slugParts!, closed.number);
           appendJournal(dir, {
@@ -5332,7 +5652,7 @@ export async function cmdSweepNextCase(cli: Cli): Promise<number> {
   const worktree = caseWorktreePath(dir, jc.caseId);
   // D-059: a REISSUE case (driver-journaled at start) is served as a REVISION —
   // the worktree carries the prior published resolution and the materials carry
-  // ALL human PR comments verbatim, never the fresh-conflict briefing.
+  // the FULL time-ordered review dialog, never the fresh-conflict briefing.
   const caseRow = journal.find((e) => e.action === 'case' && e.caseId === jc.caseId) ?? null;
   const isReissue = caseRow?.reissue === true;
   progress(
@@ -6083,6 +6403,22 @@ async function collectPassPullRequests(
         status: e.draft === true ? 'draft' : 'open',
         kind: 'recovered-publish',
       });
+    } else if (e.action === 'origin-approved' && typeof e.prNumber === 'number') {
+      put({
+        number: e.prNumber,
+        url: typeof e.prUrl === 'string' ? e.prUrl : '',
+        title: null,
+        status: 'open',
+        kind: 'approved-landing',
+      });
+    } else if (e.action === 'publish-skipped-live' && typeof e.prNumber === 'number') {
+      put({
+        number: e.prNumber,
+        url: typeof e.prUrl === 'string' ? e.prUrl : '',
+        title: null,
+        status: typeof e.liveState === 'string' ? e.liveState : 'closed',
+        kind: 'owner-acted-mid-pass',
+      });
     } else if (e.action === 'pr-published' && typeof e.number === 'number') {
       const titlePath = join(dir, String(e.caseId ?? ''), 'pr', 'title.txt');
       put({
@@ -6211,16 +6547,33 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   }
   writeMachineState(dir, { ...st, finishStep: 'push' });
 
-  // (3) push target branches (flips JUDGED PRs to merged) + closure checks + urges.
+  // (3) push target branches (flips JUDGED PRs to merged) + closure checks +
+  // urges. PUSH RESILIENCE (D-059 FINAL): per-branch failures (`push-failed`
+  // journal rows, categorized) do NOT halt finish — the rest of the pass
+  // completes and the SWEEP-RESULT reports landed vs failed factually. Only a
+  // GLOBAL failure with no per-branch rows (verify gate, token, closure check)
+  // still halts here.
   const pushLenBefore = readJournal(dir).length;
   const pushRc = await cmdPush({ ...cli, cmd: 'push', execute: true, internal: true }, makeTransport);
-  if (pushRc !== 0) {
-    console.error('finish: push halted (ERR15/ERR16/ERR18) — re-run finish from the push phase; pushes never redo');
+  const pushDelta = readJournal(dir).slice(pushLenBefore);
+  const pushFailures = pushDelta
+    .filter((e) => e.action === 'push-failed')
+    .map((e) => ({
+      branch: String(e.branch),
+      category: String(e.category ?? 'transient'),
+      detail: String(e.message ?? ''),
+    }));
+  if (pushRc !== 0 && pushFailures.length === 0) {
+    console.error('finish: push halted (ERR16/ERR18/token) — re-run finish from the push phase; pushes never redo');
     result(cli, { ok: false, halted: 'push' });
     return 1;
   }
-  const pushDelta = readJournal(dir).slice(pushLenBefore);
   progress(`push: targets (${pushDelta.filter((e) => e.action === 'push' && e.kind === 'target').length})`);
+  if (pushFailures.length > 0) {
+    progress(
+      `push: ${pushFailures.length} target(s) FAILED — ${pushFailures.map((f) => `${f.branch} (${f.category})`).join(', ')} — finishing the rest`,
+    );
+  }
   progress(`urge comments (${pushDelta.filter((e) => e.action === 'urge').length})`);
   writeMachineState(dir, { ...st, finishStep: 'held-prs' });
 
@@ -6230,6 +6583,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   // target pushes so cmdPublish's ERR14 held ordering holds (origin bases are
   // current). ERR07 (journal + open-PR-by-head) makes a resumed finish skip
   // already-created PRs; gate holds have no case and are never published.
+  const publishFailures: Array<{ caseId: string; branch: string }> = [];
   {
     const journal = readJournal(dir);
     const held = [...journaledCases(journal).values()].filter(
@@ -6265,9 +6619,19 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
         makeTransport,
       );
       if (rcPub !== 0) {
-        console.error(`finish: HELD publish failed for ${jc.caseId} — re-run finish after fixing`);
-        result(cli, { ok: false, halted: 'held-prs', caseId: jc.caseId });
-        return 1;
+        // PUSH RESILIENCE (D-059 FINAL): a failed held publish (e.g. its base
+        // push failed → ERR14, or a transient API error) no longer halts the
+        // whole finish — journal it, finish the rest, report factually; the
+        // case retries on the next finish (no pr-published row exists).
+        appendJournal(dir, {
+          action: 'publish-failed',
+          caseId: jc.caseId,
+          branch: jc.branch,
+          detail: 'held publish failed at finish — retries on the next finish (see the publish output above)',
+        });
+        publishFailures.push({ caseId: jc.caseId, branch: jc.branch });
+        progress(`held PR FAILED for ${jc.caseId} — finishing the rest`);
+        continue;
       }
       heldN++;
     }
@@ -6287,32 +6651,77 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   } catch {
     /* upstream ref unavailable (e.g. fixtures) — report done */
   }
-  if (!readJournal(dir).some((e) => e.action === 'pass-complete')) {
-    appendJournal(dir, { action: 'pass-complete', watermark: ctx.watermark });
-  }
-  writeMachineState(dir, {
-    schemaVersion: 1,
-    phase: 'complete',
-    watermark: ctx.watermark,
-    watermark12: ctx.watermark12,
-    currentCase: null,
-    finishStep: 'done',
-  });
-  const next = upstreamAdvanced ? 'start again' : 'done';
 
-  // Owner-facing pass summary on the ONE success SWEEP-RESULT (D-059 owner
-  // request): every related PR (found-open at start / reopened / recovered /
-  // created / reissued) + journal-derived stats, with an explicit cue to
-  // REPORT them — the agent relays numbers/titles/status to the owner.
+  // PUSH RESILIENCE (D-059 FINAL): with per-branch failures the pass is NOT
+  // sealed — the machine state stays `finishing` so a re-run finish retries
+  // exactly the failed pushes/publishes (landed branches skip as up-to-date;
+  // verify re-gates). Only a fully-landed finish completes the pass.
+  const anyFailures = pushFailures.length > 0 || publishFailures.length > 0;
+  if (!anyFailures) {
+    if (!readJournal(dir).some((e) => e.action === 'pass-complete')) {
+      appendJournal(dir, { action: 'pass-complete', watermark: ctx.watermark });
+    }
+    writeMachineState(dir, {
+      schemaVersion: 1,
+      phase: 'complete',
+      watermark: ctx.watermark,
+      watermark12: ctx.watermark12,
+      currentCase: null,
+      finishStep: 'done',
+    });
+  } else {
+    writeMachineState(dir, { ...st, phase: 'finishing', finishStep: 'push' });
+  }
+  const next = anyFailures ? 're-run finish' : upstreamAdvanced ? 'start again' : 'done';
+
+  // Owner-facing pass summary on the ONE SWEEP-RESULT (success or partial,
+  // D-059 owner request): every related PR (found-open at start / reopened /
+  // recovered / created / reissued / approved-landed) + per-branch landed vs
+  // failed outcomes + journal-derived stats, with an explicit cue to REPORT
+  // them — the agent relays numbers/titles/status/failures to the owner.
   const journalFinal = readJournal(dir);
   const pullRequests = await collectPassPullRequests(cli, dir, journalFinal, makeTransport);
+  // Per-branch landed/failed outcomes from THIS run's push phase.
+  const outcomeOf = new Map<string, { landed: boolean; category?: string }>();
+  for (const e of pushDelta) {
+    if (typeof e.branch !== 'string') continue;
+    if (e.action === 'push' && e.kind === 'target') outcomeOf.set(e.branch, { landed: true });
+    else if (e.action === 'push-skip') outcomeOf.set(e.branch, { landed: true });
+    else if (e.action === 'push-failed') outcomeOf.set(e.branch, { landed: false, category: String(e.category ?? 'transient') });
+  }
+  const branches = [...outcomeOf.entries()].map(([branch, o]) => ({
+    branch,
+    landed: o.landed,
+    ...(o.category ? { category: o.category } : {}),
+  }));
+  // Annotate each driver-published/landed PR row with its branch outcome; a
+  // held publish that failed has no PR row — it is reported via failedPublishes.
+  const branchOfPr = new Map<number, string>();
+  for (const e of journalFinal) {
+    if ((e.action === 'pr-published' || e.action === 'origin-approved') && typeof e.branch === 'string') {
+      const n = typeof e.number === 'number' ? e.number : typeof e.prNumber === 'number' ? e.prNumber : null;
+      if (n !== null) branchOfPr.set(n, e.branch);
+    }
+  }
+  const annotated = pullRequests.map((pr) => {
+    const branch = branchOfPr.get(pr.number);
+    const o = branch ? outcomeOf.get(branch) : undefined;
+    if (!o) return pr;
+    return { ...pr, landed: o.landed, ...(o.category ? { failureCategory: o.category } : {}) };
+  });
   const resolvedRows = journalFinal.filter((e) => e.action === 'resolved');
   const publishedRows = journalFinal.filter((e) => e.action === 'pr-published');
+  const failedByCategory = { diverged: 0, transient: 0, auth: 0 };
+  for (const f of pushFailures) {
+    failedByCategory[(f.category as keyof typeof failedByCategory) ?? 'transient'] =
+      (failedByCategory[(f.category as keyof typeof failedByCategory) ?? 'transient'] ?? 0) + 1;
+  }
   const stats = {
     branchesInScope: passOrder(dir).length,
     cleanMerges: journalFinal.filter((e) => e.action === 'merge').length,
     resolvedMechanical: resolvedRows.filter((e) => e.tier === 'mechanical').length,
     resolvedJudged: resolvedRows.filter((e) => e.tier === 'judged').length,
+    approvedLanded: journalFinal.filter((e) => e.action === 'origin-approved').length,
     held: journalFinal.filter((e) => e.action === 'held').length,
     deferredBranches: new Set(journalFinal.filter((e) => e.action === 'defer').map((e) => e.branch)).size,
     prsCreatedJudged: publishedRows.filter((e) => e.mode === 'judged').length,
@@ -6323,19 +6732,47 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     prsOpenAtStart: new Set(
       journalFinal.filter((e) => e.action === 'origin-blocked' && typeof e.prNumber === 'number').map((e) => e.prNumber),
     ).size,
+    // PUSH RESILIENCE: landed-vs-failed by category (this run).
+    targetsLanded: branches.filter((b) => b.landed).length,
+    targetsFailed: pushFailures.length,
+    failedByCategory,
+    heldPublishFailures: publishFailures.length,
     upstreamAdvanced,
     watermark12: ctx.watermark12,
   };
+  if (anyFailures) {
+    console.error(
+      `sweep finish PARTIAL — ${pushFailures.length} push failure(s), ${publishFailures.length} publish failure(s); re-run finish`,
+    );
+    result(cli, {
+      ok: false,
+      status: 'partial',
+      next,
+      upstreamAdvanced,
+      pullRequests: annotated,
+      branches,
+      failedPushes: pushFailures,
+      failedPublishes: publishFailures,
+      stats,
+      instruction:
+        `REPORT to the owner FACTUALLY: which branches LANDED (${branches.filter((b) => b.landed).map((b) => b.branch).join(', ') || 'none'}) ` +
+        `and which FAILED with their categories (${pushFailures.map((f) => `${f.branch}: ${f.category}`).join('; ') || 'none'}${publishFailures.length ? `; held publishes: ${publishFailures.map((p) => p.caseId).join(', ')}` : ''}), ` +
+        `plus every PR in pullRequests (number, title, status) and the stats. DIVERGED branches need the owner (never force-resolve); ` +
+        `then re-run \`finish\` — landed branches skip, failed ones retry.`,
+    });
+    return 1;
+  }
   console.error(`sweep finish complete — ${next}`);
   result(cli, {
     ok: true,
     status: 'complete',
     next,
     upstreamAdvanced,
-    pullRequests,
+    pullRequests: annotated,
+    branches,
     stats,
     instruction:
-      `REPORT to the owner: every PR in pullRequests (number, title, status) and the stats summary; then ` +
+      `REPORT to the owner: every PR in pullRequests (number, title, status), the landed branches (branches list), and the stats summary; then ` +
       (upstreamAdvanced ? 'run `sweep start` again (upstream advanced past the pinned watermark)' : 'stop — the sweep is done'),
   });
   return 0;

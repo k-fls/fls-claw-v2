@@ -162,6 +162,8 @@ function fakeGithub(overrides: Record<string, { status: number; body: unknown }>
         if (method === 'GET' && path.includes('/pulls?')) return { status: 200, body: [] }; // no existing PR
         if (method === 'POST' && path.endsWith('/pulls'))
           return { status: 201, body: { html_url: 'https://github.com/k-fls/fixture/pull/7', number: 7 } };
+        if (method === 'GET' && /\/pulls\/\d+\/reviews/.test(path)) return { status: 200, body: [] }; // D-059 review trigger
+        if (method === 'GET' && /\/pulls\/\d+\/comments/.test(path)) return { status: 200, body: [] }; // D-059 inline dialog
         if (method === 'GET' && /\/pulls\/\d+$/.test(path))
           return { status: 200, body: { number: 7, merged: true, body: 'x' } };
         if (method === 'PATCH' && /\/pulls\/\d+$/.test(path)) return { status: 200, body: {} };
@@ -740,7 +742,7 @@ describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
     expect(machineState(dir).phase).toBe('complete');
   });
 
-  it('a failed target push (ERR15) halts finish; re-running after the fix completes without re-pushing', async () => {
+  it('a failed target push (ERR15 per-branch, D-059 FINAL) -> finish reports PARTIAL (no hard halt); re-running after the fix completes without re-pushing', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
@@ -765,8 +767,18 @@ describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
         baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: passCmds(ws), out: out1 }),
       ),
     ).toBe(1);
-    expect((JSON.parse(readFileSync(out1, 'utf8')) as { halted: string }).halted).toBe('push');
+    // PARTIAL, not a push-phase hard halt: the failure is per-branch and factual.
+    const f1 = JSON.parse(readFileSync(out1, 'utf8')) as {
+      status: string;
+      halted?: string;
+      failedPushes: Array<{ branch: string; category: string }>;
+    };
+    expect(f1.status).toBe('partial');
+    expect(f1.halted).toBeUndefined();
+    expect(f1.failedPushes[0].branch).toBe('main_patched');
     expect(readJournal(dir).some((e) => e.action === 'push' && e.kind === 'target')).toBe(false); // nothing pushed
+    expect(readJournal(dir).some((e) => e.action === 'push-failed' && e.branch === 'main_patched')).toBe(true);
+    expect(machineState(dir).phase).toBe('finishing'); // NOT sealed — resumable
 
     // Fix the transport, re-run: verify still green, push now lands, complete.
     repo.git('config', `url.${bare}.insteadOf`, 'https://github.com/k-fls/fixture.git');
@@ -778,6 +790,7 @@ describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
     ).toBe(0);
     expect(readJournal(dir).filter((e) => e.action === 'push' && e.kind === 'target').length).toBe(1);
     expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).toBe(repo.sha('main_patched'));
+    expect(machineState(dir).phase).toBe('complete');
   });
 
   it('held publish crash window (finding #1): PR exists API-side but the pr-published row was lost -> finish RECONCILES and completes, no duplicate PR, no halt', async () => {
@@ -1396,7 +1409,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     expect((JSON.parse(readFileSync(nc, 'utf8')) as { status: string }).status).toBe('finalize');
   });
 
-  it('open PR whose human comments are all at/below the marker -> plain PR_ID; bot comments (marker + urge, SAME author) are excluded by CONTENT', async () => {
+  it('REVIEW-only trigger: a NEW loose comment (and bot reviews, and a quote-reply embedding the marker) do NOT reissue; only a review above the marker would', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
@@ -1413,11 +1426,24 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
       'GET /issues/12/comments': {
         status: 200,
         body: [
-          { id: 3, body: 'please prefer the upstream wording here' }, // human — addressed below
-          { id: 4, body: 'Sweep bookkeeping (driver-posted)\n<!-- sweep-addressed: 3 -->' }, // marker
-          // An urge posted LATER by the SAME PAT: excluded by CONTENT (it
-          // carries the re-asserted marker), never counted as a human comment.
-          { id: 6, body: '# Urge — main_patched still blocked\n<!-- sweep-addressed: 3 -->' },
+          // Driver bookkeeping (marker at review 300) + a later urge re-asserting
+          // it: excluded by CONTENT (same PAT as the human), marker = 300.
+          { id: 4, body: 'Sweep bookkeeping (driver-posted)\n<!-- sweep-addressed: 300 -->', user: { login: 'flsclaw' } },
+          { id: 6, body: '# Urge — main_patched still blocked\n<!-- sweep-addressed: 300 -->', user: { login: 'flsclaw' } },
+          // A NEW loose human comment ABOVE everything: comments NEVER trigger.
+          { id: 999, body: 'just pinging — any update?', user: { login: 'k-owner' }, created_at: '2026-07-22T00:00:00Z' },
+          // A HUMAN quote-reply EMBEDDING the marker stays human (own-line-only
+          // detection) — and still does not trigger (it is a comment).
+          { id: 1000, body: 'replying to the bot:\n> <!-- sweep-addressed: 300 -->\nok', user: { login: 'k-owner' } },
+        ],
+      },
+      'GET /pulls/12/reviews': {
+        status: 200,
+        body: [
+          // The review the marker already addressed (id 300 <= marker 300).
+          { id: 300, state: 'CHANGES_REQUESTED', body: 'earlier round', user: { login: 'k-owner' }, submitted_at: '2026-07-20T00:00:00Z' },
+          // A NEWER *[bot]* review: ignored for the trigger.
+          { id: 950, state: 'CHANGES_REQUESTED', body: 'lint gripes', user: { login: 'ci-lint[bot]' }, submitted_at: '2026-07-22T01:00:00Z' },
         ],
       },
     });
@@ -1426,8 +1452,9 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     const journal = readJournal(dir);
     const row = journal.find((e) => e.action === 'origin-blocked')!;
     expect(row.prNumber).toBe(12);
-    expect(row.markerId).toBe(3);
-    // Newest HUMAN id (3) <= marker (3): NO reissue — just blocked.
+    expect(row.markerId).toBe(300);
+    // Newest non-bot REVIEW (300) <= marker (300): NO reissue — just blocked,
+    // despite the newer loose comments and the newer bot review.
     expect(journal.some((e) => e.action === 'case')).toBe(false);
     const nc = join(ws, 'nc.json');
     expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: nc }))).toBe(0);
@@ -1508,7 +1535,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     expect(readFileSync(join(dir, caseId, 'worktree', 'src/x.ts'), 'utf8')).toContain('<<<<<<<');
   });
 
-  it('open PR + NEW human comment -> REISSUE: revision case from the PRIOR resolution, comments in materials, forced HELD; finish force-updates the SAME PR + posts the new marker (D-059 case 3)', async () => {
+  it('open PR + NEW review (CHANGES_REQUESTED) -> REISSUE: revision case from the PRIOR resolution, time-ordered DIALOG in materials, forced HELD; finish live-rechecks + force-updates the SAME PR + posts the review-id marker (D-059 case 3)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
@@ -1520,13 +1547,55 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     const gh = fakeGithub({
       'GET /pulls?': {
         status: 200,
-        body: [{ html_url: 'https://github.com/k-fls/fixture/pull/12', number: 12, state: 'open' }],
+        body: [
+          {
+            html_url: 'https://github.com/k-fls/fixture/pull/12',
+            number: 12,
+            state: 'open',
+            body: 'Decision needed: original resolution of src/x.ts.\n<!-- sweep-addressed: 0 -->',
+            created_at: '2026-07-18T00:00:00Z',
+          },
+        ],
       },
       'GET /issues/12/comments': {
         status: 200,
         body: [
-          { id: 4, body: 'Sweep bookkeeping (driver-posted)\n<!-- sweep-addressed: 0 -->' }, // bot marker
-          { id: 9, body: 'Owner: keep the fork guard but adopt the upstream naming' }, // human, NEW
+          {
+            id: 4,
+            body: 'Sweep bookkeeping (driver-posted): first publish.\n<!-- sweep-addressed: 0 -->',
+            user: { login: 'flsclaw' },
+            created_at: '2026-07-19T00:00:00Z',
+          }, // the agent's own prior turn (tag-bearing)
+          {
+            id: 9,
+            body: 'keep the fork guard but adopt the upstream naming',
+            user: { login: 'k-owner' },
+            created_at: '2026-07-20T10:00:00Z',
+          }, // loose human comment — dialog only, never a trigger by itself
+        ],
+      },
+      'GET /pulls/12/comments': {
+        status: 200,
+        body: [
+          {
+            id: 700,
+            body: 'this hunk drops the guard',
+            user: { login: 'k-owner' },
+            created_at: '2026-07-20T23:00:00Z',
+            path: 'src/x.ts',
+          }, // inline review comment — dialog only
+        ],
+      },
+      'GET /pulls/12/reviews': {
+        status: 200,
+        body: [
+          {
+            id: 500,
+            state: 'CHANGES_REQUESTED',
+            body: 'Please keep the guard.',
+            user: { login: 'k-owner' },
+            submitted_at: '2026-07-21T00:00:00Z',
+          }, // THE trigger: submitted review above the marker (0)
         ],
       },
     });
@@ -1535,7 +1604,8 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     const caseRow = readJournal(dir).find((e) => e.action === 'case')!;
     expect(caseRow.reissue).toBe(true);
     expect(caseRow.prNumber).toBe(12);
-    expect(caseRow.addressedCommentId).toBe(9);
+    expect(caseRow.addressedReviewId).toBe(500); // the REVIEW id, not a comment id
+    expect(caseRow.reviewState).toBe('CHANGES_REQUESTED');
     expect(caseRow.fixBranch).toBe(fixBranch);
     expect(caseRow.priorHead).toBe(fixHead);
     const caseId = caseRow.caseId as string;
@@ -1544,7 +1614,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     // The worktree pending file carries the PRIOR RESOLUTION, not markers.
     expect(readFileSync(join(dir, caseId, 'worktree', 'src/x.ts'), 'utf8')).toBe('OWNER-RESOLVED\n');
 
-    // next-case serves the revision with ALL human comments verbatim.
+    // next-case serves the revision with the FULL DIALOG, time-ordered.
     const nc = join(ws, 'nc.json');
     expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: nc }))).toBe(0);
     const served = JSON.parse(readFileSync(nc, 'utf8')) as {
@@ -1557,8 +1627,23 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     expect(served.caseId).toBe(caseId);
     expect(served.reissue).toBe(true);
     expect(served.materials).toContain('REVISE the resolution accordingly; do not start over');
-    expect(served.materials).toContain('Owner: keep the fork guard but adopt the upstream naming');
-    expect(served.materials).not.toContain('Sweep bookkeeping'); // bot comments are never served
+    // Agent-own turns: PR description + tag-bearing comment — tag STRIPPED,
+    // clearly marked as the agent's own.
+    expect(served.materials).toContain('you (prior) — PR description');
+    expect(served.materials).toContain('Decision needed: original resolution of src/x.ts.');
+    expect(served.materials).toContain('you (prior) — comment 4');
+    expect(served.materials).not.toContain('<!-- sweep-addressed:'); // tags never served back
+    // Other turns keep the author's GitHub login so the agent can address them.
+    expect(served.materials).toContain('@k-owner — comment 9');
+    expect(served.materials).toContain('keep the fork guard but adopt the upstream naming');
+    expect(served.materials).toContain('@k-owner — inline comment 700 on src/x.ts');
+    expect(served.materials).toContain('@k-owner — review 500 — CHANGES_REQUESTED');
+    // Time order: description < driver comment < loose comment < inline < review.
+    const posOf = (s: string): number => served.materials.indexOf(s);
+    expect(posOf('you (prior) — PR description')).toBeLessThan(posOf('you (prior) — comment 4'));
+    expect(posOf('you (prior) — comment 4')).toBeLessThan(posOf('@k-owner — comment 9'));
+    expect(posOf('@k-owner — comment 9')).toBeLessThan(posOf('@k-owner — inline comment 700'));
+    expect(posOf('@k-owner — inline comment 700')).toBeLessThan(posOf('@k-owner — review 500'));
 
     // The agent revises the prior resolution; ANY claimed tier routes to HELD
     // (a revision must republish to the existing PR, never merge locally).
@@ -1575,12 +1660,17 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     writePr(dir, caseId, 'revised: fork guard + upstream naming for src/x.ts', 'Decision needed: revised per review — src/x.ts keeps the fork guard and adopts the upstream naming.');
     expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
 
-    // finish: the revision replaces the fix ref head (compare-and-swap force)
-    // and the SAME PR is updated — no second PR; marker advances to 9.
+    // finish: the LIVE state of PR #12 is re-checked (still open here), the
+    // revision replaces the fix ref head (compare-and-swap force) and the SAME
+    // PR is updated — no second PR; the marker advances to REVIEW id 500.
     const ghFin = fakeGithub({
       'GET /pulls?': {
         status: 200,
         body: [{ html_url: 'https://github.com/k-fls/fixture/pull/12', number: 12, state: 'open' }],
+      },
+      'GET /pulls/12': {
+        status: 200,
+        body: { number: 12, html_url: 'https://github.com/k-fls/fixture/pull/12', state: 'open', merged: false, body: 'x' },
       },
     });
     const finOut = join(ws, 'fin.json');
@@ -1593,18 +1683,18 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     const pub = readJournal(dir).find((e) => e.action === 'pr-published')!;
     expect(pub.reissued).toBe(true);
     expect(pub.number).toBe(12);
-    expect(pub.addressedCommentId).toBe(9);
+    expect(pub.addressedReviewId).toBe(500);
     expect(ghFin.calls.some((c) => c.method === 'POST' && c.path.endsWith('/pulls'))).toBe(false); // no second PR
     const titlePatch = ghFin.calls.filter((c) => c.method === 'PATCH' && c.path.endsWith('/pulls/12'));
     expect(
       titlePatch.some((c) => (c.body as { title?: string }).title === 'revised: fork guard + upstream naming for src/x.ts'),
     ).toBe(true);
-    // The new marker records the addressed comment id (9); the urge posted this
-    // finish re-asserted the OLD id (0) so it stays bot-classified next pass.
+    // The new marker records the addressed REVIEW id (500); the urge posted
+    // this finish re-asserted the OLD id (0) so it stays bot-classified next pass.
     const comments = ghFin.calls.filter((c) => c.method === 'POST' && c.path.includes('/issues/12/comments'));
-    expect(comments.some((c) => String((c.body as { body: string }).body).includes('<!-- sweep-addressed: 9 -->'))).toBe(
-      true,
-    );
+    expect(
+      comments.some((c) => String((c.body as { body: string }).body).includes('<!-- sweep-addressed: 500 -->')),
+    ).toBe(true);
     expect(
       comments.some(
         (c) =>
@@ -1619,6 +1709,360 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     expect(repo.git('rev-parse', `${newHead}^2`)).toBe(repo.sha('main')); // still merges the conflict head
     // The target branch itself is untouched on origin (blocked: nothing merged).
     expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).toBe(repo.sha('main_patched'));
+  });
+
+  it('APPROVED review + still merges cleanly -> LANDED (no reissue): merged locally at start, verify-gated push at finish auto-flips the PR', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { fixHead } = pushFixRef(repo);
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = fakeGithub({
+      'GET /pulls?': {
+        status: 200,
+        body: [{ html_url: 'https://github.com/k-fls/fixture/pull/12', number: 12, state: 'open' }],
+      },
+      'GET /pulls/12/reviews': {
+        status: 200,
+        body: [{ id: 42, state: 'APPROVED', body: 'LGTM', user: { login: 'k-owner' }, submitted_at: '2026-07-22T00:00:00Z' }],
+      },
+    });
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile }), gh.factory)).toBe(0);
+    const dir = dirOf(repo, ws);
+    const journal = readJournal(dir);
+    const approved = journal.find((e) => e.action === 'origin-approved')!;
+    expect(approved.branch).toBe('main_patched');
+    expect(approved.reviewId).toBe(42);
+    expect(approved.prNumber).toBe(12);
+    expect(journal.some((e) => e.action === 'origin-blocked')).toBe(false); // NOT blocked
+    expect(journal.some((e) => e.action === 'case')).toBe(false); // NO reissue
+    // Landed LOCALLY: main_patched now contains the fix head + the resolution.
+    expect(await isAncestor(repo.dir, fixHead, 'main_patched')).toBe(true);
+    expect(repo.git('show', 'main_patched:src/x.ts')).toBe('OWNER-RESOLVED');
+    // ...but NOT on origin yet: the landing is verify-gated at finish.
+    expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).not.toBe(repo.sha('main_patched'));
+
+    // next-case: the branch absorbed the conflict head -> nothing left, finalize.
+    const nc = join(ws, 'nc.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: nc }))).toBe(0);
+    expect((JSON.parse(readFileSync(nc, 'utf8')) as { status: string }).status).toBe('finalize');
+
+    // finish: verify green -> the target push lands the approved merge; the PR
+    // auto-flips to merged (live refresh); no new PR is ever created.
+    const ghFin = fakeGithub({
+      'GET /pulls/12': {
+        status: 200,
+        body: { number: 12, state: 'closed', merged: true, title: 'review: main_patched resolution', body: 'x' },
+      },
+    });
+    const cmdsFile = join(ws, 'cmds-true.json');
+    writeFileSync(cmdsFile, JSON.stringify([{ cmd: 'true' }]));
+    const finOut = join(ws, 'fin.json');
+    expect(
+      await cmdSweepFinish(
+        baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, tokenFile, commandsFile: cmdsFile, out: finOut }),
+        ghFin.factory,
+      ),
+    ).toBe(0);
+    expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).toBe(repo.sha('main_patched')); // landed
+    expect(ghFin.calls.some((c) => c.method === 'POST' && c.path.endsWith('/pulls'))).toBe(false); // no new PR
+    const fin = JSON.parse(readFileSync(finOut, 'utf8')) as {
+      ok: boolean;
+      stats: Record<string, unknown>;
+      pullRequests: Array<{ number: number; kind: string; status: string; landed?: boolean }>;
+      branches: Array<{ branch: string; landed: boolean }>;
+    };
+    expect(fin.ok).toBe(true);
+    expect(fin.stats.approvedLanded).toBe(1);
+    expect(fin.stats.targetsFailed).toBe(0);
+    const pr12 = fin.pullRequests.find((p) => p.number === 12)!;
+    expect(pr12.kind).toBe('approved-landing');
+    expect(pr12.status).toBe('merged');
+    expect(pr12.landed).toBe(true);
+    expect(fin.branches.find((b) => b.branch === 'main_patched')!.landed).toBe(true);
+  });
+
+  it('APPROVED but the target ADVANCED (no longer merges cleanly) -> REISSUE against the new base; nothing landed', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { fixHead } = pushFixRef(repo); // resolution against the OLD tip
+    // The target advances with a CONFLICTING edit after the approval.
+    repo.checkout('main_patched');
+    repo.commit('mp: x moved again', { 'src/x.ts': 'fork2\n' });
+    repo.checkout('main');
+    repo.git('push', 'origin', 'main_patched');
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = fakeGithub({
+      'GET /pulls?': {
+        status: 200,
+        body: [{ html_url: 'https://github.com/k-fls/fixture/pull/12', number: 12, state: 'open' }],
+      },
+      'GET /pulls/12/reviews': {
+        status: 200,
+        body: [{ id: 42, state: 'APPROVED', body: 'LGTM', user: { login: 'k-owner' }, submitted_at: '2026-07-22T00:00:00Z' }],
+      },
+    });
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile }), gh.factory)).toBe(0);
+    const dir = dirOf(repo, ws);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'origin-approved')).toBe(false); // NOT landed
+    expect(await isAncestor(repo.dir, fixHead, 'main_patched')).toBe(false);
+    expect(journal.some((e) => e.action === 'origin-blocked' && e.branch === 'main_patched')).toBe(true);
+    const caseRow = journal.find((e) => e.action === 'case')!;
+    expect(caseRow.reissue).toBe(true);
+    expect(caseRow.reviewState).toBe('APPROVED');
+    expect(caseRow.addressedReviewId).toBe(42);
+    // The materials say re-resolve against the new base (approved-but-stale).
+    const nc = join(ws, 'nc.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: nc }))).toBe(0);
+    const served = JSON.parse(readFileSync(nc, 'utf8')) as { status: string; reissue?: boolean; materials: string };
+    expect(served.status).toBe('case-ready');
+    expect(served.reissue).toBe(true);
+    expect(served.materials).toContain('was APPROVED');
+    expect(served.materials).toContain('RE-RESOLVE it against the new base');
+  });
+
+  it('PR CLOSED with merged_at (squash/rebase merge — head not an ancestor) -> resolved + ref deleted; NEVER a reopen PATCH (no 422 halt)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    pushFixRef(repo);
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = fakeGithub({
+      'GET /pulls?': {
+        status: 200,
+        body: [
+          {
+            html_url: 'https://github.com/k-fls/fixture/pull/12',
+            number: 12,
+            state: 'closed',
+            merged_at: '2026-07-22T00:00:00Z', // MERGED (squash) — state is still 'closed'
+          },
+        ],
+      },
+    });
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile }), gh.factory)).toBe(0);
+    const dir = dirOf(repo, ws);
+    const journal = readJournal(dir);
+    const resolved = journal.find((e) => e.action === 'origin-ref-resolved')!;
+    expect(resolved.via).toBe('pr-merged');
+    expect(resolved.prNumber).toBe(12);
+    // NO reopen was attempted (the PATCH would 422 on a merged PR).
+    expect(journal.some((e) => e.action === 'origin-pr-reopened')).toBe(false);
+    expect(gh.calls.some((c) => c.method === 'PATCH')).toBe(false);
+    // The ref is cleaned up and the branch is NOT blocked.
+    expect(repo.git('-C', bare, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep')).toBe('');
+    expect(journal.some((e) => e.action === 'origin-blocked')).toBe(false);
+    // The still-live conflict re-derives as an ORDINARY fresh case (unblocked).
+    const nc = join(ws, 'nc.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: nc }))).toBe(0);
+    const served = JSON.parse(readFileSync(nc, 'utf8')) as { status: string; reissue?: boolean };
+    expect(served.status).toBe('case-ready');
+    expect(served.reissue ?? false).toBe(false);
+  });
+
+  it('pagination: the NEWEST review lives past 100 items (page 2) and still triggers the reissue', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    pushFixRef(repo);
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    // Page 1: 100 old bot reviews (GitHub returns OLDEST first — a page-1-only
+    // reader would see ONLY these and mis-classify the PR as review-quiet).
+    const page1 = Array.from({ length: 100 }, (_, i) => ({
+      id: i + 1,
+      state: 'COMMENTED',
+      body: 'scan',
+      user: { login: 'scanner[bot]' },
+      submitted_at: '2026-07-01T00:00:00Z',
+    }));
+    const gh = fakeGithub({
+      'GET /pulls?': {
+        status: 200,
+        body: [{ html_url: 'https://github.com/k-fls/fixture/pull/12', number: 12, state: 'open' }],
+      },
+      'GET /pulls/12/reviews?per_page=100&page=1': { status: 200, body: page1 },
+      'GET /pulls/12/reviews?per_page=100&page=2': {
+        status: 200,
+        body: [
+          {
+            id: 999,
+            state: 'CHANGES_REQUESTED',
+            body: 'newest — beyond page 1',
+            user: { login: 'k-owner' },
+            submitted_at: '2026-07-22T00:00:00Z',
+          },
+        ],
+      },
+    });
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile }), gh.factory)).toBe(0);
+    const caseRow = readJournal(dirOf(repo, ws)).find((e) => e.action === 'case')!;
+    expect(caseRow.reissue).toBe(true);
+    expect(caseRow.addressedReviewId).toBe(999); // the page-2 review WAS seen
+    expect(caseRow.reviewState).toBe('CHANGES_REQUESTED');
+  });
+
+  it('owner pushed onto fix/sweep (head not driver-shaped) -> case REBUILT from the CURRENT ref head; the owner edit is the revision base', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { fixBranch, fixHead } = pushFixRef(repo);
+    // The owner commits ON TOP of the driver-built head (single parent — the
+    // ref head is no longer driver-shaped) and pushes it.
+    repo.checkout('tmp-owner', { create: true, at: fixHead });
+    repo.commit('owner: tweak the resolution', { 'src/x.ts': 'OWNER-EDIT\n' });
+    const ownerHead = repo.sha('tmp-owner');
+    repo.checkout('main');
+    repo.git('branch', '-D', 'tmp-owner');
+    repo.git('push', 'origin', `${ownerHead}:refs/heads/${fixBranch}`);
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = fakeGithub({
+      'GET /pulls?': {
+        status: 200,
+        body: [{ html_url: 'https://github.com/k-fls/fixture/pull/12', number: 12, state: 'open' }],
+      },
+      'GET /pulls/12/reviews': {
+        status: 200,
+        body: [
+          { id: 77, state: 'CHANGES_REQUESTED', body: 'see my commit', user: { login: 'k-owner' }, submitted_at: '2026-07-22T00:00:00Z' },
+        ],
+      },
+    });
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile }), gh.factory)).toBe(0);
+    const dir = dirOf(repo, ws);
+    const journal = readJournal(dir);
+    // Rebuilt, not warn-degraded: journaled, with the conflict head recovered
+    // from the ref name's sha8.
+    const rebuilt = journal.find((e) => e.action === 'reissue-rebuilt')!;
+    expect(rebuilt.ownerHead).toBe(ownerHead);
+    expect(rebuilt.conflictHead).toBe(repo.sha('main'));
+    const caseRow = journal.find((e) => e.action === 'case')!;
+    expect(caseRow.reissue).toBe(true);
+    expect((caseRow.head as { sha: string }).sha).toBe(repo.sha('main'));
+    expect(caseRow.priorHead).toBe(ownerHead); // the force-with-lease CAS anchor = the OWNER's head
+    // The worktree serves the OWNER's edit as the revision base.
+    const caseId = caseRow.caseId as string;
+    expect(readFileSync(join(dir, caseId, 'worktree', 'src/x.ts'), 'utf8')).toBe('OWNER-EDIT\n');
+  });
+
+  it('truly unusable ref (unparseable name) + new review -> ESCALATED ONCE on the PR (marker advanced to the review id), blocked, no case, no warn-loop', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    // An unparseable fix ref (no -h<n>-<sha8> tail) pointing at an unmerged commit.
+    const badRef = 'fix/sweep/main_patched--garbled';
+    repo.git('push', 'origin', `${repo.sha('main')}:refs/heads/${badRef}`);
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = fakeGithub({
+      'GET /pulls?': {
+        status: 200,
+        body: [{ html_url: 'https://github.com/k-fls/fixture/pull/12', number: 12, state: 'open' }],
+      },
+      'GET /pulls/12/reviews': {
+        status: 200,
+        body: [{ id: 55, state: 'CHANGES_REQUESTED', body: 'fix it', user: { login: 'k-owner' }, submitted_at: '2026-07-22T00:00:00Z' }],
+      },
+    });
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile }), gh.factory)).toBe(0);
+    const dir = dirOf(repo, ws);
+    const journal = readJournal(dir);
+    const escalated = journal.find((e) => e.action === 'origin-ref-escalated')!;
+    expect(escalated.ref).toBe(badRef);
+    expect(escalated.reviewId).toBe(55);
+    // The escalation comment carries the marker AT the review id — the next
+    // pass reads it as current and does NOT re-escalate (no per-pass loop).
+    const esc = gh.calls.find(
+      (c) => c.method === 'POST' && c.path.includes('/issues/12/comments') && String((c.body as { body: string }).body).includes('Sweep escalation'),
+    )!;
+    expect(String((esc.body as { body: string }).body)).toContain('<!-- sweep-addressed: 55 -->');
+    // Blocked, no case, ref untouched.
+    expect(journal.some((e) => e.action === 'origin-blocked' && e.branch === 'main_patched')).toBe(true);
+    expect(journal.some((e) => e.action === 'case')).toBe(false);
+    expect(repo.git('-C', bare, 'rev-parse', `refs/heads/${badRef}`)).toBe(repo.sha('main'));
+  });
+
+  it('finish live-recheck: the owner MERGED the review PR mid-pass -> republish SKIPPED (no 2nd PR, no ref clobber), finish still green', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { fixBranch, fixHead } = pushFixRef(repo);
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = fakeGithub({
+      'GET /pulls?': {
+        status: 200,
+        body: [{ html_url: 'https://github.com/k-fls/fixture/pull/12', number: 12, state: 'open' }],
+      },
+      'GET /pulls/12/reviews': {
+        status: 200,
+        body: [
+          { id: 500, state: 'CHANGES_REQUESTED', body: 'tighten it', user: { login: 'k-owner' }, submitted_at: '2026-07-21T00:00:00Z' },
+        ],
+      },
+    });
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile }), gh.factory)).toBe(0);
+    const dir = dirOf(repo, ws);
+    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv))).toBe(0);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'REVISED\n' });
+    expect(
+      await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true }), confirm),
+    ).toBe(0);
+    writePr(dir, caseId, 'revised x', 'Decision needed: revised resolution of src/x.ts per review.');
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
+
+    // MID-PASS the owner merges PR #12. finish's live re-check must SKIP the
+    // republish: no push, no PATCH, no second PR — the next start re-derives.
+    const ghFin = fakeGithub({
+      'GET /pulls/12': {
+        status: 200,
+        body: { number: 12, html_url: 'https://github.com/k-fls/fixture/pull/12', state: 'closed', merged: true, body: 'x' },
+      },
+    });
+    const finOut = join(ws, 'fin.json');
+    expect(
+      await cmdSweepFinish(
+        baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, tokenFile, out: finOut }),
+        ghFin.factory,
+      ),
+    ).toBe(0);
+    const journal = readJournal(dir);
+    const skipRow = journal.find((e) => e.action === 'publish-skipped-live')!;
+    expect(skipRow.prNumber).toBe(12);
+    expect(skipRow.liveState).toBe('merged');
+    expect(journal.some((e) => e.action === 'pr-published')).toBe(false);
+    expect(ghFin.calls.some((c) => c.method === 'POST' && c.path.endsWith('/pulls'))).toBe(false); // no 2nd PR
+    // No title/body REPUBLISH of the merged PR (the urge's machine-block body
+    // refresh is bookkeeping, not a clobber — it carries no title).
+    expect(
+      ghFin.calls.some((c) => c.method === 'PATCH' && (c.body as { title?: string }).title !== undefined),
+    ).toBe(false);
+    // The origin fix ref is UNTOUCHED (the revision was never force-pushed).
+    expect(repo.git('-C', bare, 'rev-parse', `refs/heads/${fixBranch}`)).toBe(fixHead);
+    const fin = JSON.parse(readFileSync(finOut, 'utf8')) as { ok: boolean; status: string };
+    expect(fin.ok).toBe(true);
+    expect(fin.status).toBe('complete');
   });
 
   it('unmerged refs REQUIRE the token (fail-closed): no --token-file -> ERR11, no pass opened, nothing deleted', async () => {
@@ -1759,6 +2203,88 @@ describe('sweep finish — owner-facing PR + stats summary on the success SWEEP-
     expect(fin.stats.branchesInScope).toBe(2);
     expect(fin.instruction).toContain('REPORT to the owner');
     expect(fin.instruction).toContain('pullRequests');
+  });
+});
+
+describe('sweep finish — push resilience (D-059 FINAL): per-branch, categorized, resumable', () => {
+  it('the FIRST target diverged -> the rest still land; partial factual report (ERR15 label, no halt); a healed re-run retries only the failure', async () => {
+    // Two clean targets: main_patched (upstream-chain) and feat/other (child).
+    const repo = cleanFixture();
+    repo.checkout('feat/other', { create: true, at: 'main_patched' });
+    repo.commit('other: own file', { 'src/o.ts': 'o\n' });
+    repo.checkout('main');
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'other', branch: 'feat/other', parents: ['main_patched'] }]);
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched', 'feat/other');
+    const mpPre = repo.sha('main_patched');
+
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    const nc = join(ws, 'nc.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: nc }))).toBe(0);
+    expect((JSON.parse(readFileSync(nc, 'utf8')) as { status: string }).status).toBe('finalize'); // all clean merges
+    expect(repo.sha('main_patched')).not.toBe(mpPre); // the pass advanced both branches locally
+
+    // MID-PASS an external commit lands on origin/main_patched -> the FIRST
+    // push target is diverged (owner escalation), the second must still land.
+    const external = repo.git('commit-tree', `${mpPre}^{tree}`, '-p', mpPre, '-m', 'external commit on origin');
+    repo.git('push', 'origin', `${external}:refs/heads/main_patched`);
+
+    const dir = dirOf(repo, ws);
+    const cmdsFile = join(ws, 'cmds-true.json');
+    writeFileSync(cmdsFile, JSON.stringify([{ cmd: 'true' }]));
+    const finOut = join(ws, 'fin.json');
+    expect(
+      await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmdsFile, out: finOut })),
+    ).toBe(1);
+    const fin = JSON.parse(readFileSync(finOut, 'utf8')) as {
+      ok: boolean;
+      status: string;
+      branches: Array<{ branch: string; landed: boolean; category?: string }>;
+      failedPushes: Array<{ branch: string; category: string }>;
+      stats: { targetsFailed: number; failedByCategory: Record<string, number> };
+      instruction: string;
+    };
+    expect(fin.ok).toBe(false);
+    expect(fin.status).toBe('partial');
+    // feat/other LANDED despite main_patched failing FIRST...
+    expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/feat/other')).toBe(repo.sha('feat/other'));
+    // ...and the diverged branch was NEVER force-resolved (origin untouched).
+    expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).toBe(external);
+    expect(fin.branches.find((b) => b.branch === 'feat/other')!.landed).toBe(true);
+    const mp = fin.branches.find((b) => b.branch === 'main_patched')!;
+    expect(mp.landed).toBe(false);
+    expect(mp.category).toBe('diverged');
+    expect(fin.failedPushes).toEqual([expect.objectContaining({ branch: 'main_patched', category: 'diverged' })]);
+    expect(fin.stats.targetsFailed).toBe(1);
+    expect(fin.stats.failedByCategory.diverged).toBe(1);
+    expect(fin.instruction).toContain('main_patched: diverged');
+    expect(fin.instruction).toContain('feat/other');
+    // Journal: per-branch `push-failed` (ERR15 stays the LABEL) — NO halt row.
+    const journal = readJournal(dir);
+    expect(
+      journal.some((e) => e.action === 'push-failed' && e.branch === 'main_patched' && e.category === 'diverged' && e.id === 'ERR15_PUSH_FAILED'),
+    ).toBe(true);
+    expect(journal.some((e) => e.action === 'halt' && e.id === 'ERR15_PUSH_FAILED')).toBe(false);
+    // Partial => the pass is NOT sealed (resumable).
+    expect(machineState(dir).phase).toBe('finishing');
+    expect(journal.some((e) => e.action === 'pass-complete')).toBe(false);
+
+    // The owner heals origin/main_patched (restores the pre-divergence tip);
+    // the re-run pushes ONLY the failed branch — feat/other skips up-to-date.
+    repo.git('push', '--force', 'origin', `${mpPre}:refs/heads/main_patched`);
+    const fin2Out = join(ws, 'fin2.json');
+    expect(
+      await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmdsFile, out: fin2Out })),
+    ).toBe(0);
+    const fin2 = JSON.parse(readFileSync(fin2Out, 'utf8')) as { ok: boolean; status: string };
+    expect(fin2.ok).toBe(true);
+    expect(fin2.status).toBe('complete');
+    expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).toBe(repo.sha('main_patched'));
+    const journal2 = readJournal(dir);
+    expect(journal2.filter((e) => e.action === 'push' && e.branch === 'feat/other').length).toBe(1); // never re-pushed
+    expect(journal2.some((e) => e.action === 'push-skip' && e.branch === 'feat/other' && e.reason === 'up-to-date')).toBe(true);
+    expect(machineState(dir).phase).toBe('complete');
   });
 });
 

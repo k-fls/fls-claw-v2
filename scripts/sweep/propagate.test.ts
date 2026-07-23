@@ -1440,7 +1440,7 @@ describe('propagate push — verify-gated pass pushes (§14.4, D-049)', () => {
     expect(readJournal(dir).some((e) => e.action === 'push-skip' && e.reason === 'up-to-date')).toBe(true);
   });
 
-  it('a failing target push is ERR15: journaled halt, hard stop, no fallback (D-046 case 2)', async () => {
+  it('a failing target push is ERR15 PER BRANCH (categorized `push-failed`, D-059 FINAL) — reported, journaled, NO hard-halt row; the branch retries next run', async () => {
     const { repo } = conflictFixture();
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
@@ -1454,11 +1454,26 @@ describe('propagate push — verify-gated pass pushes (§14.4, D-049)', () => {
     repo.git('config', '--unset', `url.${bare}.insteadOf`);
     const out = join(ws, 'push-out.json');
     expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, out }))).toBe(1);
-    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string; detail: string }> };
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      issues: Array<{ id: string; detail: string }>;
+      failed: Array<{ branch: string; category: string }>;
+    };
     const issue = res.issues.find((i) => i.id === 'ERR15_PUSH_FAILED');
     expect(issue).toBeTruthy();
     expect(issue!.detail).toContain('D-046 case 2');
-    expect(readJournal(dir).some((e) => e.action === 'halt' && e.id === 'ERR15_PUSH_FAILED')).toBe(true);
+    // Per-branch categorized failure, ERR15 as the LABEL — never a stop.
+    expect(res.failed.length).toBe(1);
+    expect(res.failed[0].branch).toBe('main_patched');
+    expect(['transient', 'auth', 'diverged']).toContain(res.failed[0].category);
+    const journal = readJournal(dir);
+    expect(
+      journal.some((e) => e.action === 'push-failed' && e.branch === 'main_patched' && e.id === 'ERR15_PUSH_FAILED'),
+    ).toBe(true);
+    expect(journal.some((e) => e.action === 'halt' && e.id === 'ERR15_PUSH_FAILED')).toBe(false);
+    // RESUMABLE: fix the transport, re-push -> the failed branch lands.
+    repo.git('config', `url.${bare}.insteadOf`, 'https://github.com/k-fls/fixture.git');
+    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true }))).toBe(0);
+    expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).toBe(repo.sha('main_patched'));
   });
 
   it('JUDGED closure check: a PR that did not flip to merged after the target push is ERR16', async () => {

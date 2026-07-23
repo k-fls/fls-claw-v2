@@ -18,14 +18,20 @@ import {
   MACHINE_BLOCK_BEGIN,
   MACHINE_BLOCK_END,
   checkBaseHeight,
+  classifyComments,
+  classifyReviewTrigger,
   decidedAlready,
+  extractSweepAddressed,
+  ghPaginated,
   haltIdFor,
   isBlocking,
   parseGithubSlug,
   renderMachineBlock,
+  stripSweepAddressed,
   withMachineBlock,
   type GithubTransport,
   type Issue,
+  type PrReview,
 } from './publish.js';
 import { cmdPlan, cmdPublish, cmdResolve, cmdRun, passDir, readJournal, type Cli } from './propagate.js';
 import type { FeatureEntry } from './types.js';
@@ -327,6 +333,71 @@ describe('publish — decidedAlready (ERR05) + helpers', () => {
 });
 
 // --- cmdPublish: blocking battery end-to-end ---------------------------------
+
+describe('D-059 FINAL — review-loop primitives (hardened tag, review trigger, pagination)', () => {
+  it('the sweep-addressed tag is recognized ONLY as its own marker line — a quote-reply/inline embedding stays human', () => {
+    expect(extractSweepAddressed('<!-- sweep-addressed: 7 -->')).toBe(7);
+    expect(extractSweepAddressed('   <!-- sweep-addressed: 7 -->  ')).toBe(7); // whitespace-tolerant
+    expect(extractSweepAddressed('note above\n<!-- sweep-addressed: 7 -->')).toBe(7);
+    expect(extractSweepAddressed('> <!-- sweep-addressed: 7 -->')).toBeNull(); // quote-reply stays human
+    expect(extractSweepAddressed('inline <!-- sweep-addressed: 7 --> text')).toBeNull(); // embedded stays human
+    expect(extractSweepAddressed('<!-- sweep-addressed: 3 -->\n<!-- sweep-addressed: 9 -->')).toBe(9); // MAX
+    expect(stripSweepAddressed('reply text\n<!-- sweep-addressed: 3 -->')).toBe('reply text');
+    expect(stripSweepAddressed('<!-- sweep-addressed: 3 -->')).toBe(''); // marker-only -> empty (dropped from the dialog)
+
+    const { humans, driver, markerId } = classifyComments([
+      { id: 1, body: 'first publish note\n<!-- sweep-addressed: 3 -->', author: 'shared-pat', createdAt: '' },
+      { id: 2, body: 'looks wrong:\n> <!-- sweep-addressed: 9 -->\nplease fix', author: 'k-owner', createdAt: '' },
+      { id: 3, body: '<!-- sweep-addressed: 5 -->', author: 'shared-pat', createdAt: '' },
+    ]);
+    expect(driver.map((c) => c.id)).toEqual([1, 3]);
+    expect(humans.map((c) => c.id)).toEqual([2]); // the embedded 9 never counts as a marker
+    expect(markerId).toBe(5);
+  });
+
+  it('classifyReviewTrigger: reviews ONLY trigger, *[bot]* reviews ignored, the marker watermark bounds the reissue', () => {
+    const r = (id: number, state: string, author: string): PrReview => ({ id, state, body: '', author, submittedAt: '' });
+    expect(classifyReviewTrigger([], null).reissueDue).toBe(false); // no review, no trigger — ever
+    expect(classifyReviewTrigger([r(5, 'CHANGES_REQUESTED', 'lint[bot]')], null).reissueDue).toBe(false); // bots ignored
+    const t = classifyReviewTrigger([r(5, 'COMMENTED', 'k-owner'), r(9, 'APPROVED', 'k-owner')], null);
+    expect(t.reissueDue).toBe(true);
+    expect(t.latest!.id).toBe(9); // the NEWEST review carries the action state
+    expect(t.latest!.state).toBe('APPROVED');
+    expect(t.maxReviewId).toBe(9);
+    expect(classifyReviewTrigger([r(9, 'APPROVED', 'k-owner')], 9).reissueDue).toBe(false); // addressed
+    expect(classifyReviewTrigger([r(9, 'APPROVED', 'k-owner')], 4).reissueDue).toBe(true); // beyond the marker
+    expect(classifyReviewTrigger([r(9, 'PENDING', 'k-owner')], null).reissueDue).toBe(false); // unsubmitted never triggers
+  });
+
+  it('ghPaginated exhausts pages (oldest-first API — the newest item lives on the LAST page) and fails CLOSED', async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => ({ id: i + 1 }));
+    const page2 = [{ id: 999 }];
+    const paths: string[] = [];
+    const transport: GithubTransport = {
+      async request(_m, path) {
+        paths.push(path);
+        if (path.endsWith('&page=1')) return { status: 200, body: page1 };
+        if (path.endsWith('&page=2')) return { status: 200, body: page2 };
+        return { status: 500, body: null };
+      },
+    };
+    const items = (await ghPaginated(transport, '/repos/o/r/pulls/12/reviews')) as Array<{ id: number }>;
+    expect(items.length).toBe(101);
+    expect(items[items.length - 1].id).toBe(999); // the newest item WAS seen
+    expect(paths).toEqual([
+      '/repos/o/r/pulls/12/reviews?per_page=100&page=1',
+      '/repos/o/r/pulls/12/reviews?per_page=100&page=2',
+    ]);
+    // Fail-closed: a non-200 mid-pagination THROWS (never reads as "no items").
+    const flaky: GithubTransport = {
+      async request(_m, path) {
+        if (path.endsWith('&page=1')) return { status: 200, body: page1 };
+        return { status: 502, body: null };
+      },
+    };
+    await expect(ghPaginated(flaky, '/repos/o/r/pulls/12/reviews')).rejects.toThrow(/HTTP 502/);
+  });
+});
 
 describe('propagate publish — check battery (blocking ids reachable)', () => {
   it('ERR01: an unresolved case (or an unknown id) cannot publish', async () => {
