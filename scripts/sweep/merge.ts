@@ -34,6 +34,7 @@ import {
   revParse,
   worktreeBranches,
 } from './git.js';
+import { isBlocked } from './ledger.js';
 import type { Ledger } from './types.js';
 
 /**
@@ -86,7 +87,7 @@ export async function planMerges(repo: string, targets: MergeTarget[], ledger: L
     const bs = ledger.branches[t.branch];
     let action: MergePlanItem['action'];
     if (PROTECTED_BRANCH_RE.test(t.branch)) action = 'skip-protected';
-    else if (bs?.status === 'frozen' || bs?.status === 'excluded') action = 'skip-frozen';
+    else if (isBlocked(bs) || bs?.status === 'excluded') action = 'skip-frozen'; // blocked ⇔ merge_status != NONE (D-057)
     else if (t.upToDate) action = 'up-to-date';
     else if (t.mergeModel === 'upstream-chain' && !t.stopPoint) action = 'skip-no-stop-point';
     else action = 'merge';

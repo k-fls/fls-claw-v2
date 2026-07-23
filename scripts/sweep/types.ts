@@ -101,28 +101,53 @@ export interface SweepReport {
 }
 
 /**
+ * Per-branch merge status (D-057): exactly three states — PR_ID | DEFERRED |
+ * NONE. NONE is represented by an absent/null `merge_status` field; there is
+ * no other freeze flag anywhere. The single invariant:
+ *
+ *     blocked(X)  ⇔  merge_status(X) != NONE,   ALWAYS.
+ *
+ * NO height is stored: heights are LIVE per-pass values. A PR_ID branch's
+ * block height is re-derived from `headSha` against the pass's pinned chain;
+ * a DEFERRED branch's block height is re-derived by probing its own conflict
+ * live. PR_ID persists from the moment a branch is held until the branch is
+ * COMPLETELY resolved (the owner resolves the PR AND the merge has landed on
+ * the branch) — never cleared at any intermediate step. DEFERRED is sticky
+ * while any DIRECT parent has merge_status != NONE (recomputed from the
+ * parents each pass, never independently mutated) and clears only when ALL
+ * parents are NONE, at which point the branch re-merges fresh.
+ */
+export type MergeStatus =
+  | {
+      state: 'PR_ID';
+      /** The case that blocked the branch ('gate' for a §9 verify rollback hold). */
+      caseId: string;
+      /**
+       * The conflicting head sha at hold time (null for gate holds). Dual duty:
+       * the block height is re-derived from it against each pass's chain, and
+       * completion = the branch tip contains it (the owner's PR merge landed).
+       */
+      headSha: string | null;
+      /** Freeze-PR head branch on origin (urge comments target its PR). */
+      fixBranch: string | null;
+      /** Freeze-PR number on GitHub (urge posting + D-004 machine-block target). */
+      prNumber: number | null;
+    }
+  | { state: 'DEFERRED' };
+
+/**
  * Group-owned ledger branch override. Absence of an entry = active.
  * lastMergedUpstream is NOT stored — it is derived as
  * `git merge-base <branch> upstream/main` (see ledger.derivedLastMerged).
+ * Blockedness is `merge_status` ONLY (D-057) — the pre-D-057 independent
+ * freeze fields (status:'frozen', frozenBy, heldHead, heldPaths, fixBranch,
+ * pendingBehindFreeze) are retired; readLedger up-converts legacy files.
  */
 export interface LedgerBranch {
-  status: 'active' | 'frozen' | 'excluded';
-  frozenBy: string | null;
-  pendingBehindFreeze: number;
+  status: 'active' | 'excluded';
+  /** D-057 merge_status; absent/null = NONE (see MergeStatus). */
+  merge_status?: MergeStatus | null;
   notes: string;
-  /** Conflicting head sha at freeze time (propagation §8 — derived-unfreeze target). */
-  heldHead?: string | null;
-  /**
-   * Conflicted paths at freeze time (§5/N3): with `heldHead` they let a LATER
-   * pass rebuild the HELD registry for DEFERRED matching (the height is
-   * re-derived from `heldHead` against that pass's chain — heights are
-   * pass-relative and never carried numerically). Absent for gate holds.
-   */
-  heldPaths?: string[] | null;
-  /** Freeze-PR branch (urge comments target its PR, cross-pass). */
-  fixBranch?: string | null;
-  /** Freeze-PR number on GitHub (urge posting + D-004 machine-block target, D-049). */
-  prNumber?: number | null;
   /** Newest pending head the owner was last urged about (one POSTED urge per new head). */
   lastUrgedHead?: string | null;
 }
@@ -349,8 +374,11 @@ export interface ParentPlan {
   verdict: ParentVerdict;
   /** Reported conflict above the merge point (the smallest conflicting height). */
   case: ConflictCase | null;
-  /** DEFERRED: the transitive-ancestor branch whose HELD this conflict belongs to (§5). */
+  /** DEFERRED: the lowest blocked DIRECT parent this conflict defers behind (D-057). */
   deferredTo: string | null;
+  /** DEFERRED: the height of X's own conflict (the run TOP) — the block-height this
+   * branch contributes to its children's height-MIN when it is itself deferred (D-057). */
+  deferHeight?: number;
   /** No-op reason when verdict is skip. */
   skipReason: string | null;
   /** Forced (empty) merge to honour the leaf/always_merge rule (§6). */
@@ -467,6 +495,13 @@ export interface ColdReadVerdict {
   answers?: Partial<Record<'q1' | 'q2' | 'q3', string>>;
   /** Non-empty reviewer notes (validated at resolve). */
   notes: string;
+  /**
+   * Short (1-2 line) reviewer feedback for the RESOLVING AGENT (D-057): why
+   * the rejection / what is off. Surfaced to the agent on a reject so it can
+   * act, and reused as the PR-description prefix on a HELD escalation
+   * (scope-exceeded / rejected-2x / cap). Bounded — the driver caps it.
+   */
+  feedback?: string;
   /**
    * Freshness binding (§7, tightened 2026-07-20): the tree OID of the
    * resolution the verdict attests to. Must equal `treeOf(--resolved-ref)` at

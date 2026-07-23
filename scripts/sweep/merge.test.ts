@@ -68,9 +68,14 @@ function parentTarget(branch: string, parents: string[]) {
 }
 
 describe('planMerges', () => {
-  it('classifies protected / frozen / up-to-date / clean / conflicting targets', async () => {
+  it('classifies protected / blocked (merge_status PR_ID) / up-to-date / clean / conflicting targets', async () => {
+    // blocked ⇔ merge_status != NONE (D-057) — no independent freeze flag.
     const ledger = ledgerWith({
-      'feat/gated': { status: 'frozen', frozenBy: 'PR #7', pendingBehindFreeze: 1, notes: '' },
+      'feat/gated': {
+        status: 'active',
+        merge_status: { state: 'PR_ID', caseId: 'PR #7', headSha: null, fixBranch: null, prNumber: 7 },
+        notes: '',
+      },
     });
     const plan = await planMerges(
       repo.dir,

@@ -7,6 +7,19 @@ heads, verify, push) become the driver's implementation, wrapped by this machine
 MERGE-POLICY.md still governs tiers/merge/publication semantics; this file governs the
 command surface and who-does-what.
 
+D-057 amendment (2026-07-23): HELD publish is now UNIFIED on one key — does a
+MARKER-CLEAN resolution exist? Marker-clean (the agent actually resolved) → an
+ACTIVE (non-draft) PR at the resolved merge commit that the OWNER reviews & merges
+(the driver NEVER auto-merges a HELD PR — auto-merge stays JUDGED); unresolved
+(markers remain / no valid resolution) → a DRAFT PR built from the PRISTINE conflict
+(clean-prefix commit + the original upstream-vs-ours conflict, ZERO agent edits).
+Scope-exceeded-but-cold-read-agreed and twice-cold-read-rejected escalate to a
+flagged HELD PR (`[AUTO-ESCALATED: …]` prefix + reviewer feedback). The old
+draft-only HELD model and the demote-on-scope-before-cold-read step are RETIRED.
+Blockedness is the `merge_status ∈ {PR_ID | DEFERRED | NONE}` block model (invariant
+`blocked ⇔ merge_status != NONE`), replacing the independent freeze fields. See
+MERGE-POLICY.md §1 for the full semantics.
+
 ## 1. Principle
 
 - The DRIVER is a resumable state machine owning ALL state (pinned watermark, current
@@ -48,7 +61,8 @@ command surface and who-does-what.
 
 ### `sweep next-case`
 - Deterministic, internal, no `claude -p`: fetch, scan, plan (DAG/breadth-wise order),
-  execute CLEAN merges + no-op skips + DEFERRED freezes, advance to the next conflict.
+  execute CLEAN merges + no-op skips + DEFERRED holds (the `merge_status` block
+  model, MERGE-POLICY §1), advance to the next conflict.
 - Handles the barrier/reopen internally (resolve reopens descendants; next-case just
   serves the next ready case). The agent never sees the DAG.
 - Prepares the conflict worktree for that case.
@@ -60,18 +74,25 @@ command surface and who-does-what.
 ### `report-case --tier mechanical|judged|held`
 - `--tier` is the ONLY agent param — a CLAIM; the driver is demote-only.
 - Driver, blocking, internal (deterministic first): snapshot the worktree tree →
-  uncommitted/empty check → scope guard (resolution diff ⊆ conflicted paths, else
-  demote per MERGE-POLICY) → branch-scoped tests (cheap; NOT the full rebuild) →
+  uncommitted/empty check → scope guard (resolution diff ⊆ conflicted paths; a
+  violation no longer demotes to HELD here — `scopeExceeded` is CARRIED forward to
+  the cold read, D-057) → branch-scoped tests (cheap; NOT the full rebuild) →
   ERR05 recorded-decision / adequacy → per-case attempt cap (force-HELD beyond N,
   D-052).
 - COLD READ placement — fires once per case, where all reviewable content exists:
   - `mechanical` (no description ever): cold read (`claude -p`) HERE, over the
-    resolution diff → pass → merge in place → `merged, take next case`.
+    resolution diff. Confirm → merge in place → `merged, take next case`. Confirm
+    but scope-exceeded → HELD publishing the resolution as an ACTIVE PR (owner
+    reviews & merges; escalation prefix + reviewer feedback, D-057). Reject → the
+    reviewer's short feedback is returned for a revise-and-retry (1st strike, no
+    freeze); the 2nd reject stops retrying and escalates to HELD (D-057).
   - `judged` / `held`: NO cold read here (deferred to `report-pr`, §report-pr).
     On deterministic pass → `provide PR description`.
 - Return instructions (examples, authoritative): `merged, take next case` /
   `provide PR description` / `can't report judged with conflicts present, use held` /
-  `uncommitted` / `tests failed: <details path>` / `scope violation -> held`.
+  `uncommitted` / `tests failed: <details path>` / `cold read rejected — revise the
+  resolution and re-run` (1st strike) / `held` (scope-exceeded, or the 2nd cold-read
+  reject, D-057).
 - Pure function of (current case, worktree tree). Re-callable; no accumulating loop
   state beyond the journaled attempt cap.
 
@@ -79,16 +100,34 @@ command surface and who-does-what.
 - Reads the agent's free-text PR description from the fixed path.
 - SINGLE cold read (`claude -p`) over the resolution diff AND the description together
   (one call covers both code and prose): judges resolution soundness AND whether the
-  description misrepresents the code. Reject / UNVERIFIABLE-FROM-REQUEST → HELD
-  (fail-closed). This is the kept kind-1 read with the description in view — NOT the
-  retired standalone prose gate (D-050); adequacy (ERR05 / duplicate) stays mechanical.
-- Description-only defects → `rewrite: <reason>` (agent rewrites, re-calls).
+  description misrepresents the code. This is the kept kind-1 read with the
+  description in view — NOT the retired standalone prose gate (D-050); adequacy
+  (ERR05 / duplicate) stays mechanical.
+- Verdict handling (D-057):
+  - Description-only defect on a sound resolution → `rewrite: <reason>` (agent
+    rewrites, re-calls) — NOT a freeze.
+  - Resolution rejection (incl. UNVERIFIABLE-FROM-REQUEST, which fails closed) is
+    COUNTED per case. On a `judged` claim the 1st reject returns the reviewer's
+    feedback for a revise-and-retry (re-snapshots the worktree, no freeze); the 2nd
+    reject stops retrying and escalates to HELD. On a `held` claim a reject keeps the
+    case frozen-and-unpublished and returns `rewrite` until the description is
+    accurate.
+  - Confirm on a `judged` claim but scope-exceeded → HELD publishing the resolution
+    as an ACTIVE PR (owner reviews & merges; escalation prefix + reviewer feedback).
 - On pass, by tier:
-  - `held`: PUBLISH THE DRAFT PR NOW (push the `fix/sweep` branch at the case head,
-    open the draft). Reason: a HELD PR lands nothing on a target branch — it is a
-    frozen-conflict exhibit for owner review, no auto-merge, no verify dependency — so
-    there is no reason to postpone, and the owner should see it the moment the case is
-    frozen (D-047: a prepared-but-unpublished PR is useless).
+  - `held`: PUBLISH THE HELD PR NOW via the UNIFIED publish (D-057) — push the
+    `fix/sweep` branch and open the PR. Active-vs-draft is decided by whether a
+    MARKER-CLEAN resolution exists: marker-clean (the agent actually resolved) → an
+    ACTIVE (non-draft) PR at the RESOLVED merge commit, which the OWNER reviews &
+    MERGES (the driver NEVER auto-merges a HELD PR — auto-merge stays JUDGED);
+    markers remain / no valid resolution → a DRAFT PR built from the PRISTINE
+    conflict (clean-prefix commit + the original upstream-vs-ours conflict, ZERO
+    agent edits, so the owner resolves fresh rather than the agent's mangled try).
+    Escalated holds (scope-exceeded / cold-read-rejected-2x / non-convergence cap)
+    prepend an `[AUTO-ESCALATED: …]` prefix + the reviewer feedback to the
+    description. Reason: the driver auto-merges nothing here, so publishing it lands
+    nothing on a target branch by itself, and the owner should see the held case the
+    moment it is frozen (D-047: a prepared-but-unpublished PR is useless).
   - `judged`: RECORD PR INTENT ONLY; the PR is created and closed at `finish` (§finish).
     Reason: a JUDGED PR is history that AUTO-MERGES when its merge commit is pushed to
     the target branch — that push must clear the full-integration verify (below), so it
@@ -108,7 +147,7 @@ command surface and who-does-what.
   2. push target branches (CLEAN / MECHANICAL / prefix merges).
   3. push JUDGED closures (same merge commit → PR auto-flips merged); create the JUDGED
      history PRs.
-  4. (HELD drafts are already published from `report-pr`.)
+  4. (HELD PRs — active or draft, D-057 — are already published from `report-pr`.)
   5. post urge comments (D-004 pending-count) on frozen branches with new pending heads.
   6. journal-derived owner report (which PRs need the owner, or the done-line).
   7. check upstream advanced past the pinned watermark → `start again` or `done`.
@@ -117,9 +156,10 @@ command surface and who-does-what.
 
 ## 3. Publish-timing rule (the reasoning, one line)
 
-Postpone iff the action LANDS CODE ON A TARGET BRANCH (needs the full-integration
-verify): CLEAN / MECHANICAL / JUDGED-closure → `finish`. HELD draft PRs land nothing →
-publish at `report-pr`.
+Postpone iff the DRIVER's action LANDS CODE ON A TARGET BRANCH (needs the
+full-integration verify): CLEAN / MECHANICAL / JUDGED-closure → `finish`. A HELD PR
+(active or draft, D-057) is published at `report-pr`: the driver never auto-merges a
+HELD PR, so publishing it lands nothing on a target branch by itself.
 
 ## 4. Division of labor
 
@@ -130,7 +170,8 @@ publish at `report-pr`.
 - DRIVER code (deterministic): fetch / scan / plan / merge / DAG / candidate inheritance
   (git ancestry + merge-base + reachability) / verify / push / PR create+close / git /
   state / journal.
-- OWNER (escalation via report, never inline chat): HELD PR review; ambiguous candidate
+- OWNER (escalation via report, never inline chat): HELD PR review (active PRs the
+  owner merges; draft pristine-conflict PRs the owner resolves); ambiguous candidate
   inheritance; overlap/PoI awareness; genuine failures (ERR15, etc.).
 
 ## 5. Properties
@@ -139,6 +180,7 @@ publish at `report-pr`.
 - Zero agent identifying params → the misdirection bug classes are structurally gone.
 - Scope guard preserved and strengthened (the agent cannot point the driver at the
   wrong case).
-- Owner surface = HELD PRs + the one journal-derived report; JUDGED PRs are history.
+- Owner surface = HELD PRs (active or draft) + the one journal-derived report; JUDGED
+  PRs are history.
 - The agent doctrine collapses to: call these five commands in order; do what each
   returns.

@@ -15,7 +15,7 @@ import { dirname, join } from 'node:path';
 
 import { LOG_FILENAME, REPORTS_DIRNAME } from './config.js';
 import { git } from './git.js';
-import type { Ledger, LedgerBranch } from './types.js';
+import type { Ledger, LedgerBranch, MergeStatus } from './types.js';
 
 export function emptyLedger(): Ledger {
   return { schemaVersion: 1, lastSweep: null, branches: {}, openPois: [] };
@@ -24,20 +24,57 @@ export function emptyLedger(): Ledger {
 export function defaultLedgerBranch(): LedgerBranch {
   return {
     status: 'active',
-    frozenBy: null,
-    pendingBehindFreeze: 0,
+    merge_status: null,
     notes: '',
-    heldHead: null,
-    heldPaths: null,
-    fixBranch: null,
     lastUrgedHead: null,
   };
+}
+
+/** blocked(X) ⇔ merge_status(X) != NONE (D-057) — the ONLY blocked predicate. */
+export function isBlocked(b: LedgerBranch | undefined): boolean {
+  return (b?.merge_status ?? null) !== null;
+}
+
+/**
+ * Pre-D-057 ledger branch shape (independent freeze flags), up-converted on
+ * read so an existing on-disk ledger keeps its blocked branches blocked:
+ * status:'frozen' → merge_status PR_ID carrying the old caseId/head/PR fields.
+ */
+interface LegacyLedgerBranch {
+  status?: string;
+  frozenBy?: string | null;
+  heldHead?: string | null;
+  heldPaths?: string[] | null;
+  fixBranch?: string | null;
+  prNumber?: number | null;
+  pendingBehindFreeze?: number;
+}
+
+function upconvertLegacyBranch(raw: LedgerBranch & LegacyLedgerBranch): LedgerBranch {
+  const { frozenBy, heldHead, heldPaths, fixBranch, prNumber, pendingBehindFreeze, ...rest } = raw;
+  void heldPaths; // retired: DEFER is pure height-MIN (D-057) — paths are never matched
+  void pendingBehindFreeze; // retired: pending counts are derived live per pass
+  let merge_status: MergeStatus | null = rest.merge_status ?? null;
+  if (!merge_status && raw.status === 'frozen') {
+    merge_status = {
+      state: 'PR_ID',
+      caseId: frozenBy ?? 'legacy-freeze',
+      headSha: heldHead ?? null,
+      fixBranch: fixBranch ?? null,
+      prNumber: prNumber ?? null,
+    };
+  }
+  const status: LedgerBranch['status'] = raw.status === 'excluded' ? 'excluded' : 'active';
+  return { ...rest, status, merge_status };
 }
 
 export function readLedger(path: string): Ledger {
   if (!existsSync(path)) return emptyLedger();
   const parsed = JSON.parse(readFileSync(path, 'utf8')) as Ledger;
   if (parsed.schemaVersion !== 1) throw new Error(`ledger schemaVersion ${parsed.schemaVersion} unsupported`);
+  for (const [name, b] of Object.entries(parsed.branches ?? {})) {
+    parsed.branches[name] = upconvertLegacyBranch(b as LedgerBranch & LegacyLedgerBranch);
+  }
   return parsed;
 }
 

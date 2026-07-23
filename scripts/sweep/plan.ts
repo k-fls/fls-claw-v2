@@ -12,7 +12,7 @@
  * for own conflicts, run the DEFERRED check (deferred.ts).
  */
 import { DEFAULT_STACK_CAP, EXCLUDED_BRANCH_GLOBS } from './config.js';
-import { checkDeferred } from './deferred.js';
+import { checkDeferred, type BlockedParent } from './deferred.js';
 import { globMatchAny } from './globs.js';
 import { buildEligibleLine, mergePointSweep } from './interval.js';
 import { deriveCoverage, enumerateChain, type Chain } from './heights.js';
@@ -56,8 +56,22 @@ export function allParentsSkipped(plan: BranchPlan): boolean {
  * Cheapest parent chain from `branch` up to an entry-point branch (§6): BFS over
  * child->parents, shortest hop count. Returns [branch, ..., entry] or [] when no
  * entry is reachable.
+ *
+ * `blocked` (D-057): branches with merge_status != NONE (PR_ID | DEFERRED).
+ * The un-skip chain must NEVER merge into or through a blocked branch — a
+ * PR_ID branch is waiting on its own owner PR and a DEFERRED branch takes
+ * NOTHING while sticky, so a forced merge on such a hop would push content
+ * past the block. Blocked branches are excluded from the search entirely
+ * (as intermediates AND as the entry terminal — a blocked entry's tip carries
+ * no pass progress to pull); when no unblocked chain exists the un-skip is
+ * aborted ([] — the leaf simply stays skipped this pass).
  */
-export function shortestUnskipChain(branch: string, edges: Record<string, string[]>, entrySet: Set<string>): string[] {
+export function shortestUnskipChain(
+  branch: string,
+  edges: Record<string, string[]>,
+  entrySet: Set<string>,
+  blocked: Set<string> = new Set(),
+): string[] {
   if (entrySet.has(branch)) return [branch];
   const queue: string[][] = [[branch]];
   const seen = new Set<string>([branch]);
@@ -65,7 +79,7 @@ export function shortestUnskipChain(branch: string, edges: Record<string, string
     const path = queue.shift()!;
     const tail = path[path.length - 1];
     for (const parent of edges[tail] ?? []) {
-      if (seen.has(parent)) continue;
+      if (seen.has(parent) || blocked.has(parent)) continue;
       const next = [...path, parent];
       if (entrySet.has(parent)) return next;
       seen.add(parent);
@@ -82,10 +96,20 @@ export interface DerivePlanOptions {
   base: string;
   features: FeatureEntry[];
   scope: SweepScope;
-  /** HELD registry from the pass journal (empty on the first plan). */
+  /**
+   * PR_ID-blocked branches with their LIVE-derived block heights (this-pass
+   * holds + cross-pass PR_ID entries whose height was re-derived from the
+   * stored head sha, D-057). Seeds blockHeightOf; also the annotate input.
+   */
   held?: HeldRecord[];
-  /** Branches frozen in the group ledger (cross-pass) — arrive with empty intervals (§8). */
-  frozen?: Set<string>;
+  /**
+   * Per-branch merge_status view (D-057): PR_ID | DEFERRED; absence = NONE.
+   * PR_ID branches arrive with empty intervals (blocked on their own PR).
+   * DEFERRED branches are sticky while a DIRECT parent is blocked (no merges,
+   * block height re-probed live for their children) and derive NORMALLY when
+   * every parent is NONE (the "re-merge fresh" view — `run` commits the clear).
+   */
+  mergeStatusOf?: Map<string, 'PR_ID' | 'DEFERRED'>;
   /** Global case-stacking cap (routing.yaml `stack_cap`, D-049 §2); per-feature `stack_cap` overrides. */
   stackCap?: number;
 }
@@ -101,6 +125,7 @@ async function analyzeParent(
   chain: Chain,
   ancestors: string[],
   held: HeldRecord[],
+  blockedParents: BlockedParent[],
   stackCap: number,
 ): Promise<ParentPlan> {
   const line = await buildEligibleLine({ repo, branch, branchTip, parent, parentRef, model, chain });
@@ -132,13 +157,13 @@ async function analyzeParent(
 
   if (sweep.firstConflict) {
     const fc = sweep.firstConflict;
-    // Window floor = largest clean height below the conflict (merge point when
-    // one exists, else the branch's coverage on this eligible line) — §5. The
-    // window's upper bound is the case run's TOP height (D-049 §2).
-    const floor = sweep.mergePoint?.height ?? line.coverage;
-    const decision = checkDeferred(fc.head.height, floor, fc.conflictedPaths, ancestors, held);
+    // DEFERRED = pure height-MIN over X's blocked DIRECT parents (D-057): defer
+    // iff any direct parent is blocked and this conflict is at/above the lowest
+    // blocked parent's height. No path/window/ancestor-set test.
+    const decision = checkDeferred(fc.head.height, blockedParents);
     if (decision.deferred) {
-      pp.deferredTo = decision.ancestor!.branch;
+      pp.deferredTo = decision.blockedBy;
+      pp.deferHeight = fc.head.height;
     } else {
       pp.case = {
         head: fc.head,
@@ -180,10 +205,22 @@ export interface DeriveBranchArgs {
   isLeaf: boolean;
   alwaysMerge: boolean;
   held: HeldRecord[];
+  /** Block-height of each currently-blocked branch (merge_status != NONE), for the
+   * D-057 height-MIN DEFER over this branch's blocked DIRECT parents. */
+  blockHeightOf?: Map<string, number>;
   /** Effective case-stacking cap (D-049 §2 lever); DEFAULT_STACK_CAP when omitted. */
   stackCap?: number;
-  /** When true the branch is ledger-frozen: arrives with an empty interval (§8). */
-  frozen?: boolean;
+  /**
+   * This branch's own merge_status when blocked (D-057; omitted = NONE):
+   *  - `{state:'PR_ID'}`: blocked on its own PR — empty interval, skip rows.
+   *  - `{state:'DEFERRED', behind}`: sticky-deferred (a DIRECT parent is still
+   *    blocked). Parents are PROBED normally so the branch's own conflict
+   *    height is re-derived live (its children's height-MIN input), but every
+   *    would-be merge is suppressed to a skip and every own conflict is forced
+   *    to a defer — set-time BECOME never re-runs while sticky. `behind` names
+   *    a blocked direct parent (the defer pointer fallback).
+   */
+  mergeBlocked?: { state: 'PR_ID' } | { state: 'DEFERRED'; behind: string };
   /**
    * D-045 (§13): the branch is remote-only — read its tip from origin/<branch>
    * and flag the plan row `materialize`. `run --execute` creates the local ref
@@ -212,12 +249,21 @@ export interface DeriveBranchArgs {
  * (§3 execution re-probe).
  */
 export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> {
-  const { repo, branch, kind, model, parents, chain, ancestors, tierFloor, isLeaf, alwaysMerge, held, frozen } = args;
+  const { repo, branch, kind, model, parents, chain, ancestors, tierFloor, isLeaf, alwaysMerge, held } = args;
+  const mergeBlocked = args.mergeBlocked ?? null;
+  // D-057: X's blocked DIRECT parents (with their block-heights) — the input to
+  // the height-MIN DEFER rule. Restricted to DIRECT parents (never transitive):
+  // a clean intermediate parent (absent here) stops propagation until it re-merges.
+  const blockHeightOf = args.blockHeightOf ?? new Map<string, number>();
+  const blockedParents: BlockedParent[] = parents
+    .filter((p) => blockHeightOf.has(p))
+    .map((p) => ({ branch: p, height: blockHeightOf.get(p)! }));
   const refOf = args.refOf ?? ((b: string) => b);
   const materialize = args.materialize === true;
   const stackCap = args.stackCap ?? DEFAULT_STACK_CAP;
-  // Ledger-frozen: no merges this pass (barrier satisfied by an empty interval).
-  if (frozen) {
+  // merge_status PR_ID (D-057): blocked on its own PR — no merges this pass
+  // (barrier satisfied by an empty interval).
+  if (mergeBlocked?.state === 'PR_ID') {
     const parentPlans: ParentPlan[] = parents.map((parent) => ({
       parent,
       model,
@@ -225,7 +271,7 @@ export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> 
       verdict: 'skip',
       case: null,
       deferredTo: null,
-      skipReason: 'frozen',
+      skipReason: 'held',
     }));
     return {
       branch,
@@ -256,9 +302,30 @@ export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> 
         chain,
         ancestors,
         held,
+        blockedParents,
         stackCap,
       ),
     );
+  }
+  // merge_status DEFERRED, sticky (D-057): a DIRECT parent is still blocked, so
+  // the branch takes NOTHING this pass — it waits until ALL parents are NONE,
+  // then re-merges fresh. The probes above still ran so the branch's own
+  // conflict height is LIVE (its children's height-MIN input); here every
+  // would-be merge is suppressed and every own conflict forced to a defer
+  // (STAY is independent of height — BECOME's height-MIN is set-time only).
+  if (mergeBlocked?.state === 'DEFERRED') {
+    for (const pp of parentPlans) {
+      if (pp.case) {
+        pp.deferredTo = pp.deferredTo ?? mergeBlocked.behind;
+        pp.deferHeight = pp.deferHeight ?? pp.case.head.height;
+        pp.case = null;
+      }
+      if (pp.verdict === 'merge' || pp.verdict === 'case') {
+        pp.verdict = pp.deferredTo ? 'defer' : 'skip';
+        pp.mergePoint = null; // the suppressed clean prefix does NOT land while sticky
+        if (!pp.deferredTo) pp.skipReason = 'deferred';
+      }
+    }
   }
   return {
     branch,
@@ -307,7 +374,7 @@ export function validateInventoryInheritance(
 export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPlan> {
   const { repo, upstreamRef, base, features, scope } = opts;
   const held = opts.held ?? [];
-  const frozen = opts.frozen ?? new Set<string>();
+  const mergeStatusOf = opts.mergeStatusOf ?? new Map<string, 'PR_ID' | 'DEFERRED'>();
 
   const chain = await enumerateChain(repo, upstreamRef, base);
   const watermark = chain.watermark;
@@ -336,10 +403,43 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
   const branches: BranchPlan[] = [];
   const byBranch = new Map<string, BranchPlan>();
 
+  // D-057 block-height map: every currently-blocked branch (merge_status != NONE)
+  // with the height it is blocked at, for the height-MIN DEFER rule. Seeded from
+  // the HELD registry (PR_ID branches, this-pass + cross-pass; height re-derived
+  // in `held`) and GROWN in DAG order — a branch DEFERRED this pass (or sticky
+  // from a prior pass) becomes a blocked parent for its own children. Heights
+  // are live per-pass values, never read from merge_status.
+  const blockHeightOf = new Map<string, number>();
+  for (const rec of held) blockHeightOf.set(rec.branch, rec.height);
+  // The LIVE blocked set (merge_status != NONE) as of this point in DAG order:
+  // PR_ID branches (ledger + held registry) up front; DEFERRED branches join as
+  // they are sticky-confirmed; freshly-deferring branches join as derived.
+  const blockedNow = new Set<string>([
+    ...held.map((r) => r.branch),
+    ...[...mergeStatusOf.entries()].filter(([, s]) => s === 'PR_ID').map(([b]) => b),
+  ]);
+
   for (const entry of ordered) {
     const model: 'entry' | 'parents' = entry.mergeModel === 'upstream-chain' ? 'entry' : 'parents';
     const parents = model === 'entry' ? ['main'] : entry.parents;
     const feat = featureByBranch.get(entry.branch) as (FeatureEntry & { always_merge?: boolean }) | undefined;
+    // This branch's own merge_status view (D-057): PR_ID → empty interval;
+    // DEFERRED → sticky iff a DIRECT parent is still blocked (STAY rule —
+    // recomputed from the parents, never trusted as an independent flag);
+    // with every parent NONE it derives NORMALLY (the "re-merge fresh" view;
+    // `run` commits the actual clear).
+    let mergeBlocked: DeriveBranchArgs['mergeBlocked'];
+    if (mergeStatusOf.get(entry.branch) === 'PR_ID') {
+      mergeBlocked = { state: 'PR_ID' };
+    } else if (mergeStatusOf.get(entry.branch) === 'DEFERRED') {
+      const blockedParents = parents.filter((p) => blockedNow.has(p));
+      if (blockedParents.length > 0) {
+        const behind = blockedParents.reduce((lo, p) =>
+          (blockHeightOf.get(p) ?? Infinity) < (blockHeightOf.get(lo) ?? Infinity) ? p : lo,
+        );
+        mergeBlocked = { state: 'DEFERRED', behind };
+      }
+    }
     const bp = await deriveBranch({
       repo,
       branch: entry.branch,
@@ -352,14 +452,23 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
       isLeaf: model === 'parents' && leaves.has(entry.branch),
       alwaysMerge: feat?.always_merge === true,
       held,
+      blockHeightOf,
       // D-049 §2 lever: per-feature `stack_cap` beats the routing.yaml global.
       stackCap: feat?.stack_cap ?? opts.stackCap ?? DEFAULT_STACK_CAP,
-      frozen: frozen.has(entry.branch),
+      mergeBlocked,
       materialize: entry.materialize === true,
       refOf,
     });
     branches.push(bp);
     byBranch.set(bp.branch, bp);
+    if (mergeBlocked) blockedNow.add(bp.branch); // PR_ID or sticky-DEFERRED stays blocked
+    // A branch DEFERRED this pass (fresh or sticky) is itself blocked: record its
+    // lowest own-conflict height so its children defer behind it (D-057).
+    const deferHeights = bp.parents.filter((pp) => pp.verdict === 'defer' && pp.deferHeight !== undefined).map((pp) => pp.deferHeight!);
+    if (deferHeights.length) {
+      blockedNow.add(bp.branch);
+      if (!blockHeightOf.has(bp.branch)) blockHeightOf.set(bp.branch, Math.min(...deferHeights));
+    }
   }
 
   // Leaf / always_merge un-skip (§6): a leaf whose every parent no-op'd, in a
@@ -368,11 +477,23 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
   // parents" uniform. NO merge-main-directly exception.
   if (passHasProgress) {
     for (const bp of branches) {
-      if (frozen.has(bp.branch)) continue; // frozen leaves stay frozen
+      if (blockedNow.has(bp.branch)) continue; // blocked leaves stay blocked (merge_status != NONE)
       if (!(bp.isLeaf || bp.alwaysMerge)) continue;
       if (!allParentsSkipped(bp)) continue;
-      const uchain = shortestUnskipChain(bp.branch, scopeResult.edges, entrySet);
-      if (uchain.length < 2) continue; // no entry reachable
+      // D-057: the chain must not merge into/through a blocked hop — blocked
+      // branches are excluded from the search (no unblocked chain = no un-skip).
+      const uchain = shortestUnskipChain(bp.branch, scopeResult.edges, entrySet, blockedNow);
+      if (uchain.length < 2) {
+        // An entry IS reachable, but only through blocked hops: the un-skip is
+        // ABORTED. Mark the rows so the step verifier's leaf rule knows this
+        // all-skip is sanctioned (mirrors cmdRun's live derivation).
+        if (shortestUnskipChain(bp.branch, scopeResult.edges, entrySet).length >= 2) {
+          for (const pp of bp.parents) {
+            if (pp.verdict === 'skip' || pp.verdict === 'up-to-date') pp.skipReason = 'unskip-blocked';
+          }
+        }
+        continue; // no (unblocked) entry reachable
+      }
       bp.unskipChain = uchain;
       // Force a merge on each (child <- next parent) hop of the chain.
       for (let i = 0; i < uchain.length - 1; i++) {

@@ -34,7 +34,6 @@ import { checkDeferred } from './deferred.js';
 import { isAncestor, newStyleMergeTree } from './git.js';
 import { deriveCoverage, type Chain } from './heights.js';
 import { mergePointSweep, type EligibleLine } from './interval.js';
-import type { HeldRecord } from './types.js';
 
 const DIR = join(dirname(fileURLToPath(import.meta.url)), 'test-cases', 'propagation');
 const REPO = (() => {
@@ -242,14 +241,11 @@ describe.skipIf(!AVAILABLE)('propagation real-DAG cases (mined 2026-07-18)', () 
     expect(childProbe.clean).toBe(false);
     expect(childProbe.conflictFiles).toEqual(c.child.conflicted_paths);
 
-    // The parent is HELD at height 1 on S_P; the child conflicts at N'=1 with
-    // floor 0 (coverage 0). Window (0, 1] contains 1 -> DEFERRED (intersecting).
-    const held: HeldRecord[] = [
-      { branch: c.parent.branch, height: 1, conflictedPaths: c.parent.conflicted_paths, caseId: 'p2' },
-    ];
-    const d = checkDeferred(1, 0, childProbe.conflictFiles, [c.parent.branch], held);
+    // The DIRECT parent is HELD (blocked) at height 1; the child conflicts at
+    // height 1 -> MIN(1) <= 1 -> DEFERRED (paths no longer matter, D-057).
+    const d = checkDeferred(1, [{ branch: c.parent.branch, height: 1 }]);
     expect(d.deferred).toBe(true);
-    expect(d.ancestor?.branch).toBe(c.parent.branch);
+    expect(d.blockedBy).toBe(c.parent.branch);
   });
 
   // p3 — same-commit DISJOINT (§5 negative). NOT-FOUND as an ancestor pair;
@@ -265,13 +261,13 @@ describe.skipIf(!AVAILABLE)('propagation real-DAG cases (mined 2026-07-18)', () 
     // Disjoint from the module family's {src/cli/resources/groups.ts}.
     expect(probe.conflictFiles).not.toContain('src/cli/resources/groups.ts');
 
-    // Synthesize the ancestor HELD state (host-rpc @ h1 on groups.ts); the
-    // telegram probe shares the height but has DISJOINT paths -> NOT deferred.
-    const held: HeldRecord[] = [
-      { branch: 'module/host-rpc', height: 1, conflictedPaths: ['src/cli/resources/groups.ts'], caseId: 'p3' },
-    ];
-    const d = checkDeferred(1, 0, probe.conflictFiles, ['module/host-rpc'], held);
+    // module/host-rpc is a SIBLING, not a DIRECT parent of the telegram branch,
+    // so under the direct-parent rule (D-057) it contributes NO blocked parent —
+    // NOT deferred (telegram's own independent conflict). It is parent-ness, not
+    // path disjointness, that prevents the defer now.
+    const d = checkDeferred(1, []);
     expect(d.deferred).toBe(false);
+    expect(d.blockedBy).toBeNull();
   });
 
   // p4 — multi-parent, differing parent coverage (§2/§4, class 4). VERIFIED.

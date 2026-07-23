@@ -5,9 +5,11 @@
  *
  * Born from the 2026-07-21 forensic reviews of the freeze PRs, corrected the
  * same day by D-049 (MERGE-POLICY.md):
- *  - PR heads are REAL commits pushed by the driver via `git push` (D-049 §5):
- *    HELD = the case run's TOP commit verbatim (D-030 head), published AFTER
- *    the pass's target pushes so the base is current and the diff = the run;
+ *  - PR heads are REAL commits pushed by the driver via `git push` (D-049 §5;
+ *    unified per D-057): HELD with a marker-clean resolution = the resolved
+ *    merge commit (ACTIVE PR — the owner reviews & merges); HELD without one
+ *    = the pristine-conflict head (clean-prefix commit + the automerge tree
+ *    with its markers, DRAFT PR — no agent edits, the owner resolves fresh);
  *    JUDGED = the real merge commit, published BEFORE the target push so the
  *    push auto-flips the PR to merged (D-040). The 2026-07-21 synthetic
  *    exhibit-head mechanism (and its ERR03/ERR04 asserts) is RETIRED — the

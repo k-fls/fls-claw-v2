@@ -15,7 +15,8 @@
  *   report-case --tier T          T ∈ mechanical|judged|held (the ONLY agent param); deterministic checks
  *                                 then the cold read (mechanical: here → merge; judged/held: deferred)
  *   report-pr                     judged/held only; single cold read over the resolution diff AND the
- *                                 PR description (pr/title.txt + pr/body.md); held publishes the draft now,
+ *                                 PR description (pr/title.txt + pr/body.md); held publishes its PR now
+ *                                 (active for a marker-clean resolution, draft for the pristine conflict),
  *                                 judged records intent (created at finish)
  *   finish                        verify → JUDGED PRs → push targets → urges → owner report → start-again/done
  *   abort                         discard the open pass cleanly (rolls mutated branches back to pre-ref)

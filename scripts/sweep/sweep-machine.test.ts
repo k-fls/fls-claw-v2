@@ -112,6 +112,7 @@ const confirm: ColdReadInvoker = async () => ({
 const rejectCode: ColdReadInvoker = async () => ({
   verdict: 'reject',
   notes: 'silently drops the fork behaviour',
+  feedback: 'restore the fork-side guard before re-reporting',
   defect: 'code',
 });
 const rejectDesc: ColdReadInvoker = async () => ({
@@ -296,7 +297,7 @@ describe('sweep report-case (D-053 §2)', () => {
     expect(existsSync(join(dir, caseId, 'pr', 'materials.md'))).toBe(true);
   });
 
-  it('scope-guard violation -> HELD, frozen, no merge', async () => {
+  it('scope exceeded + cold read AGREES -> HELD publishing the RESOLUTION (escalated, no merge) — D-057 #3', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
@@ -315,10 +316,39 @@ describe('sweep report-case (D-053 §2)', () => {
     expect(res.tier).toBe('held');
     expect(res.instruction).toBe('provide PR description');
     expect(repo.sha('main_patched')).toBe(postRun); // no merge
-    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.status).toBe('frozen');
+    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.merge_status?.state).toBe('PR_ID');
+    // The cold read RAN (not demoted before it) and the held entry carries the
+    // marker-clean resolution + the scope escalation for the unified publish.
+    expect(readJournal(dir).some((e) => e.action === 'coldread' && e.caseId === caseId)).toBe(true);
+    const held = readJournal(dir).find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect(held.resolution).toMatchObject({ markerClean: true });
+    expect(held.escalation).toMatchObject({ tag: '[AUTO-ESCALATED: scope exceeded]' });
+    expect((held.escalation as { feedback: string }).feedback).toContain('src/extra.ts');
   });
 
-  it('mechanical cold-read reject -> HELD (fail-closed)', async () => {
+  it('markerClean covers EXTRA changed files: a marker left in a scope-exceeded file is NOT marker-clean (draft, not active)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    const caseId = await toCase(repo, ws, inv);
+    // The conflicted path is resolved clean, but the scope-exceeded EXTRA file
+    // still carries conflict markers — the resolution must NOT be recorded
+    // marker-clean (an ACTIVE PR would ship the marker); the unified publish
+    // has to fall back to the draft pristine conflict.
+    resolveWorktree(dir, caseId, {
+      'src/x.ts': 'RESOLVED\n',
+      'src/extra.ts': '<<<<<<< ours\nsneaky\n=======\nother\n>>>>>>> theirs\n',
+    });
+    expect(
+      await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true }), confirm),
+    ).toBe(0);
+    const held = readJournal(dir).find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect(held.escalation).toMatchObject({ tag: '[AUTO-ESCALATED: scope exceeded]' });
+    expect((held.resolution as { markerClean: boolean }).markerClean).toBe(false);
+  });
+
+  it('mechanical cold-read reject: 1st -> revise with feedback (still case-ready); 2nd -> HELD escalated (D-057 #4)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
@@ -326,6 +356,19 @@ describe('sweep report-case (D-053 §2)', () => {
     const caseId = await toCase(repo, ws, inv);
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
     const out = join(ws, 'rc.json');
+    // FIRST rejection: no freeze — the reviewer's feedback reaches the agent.
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        rejectCode,
+      ),
+    ).toBe(1);
+    const first = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; tier: string; feedback?: string };
+    expect(first.instruction).toContain('revise the resolution');
+    expect(first.instruction).toContain('restore the fork-side guard'); // reviewer feedback, verbatim
+    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
+    expect(machineState(dir).phase).toBe('case-ready'); // still the agent's case
+    // SECOND rejection: stop retrying — HELD, escalation recorded for the PR prefix.
     expect(
       await cmdSweepReportCase(
         baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
@@ -333,7 +376,10 @@ describe('sweep report-case (D-053 §2)', () => {
       ),
     ).toBe(0);
     expect((JSON.parse(readFileSync(out, 'utf8')) as { tier: string }).tier).toBe('held');
-    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
+    const held = readJournal(dir).find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect(held.escalation).toMatchObject({ tag: '[AUTO-ESCALATED: cold read rejected 2x]' });
+    expect((held.escalation as { feedback: string }).feedback).toContain('restore the fork-side guard');
+    expect(held.resolution).toMatchObject({ markerClean: true }); // active review PR at publish
     expect(machineState(dir).currentCase?.tier).toBe('held');
   });
 
@@ -412,6 +458,51 @@ describe('sweep report-pr (D-053 §2)', () => {
     expect(machineState(dir).phase).toBe('open');
   });
 
+  it('held with a MARKER-CLEAN resolution (scope-exceeded confirm) -> publishes an ACTIVE (non-draft) PR with the prefix', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const dir = dirOf(repo, ws);
+    const caseId = currentCaseId(dir);
+    // Marker-clean resolution that exceeds the conflict scope (#3) + confirm.
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n', 'src/extra.ts': 'sneaky\n' });
+    expect(
+      await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true }), confirm),
+    ).toBe(0);
+    writePr(dir, caseId, `held case ${caseId}`, 'Decision needed: resolution of src/x.ts — study before merge.');
+    const gh = fakeGithub();
+    const out = join(ws, 'pr.json');
+    expect(
+      await cmdSweepReportPr(
+        baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, tokenFile, out }),
+        confirm,
+        gh.factory,
+      ),
+    ).toBe(0);
+    const pub = readJournal(dir).find((e) => e.action === 'pr-published' && e.caseId === caseId)!;
+    expect(pub.mode).toBe('held');
+    expect(pub.draft).toBe(false); // ACTIVE: owner reviews & MERGES (driver never does)
+    const prCall = gh.calls.find((c) => c.method === 'POST' && c.path.endsWith('/pulls'))!;
+    expect((prCall.body as { draft: boolean }).draft).toBe(false);
+    const sentBody = (prCall.body as { body: string }).body;
+    expect(sentBody.startsWith('[AUTO-ESCALATED: scope exceeded]')).toBe(true);
+    expect(sentBody).toContain('src/extra.ts');
+    // The pushed head is the RESOLVED merge commit: the agent's tree, parented
+    // on the branch tip + the conflict head (owner merge completes PR_ID).
+    const head = pub.head as string;
+    const caseHead = (readJournal(dir).find((e) => e.action === 'case')!.head as { sha: string }).sha;
+    expect(repo.git('rev-parse', `${head}^2`)).toBe(caseHead);
+    expect(repo.git('show', `${head}:src/x.ts`)).toBe('RESOLVED');
+    expect(repo.git('show', `${head}:src/extra.ts`)).toBe('sneaky');
+    expect(machineState(dir).phase).toBe('open');
+  });
+
   it('judged: records PR intent + merges locally, NO push / NO PR created', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
@@ -428,13 +519,25 @@ describe('sweep report-pr (D-053 §2)', () => {
     expect(readJournal(dir).some((e) => e.action === 'push')).toBe(false);
   });
 
-  it('judged cold-read reject -> HELD (fail-closed), not merged', async () => {
+  it('judged cold-read reject: 1st -> revise with feedback (never merged); 2nd -> HELD escalated (D-057 #4)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
     const { dir, caseId } = await toAwaiting(repo, ws, inv, 'judged');
     const beforeTip = repo.sha('main_patched');
     const out = join(ws, 'pr.json');
+    // FIRST rejection: no freeze, no merge — feedback surfaced, still awaiting-pr.
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), rejectCode)).toBe(
+      1,
+    );
+    const first = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; tier: string };
+    expect(first.tier).toBe('judged');
+    expect(first.instruction).toContain('revise the resolution');
+    expect(first.instruction).toContain('restore the fork-side guard');
+    expect(repo.sha('main_patched')).toBe(beforeTip); // NOT merged
+    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
+    expect(machineState(dir).phase).toBe('awaiting-pr');
+    // SECOND rejection: stop retrying — HELD (escalated), still never merged.
     expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), rejectCode)).toBe(
       1,
     );
@@ -442,7 +545,8 @@ describe('sweep report-pr (D-053 §2)', () => {
     expect(res.tier).toBe('held');
     expect(res.instruction).toContain('held:');
     expect(repo.sha('main_patched')).toBe(beforeTip); // NOT merged
-    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
+    const held = readJournal(dir).find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect(held.escalation).toMatchObject({ tag: '[AUTO-ESCALATED: cold read rejected 2x]' });
     expect(machineState(dir).currentCase?.tier).toBe('held');
   });
 
@@ -467,6 +571,34 @@ describe('sweep report-pr (D-053 §2)', () => {
     expect((JSON.parse(readFileSync(out, 'utf8')) as { instruction: string }).instruction).toContain('rewrite:');
     expect(readJournal(dir).some((e) => e.action === 'pr-published' && e.caseId === caseId)).toBe(false);
     expect(gh.calls.some((c) => c.method === 'POST' && c.path.endsWith('/pulls'))).toBe(false);
+  });
+
+  it('a description-defect reject never counts toward the code-reject escalation (D-057 #4)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const { dir, caseId } = await toAwaiting(repo, ws, inv, 'judged');
+    const out = join(ws, 'pr.json');
+    // Description-only defect: resolution SOUND, prose wrong -> rewrite (no strike).
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), rejectDesc)).toBe(
+      1,
+    );
+    expect((JSON.parse(readFileSync(out, 'utf8')) as { instruction: string }).instruction).toContain('rewrite:');
+    // FIRST code reject AFTER the description defect: still the FIRST strike ->
+    // revise-with-feedback, NOT an escalation to HELD.
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), rejectCode)).toBe(
+      1,
+    );
+    const first = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; tier: string };
+    expect(first.tier).toBe('judged');
+    expect(first.instruction).toContain('revise the resolution');
+    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
+    // SECOND code reject -> HELD (the limit counts RESOLUTION rejects only).
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), rejectCode)).toBe(
+      1,
+    );
+    expect((JSON.parse(readFileSync(out, 'utf8')) as { tier: string }).tier).toBe('held');
+    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
   });
 });
 
@@ -798,6 +930,21 @@ describe('cold-read infra failure ≠ content reject (D-054, ERR35_COLDREAD_UNAV
     expect(auth.reason).toMatch(/auth\/login failure/i);
   });
 
+  it('parseMachineVerdict: the 1-2 line `feedback` field is carried through and BOUNDED (D-057)', () => {
+    const withFeedback = parseMachineVerdict(
+      '{"verdict":"reject","notes":"drops behaviour","feedback":"restore the fork guard in src/x.ts"}',
+    );
+    expect(withFeedback.feedback).toBe('restore the fork guard in src/x.ts');
+    // Bounded: an over-long feedback is capped, never carried whole.
+    const long = parseMachineVerdict(
+      `{"verdict":"reject","notes":"n","feedback":"${'x'.repeat(2000)}"}`,
+    );
+    expect(long.feedback!.length).toBeLessThanOrEqual(400);
+    // Absent/blank feedback stays absent.
+    expect(parseMachineVerdict('{"verdict":"confirm","notes":"ok"}').feedback).toBeUndefined();
+    expect(parseMachineVerdict('{"verdict":"confirm","notes":"ok","feedback":"  "}').feedback).toBeUndefined();
+  });
+
   it('report-case mechanical: infra error -> HARD HALT (ERR35), case NOT held, still case-ready', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
@@ -824,7 +971,7 @@ describe('cold-read infra failure ≠ content reject (D-054, ERR35_COLDREAD_UNAV
     expect(readJournal(dir).some((e) => e.action === 'halt' && e.id === 'ERR35_COLDREAD_UNAVAILABLE')).toBe(true);
   });
 
-  it('report-case mechanical: a cold read that RAN and rejected -> still HELD (content decision preserved)', async () => {
+  it('report-case mechanical: a cold read that RAN and rejected is a CONTENT decision — retry path, never ERR35', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
@@ -833,6 +980,20 @@ describe('cold-read infra failure ≠ content reject (D-054, ERR35_COLDREAD_UNAV
     await cmdSweepNextCase(baseCli(repo, ws, inv));
     const caseId = currentCaseId(dir);
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    // A genuine reject is a content decision: first strike -> revise-and-retry
+    // (rc 1, no freeze) and NEVER the ERR35 infra halt.
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true }),
+        rejectCode,
+      ),
+    ).toBe(1);
+    expect(readJournal(dir).some((e) => e.action === 'coldread' && e.caseId === caseId && e.rejected === true)).toBe(
+      true,
+    );
+    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
+    expect(readJournal(dir).some((e) => e.action === 'halt' && e.id === 'ERR35_COLDREAD_UNAVAILABLE')).toBe(false);
+    // Second strike -> HELD (still a content decision, still no ERR35).
     expect(
       await cmdSweepReportCase(
         baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true }),

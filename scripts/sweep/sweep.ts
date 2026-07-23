@@ -490,7 +490,9 @@ async function cmdStatus(cli: Cli): Promise<number> {
     // DERIVED state: merge-base(branch, upstream) replaces stored lastMergedUpstream.
     const mergeBase = (await refExists(cli.repo, name)) ? await derivedLastMerged(cli.repo, name, cli.upstream) : null;
     const merged = mergeBase ? mergeBase.slice(0, 12) : 'n/a';
-    const extras = [bs?.frozenBy ? `frozen by ${bs.frozenBy}` : '', bs?.notes ?? ''].filter(Boolean).join('; ');
+    const ms = bs?.merge_status;
+    const blockedLabel = ms?.state === 'PR_ID' ? `held by ${ms.caseId}` : ms?.state === 'DEFERRED' ? 'deferred' : '';
+    const extras = [blockedLabel, bs?.notes ?? ''].filter(Boolean).join('; ');
     const scan = report?.branches[name];
     const model = entry ?? scan;
     const sourceLabel =

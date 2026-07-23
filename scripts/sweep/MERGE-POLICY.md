@@ -5,13 +5,24 @@ noise, review, and publication. PROPAGATION.md holds driver mechanics; on confli
 this file wins. The AGENT drives these tiers through the D-053 SWEEP STATE MACHINE
 (`SWEEP-STATE-MACHINE.md`: `start`/`next-case`/`report-case --tier`/`report-pr`/
 `finish`); this file's tier/merge/publication semantics are UNCHANGED — the state
-machine wraps them, with one publication-timing amendment: a HELD draft PR is
-published at `report-pr` the moment the case is frozen (§5's "HELD draft PRs last"
-ordering was about NOT letting a HELD merge onto a target — a HELD draft lands
+machine wraps them, with one publication-timing amendment: a HELD PR (active or
+draft, per D-057 §1) is published at `report-pr` the moment the case is held (§5's
+"HELD PRs last" ordering was about NOT letting a HELD merge onto a target — a HELD PR lands
 nothing on a target branch, so it needs neither the verify gate nor the target
 push, D-053). Supersedes: case-1..4 ladder (DESIGN.md §6), doc 02 §5 step-3
 "one PR per DAG edge batch", D-030 exhibit-commit construction, the API push
 workaround, "merging remains owner-only".
+
+D-057 amendment (2026-07-23): blockedness is now the `merge_status ∈ {PR_ID |
+DEFERRED | NONE}` block model (invariant `blocked ⇔ merge_status != NONE`),
+replacing the independent ledger freeze fields; DEFERRED is pure height-MIN over
+blocked DIRECT parents (the `(floor, N′]` path-intersection window is retired);
+HELD publish is unified into one ACTIVE PR at the resolved merge commit when the
+resolution is marker-clean (owner reviews & merges — the driver never auto-merges
+it) or a DRAFT PR at the pristine conflict when unresolved; scope-exceeded-but-
+cold-read-agreed and twice-cold-read-rejected escalate to a flagged HELD PR; the
+case worktree is a pending diff (clean prefix committed, agent sees only the
+conflicting delta). §1 carries the detail.
 
 ## 1. Merge tiers (per parent→branch merge attempt)
 
@@ -20,20 +31,59 @@ workaround, "merging remains owner-only".
 | CLEAN | no textual conflict (merge-tree) | bulk direct merge | none | none |
 | MECHANICAL | conflict the agent is allowed to resolve (qualification: §7) | direct merge | cold-read confirm required | none — journal + cold-read artifact only |
 | JUDGED | non-obvious conflict, agent-resolved | merge; same commit pushed to target → PR auto-marks merged | cold-read confirm required | yes (history) |
-| HELD | unresolved / cold-read reject / scope-guard violation / red verify gate / escalation | clean prefix merges first; draft PR at the conflicting head | **owner** (the only review state) | draft PR, real diff (D-030 head) |
-| DEFERRED | conflict belongs to a HELD ancestor: held height ∈ (floor, N′] window AND conflicted paths intersect | no merge of that range; freeze; auto-unfreeze when ancestor clears | none | none |
+| HELD | unresolved / cold-read reject×2 / scope-guard violation / red verify gate / non-convergence cap / escalation | clean prefix merges first; PR head = the resolved merge commit if marker-clean, else the pristine conflict | **owner** (the only review state) | ACTIVE PR (marker-clean resolution, owner merges) or DRAFT PR (pristine conflict), real diff (D-030) |
+| DEFERRED | own conflict at height h ≥ MIN(blocked DIRECT parents' heights); a parent is blocked ⇔ `merge_status != NONE` | clean prefix committed; STOP — no merge above, NO PR; sticky while any direct parent is blocked; clears when all parents NONE → re-merge fresh (D-057) | none | none |
 
 Tier rules:
 - CLEAN vs conflict: computed (merge-tree). MECHANICAL vs JUDGED: agent-claimed, driver demote-only.
 - Floors: `edition/*` and `tier_floor: judged` entries → min JUDGED (D-015). Edition
   JUDGED **auto-merges** (intended); owner-gating happens only by escalation to HELD.
+- Blocked = the `merge_status` block model (D-057): per branch `merge_status ∈
+  {PR_ID | DEFERRED | NONE}` (NONE = absent field) and `blocked(X) ⇔ merge_status(X)
+  != NONE` ALWAYS. No height/path is stored — heights are live per-pass values.
+  PR_ID persists from the hold until the branch is COMPLETELY resolved (owner
+  resolves the PR AND the merge lands on the branch), never cleared at any
+  intermediate step; DEFERRED is sticky while any direct parent is blocked. This one
+  block replaces the retired independent freeze fields (status:'frozen', frozenBy,
+  heldHead, heldPaths, fixBranch, pendingBehindFreeze); legacy ledgers up-convert on read.
+- Case worktree = a PENDING DIFF (D-057): the driver commits the CLEAN PREFIX (the
+  automerge tree with the conflicted paths reset to base/ours) as the case worktree's
+  HEAD and writes ONLY the conflicting delta (marker content) into the working tree, so
+  `git status` shows exactly the conflicted paths and the agent reviews/edits only that
+  delta — never the whole tree. On-disk bytes and the `add -A; write-tree` snapshot are
+  identical to the old full checkout, so empty-check / scope-guard / cold-read diff are
+  unaffected.
 - Only HELD needs external review. Anything review-worthy at any tier is ESCALATED to
   HELD and inherits ALL HELD rules. Old "case 3" (open provisional PR) is retired.
-- Scope guard: resolution diff ⊄ allowed set → HELD. Lever: `same-files` (default;
-  extra file = violation) / `conflict-hunks` (strict; must stay in marker regions).
+- HELD publish is UNIFIED on one key — does a MARKER-CLEAN resolution exist? Marker-
+  clean (the agent actually resolved) → ACTIVE (non-draft) PR at the resolved merge
+  commit; the owner reviews & merges — the driver NEVER auto-merges a HELD PR (auto-
+  merge stays JUDGED). Markers remain / `--tier held` with no valid resolution → DRAFT
+  PR built from the PRISTINE conflict (clean-prefix commit + the original
+  upstream-vs-ours automerge tree, NO agent edits — the owner resolves fresh, not the
+  agent's mangled attempt).
+- Scope guard: resolution diff ⊄ allowed set. Lever: `same-files` (default; extra file
+  = violation) / `conflict-hunks` (strict; must stay in marker regions). A scope
+  violation no longer demotes to HELD BEFORE the cold read (D-057): `scopeExceeded` is
+  carried forward, the cold read judges the RESOLUTION, and if it AGREES the case is
+  HELD publishing that resolution — an ACTIVE PR flagged `[AUTO-ESCALATED: scope
+  exceeded]` (owner merges; never auto-merged). Scope OK + agrees → JUDGED as before;
+  rejects → the reject path below.
+- Cold-read rejections are COUNTED per case (D-057): the 1st reject does NOT freeze —
+  the reviewer's short feedback is surfaced to the agent to revise and re-run; on the
+  2nd reject the driver stops retrying and passes the case HELD (ACTIVE if marker-clean,
+  else DRAFT pristine conflict) with `[AUTO-ESCALATED: cold read rejected 2x]` + the
+  reviewer feedback prepended to the PR description. This tightens/replaces the old
+  3-distinct-tree convergence cap (its own prefix `[AUTO-ESCALATED: resolution did not
+  converge]`).
 - Red verify gate → HELD(gate).
-- Same-height conflict, disjoint paths from the held ancestor → own conflict, normal
-  ladder (not DEFERRED).
+- DEFER rule (D-057) = PURE HEIGHT-MIN over blocked DIRECT parents: X's own conflict at
+  height h is DEFERRED iff some direct parent is blocked AND h ≥ MIN(blocked parents'
+  heights). Below that MIN every parent is clean, so the conflict is X's OWN (normal
+  ladder → its own PR). The pre-D-057 rule — an intersecting HELD-ancestor height in the
+  `(floor, N′]` window plus a conflicted-path intersection — is RETIRED: no path check,
+  no per-transitive-ancestor window. A clean intermediate parent (merge_status NONE)
+  correctly stops propagation until it re-merges the resolved content.
 
 ## 2. Case unit — commit stacking
 
@@ -41,8 +91,8 @@ Tier rules:
   sets intersect (one logical decision), capped (default 5, configurable).
 - The run breaks at: a clean height, a disjoint-path conflict (own case later), the cap.
 - Applies to ALL conflict tiers: MECHANICAL/JUDGED resolve the run as one case (one
-  cold-read); HELD's draft PR head = the run's TOP commit → diff = the whole run.
-- DEFERRED windows and urge tracking are computed against the run's top.
+  cold-read); HELD's PR head = the run's TOP commit → diff = the whole run.
+- The DEFER height-check (run top vs MIN blocked-parent height) and urge tracking are computed against the run's top.
 - Never stack disjoint-path conflicts; never stack across a clean height.
 
 ## 3. Hierarchy / batching
@@ -89,8 +139,8 @@ Tier rules:
   journaled pass pushes are the only pushes).
 - Nothing is pushed before `propagate verify` is green for the pass (D-012).
 - Per-pass push order, per branch: target branches (CLEAN/MECHANICAL/prefix merges) →
-  JUDGED closure pushes (PR flips to merged) → HELD draft PRs (base is then current,
-  so the HELD diff = the case run only).
+  JUDGED closure pushes (PR flips to merged) → HELD PRs (active or draft; base is then
+  current, so the HELD diff = the case run only).
 - Pre-PR height check (blocking ID): the origin base branch must be AT LEAST at the
   expected pass height; higher is fine (someone else committed); lower/diverged = halt.
 - All GitHub writes go through the driver tooling with the ERR/WARN ID contract
@@ -103,7 +153,7 @@ Tier rules:
 
 ## 6. Review & reporting integration
 
-- Owner attention surface = HELD draft PRs + D-046 messages (candidates, failures,
+- Owner attention surface = HELD PRs (active or draft) + D-046 messages (candidates, failures,
   one end-of-sweep result). JUDGED PRs are history, not owner work.
 - D-004 annotation: a frozen branch's HELD PR carries the count of further pending
   upstream commits (kept current via urge comments).

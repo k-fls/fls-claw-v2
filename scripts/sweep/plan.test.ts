@@ -150,13 +150,147 @@ describe('derivePlan — DEFERRED to a HELD ancestor', () => {
     expect(p.parents[0].case).toBeNull(); // DEFERRED emits NO case / PR
   });
 
-  it('NOT deferred (own conflict -> case) when the HELD ancestor paths are disjoint', async () => {
+  it('DEFERS even when the HELD parent paths are DISJOINT (D-057 dropped path-intersection)', async () => {
     const held = [{ branch: 'main_patched', height: 0, conflictedPaths: ['src/other.ts'], caseId: 'main_patched-h0' }];
     const plan = await derivePlan({ repo: repo.dir, upstreamRef: 'main', base, features, scope: {}, held });
+    const p = plan.branches.find((b) => b.branch === 'feat/p')!;
+    // main_patched is a blocked DIRECT parent at height 0; feat/p conflicts at
+    // height 0 -> MIN(0) <= 0 -> DEFERRED regardless of conflicted paths.
+    expect(p.parents[0].verdict).toBe('defer');
+    expect(p.parents[0].deferredTo).toBe('main_patched');
+    expect(p.parents[0].case).toBeNull();
+  });
+
+  it('NOT deferred (own conflict -> case) when NO direct parent is blocked', async () => {
+    const plan = await derivePlan({ repo: repo.dir, upstreamRef: 'main', base, features, scope: {}, held: [] });
     const p = plan.branches.find((b) => b.branch === 'feat/p')!;
     expect(p.parents[0].verdict).toBe('case');
     expect(p.parents[0].deferredTo).toBeNull();
     expect(p.parents[0].case?.conflictedPaths).toEqual(['src/x.ts']);
+  });
+});
+
+// --- merge_status views in derivation (D-057) ------------------------------
+describe('derivePlan — mergeStatusOf (D-057: PR_ID empty interval, DEFERRED sticky)', () => {
+  // Same fixture as the DEFERRED wiring above: feat/p conflicts vs main_patched at h0.
+  const repo = initFixtureRepo();
+  repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+  const base = repo.sha('main');
+  repo.checkout('main_patched', { create: true, at: 'main' });
+  repo.checkout('feat/p', { create: true, at: 'main_patched' });
+  repo.commit('feat/p: x = P', { 'src/x.ts': 'P\n' });
+  repo.checkout('main');
+  repo.commit('U0: x = up0', { 'src/x.ts': 'up0\n' });
+  repo.checkout('main_patched');
+  repo.git('merge', '--no-edit', '-m', 'main_patched merges U0', 'main');
+  repo.checkout('main');
+  afterAll(() => repo.destroy());
+
+  const features: FeatureEntry[] = [
+    { id: 'p', name: 'p', kind: 'feat', status: 'shipped', branch: 'feat/p', parents: ['main_patched'] },
+  ];
+
+  it('a PR_ID branch arrives with an EMPTY interval (skip rows, no probes act)', async () => {
+    const plan = await derivePlan({
+      repo: repo.dir,
+      upstreamRef: 'main',
+      base,
+      features,
+      scope: {},
+      mergeStatusOf: new Map([['feat/p', 'PR_ID']]),
+    });
+    const p = plan.branches.find((b) => b.branch === 'feat/p')!;
+    expect(p.parents.every((pp) => pp.verdict === 'skip' && pp.skipReason === 'held')).toBe(true);
+  });
+
+  it('STICKY: a DEFERRED branch behind a blocked parent forces defer EVEN when the height-MIN would not (STAY ≠ BECOME)', async () => {
+    // main_patched is PR_ID-blocked but contributes NO height (no held record),
+    // so the BECOME height-MIN alone would emit a case; the sticky STAY rule is
+    // independent of height and keeps the branch deferred.
+    const plan = await derivePlan({
+      repo: repo.dir,
+      upstreamRef: 'main',
+      base,
+      features,
+      scope: {},
+      held: [],
+      mergeStatusOf: new Map([
+        ['main_patched', 'PR_ID'],
+        ['feat/p', 'DEFERRED'],
+      ]),
+    });
+    const p = plan.branches.find((b) => b.branch === 'feat/p')!;
+    expect(p.parents[0].verdict).toBe('defer');
+    expect(p.parents[0].deferredTo).toBe('main_patched');
+    expect(p.parents[0].case).toBeNull();
+    expect(p.parents[0].deferHeight).toBe(0); // live-probed: its children's height-MIN input
+    expect(p.parents[0].mergePoint).toBeNull(); // takes NOTHING while sticky
+  });
+
+  it('CLEARED view: a DEFERRED branch whose parents are all NONE derives normally (re-merge fresh → own case)', async () => {
+    const plan = await derivePlan({
+      repo: repo.dir,
+      upstreamRef: 'main',
+      base,
+      features,
+      scope: {},
+      mergeStatusOf: new Map([['feat/p', 'DEFERRED']]), // parent main_patched is NONE
+    });
+    const p = plan.branches.find((b) => b.branch === 'feat/p')!;
+    expect(p.parents[0].verdict).toBe('case'); // fresh re-merge hits its own conflict → own PR
+    expect(p.parents[0].deferredTo).toBeNull();
+  });
+});
+
+// --- §6 un-skip vs blocked branches (D-057) --------------------------------
+describe('derivePlan — un-skip never merges into/through a blocked branch (D-057)', () => {
+  // leaf feat/l -> feat/d -> entry main_patched. main_patched is PR_ID-blocked
+  // (which keeps feat/d sticky-DEFERRED); U0 gives the pass progress so the
+  // leaf un-skip rule fires — but its only chain runs through blocked hops.
+  const repo = initFixtureRepo();
+  const base = repo.sha('main');
+  repo.checkout('main_patched', { create: true, at: 'main' });
+  repo.checkout('feat/d', { create: true, at: 'main_patched' });
+  repo.checkout('feat/l', { create: true, at: 'feat/d' });
+  repo.checkout('main');
+  repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+  afterAll(() => repo.destroy());
+
+  const features: FeatureEntry[] = [
+    { id: 'd', name: 'd', kind: 'feat', status: 'shipped', branch: 'feat/d', parents: ['main_patched'] },
+    { id: 'l', name: 'l', kind: 'feat', status: 'shipped', branch: 'feat/l', parents: ['feat/d'] },
+  ];
+
+  it('aborts the un-skip instead of force-merging a DEFERRED intermediate hop', async () => {
+    const plan = await derivePlan({
+      repo: repo.dir,
+      upstreamRef: 'main',
+      base,
+      features,
+      scope: {},
+      mergeStatusOf: new Map([
+        ['main_patched', 'PR_ID'],
+        ['feat/d', 'DEFERRED'],
+      ]),
+    });
+    const d = plan.branches.find((b) => b.branch === 'feat/d')!;
+    const l = plan.branches.find((b) => b.branch === 'feat/l')!;
+    expect(l.isLeaf).toBe(true);
+    // The blocked intermediate must NOT be force-merged (it takes NOTHING
+    // while merge_status != NONE)...
+    expect(d.parents[0].verdict).not.toBe('merge');
+    expect(d.parents[0].forced ?? false).toBe(false);
+    // ...and the leaf's un-skip is aborted outright (no chain avoids the block).
+    expect(l.unskipChain ?? null).toBeNull();
+    expect(l.parents[0].forced ?? false).toBe(false);
+    expect(l.parents[0].verdict).toBe('up-to-date');
+  });
+
+  it('shortestUnskipChain skips blocked hops explicitly', () => {
+    const edges = { 'feat/l': ['feat/d'], 'feat/d': ['main_patched'] };
+    const entry = new Set(['main_patched']);
+    expect(shortestUnskipChain('feat/l', edges, entry)).toEqual(['feat/l', 'feat/d', 'main_patched']);
+    expect(shortestUnskipChain('feat/l', edges, entry, new Set(['feat/d']))).toEqual([]);
   });
 });
 

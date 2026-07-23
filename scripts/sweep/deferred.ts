@@ -1,67 +1,55 @@
 /**
- * scripts/sweep/deferred.ts — the ancestor-HELD matching rule (PROPAGATION.md
- * §5, D-036).
+ * scripts/sweep/deferred.ts — the DEFERRED rule (owner directive 2026-07-22,
+ * D-057): pure height-MIN over the branch's BLOCKED DIRECT PARENTS.
  *
- * When the sweep finds branch C's first conflicting run against parent Q, with
- * run TOP height N' (D-049 §2 — the window is computed against the run's top),
- * and the pass registry records a TRANSITIVE inventory ancestor P (not only a
- * direct parent) HELD at height N with conflicted path set S_P:
- *   - N lies in the CONFLICTING WINDOW `(floor, N']` AND C's conflicted paths
- *     intersect S_P -> DEFERRED (freeze, NO PR, journal pointer at P;
- *     auto-unfreeze when P clears). `floor` is the largest clean height below
- *     the conflict on C's eligible line (the merge-point height when one
- *     exists, else C's coverage at line-build time): the held commit's content
- *     is part of what this merge would newly introduce.
- *   - height inside the window but paths DISJOINT -> NOT deferred: C's own
- *     independent conflict; normal MECHANICAL/JUDGED/HELD ladder.
+ * When branch X hits its OWN conflict at height `conflictHeight` (the run TOP,
+ * D-049 §2), it is DEFERRED — clean prefix committed, STOP, NO PR — iff any
+ * DIRECT parent is currently blocked (merge_status != NONE) AND the conflict is
+ * at or above the LOWEST blocked parent's height:
  *
- * Exact equality N' == N is the special case where the eligible line has a head
- * at N (entry model / fine-grained lines). Parents-model lines are usually
- * coarser — a parent that advanced in one merge has a single head far above N —
- * so the window rule is the faithful generalization (spec §5, updated
- * 2026-07-18). Height is the comparison key (never date/subject).
+ *     defer  ⇔  blockedParents ≠ ∅  ∧  conflictHeight ≥ MIN(blockedParents.height)
+ *
+ * Below that MIN the parents are all clean, so the conflict is X's OWN
+ * independent one (normal MECHANICAL/JUDGED/HELD ladder → raises its own PR).
+ *
+ * This REPLACES the pre-D-057 rule (per-transitive-ancestor window
+ * `(floor, N']` + conflicted-path intersection): DEFERRED no longer depends on
+ * paths or on the full ancestor set — only on DIRECT parents, because a clean
+ * intermediate parent (merge_status NONE) correctly stops propagation until it
+ * re-merges the resolved content (the cascade: parent resolves → its merge
+ * lands → NONE → the child re-merges and may catch its own new PR). The height
+ * is the comparison key (never date/subject). Heights are LIVE per-pass values,
+ * never stored in merge_status.
  */
-import type { HeldRecord } from './types.js';
+
+/** A direct parent that is currently blocked (merge_status != NONE), with the
+ * height at which it is blocked (its own conflict/held height, live-derived). */
+export interface BlockedParent {
+  branch: string;
+  height: number;
+}
 
 export interface DeferDecision {
   deferred: boolean;
-  /** The ancestor HELD record this conflict belongs to (when deferred). */
-  ancestor: HeldRecord | null;
-}
-
-function intersects(a: string[], b: string[]): boolean {
-  const set = new Set(a);
-  return b.some((p) => set.has(p));
+  /** The lowest blocked parent this conflict defers behind (when deferred). */
+  blockedBy: string | null;
 }
 
 /**
- * Decide whether C's first conflict is DEFERRED to a HELD ancestor.
+ * Decide whether X's own conflict at `conflictHeight` is DEFERRED.
  *
- * @param firstConflictHeight  the TOP height N' of C's conflicting run against Q (D-049 §2).
- * @param floor                largest clean height below the conflict on C's
- *                             eligible line (merge-point height, else coverage);
- *                             the window is the half-open `(floor, N']`.
- * @param conflictedPaths      C's conflicted path set at that height.
- * @param transitiveAncestors  every transitive inventory ancestor of C.
- * @param held                 the pass registry of HELD branches.
+ * @param conflictHeight  the TOP height of X's conflicting run (D-049 §2).
+ * @param blockedParents  X's DIRECT parents that are blocked, with their heights.
  */
-export function checkDeferred(
-  firstConflictHeight: number,
-  floor: number,
-  conflictedPaths: string[],
-  transitiveAncestors: string[],
-  held: HeldRecord[],
-): DeferDecision {
-  const ancestorSet = new Set(transitiveAncestors);
-  for (const rec of held) {
-    if (!ancestorSet.has(rec.branch)) continue;
-    // N must lie in the conflicting window (floor, N'] — the held commit's
-    // content is part of what this merge newly introduces.
-    if (!(rec.height > floor && rec.height <= firstConflictHeight)) continue;
-    if (intersects(conflictedPaths, rec.conflictedPaths)) {
-      return { deferred: true, ancestor: rec };
+export function checkDeferred(conflictHeight: number, blockedParents: BlockedParent[]): DeferDecision {
+  let min = Infinity;
+  let lowest: string | null = null;
+  for (const p of blockedParents) {
+    if (p.height < min) {
+      min = p.height;
+      lowest = p.branch;
     }
-    // In-window but disjoint paths -> C's own independent conflict (NOT deferred).
   }
-  return { deferred: false, ancestor: null };
+  if (lowest !== null && conflictHeight >= min) return { deferred: true, blockedBy: lowest };
+  return { deferred: false, blockedBy: null };
 }
