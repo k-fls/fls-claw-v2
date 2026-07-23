@@ -1262,6 +1262,14 @@ async function createCaseWorktree(cli: Cli, dir: string, caseFile: CaseFile, bas
         `clean prefix for ${caseFile.id} — conflict pending in: ${caseFile.conflictedPaths.join(', ')}`,
       ])
     ).stdout.trim();
+    // Idempotent (D-057): a case RE-EMITTED after a reopen may leave a stale
+    // worktree registration and/or dir at this path — `worktree add` then fails
+    // with "missing but already registered" or "already exists", stranding the
+    // case with no worktree. Clear both (registration via remove+prune, dir via
+    // rm) before re-adding so re-emission always yields a fresh worktree.
+    await git(cli.repo, ['worktree', 'remove', '--force', wtPath], { allowCodes: [1, 128] });
+    await git(cli.repo, ['worktree', 'prune'], { allowCodes: [1, 128] });
+    rmSync(wtPath, { recursive: true, force: true });
     await git(cli.repo, ['worktree', 'add', '--detach', wtPath, prefixCommit]);
     // Materialize the conflicted paths as PENDING working-tree changes: write the
     // automerge (marker) blob to disk without staging, or delete the file when the

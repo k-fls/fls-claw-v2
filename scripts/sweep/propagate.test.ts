@@ -1762,6 +1762,32 @@ describe('propagate — SPEC 1: resolution worktree created at case emission, re
     expect(existsSync(wtPath)).toBe(false);
     expect(readJournal(dir).some((e) => e.action === 'worktree-removed' && e.caseId === caseId)).toBe(true);
   });
+
+  it('re-emitting a case recreates the worktree idempotently (D-057 — no "already registered" failure)', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
+    const wtPath = join(dir, caseId, 'worktree');
+    expect(existsSync(wtPath)).toBe(true);
+
+    // The worktree + its git registration persist; force the branch to be
+    // re-processed (as a reopen/re-emit would) by dropping its `arrived` marker.
+    // createCaseWorktree is then called AGAIN on the already-registered path —
+    // which pre-D-057 failed with "missing but already registered"/"already exists".
+    stripJournal(dir, new Set(['arrived']));
+    expect(await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }))).toBe(0);
+
+    // Idempotent recovery: a fresh worktree with the conflict markers, no failure warning.
+    expect(readFileSync(join(wtPath, 'src/x.ts'), 'utf8')).toContain('<<<<<<<');
+    const wtWarns = readJournal(dir).filter(
+      (e) => e.action === 'warning' && String(e.message ?? '').includes('case worktree creation failed'),
+    );
+    expect(wtWarns).toEqual([]);
+  });
 });
 
 // --- SPEC 2: annotate-class journaled + surfaced ----------------------------
