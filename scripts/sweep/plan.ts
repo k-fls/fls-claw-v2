@@ -16,7 +16,7 @@ import { checkDeferred, type BlockedParent } from './deferred.js';
 import { globMatchAny } from './globs.js';
 import { buildEligibleLine, mergePointSweep } from './interval.js';
 import { deriveCoverage, enumerateChain, type Chain } from './heights.js';
-import { git, revParse } from './git.js';
+import { git, newStyleMergeTree, revParse } from './git.js';
 import { resolveScope, type ScopeResult } from './scope.js';
 import { tierFloor } from './tiers.js';
 import type { BranchPlan, FeatureEntry, HeldRecord, ParentPlan, PropagationPlan, SweepScope } from './types.js';
@@ -87,6 +87,55 @@ export function shortestUnskipChain(
     }
   }
   return [];
+}
+
+/**
+ * §6 un-skip chain conflict pre-probe (2026-07-23 live ERR21 halt): before ANY
+ * hop of `uchain` is forced, simulate the WHOLE top-down forcing sequence —
+ * every `child <- parent` hop probed via merge-tree, INCLUDING the leaf's own
+ * forced merge (`uchain[0] <- uchain[1]`). Each clean hop advances the child's
+ * SIMULATED tip to a hypothetical ref-less merge commit (commit-tree — no ref
+ * moves, same tree/parents the real forced merge will create), so later hops
+ * probe the post-force ancestry exactly as the real sequence will see it.
+ *
+ * The un-skip premise ("every parent no-op'd, so forcing produces empty
+ * merges") breaks once a prior forced hop moves a tip and a later hop then
+ * genuinely conflicts: commitTreeMerge is CLEAN-ONLY and would throw mid-chain
+ * (ERR21_MERGE_FAILED hard-halt) leaving partial forced merges behind. Returns
+ * true when every hop merges clean; false means the caller must ABORT the
+ * un-skip — force NO hops and mark the leaf's skip rows 'unskip-conflict' (the
+ * step verifier's sanctioned all-skip, like 'unskip-blocked'). The conflicting
+ * hop branch is NOT handled here: its own normal case derivation owns the
+ * conflict (never double-handled).
+ */
+export async function unskipChainClean(
+  repo: string,
+  uchain: string[],
+  refOf: (b: string) => string = (b) => b,
+): Promise<boolean> {
+  const tips = new Map<string, string>();
+  for (const b of uchain) tips.set(b, await revParse(repo, refOf(b)));
+  for (let i = uchain.length - 2; i >= 0; i--) {
+    const child = uchain[i];
+    const parent = uchain[i + 1];
+    const childTip = tips.get(child)!;
+    const parentTip = tips.get(parent)!;
+    const probe = await newStyleMergeTree(repo, childTip, parentTip);
+    if (!probe.clean) return false;
+    if (i === 0) break; // the leaf's own hop is last — nothing probes below it
+    const hyp = await git(repo, [
+      'commit-tree',
+      probe.treeOid,
+      '-p',
+      childTip,
+      '-p',
+      parentTip,
+      '-m',
+      `unskip pre-probe: ${parent} -> ${child}`,
+    ]);
+    tips.set(child, hyp.stdout.trim());
+  }
+  return true;
 }
 
 export interface DerivePlanOptions {
@@ -493,6 +542,18 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
           }
         }
         continue; // no (unblocked) entry reachable
+      }
+      // §6 conflict pre-probe (2026-07-23 live ERR21): never mark a chain
+      // forced when any hop — including the leaf's own — does not merge CLEAN
+      // (simulated top-down, post-force ancestry). The leaf stays skipped this
+      // pass ('unskip-conflict', the sanctioned all-skip); the conflicting hop
+      // branch keeps its OWN verdict (its normal case derivation owns the
+      // conflict). Mirrors cmdRun's live guard — plan and run stay consistent.
+      if (!(await unskipChainClean(repo, uchain, refOf))) {
+        for (const pp of bp.parents) {
+          if (pp.verdict === 'skip' || pp.verdict === 'up-to-date') pp.skipReason = 'unskip-conflict';
+        }
+        continue;
       }
       bp.unskipChain = uchain;
       // Force a merge on each (child <- next parent) hop of the chain.

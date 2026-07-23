@@ -3036,6 +3036,58 @@ describe('propagate run — un-skip never force-merges into/through a blocked br
   });
 });
 
+// --- §6 un-skip conflict pre-probe on the LIVE run path (2026-07-23 halt) ----
+describe('propagate run — un-skip aborts when a chain hop genuinely conflicts (no ERR21)', () => {
+  it('a conflicting intermediate hop aborts the un-skip; the hop branch keeps its OWN case; rc 0', async () => {
+    // leaf feat/l -> feat/m -> entry main_patched. The entry merges U0 cleanly
+    // at its own step (tip MOVES), feat/m then genuinely conflicts with the
+    // moved tip (its own case, NOT a blocked merge_status), while feat/l is
+    // up-to-date with feat/m — the leaf un-skip fires and its ONLY chain runs
+    // THROUGH the conflicting hop. Unguarded, the forced feat/m <- main_patched
+    // merge reaches clean-only commitTreeMerge -> ERR21 hard-halt (the live
+    // 2026-07-23 module/credentials <- module/crypto halt).
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.checkout('feat/m', { create: true, at: 'main_patched' });
+    repo.commit('feat/m: x = mfork', { 'src/x.ts': 'mfork\n' });
+    repo.checkout('feat/l', { create: true, at: 'feat/m' });
+    repo.commit('feat/l: own', { 'src/l.ts': 'l\n' });
+    repo.checkout('main');
+    repo.commit('U0: x = up0', { 'src/x.ts': 'up0\n' }); // progress; conflicts feat/m only
+    cleanups.push(() => repo.destroy());
+
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'm', branch: 'feat/m', parents: ['main_patched'] },
+      { id: 'l', branch: 'feat/l', parents: ['feat/m'] },
+    ]);
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    const mTip = repo.sha('feat/m');
+    const lTip = repo.sha('feat/l');
+    expect(await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }))).toBe(0);
+
+    const journal = readJournal(dir);
+    // The un-skip ABORTED: no forced merge journaled anywhere, no halt of any
+    // kind (in particular no ERR21_MERGE_FAILED and no step-verification-failed
+    // — the all-skip is sanctioned), and no tip moved.
+    expect(journal.some((e) => e.action === 'merge' && e.forced === true)).toBe(false);
+    expect(journal.some((e) => e.action === 'halt')).toBe(false);
+    expect(repo.sha('feat/m')).toBe(mTip);
+    expect(repo.sha('feat/l')).toBe(lTip);
+    // The conflicting hop branch is handled by its OWN normal case derivation
+    // — exactly one case, never double-handled by the un-skip.
+    expect(journal.some((e) => e.action === 'case' && e.branch === 'feat/m')).toBe(true);
+    expect(journal.filter((e) => e.action === 'case').length).toBe(1);
+    // The leaf arrives all-skip with the sanctioned conflict-abort reason.
+    expect(journal.some((e) => e.action === 'arrived' && e.branch === 'feat/l')).toBe(true);
+    expect(
+      journal.some((e) => e.action === 'skip' && e.branch === 'feat/l' && e.reason === 'unskip-conflict'),
+    ).toBe(true);
+  });
+});
+
 // --- freeze publishes NOTHING (D-058 invariant) ------------------------------
 describe('propagate freeze — a hold publishes nothing and leaves no state outside the pass dir (D-058)', () => {
   it('resolve --tier held: journal held row only — no origin ref, no PR journal, ledger byte-identical', async () => {

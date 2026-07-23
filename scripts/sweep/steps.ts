@@ -219,13 +219,17 @@ export async function verifyStepFile(repo: string, step: StepFile, ctx: StepVeri
   // Leaf / always_merge rule (§6): when EVERY parent no-op'd in a pass that
   // carries progress, such a branch must land at least one real merge (a forced
   // empty merge counts). A branch that is BLOCKED — a conflict case pending, a
-  // DEFERRED parent, or an un-skip aborted because every chain to an entry
-  // passes a merge_status-blocked hop (D-057 'unskip-blocked') — is not
-  // no-op'ing and is exempt (it cannot merge yet).
+  // DEFERRED parent, an un-skip aborted because every chain to an entry passes
+  // a merge_status-blocked hop (D-057 'unskip-blocked'), or an un-skip aborted
+  // because a chain hop genuinely conflicts ('unskip-conflict', the 2026-07-23
+  // ERR21 pre-probe) — is not no-op'ing and is exempt (it cannot merge yet).
   const blocked = step.merges.some(
     (m) =>
       m.action === 'skip' &&
-      (m.skipReason === 'conflict-pending' || m.skipReason === 'deferred' || m.skipReason === 'unskip-blocked'),
+      (m.skipReason === 'conflict-pending' ||
+        m.skipReason === 'deferred' ||
+        m.skipReason === 'unskip-blocked' ||
+        m.skipReason === 'unskip-conflict'),
   );
   if (
     (step.isLeaf || step.alwaysMerge) &&

@@ -294,6 +294,50 @@ describe('derivePlan — un-skip never merges into/through a blocked branch (D-0
   });
 });
 
+// --- §6 un-skip vs a CONFLICTING chain hop (2026-07-23 ERR21 pre-probe) -----
+describe('derivePlan — un-skip never marks a chain forced when a hop conflicts', () => {
+  // leaf feat/l -> feat/m -> entry main_patched. feat/m genuinely conflicts
+  // with main_patched's CURRENT tip (its own case — a conflict is NOT a
+  // merge_status block, so the chain search alone does not exclude it), while
+  // feat/l is up-to-date with feat/m; U0 gives the pass progress so the leaf
+  // un-skip rule fires. Unguarded, the plan clobbered feat/m's case verdict
+  // with a forced merge that run's clean-only commitTreeMerge cannot execute.
+  const repo = initFixtureRepo();
+  repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+  const base = repo.sha('main');
+  repo.checkout('main_patched', { create: true, at: 'main' });
+  repo.checkout('feat/m', { create: true, at: 'main_patched' });
+  repo.commit('feat/m: x = mfork', { 'src/x.ts': 'mfork\n' });
+  repo.checkout('feat/l', { create: true, at: 'feat/m' });
+  repo.commit('feat/l: own', { 'src/l.ts': 'l\n' });
+  repo.checkout('main_patched');
+  repo.commit('mp: x = fork', { 'src/x.ts': 'fork\n' }); // conflicts feat/m
+  repo.checkout('main');
+  repo.commit('U0: util', { 'src/util.ts': 'u\n' }); // pass progress, clean for mp
+  afterAll(() => repo.destroy());
+
+  const features: FeatureEntry[] = [
+    { id: 'm', name: 'm', kind: 'feat', status: 'shipped', branch: 'feat/m', parents: ['main_patched'] },
+    { id: 'l', name: 'l', kind: 'feat', status: 'shipped', branch: 'feat/l', parents: ['feat/m'] },
+  ];
+
+  it('aborts the un-skip: no forced verdicts, the hop keeps its OWN case, leaf rows carry unskip-conflict', async () => {
+    const plan = await derivePlan({ repo: repo.dir, upstreamRef: 'main', base, features, scope: {} });
+    const m = plan.branches.find((b) => b.branch === 'feat/m')!;
+    const l = plan.branches.find((b) => b.branch === 'feat/l')!;
+    expect(l.isLeaf).toBe(true);
+    // The conflicting hop is NOT force-merged — its own case derivation owns
+    // the conflict (the case verdict survives, never clobbered to forced).
+    expect(m.parents[0].verdict).toBe('case');
+    expect(m.parents[0].forced ?? false).toBe(false);
+    // The leaf's un-skip is aborted outright with the sanctioned skip reason.
+    expect(l.unskipChain ?? null).toBeNull();
+    expect(l.parents[0].forced ?? false).toBe(false);
+    expect(l.parents[0].verdict).toBe('up-to-date');
+    expect(l.parents[0].skipReason).toBe('unskip-conflict');
+  });
+});
+
 // --- annotate-class detection (§1 D-002, SPEC 2) --------------------------
 describe('derivePlan — annotate-class (clean merge THROUGH a HELD-ancestor height)', () => {
   // feat/c (coverage -1) merges main_patched cleanly to height 0; main_patched

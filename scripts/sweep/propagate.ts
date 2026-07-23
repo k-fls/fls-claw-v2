@@ -162,6 +162,7 @@ import {
   plansDiffer,
   shortestUnskipChain,
   transitiveAncestors,
+  unskipChainClean,
 } from './plan.js';
 import { deriveCoverage, enumerateChain, type Chain } from './heights.js';
 import { verifyEverything, type VerifyCommand } from './verify.js';
@@ -1757,7 +1758,21 @@ export async function cmdRun(cli: Cli): Promise<number> {
             if (pp.verdict === 'skip' || pp.verdict === 'up-to-date') pp.skipReason = 'unskip-blocked';
           }
         }
-        if (uchain.length >= 2) {
+        // §6 conflict pre-probe (2026-07-23 live halt): the un-skip premise
+        // ("every parent no-op'd, so forcing produces empty merges") breaks
+        // once a prior forced hop moves a tip and a later hop then genuinely
+        // conflicts — journaledMerge -> clean-only commitTreeMerge would throw
+        // mid-chain (ERR21_MERGE_FAILED hard-halt, partial forced merges left
+        // behind). Simulate the WHOLE chain first, including the leaf's own
+        // forced merge; ANY unclean hop aborts the un-skip with NO hops forced
+        // — the leaf stays skipped ('unskip-conflict', the step verifier's
+        // sanctioned all-skip, exactly like the 'unskip-blocked' abort above)
+        // and the conflicting branch is handled by its OWN case derivation.
+        if (uchain.length >= 2 && !(await unskipChainClean(cli.repo, uchain))) {
+          for (const pp of bp.parents) {
+            if (pp.verdict === 'skip' || pp.verdict === 'up-to-date') pp.skipReason = 'unskip-conflict';
+          }
+        } else if (uchain.length >= 2) {
           bp.unskipChain = uchain;
           // Force the upstream hops (all but the leaf's own), top-down.
           for (let i = uchain.length - 2; i >= 1; i--) {
