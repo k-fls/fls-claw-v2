@@ -764,8 +764,9 @@ function openCaseBranches(journal: JournalEntry[]): Set<string> {
       closed.add(e.caseId);
     }
   }
+  const superseded = supersededCaseIds(journal);
   const out = new Set<string>();
-  for (const [caseId, branch] of branchOf) if (!closed.has(caseId)) out.add(branch);
+  for (const [caseId, branch] of branchOf) if (!closed.has(caseId) && !superseded.has(caseId)) out.add(branch);
   return out;
 }
 
@@ -4259,7 +4260,8 @@ export async function cmdStatus(cli: Cli): Promise<number> {
   const resolvedCases = new Set(
     journal.filter((e) => e.action === 'resolved' || e.action === 'held').map((e) => e.caseId as string),
   );
-  const open = openCases.filter((c) => !resolvedCases.has(c));
+  const supersededCases = supersededCaseIds(journal);
+  const open = openCases.filter((c) => !resolvedCases.has(c) && !supersededCases.has(c));
   console.log(`open cases: ${open.length}${open.length ? ` — ${open.join(', ')}` : ''}`);
   const divergedHalts = journal.filter((e) => e.action === 'halt' && e.reason === 'sync-diverged');
   if (divergedHalts.length) {
@@ -4879,10 +4881,41 @@ function reissueCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEn
 }
 
 /** Undispositioned cases this pass, topmost-first (DAG order = journal order). */
+/**
+ * Cases SUPERSEDED by a later reopen (bug #63). Resolving a case reopens its
+ * branch + descendants (§8); the next `run` re-derives each reopened branch
+ * against its now-ADVANCED parent and re-emits a FRESH case — new conflict
+ * head, new height (so a new caseId), new conflict set. The pre-reopen case is
+ * never dispositioned (it was superseded, not resolved), so every "open case"
+ * reader MUST drop it: otherwise `openCases` still serves the stale case first
+ * (lower index) and `report-case` fires ERR02_CASE_STALE forever, the branch
+ * stays wrongly excluded from the publishable set even after the fresh case
+ * resolves, and the pass never completes. A case is superseded when its LAST
+ * `case` entry precedes its branch's most-recent `reopened` (using the last
+ * entry, not `firstIndex`, so a case re-emitted under the SAME caseId after the
+ * reopen correctly survives). A reopen that re-emits nothing (branch healed /
+ * merged clean / deferred) simply leaves the branch with no open case — right.
+ */
+function supersededCaseIds(journal: JournalEntry[]): Set<string> {
+  const lastReopened = new Map<string, number>();
+  const lastCase = new Map<string, { branch: string; idx: number }>();
+  journal.forEach((e, i) => {
+    if (typeof e.branch !== 'string') return;
+    if (e.action === 'reopened') lastReopened.set(e.branch, i);
+    else if (e.action === 'case' && typeof e.caseId === 'string') lastCase.set(e.caseId, { branch: e.branch, idx: i });
+  });
+  const out = new Set<string>();
+  for (const [caseId, { branch, idx }] of lastCase) {
+    if (idx < (lastReopened.get(branch) ?? -1)) out.add(caseId);
+  }
+  return out;
+}
+
 function openCases(journal: JournalEntry[]): JournaledCase[] {
   const cases = journaledCases(journal);
+  const superseded = supersededCaseIds(journal);
   return [...cases.values()]
-    .filter((c) => lastDisposition(journal, c.caseId) === null)
+    .filter((c) => !superseded.has(c.caseId) && lastDisposition(journal, c.caseId) === null)
     .sort((a, b) => a.firstIndex - b.firstIndex);
 }
 

@@ -919,6 +919,27 @@ describe('publishableRecipe (D-051 fix 1 — pure recipe derivation)', () => {
     const held = new Set(['module/b', 'module/frozen-elsewhere']);
     expect(publishableRecipe(journal, order, held)).toEqual(['main_patched', 'module/a']);
   });
+
+  it('bug #63: a case SUPERSEDED by a reopen (stale, never disposed) does NOT exclude its branch once the fresh re-emitted case resolves', () => {
+    // module/c: stale case C-h1 emitted, parent resolved → c reopened → fresh
+    // case C-h2 emitted against the advanced parent, then RESOLVED. The stale
+    // C-h1 is never dispositioned; without supersession it would keep c out of
+    // the publishable set forever (and, in openCases, be served first → an
+    // ERR02_CASE_STALE loop). It must be treated as dead.
+    const journal: JournalEntry[] = (
+      [
+        { action: 'pre-ref', branch: 'main_patched', ref: 'x' },
+        { action: 'pre-ref', branch: 'module/c', ref: 'x' },
+        { action: 'case', branch: 'module/c', caseId: 'C-h1', head: { sha: 'aaa', height: 1 } }, // stale
+        { action: 'resolved', branch: 'main_patched', caseId: 'M1' },
+        { action: 'reopened', branch: 'module/c' }, // supersedes C-h1
+        { action: 'case', branch: 'module/c', caseId: 'C-h2', head: { sha: 'bbb', height: 2 } }, // fresh
+        { action: 'resolved', branch: 'module/c', caseId: 'C-h2' },
+      ] as Array<Record<string, unknown>>
+    ).map((e) => ({ ts: '', ...e }) as JournalEntry);
+    const order = ['main_patched', 'module/c'];
+    expect(publishableRecipe(journal, order, new Set())).toEqual(['main_patched', 'module/c']);
+  });
 });
 
 describe('propagate verify — publishable set (D-051)', () => {
