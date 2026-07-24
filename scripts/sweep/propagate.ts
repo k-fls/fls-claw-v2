@@ -6086,8 +6086,12 @@ export async function cmdSweepReportCase(
   // resolution applying the recorded decision, so a judged claim SATISFIES it —
   // blocking there loops with no exit. It still steers a mechanical/held claim
   // to judged (the effective tier is judged only when the agent claimed judged
-  // and no force-demotion to held applied).
-  if (decidedIssue && effectiveTier !== 'judged') issues.push(decidedIssue);
+  // and no force-demotion to held applied). ALSO exempt a cap-forced HELD (bug
+  // #65 finding A): once the per-case attempt cap trips, effectiveTier is pinned
+  // to 'held' and can never become 'judged', so without this the block would
+  // preempt the force-HELD freeze below and loop forever — and a forced HELD IS
+  // the correct escalation for a decided-but-non-converging case.
+  if (decidedIssue && effectiveTier !== 'judged' && !capExceeded) issues.push(decidedIssue);
 
   // Hard blocks that are NOT a freeze: the agent must fix + re-report. An
   // adequacy hit (ERR05/ERR06) means "do not open this; apply/consolidate".
