@@ -127,10 +127,20 @@ branch is a driver halt and an owner escalation.
    - `SWEEP-RESULT: <json>` — the SINGLE machine-readable result line (one per
      command). Your guidance: parse it and ACT on it. Never `send_message` it.
    - Everything else (git chatter, `claude -p` noise) → ignore.
-   - `next-case` and `finish` are long — run them in the BACKGROUND with an
-     UNFILTERED monitor on their output (filtering drops `SWEEP-STEP:` lines).
-     `report-case`/`report-pr` are short — keep them FOREGROUND; relay their
-     `SWEEP-STEP:` lines the same way.
+   - Run EVERY command in the FOREGROUND (blocking) — including the long ones
+     (`next-case`, `finish`). Do NOT background them. Backgrounding parks you
+     waiting on a monitor with no queued next action, and a context compaction
+     that lands in that wait WEDGES the turn (issue #66): the follow-up gets
+     pushed into a dead query, nothing resumes, and the sweep stalls
+     unrecoverably. Foreground means the command runs to completion and returns
+     its whole output at once — pass a generous Bash timeout (the maximum your
+     tool allows) so a long `next-case`/`finish` is never cut off, then relay its
+     `SWEEP-STEP:` lines from the returned output afterward. A compaction then
+     only ever happens at a clean turn boundary (between commands), where you
+     just pick the loop back up (see RESUME ACROSS A CONTEXT COMPACTION). If a
+     foreground command ever does exceed the timeout, re-run it — `next-case` is
+     idempotent and `finish` is resumable (landed work skips); never switch it to
+     the background to dodge a timeout.
 
    DO WHAT EACH COMMAND RETURNS — never pass ids, never argue with a blocking id:
    - `start` — networked: fetches origin+upstream, then rebuilds the blocked set
