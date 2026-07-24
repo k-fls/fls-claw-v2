@@ -102,6 +102,22 @@ branch is a driver halt and an owner escalation.
    finish --execute --token-file <path> --commands-file <cheap-tests.json>   # creates ALL PRs, after verify
    ```
 
+   RUN THE LOOP TO `finish` IN ONE CONTINUOUS TURN. Each command is a single
+   STEP of the loop, not a turn boundary. After `next-case` serves a case,
+   resolve it, `report-case` (then `report-pr` if asked), and immediately take
+   the NEXT case — do not end your turn, idle, or wait for a prompt while a case
+   sits at `case-ready` or `awaiting-pr`. You stop for exactly three things: a
+   `finish` SWEEP-RESULT (the pass is done), a genuine stop-case (report to the
+   owner and stop — see the ERR table + "Reporting to the owner"), or the owner
+   interrupting you. A clean case, a long run, or a quiet stretch is NOT a stop.
+
+   RESUME ACROSS A CONTEXT COMPACTION. The driver holds ALL pass state itself
+   (journal + machine-state); you carry none. So a compaction mid-loop is a
+   re-orientation point, never a finish line: right after one, run `next-case`
+   (it deterministically re-serves the current case or advances to the next) and
+   continue — or `report-pr` first if the machine was `awaiting-pr`. Never end
+   the turn at a compaction; pick the loop back up.
+
    THE TWO-PREFIX STDOUT CONTRACT — only two kinds of lines matter:
    - `SWEEP-STEP: <msg>` — a major-step progress line (driver self-limits).
      RELAY each one to the owner via `send_message` as a one-line statement —
