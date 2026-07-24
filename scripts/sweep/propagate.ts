@@ -6082,16 +6082,18 @@ export async function cmdSweepReportCase(
     );
   }
 
-  // ERR05 (decided-already, #65): the prescribed forward path IS a JUDGED
-  // resolution applying the recorded decision, so a judged claim SATISFIES it —
-  // blocking there loops with no exit. It still steers a mechanical/held claim
-  // to judged (the effective tier is judged only when the agent claimed judged
-  // and no force-demotion to held applied). ALSO exempt a cap-forced HELD (bug
-  // #65 finding A): once the per-case attempt cap trips, effectiveTier is pinned
-  // to 'held' and can never become 'judged', so without this the block would
-  // preempt the force-HELD freeze below and loop forever — and a forced HELD IS
-  // the correct escalation for a decided-but-non-converging case.
-  if (decidedIssue && effectiveTier !== 'judged' && !capExceeded) issues.push(decidedIssue);
+  // ERR05 (decided-already) is a FIRST-ATTEMPT steer, not a standing gate: it
+  // fires once — on the case's first report this sweep (no prior report-attempt
+  // tree) and only for a non-judged claim — to say "this file is already
+  // decided; apply the recorded decision as a JUDGED resolution, don't
+  // mechanical-merge or re-ask the owner". Re-firing it on every later attempt
+  // is what dead-ended #65 (a judged retry re-hit it) and finding A (a
+  // cap-forced HELD can never be 'judged', so it looped past the force-HELD
+  // freeze below). First-attempt-only subsumes both: once steered, the case
+  // disposes on the next attempt (judged proceeds; a held/mechanical retry is no
+  // longer blocked and reaches its freeze/merge). A judged FIRST attempt is
+  // already complying, so it proceeds immediately.
+  if (decidedIssue && effectiveTier !== 'judged' && priorTrees.size === 0) issues.push(decidedIssue);
 
   // Hard blocks that are NOT a freeze: the agent must fix + re-report. An
   // adequacy hit (ERR05/ERR06) means "do not open this; apply/consolidate".

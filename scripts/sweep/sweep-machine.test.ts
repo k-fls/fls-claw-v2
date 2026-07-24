@@ -377,32 +377,28 @@ describe('sweep report-case (D-053 §2)', () => {
     expect(readJournal(dir).some((e) => e.action === 'resolved' && e.caseId === caseId)).toBe(false); // blocked before merge
   });
 
-  it('ERR05 decided-already + cap-forced HELD reaches the freeze, does NOT loop (#65 finding A)', async () => {
+  it('ERR05 decided-already is FIRST-ATTEMPT-ONLY: 1st held report steers, 2nd disposes — no loop (#65 finding A)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
     const inv = decidedInventory(['src/x.ts']);
     const dir = dirOf(repo, ws);
     const caseId = await toCase(repo, ws, inv);
     const out = join(ws, 'rc.json');
-    // Burn the per-case attempt cap with distinct HELD resolutions on the
-    // decided path. Pre-cap each is ERR05-blocked (steer to judged); the cap
-    // (>RESOLVE_COLDREAD_CAP=3 distinct trees) then FORCES held — which must NOT
-    // re-block on ERR05 (once capped, effectiveTier is pinned 'held' and can
-    // never be 'judged', so the old guard looped forever with no exit).
-    let lastOut: { tier: string; issues?: Array<{ id: string }> } = { tier: '' };
-    let lastRc = -1;
-    for (let k = 1; k <= 4; k++) {
-      resolveWorktree(dir, caseId, { 'src/x.ts': `RESOLVED variant ${k}\n` });
-      lastRc = await cmdSweepReportCase(
-        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true, out }),
-        confirm,
-      );
-      lastOut = JSON.parse(readFileSync(out, 'utf8'));
-    }
-    // 4th report tripped the cap → forced HELD freeze, not an ERR05 dead-end.
-    expect(lastRc).toBe(0);
-    expect(lastOut.tier).toBe('held');
-    expect((lastOut.issues ?? []).some((i) => i.id === 'ERR05_DECIDED_ALREADY')).toBe(false);
+    // Attempt 1 (held, decided path): ERR05 fires ONCE — the steer.
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED variant 1\n' });
+    expect(
+      await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true, out }), confirm),
+    ).toBe(1);
+    expect((JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> }).issues.some((i) => i.id === 'ERR05_DECIDED_ALREADY')).toBe(true);
+    // Attempt 2 (distinct tree): ERR05 is quiet now (not the first attempt), so
+    // the case reaches its HELD freeze instead of looping forever.
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED variant 2\n' });
+    expect(
+      await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true, out }), confirm),
+    ).toBe(0);
+    const res2 = JSON.parse(readFileSync(out, 'utf8')) as { tier: string; issues?: Array<{ id: string }> };
+    expect(res2.tier).toBe('held');
+    expect((res2.issues ?? []).some((i) => i.id === 'ERR05_DECIDED_ALREADY')).toBe(false);
     expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
   });
 
