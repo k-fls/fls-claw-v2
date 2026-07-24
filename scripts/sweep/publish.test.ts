@@ -34,7 +34,18 @@ import {
   type Issue,
   type PrReview,
 } from './publish.js';
-import { cmdPlan, cmdPublish, cmdResolve, cmdRun, passDir, readJournal, type Cli } from './propagate.js';
+import {
+  cmdPlan,
+  cmdPublish,
+  cmdResolve,
+  cmdRun,
+  duplicateCaseIssue,
+  journaledCases,
+  passDir,
+  readJournal,
+  type Cli,
+  type JournalEntry,
+} from './propagate.js';
 import type { FeatureEntry } from './types.js';
 
 const cleanups: Array<() => void> = [];
@@ -595,6 +606,50 @@ describe('propagate publish — check battery (blocking ids reachable)', () => {
     expect(await cmdPublish(cli({ cmd: 'publish', caseId: topmost, out }))).toBe(1); // blocked on text only
     expect(readOut(out).issues.some((i) => i.id === 'ERR06_DUPLICATE_CASE')).toBe(false);
     expect(readOut(out).issues.some((i) => i.id === 'ERR08_TEXT_MISSING')).toBe(true);
+  });
+
+  it('ERR06 (#64): a subset sibling SUPERSEDED by a reopen is NOT a duplicate of the fresh superset case', async () => {
+    // The live #64 shape: module/x emits a subset case (p1, "h169", topmost by
+    // journal order), its parent resolves → x is reopened → a fresh SUPERSET
+    // case (p1+p2, "h180") is emitted. The superset's conflict blob on the
+    // SHARED path (p1) is byte-identical to the subset's, so absent supersession
+    // duplicateCaseIssue fires ERR06 pointing at the (earlier) subset — a case
+    // next-case will never serve → infinite loop. The subset is dead; skip it.
+    const repo = initFixtureRepo();
+    repo.commit('base', { 'src/p1.ts': 'orig\n', 'src/p2.ts': 'orig\n' });
+    repo.checkout('module/x', { create: true, at: 'main' });
+    repo.commit('x fork edit p1+p2', { 'src/p1.ts': 'fork1\n', 'src/p2.ts': 'fork2\n' });
+    repo.checkout('main');
+    // parent side: subHead rewrites p1 only; supHead = subHead + rewrite p2. Both
+    // carry the SAME p1 content, so the p1 conflict blob matches across the two.
+    repo.checkout('parent', { create: true, at: 'main' });
+    repo.commit('sub: p1=up', { 'src/p1.ts': 'up1\n' });
+    const subHead = repo.sha('parent');
+    repo.commit('sup: +p2=up', { 'src/p2.ts': 'up2\n' });
+    const supHead = repo.sha('parent');
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+
+    const ws = mkWorkspace();
+    const cli = baseCli(repo, ws, writeInventory([{ id: 'x', branch: 'module/x', parents: ['parent'] }]));
+    const mk = (rows: Array<Record<string, unknown>>): JournalEntry[] =>
+      rows.map((e) => ({ ts: '', ...e }) as JournalEntry);
+    // Subset case FIRST (earlier index = topmost), reopen, then the fresh superset.
+    const journal = mk([
+      { action: 'case', branch: 'module/x', parent: 'main_patched', caseId: 'x-sub', head: { sha: subHead, height: 1 }, conflictedPaths: ['src/p1.ts'] },
+      { action: 'reopened', branch: 'module/x' },
+      { action: 'case', branch: 'module/x', parent: 'main_patched', caseId: 'x-sup', head: { sha: supHead, height: 2 }, conflictedPaths: ['src/p1.ts', 'src/p2.ts'] },
+    ]);
+    const self = journaledCases(journal).get('x-sup')!;
+    // With the reopen: the subset is superseded → no ERR06 on the fresh superset.
+    expect(await duplicateCaseIssue(cli, journal, journaledCases(journal), self)).toBeNull();
+    // Control: WITHOUT the reopen the subset is a live sibling and the fixture
+    // genuinely IS a signature match — proving the assertion above tests the
+    // supersession, not a fixture that simply fails to match.
+    const noReopen = journal.filter((e) => e.action !== 'reopened');
+    const dup = await duplicateCaseIssue(cli, noReopen, journaledCases(noReopen), journaledCases(noReopen).get('x-sup')!);
+    expect(dup?.id).toBe('ERR06_DUPLICATE_CASE');
+    expect(dup!.detail).toContain('x-sub');
   });
 
   it('ERR07: a journaled pr-published entry for the case blocks a second publish', async () => {

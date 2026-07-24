@@ -2987,7 +2987,7 @@ interface JournaledCase {
   firstIndex: number;
 }
 
-function journaledCases(journal: JournalEntry[]): Map<string, JournaledCase> {
+export function journaledCases(journal: JournalEntry[]): Map<string, JournaledCase> {
   const out = new Map<string, JournaledCase>();
   journal.forEach((e, i) => {
     if (e.action !== 'case' || typeof e.caseId !== 'string') return;
@@ -3236,7 +3236,7 @@ interface DuplicateIssue extends Issue {
   duplicateOf?: { caseId: string; url: string; number: number };
 }
 
-async function duplicateCaseIssue(
+export async function duplicateCaseIssue(
   cli: Cli,
   journal: JournalEntry[],
   cases: Map<string, JournaledCase>,
@@ -3298,8 +3298,15 @@ async function duplicateCaseIssue(
     }
   };
 
+  const superseded = supersededCaseIds(journal);
   for (const other of cases.values()) {
     if (other.caseId === self.caseId) continue;
+    // A case SUPERSEDED by a reopen (bug #64) is dead — never a duplicate. Its
+    // undispositioned `case` row would otherwise read as an open sibling and,
+    // since a reopen re-emits a superset case (same conflict + new paths), match
+    // this case's signature and fire ERR06 pointing at a case next-case will
+    // never serve → the same wedge #63 fixed in the open-case readers.
+    if (superseded.has(other.caseId)) continue;
     const disposition = lastDisposition(journal, other.caseId);
     const isOpen = disposition === null || disposition.action === 'held';
     const isPublished = published.has(other.caseId);
@@ -4896,7 +4903,7 @@ function reissueCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEn
  * reopen correctly survives). A reopen that re-emits nothing (branch healed /
  * merged clean / deferred) simply leaves the branch with no open case — right.
  */
-function supersededCaseIds(journal: JournalEntry[]): Set<string> {
+export function supersededCaseIds(journal: JournalEntry[]): Set<string> {
   const lastReopened = new Map<string, number>();
   const lastCase = new Map<string, { branch: string; idx: number }>();
   journal.forEach((e, i) => {
@@ -4906,12 +4913,17 @@ function supersededCaseIds(journal: JournalEntry[]): Set<string> {
   });
   const out = new Set<string>();
   for (const [caseId, { branch, idx }] of lastCase) {
-    if (idx < (lastReopened.get(branch) ?? -1)) out.add(caseId);
+    // Only an UNDISPOSED case can be superseded. A resolved/held case's
+    // disposition STANDS — the `reopened` it triggers re-processes the branch's
+    // DESCENDANTS (§8), not the case itself, and a held case remains a valid
+    // duplicate candidate (ERR06). Without this guard a just-held case would be
+    // dropped from the duplicate scan the instant its own resolve reopened it.
+    if (idx < (lastReopened.get(branch) ?? -1) && lastDisposition(journal, caseId) === null) out.add(caseId);
   }
   return out;
 }
 
-function openCases(journal: JournalEntry[]): JournaledCase[] {
+export function openCases(journal: JournalEntry[]): JournaledCase[] {
   const cases = journaledCases(journal);
   const superseded = supersededCaseIds(journal);
   return [...cases.values()]

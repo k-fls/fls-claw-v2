@@ -28,9 +28,11 @@ import {
   cmdStatus,
   cmdUnfreeze,
   cmdVerify,
+  openCases,
   passDir,
   publishableRecipe,
   readJournal,
+  supersededCaseIds,
   type Cli,
   type JournalEntry,
 } from './propagate.js';
@@ -910,7 +912,7 @@ describe('publishableRecipe (D-051 fix 1 — pure recipe derivation)', () => {
         { action: 'pre-ref', branch: 'module/b', ref: 'x' }, // advanced but held below
         { action: 'pre-ref', branch: 'module/c', ref: 'x' }, // advanced but open case below
         { action: 'held', branch: 'module/b', caseId: 'B1', height: -1, conflictedPaths: [] },
-        { action: 'case', branch: 'module/c', caseId: 'C1' },
+        { action: 'case', branch: 'module/c', parent: 'main_patched', caseId: 'C1' },
       ] as Array<Record<string, unknown>>
     ).map((e) => ({ ts: '', ...e }) as JournalEntry);
     const order = ['main_patched', 'module/a', 'module/b', 'module/c'];
@@ -930,15 +932,69 @@ describe('publishableRecipe (D-051 fix 1 — pure recipe derivation)', () => {
       [
         { action: 'pre-ref', branch: 'main_patched', ref: 'x' },
         { action: 'pre-ref', branch: 'module/c', ref: 'x' },
-        { action: 'case', branch: 'module/c', caseId: 'C-h1', head: { sha: 'aaa', height: 1 } }, // stale
+        { action: 'case', branch: 'module/c', parent: 'main_patched', caseId: 'C-h1', head: { sha: 'aaa', height: 1 } }, // stale
         { action: 'resolved', branch: 'main_patched', caseId: 'M1' },
         { action: 'reopened', branch: 'module/c' }, // supersedes C-h1
-        { action: 'case', branch: 'module/c', caseId: 'C-h2', head: { sha: 'bbb', height: 2 } }, // fresh
+        { action: 'case', branch: 'module/c', parent: 'main_patched', caseId: 'C-h2', head: { sha: 'bbb', height: 2 } }, // fresh
         { action: 'resolved', branch: 'module/c', caseId: 'C-h2' },
       ] as Array<Record<string, unknown>>
     ).map((e) => ({ ts: '', ...e }) as JournalEntry);
     const order = ['main_patched', 'module/c'];
     expect(publishableRecipe(journal, order, new Set())).toEqual(['main_patched', 'module/c']);
+  });
+});
+
+describe('reopen-superseded cases (bug #63/#64 — every open-case reader)', () => {
+  const j = (rows: Array<Record<string, unknown>>): JournalEntry[] =>
+    rows.map((e) => ({ ts: '', ...e }) as JournalEntry);
+
+  // The exact live shape: module/container-queue emits h169, its parent
+  // resolves → the branch is reopened → a FRESH superset case h180 is emitted.
+  const liveShape = (): JournalEntry[] =>
+    j([
+      { action: 'case', branch: 'module/x', parent: 'main_patched', caseId: 'x-h169', head: { sha: 'aaa', height: 169 }, conflictedPaths: ['p1'] },
+      { action: 'arrived', branch: 'module/x' },
+      { action: 'reopened', branch: 'module/x' },
+      { action: 'case', branch: 'module/x', parent: 'main_patched', caseId: 'x-h180', head: { sha: 'bbb', height: 180 }, conflictedPaths: ['p1', 'p2'] },
+      { action: 'arrived', branch: 'module/x' },
+    ]);
+
+  it('supersededCaseIds: the pre-reopen case is superseded; the post-reopen re-emit is not', () => {
+    expect(supersededCaseIds(liveShape())).toEqual(new Set(['x-h169']));
+  });
+
+  it('openCases: serves ONLY the fresh case (the stale one would be served first → ERR02 loop, bug #63)', () => {
+    const open = openCases(liveShape());
+    expect(open.map((c) => c.caseId)).toEqual(['x-h180']);
+  });
+
+  it('a case RE-EMITTED under the SAME caseId after a reopen survives (last-entry, not firstIndex)', () => {
+    const journal = j([
+      { action: 'case', branch: 'module/x', parent: 'main_patched', caseId: 'x-h5', head: { sha: 'a', height: 5 }, conflictedPaths: ['p1'] },
+      { action: 'reopened', branch: 'module/x' },
+      { action: 'case', branch: 'module/x', parent: 'main_patched', caseId: 'x-h5', head: { sha: 'a', height: 5 }, conflictedPaths: ['p1'] }, // same id, re-emitted
+    ]);
+    expect(supersededCaseIds(journal)).toEqual(new Set());
+    expect(openCases(journal).map((c) => c.caseId)).toEqual(['x-h5']);
+  });
+
+  it('a reopen that re-emits NOTHING (branch healed / merged clean / deferred) leaves no open case', () => {
+    const journal = j([
+      { action: 'case', branch: 'module/x', parent: 'main_patched', caseId: 'x-h1', head: { sha: 'a', height: 1 }, conflictedPaths: ['p1'] },
+      { action: 'reopened', branch: 'module/x' },
+      { action: 'merge', branch: 'module/x', parent: 'main_patched' }, // clean re-merge, no new case
+    ]);
+    expect(supersededCaseIds(journal)).toEqual(new Set(['x-h1']));
+    expect(openCases(journal)).toEqual([]);
+  });
+
+  it('a disposed case is not resurrected by a later reopen of its branch', () => {
+    const journal = j([
+      { action: 'case', branch: 'module/x', parent: 'main_patched', caseId: 'x-h1', head: { sha: 'a', height: 1 }, conflictedPaths: ['p1'] },
+      { action: 'resolved', branch: 'module/x', caseId: 'x-h1' },
+      { action: 'reopened', branch: 'module/x' }, // reopens for descendants; x-h1 stays resolved
+    ]);
+    expect(openCases(journal)).toEqual([]);
   });
 });
 
