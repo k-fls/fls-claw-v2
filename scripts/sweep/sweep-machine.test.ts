@@ -104,6 +104,23 @@ function conflictFixture(): FixtureRepo {
   cleanups.push(() => repo.destroy());
   return repo;
 }
+/** Two feature branches (feat/a, feat/b) carrying the SAME fork edit on src/x.ts
+ * — identical conflict signature against main_patched (finding B duplicates). */
+function dupFixture(): FixtureRepo {
+  const repo = initFixtureRepo();
+  repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+  repo.checkout('main_patched', { create: true, at: 'main' });
+  repo.commit('mp: x = mp', { 'src/x.ts': 'mp\n' });
+  repo.checkout('main');
+  repo.checkout('feat/a', { create: true, at: 'main' });
+  repo.commit('a: x = fork', { 'src/x.ts': 'fork\n' });
+  repo.checkout('main');
+  repo.checkout('feat/b', { create: true, at: 'main' });
+  repo.commit('b: x = fork', { 'src/x.ts': 'fork\n' });
+  repo.checkout('main');
+  cleanups.push(() => repo.destroy());
+  return repo;
+}
 /** main_patched (disjoint y), U0 clean util — merges clean, NO case. */
 function cleanFixture(): FixtureRepo {
   const repo = initFixtureRepo();
@@ -400,6 +417,47 @@ describe('sweep report-case (D-053 §2)', () => {
     expect(res2.tier).toBe('held');
     expect((res2.issues ?? []).some((i) => i.id === 'ERR05_DECIDED_ALREADY')).toBe(false);
     expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
+  });
+
+  it('ERR06 finding B: a duplicate of a HELD topmost CONSOLIDATES (held-duplicate), never wedges finish', async () => {
+    const repo = dupFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'a', branch: 'feat/a', parents: ['main_patched'] },
+      { id: 'b', branch: 'feat/b', parents: ['main_patched'] },
+    ]);
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const first = currentCaseId(dir); // topmost duplicate (DAG order)
+    // Freeze the topmost HELD, then clear awaiting-pr so the twin can be served.
+    resolveWorktree(dir, first, { 'src/x.ts': 'HELD variant\n' });
+    expect(
+      await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true }), confirm),
+    ).toBe(0);
+    writePr(dir, first, 'held: x', 'freezing x for the owner');
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
+
+    // Serve the twin — identical conflict to the now-HELD topmost.
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const second = currentCaseId(dir);
+    expect(second).not.toBe(first);
+    const out = join(ws, 'rc.json');
+    // Before finding B this looped ERR06 ("resolve THAT case" — impossible, it's
+    // frozen) and finish then refused (ERR34). Now it consolidates.
+    expect(
+      await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true, out }), confirm),
+    ).toBe(0);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; issues?: Array<{ id: string }> };
+    expect(res.instruction).toContain('consolidated into held case');
+    expect((res.issues ?? []).every((i) => i.id !== 'ERR06_DUPLICATE_CASE') || res.instruction.includes('consolidated')).toBe(true);
+    // held-duplicate journaled for the twin, referencing the topmost.
+    const hd = readJournal(dir).find((e) => e.action === 'held-duplicate' && e.caseId === second);
+    expect(hd).toBeTruthy();
+    expect(hd!.duplicateOf).toBe(first);
+    // The twin DRAINED: next-case finalizes (no open case wedges finish).
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out }))).toBe(0);
+    expect((JSON.parse(readFileSync(out, 'utf8')) as { status: string }).status).toBe('finalize');
   });
 
   it('scope exceeded + cold read AGREES -> HELD publishing the RESOLUTION (escalated, no merge) — D-057 #3', async () => {

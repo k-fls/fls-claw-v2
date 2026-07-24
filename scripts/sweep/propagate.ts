@@ -2967,7 +2967,13 @@ async function originSlug(cli: Cli): Promise<{ owner: string; repo: string } | n
 function lastDisposition(journal: JournalEntry[], caseId: string): JournalEntry | null {
   let last: JournalEntry | null = null;
   for (const e of journal) {
-    if ((e.action === 'held' || e.action === 'resolved') && e.caseId === caseId) last = e;
+    // `held-duplicate` (finding B) IS a terminal disposition: the case folded
+    // into a HELD topmost sibling and inherits its PR — it must drain from
+    // openCases (so `finish` completes) and never publish a PR of its own. It is
+    // NOT `held`, so the finish held-publish phase (which filters action==='held')
+    // correctly skips it.
+    if ((e.action === 'held' || e.action === 'resolved' || e.action === 'held-duplicate') && e.caseId === caseId)
+      last = e;
   }
   return last;
 }
@@ -3234,6 +3240,13 @@ async function publishHead(
  */
 interface DuplicateIssue extends Issue {
   duplicateOf?: { caseId: string; url: string; number: number };
+  /**
+   * Set (finding B) when the matching topmost sibling is itself HELD (frozen for
+   * the owner, no PR yet). "Resolve THAT case" is impossible — it is frozen — so
+   * report-case CONSOLIDATES this case into it (a `held-duplicate` disposition)
+   * rather than blocking, and it inherits the topmost's held PR at finish.
+   */
+  heldDuplicateOf?: { caseId: string; branch: string };
 }
 
 export async function duplicateCaseIssue(
@@ -3321,6 +3334,18 @@ export async function duplicateCaseIssue(
       };
     }
     if (other.firstIndex < self.firstIndex) {
+      // Finding B: a HELD topmost cannot be "resolved" — it is frozen for the
+      // owner. Flag it for consolidation (report-case journals a held-duplicate)
+      // instead of an unsatisfiable "resolve THAT case" block that would loop
+      // and then wedge `finish` (ERR34). An UNDISPOSED topmost keeps the plain
+      // block: the agent CAN resolve it first, then this case inherits via rerere.
+      if (disposition?.action === 'held') {
+        return {
+          id: 'ERR06_DUPLICATE_CASE',
+          detail: `identical conflict to HELD case '${other.caseId}' (topmost) — it is frozen for the owner, so this case consolidates into it and inherits its PR`,
+          heldDuplicateOf: { caseId: other.caseId, branch: other.branch },
+        };
+      }
       return {
         id: 'ERR06_DUPLICATE_CASE',
         detail: `duplicate of case '${other.caseId}' (topmost by DAG order) — publish/resolve THAT case; this one inherits the resolution`,
@@ -6028,10 +6053,11 @@ export async function cmdSweepReportCase(
   // (Skipped for a REISSUE: its PR already exists — adequacy was settled at the
   // original publish; ERR05/ERR06 would wrongly re-litigate the open review.)
   let decidedIssue: Issue | null = null;
+  let dupIssue: DuplicateIssue | null = null;
   if (!isReissue) {
     decidedIssue = decidedAlready(registry.features, rc.branch, rc.conflictedPaths);
-    const dup = await duplicateCaseIssue(cli, journal, journaledCases(journal), journaledCases(journal).get(caseId)!);
-    if (dup) issues.push(dup);
+    dupIssue = await duplicateCaseIssue(cli, journal, journaledCases(journal), journaledCases(journal).get(caseId)!);
+    if (dupIssue) issues.push(dupIssue);
   }
 
   // Per-case attempt cap (D-052 force-HELD): count DISTINCT resolved trees this
@@ -6094,6 +6120,42 @@ export async function cmdSweepReportCase(
   // longer blocked and reaches its freeze/merge). A judged FIRST attempt is
   // already complying, so it proceeds immediately.
   if (decidedIssue && effectiveTier !== 'judged' && priorTrees.size === 0) issues.push(decidedIssue);
+
+  // Finding B: CONSOLIDATE into a HELD topmost sibling rather than block. The
+  // twin is frozen for the owner (no PR yet), so "resolve THAT case" is
+  // impossible; blocking here loops and then wedges `finish` (ERR34). Journal a
+  // `held-duplicate` disposition — a terminal disposition that drains openCases
+  // (finish completes) and never opens a PR of its own; this case inherits the
+  // twin's held PR. Reopen descendants so they re-evaluate against the unchanged
+  // held state. Runs BEFORE the adequacy block + ERR32 (a duplicate child's own
+  // worktree/markers are irrelevant — it takes the twin's resolution).
+  if (dupIssue?.heldDuplicateOf) {
+    if (!cli.execute) {
+      result(cli, {
+        dryRun: true,
+        instruction: `would consolidate into held ${dupIssue.heldDuplicateOf.caseId}`,
+        tier: 'held',
+        issues,
+      });
+      return 0;
+    }
+    appendJournal(dir, {
+      action: 'held-duplicate',
+      caseId,
+      branch: rc.branch,
+      duplicateOf: dupIssue.heldDuplicateOf.caseId,
+      detail: dupIssue.detail,
+    });
+    reopen(dir, reopenTargets);
+    writeMachineState(dir, { ...st, phase: 'open', currentCase: null });
+    console.error(`report-case: ${caseId} consolidated into held ${dupIssue.heldDuplicateOf.caseId}`);
+    result(cli, {
+      instruction: `consolidated into held case ${dupIssue.heldDuplicateOf.caseId} (inherits its PR); take next case`,
+      tier: 'held',
+      issues,
+    });
+    return 0;
+  }
 
   // Hard blocks that are NOT a freeze: the agent must fix + re-report. An
   // adequacy hit (ERR05/ERR06) means "do not open this; apply/consolidate".
