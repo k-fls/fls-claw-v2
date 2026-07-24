@@ -28,6 +28,7 @@ import {
   cmdStatus,
   cmdUnfreeze,
   cmdVerify,
+  coldReadWithRetry,
   openCases,
   passDir,
   publishableRecipe,
@@ -35,6 +36,7 @@ import {
   supersededCaseIds,
   type Cli,
   type JournalEntry,
+  type MachineVerdict,
 } from './propagate.js';
 import type { GithubTransport } from './publish.js';
 import { verifyEverything } from './verify.js';
@@ -3192,5 +3194,41 @@ describe('propagate freeze — a hold publishes nothing and leaves no state outs
     // No durable local state either: the ledger is byte-identical.
     const ledgerAfter = existsSync(ledgerPath) ? readFileSync(ledgerPath, 'utf8') : null;
     expect(ledgerAfter).toBe(ledgerBefore);
+  });
+});
+
+describe('coldReadWithRetry (ERR35 transient auth — delay + retry, auth is auto-refreshed)', () => {
+  const authErr = (): MachineVerdict => ({ verdict: 'error', notes: '', reason: 'cold read auth/login failure: Not logged in' });
+  it('retries an infra/auth error and returns the first CONTENT verdict once auth recovers', async () => {
+    let n = 0;
+    const attempt = (): MachineVerdict => {
+      n += 1;
+      return n < 3 ? authErr() : { verdict: 'confirm', notes: 'ok' };
+    };
+    const v = await coldReadWithRetry(attempt, [0, 0, 0, 0]); // zero backoff in tests
+    expect(v.verdict).toBe('confirm');
+    expect(n).toBe(3); // failed twice (auth warming up), succeeded on the 3rd
+  });
+
+  it('propagates the infra error only AFTER exhausting the backoff (→ ERR35)', async () => {
+    let n = 0;
+    const attempt = (): MachineVerdict => {
+      n += 1;
+      return authErr();
+    };
+    const v = await coldReadWithRetry(attempt, [0, 0, 0]);
+    expect(v.verdict).toBe('error');
+    expect(n).toBe(3); // all attempts spent before giving up
+  });
+
+  it('does NOT retry a content reject — a valid verdict returns immediately', async () => {
+    let n = 0;
+    const attempt = (): MachineVerdict => {
+      n += 1;
+      return { verdict: 'reject', notes: 'drops the fork behaviour' };
+    };
+    const v = await coldReadWithRetry(attempt, [0, 0, 0]);
+    expect(v.verdict).toBe('reject');
+    expect(n).toBe(1); // no retry on a real content decision
   });
 });

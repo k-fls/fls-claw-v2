@@ -4537,26 +4537,59 @@ export function parseMachineVerdict(stdout: string): MachineVerdict {
  * (silent if the file is unreadable: fall through to the infra-error path, never
  * crash). A spawn error / non-zero exit → `error` (infra), never a content reject.
  */
-export const defaultColdReadInvoker: ColdReadInvoker = async (prompt) => {
-  const env = { ...process.env };
-  if (!env.CLAUDE_CODE_OAUTH_TOKEN) {
+/** Default backoff (ms) before cold-read attempts: immediate, then a widening
+ * wait for an AUTOMATED auth refresh to land in the credentials file. */
+const COLDREAD_BACKOFF_MS = [0, 5000, 15000, 30000];
+
+/**
+ * Retry wrapper for a single-shot cold read. Auth is refreshed AUTOMATICALLY
+ * into the credentials file, but not instantly — a cold-started container or a
+ * mid-run token rotation can make `claude -p` print "Not logged in" for a few
+ * seconds. A `verdict:'error'` is an INFRA/auth failure (D-054), so we wait and
+ * retry (the `attempt` re-reads the token fresh each call, so a retry picks up
+ * the just-refreshed token). A real confirm/reject is a content decision and
+ * returns immediately — never retried. Only after the whole backoff is spent
+ * does the infra error propagate (→ ERR35). Injectable backoff (tests pass
+ * zeros); exported for unit tests.
+ */
+export async function coldReadWithRetry(
+  attempt: () => MachineVerdict,
+  backoffMs: number[] = COLDREAD_BACKOFF_MS,
+): Promise<MachineVerdict> {
+  let last: MachineVerdict = { verdict: 'error', notes: '', reason: 'cold read not attempted' };
+  for (let i = 0; i < backoffMs.length; i++) {
+    if (backoffMs[i] > 0) await new Promise((r) => setTimeout(r, backoffMs[i]));
+    last = attempt();
+    if (last.verdict !== 'error') return last; // content decision (confirm/reject) — done
+    // else: infra/auth failure — wait and retry with a freshly-read token
+  }
+  return last;
+}
+
+export const defaultColdReadInvoker: ColdReadInvoker = (prompt) =>
+  coldReadWithRetry(() => {
+    const env = { ...process.env };
+    // Re-read the token from the credentials file EVERY attempt: auth is
+    // auto-refreshed into this file, so a retry after a transient "Not logged
+    // in" must pick up the NEW token rather than reuse a stale env value. The
+    // file (when it carries a token) is the fresh source of truth; the ambient
+    // env is only the fallback when the file is unreadable/tokenless.
     try {
       const creds = JSON.parse(readFileSync(join(homedir(), '.claude', '.credentials.json'), 'utf8'));
       if (creds?.claudeAiOauth?.accessToken) env.CLAUDE_CODE_OAUTH_TOKEN = creds.claudeAiOauth.accessToken;
     } catch {
       /* credentials unreadable — fall through to the infra-error path */
     }
-  }
-  const res = spawnSync('claude', ['-p'], { input: prompt, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env });
-  if (res.status !== 0 || typeof res.stdout !== 'string') {
-    return {
-      verdict: 'error',
-      notes: '',
-      reason: `claude -p failed (status ${res.status ?? 'null'}${res.error ? `: ${res.error.message}` : ''})`,
-    };
-  }
-  return parseMachineVerdict(res.stdout);
-};
+    const res = spawnSync('claude', ['-p'], { input: prompt, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env });
+    if (res.status !== 0 || typeof res.stdout !== 'string') {
+      return {
+        verdict: 'error',
+        notes: '',
+        reason: `claude -p failed (status ${res.status ?? 'null'}${res.error ? `: ${res.error.message}` : ''})`,
+      };
+    }
+    return parseMachineVerdict(res.stdout);
+  });
 
 /**
  * Fail-closed reduction shared by both cold reads (mirrors cmdResolve's D-050
