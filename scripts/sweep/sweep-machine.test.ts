@@ -45,6 +45,23 @@ function emptyInventory(): string {
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   return dir;
 }
+/** Inventory with one feature carrying a recorded decision (prompt.decided_paths). */
+function decidedInventory(paths: string[]): string {
+  const dir = mkdtempSync(join(tmpdir(), 'sm-inv-'));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const yaml = [
+    'id: prior-decision',
+    'name: prior-decision',
+    'kind: feat',
+    'status: shipped',
+    'branch: feat/none',
+    'prompt:',
+    '  decided_paths:',
+    ...paths.map((p) => `    - ${JSON.stringify(p)}`),
+  ].join('\n');
+  writeFileSync(join(dir, 'prior-decision.yaml'), yaml + '\n');
+  return dir;
+}
 /** Minimal inventory writer (id/branch/parents) — mirrors propagate.test.ts. */
 function writeInventory(entries: Array<{ id: string; branch: string; parents?: string[] }>): string {
   const dir = mkdtempSync(join(tmpdir(), 'sm-inv-'));
@@ -315,6 +332,49 @@ describe('sweep report-case (D-053 §2)', () => {
     expect(st.phase).toBe('awaiting-pr');
     expect(st.currentCase?.tier).toBe('judged');
     expect(existsSync(join(dir, caseId, 'pr', 'materials.md'))).toBe(true);
+  });
+
+  it('ERR05 decided-already + JUDGED claim: NOT blocked — applying the recorded decision as judged IS the forward path (#65)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = decidedInventory(['src/x.ts']); // a recorded decision covers the conflicted path
+    const dir = dirOf(repo, ws);
+    const caseId = await toCase(repo, ws, inv);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED per recorded decision\n' });
+    const out = join(ws, 'rc.json');
+    // Before #65 this looped: report-case fired ERR05 regardless of tier, and
+    // --tier judged (the prescribed action) re-hit it with no exit.
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true, out }),
+        confirm,
+      ),
+    ).toBe(0);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; tier: string; issues?: Array<{ id: string }> };
+    expect(res.tier).toBe('judged');
+    expect(res.instruction).toBe('provide PR description');
+    expect((res.issues ?? []).some((i) => i.id === 'ERR05_DECIDED_ALREADY')).toBe(false);
+    expect(machineState(dir).phase).toBe('awaiting-pr');
+  });
+
+  it('ERR05 decided-already + MECHANICAL claim: STILL blocked -> steered to judged (#65 must not over-open the gate)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = decidedInventory(['src/x.ts']);
+    const dir = dirOf(repo, ws);
+    const caseId = await toCase(repo, ws, inv);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        confirm,
+      ),
+    ).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; issues: Array<{ id: string }> };
+    expect(res.issues.some((i) => i.id === 'ERR05_DECIDED_ALREADY')).toBe(true);
+    expect(res.instruction).toContain('apply the recorded decision (judged)');
+    expect(readJournal(dir).some((e) => e.action === 'resolved' && e.caseId === caseId)).toBe(false); // blocked before merge
   });
 
   it('scope exceeded + cold read AGREES -> HELD publishing the RESOLUTION (escalated, no merge) — D-057 #3', async () => {

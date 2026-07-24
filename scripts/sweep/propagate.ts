@@ -3402,7 +3402,11 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
     scopeFile: cli.scopeFile,
     routingFile: cli.routingFile,
   });
-  push(decidedAlready(registry.features, jc.branch, jc.conflictedPaths));
+  // ERR05 (decided-already) is SATISFIED by a judged resolution — applying the
+  // recorded decision as judged IS the prescribed action (#65), so it must not
+  // block the judged publish (that would dead-end a case with no forward path).
+  // It still applies to a held publish (re-asking the owner on a decided matter).
+  if (mode !== 'judged') push(decidedAlready(registry.features, jc.branch, jc.conflictedPaths));
   push(await duplicateCaseIssue(cli, journal, cases, jc));
   const priorPr = journal.filter((e) => e.action === 'pr-published' && e.caseId === jc.caseId).pop();
   if (priorPr) {
@@ -5990,9 +5994,9 @@ export async function cmdSweepReportCase(
   });
   // (Skipped for a REISSUE: its PR already exists — adequacy was settled at the
   // original publish; ERR05/ERR06 would wrongly re-litigate the open review.)
+  let decidedIssue: Issue | null = null;
   if (!isReissue) {
-    const decided = decidedAlready(registry.features, rc.branch, rc.conflictedPaths);
-    if (decided) issues.push(decided);
+    decidedIssue = decidedAlready(registry.features, rc.branch, rc.conflictedPaths);
     const dup = await duplicateCaseIssue(cli, journal, journaledCases(journal), journaledCases(journal).get(caseId)!);
     if (dup) issues.push(dup);
   }
@@ -6044,6 +6048,13 @@ export async function cmdSweepReportCase(
       `reissue revision for PR #${caseRow!.prNumber ?? '?'} — republished to the existing review PR at finish (D-059)`,
     );
   }
+
+  // ERR05 (decided-already, #65): the prescribed forward path IS a JUDGED
+  // resolution applying the recorded decision, so a judged claim SATISFIES it —
+  // blocking there loops with no exit. It still steers a mechanical/held claim
+  // to judged (the effective tier is judged only when the agent claimed judged
+  // and no force-demotion to held applied).
+  if (decidedIssue && effectiveTier !== 'judged') issues.push(decidedIssue);
 
   // Hard blocks that are NOT a freeze: the agent must fix + re-report. An
   // adequacy hit (ERR05/ERR06) means "do not open this; apply/consolidate".
