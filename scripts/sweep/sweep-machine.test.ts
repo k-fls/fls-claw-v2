@@ -25,6 +25,7 @@ import {
   parseMachineVerdict,
   passDir,
   readJournal,
+  RESOLVE_COLDREAD_CAP,
   type Cli,
   type ColdReadInvoker,
 } from './propagate.js';
@@ -555,8 +556,8 @@ describe('sweep report-case (D-053 §2)', () => {
     const inv = emptyInventory();
     const dir = dirOf(repo, ws);
     const caseId = await toCase(repo, ws, inv);
-    // Three distinct never-resolved (marker-laden) trees -> ERR32 each.
-    for (let n = 1; n <= 3; n++) {
+    // CAP distinct never-resolved (marker-laden) trees -> ERR32 each (below cap).
+    for (let n = 1; n <= RESOLVE_COLDREAD_CAP; n++) {
       resolveWorktree(dir, caseId, { 'src/x.ts': `<<<<<<< a\nattempt ${n}\n=======\nb\n>>>>>>> c\n` });
       expect(
         await cmdSweepReportCase(
@@ -565,8 +566,8 @@ describe('sweep report-case (D-053 §2)', () => {
         ),
       ).toBe(1);
     }
-    // Fourth distinct tree trips the cap -> force HELD.
-    resolveWorktree(dir, caseId, { 'src/x.ts': `<<<<<<< a\nattempt 4\n=======\nb\n>>>>>>> c\n` });
+    // One more distinct tree trips the cap -> force HELD.
+    resolveWorktree(dir, caseId, { 'src/x.ts': `<<<<<<< a\nattempt over\n=======\nb\n>>>>>>> c\n` });
     const out = join(ws, 'rc.json');
     expect(
       await cmdSweepReportCase(
@@ -803,6 +804,25 @@ describe('sweep report-pr (D-053 §2)', () => {
       1,
     );
     expect((JSON.parse(readFileSync(out, 'utf8')) as { tier: string }).tier).toBe('held');
+    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
+  });
+
+  it('report-pr description rewrites are BOUNDED: 2nd description reject -> HELD, not an unbounded loop (token-opt)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const { dir, caseId } = await toAwaiting(repo, ws, inv, 'judged');
+    const out = join(ws, 'pr.json');
+    // 1st description reject -> one rewrite retry allowed.
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), rejectDesc)).toBe(1);
+    expect((JSON.parse(readFileSync(out, 'utf8')) as { instruction: string }).instruction).toContain('rewrite:');
+    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
+    // 2nd description reject reaches COLDREAD_REJECT_LIMIT -> stop looping full
+    // cold reads on prose; escalate to HELD (sound resolution -> owner review).
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), rejectDesc)).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; tier: string };
+    expect(res.tier).toBe('held');
+    expect(res.instruction).toContain('description rejected');
     expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
   });
 });

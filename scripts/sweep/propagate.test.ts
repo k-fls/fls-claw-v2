@@ -33,6 +33,7 @@ import {
   passDir,
   publishableRecipe,
   readJournal,
+  RESOLVE_COLDREAD_CAP,
   supersededCaseIds,
   type Cli,
   type JournalEntry,
@@ -453,22 +454,25 @@ describe('propagate resolve — stale-verdict auto-clear + convergence cap (D-05
     const { caseId, caseFile } = await openCase(repo, ws, inv, dir);
     const postRun = repo.sha('main_patched');
 
-    // Three distinct resolution trees, each WITHOUT a matching verdict: every
+    // CAP distinct resolution trees, each WITHOUT a matching verdict: every
     // attempt is journaled (`coldread-attempt`) but returns exit 2 (no merge),
     // so the case stays open — exactly the thrash the cap must break.
-    for (const body of ['A\n', 'B\n', 'C\n']) {
+    const belowCap = Array.from({ length: RESOLVE_COLDREAD_CAP }, (_, i) => `v${i}\n`);
+    for (const body of belowCap) {
       const ref = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': body });
       expect(
         await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef: ref })),
       ).toBe(2);
     }
-    expect(readJournal(dir).filter((e) => e.action === 'coldread-attempt' && e.caseId === caseId).length).toBe(3);
+    expect(readJournal(dir).filter((e) => e.action === 'coldread-attempt' && e.caseId === caseId).length).toBe(
+      RESOLVE_COLDREAD_CAP,
+    );
 
-    // The 4th DISTINCT tree exceeds the cap -> force-HELD (exit 0), no merge,
+    // One more DISTINCT tree exceeds the cap -> force-HELD (exit 0), no merge,
     // branch ledger-frozen; the loop is broken.
-    const ref4 = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'D\n' });
+    const refOver = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'over\n' });
     expect(
-      await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef: ref4 })),
+      await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef: refOver })),
     ).toBe(0);
     const j = readJournal(dir);
     expect(j.some((e) => e.action === 'resolve-not-converged' && e.id === 'ERR26_RESOLVE_NOT_CONVERGED')).toBe(true);

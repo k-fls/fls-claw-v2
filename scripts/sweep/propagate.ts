@@ -1194,7 +1194,7 @@ const COLDREAD_VERDICT_GUIDANCE =
  * driver stops retrying the case and force-freezes it HELD for the owner
  * rather than looping. Kept small — a genuine resolve converges in one or two.
  */
-const RESOLVE_COLDREAD_CAP = 3;
+export const RESOLVE_COLDREAD_CAP = 2;
 
 /**
  * D-057: cold-read REJECTIONS per case before the driver stops retrying and
@@ -1236,6 +1236,20 @@ function boundedFeedback(v: { feedback?: unknown }): string | null {
 function coldReadRejectionCount(journal: JournalEntry[], caseId: string): number {
   return journal.filter(
     (e) => e.action === 'coldread' && e.caseId === caseId && e.rejected === true && e.defect !== 'description',
+  ).length;
+}
+
+/**
+ * Cold-read DESCRIPTION-defect rejections for a case (report-pr prose rewrites).
+ * A description defect is a "rewrite the PR text" instruction, not a resolution
+ * strike — but left unbounded it loops full cold reads on wording (the host-rpc
+ * 4-attempt burn). Bounded separately at COLDREAD_REJECT_LIMIT: a PR
+ * description that does not converge escalates to HELD (the sound resolution
+ * goes to owner review, the prose flagged) instead of re-reading forever.
+ */
+function coldReadDescriptionRejectionCount(journal: JournalEntry[], caseId: string): number {
+  return journal.filter(
+    (e) => e.action === 'coldread' && e.caseId === caseId && e.rejected === true && e.defect === 'description',
   ).length;
 }
 
@@ -6542,6 +6556,25 @@ export async function cmdSweepReportPr(
 
   // A description-only defect on a sound resolution → rewrite (not a freeze).
   if (rejected && verdict.defect === 'description') {
+    // Bound the rewrite loop (token-opt): a PR description rejected
+    // COLDREAD_REJECT_LIMIT times is not converging — stop burning full cold
+    // reads on wording and freeze HELD (sound resolution → owner review, prose
+    // flagged via the escalation prefix). The count includes the reject just
+    // journaled above, so the first reject still gets one rewrite retry.
+    const descRejections = coldReadDescriptionRejectionCount(readJournal(dir), caseId);
+    if (descRejections >= COLDREAD_REJECT_LIMIT && rc) {
+      await freezeHeld(cli, dir, rc, [`PR description rejected ${descRejections}x — escalated to HELD (prose not converging)`], {
+        resolvedTree,
+        escalation: { tag: ESCALATE_REJECTED_2X, feedback },
+      });
+      reopen(dir, [rc.branch, ...rc.descendants]);
+      writeMachineState(dir, { ...st, currentCase: { caseId, branch, tier: 'held' } });
+      result(cli, {
+        instruction: `held: PR description rejected ${descRejections}x — re-run report-pr to publish for owner review`,
+        tier: 'held',
+      });
+      return 1;
+    }
     result(cli, {
       instruction: `rewrite: ${verdict.notes}${feedback ? ` — ${feedback}` : ''}`,
       tier,
