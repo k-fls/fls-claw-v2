@@ -1034,6 +1034,31 @@ const COLD_READ_PREAMBLE = [
 const CONTEXT_EXCERPT_CAP = 2000;
 
 /**
+ * The PATH-RELEVANT slice of an `extra_context` blob (token-opt): only the
+ * lines that mention a conflicted path, each with ±2 lines of surrounding
+ * context, gaps elided with `…`. Returns null when nothing in the blob mentions
+ * a conflicted path — so an entry's full recorded-decision prose is embedded
+ * only for the parts that bear on THIS case, not the whole blob truncated.
+ */
+export function relevantExcerpt(ctx: string, paths: string[], around = 2): string | null {
+  const lines = ctx.split('\n');
+  const keep = new Set<number>();
+  lines.forEach((l, i) => {
+    if (paths.some((p) => l.includes(p)))
+      for (let j = Math.max(0, i - around); j <= Math.min(lines.length - 1, i + around); j++) keep.add(j);
+  });
+  if (keep.size === 0) return null;
+  const out: string[] = [];
+  let prev = -2;
+  for (const i of [...keep].sort((a, b) => a - b)) {
+    if (i > prev + 1) out.push('…');
+    out.push(lines[i]);
+    prev = i;
+  }
+  return out.join('\n').slice(0, CONTEXT_EXCERPT_CAP);
+}
+
+/**
  * Per-side one-line histories over the conflicted paths: what each side did to
  * the disputed files since their merge base (`git log --oneline`, capped).
  * Driver-derived facts used by the case context block (§7, D-048) and
@@ -1049,6 +1074,42 @@ async function perSideLog(
   const log = async (to: string): Promise<string> =>
     (await git(repo, ['log', '--oneline', '-20', `${base}..${to}`, '--', ...paths])).stdout.trimEnd() || '(no commits)';
   return { ours: await log(branchTip), theirs: await log(headSha) };
+}
+
+/**
+ * The CONFLICT REGIONS only (token-opt), extracted from the automerge tree
+ * blobs: each `<<<<<<<…=======…>>>>>>>` block (diff3 `|||||||` base included)
+ * with ±`around` lines of surrounding context, gaps elided with `…`, one
+ * labeled block per path. Replaces a full `git diff <tip> <automergeTree>`,
+ * which also dragged in theirs's NON-conflicting clean changes to the same
+ * files — the cold read only judges the marked regions + the resolution diff.
+ * A path absent from the tree (delete/modify) is skipped (its conflict shows in
+ * the resolution diff). Best-effort; returns '' if nothing is markered.
+ */
+export async function conflictHunks(repo: string, tree: string, paths: string[], around = 3): Promise<string> {
+  const blocks: string[] = [];
+  for (const p of paths) {
+    const res = await git(repo, ['cat-file', '-p', `${tree}:${p}`], { allowCodes: [128] });
+    if (res.code !== 0) continue;
+    const lines = res.stdout.split('\n');
+    const keep = new Set<number>();
+    let inConflict = false;
+    lines.forEach((l, i) => {
+      if (/^<{7}/.test(l)) inConflict = true;
+      if (inConflict) for (let j = Math.max(0, i - around); j <= Math.min(lines.length - 1, i + around); j++) keep.add(j);
+      if (/^>{7}/.test(l)) inConflict = false;
+    });
+    if (keep.size === 0) continue;
+    const out: string[] = [`--- ${p} ---`];
+    let prev = -2;
+    for (const i of [...keep].sort((a, b) => a - b)) {
+      if (i > prev + 1) out.push('…');
+      out.push(lines[i]);
+      prev = i;
+    }
+    blocks.push(out.join('\n'));
+  }
+  return blocks.join('\n\n');
 }
 
 /**
@@ -1072,10 +1133,11 @@ function inventoryContextLines(features: FeatureEntry[], branch: string, parent:
     lines.push(`- entry '${f.id}'${f.branch ? ` (branch ${f.branch})` : ''}: ${f.summary ?? f.name}`);
     if (f.owned_paths?.length) lines.push(`  owned_paths: ${f.owned_paths.join(', ')}`);
     const ctx = f.prompt?.extra_context?.trim();
-    if (ctx)
-      lines.push(
-        `  extra_context: ${ctx.length > CONTEXT_EXCERPT_CAP ? `${ctx.slice(0, CONTEXT_EXCERPT_CAP)}…` : ctx}`,
-      );
+    // Only the path-relevant slice of extra_context (token-opt) — an entry
+    // matched by branch/parent whose prose does not bear on a conflicted path
+    // contributes just its summary/owned_paths/decided_paths, not the blob.
+    const ex = ctx ? relevantExcerpt(ctx, paths) : null;
+    if (ex) lines.push(`  extra_context (path-relevant): ${ex}`);
     if (f.prompt?.decided_paths?.length) lines.push(`  decided_paths: ${f.prompt.decided_paths.join(', ')}`);
   }
   return lines;
@@ -1869,18 +1931,12 @@ export async function cmdRun(cli: Cli): Promise<number> {
         };
         const caseDir = join(dir, caseFile.id);
         writeJsonFile(join(caseDir, 'case.json'), caseFile);
-        const diffText = await git(
-          cli.repo,
-          ['diff', nowTip, caseFile.automergeTree, '--', ...caseFile.conflictedPaths],
-          {
-            allowCodes: [1],
-          },
-        );
+        const diffText = await conflictHunks(cli.repo, caseFile.automergeTree, caseFile.conflictedPaths);
         writeFileSync(
           join(caseDir, 'coldread-request.md'),
           // Resolution diff added at resolve (§7); D-048 context block included
           // from emission so the reader is never context-starved.
-          coldReadRequest(caseFile, diffText.stdout.slice(0, 60000), null, await caseContextLines(cli, caseFile)),
+          coldReadRequest(caseFile, diffText.slice(0, 60000), null, await caseContextLines(cli, caseFile)),
         );
         appendJournal(dir, {
           action: 'case',
@@ -2651,16 +2707,13 @@ export async function cmdResolve(cli: Cli): Promise<number> {
         }
       }
 
-      const tipNow = await revParse(cli.repo, rc.branch);
-      const conflictDiff = await git(cli.repo, ['diff', tipNow, rc.automergeTree, '--', ...rc.conflictedPaths], {
-        allowCodes: [1],
-      });
+      const conflictDiff = await conflictHunks(cli.repo, rc.automergeTree, rc.conflictedPaths);
       const resolutionDiff = await git(cli.repo, ['diff', rc.automergeTree, resolvedTree], { allowCodes: [1] });
       writeFileSync(
         join(caseDir, 'coldread-request.md'),
         coldReadRequest(
           rc,
-          conflictDiff.stdout.slice(0, 60000),
+          conflictDiff.slice(0, 60000),
           resolutionDiff.stdout.slice(0, 60000),
           await caseContextLines(cli, rc), // D-048: driver-derived context, regenerated fresh
         ),
@@ -6252,9 +6305,7 @@ export async function cmdSweepReportCase(
   }
 
   // --- MECHANICAL: cold read HERE, over the resolution diff ------------------
-  const conflictDiff = (
-    await git(cli.repo, ['diff', branchTip, rc.automergeTree, '--', ...rc.conflictedPaths], { allowCodes: [1] })
-  ).stdout;
+  const conflictDiff = await conflictHunks(cli.repo, rc.automergeTree, rc.conflictedPaths);
   const resolutionDiff = (await git(cli.repo, ['diff', rc.automergeTree, resolvedTree], { allowCodes: [1] })).stdout;
   const prompt = machineColdReadPrompt({
     id: caseId,
@@ -6474,19 +6525,13 @@ export async function cmdSweepReportPr(
           COLDREAD_FEEDBACK_CAP,
         )
       : null;
-    conflictDiff = (
-      await git(cli.repo, ['diff', branchTip0, rc.automergeTree, '--', ...rc.conflictedPaths], { allowCodes: [1] })
-    ).stdout;
+    conflictDiff = await conflictHunks(cli.repo, rc.automergeTree, rc.conflictedPaths);
     resolutionDiff = (await git(cli.repo, ['diff', rc.automergeTree, resolvedTree], { allowCodes: [1] })).stdout;
   } else {
     // held: review the RECORDED marker-clean resolution when one exists (the
     // unified publish will ship it as the active review PR); otherwise the
     // frozen conflict exhibit is the review content.
-    conflictDiff = (
-      await git(cli.repo, ['diff', branchTip0, caseFile.automergeTree, '--', ...caseFile.conflictedPaths], {
-        allowCodes: [1],
-      })
-    ).stdout;
+    conflictDiff = await conflictHunks(cli.repo, caseFile.automergeTree, caseFile.conflictedPaths);
     const heldDisp = lastDisposition(journal, caseId);
     const heldResolution = heldDisp?.resolution as { tree: string; markerClean: boolean } | null | undefined;
     resolutionDiff =

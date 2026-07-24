@@ -29,7 +29,9 @@ import {
   cmdUnfreeze,
   cmdVerify,
   coldReadWithRetry,
+  conflictHunks,
   openCases,
+  relevantExcerpt,
   passDir,
   publishableRecipe,
   readJournal,
@@ -3236,3 +3238,48 @@ describe('coldReadWithRetry (ERR35 transient auth — delay + retry, auth is aut
     expect(n).toBe(1); // no retry on a real content decision
   });
 });
+
+describe('materials token-opt helpers (#3)', () => {
+  it('relevantExcerpt returns only the path-relevant window; null when no path is mentioned', () => {
+    const ctx = ['intro line', 'blah blah', 'decision about src/x.ts here', 'more', 'unrelated tail', 'final'].join(
+      '\n',
+    );
+    const ex = relevantExcerpt(ctx, ['src/x.ts'], 1);
+    expect(ex).toContain('src/x.ts');
+    expect(ex).toContain('blah blah'); // -1 context
+    expect(ex).toContain('more'); // +1 context
+    expect(ex).not.toContain('final'); // far away → excluded
+    expect(relevantExcerpt('nothing relevant\nat all here', ['src/x.ts'])).toBeNull();
+  });
+
+  it('conflictHunks extracts only the marker regions + context, not far-away lines', async () => {
+    const repo = initFixtureRepo();
+    cleanups.push(() => repo.destroy());
+    const content = [
+      'top of file',
+      'a',
+      'b',
+      'c',
+      'd',
+      'e',
+      '<<<<<<< ours',
+      'OURS LINE',
+      '=======',
+      'THEIRS LINE',
+      '>>>>>>> theirs',
+      'x',
+      'y',
+      'z',
+      'bottom of file',
+    ].join('\n');
+    repo.commit('conflict', { 'src/x.ts': content });
+    const hunks = await conflictHunks(repo.dir, 'HEAD', ['src/x.ts'], 2);
+    expect(hunks).toContain('--- src/x.ts ---');
+    expect(hunks).toContain('<<<<<<< ours');
+    expect(hunks).toContain('OURS LINE');
+    expect(hunks).toContain('THEIRS LINE');
+    expect(hunks).toContain('>>>>>>> theirs');
+    expect(hunks).not.toContain('top of file'); // far above → excluded
+    expect(hunks).not.toContain('bottom of file'); // far below → excluded
+  });
+})

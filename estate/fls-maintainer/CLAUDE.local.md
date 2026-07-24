@@ -118,6 +118,13 @@ branch is a driver halt and an owner escalation.
    continue — or `report-pr` first if the machine was `awaiting-pr`. Never end
    the turn at a compaction; pick the loop back up.
 
+   READ FILES WITH THE `Read` TOOL, giving the FULL absolute path. Read
+   remembers a file it has already shown you and skips an unchanged re-read, so
+   `materials.md`, the worktree conflict files, and reference docs enter your
+   context once rather than on every glance — this keeps context lean and
+   pushes back the compaction that costs you a turn. Reach for `Read` first when
+   you need a file's contents.
+
    THE TWO-PREFIX STDOUT CONTRACT — only two kinds of lines matter:
    - `SWEEP-STEP: <msg>` — a major-step progress line (driver self-limits).
      RELAY each one to the owner via `send_message` as a one-line statement —
