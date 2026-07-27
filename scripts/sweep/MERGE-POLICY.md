@@ -101,6 +101,22 @@ success/partial `SWEEP-RESULT` reports `pullRequests` (every PR the pass touched
 recovered) with an instruction to report landed-vs-conflicted to the owner. Only a GLOBAL
 failure with no per-branch rows (red verify gate, missing token, closure check) halts.
 
+D-060 amendment (2026-07-25): the quality gate is SINGLE and lives at `report-case`.
+Tier semantics are UNCHANGED; what moves is WHERE a resolution is judged. Every
+RESOLVED case now clears a CHECKS GATE (typecheck THEN tests, from the repo-shipped
+`scripts/sweep/checks.json`) before the cold read, and the cold read runs for ALL
+tiers there — including judged and held, which previously deferred it to `report-pr`.
+A checks failure returns `ERR36_TYPECHECK_FAILED` / `ERR40_TESTS_FAILED` for a fix-and-
+re-run and charges no report-attempt; ten consecutive failures reset the worktree to
+the pristine conflict and freeze a HELD DRAFT (`[AUTO-ESCALATED: checks failing]`) so a
+failing resolution is never published. `report-pr` becomes PR AUTHORING ONLY — it reads
+`pr/body.md` (H1 first line = title) and records intent, with no cold read, no checks
+and no network. Consequently the cold reader never sees PR prose, and the
+`defect: description` verdict (with the prose-rewrite loop it drove) is RETIRED: every
+reject counts as a resolution reject toward the 2× HELD escalation. At `finish`, red
+tests with no attributable single-branch offender STOP the pass (`ERR40_TESTS_FAILED`,
+publish nothing, report to the owner) rather than halting resumably.
+
 ## 1. Merge tiers (per parent→branch merge attempt)
 
 | Tier | Trigger | Action | Review | PR |

@@ -15,6 +15,7 @@ import { initFixtureRepo, type FixtureRepo } from './fixtures.js';
 import { isAncestor } from './git.js';
 import { readLedger } from './ledger.js';
 import {
+  CHECKS_FAIL_LIMIT,
   cmdSweepAbort,
   cmdSweepFinish,
   cmdSweepNextCase,
@@ -27,6 +28,7 @@ import {
   readJournal,
   RESOLVE_COLDREAD_CAP,
   type Cli,
+  type ChecksRunner,
   type ColdReadInvoker,
 } from './propagate.js';
 import type { GithubTransport } from './publish.js';
@@ -167,11 +169,12 @@ const rejectCode: ColdReadInvoker = async () => ({
   feedback: 'restore the fork-side guard before re-reporting',
   defect: 'code',
 });
-const rejectDesc: ColdReadInvoker = async () => ({
-  verdict: 'reject',
-  notes: 'description misrepresents the resolution',
-  defect: 'description',
-});
+// D-060: the cold read is the SINGLE quality gate and it lives at `report-case`.
+// Any stage that must not cold-read gets this invoker — it fails the test loudly
+// instead of silently passing a second `claude -p` through.
+const neverInvoked: ColdReadInvoker = async () => {
+  throw new Error('cold read invoked where D-060 forbids one');
+};
 // D-054: the cold-read TOOLING is broken (spawn/exit/unparseable/auth) — an infra
 // error, distinct from a content reject. Must halt (ERR35), never freeze HELD.
 const infraError: ColdReadInvoker = async () => ({
@@ -326,7 +329,7 @@ describe('sweep report-case (D-053 §2)', () => {
     expect(readJournal(dirOf(repo, ws)).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
   });
 
-  it('judged: defers the cold read -> provide PR description, no merge, no cold read', async () => {
+  it('judged: cold read HERE (D-060) confirms -> provide PR description, NOT merged yet (merge lands at report-pr)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
@@ -344,8 +347,10 @@ describe('sweep report-case (D-053 §2)', () => {
     const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; tier: string };
     expect(res.instruction).toBe('provide PR description');
     expect(res.tier).toBe('judged');
-    expect(repo.sha('main_patched')).toBe(beforeTip); // NOT merged yet
-    expect(readJournal(dir).some((e) => e.action === 'coldread' && e.caseId === caseId)).toBe(false); // deferred
+    expect(repo.sha('main_patched')).toBe(beforeTip); // NOT merged yet (report-pr merges)
+    // D-060: the single quality gate (cold read) now runs at report-case for
+    // judged too — the coldread row exists here (no longer deferred to report-pr).
+    expect(readJournal(dir).some((e) => e.action === 'coldread' && e.caseId === caseId)).toBe(true);
     const st = machineState(dir);
     expect(st.phase).toBe('awaiting-pr');
     expect(st.currentCase?.tier).toBe('judged');
@@ -550,25 +555,63 @@ describe('sweep report-case (D-053 §2)', () => {
     expect(machineState(dir).currentCase?.tier).toBe('held');
   });
 
-  it('per-case attempt cap force-HELD after RESOLVE_COLDREAD_CAP distinct non-converging trees (D-052)', async () => {
+  it('judged cold-read reject (D-060: the gate is HERE, not at report-pr): 1st -> revise, 2nd -> HELD escalated, never merged', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
     const dir = dirOf(repo, ws);
     const caseId = await toCase(repo, ws, inv);
-    // CAP distinct never-resolved (marker-laden) trees -> ERR32 each (below cap).
-    for (let n = 1; n <= RESOLVE_COLDREAD_CAP; n++) {
-      resolveWorktree(dir, caseId, { 'src/x.ts': `<<<<<<< a\nattempt ${n}\n=======\nb\n>>>>>>> c\n` });
-      expect(
-        await cmdSweepReportCase(
-          baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true }),
-          confirm,
-        ),
-      ).toBe(1);
-    }
-    // One more distinct tree trips the cap -> force HELD.
-    resolveWorktree(dir, caseId, { 'src/x.ts': `<<<<<<< a\nattempt over\n=======\nb\n>>>>>>> c\n` });
+    const beforeTip = repo.sha('main_patched');
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
     const out = join(ws, 'rc.json');
+    // FIRST rejection: no freeze, no awaiting-pr — the case stays with the agent.
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true, out }),
+        rejectCode,
+      ),
+    ).toBe(1);
+    const first = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string };
+    expect(first.instruction).toContain('revise the resolution');
+    expect(first.instruction).toContain('restore the fork-side guard'); // reviewer feedback, verbatim
+    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
+    expect(machineState(dir).phase).toBe('case-ready');
+    // SECOND rejection: HELD (escalated) — the judged merge at report-pr is never
+    // reached, so main_patched is untouched throughout.
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true, out }),
+        rejectCode,
+      ),
+    ).toBe(0);
+    expect((JSON.parse(readFileSync(out, 'utf8')) as { tier: string }).tier).toBe('held');
+    const held = readJournal(dir).find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect(held.escalation).toMatchObject({ tag: '[AUTO-ESCALATED: cold read rejected 2x]' });
+    expect(repo.sha('main_patched')).toBe(beforeTip);
+    expect(machineState(dir).currentCase?.tier).toBe('held');
+  });
+
+  it('per-case attempt cap force-HELD after RESOLVE_COLDREAD_CAP distinct cold-read-reaching trees (D-060 5b)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    const caseId = await toCase(repo, ws, inv);
+    // D-060: report-attempt is recorded POST-CHECKS (5b), so the cap counts only
+    // cold-read-reaching (RESOLVED, checks-passing) trees. Seed CAP prior
+    // report-attempt rows with distinct trees, then report ONE more distinct
+    // RESOLVED tree: 5b sees >CAP distinct and force-freezes HELD ACTIVE with the
+    // convergence escalation, BEFORE the cold read runs.
+    const jp = join(dir, 'journal.jsonl');
+    for (let n = 1; n <= RESOLVE_COLDREAD_CAP; n++) {
+      appendFileSync(
+        jp,
+        JSON.stringify({ ts: new Date().toISOString(), action: 'report-attempt', caseId, branch: 'main_patched', tier: 'mechanical', resolvedTree: `seed-tree-${n}` }) + '\n',
+      );
+    }
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED distinct final\n' });
+    const out = join(ws, 'rc.json');
+    const coldreadsBefore = readJournal(dir).filter((e) => e.action === 'coldread' && e.caseId === caseId).length;
     expect(
       await cmdSweepReportCase(
         baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
@@ -576,7 +619,247 @@ describe('sweep report-case (D-053 §2)', () => {
       ),
     ).toBe(0);
     expect((JSON.parse(readFileSync(out, 'utf8')) as { tier: string }).tier).toBe('held');
-    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
+    const held = readJournal(dir).find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect(held).toBeTruthy();
+    expect((held.escalation as { tag: string }).tag).toBe('[AUTO-ESCALATED: resolution did not converge]');
+    // The cap tripped BEFORE the cold read — no new coldread row.
+    expect(readJournal(dir).filter((e) => e.action === 'coldread' && e.caseId === caseId).length).toBe(coldreadsBefore);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// D-060 §5a: the CHECKS GATE (typecheck THEN tests) at report-case. The runner
+// is injected (3rd param) so nothing spawns a real pnpm/bun; the checks-file is
+// resolved + pinned by `start`, so these fixtures pass it there and never again.
+// ---------------------------------------------------------------------------
+
+describe('sweep report-case — the checks gate (D-060 §5a)', () => {
+  /** A checks-file the fake runner keys off (the cmd strings are just labels). */
+  function checksFile(ws: string, over: Partial<{ typecheck: string[]; test: string[] }> = {}): string {
+    const f = join(ws, 'checks.json');
+    writeFileSync(
+      f,
+      JSON.stringify({
+        typecheck: (over.typecheck ?? ['tsc --noEmit']).map((cmd) => ({ cmd, cwd: '.' })),
+        test: (over.test ?? ['vitest run']).map((cmd) => ({ cmd, cwd: '.' })),
+      }),
+    );
+    return f;
+  }
+  /** Fails exactly the named commands; records every list it was handed, in order. */
+  function runner(failing: string[]): { fn: ChecksRunner; ran: string[][] } {
+    const ran: string[][] = [];
+    const fn: ChecksRunner = async (commands) => {
+      const names = commands.map((c) => c.cmd);
+      ran.push(names);
+      const failedNames = names.filter((n) => failing.includes(n));
+      return { ok: failedNames.length === 0, failedNames, output: failedNames.map((n) => `$ ${n}\nboom\n`).join('') };
+    };
+    return { fn, ran };
+  }
+  async function toResolvedCase(
+    repo: FixtureRepo,
+    ws: string,
+    inv: string,
+    checks: string,
+  ): Promise<{ dir: string; caseId: string }> {
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const dir = dirOf(repo, ws);
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    return { dir, caseId };
+  }
+
+  it('typecheck RED -> ERR36 (fix + re-run), tests never run, NO cold read, NO report-attempt, still case-ready', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    const r = runner(['tsc --noEmit']);
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        neverInvoked, // the gate fails BEFORE the cold read — no `claude -p` burned
+        r.fn,
+      ),
+    ).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; issues: Array<{ id: string }> };
+    expect(res.issues.some((i) => i.id === 'ERR36_TYPECHECK_FAILED')).toBe(true);
+    expect(res.instruction).toContain('re-run report-case');
+    // typecheck THEN tests: the failure short-circuits, tests are never handed over.
+    expect(r.ran).toHaveLength(1);
+    expect(r.ran[0]).toEqual(['tsc --noEmit']);
+    // The agent gets the output on disk, the driver gets a journal row, and the
+    // convergence cap is NOT charged for a tree that never reached the reviewer.
+    expect(readFileSync(join(dir, caseId, 'typecheck-output.txt'), 'utf8')).toContain('tsc --noEmit');
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'checks-fail' && e.caseId === caseId && e.kind === 'typecheck')).toBe(true);
+    expect(journal.some((e) => e.action === 'report-attempt' && e.caseId === caseId)).toBe(false);
+    expect(journal.some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
+    expect(machineState(dir).phase).toBe('case-ready');
+  });
+
+  it('tests RED -> ERR40_TESTS_FAILED; a fixed re-report passes both, journals checks-pass, and reaches the cold read', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    const red = runner(['vitest run']);
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        neverInvoked,
+        red.fn,
+      ),
+    ).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> };
+    expect(res.issues.some((i) => i.id === 'ERR40_TESTS_FAILED')).toBe(true);
+    expect(red.ran.map((l) => l[0])).toEqual(['tsc --noEmit', 'vitest run']); // typecheck ran first, and passed
+    expect(readFileSync(join(dir, caseId, 'test-output.txt'), 'utf8')).toContain('vitest run');
+    // The agent fixes it: both gates green -> checks-pass, cold read, merge.
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED AND GREEN\n' });
+    const green = runner([]);
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        confirm,
+        green.fn,
+      ),
+    ).toBe(0);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'checks-pass' && e.caseId === caseId)).toBe(true);
+    expect(journal.some((e) => e.action === 'coldread' && e.caseId === caseId)).toBe(true);
+    expect(repo.git('show', 'main_patched:src/x.ts')).toBe('RESOLVED AND GREEN');
+  });
+
+  it('CHECKS_FAIL_LIMIT consecutive failures -> HELD DRAFT at the PRISTINE conflict (the failing resolution is never published)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    // Seed LIMIT-1 prior failures, then fail once more to reach the backstop.
+    const jp = join(dir, 'journal.jsonl');
+    for (let n = 1; n < CHECKS_FAIL_LIMIT; n++) {
+      appendFileSync(
+        jp,
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          action: 'checks-fail',
+          caseId,
+          resolvedTree: `seed-tree-${n}`,
+          kind: 'typecheck',
+          failed: ['tsc --noEmit'],
+        }) + '\n',
+      );
+    }
+    const r = runner(['tsc --noEmit']);
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        neverInvoked,
+        r.fn,
+      ),
+    ).toBe(0);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; tier: string };
+    expect(res.tier).toBe('held');
+    expect(res.instruction).toContain('PRISTINE conflict state');
+    const held = readJournal(dir).find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect((held.escalation as { tag: string }).tag).toBe('[AUTO-ESCALATED: checks failing]');
+    // PRISTINE: no resolution recorded, so the publish is a DRAFT of the conflict
+    // — the agent's failing tree never becomes a review PR.
+    expect(held.resolution ?? null).toBe(null);
+    expect(machineState(dir).phase).toBe('awaiting-pr');
+    expect(machineState(dir).currentCase?.tier).toBe('held');
+  });
+
+  it('a passing run RESETS the counter: LIMIT-1 failures, then a pass, then a failure is strike 1 again (no premature HELD)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    const jp = join(dir, 'journal.jsonl');
+    for (let n = 1; n < CHECKS_FAIL_LIMIT; n++) {
+      appendFileSync(
+        jp,
+        JSON.stringify({ ts: new Date().toISOString(), action: 'checks-fail', caseId, kind: 'test', failed: ['vitest run'] }) +
+          '\n',
+      );
+    }
+    appendFileSync(jp, JSON.stringify({ ts: new Date().toISOString(), action: 'checks-pass', caseId }) + '\n');
+    const r = runner(['vitest run']);
+    const out = join(ws, 'rc.json');
+    // The counter restarted at the pass, so this is strike 1 -> ERR40, not HELD.
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        neverInvoked,
+        r.fn,
+      ),
+    ).toBe(1);
+    expect(
+      (JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> }).issues.some(
+        (i) => i.id === 'ERR40_TESTS_FAILED',
+      ),
+    ).toBe(true);
+    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
+    expect(machineState(dir).phase).toBe('case-ready');
+  });
+
+  it('a HELD claim on a pristine conflict SKIPS the gate entirely (nothing to typecheck)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const checks = checksFile(ws);
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const dir = dirOf(repo, ws);
+    const caseId = currentCaseId(dir);
+    const r = runner(['tsc --noEmit', 'vitest run']); // would fail if ever called
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true, out }),
+        neverInvoked,
+        r.fn,
+      ),
+    ).toBe(0);
+    expect(r.ran).toHaveLength(0);
+    expect(readJournal(dir).some((e) => e.action === 'checks-fail' && e.caseId === caseId)).toBe(false);
+    expect((JSON.parse(readFileSync(out, 'utf8')) as { tier: string }).tier).toBe('held');
+  });
+
+  it('no checks-file in the repo -> the gate is SKIPPED (no checks rows), the cold read still gates', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    // start with NO --checks-file: the default <repo>/scripts/sweep/checks.json
+    // does not exist in the fixture, so loadChecksConfig yields null.
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const dir = dirOf(repo, ws);
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    const r = runner([]);
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true }),
+        confirm,
+        r.fn,
+      ),
+    ).toBe(0);
+    expect(r.ran).toHaveLength(0);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'checks-pass' || e.action === 'checks-fail')).toBe(false);
+    expect(journal.some((e) => e.action === 'coldread' && e.caseId === caseId)).toBe(true);
+    expect(repo.git('show', 'main_patched:src/x.ts')).toBe('RESOLVED');
   });
 });
 
@@ -726,104 +1009,63 @@ describe('sweep report-pr (D-053 §2)', () => {
     expect(readJournal(dir).some((e) => e.action === 'push')).toBe(false);
   });
 
-  it('judged cold-read reject: 1st -> revise with feedback (never merged); 2nd -> HELD escalated (D-057 #4)', async () => {
+  it('D-060: report-pr runs NO cold read — the invoker is never called; the PR text is recorded as-is', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
     const { dir, caseId } = await toAwaiting(repo, ws, inv, 'judged');
-    const beforeTip = repo.sha('main_patched');
+    const coldreads = (): number =>
+      readJournal(dir).filter((e) => e.action === 'coldread' && e.caseId === caseId).length;
+    const before = coldreads();
+    expect(before).toBe(1); // the ONE gate, already spent at report-case
     const out = join(ws, 'pr.json');
-    // FIRST rejection: no freeze, no merge — feedback surfaced, still awaiting-pr.
-    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), rejectCode)).toBe(
-      1,
+    // A cold read HERE would be a second gate (and a second `claude -p`) — the
+    // invoker must never run, even for prose the old description-defect verdict
+    // would have rejected.
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), neverInvoked)).toBe(
+      0,
     );
-    const first = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; tier: string };
-    expect(first.tier).toBe('judged');
-    expect(first.instruction).toContain('revise the resolution');
-    expect(first.instruction).toContain('restore the fork-side guard');
-    expect(repo.sha('main_patched')).toBe(beforeTip); // NOT merged
-    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
-    expect(machineState(dir).phase).toBe('awaiting-pr');
-    // SECOND rejection: stop retrying — HELD (escalated), still never merged.
-    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), rejectCode)).toBe(
-      1,
-    );
-    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; tier: string };
-    expect(res.tier).toBe('held');
-    expect(res.instruction).toContain('held:');
-    expect(repo.sha('main_patched')).toBe(beforeTip); // NOT merged
-    const held = readJournal(dir).find((e) => e.action === 'held' && e.caseId === caseId)!;
-    expect(held.escalation).toMatchObject({ tag: '[AUTO-ESCALATED: cold read rejected 2x]' });
-    expect(machineState(dir).currentCase?.tier).toBe('held');
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; prIntent: boolean };
+    expect(res.instruction).toBe('take next case');
+    expect(res.prIntent).toBe(true);
+    expect(coldreads()).toBe(before); // no SECOND cold read
+    expect(machineState(dir).phase).toBe('open');
   });
 
-  it('description-only defect -> rewrite (no freeze, no publish)', async () => {
+  it('D-060: the H1 first line of pr/body.md IS the title (no title.txt); a body with no H1 is ERR08', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
-    repo.attachBareOrigin();
-    repo.git('push', 'origin', 'main_patched');
-    const tokenFile = join(ws, 'tok.txt');
-    writeFileSync(tokenFile, 'tok\n');
-    const { dir, caseId } = await toAwaiting(repo, ws, inv, 'held');
-    const gh = fakeGithub();
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const dir = dirOf(repo, ws);
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true }), confirm);
+    const prDir = join(dir, caseId, 'pr');
+    mkdirSync(prDir, { recursive: true });
     const out = join(ws, 'pr.json');
-    expect(
-      await cmdSweepReportPr(
-        baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, tokenFile, out }),
-        rejectDesc,
-      ),
-    ).toBe(1);
-    expect((JSON.parse(readFileSync(out, 'utf8')) as { instruction: string }).instruction).toContain('rewrite:');
-    expect(readJournal(dir).some((e) => e.action === 'pr-published' && e.caseId === caseId)).toBe(false);
-    expect(gh.calls.some((c) => c.method === 'POST' && c.path.endsWith('/pulls'))).toBe(false);
-  });
-
-  it('a description-defect reject never counts toward the code-reject escalation (D-057 #4)', async () => {
-    const repo = conflictFixture();
-    const ws = mkWorkspace();
-    const inv = emptyInventory();
-    const { dir, caseId } = await toAwaiting(repo, ws, inv, 'judged');
-    const out = join(ws, 'pr.json');
-    // Description-only defect: resolution SOUND, prose wrong -> rewrite (no strike).
-    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), rejectDesc)).toBe(
+    // No H1, no title.txt -> the driver never invents PR prose (D-048).
+    writeFileSync(join(prDir, 'body.md'), 'Decision needed: resolution of src/x.ts.\n');
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), neverInvoked)).toBe(
       1,
     );
-    expect((JSON.parse(readFileSync(out, 'utf8')) as { instruction: string }).instruction).toContain('rewrite:');
-    // FIRST code reject AFTER the description defect: still the FIRST strike ->
-    // revise-with-feedback, NOT an escalation to HELD.
-    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), rejectCode)).toBe(
-      1,
+    const err = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> };
+    expect(err.issues.some((i) => i.id === 'ERR08_TEXT_MISSING')).toBe(true);
+    expect(machineState(dir).phase).toBe('awaiting-pr'); // still the agent's case
+    // H1 first line -> title; the remainder is the body. Both are normalized to
+    // disk so the finish-time publish reads them unchanged.
+    writeFileSync(
+      join(prDir, 'body.md'),
+      '# judged: keep the fork line in src/x.ts\n\nDecision needed: resolution of src/x.ts — study before merge.\n',
     );
-    const first = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; tier: string };
-    expect(first.tier).toBe('judged');
-    expect(first.instruction).toContain('revise the resolution');
-    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
-    // SECOND code reject -> HELD (the limit counts RESOLUTION rejects only).
-    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), rejectCode)).toBe(
-      1,
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), neverInvoked)).toBe(
+      0,
     );
-    expect((JSON.parse(readFileSync(out, 'utf8')) as { tier: string }).tier).toBe('held');
-    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
-  });
-
-  it('report-pr description rewrites are BOUNDED: 2nd description reject -> HELD, not an unbounded loop (token-opt)', async () => {
-    const repo = conflictFixture();
-    const ws = mkWorkspace();
-    const inv = emptyInventory();
-    const { dir, caseId } = await toAwaiting(repo, ws, inv, 'judged');
-    const out = join(ws, 'pr.json');
-    // 1st description reject -> one rewrite retry allowed.
-    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), rejectDesc)).toBe(1);
-    expect((JSON.parse(readFileSync(out, 'utf8')) as { instruction: string }).instruction).toContain('rewrite:');
-    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
-    // 2nd description reject reaches COLDREAD_REJECT_LIMIT -> stop looping full
-    // cold reads on prose; escalate to HELD (sound resolution -> owner review).
-    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), rejectDesc)).toBe(1);
-    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; tier: string };
-    expect(res.tier).toBe('held');
-    expect(res.instruction).toContain('description rejected');
-    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
+    expect(readFileSync(join(prDir, 'title.txt'), 'utf8').trim()).toBe('judged: keep the fork line in src/x.ts');
+    const body = readFileSync(join(prDir, 'body.md'), 'utf8');
+    expect(body.startsWith('#')).toBe(false); // the H1 was consumed as the title
+    expect(body).toContain('Decision needed');
   });
 });
 
@@ -878,7 +1120,7 @@ describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
     expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).toBe(repo.sha('main_patched'));
   });
 
-  it('red verify -> halt (resumable); a re-run with a green gate completes', async () => {
+  it('D-060: RED TESTS at finish STOP the pass (publish nothing, report to the owner); a re-run with a green gate completes', async () => {
     const repo = cleanFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
@@ -893,7 +1135,26 @@ describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
         baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: failCmds(ws), out: out1 }),
       ),
     ).toBe(1);
-    expect((JSON.parse(readFileSync(out1, 'utf8')) as { halted: string }).halted).toBe('verify');
+    // Build clean, no single-branch offender to roll back: red tests are code work
+    // or an owner decision, NOT a resumable rollback — the pass stops and names
+    // the failing commands instead of reporting a generic ERR18 halt.
+    const f1 = JSON.parse(readFileSync(out1, 'utf8')) as {
+      status: string;
+      stoppedAt: string;
+      failedTests: string[];
+      halted?: string;
+      issues: Array<{ id: string }>;
+      instruction: string;
+    };
+    expect(f1.status).toBe('stopped');
+    expect(f1.stoppedAt).toBe('finish-tests');
+    expect(f1.failedTests.length).toBeGreaterThan(0);
+    expect(f1.halted).toBeUndefined(); // not the ERR18 rollback path
+    expect(f1.issues.some((i) => i.id === 'ERR40_TESTS_FAILED')).toBe(true);
+    expect(f1.instruction).toContain('publish nothing');
+    expect(readJournal(dir).some((e) => e.action === 'finish-tests-failed')).toBe(true);
+    expect(readJournal(dir).some((e) => e.action === 'pr-published')).toBe(false);
+    expect(readJournal(dir).some((e) => e.action === 'push')).toBe(false);
     // Re-run from the verify phase with a green gate -> completes; push not redone before.
     const out2 = join(ws, 'f2.json');
     expect(
@@ -1377,7 +1638,7 @@ describe('cold-read infra failure ≠ content reject (D-054, ERR35_COLDREAD_UNAV
     expect(readJournal(dir).some((e) => e.action === 'halt' && e.id === 'ERR35_COLDREAD_UNAVAILABLE')).toBe(false);
   });
 
-  it('report-pr: infra error -> HARD HALT (ERR35), nothing frozen/published, still awaiting-pr', async () => {
+  it('report-case JUDGED: infra error -> HARD HALT (ERR35), never awaiting-pr, nothing merged (D-060 moved this gate)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
@@ -1385,20 +1646,24 @@ describe('cold-read infra failure ≠ content reject (D-054, ERR35_COLDREAD_UNAV
     await cmdSweepStart(baseCli(repo, ws, inv));
     await cmdSweepNextCase(baseCli(repo, ws, inv));
     const caseId = currentCaseId(dir);
+    const beforeTip = repo.sha('main_patched');
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
-    // judged deterministic pass -> awaiting-pr; the cold read is deferred to report-pr.
-    await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true }), confirm);
-    writePr(dir, caseId, 'judged x', 'Decision needed: keep the fork line in src/x.ts.');
-    const out = join(ws, 'pr.json');
+    const out = join(ws, 'rc.json');
+    // The judged cold read runs HERE now, so its infra failure halts HERE — the
+    // case never reaches awaiting-pr on broken tooling.
     expect(
-      await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), infraError),
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true, out }),
+        infraError,
+      ),
     ).toBe(1);
     const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> };
     expect(res.issues.some((i) => i.id === 'ERR35_COLDREAD_UNAVAILABLE')).toBe(true);
-    // nothing published, nothing merged; the case is still awaiting its PR.
-    expect(readJournal(dir).some((e) => e.action === 'pr-published' && e.caseId === caseId)).toBe(false);
+    // NOT a content decision: no freeze, nothing merged, still the current case.
+    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
     expect(readJournal(dir).some((e) => e.action === 'resolved' && e.caseId === caseId)).toBe(false);
-    expect(machineState(dir).phase).toBe('awaiting-pr');
+    expect(repo.sha('main_patched')).toBe(beforeTip);
+    expect(machineState(dir).phase).toBe('case-ready');
     expect(readJournal(dir).some((e) => e.action === 'halt' && e.id === 'ERR35_COLDREAD_UNAVAILABLE')).toBe(true);
   });
 });
@@ -1649,6 +1914,78 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     expect(readJournal(dirOf(repo, ws)).some((e) => e.action === 'origin-blocked')).toBe(false);
     expect(existsSync(join(dirOf(repo, ws), 'plan-initial.json'))).toBe(false);
     expect(repo.git('-C', bare, 'rev-parse', `refs/heads/${fixBranch}`)).toBe(fixHead);
+  });
+
+  it('a REJECTED token (403) is ERR41 naming the token SOURCE — not a generic ERR13 the agent would retry', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { fixBranch, fixHead } = pushFixRef(repo);
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'stale-token\n');
+    // The token is PRESENT (so not ERR11) but GitHub rejects it mid-pass — the
+    // in-flight failure every networked command can hit once the token comes
+    // from the environment rather than from the agent.
+    const gh = fakeGithub({ 'GET /pulls?': { status: 403, body: { message: 'Bad credentials' } } });
+    const out = join(ws, 'start.json');
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile, out }), gh.factory)).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string; detail: string }> };
+    expect(res.issues[0].id).toBe('ERR41_TOKEN_REJECTED');
+    // The report must name WHERE the rejected token came from — a stale ambient
+    // $GITHUB_TOKEN and a revoked $GH_TOKEN otherwise fail identically.
+    expect(res.issues[0].detail).toContain(tokenFile);
+    expect(res.issues[0].detail).toContain('403');
+    expect(res.issues[0].detail).toContain('cannot clear this'); // retrying is pointless — say so
+    // Fail-closed exactly like ERR13: nothing journaled, no pass, ref intact.
+    expect(readJournal(dirOf(repo, ws)).some((e) => e.action === 'origin-blocked')).toBe(false);
+    expect(existsSync(join(dirOf(repo, ws), 'plan-initial.json'))).toBe(false);
+    expect(repo.git('-C', bare, 'rev-parse', `refs/heads/${fixBranch}`)).toBe(fixHead);
+  });
+
+  it('ERR41 names $GH_TOKEN / $GITHUB_TOKEN when the token came from the environment (D-060 env default)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    pushFixRef(repo);
+    const gh = fakeGithub({ 'GET /pulls?': { status: 401, body: { message: 'Bad credentials' } } });
+    const prevGh = process.env.GH_TOKEN;
+    const prevGithub = process.env.GITHUB_TOKEN;
+    cleanups.push(() => {
+      if (prevGh === undefined) delete process.env.GH_TOKEN;
+      else process.env.GH_TOKEN = prevGh;
+      if (prevGithub === undefined) delete process.env.GITHUB_TOKEN;
+      else process.env.GITHUB_TOKEN = prevGithub;
+    });
+    // No --token-file: a STALE AMBIENT $GITHUB_TOKEN is what the driver picks up.
+    delete process.env.GH_TOKEN;
+    process.env.GITHUB_TOKEN = 'stale-ambient';
+    const out = join(ws, 'start.json');
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { out }), gh.factory)).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string; detail: string }> };
+    expect(res.issues[0].id).toBe('ERR41_TOKEN_REJECTED');
+    expect(res.issues[0].detail).toContain('$GITHUB_TOKEN'); // the actual culprit is named
+    expect(res.issues[0].detail).not.toContain('stale-ambient'); // never echo the token itself
+  });
+
+  it('a non-auth API failure stays ERR13 (the retry-once path is unchanged)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    pushFixRef(repo);
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = fakeGithub({ 'GET /pulls?': { status: 500, body: { message: 'boom' } } });
+    const out = join(ws, 'start.json');
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile, out }), gh.factory)).toBe(1);
+    expect((JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> }).issues[0].id).toBe(
+      'ERR13_API_FAILED',
+    );
   });
 
   it('a failing REOPEN is ERR13 (fail-closed): no wrongful mutation, ref intact, nothing journaled reopened', async () => {

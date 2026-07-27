@@ -30,8 +30,9 @@ before `finish` leaves no PR on origin.
 (b) `sweep start` is NETWORKED and origin-derived. It fetches origin+upstream (fetch
 failure = ERR39), then reconstructs the blocked set from the origin `fix/sweep/*` refs
 — merged into `origin/<target>` → resolved + delete the ref; unmerged WITH an open PR →
-blocked; unmerged WITHOUT a PR → orphan, delete it. It takes `--token-file` (it queries
-GitHub for those PRs). The ledger `merge_status` authority (and the D-057
+blocked; unmerged WITHOUT a PR → orphan, delete it. It reads the GitHub token from the
+ENVIRONMENT (`GH_TOKEN`, fallback `GITHUB_TOKEN`) at each networked write — the agent
+manages no token file (D-060; `--token-file` survives as an internal/test override). The ledger `merge_status` authority (and the D-057
 reconcile/settle machinery) is retired: the local pass dir is disposable, so `start`
 always re-derives a clean picture from origin.
 
@@ -58,6 +59,27 @@ RESUMABLE (landed branches skip, failed retry). The one success/partial `SWEEP-R
 carries `pullRequests` + `stats` (landed/failed by category, PRs created/reissued/
 reopened/recovered) + an instruction to report landed-vs-conflicted to the owner. Only a
 GLOBAL failure (verify/token/closure) halts. See MERGE-POLICY.md D-059 for the semantics.
+
+D-060 amendment (2026-07-25): ONE quality gate, and a smaller agent surface.
+(a) `report-case` is the single gate for ALL tiers: a new CHECKS GATE (typecheck THEN
+tests, from the repo-shipped `scripts/sweep/checks.json`, `ERR36`/`ERR40`, reset-on-pass
+counter, `CHECKS_FAIL_LIMIT`=10 → pristine HELD DRAFT) followed by the cold read, which
+now runs for judged and held too. `report-attempt` is recorded POST-checks, so
+`RESOLVE_COLDREAD_CAP` counts only trees that reached the reviewer.
+(b) `report-pr` is PR AUTHORING ONLY — no cold read, no checks, no network. The cold
+reader never sees PR prose again, so the `defect: description` verdict (and the prose
+rewrite loop it drove) is RETIRED: every reject is a resolution reject.
+(c) Agent surface: execute is the DEFAULT (`--dry-run` opts out); the GH token comes from
+the ENVIRONMENT; `start` resolves and PINS the inventory + checks-file into pass state,
+so no later command takes either flag. PR text is `pr/body.md` with an H1 first line.
+(d) RED TESTS at `finish` with no attributable offender STOP the pass (publish nothing,
+report to the owner) instead of halting resumably.
+(e) An in-flight networked 401/403 is `ERR41_TOKEN_REJECTED`, not the generic
+`ERR13_API_FAILED` whose contract is "retry once" — a retry with the same rejected token
+can never clear it. Because (c) makes the driver pick a token off the environment
+silently, the detail NAMES THE SOURCE (`--token-file <path>` / `$GH_TOKEN` /
+`$GITHUB_TOKEN`) and never echoes the token, so a stale ambient `$GITHUB_TOKEN` is
+distinguishable from a revoked grant. Fail-closed behavior is unchanged.
 
 ## 1. Principle
 
@@ -99,8 +121,8 @@ GLOBAL failure (verify/token/closure) halts. See MERGE-POLICY.md D-059 for the s
   UNBLOCKED; `finish` verifies + pushes → the PR auto-flips merged); APPROVED-but-stale /
   CHANGES_REQUESTED / COMMENTED / other → REISSUE (`materializeReissueCase`). Loose
   issue/inline comments never trigger; they only feed the reissue dialog. It takes
-  `--token-file` (it queries GitHub for those PRs; token missing while unmerged refs
-  exist = `ERR11`), and every lookup/write is fail-closed (non-200 = `ERR13`). The
+  the GH token from the environment (`GH_TOKEN`/`GITHUB_TOKEN`; missing while unmerged
+  refs exist = `ERR11`), and every lookup/write is fail-closed (non-200 = `ERR13`). The
   ledger's `merge_status` is no longer read — the pass dir is disposable and `start` is
   idempotent on origin; a pass that crashed before `finish` published nothing, so the
   re-derived picture is clean.
@@ -144,44 +166,57 @@ GLOBAL failure (verify/token/closure) halts. See MERGE-POLICY.md D-059 for the s
 - Driver, blocking, internal (deterministic first): snapshot the worktree tree →
   uncommitted/empty check → scope guard (resolution diff ⊆ conflicted paths; a
   violation no longer demotes to HELD here — `scopeExceeded` is CARRIED forward to
-  the cold read, D-057) → branch-scoped tests (cheap; NOT the full rebuild) →
-  ERR05 recorded-decision / adequacy → per-case attempt cap (force-HELD beyond N,
-  D-052).
-- COLD READ placement — fires once per case, where all reviewable content exists:
-  - `mechanical` (no description ever): cold read (`claude -p`) HERE, over the
-    resolution diff. Confirm → merge in place → `merged, take next case`. Confirm
-    but scope-exceeded → HELD publishing the resolution as an ACTIVE PR (owner
-    reviews & merges; escalation prefix + reviewer feedback, D-057). Reject → the
-    reviewer's short feedback is returned for a revise-and-retry (1st strike, no
-    freeze); the 2nd reject stops retrying and escalates to HELD (D-057).
-  - `judged` / `held`: NO cold read here (deferred to `report-pr`, §report-pr).
-    On deterministic pass → `provide PR description`.
+  the cold read, D-057) → ERR05 recorded-decision / adequacy.
+- **THE SINGLE QUALITY GATE (D-060).** `report-case` is where a resolution is
+  judged — for ALL THREE tiers — and it is the only stage that runs checks or a
+  cold read. A RESOLVED case (no conflict markers left) passes through, in order:
+  - **5a. CHECKS GATE.** `checks.typecheck` THEN `checks.test`, run in the case
+    worktree from the pass's pinned `checks.json` (shipped in the repo; a missing
+    file or empty list skips that gate). A failure writes
+    `<caseDir>/{typecheck,test}-output.txt`, journals `checks-fail`, and returns
+    `ERR36_TYPECHECK_FAILED` / `ERR40_TESTS_FAILED` with "read the output, fix the
+    pending files, re-run report-case" — the phase stays `case-ready` and NO
+    report-attempt is charged. All green → `checks-pass` (which RESETS the
+    counter). At `CHECKS_FAIL_LIMIT` (10) consecutive failures the driver stops
+    asking: it resets the worktree to the PRISTINE conflict and freezes a HELD
+    DRAFT tagged `[AUTO-ESCALATED: checks failing]` — the agent's failing
+    resolution is never published.
+  - **5b. report-attempt** is recorded HERE, post-checks, so `RESOLVE_COLDREAD_CAP`
+    counts only trees that actually reached the reviewer. Beyond the cap → HELD
+    ACTIVE, `[AUTO-ESCALATED: resolution did not converge]`.
+  - **5c. COLD READ** (`claude -p`) over the RESOLUTION DIFF ONLY — no PR prose
+    exists yet, so there is nothing else to judge and no defect to classify; every
+    reject is a resolution reject. Infra failure → `ERR35` hard halt (case stays
+    put). Reject → the reviewer's short feedback is returned for a
+    revise-and-retry (1st strike, no freeze); the 2nd reject escalates to HELD
+    ACTIVE. Confirm + scope-exceeded → HELD ACTIVE (owner reviews & merges;
+    escalation prefix + feedback, D-057). Confirm + in-scope, by tier:
+    `mechanical` → merge in place → `merged, take next case`; `judged` → `provide
+    PR description` (the merge itself lands at `report-pr`); `held` → freeze HELD
+    ACTIVE → `provide PR description`.
+  - A `held` CLAIM on a still-pristine conflict skips 5a-5c entirely (there is no
+    resolution to check or read) — straight to HELD DRAFT + `provide PR
+    description`, based on the pristine conflict.
 - Return instructions (examples, authoritative): `merged, take next case` /
   `provide PR description` / `can't report judged with conflicts present, use held` /
-  `uncommitted` / `tests failed: <details path>` / `cold read rejected — revise the
-  resolution and re-run` (1st strike) / `held` (scope-exceeded, or the 2nd cold-read
-  reject, D-057).
+  `uncommitted` / `read <output-file> …, fix the pending files, re-run report-case`
+  (ERR36/ERR40) / `cold read rejected — revise the resolution and re-run` (1st
+  strike) / `held` (scope-exceeded, the 2nd cold-read reject, the convergence cap,
+  or the checks limit).
 - Pure function of (current case, worktree tree). Re-callable; no accumulating loop
   state beyond the journaled attempt cap.
 
 ### `report-pr`  (judged and held only; mechanical has no PR)
-- Reads the agent's free-text PR description from the fixed path.
-- SINGLE cold read (`claude -p`) over the resolution diff AND the description together
-  (one call covers both code and prose): judges resolution soundness AND whether the
-  description misrepresents the code. This is the kept kind-1 read with the
-  description in view — NOT the retired standalone prose gate (D-050); adequacy
-  (ERR05 / duplicate) stays mechanical.
-- Verdict handling (D-057):
-  - Description-only defect on a sound resolution → `rewrite: <reason>` (agent
-    rewrites, re-calls) — NOT a freeze.
-  - Resolution rejection (incl. UNVERIFIABLE-FROM-REQUEST, which fails closed) is
-    COUNTED per case. On a `judged` claim the 1st reject returns the reviewer's
-    feedback for a revise-and-retry (re-snapshots the worktree, no freeze); the 2nd
-    reject stops retrying and escalates to HELD. On a `held` claim a reject keeps the
-    case frozen-and-unpublished and returns `rewrite` until the description is
-    accurate.
-  - Confirm on a `judged` claim but scope-exceeded → HELD publishing the resolution
-    as an ACTIVE PR (owner reviews & merges; escalation prefix + reviewer feedback).
+- **PR AUTHORING ONLY (D-060).** NO cold read, NO checks, NO tests, NO network —
+  the single quality gate already ran at `report-case`, and re-reading here would
+  be a second `claude -p` over content that was already judged.
+- PR text: `pr/body.md` in the case dir, whose FIRST line is the H1 title
+  (`# <title>`); everything below it is the body. (A legacy `pr/title.txt` +
+  `pr/body.md` pair is still accepted; the resolved values are normalized back to
+  both files so the finish-time publish reads them unchanged.) A missing title or
+  body → `ERR08_TEXT_MISSING`; the driver NEVER generates PR prose (D-048).
+  Deterministic text checks add `WARN01_TEMPLATE_TEXT` / `WARN02_NO_DECISION_LINE`
+  — advisory, never blocking.
 - On pass, by tier — RECORD PR INTENT, PUBLISH NOTHING (D-058). Every PR is created at
   `finish`, after verify; `report-pr` only journals what to create:
   - `judged`: merge the resolution in place on the branch, then record the PR intent —
@@ -212,6 +247,14 @@ GLOBAL failure (verify/token/closure) halts. See MERGE-POLICY.md D-059 for the s
   1. verify the publishable set (full rebuild, D-051 semantics: this pass's advanced
      branches on main_patched; held/frozen excluded; red on a publishable branch →
      rollback to pre-ref + HELD(gate); red on a non-publishable branch → non-blocking).
+     The gate runs `checks.test` (host + runner) from the pass's pinned `checks.json`.
+     **RED TESTS WITH NO SINGLE-BRANCH OFFENDER STOP THE PASS (D-060):** the failing
+     names are journaled (`finish-tests-failed`) and the result is
+     `status:"stopped"`, `stoppedAt:"finish-tests"`, `ERR40_TESTS_FAILED`,
+     "REPORT to the owner … publish nothing" — nothing is pushed or published.
+     Fixing red tests is code work or an owner decision, never a re-run; that is
+     distinct from the attributable red above, which rolls the offender back and
+     IS resumable (`halted:"verify"`, `ERR18`).
   2. create the JUDGED history PRs (non-draft), before the target push.
   3. push target branches (CLEAN / MECHANICAL / prefix merges) + JUDGED closure pushes
      (same merge commit → the JUDGED PRs auto-flip merged) + closure checks + urge

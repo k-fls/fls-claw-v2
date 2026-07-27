@@ -10,26 +10,28 @@
  *
  * Commands (do what each RETURNS; never pass ids):
  *   start                         fetch origin/upstream, derive the blocked set from the origin
- *                                 fix/sweep refs (D-058; needs --token-file when unmerged refs
- *                                 exist), then open a pass and pin the watermark (refuses an
- *                                 open pass — finish/abort first)
+ *                                 fix/sweep refs (D-058), then open a pass and pin the watermark
+ *                                 (refuses an open pass — finish/abort first). Resolves + persists
+ *                                 the inventory + checks-file (D-060); later commands read them from
+ *                                 state. Optional start-only flags: --inventory <dir> (default
+ *                                 ../inventory), --checks-file <path> (default scripts/sweep/checks.json)
  *   next-case                     advance the deterministic machinery; returns {status:"case-ready",…}
  *                                 (worktree/branch/conflictedPaths/materials) or {status:"finalize"}
- *   report-case --tier T          T ∈ mechanical|judged|held (the ONLY agent param); deterministic checks
- *                                 then the cold read (mechanical: here → merge; judged/held: deferred)
- *   report-pr                     judged/held only; single cold read over the resolution diff AND the
- *                                 PR description (pr/title.txt + pr/body.md); records PR intent and
- *                                 PUBLISHES NOTHING — every PR is created at finish (D-058)
- *   finish                        verify → JUDGED PRs → push targets → urges → HELD PRs (active for a
- *                                 marker-clean resolution, draft for the pristine conflict) → owner
- *                                 report → start-again/done
+ *   report-case --tier T          T ∈ mechanical|judged|held (the ONLY agent param) — the SINGLE quality
+ *                                 gate: checks (typecheck THEN tests) then the cold read (mechanical →
+ *                                 merge; judged/held → provide PR description). D-060
+ *   report-pr                     PR AUTHORING ONLY — reads pr/body.md (first line is the H1 title,
+ *                                 `# <title>`; rest is the body), records PR intent, PUBLISHES NOTHING
+ *                                 (every PR is created at finish). No cold read, no tests. D-060
+ *   finish                        verify (runs checks.test — tests red → STOP, publish nothing) → JUDGED
+ *                                 PRs → push targets → urges → HELD PRs → owner report → start-again/done
  *   abort                         discard the open pass cleanly (rolls mutated branches back to pre-ref)
  *
- * Every mutating command needs --execute (dry-run by default). Networked steps
- * (start's origin PR checks, finish) take --token-file <path> like `propagate`.
- * The cold read is a real `claude -p` subprocess; the branch-scoped test command
- * list is opt-in via --commands-file. All the deterministic internals are the
- * `propagate` driver's — this file only wraps them as the five-command surface.
+ * Execute is the DEFAULT; --dry-run computes without writing. The substitute
+ * GitHub token comes from the environment (GH_TOKEN, fallback GITHUB_TOKEN) at
+ * each networked write (D-060) — the agent manages no token file. The cold read
+ * is a real `claude -p` subprocess. All the deterministic internals are the
+ * `propagate` driver's — this file only wraps them as the six-command surface.
  */
 import {
   cmdSweepAbort,
@@ -52,7 +54,7 @@ const SUBCOMMANDS: Record<string, (cli: Cli) => Promise<number>> = {
 };
 
 const USAGE =
-  'Usage: pnpm exec tsx scripts/sweep/sweep-machine.ts <start|next-case|report-case|report-pr|finish|abort> [--repo <path>] [--workspace <dir>] [--inventory <dir>] [--tier <t>] [--execute] [--token-file <path>] [--commands-file <file>] [--out <file>]';
+  'Usage: pnpm exec tsx scripts/sweep/sweep-machine.ts <start|next-case|report-case|report-pr|finish|abort> [--repo <path>] [--workspace <dir>] [--inventory <dir>] [--checks-file <path>] [--tier <t>] [--dry-run] [--out <file>]';
 
 const invokedDirectly = process.argv[1] && /sweep-machine\.ts$/.test(process.argv[1]);
 if (invokedDirectly) {
