@@ -5,7 +5,16 @@
  * nothing spawns a real subprocess or touches the network.
  */
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -834,6 +843,42 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     expect(r.ran).toHaveLength(0);
     expect(readJournal(dir).some((e) => e.action === 'checks-fail' && e.caseId === caseId)).toBe(false);
     expect((JSON.parse(readFileSync(out, 'utf8')) as { tier: string }).tier).toBe('held');
+  });
+
+  it('the case worktree gets the clone dep trees LINKED, so the gate can actually run (tsc/vitest resolve)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    // The clone has installed deps; a `git worktree add` checkout does NOT, so
+    // without the link `pnpm run typecheck` dies with `tsc: not found` on EVERY
+    // resolved case — a failure no agent edit can fix, marching every case to
+    // the CHECKS_FAIL_LIMIT force-HELD. Both trees the shipped checks.json needs.
+    for (const rel of ['node_modules/.bin', 'container/agent-runner/node_modules/.bin']) {
+      mkdirSync(join(repo.dir, rel), { recursive: true });
+      writeFileSync(join(repo.dir, rel, 'tsc'), '#!/bin/sh\nexit 0\n');
+    }
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const dir = dirOf(repo, ws);
+    const caseId = currentCaseId(dir);
+    const wt = join(dir, caseId, 'worktree');
+    for (const rel of ['node_modules', 'container/agent-runner/node_modules']) {
+      expect(existsSync(join(wt, rel))).toBe(true);
+      expect(lstatSync(join(wt, rel)).isSymbolicLink()).toBe(true);
+      expect(realpathSync(join(wt, rel))).toBe(realpathSync(join(repo.dir, rel)));
+    }
+    expect(existsSync(join(wt, 'node_modules', '.bin', 'tsc'))).toBe(true); // resolves through the link
+    expect(readJournal(dir).find((e) => e.action === 'case-worktree')!.linkedDeps).toEqual([
+      'node_modules',
+      'container/agent-runner/node_modules',
+    ]);
+    // The links are gitignored, so the RESOLVED TREE the driver snapshots is
+    // unaffected — a linked dep tree can never leak into a merge or a PR.
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    expect(
+      await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true }), confirm),
+    ).toBe(0);
+    expect(repo.git('ls-tree', '-r', '--name-only', 'main_patched').split('\n')).not.toContain('node_modules');
   });
 
   it('no checks-file in the repo -> the gate is SKIPPED (no checks rows), the cold read still gates', async () => {

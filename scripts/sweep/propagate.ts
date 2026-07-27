@@ -81,6 +81,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
   appendFileSync,
 } from 'node:fs';
@@ -1477,6 +1478,44 @@ async function cleanPrefixTree(
  * of re-resolving the raw conflict. Everything else (prefix HEAD, pending
  * status, snapshot/scope-guard vs automergeTree) is identical.
  */
+/**
+ * The dependency trees a case worktree needs for the D-060 checks gate. Relative
+ * to the clone root; each is linked only when the clone actually has it.
+ */
+const WORKTREE_DEP_LINKS = ['node_modules', 'container/agent-runner/node_modules'];
+
+/**
+ * D-060 fix: a `git worktree add` checkout has NO `node_modules`, so the checks
+ * gate (`pnpm run typecheck` / `pnpm test`, run IN the case worktree) would fail
+ * with `tsc: not found` on EVERY resolved case — a failure the agent cannot fix
+ * by editing conflicted files, which would march `checksFailCount` to
+ * `CHECKS_FAIL_LIMIT` and force-freeze every case as a bogus
+ * `[AUTO-ESCALATED: checks failing]` HELD draft.
+ *
+ * Symlink the CLONE's installed dependency trees into the worktree so the checks
+ * run against the agent's resolved tree with the deps the clone already has.
+ * `node_modules/` is gitignored at every depth, so the links never reach
+ * `snapshotWorktreeTree`'s `git add -A` and cannot pollute the resolved tree.
+ * Best-effort and per-tree: a missing tree in the clone is simply not linked
+ * (and its check then fails loudly and correctly, rather than silently).
+ */
+function linkNodeModules(repo: string, wtPath: string): string[] {
+  const linked: string[] = [];
+  for (const rel of WORKTREE_DEP_LINKS) {
+    const src = join(repo, rel);
+    const dest = join(wtPath, rel);
+    if (!existsSync(src) || existsSync(dest)) continue;
+    try {
+      mkdirSync(dirname(dest), { recursive: true });
+      symlinkSync(src, dest, 'dir');
+      linked.push(rel);
+    } catch {
+      /* best-effort: an unlinkable tree just leaves that check to fail loudly */
+    }
+  }
+  return linked;
+}
+
 async function createCaseWorktree(
   cli: Cli,
   dir: string,
@@ -1525,11 +1564,13 @@ async function createCaseWorktree(
     // shared .git so rerere-enabled operations in the case worktree see the
     // recorded resolutions. Best-effort, like the worktree itself.
     const seeded = await installRrCache(cli.repo, join(cli.workspace, RR_CACHE_DIRNAME));
+    const linkedDeps = linkNodeModules(cli.repo, wtPath);
     appendJournal(dir, {
       action: 'case-worktree',
       caseId: caseFile.id,
       path: wtPath,
       rerereSeeded: seeded,
+      linkedDeps,
       pendingPaths: caseFile.conflictedPaths,
       ...(contentSource ? { contentSource } : {}),
     });
