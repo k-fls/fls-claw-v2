@@ -117,6 +117,7 @@ import {
   readCandidateFiles,
   reconcileCandidates,
 } from './candidates.js';
+import { attributeFailure } from './attribute.js';
 import { readLedger, writeLedger, defaultLedgerBranch } from './ledger.js';
 import { installRrCache } from './merge.js';
 import { loadRegistry } from './registry.js';
@@ -1079,6 +1080,29 @@ async function journaledResolvedMerge(
   return commit;
 }
 
+/**
+ * D-061 (B): commit a GATE FIX onto a branch — a SINGLE-parent commit, unlike
+ * `journaledResolvedMerge`. A gate fix is new code, not a propagation merge:
+ * there is no `theirs` side to record, and recording the branch tip as a second
+ * parent would fabricate a self-merge. Same ref-scope guard and same
+ * follow-the-ref treatment of a checked-out worktree.
+ */
+async function journaledFixCommit(
+  repo: string,
+  branch: string,
+  fixedTree: string,
+  message: string,
+  scope: Set<string>,
+): Promise<string> {
+  guardRef(branch, scope);
+  const wt = await checkedOutWorktree(repo, branch);
+  const tip = await revParse(repo, branch);
+  const commit = (await git(repo, ['commit-tree', fixedTree, '-p', tip, '-m', message])).stdout.trim();
+  await git(repo, ['update-ref', `refs/heads/${branch}`, commit, tip]);
+  if (wt) await git(repo, ['reset', '--hard', commit], { cwd: wt });
+  return commit;
+}
+
 // --------------------------------------------------------------------------
 // Case artifacts.
 // --------------------------------------------------------------------------
@@ -1391,6 +1415,20 @@ function loadChecksConfig(checksFile: string | undefined): ChecksConfig | null {
  * bomb for 11 failing names. The tail is where failures and summaries live.
  */
 const CHECKS_OUTPUT_TAIL_LINES = 250;
+
+/**
+ * Cap on the failing verify output carried in a journal row (D-061 B). Enough
+ * for the compiler diagnostics `attributeFailure` parses; small enough that a
+ * chatty test runner cannot bloat the journal the whole pass reads repeatedly.
+ */
+const VERIFY_OUTPUT_JOURNAL_CAP = 20000;
+
+/**
+ * The `parent` a gate-fix case records. A gate fix is NOT a parent→child merge,
+ * so there is no real parent; this sentinel keeps the CaseFile shape intact and
+ * makes gate-fix rows obvious in the journal.
+ */
+const GATE_FIX_PARENT = '(gate-fix)';
 
 /**
  * The bounded view of a failing checks run: the failing command names up front
@@ -2534,6 +2572,56 @@ interface ResolvedCase {
   scope: Set<string>;
   /** Transitive inventory descendants from the registry edges (reopen targets, N2). */
   descendants: string[];
+}
+
+/**
+ * D-061 (B): re-derive a GATE-FIX case. `reverifyCase` cannot be used — it
+ * re-derives a CONFLICT (live first-conflict head against a named parent, an
+ * automerge tree, a plan snapshot entry), and a gate fix has none of those. Left
+ * on that path every gate-fix case dies with ERR02_CASE_STALE and the agent
+ * loops: next-case serves it, report-case rejects it, forever.
+ *
+ * The trust boundary still holds: branch, files and the failing commands come
+ * from the DRIVER'S OWN journal row, never from the agent-writable case.json.
+ * Scope and descendants are re-derived from the registry, as everywhere else.
+ */
+async function reverifyGateFixCase(
+  cli: Cli,
+  dir: string,
+  caseFile: CaseFile,
+  journal: JournalEntry[],
+): Promise<{ ok: boolean; rc?: ResolvedCase; errors: string[] }> {
+  const row = journal.find((e) => e.action === 'gate-fix' && e.caseId === caseFile.id);
+  if (!row) return { ok: false, errors: [`no gate-fix journal row for ${caseFile.id}`] };
+  const branch = String(row.branch);
+  if (!(await refExists(cli.repo, branch))) return { ok: false, errors: [`gate-fix branch ${branch} no longer exists`] };
+  const registry = loadRegistry({ inventoryDir: cli.inventory, scopeFile: cli.scopeFile, routingFile: cli.routingFile });
+  const scopeResult = await resolveScope(cli.repo, registry.features, registry.scope, { includeRemote: true });
+  const scope = new Set(scopeResult.ordered.map((e) => e.branch));
+  if (!scope.has(branch)) return { ok: false, errors: [`gate-fix branch ${branch} is out of pass scope`] };
+  const tip = await revParse(cli.repo, branch);
+  const files = Array.isArray(row.files) ? (row.files as string[]) : [];
+  return {
+    ok: true,
+    errors: [],
+    rc: {
+      id: caseFile.id,
+      branch,
+      parent: GATE_FIX_PARENT,
+      model: 'parents',
+      head: { sha: tip, height: -1 },
+      run: [],
+      conflictedPaths: files,
+      automergeTree: await treeOf(cli.repo, tip),
+      reproduction: { command: (Array.isArray(row.failedCommands) ? (row.failedCommands as string[]) : []).join(' && ') },
+      tierFloor: 'judged',
+      // 'same-files': the gate fix must stay within the files the driver named.
+      scopeGuardMode: 'same-files',
+      pendingAbove: 0,
+      scope,
+      descendants: transitiveDescendants(scopeResult.edges, branch),
+    },
+  };
 }
 
 /**
@@ -4490,8 +4578,18 @@ export async function cmdVerify(cli: Cli): Promise<number> {
   if (!offender) {
     // D-060: expose the failed command names so finish can render a factual
     // "tests failed at finish — <list>" STOP result.
-    const failedCommands = first.commands.filter((c) => c.code !== 0).map((c) => c.cmd);
-    appendJournal(dir, { action: 'verify', ok: false, attributionFailed: true, failedCommands });
+    // D-061 (B): ALSO journal the failing OUTPUT. finish cannot attribute an
+    // unattributable red to a branch without the diagnostics — file paths live
+    // in the compiler output, not in a command name — and the VerifyResult
+    // itself never reaches finish; only this journal row does. Bounded so a
+    // chatty runner cannot bloat the journal.
+    const failedCmds = first.commands.filter((c) => c.code !== 0);
+    const failedCommands = failedCmds.map((c) => c.cmd);
+    const failedOutput = failedCmds
+      .map((c) => `$ ${c.cmd}\n${c.outputTail}`)
+      .join('\n')
+      .slice(-VERIFY_OUTPUT_JOURNAL_CAP);
+    appendJournal(dir, { action: 'verify', ok: false, attributionFailed: true, failedCommands, failedOutput });
     console.error('verify: RED — no single-branch attribution (leave-one-out did not isolate an offender)');
     emit(cli, { ok: false, attributionFailed: true, commands: first.commands });
     return 1;
@@ -6374,14 +6472,20 @@ export async function cmdSweepNextCase(cli: Cli): Promise<number> {
   // the FULL time-ordered review dialog, never the fresh-conflict briefing.
   const caseRow = journal.find((e) => e.action === 'case' && e.caseId === jc.caseId) ?? null;
   const isReissue = caseRow?.reissue === true;
+  // D-061 (B): a GATE-FIX case has no merge and no markers — the briefing is the
+  // failing build, not a conflict.
+  const isGateFix = caseRow?.gateFix === true;
   progress(
     `case ready: ${jc.branch} — ${caseFile.conflictedPaths.join(', ')}${isReissue ? ' (REISSUE — revise the published resolution)' : ''}`,
   );
   // D-060: every case carries the fixed checks-contract line (typechecks now;
   // tests are report-case's job) — served in both the materials and the result.
   const materials =
-    (isReissue ? reissueCaseMaterials(dir, jc, caseRow!) : await machineCaseMaterials(cli, jc)) +
-    `\n\n${CHECKS_HANDOFF_LINE}`;
+    (isGateFix
+      ? gateFixCaseMaterials(dir, jc, caseRow!)
+      : isReissue
+        ? reissueCaseMaterials(dir, jc, caseRow!)
+        : await machineCaseMaterials(cli, jc)) + `\n\n${CHECKS_HANDOFF_LINE}`;
   writeFileSync(join(dir, jc.caseId, 'materials.md'), materials + '\n');
   st = { ...st, phase: 'case-ready', currentCase: { caseId: jc.caseId, branch: jc.branch } };
   writeMachineState(dir, st);
@@ -6458,9 +6562,12 @@ export async function cmdSweepReportCase(
 
   // §7 trust boundary: re-derive the case from git + registry (case.json is only
   // a pointer). Reuses the flag-path's reverifyCase verbatim.
-  const rv = isReissue
-    ? await reverifyReissueCase(cli, ctx, caseFile, journal, caseRow!)
-    : await reverifyCase(cli, ctx, dir, caseFile, journal);
+  const isGateFixCase = caseRow?.gateFix === true;
+  const rv = isGateFixCase
+    ? await reverifyGateFixCase(cli, dir, caseFile, journal)
+    : isReissue
+      ? await reverifyReissueCase(cli, ctx, caseFile, journal, caseRow!)
+      : await reverifyCase(cli, ctx, dir, caseFile, journal);
   if (!rv.ok) {
     console.error(`report-case HALT: case re-verification failed:\n  ${rv.errors.join('\n  ')}`);
     result(cli, {
@@ -6960,6 +7067,43 @@ export async function cmdSweepReportPr(
   // already confirmed it at report-case; re-verify + re-snapshot (fail-closed to
   // HELD only if it no longer resolves), then merge (the history PR flips to
   // merged when pushed at finish).
+  // D-061 (B): a JUDGED GATE FIX is new code on the branch, not a propagation
+  // merge — there is no parent to merge and no conflict to re-verify. Commit the
+  // fixed tree as a SINGLE-parent commit, then REOPEN every descendant so the
+  // fix is pulled through the DAG; the next `finish` sees cases outstanding
+  // (ERR34) and sends the agent back to `next-case`, and the pass can still
+  // complete. This is what makes a trunk-rooted fix salvage the pass instead of
+  // forcing a restart.
+  const gateFixRow = journal.find((e) => e.action === 'gate-fix' && e.caseId === caseId);
+  if (gateFixRow) {
+    const fixedTree = await snapshotWorktreeTree(cli.repo, caseWorktreePath(dir, caseId));
+    const registry = loadRegistry({ inventoryDir: cli.inventory, scopeFile: cli.scopeFile, routingFile: cli.routingFile });
+    const scopeResult = await resolveScope(cli.repo, registry.features, registry.scope, { includeRemote: true });
+    const scope = new Set(scopeResult.ordered.map((e) => e.branch));
+    const descendants = transitiveDescendants(scopeResult.edges, branch);
+    const preReffed0 = preReffedSet(journal);
+    await recordPreRef(cli, dir, preReffed0, branch);
+    const fixMsg = `${title}\n\n${body}\n\nGate fix for ${(gateFixRow.files as string[]).join(', ')} (case ${caseId}).`;
+    const fixCommit = await journaledFixCommit(cli.repo, branch, fixedTree, fixMsg, scope);
+    appendJournal(dir, { action: 'resolved', branch, caseId, tier: 'judged', gateFix: true, mergeCommit: fixCommit });
+    appendJournal(dir, { action: 'pr-intent', caseId, branch, mode: 'judged', gateFix: true, mergeCommit: fixCommit });
+    await removeCaseWorktree(cli, dir, caseId);
+    reopen(dir, [branch, ...descendants]);
+    writeMachineState(dir, { ...st, phase: 'open', currentCase: null });
+    progress(`gate-fix (judged): ${branch} — ${fixCommit.slice(0, 12)}; ${descendants.length} descendant(s) reopened`);
+    console.error(`report-pr: gate-fix ${caseId} committed ${fixCommit.slice(0, 12)} on ${branch}`);
+    result(cli, {
+      instruction: 'take next case — the gate fix must now be pulled through the reopened branches',
+      tier: 'judged',
+      gateFix: true,
+      mergeCommit: fixCommit,
+      reopened: descendants,
+      prIntent: true,
+      issues: warnings,
+    });
+    return 0;
+  }
+
   const rv = await reverifyCase(cli, ctx, dir, caseFile, journal);
   if (!rv.ok) {
     result(cli, {
@@ -7013,6 +7157,156 @@ export async function cmdSweepReportPr(
  * A pass that crashes BEFORE this stage has published nothing — the next
  * `start` sees a clean origin picture and redoes the pass.
  */
+/**
+ * The GATE-FIX briefing (D-061 B). Deliberately unlike a conflict briefing: it
+ * says up front that there is no merge and nothing pending, so the agent does
+ * not hunt for markers, and it states the scope explicitly because the standard
+ * "your scope is what this merge causes" rule does not apply here.
+ */
+function gateFixCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEntry): string {
+  const gf = readJournal(dir).find((e) => e.action === 'gate-fix' && e.caseId === jc.caseId);
+  const files = Array.isArray(gf?.files) ? (gf.files as string[]) : (caseRow.conflictedPaths as string[]) ?? [];
+  const failedCommands = Array.isArray(gf?.failedCommands) ? (gf.failedCommands as string[]) : [];
+  const candidates = Array.isArray(gf?.candidates) ? (gf.candidates as string[]) : [];
+  const outFile = join(dir, jc.caseId, 'gate-fix-output.txt');
+  const raw = existsSync(outFile) ? readFileSync(outFile, 'utf8') : '';
+  const tail = raw.split('\n').slice(-120).join('\n');
+  return [
+    `# GATE-FIX — ${jc.branch}`,
+    '',
+    'The full-integration build is RED from a defect that is NOT a merge conflict.',
+    'There are NO conflict markers and NOTHING is pending in this worktree.',
+    '',
+    `Failing checks: ${failedCommands.join(', ') || '(see the output below)'}`,
+    `Attributed to ${jc.branch} — ${String(gf?.reason ?? 'registry ownership')}.`,
+    ...(candidates.length > 1 ? [`Implicated: ${candidates.join(', ')} (earliest by hierarchy wins).`] : []),
+    '',
+    '## Files to fix',
+    ...files.map((f) => `- ${f}`),
+    '',
+    '## SCOPE',
+    'The files above, plus what fixing them DIRECTLY forces. This is the ONLY case',
+    'type where you change code this pass did not merge. Do NOT restructure, and do',
+    'NOT report a diagnosis to the owner instead of fixing — your fix reaches them',
+    'as a PR.',
+    '',
+    '## TIER',
+    '- `--tier judged` — you are confident. The fix is committed on the branch and',
+    '  pulled through every descendant; this pass can still complete.',
+    '- `--tier held`   — you are not. The fix is published as a PR for the owner and',
+    '  BLOCKS the next sweep until it is merged.',
+    '',
+    `## Failing output (tail; full log: ${outFile})`,
+    '```',
+    tail,
+    '```',
+  ].join('\n');
+}
+
+/** The failing command names on an `attributionFailed` verify row, if any. */
+function failedCommandsOf(row: JournalEntry | undefined): string[] {
+  return Array.isArray(row?.failedCommands) ? (row.failedCommands as string[]) : [];
+}
+
+/**
+ * D-061 (B): turn an unattributable red into a GATE-FIX case.
+ *
+ * Blame the failing files to a branch (`attributeFailure`, owner rule: earliest
+ * by hierarchy), then prepare a worktree at that branch's tip. Unlike a conflict
+ * case there is nothing pending and no markers — the agent edits the named files
+ * so the checks pass.
+ *
+ * ANTI-LOOP: a gate fix that does not actually fix leaves verify red, which
+ * would prepare another case for the same files forever. One attempt per
+ * (branch, file-set) per pass; a second red over the same set is NOT served and
+ * the caller falls back to the STOP path.
+ */
+async function materializeGateFixCase(
+  cli: Cli,
+  dir: string,
+  failedOutput: string,
+  failedCommands: string[],
+  accused: string | null,
+): Promise<{ served: boolean; caseId: string; branch: string; files: string[]; reason: string; detail: string }> {
+  const journal = readJournal(dir);
+  const { features } = loadRegistry({ inventoryDir: cli.inventory, scopeFile: cli.scopeFile, routingFile: cli.routingFile });
+  const a = attributeFailure(failedOutput, features, accused);
+  const files = a.files;
+  const none = { served: false as const, caseId: '', branch: a.branch ?? '', files, reason: '', detail: '' };
+  if (!a.branch) {
+    return { ...none, reason: 'no branch could be blamed for the failing files', detail: `verify RED (no clean attribution); ${a.reason}` };
+  }
+  const key = `${a.branch}::${[...files].sort().join(',')}`;
+  if (journal.some((e) => e.action === 'gate-fix' && e.key === key)) {
+    return {
+      ...none,
+      branch: a.branch,
+      reason: `a gate fix was already attempted for ${a.branch} over these files and the build is still red`,
+      detail: `verify RED again after a gate fix on ${a.branch} — not re-serving`,
+    };
+  }
+  const caseId = `gate-fix-${a.branch.replace(/[^\w.-]+/g, '__')}`;
+  const tip = await revParse(cli.repo, a.branch);
+  await createGateFixWorktree(cli, dir, caseId, tip);
+  const caseFile: CaseFile = {
+    schemaVersion: 1,
+    id: caseId,
+    branch: a.branch,
+    parent: GATE_FIX_PARENT,
+    head: { sha: tip, height: -1 },
+    tierFloor: 'judged',
+    conflictedPaths: files,
+    automergeTree: await treeOf(cli.repo, tip),
+    reproduction: { command: failedCommands.join(' && ') },
+    deferredCheck: { firstConflictHeight: -1, transitiveAncestors: [] },
+  };
+  mkdirSync(join(dir, caseId), { recursive: true });
+  writeFileSync(join(dir, caseId, 'case.json'), JSON.stringify(caseFile, null, 2) + '\n');
+  appendJournal(dir, {
+    action: 'gate-fix',
+    key,
+    caseId,
+    branch: a.branch,
+    files,
+    failedCommands,
+    reason: a.reason,
+    candidates: a.candidates.map((c) => `${c.branch}@${c.depth}/${c.match}`),
+  });
+  appendJournal(dir, {
+    action: 'case',
+    caseId,
+    branch: a.branch,
+    parent: GATE_FIX_PARENT,
+    gateFix: true,
+    head: { sha: tip, height: -1 },
+    height: -1,
+    conflictedPaths: files,
+  });
+  writeFileSync(join(dir, caseId, 'gate-fix-output.txt'), failedOutput);
+  return {
+    served: true,
+    caseId,
+    branch: a.branch,
+    files,
+    reason: a.reason,
+    detail: `verify RED (no clean attribution) — ${a.reason}`,
+  };
+}
+
+/**
+ * A gate-fix worktree: the branch tip, CLEAN. No clean-prefix commit, no pending
+ * conflict blobs — there is no merge here. The dep links + per-worktree excludes
+ * are installed exactly as for a conflict case so the checks gate can run.
+ */
+async function createGateFixWorktree(cli: Cli, dir: string, caseId: string, tip: string): Promise<void> {
+  const wtPath = caseWorktreePath(dir, caseId);
+  await git(cli.repo, ['worktree', 'remove', '--force', wtPath], { allowCodes: [1, 128] });
+  await git(cli.repo, ['worktree', 'prune'], { allowCodes: [1, 128] });
+  rmSync(wtPath, { recursive: true, force: true });
+  await git(cli.repo, ['worktree', 'add', '--detach', wtPath, tip]);
+  await linkNodeModules(cli.repo, wtPath);
+}
+
 /** One related PR in a finished pass's owner-facing summary (D-059 owner request). */
 interface PassPrSummary {
   number: number;
@@ -7129,19 +7423,33 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   const dir = ctx.dir;
   let st = readMachineState(dir);
   const checksFile = applyPassConfig(cli, st);
-  // D-060: the finish verify gate runs the `test` commands (host + runner) from
-  // the pass's pinned checks-file on the publishable set; a persisted checks-file
-  // wins over any legacy --commands-file. When it is absent, the tests gate is
-  // skipped (cli.commands undefined → cmdVerify falls back to --commands-file /
-  // VERIFY_COMMANDS, the pre-D-060 behavior).
+  // D-060: the finish verify gate runs the checks from the pass's pinned
+  // checks-file on the publishable set; a persisted checks-file wins over any
+  // legacy --commands-file. When it is absent the gate is skipped (cli.commands
+  // undefined → cmdVerify falls back to --commands-file / VERIFY_COMMANDS, the
+  // pre-D-060 behavior).
+  //
+  // D-061 (B): TYPECHECK FIRST, then tests. Pre-D-061 finish ran `test` ONLY, so
+  // a type error surfaced indirectly (a suite failing to import) or not at all,
+  // and the verify log held no compiler diagnostics — leaving `attributeFailure`
+  // nothing to parse and every unattributable red falling back to the branch
+  // verify accused. Typecheck output is what makes blame possible, and it is the
+  // cheap check besides.
   const finishChecks = loadChecksConfig(checksFile);
-  const finishTestCommands = finishChecks?.test;
+  const finishTestCommands = finishChecks ? [...finishChecks.typecheck, ...finishChecks.test] : undefined;
   if (!st) {
     console.error('finish: no machine state — run `sweep start` first');
     return 2;
   }
   if (st.phase === 'awaiting-pr' || openCases(readJournal(dir)).length > 0) {
-    const detail = 'cases remain — resolve every case (next-case/report-case/report-pr) before finish';
+    // D-061 (B): say WHY cases reappeared when a judged gate fix reopened the
+    // DAG — otherwise "cases remain" right after a finish reads like a driver
+    // bug, and the agent is liable to report it as one instead of looping.
+    const gfResolved = readJournal(dir).find((e) => e.action === 'resolved' && e.gateFix === true);
+    const detail = gfResolved
+      ? `cases remain — the gate fix on ${String(gfResolved.branch)} advanced that branch, so its descendants were ` +
+        `reopened to pull the fix through. This is expected: run \`next-case\` and work them, then finish again.`
+      : 'cases remain — resolve every case (next-case/report-case/report-pr) before finish';
     console.error(`finish [ERR34_CASES_REMAIN]: ${detail}`);
     result(cli, { ok: false, issues: [{ id: 'ERR34_CASES_REMAIN', detail }] });
     return 1;
@@ -7195,22 +7503,49 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
       .slice(verifyLenBefore)
       .find((e) => e.action === 'verify' && e.attributionFailed === true && Array.isArray(e.failedCommands));
     const failedTests = attrib ? (attrib.failedCommands as string[]) : [];
-    if (verifyRc !== 0 && failedTests.length > 0) {
-      appendJournal(dir, { action: 'finish-tests-failed', failed: failedTests });
-      progress(`verify: tests RED — ${failedTests.join(', ')} — publish nothing`);
-      console.error(`finish: tests failed at finish — ${failedTests.join(', ')}; publishing nothing`);
-      // Leave the pass UNSEALED (phase finishing) — nothing published/pushed.
-      result(cli, {
-        ok: false,
-        status: 'stopped',
-        stoppedAt: 'finish-tests',
-        failedTests,
-        issues: [{ id: 'ERR40_TESTS_FAILED', detail: `tests failed at finish — ${failedTests.join(', ')}` }],
-        instruction: `REPORT to the owner: tests failed at finish — ${failedTests.join(', ')}; publish nothing`,
-      });
-      return 1;
-    }
     const offender = gateAfter > gateBefore ? (gatesNow[gatesNow.length - 1].branch as string | undefined) : undefined;
+
+    // D-061 (B): an UNATTRIBUTABLE red is a build defect nobody in this pass
+    // caused — pre-D-061 it dead-ended in an ERR18/ERR40 whose message asked a
+    // HUMAN to fix something the agent is forbidden to deliver (it may not push
+    // or open a PR). Turn it into a CASE instead, so the fix flows through the
+    // machinery that already exists: agent edits → checks gate PROVES it green →
+    // cold read → judged (merge in place + re-propagate) or held (fix/sweep ref +
+    // PR that blocks the next pass until the owner merges).
+    if (verifyRc !== 0) {
+      const failedOutput = typeof attrib?.failedOutput === 'string' ? attrib.failedOutput : '';
+      const gate = await materializeGateFixCase(cli, dir, failedOutput, failedCommandsOf(attrib), offender ?? null);
+      if (gate.served) {
+        writeMachineState(dir, { ...st, phase: 'open', currentCase: null, finishStep: 'verify' });
+        progress(`verify: RED (unattributed) — gate-fix case prepared on ${gate.branch}`);
+        console.error(`finish: gate-fix case ${gate.caseId} prepared on ${gate.branch}`);
+        result(cli, {
+          ok: false,
+          status: 'gate-fix-required',
+          stoppedAt: 'verify',
+          issues: [{ id: 'ERR18_VERIFY_PENDING', detail: gate.detail }],
+          gateFix: { caseId: gate.caseId, branch: gate.branch, files: gate.files, reason: gate.reason },
+          instruction: `a GATE-FIX case has been prepared on ${gate.branch} — run \`next-case\``,
+        });
+        return 1;
+      }
+      // Not servable (already attempted for these files, or nothing to blame):
+      // fall through to the pre-D-061 STOP so a bad fix cannot cycle forever.
+      if (failedTests.length > 0) {
+        appendJournal(dir, { action: 'finish-tests-failed', failed: failedTests });
+        progress(`verify: RED — ${failedTests.join(', ')} — publish nothing (${gate.reason})`);
+        console.error(`finish: ${failedTests.join(', ')} failed; ${gate.reason}; publishing nothing`);
+        result(cli, {
+          ok: false,
+          status: 'stopped',
+          stoppedAt: 'finish-tests',
+          failedTests,
+          issues: [{ id: 'ERR40_TESTS_FAILED', detail: `checks failed at finish — ${failedTests.join(', ')}` }],
+          instruction: `REPORT to the owner: checks failed at finish — ${failedTests.join(', ')}; ${gate.reason}; publish nothing`,
+        });
+        return 1;
+      }
+    }
     const detail =
       verifyRc !== 0
         ? 'verify RED (no clean attribution) — investigate, fix, then re-run `finish` from the verify phase'
