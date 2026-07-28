@@ -7481,7 +7481,8 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
       !journal.some((e) => e.action === 'pr-published' && e.caseId === jc.caseId);
     const judged = [...journaledCases(journal).values()].filter((jc) => {
       const d = lastDisposition(journal, jc.caseId);
-      return d?.action === 'resolved' && d.tier === 'judged' && unpublished(jc);
+      // D-061 (B): a gate fix is never a JUDGED history PR — see below.
+      return d?.action === 'resolved' && d.tier === 'judged' && d.gateFix !== true && unpublished(jc);
     });
     const held = [...journaledCases(journal).values()].filter(
       (jc) => lastDisposition(journal, jc.caseId)?.action === 'held' && unpublished(jc),
@@ -7582,7 +7583,12 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     const journal = readJournal(dir);
     const judged = [...journaledCases(journal).values()].filter((jc) => {
       const d = lastDisposition(journal, jc.caseId);
-      return d?.action === 'resolved' && d.tier === 'judged';
+      // D-061 (B): EXCLUDE gate fixes. The JUDGED history PR is auto-flipped to
+      // merged by the target push landing the SAME merge commit — machinery for a
+      // propagation merge. A gate fix is a single-parent commit with no conflict
+      // head, so cmdPublish cannot build it and finish halted at `judged-prs`.
+      // Selection is by DISPOSITION, so dropping its pr-intent was not enough.
+      return d?.action === 'resolved' && d.tier === 'judged' && d.gateFix !== true;
     });
     let closuresN = 0;
     for (const jc of judged) {

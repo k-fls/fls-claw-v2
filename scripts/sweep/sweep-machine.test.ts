@@ -3516,8 +3516,6 @@ describe('sweep start — canonical pass location + clean-slate boundary (D-055)
 // ---------------------------------------------------------------------------
 
 describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
-  // The judged-tier test below is SKIPPED — see the note on it.
-  //
   // ROOT CAUSE of the serving bug, fixed 2026-07-28: `crashHeal` journaled `resolved` for every
   // gate-fix case on the next command. Its heuristic is "the ref already
   // contains the case head, so it was resolved before a crash" — but a gate-fix
@@ -3596,13 +3594,7 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     expect(repo.git('-C', join(dir, res.gateFix.caseId, 'worktree'), 'status', '--porcelain')).toBe('');
   });
 
-  // SKIPPED — the judged tier is NOT finished. The fix commit, its single parent
-  // and the descendant reopen all verify (assertions below pass); the failure is
-  // afterwards: the second `finish` re-enters the gate-fix path with the build
-  // reported red again even though the check now passes, so the pass does not
-  // complete. Root cause not yet identified. The HELD tier and the trigger are
-  // unaffected and covered by the two passing tests.
-  it.skip('judged gate fix -> SINGLE-parent commit + descendants reopened; finish then says WHY cases remain', async () => {
+  it('judged gate fix -> single-parent commit, descendants pulled through, and the SAME pass completes', async () => {
     const repo = gateFixRepo(true);
     const ws = mkWorkspace();
     const inv = writeInventory([
