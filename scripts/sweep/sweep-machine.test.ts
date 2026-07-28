@@ -364,14 +364,28 @@ describe('sweep start — the base gate (D-061 A)', () => {
     expect(r.ran).toEqual([['tsc --noEmit']]);
   });
 
-  it('base RED that nothing owns -> still REFUSES (ERR42) rather than guess a branch', async () => {
+  /**
+   * Blame is by GIT HISTORY now (owner-approved 2026-07-28), so "the registry
+   * owns nothing matching the path" is no longer a state: an untouched failing
+   * file falls to the trunk, which for a base red is the anchor being fixed
+   * anyway. What still has to refuse is a red whose output names NO source file
+   * — there is nothing to hand an agent, and inventing a case for it would
+   * pre-empt the honest STOP. (Previously this test starved blame by pointing
+   * `owned_paths` elsewhere; that starves nothing now, because module/cg really
+   * did commit src/x.ts.)
+   */
+  it('base RED that names no source files -> still REFUSES (ERR42) rather than invent a case', async () => {
     const repo = gateFixRepoForBase();
     const ws = mkWorkspace();
-    // Registry owns nothing matching the failing path -> no branch to blame.
-    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/unrelated.ts'] }]);
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
     const out = join(ws, 'start.json');
+    const noDiagnostics: ChecksRunner = async (commands) => ({
+      ok: false,
+      failedNames: commands.map((c) => c.cmd),
+      output: 'ELIFECYCLE Command failed.\nsh: 1: tsc: not found\n',
+    });
     expect(
-      await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: baseChecks(ws), out }), undefined, baseRunner()),
+      await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: baseChecks(ws), out }), undefined, noDiagnostics),
     ).toBe(1);
     const res = JSON.parse(readFileSync(out, 'utf8')) as {
       status: string;
@@ -381,7 +395,7 @@ describe('sweep start — the base gate (D-061 A)', () => {
     expect(res.status).toBe('stopped');
     expect(res.issues[0].id).toBe('ERR42_BASE_RED');
     expect(res.issues[0].detail).toContain('red before any merge');
-    expect(res.issues[0].detail).toContain('no branch could be blamed');
+    expect(res.issues[0].detail).toContain('named no source files');
     expect(res.instruction).toContain('REPORT to the owner');
     // No gate-fix case was invented on a guessed branch.
     expect(readJournal(dirOf(repo, ws)).some((e) => e.action === 'gate-fix')).toBe(false);
@@ -400,11 +414,11 @@ describe('sweep start — the base gate (D-061 A)', () => {
   /**
    * DEFECT 4a (HIGH) — a BASE-RED gate fix targets a branch that can never BE
    * the base. `runBaseChecks` typechecks the base anchor (main_patched) in
-   * isolation, but `materializeGateFixCase` blames the failing FILE through the
-   * registry, and no inventory entry carries `branch: main_patched` — so
-   * attribution can only ever land on a FEATURE branch. Committing the fix
-   * there does nothing for the trunk: the next `start` re-runs the same base
-   * typecheck on the same red main_patched and fails identically.
+   * isolation, but `materializeGateFixCases` blames the failing FILE — here to
+   * module/cg, which really did commit it — and committing the fix there does
+   * nothing for the trunk: the next `start` re-runs the same base typecheck on
+   * the same red main_patched and fails identically. (Blame CAN now name the
+   * trunk, since git history includes it; ROOTING is what guarantees it.)
    *
    * CORRECT BEHAVIOUR: a base-red gate fix targets the BASE BRANCH ITSELF (the
    * anchor that was checked), because that is the only place a commit can turn
@@ -3777,6 +3791,65 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     expect(repo.git('-C', join(dir, res.gateFix.caseId, 'worktree'), 'status', '--porcelain')).toBe('');
   });
 
+  /**
+   * BATCHING (owner-approved 2026-07-28). A red build routinely names files that
+   * belong to DIFFERENT branches. One case forced them all onto one branch's
+   * worktree, where the fix for someone else's file either cannot be made or
+   * lands where it reaches nobody. One case PER BRANCH, carrying that branch's
+   * files, SHALLOWEST BRANCH FIRST — a judged trunk/parent fix plus the reopen it
+   * triggers can moot a descendant's case, so the shallower one must be workable
+   * first.
+   */
+  it('failing files on TWO branches -> one gate-fix case each, shallowest branch first', async () => {
+    const repo = gateFixRepo(true); // module/cg owns src/x.ts, feat/child owns src/child.ts
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'cg', branch: 'module/cg', parents: ['main_patched'] },
+      { id: 'child', branch: 'feat/child', parents: ['module/cg'] },
+    ]);
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const cmds = join(ws, 'cmds.json');
+    // The DEEPER branch's file is printed FIRST: order comes from the hierarchy,
+    // never from the compiler's output order.
+    writeFileSync(
+      cmds,
+      JSON.stringify([
+        {
+          cmd:
+            'echo "src/child.ts(4,1): error TS2345: nope"; ' +
+            'echo "src/x.ts(1,1): error TS2345: nope"; exit 1',
+        },
+      ]),
+    );
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const out = join(ws, 'f1.json');
+    expect(
+      await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out })),
+    ).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      status: string;
+      gateFix: { caseId: string; branch: string; files: string[] };
+      gateFixes: Array<{ caseId: string; branch: string; files: string[] }>;
+    };
+    expect(res.status).toBe('gate-fix-required');
+    expect(res.gateFixes.map((g) => g.branch)).toEqual(['module/cg', 'feat/child']);
+    expect(res.gateFixes.map((g) => g.files)).toEqual([['src/x.ts'], ['src/child.ts']]);
+    // Distinct cases, each with its own worktree and its own anti-loop key.
+    expect(res.gateFixes[0].caseId).not.toBe(res.gateFixes[1].caseId);
+    for (const g of res.gateFixes) expect(existsSync(join(dir, g.caseId, 'worktree'))).toBe(true);
+    const rows = readJournal(dir).filter((e) => e.action === 'gate-fix');
+    expect(rows.map((e) => e.branch)).toEqual(['module/cg', 'feat/child']);
+    expect(rows.map((e) => e.key)).toEqual(['module/cg::src/x.ts', 'feat/child::src/child.ts']);
+    // The single-case reader gets the SHALLOWEST, which is what next-case serves.
+    expect(res.gateFix.branch).toBe('module/cg');
+    const nc = join(ws, 'nc.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: nc }))).toBe(0);
+    expect(JSON.parse(readFileSync(nc, 'utf8')).caseId).toBe(res.gateFixes[0].caseId);
+  });
+
   it('judged gate fix -> single-parent commit, descendants pulled through, and the SAME pass completes', async () => {
     const repo = gateFixRepo(true);
     const ws = mkWorkspace();
@@ -4057,12 +4130,19 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
    */
   it('two gate fixes on ONE branch over different files get DISTINCT ids', async () => {
     const repo = gateFixRepo();
+    // BOTH files must be module/cg's OWN work for both fixes to land on ONE
+    // branch — blame reads git history, and src/y.ts is main_patched's commit in
+    // this fixture, so the second red would (correctly) blame the trunk instead
+    // and this test would stop exercising the id collision it exists for.
+    repo.checkout('module/cg');
+    repo.commit('cg: own z', { 'src/z.ts': 'cg\n' });
+    repo.checkout('main');
     const ws = mkWorkspace();
-    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts', 'src/y.ts'] }]);
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts', 'src/z.ts'] }]);
     const dir = dirOf(repo, ws);
     repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
-    // Red on src/x.ts first; once that flag is cleared, red on src/y.ts.
+    // Red on src/x.ts first; once that flag is cleared, red on src/z.ts.
     const flagX = join(ws, 'red-x');
     const flagY = join(ws, 'red-y');
     writeFileSync(flagX, 'x');
@@ -4074,7 +4154,7 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
         {
           cmd:
             `if [ -f ${flagX} ]; then echo "src/x.ts(1,1): error TS2345: nope"; exit 1; ` +
-            `elif [ -f ${flagY} ]; then echo "src/y.ts(2,2): error TS2345: nope"; exit 1; fi`,
+            `elif [ -f ${flagY} ]; then echo "src/z.ts(2,2): error TS2345: nope"; exit 1; fi`,
         },
       ]),
     );
@@ -4093,7 +4173,7 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out: f2 }));
     const res2 = JSON.parse(readFileSync(f2, 'utf8')) as { status: string; gateFix: { caseId: string; files: string[] } };
     expect(res2.status).toBe('gate-fix-required');
-    expect(res2.gateFix.files).toEqual(['src/y.ts']);
+    expect(res2.gateFix.files).toEqual(['src/z.ts']);
     // Same branch, different files -> a DIFFERENT case id (both gate-fix-shaped).
     expect(res2.gateFix.caseId).not.toBe(idX);
     expect(res2.gateFix.caseId).toMatch(/^gate-fix-module__cg-[0-9a-f]{8}$/);

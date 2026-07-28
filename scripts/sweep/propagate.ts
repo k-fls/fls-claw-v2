@@ -2777,7 +2777,7 @@ async function reverifyGateFixCase(
   if (!scope.has(branch)) return { ok: false, errors: [`gate-fix branch ${branch} is out of pass scope`] };
   const tip = await revParse(cli.repo, branch);
   const files = Array.isArray(row.files) ? (row.files as string[]) : [];
-  // Same head/height/run derivation as `materializeGateFixCase` — re-derived
+  // Same head/height/run derivation as `materializeGateFixCases` — re-derived
   // from git, never read back from the agent-writable case.json.
   const head = { sha: tip, height: await gateFixHeadHeight(cli, ctx.chain, tip) };
   return {
@@ -6607,21 +6607,23 @@ export async function cmdSweepStart(
       });
       return 1;
     }
-    const gate = await materializeGateFixCase(cli, ctx.dir, ctx.chain, baseRed.output, baseRed.failed, null, {
+    const gate = await materializeGateFixCases(cli, ctx.dir, ctx.chain, baseRed.output, baseRed.failed, null, {
       rootBranch: baseRed.anchor,
     });
     if (gate.served) {
-      recordBaseGateAttempt(cli.workspace, attemptKey, gate.caseId, gate.branch);
-      progress(`base RED on ${baseRed.anchor} — gate-fix case prepared on ${gate.branch}`);
-      console.error(`sweep start: base red — gate-fix case ${gate.caseId} on ${gate.branch}`);
+      // A base-red gate fix is ROOTED on the anchor, so there is exactly one case.
+      const first = gate.cases[0];
+      recordBaseGateAttempt(cli.workspace, attemptKey, first.caseId, first.branch);
+      progress(`base RED on ${baseRed.anchor} — gate-fix case prepared on ${first.branch}`);
+      console.error(`sweep start: base red — gate-fix case ${first.caseId} on ${first.branch}`);
       result(cli, {
         status: 'gate-fix-required',
         watermark: ctx.watermark,
         watermark12: ctx.watermark12,
         passDir: ctx.dir,
         issues: [{ id: 'ERR42_BASE_RED', detail: `${baseRed.anchor} was already red BEFORE any merge — ${gate.detail}` }],
-        gateFix: { caseId: gate.caseId, branch: gate.branch, files: gate.files, reason: gate.reason },
-        instruction: `the base ${baseRed.anchor} is broken; a GATE-FIX case has been prepared on ${gate.branch} — run \`next-case\``,
+        gateFix: { caseId: first.caseId, branch: first.branch, files: first.files, reason: gate.reason },
+        instruction: `the base ${baseRed.anchor} is broken; a GATE-FIX case has been prepared on ${first.branch} — run \`next-case\``,
       });
       return 0;
     }
@@ -7660,23 +7662,39 @@ function rootChecksOutput(output: string, commands: VerifyCommand[]): string {
   return out.join('\n');
 }
 
+/** One materialized gate-fix case (a pass can need several — see below). */
+interface GateFixCaseSummary {
+  caseId: string;
+  branch: string;
+  files: string[];
+  reason: string;
+}
+
 /**
- * D-061 (B): turn an unattributable red into a GATE-FIX case.
+ * D-061 (B): turn an unattributable red into GATE-FIX case(s).
  *
- * Blame the failing files to a branch (`attributeFailure`, owner rule: earliest
- * by hierarchy), then prepare a worktree at that branch's tip. Unlike a conflict
- * case there is nothing pending and no markers — the agent edits the named files
- * so the checks pass.
+ * Blame the failing files to their branches by GIT HISTORY (`attributeFailure`,
+ * owner rule: shallowest by hierarchy), then prepare a worktree at each blamed
+ * branch's tip. Unlike a conflict case there is nothing pending and no markers —
+ * the agent edits the named files so the checks pass.
+ *
+ * BATCHED, ONE CASE PER BRANCH (owner-approved 2026-07-28). A red build routinely
+ * names files that belong to DIFFERENT branches; a single case forced all of them
+ * onto one branch's worktree, where the fix for someone else's file either cannot
+ * be made or lands where it reaches nobody. Cases come back SHALLOWEST BRANCH
+ * FIRST: a judged trunk fix plus the `reopen()` it triggers can moot a
+ * descendant's case entirely, so the trunk must be workable before its children.
  *
  * ANTI-LOOP: a gate fix that does not actually fix leaves verify red, which
  * would prepare another case for the same files forever. One attempt per
- * (branch, file-set) per pass; a second red over the same set is NOT served and
- * the caller falls back to the STOP path.
+ * (branch, file-set) per pass — the key is per BRANCH, so one looping branch
+ * never suppresses another branch's first attempt. When nothing at all is
+ * servable the caller falls back to the STOP path.
  *
  * `rootBranch` (the BASE GATE at `start`): the case is rooted THERE rather than
  * on the blamed branch — see the rooting comment below.
  */
-async function materializeGateFixCase(
+async function materializeGateFixCases(
   cli: Cli,
   dir: string,
   chain: Chain,
@@ -7684,13 +7702,13 @@ async function materializeGateFixCase(
   failedCommands: VerifyCommand[],
   accused: string | null,
   opts: { rootBranch?: string } = {},
-): Promise<{ served: boolean; caseId: string; branch: string; files: string[]; reason: string; detail: string }> {
+): Promise<{ served: boolean; cases: GateFixCaseSummary[]; reason: string; detail: string }> {
   const journal = readJournal(dir);
   const { features } = loadRegistry({ inventoryDir: cli.inventory, scopeFile: cli.scopeFile, routingFile: cli.routingFile });
-  const a = attributeFailure(rootChecksOutput(failedOutput, failedCommands), features, accused);
+  const a = await attributeFailure(cli.repo, rootChecksOutput(failedOutput, failedCommands), features, accused);
   const files = a.files;
   const commandNames = failedCommands.map((c) => c.cmd);
-  const none = { served: false as const, caseId: '', branch: a.branch ?? '', files, reason: '', detail: '' };
+  const none = { served: false as const, cases: [] as GateFixCaseSummary[], reason: '', detail: '' };
   // NO FILES, NO CASE. `cmdVerify`'s ROLLBACK arm (an offender isolated, rolled
   // back, HELD(gate), and the re-verify STILL red) journals no attributionFailed
   // row, so `failedOutput` arrives empty: attribution parses nothing, falls back
@@ -7705,86 +7723,102 @@ async function materializeGateFixCase(
     };
   }
   // ROOTING. A BASE-RED gate fix must target the BASE ANCHOR ITSELF: the base
-  // gate typechecks main_patched IN ISOLATION, and no inventory entry carries
-  // `branch: main_patched`, so blame can only ever land on a DESCENDANT feature
-  // branch — where a commit does nothing for the trunk. The next `start` re-runs
-  // the same typecheck on the same red base and fails identically, forever.
-  // Blame still has to find SOMEONE (candidates) or we are guessing about files
-  // nobody claims — `a.branch` may now be null on a legitimate tie, which is not
-  // the same as "unowned", so the candidate list is what decides.
-  const rooted = opts.rootBranch && a.candidates.length > 0 ? opts.rootBranch : null;
-  const branch = rooted ?? a.branch;
-  if (!branch) {
+  // gate typechecks the anchor IN ISOLATION, so a commit on any other branch —
+  // however honestly blamed — does nothing for it. The next `start` re-runs the
+  // same typecheck on the same red base and fails identically, forever. One case
+  // then, carrying EVERY failing file, because they must all be fixed in the one
+  // place that is the base.
+  const rooted = opts.rootBranch ?? null;
+  const groups: Array<{ branch: string; files: string[]; reason: string }> = rooted
+    ? [
+        {
+          branch: rooted,
+          files,
+          reason: `${a.reason}; rooted on the base ${rooted} — a commit on a descendant can never turn the base green`,
+        },
+      ]
+    : a.groups.map((g) => ({ branch: g.branch, files: g.files, reason: g.reason }));
+  if (groups.length === 0) {
     return { ...none, reason: 'no branch could be blamed for the failing files', detail: `verify RED (no clean attribution); ${a.reason}` };
   }
-  const reason = rooted
-    ? `${a.reason}; rooted on the base ${rooted} — a commit on a descendant can never turn the base green`
-    : a.reason;
-  const key = gateFixKey(branch, files);
-  if (journal.some((e) => e.action === 'gate-fix' && e.key === key)) {
+
+  const cases: GateFixCaseSummary[] = [];
+  const looping: string[] = [];
+  for (const g of groups) {
+    const key = gateFixKey(g.branch, g.files);
+    if (journal.some((e) => e.action === 'gate-fix' && e.key === key)) {
+      looping.push(g.branch);
+      continue;
+    }
+    // N5 SHAPE: the gate-fix id form (`gateFixCaseId` — branch + file-set digest,
+    // never a height). The id is joined into paths AND passed to `publish --case`.
+    const caseId = gateFixCaseId(g.branch, g.files);
+    const tip = await revParse(cli.repo, g.branch);
+    // The head's HEIGHT (see `gateFixHeadHeight`): the tip's coverage on this
+    // pass's pinned chain, not the `-1` placeholder that used to stand here.
+    const head = { sha: tip, height: await gateFixHeadHeight(cli, chain, tip) };
+    await createGateFixWorktree(cli, dir, caseId, tip);
+    const caseFile: CaseFile = {
+      schemaVersion: 1,
+      id: caseId,
+      branch: g.branch,
+      parent: GATE_FIX_PARENT,
+      head,
+      // `run[run.length - 1] === head` is the run invariant (types.ts). A gate fix
+      // stacks nothing, so its run is the head alone — NOT the empty array, which
+      // breaks the invariant and prints "0 height(s)" into the case materials.
+      run: [head],
+      tierFloor: 'judged',
+      conflictedPaths: g.files,
+      automergeTree: await treeOf(cli.repo, tip),
+      reproduction: { command: commandNames.join(' && ') },
+      // firstConflictHeight is documented as "the run's TOP height" — that is
+      // `head.height`, whatever kind of case this is. (Nothing reads a gate fix's
+      // DEFERRED inputs: it has no transitive ancestors to defer against.)
+      deferredCheck: { firstConflictHeight: head.height, transitiveAncestors: [] },
+    };
+    mkdirSync(join(dir, caseId), { recursive: true });
+    writeFileSync(join(dir, caseId, 'case.json'), JSON.stringify(caseFile, null, 2) + '\n');
+    appendJournal(dir, {
+      action: 'gate-fix',
+      key,
+      caseId,
+      branch: g.branch,
+      files: g.files,
+      failedCommands: commandNames,
+      reason: g.reason,
+      // Git evidence, not declarations: `<branch>@<depth>/<own commits>`.
+      candidates: a.candidates.map((c) => `${c.branch}@${c.depth}/${c.commits}`),
+    });
+    appendJournal(dir, {
+      action: 'case',
+      caseId,
+      branch: g.branch,
+      parent: GATE_FIX_PARENT,
+      gateFix: true,
+      head,
+      height: head.height,
+      run: caseFile.run,
+      conflictedPaths: g.files,
+    });
+    writeFileSync(join(dir, caseId, 'gate-fix-output.txt'), failedOutput);
+    cases.push({ caseId, branch: g.branch, files: g.files, reason: g.reason });
+  }
+  if (cases.length === 0) {
+    const who = looping.join(', ');
     return {
       ...none,
-      branch,
-      reason: `a gate fix was already attempted for ${branch} over these files and the build is still red`,
-      detail: `verify RED again after a gate fix on ${branch} — not re-serving`,
+      reason: `a gate fix was already attempted for ${who} over these files and the build is still red`,
+      detail: `verify RED again after a gate fix on ${who} — not re-serving`,
     };
   }
-  // N5 SHAPE: the gate-fix id form (`gateFixCaseId` — branch + file-set digest,
-  // never a height). The id is joined into paths AND passed to `publish --case`.
-  const caseId = gateFixCaseId(branch, files);
-  const tip = await revParse(cli.repo, branch);
-  // The head's HEIGHT (see `gateFixHeadHeight`): the tip's coverage on this
-  // pass's pinned chain, not the `-1` placeholder that used to stand here.
-  const head = { sha: tip, height: await gateFixHeadHeight(cli, chain, tip) };
-  await createGateFixWorktree(cli, dir, caseId, tip);
-  const caseFile: CaseFile = {
-    schemaVersion: 1,
-    id: caseId,
-    branch,
-    parent: GATE_FIX_PARENT,
-    head,
-    // `run[run.length - 1] === head` is the run invariant (types.ts). A gate fix
-    // stacks nothing, so its run is the head alone — NOT the empty array, which
-    // breaks the invariant and prints "0 height(s)" into the case materials.
-    run: [head],
-    tierFloor: 'judged',
-    conflictedPaths: files,
-    automergeTree: await treeOf(cli.repo, tip),
-    reproduction: { command: commandNames.join(' && ') },
-    // firstConflictHeight is documented as "the run's TOP height" — that is
-    // `head.height`, whatever kind of case this is. (Nothing reads a gate fix's
-    // DEFERRED inputs: it has no transitive ancestors to defer against.)
-    deferredCheck: { firstConflictHeight: head.height, transitiveAncestors: [] },
-  };
-  mkdirSync(join(dir, caseId), { recursive: true });
-  writeFileSync(join(dir, caseId, 'case.json'), JSON.stringify(caseFile, null, 2) + '\n');
-  appendJournal(dir, {
-    action: 'gate-fix',
-    key,
-    caseId,
-    branch,
-    files,
-    failedCommands: commandNames,
-    reason,
-    candidates: a.candidates.map((c) => `${c.branch}@${c.depth}/${c.match}`),
-  });
-  appendJournal(dir, {
-    action: 'case',
-    caseId,
-    branch,
-    parent: GATE_FIX_PARENT,
-    gateFix: true,
-    head,
-    height: head.height,
-    run: caseFile.run,
-    conflictedPaths: files,
-  });
-  writeFileSync(join(dir, caseId, 'gate-fix-output.txt'), failedOutput);
+  const reason =
+    cases.length === 1
+      ? cases[0].reason
+      : `${cases.length} gate-fix cases prepared (shallowest first): ${cases.map((c) => `${c.branch} [${c.files.join(', ')}]`).join('; ')} — ${a.reason}`;
   return {
     served: true,
-    caseId,
-    branch,
-    files,
+    cases,
     reason,
     detail: `verify RED (no clean attribution) — ${reason}`,
   };
@@ -8023,18 +8057,25 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     // PR that blocks the next pass until the owner merges).
     if (verifyRc !== 0) {
       const failedOutput = typeof attrib?.failedOutput === 'string' ? attrib.failedOutput : '';
-      const gate = await materializeGateFixCase(cli, dir, ctx.chain, failedOutput, failedChecksOf(attrib), offender ?? null);
+      const gate = await materializeGateFixCases(cli, dir, ctx.chain, failedOutput, failedChecksOf(attrib), offender ?? null);
       if (gate.served) {
         writeMachineState(dir, { ...st, phase: 'open', currentCase: null, finishStep: 'verify' });
-        progress(`verify: RED (unattributed) — gate-fix case prepared on ${gate.branch}`);
-        console.error(`finish: gate-fix case ${gate.caseId} prepared on ${gate.branch}`);
+        // BATCHED blame: the failing files can belong to several branches, and
+        // `gateFix` reports the FIRST — the shallowest, which `next-case` serves
+        // first because a judged fix there can moot the ones below it. Every case
+        // is listed in `gateFixes` (and journaled) so nothing is invisible.
+        const first = gate.cases[0];
+        const branches = gate.cases.map((c) => c.branch).join(', ');
+        progress(`verify: RED (unattributed) — ${gate.cases.length} gate-fix case(s) prepared on ${branches}`);
+        console.error(`finish: gate-fix case${gate.cases.length > 1 ? 's' : ''} prepared on ${branches}`);
         result(cli, {
           ok: false,
           status: 'gate-fix-required',
           stoppedAt: 'verify',
           issues: [{ id: 'ERR18_VERIFY_PENDING', detail: gate.detail }],
-          gateFix: { caseId: gate.caseId, branch: gate.branch, files: gate.files, reason: gate.reason },
-          instruction: `a GATE-FIX case has been prepared on ${gate.branch} — run \`next-case\``,
+          gateFix: { caseId: first.caseId, branch: first.branch, files: first.files, reason: gate.reason },
+          gateFixes: gate.cases.map((c) => ({ caseId: c.caseId, branch: c.branch, files: c.files })),
+          instruction: `${gate.cases.length} GATE-FIX case(s) have been prepared (shallowest branch first: ${branches}) — run \`next-case\``,
         });
         return 1;
       }
