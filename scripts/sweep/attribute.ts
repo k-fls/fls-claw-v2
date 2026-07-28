@@ -18,6 +18,8 @@
  * being applied N times on N leaves (or on a leaf that never reaches its
  * siblings).
  */
+import { globMatchAny } from './globs.js';
+import { branchHierarchy, byHierarchy, depthOf, minPathOf, TRUNK_BRANCH, type Hierarchy } from './hierarchy.js';
 import type { FeatureEntry } from './types.js';
 
 /** A `tsc` diagnostic in either the bracket or the colon form. */
@@ -43,75 +45,73 @@ export function parseFailingFiles(output: string): string[] {
   return files;
 }
 
-/**
- * Depth of an entry in the `parents` DAG — 0 for a root (no parents), otherwise
- * 1 + the MINIMUM parent depth (the shortest route to a root, so a branch that
- * also has a deep parent is not pushed down by it). Cycle-safe and memoized: a
- * malformed registry must not hang the driver, so a node already on the current
- * path contributes no depth.
- */
-export function hierarchyDepth(features: FeatureEntry[], id: string): number {
-  const byId = new Map(features.map((f) => [f.id, f]));
-  const memo = new Map<string, number>();
-  const walk = (cur: string, seen: Set<string>): number => {
-    const cached = memo.get(cur);
-    if (cached !== undefined) return cached;
-    const entry = byId.get(cur);
-    const parents = (entry?.parents ?? []).filter((p) => byId.has(p) && !seen.has(p));
-    if (parents.length === 0) {
-      memo.set(cur, 0);
-      return 0;
-    }
-    const next = new Set(seen).add(cur);
-    const d = 1 + Math.min(...parents.map((p) => walk(p, next)));
-    memo.set(cur, d);
-    return d;
-  };
-  return walk(id, new Set([id]));
-}
-
 /** A branch implicated in a failure, with why and how deep it sits. */
 export interface BranchCandidate {
   branch: string;
   id: string;
-  depth: number;
+  /** From the ONE hierarchy (hierarchy.ts). Null = no route to the root. */
+  depth: number | null;
+  /** Shortest parent chain to the root, excluding `main`. */
+  minPath: string[] | null;
   /** `owned` beats `touched` — an owner is the intended home of the path. */
   match: 'owned' | 'touched';
 }
 
 function pathMatches(patterns: string[] | undefined, file: string): boolean {
-  return (patterns ?? []).some((p) => {
-    const clean = p.replace(/\/+$/, '');
-    return file === clean || file.startsWith(clean + '/');
-  });
+  // GLOB semantics, via the driver's existing helper (routing.ts and
+  // validate.ts already use it). These fields are gitignore-style globs and the
+  // live inventory is full of `scripts/sweep/**`-shaped patterns; the literal
+  // prefix test this replaced could never match one, so blame silently found no
+  // owner and fell back to the accused branch (defect 5).
+  return globMatchAny(patterns ?? [], file);
 }
 
 /**
- * Every registry branch implicated by the failing files, sorted by the OWNER
- * RULE: shallowest hierarchy depth first, `owned` before `touched` at equal
- * depth, then branch name so the choice is deterministic across runs.
+ * Every branch implicated by the failing files, ordered by the OWNER RULE:
+ * shallowest hierarchy depth first (UNRESOLVED last, never as 0), `owned` before
+ * `touched` at equal depth. Name order is applied ONLY to make the listing
+ * stable — it is never a decision, see `attributeFailure`.
+ *
+ * The TRUNK is always a candidate when it matches: the defect is frequently on
+ * `main_patched` itself (live 2026-07-28 — fcee39ea), and excluding it
+ * guarantees a wrong answer in exactly the case the base gate exists to catch.
  */
-export function branchCandidates(files: string[], features: FeatureEntry[]): BranchCandidate[] {
+export function branchCandidates(files: string[], features: FeatureEntry[], h?: Hierarchy): BranchCandidate[] {
+  const hier = h ?? branchHierarchy(features);
   const out = new Map<string, BranchCandidate>();
-  for (const f of features) {
-    if (!f.branch) continue;
-    const owned = files.some((file) => pathMatches(f.owned_paths, file));
-    const touched = files.some((file) => pathMatches(f.touch_paths, file));
-    if (!owned && !touched) continue;
+  const consider = (branch: string, id: string, owned: boolean, touched: boolean): void => {
+    if (!owned && !touched) return;
     const cand: BranchCandidate = {
-      branch: f.branch,
-      id: f.id,
-      depth: hierarchyDepth(features, f.id),
+      branch,
+      id,
+      depth: depthOf(hier, branch),
+      minPath: minPathOf(hier, branch),
       match: owned ? 'owned' : 'touched',
     };
-    const prior = out.get(f.branch);
-    if (!prior || cand.depth < prior.depth) out.set(f.branch, cand);
+    const prior = out.get(branch);
+    if (!prior || (cand.depth !== null && (prior.depth === null || cand.depth < prior.depth))) out.set(branch, cand);
+  };
+  for (const f of features) {
+    if (!f.branch) continue;
+    consider(
+      f.branch,
+      f.id,
+      files.some((file) => pathMatches(f.owned_paths, file)),
+      files.some((file) => pathMatches(f.touch_paths, file)),
+    );
   }
+  const trunk = features.find((f) => f.branch === TRUNK_BRANCH);
+  if (!out.has(TRUNK_BRANCH) && trunk) {
+    consider(
+      TRUNK_BRANCH,
+      trunk.id,
+      files.some((file) => pathMatches(trunk.owned_paths, file)),
+      files.some((file) => pathMatches(trunk.touch_paths, file)),
+    );
+  }
+  const order = byHierarchy(hier);
   return [...out.values()].sort(
-    (a, b) =>
-      a.depth - b.depth ||
-      (a.match === b.match ? 0 : a.match === 'owned' ? -1 : 1) ||
-      a.branch.localeCompare(b.branch),
+    (a, b) => order(a.branch, b.branch) || (a.match === b.match ? 0 : a.match === 'owned' ? -1 : 1),
   );
 }
 
@@ -126,10 +126,12 @@ export interface Attribution {
 /**
  * Attribute a failing checks run to the branch a fix belongs on.
  *
- * Falls back to `accused` (the branch verify rolled back) ONLY when the registry
- * yields nothing — an explicit "could not attribute" is far better than a
- * confident wrong branch, because a gate-fix case rooted on the wrong branch
- * gives the agent files it has no business editing.
+ * REFUSES rather than guesses. There is no arbitrary tie-break: when the top two
+ * candidates are indistinguishable on BOTH real signals (hierarchy depth and
+ * owned-vs-touched), this returns `branch: null` and names the tied candidates.
+ * The previous version fell through to `localeCompare` and then reported
+ * "earliest by hierarchy" — a decision made by spelling, described as a rule.
+ * Determinism is only ever used for ORDERING the reported list.
  */
 export function attributeFailure(
   output: string,
@@ -138,21 +140,40 @@ export function attributeFailure(
 ): Attribution {
   const files = parseFailingFiles(output);
   if (files.length === 0) {
-    return { branch: accused ?? null, files, candidates: [], reason: 'no file paths in the output — fell back to the branch verify accused' };
+    return {
+      branch: accused ?? null,
+      files,
+      candidates: [],
+      reason: 'no file paths in the output — fell back to the branch verify accused',
+    };
   }
   const candidates = branchCandidates(files, features);
   if (candidates.length === 0) {
-    return { branch: accused ?? null, files, candidates, reason: 'no registry entry owns or touches the failing files — fell back to the branch verify accused' };
+    return {
+      branch: accused ?? null,
+      files,
+      candidates,
+      reason: 'no registry entry owns or touches the failing files — fell back to the branch verify accused',
+    };
   }
-  const pick = candidates[0];
-  const tied = candidates.filter((c) => c.depth === pick.depth).length;
+  const [first, second] = candidates;
+  const indistinguishable = second && second.depth === first.depth && second.match === first.match;
+  if (indistinguishable) {
+    const tied = candidates.filter((c) => c.depth === first.depth && c.match === first.match).map((c) => c.branch);
+    return {
+      branch: null,
+      files,
+      candidates,
+      reason: `${tied.length} branches tie on hierarchy depth ${first.depth ?? 'UNRESOLVED'} and on ${first.match} — cannot attribute (${tied.join(', ')})`,
+    };
+  }
   return {
-    branch: pick.branch,
+    branch: first.branch,
     files,
     candidates,
     reason:
       candidates.length === 1
-        ? `${pick.branch} ${pick.match} the failing path(s)`
-        : `${candidates.length} branches implicated; picked ${pick.branch} — earliest by hierarchy (depth ${pick.depth}${tied > 1 ? `, ${pick.match} wins the tie` : ''})`,
+        ? `${first.branch} ${first.match} the failing path(s)`
+        : `${candidates.length} branches implicated; picked ${first.branch} — earliest by hierarchy (depth ${first.depth ?? 'UNRESOLVED'} via ${(first.minPath ?? []).join(' <- ') || 'main'})`,
   };
 }

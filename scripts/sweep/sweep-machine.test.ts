@@ -7,6 +7,7 @@
 import { execFileSync } from 'node:child_process';
 import {
   appendFileSync,
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -389,6 +390,144 @@ describe('sweep start — the base gate (D-061 A)', () => {
     expect(await cmdSweepStart(baseCli(repo, ws, inv), undefined, r.fn)).toBe(0);
     expect(r.ran).toEqual([]);
     expect(existsSync(join(dirOf(repo, ws), 'machine-state.json'))).toBe(true);
+  });
+
+  /**
+   * DEFECT 4a (HIGH) — a BASE-RED gate fix targets a branch that can never BE
+   * the base. `runBaseChecks` typechecks the base anchor (main_patched) in
+   * isolation, but `materializeGateFixCase` blames the failing FILE through the
+   * registry, and no inventory entry carries `branch: main_patched` — so
+   * attribution can only ever land on a FEATURE branch. Committing the fix
+   * there does nothing for the trunk: the next `start` re-runs the same base
+   * typecheck on the same red main_patched and fails identically.
+   *
+   * CORRECT BEHAVIOUR: a base-red gate fix targets the BASE BRANCH ITSELF (the
+   * anchor that was checked), because that is the only place a commit can turn
+   * the base green.
+   */
+  it('DEFECT 4a — a base-RED gate fix targets the BASE branch, not a descendant feature branch', async () => {
+    const repo = gateFixRepoForBase(); // main_patched is the base anchor and contains src/x.ts
+    const ws = mkWorkspace();
+    // The registry owns src/x.ts on a FEATURE branch; nothing claims main_patched.
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
+    const out = join(ws, 'start.json');
+    expect(
+      await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: baseChecks(ws), out }), undefined, baseRunner()),
+    ).toBe(0);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { gateFix: { branch: string } };
+    // Today: 'module/cg' — a branch whose tip is NOT the base, so fixing it
+    // leaves the base red forever.
+    expect(res.gateFix.branch).toBe('main_patched');
+  });
+
+  /**
+   * DEFECT 4b (HIGH) — the gate-fix ANTI-LOOP key lives in the PASS JOURNAL
+   * (`materializeGateFixCase` refuses when a `gate-fix` row with the same
+   * `key` exists), but `cmdSweepStart` rmSync's the whole pass dir — journal
+   * included — on every start. So a red base that was never fixed mints a
+   * byte-identical gate-fix case on EVERY pass, forever: the anti-loop guard
+   * can never see the previous attempt.
+   *
+   * CORRECT BEHAVIOUR: a second start against the SAME unchanged red base must
+   * not silently re-serve the identical case; it has to refuse (ERR42 stopped)
+   * or otherwise surface the prior failed attempt, exactly like the
+   * within-pass ANTI-LOOP arm at finish.
+   */
+  it('DEFECT 4b — a second start on the same unchanged red base does NOT re-mint the same gate-fix case', async () => {
+    const repo = gateFixRepoForBase();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
+    const checks = baseChecks(ws);
+    const out1 = join(ws, 'start1.json');
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks, out: out1 }), undefined, baseRunner())).toBe(0);
+    const res1 = JSON.parse(readFileSync(out1, 'utf8')) as { status: string; gateFix: { caseId: string } };
+    expect(res1.status).toBe('gate-fix-required');
+    // The agent gives up on the case and ends the pass (nothing was fixed — the
+    // base is still exactly as red as it was).
+    expect(await cmdSweepAbort(baseCli(repo, ws, inv, { cmd: 'sweep-abort' }))).toBe(0);
+
+    const out2 = join(ws, 'start2.json');
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks, out: out2 }), undefined, baseRunner());
+    const res2 = JSON.parse(readFileSync(out2, 'utf8')) as { status: string; gateFix?: { caseId: string } };
+    // Today: 'gate-fix-required' again with the SAME caseId — an infinite loop.
+    expect(res2.status).not.toBe('gate-fix-required');
+  });
+
+  /**
+   * DEFECT 6 (MED) — the shipped checks.json runs
+   * `{ cmd: 'bun test', cwd: 'container/agent-runner' }`, so that command's
+   * diagnostics print paths relative to THAT subdirectory (`src/auth/x.ts`).
+   * Those strings are handed to `attributeFailure` unchanged and matched
+   * against repo-root-relative registry patterns, so they either miss entirely
+   * or (worse) collide with a root-level `src/…` owner and blame the wrong
+   * branch.
+   *
+   * CORRECT BEHAVIOUR: a failing path produced by a command with a non-`.` cwd
+   * is normalised to repo-root-relative (`container/agent-runner/src/auth/x.ts`)
+   * BEFORE attribution.
+   */
+  it('DEFECT 6 — failing paths from a sub-cwd checks command are normalised to repo-root-relative', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base', { 'container/agent-runner/src/auth/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: y', { 'src/y.ts': 'fork\n' });
+    repo.checkout('module/runner', { create: true, at: 'main_patched' });
+    repo.commit('runner: own the sub-package', { 'container/agent-runner/src/auth/x.ts': 'runner\n' });
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+
+    const ws = mkWorkspace();
+    const checks = join(ws, 'checks.json');
+    // Exactly the shape of the shipped checks.json: a command rooted in a
+    // sub-directory of the clone.
+    writeFileSync(
+      checks,
+      JSON.stringify({ typecheck: [{ cmd: 'tsc --noEmit', cwd: 'container/agent-runner' }], test: [] }),
+    );
+    // The sub-package's own compiler prints paths relative to ITS cwd.
+    const subCwdRunner: ChecksRunner = async (commands) => ({
+      ok: false,
+      failedNames: commands.map((c) => c.cmd),
+      output: "src/auth/x.ts(12,3): error TS2345: Argument of type 'string | null' is not assignable.\n",
+    });
+    // A literal owned_paths directory (no glob) so this test isolates the cwd
+    // defect from the glob defect (5).
+    const inv = writeInventory([{ id: 'runner', branch: 'module/runner', owned: ['container/agent-runner'] }]);
+    const out = join(ws, 'start.json');
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks, out }), undefined, subCwdRunner)).toBe(0);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; gateFix: { branch: string; files: string[] } };
+    expect(res.status).toBe('gate-fix-required');
+    expect(res.gateFix.files).toEqual(['container/agent-runner/src/auth/x.ts']);
+    expect(res.gateFix.branch).toBe('module/runner');
+  });
+
+  /**
+   * DEFECT 7 (MED) — `loadChecksConfig` swallows a JSON parse error and returns
+   * null, which is the SAME value as "there is no checks file". That silently
+   * disables BOTH gates (the per-case checks gate at report-case and the finish
+   * verify command list) with no journal row, no issue and no warning: the pass
+   * then runs to completion reporting everything green while nothing was ever
+   * typechecked or tested.
+   *
+   * CORRECT BEHAVIOUR: a malformed checks file is LOUD — an error/issue or at
+   * minimum a journaled warning — never an indistinguishable silent skip.
+   */
+  it('DEFECT 7 — a MALFORMED checks file is LOUD, never a silent skip', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const bad = join(ws, 'checks.json');
+    writeFileSync(bad, '{ "typecheck": [ {"cmd": "tsc --noEmit"} ,,, ]\n'); // truncated/invalid JSON
+    const r = runner(['tsc --noEmit']);
+    const out = join(ws, 'start.json');
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: bad, out }), undefined, r.fn);
+    expect(r.ran).toEqual([]); // (documents the silent skip: the gate never ran)
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues?: Array<{ id: string; detail?: string }> };
+    const journal = readJournal(dirOf(repo, ws));
+    const loud =
+      (res.issues ?? []).some((i) => /CHECKS/i.test(i.id) || /checks/i.test(i.detail ?? '')) ||
+      journal.some((e) => /checks/i.test(JSON.stringify(e)) && (e.action === 'warning' || typeof e.id === 'string'));
+    expect(loud).toBe(true);
   });
 });
 
@@ -3702,5 +3841,257 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     ).toBe(1);
     expect(count()).toBe(1); // still ONE — the loop is closed
     expect((JSON.parse(readFileSync(f2, 'utf8')) as { status?: string }).status).not.toBe('gate-fix-required');
+  });
+
+  /** Drive a red finish to a served gate-fix case; returns its caseId. */
+  async function serveGateFix(
+    repo: FixtureRepo,
+    ws: string,
+    inv: string,
+    cmds: string,
+  ): Promise<string> {
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const f1 = join(ws, 'gf.json');
+    await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out: f1 }));
+    const res = JSON.parse(readFileSync(f1, 'utf8')) as { status: string; gateFix: { caseId: string } };
+    expect(res.status).toBe('gate-fix-required');
+    await cmdSweepNextCase(baseCli(repo, ws, inv)); // serve it
+    return res.gateFix.caseId;
+  }
+
+  /**
+   * DEFECT 2 (HIGH) — a HELD gate fix is SILENTLY DROPPED, never published.
+   * `publishHead`'s held arm opens with
+   * `if (await isAncestor(cli.repo, jc.head.sha, tip)) -> ERR02_CASE_STALE
+   * "the resolution landed"`. For a gate-fix case `head.sha` IS the branch tip
+   * by construction, and `freezeHeld` never advances the ref, so the guard
+   * fires on EVERY held gate fix: finish journals `publish-failed`, no
+   * fix/sweep ref is pushed, no PR is opened, and the agent's fix is lost.
+   *
+   * CORRECT BEHAVIOUR: a HELD gate fix publishes like any other held case — a
+   * fix/sweep ref + a PR for the owner.
+   */
+  it('DEFECT 2 — a HELD gate fix publishes a fix/sweep ref + PR (not ERR02 "the resolution landed")', async () => {
+    const repo = gateFixRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched', 'module/cg');
+    const { cmds, clear } = redUntilCleared(ws);
+    const caseId = await serveGateFix(repo, ws, inv, cmds);
+
+    // The agent fixes the file but is NOT confident -> --tier held: the fix must
+    // reach the owner as a PR.
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'FIXED\n' });
+    expect(
+      await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true }), confirm),
+    ).toBe(0);
+    writePr(dir, caseId, 'fix: nullable arg', 'The build was red on src/x.ts — owner decision needed.');
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
+    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
+
+    clear(); // the held branch is out of the publishable set; the rest is green
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = fakeGithub();
+    const f2 = join(ws, 'f2.json');
+    await cmdSweepFinish(
+      baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, tokenFile, out: f2 }),
+      gh.factory,
+    );
+    const j = readJournal(dir);
+    expect(j.filter((e) => e.action === 'publish-failed' && e.caseId === caseId)).toEqual([]);
+    expect(j.some((e) => e.action === 'pr-published' && e.caseId === caseId)).toBe(true);
+  });
+
+  /**
+   * DEFECT 8 (MED) — the judged gate-fix result claims an intent it never
+   * recorded. The arm deliberately journals NO `pr-intent` row (a gate fix is a
+   * single-parent commit, so the JUDGED history-PR path does not apply, and
+   * finish's judged selection explicitly excludes `gateFix !== true`), yet it
+   * still returns `prIntent: true`. The agent reads that field as "a PR is
+   * coming at finish" and reports a PR to the owner that will never exist.
+   *
+   * CORRECT BEHAVIOUR: the result must not claim an intent that was not
+   * recorded — `prIntent` must reflect the journal.
+   */
+  it('DEFECT 8 — the judged gate-fix result does not claim a pr-intent it never journaled', async () => {
+    const repo = gateFixRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { cmds } = redUntilCleared(ws);
+    const caseId = await serveGateFix(repo, ws, inv, cmds);
+
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'FIXED\n' });
+    expect(
+      await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true }), confirm),
+    ).toBe(0);
+    writePr(dir, caseId, 'fix: nullable arg', 'The build was red on src/x.ts.');
+    const pr = join(ws, 'pr.json');
+    expect(
+      await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out: pr }), confirm),
+    ).toBe(0);
+    const prRes = JSON.parse(readFileSync(pr, 'utf8')) as { gateFix: boolean; prIntent?: boolean };
+    expect(prRes.gateFix).toBe(true);
+    // No pr-intent row exists for this case — by design (documented in the arm).
+    expect(readJournal(dir).some((e) => e.action === 'pr-intent' && e.caseId === caseId)).toBe(false);
+    // …so the result must not advertise one.
+    expect(prRes.prIntent).not.toBe(true);
+  });
+
+  /**
+   * DEFECT 9a (MED) — the PRISTINE-CONFLICT path is reachable for a gate-fix
+   * case. `report-case --tier held` on a gate-fix case whose worktree the agent
+   * did not change takes branch 4 (`claimed === 'held' && conflictsPresent`,
+   * where `conflictsPresent` is true merely because the tree equals the
+   * automerge tree) and answers "base it on the PRISTINE conflict state" — for
+   * a case that NEVER had a conflict, has no markers and nothing pending. The
+   * agent is then told to describe a conflict that does not exist, and the case
+   * freezes as a draft pristine-conflict PR of an empty diff.
+   *
+   * CORRECT BEHAVIOUR: a gate-fix case is never routed down the
+   * pristine-conflict path; an unchanged gate-fix worktree means "you did not
+   * fix anything", not "here is a pristine conflict".
+   */
+  it('DEFECT 9a — a gate-fix case is never routed down the PRISTINE-conflict path', async () => {
+    const repo = gateFixRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { cmds } = redUntilCleared(ws);
+    const caseId = await serveGateFix(repo, ws, inv, cmds);
+    expect(repo.git('-C', join(dir, caseId, 'worktree'), 'status', '--porcelain')).toBe(''); // no conflict, ever
+
+    const out = join(ws, 'rc.json');
+    // The agent gives up WITHOUT editing anything and claims held.
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true, out }),
+      neverInvoked,
+    );
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string };
+    expect(res.instruction).not.toMatch(/pristine/i);
+  });
+});
+
+/**
+ * DEFECT 3 (HIGH) — a gate-fix case can be served with NO FILES.
+ * `materializeGateFixCase` refuses only when `!a.branch`; it never checks
+ * `files.length === 0`. When `cmdVerify` returns non-zero WITHOUT journaling an
+ * `attributionFailed` row — the ROLLBACK arm: an offender is isolated, rolled
+ * back, HELD(gate), and the re-verify is STILL red — `failedOutput` is `''`, so
+ * `attributeFailure` parses no paths and falls back to the ACCUSED branch. A
+ * case is then minted with empty `conflictedPaths`, an empty
+ * `gate-fix-output.txt` and status `gate-fix-required`, pre-empting the honest
+ * STOP: the agent is handed a case with nothing to fix and no diagnostics.
+ *
+ * CORRECT BEHAVIOUR: no files -> do NOT serve a case; fall through to the
+ * STOP/report path.
+ */
+describe('sweep finish — a gate-fix case is never served with NO files (defect 3)', () => {
+  /** main_patched (clean fork trunk) + feat/other, both advanced by the pass. */
+  function rollbackFixture(): FixtureRepo {
+    const repo = cleanFixture();
+    repo.checkout('feat/other', { create: true, at: 'main_patched' });
+    repo.commit('other: own file', { 'src/o.ts': 'o\n' });
+    repo.checkout('main');
+    return repo;
+  }
+  /**
+   * A verify command that is RED on run 1 (full recipe), GREEN on run 2 (the
+   * leave-one-out probe that isolates feat/other as the offender) and RED again
+   * on run 3 (the post-rollback re-verify). That is exactly the shape of a
+   * flaky/environmental red: cmdVerify rolls a branch back, journals HELD(gate)
+   * and returns non-zero, having journaled NO attributionFailed row and NO
+   * failing output.
+   */
+  function redGreenRed(ws: string): string {
+    const f = join(ws, 'cmds.json');
+    const counter = join(ws, 'verify-runs');
+    writeFileSync(
+      f,
+      JSON.stringify([
+        {
+          cmd:
+            `n=$(cat ${counter} 2>/dev/null || echo 0); n=$((n+1)); printf %s "$n" > ${counter}; ` +
+            `if [ "$n" -eq 2 ]; then exit 0; fi; echo boom; exit 1`,
+        },
+      ]),
+    );
+    return f;
+  }
+
+  it('DEFECT 3 — verify red with no journaled diagnostics -> STOP, not an empty gate-fix case', async () => {
+    const repo = rollbackFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'other', branch: 'feat/other', parents: ['main_patched'] }]);
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched', 'feat/other');
+    const cmds = redGreenRed(ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const out = join(ws, 'f1.json');
+    expect(
+      await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out })),
+    ).toBe(1);
+    const journal = readJournal(dir);
+    // Precondition: this IS the rollback arm — an offender was frozen HELD(gate)
+    // and no attributionFailed row (hence no diagnostics) was journaled.
+    expect(journal.some((e) => e.action === 'held' && e.reason === 'gate')).toBe(true);
+    expect(journal.some((e) => e.action === 'verify' && e.attributionFailed === true)).toBe(false);
+    // Today: a `gate-fix` row with files: [] and an empty gate-fix-output.txt.
+    expect(journal.filter((e) => e.action === 'gate-fix')).toEqual([]);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { status?: string; gateFix?: { files: string[] } };
+    expect(res.status).not.toBe('gate-fix-required');
+  });
+});
+
+/**
+ * DEFECT 9b (MED) — `createCaseWorktree` wraps its whole body in `catch {}`,
+ * journals a `warning` and RETURNS NORMALLY. Its callers (the held-claim
+ * pristine reset and the CHECKS_FAIL_LIMIT backstop) then tell the agent "the
+ * worktree is now pristine" and freeze a DRAFT PR built from a worktree that
+ * was never reset — the agent's discarded edits are still on disk and the
+ * driver's claim is simply false.
+ *
+ * CORRECT BEHAVIOUR: a failed worktree reset must not be reported as success.
+ */
+describe('report-case — a FAILED pristine reset is not reported as success (defect 9b)', () => {
+  it('DEFECT 9b — a worktree reset that fails is not announced as "the worktree is now pristine"', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv))).toBe(0);
+    const caseId = currentCaseId(dir);
+    const wt = join(dir, caseId, 'worktree');
+    // The agent left work behind but could not resolve the markers -> --tier held,
+    // which is supposed to RESET the worktree to the pristine conflict.
+    writeFileSync(join(wt, 'NOTES.md'), 'agent scratch\n');
+    // Make the reset fail the way a container-uid-owned tree does on the host.
+    chmodSync(wt, 0o555);
+    cleanups.push(() => chmodSync(wt, 0o755));
+
+    const out = join(ws, 'rc.json');
+    const rc = await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true, out }),
+      neverInvoked,
+    );
+    // Precondition: the reset really did fail (journaled warning) and the
+    // worktree is NOT pristine — the agent's file is still there.
+    expect(readJournal(dir).some((e) => e.action === 'warning' && /worktree creation failed/.test(String(e.message)))).toBe(true);
+    expect(existsSync(join(wt, 'NOTES.md'))).toBe(true);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string };
+    expect(rc).not.toBe(0);
+    expect(res.instruction).not.toContain('the worktree is now pristine');
   });
 });
