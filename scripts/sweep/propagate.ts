@@ -2527,6 +2527,13 @@ async function crashHeal(cli: Cli, dir: string, journal: JournalEntry[]): Promis
   const healed: string[] = [];
   for (const e of journal) {
     if (e.action !== 'case' || closed.has(e.caseId as string)) continue;
+    // D-061 (B): NEVER crash-heal a GATE-FIX case. The heuristic below reads
+    // "the ref already contains the case head, so it was resolved before a
+    // crash" — but a gate-fix case's head IS the branch tip by construction, and
+    // a commit is always its own ancestor, so it matched instantly and every
+    // gate-fix case was journaled `resolved` on the next command. `openCases`
+    // then dropped it and `next-case` answered `finalize` with the case unserved.
+    if (e.gateFix === true) continue;
     const head = e.head as { sha?: string } | undefined;
     if (!head?.sha || typeof e.branch !== 'string') continue; // pre-head-journaling entries: not healable
     if (!(await refExists(cli.repo, e.branch))) continue;
@@ -7092,7 +7099,12 @@ export async function cmdSweepReportPr(
     const fixMsg = `${title}\n\n${body}\n\nGate fix for ${(gateFixRow.files as string[]).join(', ')} (case ${caseId}).`;
     const fixCommit = await journaledFixCommit(cli.repo, branch, fixedTree, fixMsg, scope);
     appendJournal(dir, { action: 'resolved', branch, caseId, tier: 'judged', gateFix: true, mergeCommit: fixCommit });
-    appendJournal(dir, { action: 'pr-intent', caseId, branch, mode: 'judged', gateFix: true, mergeCommit: fixCommit });
+    // NO pr-intent. The JUDGED history PR exists to be auto-flipped to merged by
+    // the target push that lands the SAME merge commit — machinery specific to a
+    // propagation merge. A gate fix is a single-parent commit with no conflict
+    // head, so that publish path does not apply (it halts at `judged-prs`). The
+    // fix's record is the commit itself: the agent's PR title/body become its
+    // message, and it reaches origin with the ordinary target push.
     await removeCaseWorktree(cli, dir, caseId);
     reopen(dir, [branch, ...descendants]);
     writeMachineState(dir, { ...st, phase: 'open', currentCase: null });

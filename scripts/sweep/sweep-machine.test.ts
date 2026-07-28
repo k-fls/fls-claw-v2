@@ -3516,11 +3516,14 @@ describe('sweep start — canonical pass location + clean-slate boundary (D-055)
 // ---------------------------------------------------------------------------
 
 describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
-  // KNOWN DEFECT (2026-07-28): the two skipped tests below FAIL. The trigger
-  // works — finish blames the right branch and journals the gate-fix + case rows
-  // (the anti-loop test proves it) — but `next-case` then answers `finalize`
-  // instead of serving the case, so the flow is NOT usable end to end yet.
-  // Supersession was ruled out as the cause. Do NOT unskip without a fix.
+  // The judged-tier test below is SKIPPED — see the note on it.
+  //
+  // ROOT CAUSE of the serving bug, fixed 2026-07-28: `crashHeal` journaled `resolved` for every
+  // gate-fix case on the next command. Its heuristic is "the ref already
+  // contains the case head, so it was resolved before a crash" — but a gate-fix
+  // case's head IS the branch tip, and a commit is its own ancestor, so it
+  // matched instantly. `openCases` then dropped it and `next-case` answered
+  // `finalize` with the case unserved.
   /** A fixture where a FEATURE branch owns the file the build fails on. */
   function gateFixRepo(withChild = false): FixtureRepo {
     const repo = initFixtureRepo();
@@ -3554,7 +3557,7 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     return { cmds: f, clear: () => rmSync(flag, { force: true }) };
   }
 
-  it.skip('red + no attribution -> gate-fix case on the OWNING branch, served with a no-merge briefing', async () => {
+  it('red + no attribution -> gate-fix case on the OWNING branch, served with a no-merge briefing', async () => {
     const repo = gateFixRepo();
     const ws = mkWorkspace();
     const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
@@ -3593,6 +3596,12 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     expect(repo.git('-C', join(dir, res.gateFix.caseId, 'worktree'), 'status', '--porcelain')).toBe('');
   });
 
+  // SKIPPED — the judged tier is NOT finished. The fix commit, its single parent
+  // and the descendant reopen all verify (assertions below pass); the failure is
+  // afterwards: the second `finish` re-enters the gate-fix path with the build
+  // reported red again even though the check now passes, so the pass does not
+  // complete. Root cause not yet identified. The HELD tier and the trigger are
+  // unaffected and covered by the two passing tests.
   it.skip('judged gate fix -> SINGLE-parent commit + descendants reopened; finish then says WHY cases remain', async () => {
     const repo = gateFixRepo(true);
     const ws = mkWorkspace();
@@ -3603,7 +3612,7 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     const dir = dirOf(repo, ws);
     repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
-    const { cmds } = redUntilCleared(ws);
+    const { cmds, clear } = redUntilCleared(ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
     await cmdSweepNextCase(baseCli(repo, ws, inv));
     const f1 = join(ws, 'f1.json');
@@ -3629,14 +3638,24 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     expect(repo.sha('module/cg')).not.toBe(tipBefore);
     expect(prRes.reopened).toContain('feat/child'); // pulled through the DAG
 
+    // The point of the judged tier: the fix is IN the branches, so once the build
+    // is green the SAME pass completes — no restart, unlike the held tier.
+    clear();
+    await cmdSweepNextCase(baseCli(repo, ws, inv)); // pull the fix through -> finalize
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = fakeGithub();
     const f2 = join(ws, 'f2.json');
     expect(
-      await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out: f2 })),
-    ).toBe(1);
-    const iss = (JSON.parse(readFileSync(f2, 'utf8')) as { issues: Array<{ id: string; detail: string }> }).issues[0];
-    expect(iss.id).toBe('ERR34_CASES_REMAIN');
-    expect(iss.detail).toContain('gate fix on module/cg');
-    expect(iss.detail).toContain('next-case');
+      await cmdSweepFinish(
+        baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, tokenFile, out: f2 }),
+        gh.factory,
+      ),
+    ).toBe(0);
+    expect((JSON.parse(readFileSync(f2, 'utf8')) as { ok: boolean }).ok).toBe(true);
+    expect(machineState(dir).phase).toBe('complete');
+    // feat/child carries the fix, pulled through by the reopen.
+    expect(repo.git('show', 'feat/child:src/x.ts')).toBe('FIXED');
   });
 
   it('ANTI-LOOP: a second red over the same branch+files is NOT re-served', async () => {
