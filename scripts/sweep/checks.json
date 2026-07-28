@@ -1,7 +1,7 @@
 {
   "typecheck": [
     { "cmd": "pnpm run typecheck", "cwd": "." },
-    { "cmd": "tsc -p container/agent-runner/tsconfig.json", "cwd": "." }
+    { "cmd": "tsc -p container/agent-runner/tsconfig.json --noEmit", "cwd": "." }
   ],
   "test": [
     { "cmd": "pnpm test", "cwd": "." },

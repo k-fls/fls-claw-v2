@@ -872,13 +872,43 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
       'node_modules',
       'container/agent-runner/node_modules',
     ]);
-    // The links are gitignored, so the RESOLVED TREE the driver snapshots is
-    // unaffected — a linked dep tree can never leak into a merge or a PR.
+    // REGRESSION (live bug, 2026-07-28): `.gitignore` has `node_modules/` — a
+    // trailing slash matches DIRECTORIES ONLY — while git records a symlink as
+    // mode 120000, a FILE. The ignore rule therefore does NOT cover these links,
+    // and `git add -A` staged both into every resolved tree of the first live
+    // pass. The per-worktree info/exclude is what actually keeps them out.
+    // Assert on TREE MODES, not on a name: the original name-only assertion
+    // passed while the bug shipped.
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
     expect(
       await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true }), confirm),
     ).toBe(0);
-    expect(repo.git('ls-tree', '-r', '--name-only', 'main_patched').split('\n')).not.toContain('node_modules');
+    const tree = repo.git('ls-tree', '-r', 'main_patched');
+    expect(tree).not.toContain('120000'); // no symlink entry of ANY kind
+    expect(tree).not.toContain('node_modules'); // and none under any path
+  });
+
+  it('the per-worktree info/exclude is what hides the links (anchored, slash-free, uncommitted)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    for (const rel of ['node_modules', 'container/agent-runner/node_modules']) {
+      mkdirSync(join(repo.dir, rel), { recursive: true });
+      writeFileSync(join(repo.dir, rel, 'marker.txt'), 'x\n');
+    }
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const dir = dirOf(repo, ws);
+    const wt = join(dir, currentCaseId(dir), 'worktree');
+    // COMMON dir: git reads info/exclude from the shared .git, not from a
+    // linked worktree's private dir (writing there is a silent no-op).
+    const gitDir = repo.git('-C', wt, 'rev-parse', '--path-format=absolute', '--git-common-dir');
+    const exclude = readFileSync(join(gitDir, 'info', 'exclude'), 'utf8');
+    expect(exclude).toContain('/node_modules');
+    expect(exclude).toContain('/container/agent-runner/node_modules');
+    // git itself must agree the links are invisible inside the worktree.
+    const status = repo.git('-C', wt, 'status', '--porcelain');
+    expect(status).not.toContain('node_modules');
   });
 
   it('no checks-file in the repo -> the gate is SKIPPED (no checks rows), the cold read still gates', async () => {

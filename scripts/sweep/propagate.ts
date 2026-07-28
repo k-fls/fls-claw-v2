@@ -1329,6 +1329,34 @@ function loadChecksConfig(checksFile: string | undefined): ChecksConfig | null {
   return { typecheck: norm(r.typecheck), test: norm(r.test) };
 }
 
+/**
+ * How much of a failing checks run the agent is handed. The FULL log goes to
+ * `<kind>-output.full.txt`; the file the driver TELLS the agent to read is capped
+ * to this many trailing lines. Live evidence (2026-07-28): an uncapped vitest run
+ * of 1860 tests wrote 973 KB and the driver said "read <output-file>" — a context
+ * bomb for 11 failing names. The tail is where failures and summaries live.
+ */
+const CHECKS_OUTPUT_TAIL_LINES = 250;
+
+/**
+ * The bounded view of a failing checks run: the failing command names up front
+ * (the thing the agent must act on), then the tail of the raw output, then a
+ * pointer to the full log on disk for when the tail is not enough.
+ */
+function boundedChecksOutput(r: ChecksRunResult, fullFile: string): string {
+  const lines = r.output.split('\n');
+  const truncated = lines.length > CHECKS_OUTPUT_TAIL_LINES;
+  const tail = truncated ? lines.slice(-CHECKS_OUTPUT_TAIL_LINES) : lines;
+  return [
+    `FAILED: ${r.failedNames.join(', ')}`,
+    truncated
+      ? `(showing the last ${CHECKS_OUTPUT_TAIL_LINES} of ${lines.length} lines — full log: ${fullFile})`
+      : `(full output below — also at ${fullFile})`,
+    '',
+    ...tail,
+  ].join('\n');
+}
+
 /** The outcome of running one checks command list in a directory (D-060). */
 export interface ChecksRunResult {
   ok: boolean;
@@ -1485,6 +1513,37 @@ async function cleanPrefixTree(
 const WORKTREE_DEP_LINKS = ['node_modules', 'container/agent-runner/node_modules'];
 
 /**
+ * Make paths invisible to `git add -A`, via `$GIT_COMMON_DIR/info/exclude` —
+ * NOT a `.gitignore` edit (that would be committed and leak into every PR).
+ * `info/exclude` is repo-local and never committed.
+ *
+ * Must be the COMMON dir: git reads `info/exclude` from the shared `.git`, NOT
+ * from a linked worktree's private `.git/worktrees/<id>/` (verified — writing
+ * there had no effect and `git status` still listed the links as untracked).
+ * Patterns are anchored (`/path`), so they apply at the top level of the clone
+ * and of every worktree alike.
+ *
+ * This exists because `.gitignore` DOES NOT COVER THE DEP LINKS (live bug,
+ * 2026-07-28): the repo ignores `node_modules/` — with a trailing slash, which
+ * matches DIRECTORIES ONLY — while git records a symlink as mode 120000, a FILE.
+ * So `git add -A` staged both links into every resolved tree of the first live
+ * pass (confirmed: `120000 blob … node_modules`). Slash-free patterns here match
+ * a path of ANY type.
+ */
+async function excludeInWorktree(repo: string, wtPath: string, patterns: string[]): Promise<void> {
+  const gitDir = (await git(repo, ['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd: wtPath })).stdout.trim();
+  if (!gitDir) return;
+  const infoDir = join(gitDir, 'info');
+  mkdirSync(infoDir, { recursive: true });
+  const file = join(infoDir, 'exclude');
+  const existing = existsSync(file) ? readFileSync(file, 'utf8') : '';
+  const lines = new Set(existing.split('\n').map((l) => l.trim()));
+  const add = patterns.map((p) => `/${p}`).filter((p) => !lines.has(p));
+  if (add.length === 0) return;
+  writeFileSync(file, (existing && !existing.endsWith('\n') ? existing + '\n' : existing) + add.join('\n') + '\n');
+}
+
+/**
  * D-060 fix: a `git worktree add` checkout has NO `node_modules`, so the checks
  * gate (`pnpm run typecheck` / `pnpm test`, run IN the case worktree) would fail
  * with `tsc: not found` on EVERY resolved case — a failure the agent cannot fix
@@ -1493,13 +1552,15 @@ const WORKTREE_DEP_LINKS = ['node_modules', 'container/agent-runner/node_modules
  * `[AUTO-ESCALATED: checks failing]` HELD draft.
  *
  * Symlink the CLONE's installed dependency trees into the worktree so the checks
- * run against the agent's resolved tree with the deps the clone already has.
- * `node_modules/` is gitignored at every depth, so the links never reach
- * `snapshotWorktreeTree`'s `git add -A` and cannot pollute the resolved tree.
+ * run against the agent's resolved tree with the deps the clone already has. The
+ * links are excluded per-worktree FIRST (`excludeInWorktree`) — do NOT rely on
+ * `.gitignore`, which does not match them (see above); without the exclude these
+ * symlinks land in the resolved tree, the merge, and the PR.
  * Best-effort and per-tree: a missing tree in the clone is simply not linked
  * (and its check then fails loudly and correctly, rather than silently).
  */
-function linkNodeModules(repo: string, wtPath: string): string[] {
+async function linkNodeModules(repo: string, wtPath: string): Promise<string[]> {
+  await excludeInWorktree(repo, wtPath, WORKTREE_DEP_LINKS);
   const linked: string[] = [];
   for (const rel of WORKTREE_DEP_LINKS) {
     const src = join(repo, rel);
@@ -1564,7 +1625,7 @@ async function createCaseWorktree(
     // shared .git so rerere-enabled operations in the case worktree see the
     // recorded resolutions. Best-effort, like the worktree itself.
     const seeded = await installRrCache(cli.repo, join(cli.workspace, RR_CACHE_DIRNAME));
-    const linkedDeps = linkNodeModules(cli.repo, wtPath);
+    const linkedDeps = await linkNodeModules(cli.repo, wtPath);
     appendJournal(dir, {
       action: 'case-worktree',
       caseId: caseFile.id,
@@ -6490,7 +6551,9 @@ export async function cmdSweepReportCase(
       const r = await runChecks(list, wtPath);
       if (r.ok) continue;
       const outFile = join(caseDir, `${kind}-output.txt`);
-      writeFileSync(outFile, r.output);
+      const fullFile = join(caseDir, `${kind}-output.full.txt`);
+      writeFileSync(fullFile, r.output);
+      writeFileSync(outFile, boundedChecksOutput(r, fullFile));
       appendJournal(dir, { action: 'checks-fail', caseId, resolvedTree, kind, failed: r.failedNames });
       const n = checksFailCount(readJournal(dir), caseId);
       if (n >= CHECKS_FAIL_LIMIT) {
