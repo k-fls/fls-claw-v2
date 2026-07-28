@@ -137,16 +137,22 @@ describe('branchCandidates — the OWNER RULE (earliest by hierarchy)', () => {
     expect(c[0].match).toBe('owned');
   });
 
-  it('GLOB semantics: `dir/**` matches beneath, a bare path matches only itself', () => {
-    // The live inventory is 23 globs + 220 exact file paths and NO bare
-    // directory patterns, so glob semantics is the whole contract — the old
-    // literal-prefix behaviour was invented and matched nothing real.
+  it('GLOB semantics: `dir/**` matches beneath — and so does a bare DIRECTORY', () => {
+    // The live inventory is 23 globs + 220 exact file paths, so glob semantics
+    // is the contract — the old literal-prefix behaviour matched none of them.
     const g = [feat({ id: 'm', branch: 'b', parents: ['main_patched'], owned_paths: ['src/modules/typing/**'] })];
     expect(branchCandidates(['src/modules/typing/index.ts'], g)).toHaveLength(1);
     expect(branchCandidates(['src/modules/typing-extra/x.ts'], g)).toHaveLength(0);
+    // A bare DIRECTORY owns what is inside it (globs.ts's own `dir/` rule, which
+    // the registry writes without the trailing slash). `container/agent-runner`
+    // is how a whole sub-package is claimed and the shipped checks.json runs
+    // that package's suite from inside it; under matches-only-itself every
+    // diagnostic that command printed found no owner at all.
     const exact = [feat({ id: 'm', branch: 'b', parents: ['main_patched'], owned_paths: ['src/modules/typing'] })];
     expect(branchCandidates(['src/modules/typing'], exact)).toHaveLength(1);
-    expect(branchCandidates(['src/modules/typing/index.ts'], exact)).toHaveLength(0);
+    expect(branchCandidates(['src/modules/typing/index.ts'], exact)).toHaveLength(1);
+    // …but a SIBLING sharing the name prefix is not beneath it.
+    expect(branchCandidates(['src/modules/typing-extra/x.ts'], exact)).toHaveLength(0);
   });
 
   it('entries without a branch are skipped', () => {

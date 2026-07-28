@@ -336,7 +336,11 @@ describe('sweep start — the base gate (D-061 A)', () => {
     };
     expect(res.status).toBe('gate-fix-required');
     expect(res.issues[0].id).toBe('ERR42_BASE_RED');
-    expect(res.gateFix.branch).toBe('module/cg'); // blamed from the tsc path, not the trunk anchor
+    // Blame must still find an OWNER for the failing path (that is what separates
+    // this from the "nothing owns it" refusal below), but the CASE is rooted on
+    // the base anchor — see DEFECT 4a: a commit on module/cg can never turn
+    // main_patched green.
+    expect(res.gateFix.branch).toBe('main_patched');
     expect(res.gateFix.files).toEqual(['src/x.ts']);
     expect(res.instruction).toContain('next-case');
     // The pass IS open (a case needs somewhere to live) but nothing merged yet.
@@ -495,10 +499,18 @@ describe('sweep start — the base gate (D-061 A)', () => {
     const inv = writeInventory([{ id: 'runner', branch: 'module/runner', owned: ['container/agent-runner'] }]);
     const out = join(ws, 'start.json');
     expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks, out }), undefined, subCwdRunner)).toBe(0);
-    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; gateFix: { branch: string; files: string[] } };
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      status: string;
+      gateFix: { branch: string; files: string[]; reason: string };
+    };
     expect(res.status).toBe('gate-fix-required');
     expect(res.gateFix.files).toEqual(['container/agent-runner/src/auth/x.ts']);
-    expect(res.gateFix.branch).toBe('module/runner');
+    // The normalised path blames the SUB-PACKAGE's owner — not a root-level
+    // `src/…` owner, which is the collision this test exists for. The CASE is
+    // rooted on the base anchor (DEFECT 4a: a base-red fix can only land there),
+    // so the owner blame is reported in `reason`.
+    expect(res.gateFix.reason).toContain('module/runner');
+    expect(res.gateFix.branch).toBe('main_patched');
   });
 
   /**

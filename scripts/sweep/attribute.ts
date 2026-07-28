@@ -63,7 +63,19 @@ function pathMatches(patterns: string[] | undefined, file: string): boolean {
   // live inventory is full of `scripts/sweep/**`-shaped patterns; the literal
   // prefix test this replaced could never match one, so blame silently found no
   // owner and fell back to the accused branch (defect 5).
-  return globMatchAny(patterns ?? [], file);
+  const globs = patterns ?? [];
+  if (globMatchAny(globs, file)) return true;
+  // A bare DIRECTORY pattern owns what is inside it. `container/agent-runner` is
+  // how a whole sub-package is claimed (the shipped checks.json runs its suite
+  // as its own command), and with glob semantics alone that pattern matched the
+  // directory entry and nothing beneath it — so every diagnostic from inside the
+  // package found no owner. globs.ts already defines this: a literal directory
+  // prefix matches its contents when the pattern ends with `/`; the registry
+  // writes them without one.
+  return globMatchAny(
+    globs.filter((p) => !p.endsWith('/') && !p.includes('*') && !p.includes('?')).map((p) => `${p}/`),
+    file,
+  );
 }
 
 /**
