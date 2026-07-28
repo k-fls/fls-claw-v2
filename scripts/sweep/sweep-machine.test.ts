@@ -181,6 +181,13 @@ const rejectCode: ColdReadInvoker = async () => ({
 // D-060: the cold read is the SINGLE quality gate and it lives at `report-case`.
 // Any stage that must not cold-read gets this invoker — it fails the test loudly
 // instead of silently passing a second `claude -p` through.
+/**
+ * A green checks runner for `start`'s BASE GATE (D-061 A). Tests that exercise
+ * the PER-CASE gate need the base to pass, or `start` refuses with ERR42 and no
+ * pass ever opens. Injected at start only; report-case gets its own runner.
+ */
+const greenBase: ChecksRunner = async () => ({ ok: true, failedNames: [], output: '' });
+
 const neverInvoked: ColdReadInvoker = async () => {
   throw new Error('cold read invoked where D-060 forbids one');
 };
@@ -250,6 +257,104 @@ describe('sweep start / abort (D-053 §2)', () => {
     expect(repo.sha('main_patched')).toBe(preRef); // rolled back
     expect(machineState(dir).phase).toBe('complete');
     expect(await cmdSweepStart(baseCli(repo, ws, inv))).toBe(0); // fresh start allowed
+  });
+});
+
+// ---------------------------------------------------------------------------
+// D-061 (A): the BASE GATE at `start`. Live 2026-07-28: the fork trunk had been
+// type-broken since fcee39ea (2026-07-04); the pass merged it into 11 branches
+// and only found out at finish, where verify went red with NO clean attribution
+// — an hour of work, no usable output, and a report asking a human to go fix it.
+// ---------------------------------------------------------------------------
+
+describe('sweep start — the base gate (D-061 A)', () => {
+  function baseChecks(ws: string): string {
+    const f = join(ws, 'checks.json');
+    writeFileSync(
+      f,
+      JSON.stringify({ typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }], test: [{ cmd: 'vitest', cwd: '.' }] }),
+    );
+    return f;
+  }
+  function runner(failing: string[]): { fn: ChecksRunner; ran: string[][] } {
+    const ran: string[][] = [];
+    const fn: ChecksRunner = async (commands) => {
+      const names = commands.map((c) => c.cmd);
+      ran.push(names);
+      const failedNames = names.filter((n) => failing.includes(n));
+      return {
+        ok: failedNames.length === 0,
+        failedNames,
+        output: failedNames.map((n) => `$ ${n}\ntype error\n`).join(''),
+      };
+    };
+    return { fn, ran };
+  }
+
+  it('base RED -> ERR42, NO pass opened, nothing merged, failing output written', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const beforeTip = repo.sha('main_patched');
+    const r = runner(['tsc --noEmit']);
+    const out = join(ws, 'start.json');
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: baseChecks(ws), out }), undefined, r.fn)).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      issues: Array<{ id: string; detail: string }>;
+      base: { branch: string; failed: string[] };
+      instruction: string;
+    };
+    expect(res.issues[0].id).toBe('ERR42_BASE_RED');
+    expect(res.base.branch).toBe('main_patched'); // the fork TRUNK, not a merge-base commit
+    expect(res.base.failed).toEqual(['tsc --noEmit']);
+    expect(res.issues[0].detail).toContain('BEFORE any merge');
+    expect(res.issues[0].detail).toContain('pre-existing'); // names it as not propagation's fault
+    expect(res.instruction).toContain('no pass opened');
+    expect(readFileSync(join(ws, 'base-check-output.txt'), 'utf8')).toContain('tsc --noEmit');
+    // NOTHING happened: no pass, no merges, trunk untouched.
+    expect(existsSync(join(dirOf(repo, ws), 'plan-initial.json'))).toBe(false);
+    expect(existsSync(join(dirOf(repo, ws), 'machine-state.json'))).toBe(false);
+    expect(repo.sha('main_patched')).toBe(beforeTip);
+    // ONLY the typecheck list runs — tests are slow, and finish still covers them.
+    expect(r.ran).toEqual([['tsc --noEmit']]);
+  });
+
+  it('base GREEN -> the pass opens normally', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const r = runner([]);
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: baseChecks(ws) }), undefined, r.fn)).toBe(0);
+    expect(existsSync(join(dirOf(repo, ws), 'machine-state.json'))).toBe(true);
+    expect(r.ran).toEqual([['tsc --noEmit']]);
+  });
+
+  it('a base-red refusal DESTROYS NOTHING — a prior completed pass survives for investigation', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'machine-state.json'),
+      JSON.stringify({ schemaVersion: 1, phase: 'complete', currentCase: null }),
+    );
+    writeFileSync(join(dir, 'journal.jsonl'), JSON.stringify({ ts: 'x', action: 'pass-complete' }) + '\n');
+    expect(
+      await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: baseChecks(ws) }), undefined, runner(['tsc --noEmit']).fn),
+    ).toBe(1);
+    // The gate runs BEFORE the clean-slate wipe, so the prior pass is intact.
+    expect(readFileSync(join(dir, 'journal.jsonl'), 'utf8')).toContain('pass-complete');
+  });
+
+  it('no checks-file -> the base gate is SKIPPED (pre-D-061 behavior, nothing runs)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const r = runner(['tsc --noEmit']); // would fail if it ever ran
+    expect(await cmdSweepStart(baseCli(repo, ws, inv), undefined, r.fn)).toBe(0);
+    expect(r.ran).toEqual([]);
+    expect(existsSync(join(dirOf(repo, ws), 'machine-state.json'))).toBe(true);
   });
 });
 
@@ -672,7 +777,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     inv: string,
     checks: string,
   ): Promise<{ dir: string; caseId: string }> {
-    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }), undefined, greenBase);
     await cmdSweepNextCase(baseCli(repo, ws, inv));
     const dir = dirOf(repo, ws);
     const caseId = currentCaseId(dir);
@@ -827,7 +932,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     const ws = mkWorkspace();
     const inv = emptyInventory();
     const checks = checksFile(ws);
-    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }), undefined, greenBase);
     await cmdSweepNextCase(baseCli(repo, ws, inv));
     const dir = dirOf(repo, ws);
     const caseId = currentCaseId(dir);

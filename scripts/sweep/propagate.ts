@@ -389,6 +389,60 @@ export function arrivedSet(journal: JournalEntry[]): Set<string> {
 // Base resolution + plan derivation wiring.
 // --------------------------------------------------------------------------
 
+/**
+ * The branch whose CURRENT state the pass will build everything on top of — the
+ * fork trunk when it exists. `resolveBase` returns a merge-base COMMIT (the cut
+ * point for height math); this is the live TRUNK TIP, which is what a build
+ * actually has to be green at.
+ */
+async function baseCheckAnchor(cli: Cli): Promise<string> {
+  return (await refExists(cli.repo, 'main_patched')) ? 'main_patched' : cli.upstream;
+}
+
+/**
+ * D-061 (A): typecheck the pass's BASE before opening the pass.
+ *
+ * `start` used to pin a watermark and begin merging without ever asking whether
+ * the thing it builds on is green. Live evidence 2026-07-28: the fork trunk had
+ * carried a type error since `fcee39ea` (2026-07-04) — `isAdmin` passing
+ * `string | null | undefined` into `hasAdminPrivilege(userId: string, …)`. The
+ * pass merged the trunk into 11 branches, produced 8 cases and 3 HELD, and only
+ * discovered it at `finish`, where verify went red with NO CLEAN ATTRIBUTION
+ * (the offender was not any branch the pass had mutated) — an hour of work and a
+ * dead end whose message asked a human to go fix something.
+ *
+ * Checked IN ISOLATION, before any merge, whatever fails is unambiguously
+ * pre-existing, so the report names a culprit instead of shrugging. Costs one
+ * `tsc --noEmit`. Only the TYPECHECK list runs — tests are far slower and the
+ * finish-time verify still covers them.
+ *
+ * Returns null when there is nothing to check (no checks-file / empty list), so
+ * a repo without one behaves exactly as before.
+ */
+async function runBaseChecks(
+  cli: Cli,
+  checksFile: string | undefined,
+  runChecks: ChecksRunner,
+): Promise<{ ok: boolean; failedNames: string[]; output: string; anchor: string; sha: string } | null> {
+  const checks = loadChecksConfig(checksFile);
+  if (!checks || checks.typecheck.length === 0) return null;
+  const anchor = await baseCheckAnchor(cli);
+  if (!(await refExists(cli.repo, anchor))) return null;
+  const sha = await revParse(cli.repo, anchor);
+  const wt = join(tmpdir(), `sweep-basecheck-${sha.slice(0, 12)}`);
+  await git(cli.repo, ['worktree', 'remove', '--force', wt], { allowCodes: [1, 128] });
+  rmSync(wt, { recursive: true, force: true });
+  await git(cli.repo, ['worktree', 'add', '--detach', wt, sha]);
+  try {
+    await linkNodeModules(cli.repo, wt);
+    const r = await runChecks(checks.typecheck, wt);
+    return { ok: r.ok, failedNames: r.failedNames, output: r.output, anchor, sha };
+  } finally {
+    await git(cli.repo, ['worktree', 'remove', '--force', wt], { allowCodes: [1, 128] });
+    rmSync(wt, { recursive: true, force: true });
+  }
+}
+
 async function resolveBase(cli: Cli): Promise<string> {
   if (cli.base) return cli.base;
   if (await refExists(cli.repo, FORK_POINT)) return FORK_POINT;
@@ -5969,7 +6023,11 @@ async function deriveOriginMergeStatus(
  * from the durable group-root ledger + rr-cache, which killed rerere and
  * diverged the ledger). A group root inside an OUTER git repo is accepted.
  */
-export async function cmdSweepStart(cli: Cli, makeTransport?: (token: string) => GithubTransport): Promise<number> {
+export async function cmdSweepStart(
+  cli: Cli,
+  makeTransport?: (token: string) => GithubTransport,
+  runChecks: ChecksRunner = defaultChecksRunner,
+): Promise<number> {
   // D-060: RESOLVE the pass config to flag-or-default up front, then persist the
   // absolute paths into machine state (below) so every later command reads them
   // FROM STATE and the agent passes no such flag mid-pass.
@@ -6062,6 +6120,31 @@ export async function cmdSweepStart(cli: Cli, makeTransport?: (token: string) =>
       result(cli, { ok: false, issues: [{ id: 'ERR30_PASS_OPEN', detail }] });
       return 1;
     }
+  }
+
+  // D-061 (A): BASE GATE — refuse to open a pass on a base that is already red.
+  // Deliberately BEFORE the clean-slate wipe below: a refusal must destroy
+  // nothing, so a prior pass's records survive for whoever investigates.
+  const baseCheck = await runBaseChecks(cli, resolvedChecksFile, runChecks);
+  if (baseCheck && !baseCheck.ok) {
+    const outFile = pathResolve(cli.workspace, 'base-check-output.txt');
+    try {
+      writeFileSync(outFile, baseCheck.output);
+    } catch {
+      /* best-effort: the detail below still names the failing commands */
+    }
+    const detail =
+      `${baseCheck.anchor} (${baseCheck.sha.slice(0, 12)}) FAILS the typecheck BEFORE any merge — ` +
+      `${baseCheck.failedNames.join(', ')}. This is pre-existing, NOT caused by propagation: fix the base ` +
+      `first, then re-run \`start\`. Full output: ${outFile}`;
+    console.error(`sweep start [ERR42_BASE_RED]: ${detail}`);
+    result(cli, {
+      ok: false,
+      issues: [{ id: 'ERR42_BASE_RED', detail }],
+      base: { branch: baseCheck.anchor, sha: baseCheck.sha, failed: baseCheck.failedNames },
+      instruction: `REPORT to the owner: the base ${baseCheck.anchor} is already broken (${baseCheck.failedNames.join(', ')}); no pass opened`,
+    });
+    return 1;
   }
 
   // Clean-slate boundary (D-055): the refusal above cleared any in-flight pass,
