@@ -96,6 +96,15 @@ finish --execute --token-file <path> --commands-file <cheap-tests.json>   # crea
 - Cold-read reject (from `report-case` or `report-pr`) — read the returned
   feedback, revise the resolution, retry ONCE. A second reject auto-escalates:
   stop re-resolving and take the next case.
+- GATE-FIX case — the full-integration build is RED from a defect that is NOT a
+  merge conflict (often pre-existing). The worktree has NO conflict markers and
+  NOTHING pending; the materials name the failing files, the failing checks and
+  the branch the driver blamed. Edit those files so the checks pass, then
+  `report-case` as usual. Claim `--tier judged` when you are confident in the
+  fix — it is committed on the branch, pulled through every descendant, and the
+  pass can still complete. Claim `--tier held` when you are not — it is
+  published as a PR for the owner and BLOCKS the next sweep until merged.
+  This is the ONLY case type where you change code this pass did not merge.
 - REISSUED case — the owner reviewed one of your open held PRs. The worktree
   holds your prior resolution as the pending files; the materials carry the
   full time-ordered PR dialog (`you (prior)` = your earlier turns; other turns
@@ -112,6 +121,10 @@ finish --execute --token-file <path> --commands-file <cheap-tests.json>   # crea
   factually and re-run `finish`. Only a global halt reported in the output, or
   a DIVERGED branch, is a stop-case 2 report.
 - `abort --execute` — the only way to drop an in-flight pass.
+- **NEVER tell the owner to edit code and push.** If a build is broken, the
+  driver serves you a GATE-FIX case and your fix reaches the owner as a PR (or
+  lands with the pass, on `--tier judged`). Reporting a diagnosis instead of
+  working the case is not a substitute. Diagnose in the case, not in chat.
 
 ### Case scope — rooted in the merge
 
@@ -128,6 +141,10 @@ whole scope — reads and edits — is what this merge causes:
   conflicted set, claim `--tier judged`.
 - If a bounded, rooted look is not enough, claim `--tier held` — never an
   ever-widening search. A case is one decision, one resolution.
+- On a GATE-FIX case there is NO merge, so "what this merge causes" does not
+  apply. Scope = the failing files named in the materials, plus what fixing
+  them DIRECTLY forces. Same bounded rule, different root: do not restructure,
+  and do not wander outside the named files.
 
 ### Driver bugs
 
@@ -157,7 +174,7 @@ around a blocking id.
 | `ERR15_PUSH_FAILED` | per-branch, NOT a stop: report landed-vs-failed, re-run `finish`; a DIVERGED branch needs the owner. No hand-push, ever |
 | `ERR16_CLOSURE_FAILED` | investigate, report; publish nothing more until understood |
 | `ERR17_URGE_FAILED` | retries next `finish`; recurring → stop-case 2 report |
-| `ERR18_VERIFY_PENDING` | re-run `finish`; never work around the gate |
+| `ERR18_VERIFY_PENDING` | re-run `finish`; if the driver serves a GATE-FIX case, resolve it like any other case |
 | `ERR20_BRANCH_DIVERGED` | owner escalation; never force-resolve (no reset, no force-push) |
 | `ERR21_MERGE_FAILED` | note it in the end-of-sweep result; file a driver issue if it recurs |
 | `ERR22_DIRTY_WORKTREE` | clean/commit the named worktree, re-run; never `reset --hard` someone else's work |
@@ -169,6 +186,10 @@ around a blocking id.
 | `ERR33_BRANCH_TESTS_FAILED` | open the named log, fix the resolution, re-report |
 | `ERR34_CASES_REMAIN` | finish every case first |
 | `ERR35_COLDREAD_UNAVAILABLE` | stop-case 2 report; the case stays put — re-run once restored |
+| `ERR36_TYPECHECK_FAILED` | open the named output file, fix the pending files, re-run `report-case` |
+| `ERR40_TESTS_FAILED` | same as ERR36; at `finish` it is a stop-case 2 report (publish nothing) |
+| `ERR41_TOKEN_REJECTED` | the GitHub token was REJECTED — re-auth; a retry with the same token cannot clear it |
+| `ERR42_BASE_RED` | the base was already broken BEFORE any merge; no pass was opened — stop-case 2 report naming the branch and failing checks |
 | `ERR39_FETCH_FAILED` | fix connectivity/creds, re-run `start`; never open a pass on a stale view |
 | `WARN01_TEMPLATE_TEXT` | rewrite the body from the case materials |
 | `WARN02_NO_DECISION_LINE` | open the body with the exact decision the owner is asked to make |
