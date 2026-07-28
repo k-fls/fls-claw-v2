@@ -3636,13 +3636,19 @@ async function publishHead(
         }
       }
       if (shipTree) {
-        // ACTIVE: the resolved merge commit — owner reviews & merges.
-        const headSha = await deterministicCommit(
-          cli.repo,
-          shipTree,
-          [tip, jc.head.sha],
-          `Resolution of ${jc.caseId} for owner review (merges ${jc.head.sha.slice(0, 12)} into ${jc.branch})`,
-        );
+        // D-061 (B): a HELD GATE FIX ships as a SINGLE-parent commit. Its
+        // `head.sha` IS the branch tip, so the ordinary two-parent form would
+        // record the tip as both parents — a degenerate self-merge whose PR
+        // diff reads as an empty merge rather than the fix.
+        const isGateFix = readJournal(dir).some((e) => e.action === 'gate-fix' && e.caseId === jc.caseId);
+        const headSha = isGateFix
+          ? await deterministicCommit(cli.repo, shipTree, [tip], `Gate fix for ${jc.caseId} on ${jc.branch} (owner review)`)
+          : await deterministicCommit(
+              cli.repo,
+              shipTree,
+              [tip, jc.head.sha],
+              `Resolution of ${jc.caseId} for owner review (merges ${jc.head.sha.slice(0, 12)} into ${jc.branch})`,
+            );
         return { headSha, mode: 'held', draft: false, escalation };
       }
     }
