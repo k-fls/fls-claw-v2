@@ -81,7 +81,9 @@ finish --execute --token-file <path> --commands-file <cheap-tests.json>   # crea
 ### Command actions
 
 - `start` — review the printed plan YOURSELF, do not post it; if it looks
-  anomalous, `abort` and report. CANDIDATES: relay each in your end-of-sweep
+  anomalous, `abort` and report. A 1-2 branch plan means SCOPE COLLAPSE
+  (missing local branches or the wrong inventory path) — `abort` and
+  investigate, never sweep on it. CANDIDATES: relay each in your end-of-sweep
   result — `clear`: propose the placement and WAIT for approval; `unclear`: ask
   the printed questions VERBATIM. NEVER add an inventory entry (or edit
   `parents:`) without owner approval; on approval, regenerate the entry locally
@@ -211,8 +213,9 @@ around a blocking id.
 - **mechanical** — a resolution so formulaic the diff alone proves it; no PR.
 - **judged** — correct but takes judgment to see; you write the PR description.
 - **held** — the ONLY review state: anything unresolved, scope-exceeded, or
-  judgment-worthy enough that the owner must decide. When in doubt: held. Never
-  invent an intermediate review state.
+  judgment-worthy enough that the owner must decide — including anything
+  SECURITY-FLAGGED. When in doubt: held. Never invent an intermediate review
+  state.
 - Analysis never waits for permission — run the sweep unprompted on schedule.
   Every owner decision travels as a HELD PR in the end-of-sweep result, never a
   chat question; never ask permission for work this document authorizes.
@@ -226,7 +229,9 @@ around a blocking id.
   file, show the resolution hunk (ours vs theirs vs chosen, and why) in a
   collapsed `<details>` block with a GitHub permalink; then state: "everything
   outside these N files is verbatim upstream <range>, already reviewed
-  upstream." Close with verification status.
+  upstream." Close with verification status — and if a gate could NOT run where
+  you are (container/bun tests), SAY SO explicitly: a merge is not "verified"
+  until the full matrix ran somewhere.
 - Write from the case materials only — the conflict markers' two sides plus the
   per-side brief in `pr/materials.md`. Do NOT explore the repo to write the
   description; if the materials aren't enough for an honest description, that
