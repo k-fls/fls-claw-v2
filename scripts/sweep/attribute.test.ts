@@ -4,10 +4,18 @@
  * The live 2026-07-28 failure is the reference case throughout: verify accused
  * `feat/mitm-credential-proxy`, but the type error was in `src/command-gate.ts`
  * — a file FOUR registry entries declare in their paths and NONE of them has
- * ever modified. The branch that actually carries the defect is the fork trunk
- * `main_patched` (6 own commits, hierarchy depth 1), which no inventory entry
- * claims at all. Blame is therefore decided by GIT HISTORY, not by declarations;
+ * ever modified. Blame is therefore decided by GIT HISTORY, not by declarations;
  * these tests build real repos and assert against real commits.
+ *
+ * The history rule itself then had to be corrected. Counting a branch's own work
+ * as a SET DIFFERENCE (`^<inventory parents>`) credited the fork trunk with 6
+ * commits over `src/command-gate.ts` — two merges plus three edits AUTHORED on
+ * `module/command-gate` and absorbed by a propagation merge — while the branch
+ * that actually wrote the file scored 0, because `^main_patched` subtracted its
+ * own work back out of it. Authorship is the FIRST-PARENT LINE:
+ * `--first-parent --no-merges <branch> ^main`. So the fixture below carries a
+ * REAL propagation merge (receiver first parent, donor second): a linear fixture
+ * cannot tell the two rules apart, which is the whole point.
  */
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -122,22 +130,37 @@ describe('hierarchy — the ONE depth/minPath implementation', () => {
 });
 
 /**
- * THE LIVE SHAPE, in miniature:
+ * THE LIVE SHAPE, in miniature — WITH THE PROPAGATION MERGE:
  *
- *   main                    src/shared.ts        (upstream — nobody's fork work)
- *   main_patched            src/command-gate.ts  x2   <- the real defect, depth 1
- *   module/command-gate     src/host-commands.ts      <- DECLARES command-gate.ts, never touched it
- *   feat/leaf               src/leaf.ts               <- also declares it; inherits the trunk's commits
- *   feat/maintenance-sweep  scripts/sweep/propagate.ts (a `**`-glob-owned path)
+ *   main                     src/shared.ts              (upstream — nobody's fork work)
+ *   main_patched             src/base.ts
+ *   module/command-gate        src/command-gate.ts x2   <- the real AUTHOR, depth 2
+ *                              src/host-commands.ts
+ *   main_patched  <--M-- module/command-gate            <- PROPAGATION MERGE (trunk = FIRST parent)
+ *   main_patched             src/trunk.ts               <- the trunk's own authored file, depth 1
+ *   feat/leaf                src/leaf.ts                (cut from module/command-gate)
+ *   feat/maintenance-sweep   scripts/sweep/propagate.ts (cut from main_patched AFTER M)
+ *
+ * That merge is what makes the fixture discriminating. After it, the trunk
+ * CONTAINS both `src/command-gate.ts` commits, so the old `^parents` set
+ * difference blames `main_patched` and zeroes out `module/command-gate` —
+ * precisely the live 6-vs-0 inversion. On the first-parent line the trunk
+ * authored NOTHING over that file and the module keeps its two edits.
  */
 function blameRepo(): FixtureRepo {
   const repo = initFixtureRepo();
   repo.commit('upstream: shared', { 'src/shared.ts': 'up\n' });
   repo.checkout('main_patched', { create: true, at: 'main' });
-  repo.commit('mp: command gate', { 'src/command-gate.ts': 'trunk\n' });
-  repo.commit('mp: command gate again', { 'src/command-gate.ts': 'trunk2\n' });
+  repo.commit('mp: fork base', { 'src/base.ts': 'base\n' });
   repo.checkout('module/command-gate', { create: true, at: 'main_patched' });
+  repo.commit('cg: command gate', { 'src/command-gate.ts': 'cg1\n' });
+  repo.commit('cg: command gate again', { 'src/command-gate.ts': 'cg2\n' });
   repo.commit('cg: host commands', { 'src/host-commands.ts': 'cg\n' });
+  // The sweep's own propagation merge: the trunk RECEIVES, so the trunk is the
+  // first parent and module/command-gate the second.
+  repo.checkout('main_patched');
+  repo.merge('module/command-gate', 'verify: merge module/command-gate');
+  repo.commit('mp: trunk-only edit', { 'src/trunk.ts': 'trunk\n' });
   repo.checkout('feat/leaf', { create: true, at: 'module/command-gate' });
   repo.commit('leaf: work', { 'src/leaf.ts': 'leaf\n' });
   repo.checkout('feat/maintenance-sweep', { create: true, at: 'main_patched' });
@@ -153,20 +176,22 @@ const liveShape: FeatureEntry[] = [
     id: 'cg',
     branch: 'module/command-gate',
     parents: ['main_patched'],
-    // The declaration that lied: four live entries claim this path, none wrote it.
     touch_paths: ['src/command-gate.ts'],
   }),
   feat({
     id: 'leaf',
     branch: 'feat/leaf',
     parents: ['module/command-gate'],
-    owned_paths: ['src/command-gate.ts'],
+    // A declaration that lies: the trunk wrote src/trunk.ts, the leaf never has.
+    owned_paths: ['src/trunk.ts'],
   }),
   feat({
     id: 'sweep',
     branch: 'feat/maintenance-sweep',
     parents: ['main_patched'],
     owned_paths: ['scripts/sweep/**'],
+    // …and another: four live entries claim src/command-gate.ts, none wrote it.
+    touch_paths: ['src/command-gate.ts'],
   }),
 ];
 
@@ -177,57 +202,102 @@ const liveShape: FeatureEntry[] = [
  * distinction it produced was a tie-break over aspirations. What survives is the
  * OWNER RULE itself (shallowest hierarchy depth first), now over git commits.
  */
-describe('blameCandidates — own commits, not declarations', () => {
-  it('a branch is a candidate iff it has OWN commits touching the file', async () => {
+describe('blameCandidates — authored commits, not declarations', () => {
+  /**
+   * THE DISCRIMINATOR. Rewritten from `a branch is a candidate iff it has OWN
+   * commits touching the file`, which asserted `['main_patched']` with 2 commits
+   * — the exact inversion the set difference produced live. This test FAILS
+   * under `^parents` (the trunk owns the file, the module scores 0) and PASSES
+   * under `--first-parent --no-merges ^main`.
+   */
+  it('the AUTHOR is credited, not the branch that ABSORBED the work by merge', async () => {
+    const repo = blameRepo();
+    // What the old rule saw: the trunk "owns" both commits, having absorbed them.
+    expect(repo.git('rev-list', '--count', 'main_patched', '^main', '--', 'src/command-gate.ts')).toBe('2');
+    expect(repo.git('rev-list', '--count', 'module/command-gate', '^main_patched', '--', 'src/command-gate.ts')).toBe('0');
+    // What the first-parent line says: the merge is the trunk's only appearance,
+    // and --no-merges drops it (live: 3 -> 0 for exactly this reason).
+    expect(repo.git('rev-list', '--count', '--first-parent', 'main_patched', '^main', '--', 'src/command-gate.ts')).toBe('1');
+    expect(
+      repo.git('rev-list', '--count', '--first-parent', '--no-merges', 'main_patched', '^main', '--', 'src/command-gate.ts'),
+    ).toBe('0');
+
+    const byFile = await blameCandidates(repo.dir, ['src/command-gate.ts'], liveShape);
+    const cands = byFile.get('src/command-gate.ts')!;
+    expect(cands[0].branch).toBe('module/command-gate');
+    expect(cands[0].depth).toBe(2);
+    expect(cands[0].commits).toBe(2);
+    expect(cands.map((c) => c.branch)).not.toContain('main_patched');
+  });
+
+  it('the TRUNK is still a candidate for what it really authored, at depth 1', async () => {
+    const repo = blameRepo();
+    const byFile = await blameCandidates(repo.dir, ['src/trunk.ts'], liveShape);
+    const cands = byFile.get('src/trunk.ts')!;
+    expect(cands[0]).toMatchObject({ branch: 'main_patched', depth: 1, commits: 1 });
+  });
+
+  it('DECLARING the path is not evidence: the declarers are not candidates', async () => {
+    const repo = blameRepo();
+    const byFile = await blameCandidates(repo.dir, ['src/command-gate.ts', 'src/trunk.ts'], liveShape);
+    // touch_paths claims src/command-gate.ts; git says it never wrote a line of it.
+    expect(byFile.get('src/command-gate.ts')!.map((c) => c.branch)).not.toContain('feat/maintenance-sweep');
+    // owned_paths claims src/trunk.ts; the trunk wrote it after the leaf was cut.
+    expect(byFile.get('src/trunk.ts')!.map((c) => c.branch)).not.toContain('feat/leaf');
+  });
+
+  /**
+   * REPLACES `INHERITED commits are not own commits — a descendant does not
+   * answer for its parent`, which asserted the exclusion set removed a parent's
+   * commits from a child. First-parent authorship draws the line differently and
+   * more honestly: it removes what a branch ABSORBED (the case that broke live),
+   * and NOT what a branch was CUT from. The two halves are asserted here and in
+   * the test below, because the second one is a real consequence of the rule and
+   * must be visible rather than discovered on production data.
+   */
+  it('ABSORBED work is not authored work — the receiver of a merge does not answer for the donor', async () => {
+    const repo = blameRepo();
+    // The trunk fully contains both commits by descent through the merge…
+    expect(repo.git('rev-list', '--count', 'main_patched', '--', 'src/command-gate.ts')).toBe('2');
+    // …and it is off its first-parent line, so the donor answers for them.
+    const byFile = await blameCandidates(repo.dir, ['src/command-gate.ts'], liveShape);
+    expect(byFile.get('src/command-gate.ts')!.map((c) => c.branch)).not.toContain('main_patched');
+    // A branch CUT from the receiver inherits nothing across that merge either.
+    expect(byFile.get('src/command-gate.ts')!.map((c) => c.branch)).not.toContain('feat/maintenance-sweep');
+  });
+
+  it('a branch CUT from its author DOES inherit it — the OWNER RULE, not the count, resolves that', async () => {
     const repo = blameRepo();
     const byFile = await blameCandidates(repo.dir, ['src/command-gate.ts'], liveShape);
     const cands = byFile.get('src/command-gate.ts')!;
-    // The trunk wrote it — twice — and is a candidate although nothing declares it.
-    expect(cands.map((c) => c.branch)).toEqual(['main_patched']);
-    expect(cands[0].depth).toBe(1);
-    expect(cands[0].commits).toBe(2);
-  });
-
-  it('DECLARING the path is not evidence: the two declarers are not candidates', async () => {
-    const repo = blameRepo();
-    const byFile = await blameCandidates(repo.dir, ['src/command-gate.ts'], liveShape);
-    const named = byFile.get('src/command-gate.ts')!.map((c) => c.branch);
-    expect(named).not.toContain('module/command-gate'); // touch_paths says yes, git says never
-    expect(named).not.toContain('feat/leaf'); // owned_paths says yes, git says never
-  });
-
-  it('INHERITED commits are not own commits — a descendant does not answer for its parent', async () => {
-    const repo = blameRepo();
-    // feat/leaf contains both trunk commits over src/command-gate.ts by descent.
-    expect(repo.git('rev-list', '--count', 'feat/leaf', '--', 'src/command-gate.ts')).toBe('2');
-    const byFile = await blameCandidates(repo.dir, ['src/command-gate.ts'], liveShape);
-    // …but none of them is its own (`^module/command-gate` removes them).
-    expect(byFile.get('src/command-gate.ts')!.map((c) => c.branch)).toEqual(['main_patched']);
+    // feat/leaf was cut from module/command-gate, so the two edits sit on its own
+    // first-parent line too. It is a candidate — and it loses, because the true
+    // author is by construction an ancestor and therefore shallower.
+    expect(cands.map((c) => c.branch)).toEqual(['module/command-gate', 'feat/leaf']);
+    expect(cands.map((c) => c.depth)).toEqual([2, 3]);
   });
 
   it('candidates are ordered SHALLOWEST FIRST, over every branch including the trunk', async () => {
     const repo = blameRepo();
-    // Both the trunk and a depth-3 leaf write the same file.
-    repo.checkout('feat/leaf');
-    repo.commit('leaf: also command gate', { 'src/command-gate.ts': 'leaf\n' });
-    repo.checkout('main');
-    const byFile = await blameCandidates(repo.dir, ['src/command-gate.ts'], liveShape);
-    const cands = byFile.get('src/command-gate.ts')!;
-    expect(cands.map((c) => c.branch)).toEqual(['main_patched', 'feat/leaf']);
-    expect(cands.map((c) => c.depth)).toEqual([1, 3]); // main=0; the trunk is 1
+    // The trunk authored src/trunk.ts; feat/maintenance-sweep was cut from the
+    // trunk afterwards and carries it on its own line at depth 2.
+    const byFile = await blameCandidates(repo.dir, ['src/trunk.ts'], liveShape);
+    const cands = byFile.get('src/trunk.ts')!;
+    expect(cands.map((c) => c.branch)).toEqual(['main_patched', 'feat/maintenance-sweep']);
+    expect(cands.map((c) => c.depth)).toEqual([1, 2]); // main=0; the trunk is 1
   });
 
   it('a branch with no ref anywhere is silently not a candidate (a planned entry has no history)', async () => {
     const repo = blameRepo();
     const withPlanned = [...liveShape, feat({ id: 'planned', branch: 'feat/never-created', parents: ['main_patched'] })];
     const byFile = await blameCandidates(repo.dir, ['src/command-gate.ts'], withPlanned);
-    expect(byFile.get('src/command-gate.ts')!.map((c) => c.branch)).toEqual(['main_patched']);
+    expect(byFile.get('src/command-gate.ts')!.map((c) => c.branch)).toEqual(['module/command-gate', 'feat/leaf']);
   });
 
   it('an ORIGIN-ONLY branch still counts (D-045 §13: no local ref is not no history)', async () => {
     const repo = blameRepo();
     repo.checkout('feat/remote-only', { create: true, at: 'main_patched' });
-    repo.commit('remote: own the file', { 'src/remote.ts': 'r\n' });
+    repo.commit('remote: author the file', { 'src/remote.ts': 'r\n' });
     repo.checkout('main');
     repo.setOrigin('feat/remote-only');
     repo.deleteLocalBranch('feat/remote-only');
@@ -236,29 +306,47 @@ describe('blameCandidates — own commits, not declarations', () => {
     expect(byFile.get('src/remote.ts')!.map((c) => c.branch)).toEqual(['feat/remote-only']);
   });
 
-  it('an UNRESOLVABLE parent skips the branch — never counts inherited commits as own', async () => {
+  /**
+   * REPLACES `an UNRESOLVABLE parent skips the branch — never counts inherited
+   * commits as own`. There is no per-branch exclusion set left to be missing, so
+   * the hazard it guarded is gone; the assertion is inverted to pin what now
+   * happens instead. `parents` still decides DEPTH, so a broken edge costs the
+   * branch its rank (UNRESOLVED sorts last) but never its evidence.
+   */
+  it('a broken `parents` edge no longer removes a branch from blame — it only costs it its depth', async () => {
     const repo = blameRepo();
-    // Its declared parent does not exist, so `^parent` cannot be subtracted; with
-    // the exclusion silently dropped, feat/leaf would be credited with the
-    // trunk's two commits over src/command-gate.ts.
     const broken = [
       feat({ id: 'leaf', branch: 'feat/leaf', parents: ['module/ghost'] }),
       feat({ id: 'cg', branch: 'module/command-gate', parents: ['main_patched'] }),
     ];
     const byFile = await blameCandidates(repo.dir, ['src/command-gate.ts'], broken);
-    expect(byFile.get('src/command-gate.ts')!.map((c) => c.branch)).toEqual(['main_patched']);
+    const cands = byFile.get('src/command-gate.ts')!;
+    expect(cands.map((c) => c.branch)).toEqual(['module/command-gate', 'feat/leaf']);
+    expect(cands.map((c) => c.depth)).toEqual([2, null]); // UNRESOLVED sorts LAST, never as 0
+  });
+
+  it('an unresolvable `main` blames NOTHING rather than counting all of upstream', async () => {
+    const repo = blameRepo();
+    repo.checkout('main_patched');
+    repo.deleteLocalBranch('main'); // no local ref, no origin/main either
+    const byFile = await blameCandidates(repo.dir, ['src/command-gate.ts', 'src/trunk.ts'], liveShape);
+    expect(byFile.get('src/command-gate.ts')).toEqual([]);
+    expect(byFile.get('src/trunk.ts')).toEqual([]);
   });
 });
 
 describe('attributeFailure — the 2026-07-28 reference case, blamed by git history', () => {
-  it('roots the fix on the branch whose COMMITS carry the defect, not the declarer and not the accused', async () => {
+  it('roots the fix on the branch that AUTHORED the defect, not the absorber, the declarer or the accused', async () => {
     const repo = blameRepo();
-    const a = await attributeFailure(repo.dir, tsc('src/command-gate.ts'), liveShape, 'feat/leaf');
-    expect(a.branch).toBe('main_patched'); // NOT the accused leaf, NOT the declarer
+    const a = await attributeFailure(repo.dir, tsc('src/command-gate.ts'), liveShape, 'feat/mitm-credential-proxy');
+    // NOT the accused, NOT feat/maintenance-sweep (which declares the path), and
+    // NOT main_patched — which is what the `^parents` set difference answered
+    // here and live, having absorbed the module's work by propagation merge.
+    expect(a.branch).toBe('module/command-gate');
     expect(a.files).toEqual(['src/command-gate.ts']);
     expect(a.groups).toHaveLength(1);
-    expect(a.groups[0]).toMatchObject({ branch: 'main_patched', depth: 1, files: ['src/command-gate.ts'] });
-    expect(a.reason).toContain('main_patched');
+    expect(a.groups[0]).toMatchObject({ branch: 'module/command-gate', depth: 2, files: ['src/command-gate.ts'] });
+    expect(a.reason).toContain('module/command-gate');
   });
 
   it('a file under a `**`-glob-owned path attributes to the branch that wrote it', async () => {
@@ -275,7 +363,7 @@ describe('attributeFailure — the 2026-07-28 reference case, blamed by git hist
     const a = await attributeFailure(repo.dir, tsc('src/shared.ts'), liveShape, 'feat/leaf');
     expect(a.branch).toBe('main_patched');
     expect(a.perFile[0].candidates).toEqual([]);
-    expect(a.perFile[0].reason).toContain('no branch has own commits');
+    expect(a.perFile[0].reason).toContain('no branch authored commits');
   });
 
   it('unparseable output -> falls back to the accused branch and SAYS so', async () => {
@@ -328,15 +416,21 @@ describe('attributeFailure — BATCHING: one group per branch, shallowest first'
     const a = await attributeFailure(
       repo.dir,
       // Deliberately out of hierarchy order in the output.
-      tsc('src/leaf.ts', 'scripts/sweep/propagate.ts', 'src/command-gate.ts'),
+      tsc('src/leaf.ts', 'scripts/sweep/propagate.ts', 'src/command-gate.ts', 'src/trunk.ts'),
       liveShape,
       'feat/accused',
     );
-    expect(a.groups.map((g) => g.branch)).toEqual(['main_patched', 'feat/maintenance-sweep', 'feat/leaf']);
-    expect(a.groups.map((g) => g.depth)).toEqual([1, 2, 3]);
+    expect(a.groups.map((g) => g.branch)).toEqual([
+      'main_patched',
+      'feat/maintenance-sweep',
+      'module/command-gate',
+      'feat/leaf',
+    ]);
+    expect(a.groups.map((g) => g.depth)).toEqual([1, 2, 2, 3]);
     expect(a.groups.map((g) => g.files)).toEqual([
-      ['src/command-gate.ts'],
+      ['src/trunk.ts'],
       ['scripts/sweep/propagate.ts'],
+      ['src/command-gate.ts'],
       ['src/leaf.ts'],
     ]);
     // The shallowest is what a single-case reader gets: a judged fix there plus
@@ -368,7 +462,7 @@ describe('attributeFailure — BATCHING: one group per branch, shallowest first'
       feat({ id: 'b', branch: 'feat/b', parents: ['main_patched'] }),
     ];
     const a = await attributeFailure(repo.dir, tsc('src/tie.ts', 'src/command-gate.ts'), features, 'feat/accused');
-    expect(a.groups.map((g) => g.branch)).toEqual(['main_patched']);
+    expect(a.groups.map((g) => g.branch)).toEqual(['module/command-gate']);
     expect(a.groups[0].files).toEqual(['src/command-gate.ts']); // the tied file is NOT smuggled in
     expect(a.unattributable.map((u) => u.file)).toEqual(['src/tie.ts']);
     expect(a.reason).toContain('cannot attribute');

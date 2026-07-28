@@ -3854,7 +3854,12 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     const repo = gateFixRepo(true);
     const ws = mkWorkspace();
     const inv = writeInventory([
-      { id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] },
+      // `parents` is REQUIRED here, as on every live entry. feat/child was cut
+      // from module/cg, so src/x.ts sits on ITS first-parent line too (blame is
+      // first-parent authorship, see attribute.ts) — depth is what separates the
+      // two, and a parentless `cg` leaves both UNRESOLVED, which blame correctly
+      // refuses as a tie instead of guessing.
+      { id: 'cg', branch: 'module/cg', parents: ['main_patched'], owned: ['src/x.ts'] },
       { id: 'child', branch: 'feat/child', parents: ['module/cg'] },
     ]);
     const dir = dirOf(repo, ws);

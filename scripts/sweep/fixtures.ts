@@ -65,6 +65,19 @@ export class FixtureRepo {
   }
 
   /**
+   * A PROPAGATION MERGE onto the currently checked-out branch: the receiving
+   * branch becomes the FIRST parent and `branch` the second, which is the whole
+   * basis of first-parent authorship (attribute.ts). `--no-ff` so the merge
+   * commit always exists — a fast-forward would splice the donated commits
+   * straight onto the receiver's own first-parent line and make it look like
+   * the author. Returns the merge commit sha.
+   */
+  merge(branch: string, message = `merge ${branch}`): string {
+    this.git('merge', '--no-ff', '--no-edit', '-m', message, branch);
+    return this.git('rev-parse', 'HEAD');
+  }
+
+  /**
    * Fake an `origin` remote-tracking ref (refs/remotes/origin/<branch>) at
    * `at` (default: the branch itself). Lets tests simulate remote-only /
    * behind / ahead / diverged branch states without a second repo
