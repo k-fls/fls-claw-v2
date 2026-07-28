@@ -293,33 +293,59 @@ describe('sweep start — the base gate (D-061 A)', () => {
     };
     return { fn, ran };
   }
+  /** A base runner failing with a REAL tsc diagnostic, so blame can parse it. */
+  function baseRunner(): ChecksRunner {
+    return async (commands) => ({
+      ok: false,
+      failedNames: commands.map((c) => c.cmd),
+      output: "src/x.ts(343,45): error TS2345: Argument of type 'string | null' is not assignable to parameter of type 'string'.\n",
+    });
+  }
+  /** main_patched plus a feature branch that OWNS the failing file. */
+  function gateFixRepoForBase(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: y', { 'src/y.ts': 'fork\n' });
+    repo.checkout('module/cg', { create: true, at: 'main_patched' });
+    repo.commit('cg: own x', { 'src/x.ts': 'cg\n' });
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
 
-  it('base RED -> ERR42, NO pass opened, nothing merged, failing output written', async () => {
-    const repo = conflictFixture();
+  it('base RED -> a GATE-FIX case on the blamed branch (D-061: not a dead end)', async () => {
+    const repo = gateFixRepoForBase();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
     const beforeTip = repo.sha('main_patched');
-    const r = runner(['tsc --noEmit']);
     const out = join(ws, 'start.json');
-    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: baseChecks(ws), out }), undefined, r.fn)).toBe(1);
+    // A red BASE used to refuse outright, which blocked every pass with no agent
+    // route to a fix: gate-fix triggers at `finish`, which a refusing `start`
+    // never reaches. Live 2026-07-28 — the trunk carried a 24-day-old type error
+    // and nothing could proceed.
+    expect(
+      await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: baseChecks(ws), out }), undefined, baseRunner()),
+    ).toBe(0);
     const res = JSON.parse(readFileSync(out, 'utf8')) as {
-      issues: Array<{ id: string; detail: string }>;
-      base: { branch: string; failed: string[] };
+      status: string;
+      gateFix: { branch: string; files: string[]; caseId: string };
+      issues: Array<{ id: string }>;
       instruction: string;
     };
+    expect(res.status).toBe('gate-fix-required');
     expect(res.issues[0].id).toBe('ERR42_BASE_RED');
-    expect(res.base.branch).toBe('main_patched'); // the fork TRUNK, not a merge-base commit
-    expect(res.base.failed).toEqual(['tsc --noEmit']);
-    expect(res.issues[0].detail).toContain('BEFORE any merge');
-    expect(res.issues[0].detail).toContain('pre-existing'); // names it as not propagation's fault
-    expect(res.instruction).toContain('no pass opened');
-    expect(readFileSync(join(ws, 'base-check-output.txt'), 'utf8')).toContain('tsc --noEmit');
-    // NOTHING happened: no pass, no merges, trunk untouched.
-    expect(existsSync(join(dirOf(repo, ws), 'plan-initial.json'))).toBe(false);
-    expect(existsSync(join(dirOf(repo, ws), 'machine-state.json'))).toBe(false);
+    expect(res.gateFix.branch).toBe('module/cg'); // blamed from the tsc path, not the trunk anchor
+    expect(res.gateFix.files).toEqual(['src/x.ts']);
+    expect(res.instruction).toContain('next-case');
+    // The pass IS open (a case needs somewhere to live) but nothing merged yet.
+    expect(existsSync(join(dirOf(repo, ws), 'machine-state.json'))).toBe(true);
     expect(repo.sha('main_patched')).toBe(beforeTip);
-    // ONLY the typecheck list runs — tests are slow, and finish still covers them.
-    expect(r.ran).toEqual([['tsc --noEmit']]);
+    // next-case serves it with the gate-fix briefing.
+    const nc = join(ws, 'nc.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: nc }))).toBe(0);
+    expect((JSON.parse(readFileSync(nc, 'utf8')) as { status: string }).status).toBe('case-ready');
+    expect(readFileSync(join(dirOf(repo, ws), res.gateFix.caseId, 'materials.md'), 'utf8')).toContain('GATE-FIX');
   });
 
   it('base GREEN -> the pass opens normally', async () => {
@@ -332,22 +358,27 @@ describe('sweep start — the base gate (D-061 A)', () => {
     expect(r.ran).toEqual([['tsc --noEmit']]);
   });
 
-  it('a base-red refusal DESTROYS NOTHING — a prior completed pass survives for investigation', async () => {
-    const repo = conflictFixture();
+  it('base RED that nothing owns -> still REFUSES (ERR42) rather than guess a branch', async () => {
+    const repo = gateFixRepoForBase();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
-    const dir = dirOf(repo, ws);
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(
-      join(dir, 'machine-state.json'),
-      JSON.stringify({ schemaVersion: 1, phase: 'complete', currentCase: null }),
-    );
-    writeFileSync(join(dir, 'journal.jsonl'), JSON.stringify({ ts: 'x', action: 'pass-complete' }) + '\n');
+    // Registry owns nothing matching the failing path -> no branch to blame.
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/unrelated.ts'] }]);
+    const out = join(ws, 'start.json');
     expect(
-      await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: baseChecks(ws) }), undefined, runner(['tsc --noEmit']).fn),
+      await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: baseChecks(ws), out }), undefined, baseRunner()),
     ).toBe(1);
-    // The gate runs BEFORE the clean-slate wipe, so the prior pass is intact.
-    expect(readFileSync(join(dir, 'journal.jsonl'), 'utf8')).toContain('pass-complete');
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      status: string;
+      issues: Array<{ id: string; detail: string }>;
+      instruction: string;
+    };
+    expect(res.status).toBe('stopped');
+    expect(res.issues[0].id).toBe('ERR42_BASE_RED');
+    expect(res.issues[0].detail).toContain('red before any merge');
+    expect(res.issues[0].detail).toContain('no branch could be blamed');
+    expect(res.instruction).toContain('REPORT to the owner');
+    // No gate-fix case was invented on a guessed branch.
+    expect(readJournal(dirOf(repo, ws)).some((e) => e.action === 'gate-fix')).toBe(false);
   });
 
   it('no checks-file -> the base gate is SKIPPED (pre-D-061 behavior, nothing runs)', async () => {

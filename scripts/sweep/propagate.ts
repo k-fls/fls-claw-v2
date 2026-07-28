@@ -6237,27 +6237,10 @@ export async function cmdSweepStart(
   // Deliberately BEFORE the clean-slate wipe below: a refusal must destroy
   // nothing, so a prior pass's records survive for whoever investigates.
   const baseCheck = await runBaseChecks(cli, resolvedChecksFile, runChecks);
-  if (baseCheck && !baseCheck.ok) {
-    const outFile = pathResolve(cli.workspace, 'base-check-output.txt');
-    try {
-      writeFileSync(outFile, baseCheck.output);
-    } catch {
-      /* best-effort: the detail below still names the failing commands */
-    }
-    const detail =
-      `${baseCheck.anchor} (${baseCheck.sha.slice(0, 12)}) FAILS the typecheck BEFORE any merge — ` +
-      `${baseCheck.failedNames.join(', ')}. This is pre-existing, NOT caused by propagation: fix the base ` +
-      `first, then re-run \`start\`. Full output: ${outFile}`;
-    console.error(`sweep start [ERR42_BASE_RED]: ${detail}`);
-    result(cli, {
-      ok: false,
-      issues: [{ id: 'ERR42_BASE_RED', detail }],
-      base: { branch: baseCheck.anchor, sha: baseCheck.sha, failed: baseCheck.failedNames },
-      instruction: `REPORT to the owner: the base ${baseCheck.anchor} is already broken (${baseCheck.failedNames.join(', ')}); no pass opened`,
-    });
-    return 1;
-  }
-
+  // D-061: carry a red base FORWARD instead of refusing here — the pass has to
+  // exist before a gate-fix case can be materialized (see the end of this
+  // function). Only the un-servable case still refuses outright.
+  const baseRed = baseCheck && !baseCheck.ok ? baseCheck : null;
   // Clean-slate boundary (D-055): the refusal above cleared any in-flight pass,
   // so anything still at the canonical location is a COMPLETE or STALE prior
   // pass (or a pre-machine-state leftover with no machine-state.json). Remove the
@@ -6324,6 +6307,42 @@ export async function cmdSweepStart(
   console.error(
     `sweep started — pass ${ctx.watermark12} pinned at ${ctx.watermark.slice(0, 12)} — pass dir: ${ctx.dir}`,
   );
+
+  // D-061 (A+B): a RED BASE now becomes a GATE-FIX case instead of a dead end.
+  // The base gate above (pre-pass) refuses only when there is nowhere to put a
+  // case; here the pass EXISTS, so the same machinery that handles an
+  // unattributable red at `finish` can serve the fix. Without this, a red base
+  // blocked every pass with no agent route to fix it — gate-fix triggers at
+  // `finish`, which a refusing `start` never reaches (live 2026-07-28: the trunk
+  // carried a type error from 2026-07-04 and nothing could proceed).
+  if (baseRed) {
+    const gate = await materializeGateFixCase(cli, ctx.dir, baseRed.output, baseRed.failedNames, null);
+    if (gate.served) {
+      progress(`base RED on ${baseRed.anchor} — gate-fix case prepared on ${gate.branch}`);
+      console.error(`sweep start: base red — gate-fix case ${gate.caseId} on ${gate.branch}`);
+      result(cli, {
+        status: 'gate-fix-required',
+        watermark: ctx.watermark,
+        watermark12: ctx.watermark12,
+        passDir: ctx.dir,
+        issues: [{ id: 'ERR42_BASE_RED', detail: `${baseRed.anchor} was already red BEFORE any merge — ${gate.detail}` }],
+        gateFix: { caseId: gate.caseId, branch: gate.branch, files: gate.files, reason: gate.reason },
+        instruction: `the base ${baseRed.anchor} is broken; a GATE-FIX case has been prepared on ${gate.branch} — run \`next-case\``,
+      });
+      return 0;
+    }
+    // Nothing blameable: fall back to the refusal, with the pass left open so
+    // the failing output stays inspectable.
+    console.error(`sweep start [ERR42_BASE_RED]: ${baseRed.anchor} red and unattributable — ${gate.reason}`);
+    result(cli, {
+      ok: false,
+      status: 'stopped',
+      issues: [{ id: 'ERR42_BASE_RED', detail: `${baseRed.anchor} is red before any merge and ${gate.reason}` }],
+      instruction: `REPORT to the owner: the base ${baseRed.anchor} is broken (${baseRed.failedNames.join(', ')}) and could not be attributed`,
+    });
+    return 1;
+  }
+
   result(cli, { status: 'started', watermark: ctx.watermark, watermark12: ctx.watermark12, passDir: ctx.dir });
   return 0;
 }
