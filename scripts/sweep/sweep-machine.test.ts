@@ -26,6 +26,7 @@ import { isAncestor } from './git.js';
 import { readLedger } from './ledger.js';
 import {
   CHECKS_FAIL_LIMIT,
+  cmdPublish,
   cmdSweepAbort,
   cmdSweepFinish,
   cmdSweepNextCase,
@@ -3990,6 +3991,235 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     );
     const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string };
     expect(res.instruction).not.toMatch(/pristine/i);
+  });
+
+  /**
+   * THE ID WAS A LIE (2026-07-28). A gate fix has no merge and therefore no
+   * height, but `--case` was validated against the CONFLICT id shape
+   * (`…-h<n>`): a bare `gate-fix-<branch>` was refused with ERR25_BAD_CASE_ID,
+   * so no HELD gate fix could ever publish however green the rest of the
+   * pipeline was. The workaround appended a FAKE height of `-h-1` — which then
+   * flowed into the fix-ref name, into the origin ref reader, and into every
+   * height reader downstream. The id now states the case's real identity
+   * (branch + failing-file digest) and the N5 guard accepts that shape AS
+   * ITSELF; the head carries its real height.
+   */
+  it('the gate-fix case file states the truth: identity id, real height, run invariant, tip tree', async () => {
+    const repo = gateFixRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { cmds } = redUntilCleared(ws);
+    const caseId = await serveGateFix(repo, ws, inv, cmds);
+
+    expect(caseId).toMatch(/^gate-fix-module__cg-[0-9a-f]{8}$/);
+    expect(caseId).not.toContain('-h-'); // no invented height, of any sign
+    const cf = JSON.parse(readFileSync(join(dir, caseId, 'case.json'), 'utf8')) as {
+      head: { sha: string; height: number };
+      run: Array<{ sha: string; height: number }>;
+      automergeTree: string;
+      deferredCheck: { firstConflictHeight: number };
+    };
+    // The head IS the branch tip; its height is that tip's real coverage on the
+    // pass chain (`deriveCoverage`), so every height reader computes from a
+    // fact — see the D-004 machine-block test below for what -1 cost.
+    expect(cf.head.sha).toBe(repo.sha('module/cg'));
+    // The branch absorbed the trunk during this pass's run, so its coverage is a
+    // real chain index — never the -1 placeholder that used to sit here.
+    expect(Number(repo.git('rev-list', '--count', 'module/cg..main').trim())).toBe(0);
+    expect(cf.head.height).toBeGreaterThanOrEqual(0);
+    expect(cf.run).toEqual([cf.head]); // run[run.length - 1] === head (types.ts)
+    expect(cf.deferredCheck.firstConflictHeight).toBe(cf.head.height);
+    // LOAD-BEARING, not incidental: the "automerge" tree is the branch tip's
+    // tree because everything downstream reads this field as "the tree the
+    // agent started from" — the scope guard diffs against it, `emptyResolution`
+    // ("nothing was fixed") compares against it, and the cold read's resolution
+    // diff is taken from it. A gate fix starts from the clean tip.
+    expect(cf.automergeTree).toBe(repo.git('rev-parse', 'module/cg^{tree}').trim());
+
+    // …and `publish --case <id>` ACCEPTS the id. ERR25_BAD_CASE_ID on exactly
+    // this call is what the fake height was bought with.
+    const out = join(ws, 'pub.json');
+    await cmdPublish(baseCli(repo, ws, inv, { cmd: 'publish', caseId, out }));
+    const pub = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> };
+    expect(pub.issues.map((i) => i.id)).not.toContain('ERR25_BAD_CASE_ID');
+  });
+
+  /**
+   * The id must be a function of the case's IDENTITY (branch + failing files),
+   * not of its kind. `gate-fix-<branch>-h-1` was the same string for every gate
+   * fix on a branch, so a second one in the same pass (different files — the
+   * anti-loop key lets it through by design) reused the first's id: it would
+   * inherit the first's `resolved` disposition, drop out of `openCases`, and
+   * `next-case` could never serve it while `finish` kept demanding it.
+   */
+  it('two gate fixes on ONE branch over different files get DISTINCT ids', async () => {
+    const repo = gateFixRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts', 'src/y.ts'] }]);
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    // Red on src/x.ts first; once that flag is cleared, red on src/y.ts.
+    const flagX = join(ws, 'red-x');
+    const flagY = join(ws, 'red-y');
+    writeFileSync(flagX, 'x');
+    writeFileSync(flagY, 'y');
+    const cmds = join(ws, 'cmds.json');
+    writeFileSync(
+      cmds,
+      JSON.stringify([
+        {
+          cmd:
+            `if [ -f ${flagX} ]; then echo "src/x.ts(1,1): error TS2345: nope"; exit 1; ` +
+            `elif [ -f ${flagY} ]; then echo "src/y.ts(2,2): error TS2345: nope"; exit 1; fi`,
+        },
+      ]),
+    );
+
+    const idX = await serveGateFix(repo, ws, inv, cmds);
+    resolveWorktree(dir, idX, { 'src/x.ts': 'FIXED\n' });
+    expect(
+      await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true }), confirm),
+    ).toBe(0);
+    writePr(dir, idX, 'fix: x', 'The build was red on src/x.ts.');
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
+
+    rmSync(flagX, { force: true }); // x is fixed; now y fails
+    await cmdSweepNextCase(baseCli(repo, ws, inv)); // pull the fix through the reopened DAG
+    const f2 = join(ws, 'f2.json');
+    await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out: f2 }));
+    const res2 = JSON.parse(readFileSync(f2, 'utf8')) as { status: string; gateFix: { caseId: string; files: string[] } };
+    expect(res2.status).toBe('gate-fix-required');
+    expect(res2.gateFix.files).toEqual(['src/y.ts']);
+    // Same branch, different files -> a DIFFERENT case id (both gate-fix-shaped).
+    expect(res2.gateFix.caseId).not.toBe(idX);
+    expect(res2.gateFix.caseId).toMatch(/^gate-fix-module__cg-[0-9a-f]{8}$/);
+    // …and the second case is actually servable, which an id collision (the
+    // shared `-h-1` id) made impossible.
+    const nc = join(ws, 'nc2.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: nc }))).toBe(0);
+    expect(JSON.parse(readFileSync(nc, 'utf8')).caseId).toBe(res2.gateFix.caseId);
+  });
+
+  /**
+   * WHAT THE FAKE HEIGHT COST. The D-004 machine block on a held PR reports
+   * `pendingAbove = chain.heads.length - 1 - head.height`. With `head.height =
+   * -1` that is `heads.length` — MORE pending commits than the pass's chain
+   * even holds — on every held gate-fix PR, for a branch that had in fact
+   * absorbed the whole trunk this pass. The head's height is now the tip's
+   * coverage, so the count is the truth.
+   *
+   * The fix REF NAME is the same lie in the other direction: it spelled
+   * `--<slug('(gate-fix)')>-h-1-<sha8>`, putting a parent label that is not a
+   * branch and a height that does not exist into a name the NEXT pass's origin
+   * reader parses a real scope branch and a real trunk height out of.
+   */
+  it('a held gate fix publishes with a truthful D-004 count and an honest fix-ref name', async () => {
+    const repo = gateFixRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched', 'module/cg');
+    const { cmds, clear } = redUntilCleared(ws);
+    const caseId = await serveGateFix(repo, ws, inv, cmds);
+
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'FIXED\n' });
+    expect(
+      await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true }), confirm),
+    ).toBe(0);
+    writePr(dir, caseId, 'fix: nullable arg', 'The build was red on src/x.ts — owner decision needed.');
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
+
+    clear();
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = fakeGithub();
+    await cmdSweepFinish(
+      baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, tokenFile, out: join(ws, 'f2.json') }),
+      gh.factory,
+    );
+    const created = gh.calls.find((c) => c.method === 'POST' && c.path.endsWith('/pulls'));
+    expect(created).toBeDefined();
+    const pr = created!.body as { head: string; body: string };
+    // The ref names the case, not a parent that does not exist at a height that
+    // does not exist. The `<slug(branch)>--` prefix stays — that is what maps
+    // the ref back to its target branch at the next `sweep start`.
+    expect(pr.head).toBe(`fix/sweep/module__cg--${caseId}`);
+    expect(pr.head).not.toContain('gate-fix_-h'); // slug('(gate-fix)') + fake height
+    // The pass merged the trunk into module/cg before the gate fix was minted,
+    // so NOTHING is pending above it. `-1` claimed 1 (= the whole chain).
+    const pending = Number(repo.git('rev-list', '--count', 'module/cg..main').trim());
+    expect(pending).toBe(0);
+    expect(pr.body).toContain(`beyond this freeze: **${pending}**`);
+  });
+
+  /**
+   * `tierFloor: 'judged'` on a gate-fix case is LOAD-BEARING, not decoration:
+   * the MECHANICAL arm of report-case merges the resolved tree in place with
+   * the case head as the SECOND PARENT — and a gate fix's head IS the branch
+   * tip, so a mechanical gate fix would commit a degenerate self-merge whose
+   * diff reads as an empty merge instead of the fix.
+   */
+  it('tierFloor judged: a gate fix claimed MECHANICAL is floored, never merged in place', async () => {
+    const repo = gateFixRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { cmds } = redUntilCleared(ws);
+    const caseId = await serveGateFix(repo, ws, inv, cmds);
+    const tipBefore = repo.sha('module/cg');
+
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'FIXED\n' });
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        confirm,
+      ),
+    ).toBe(0);
+    expect((JSON.parse(readFileSync(out, 'utf8')) as { tier: string }).tier).toBe('judged');
+    expect(readJournal(dir).some((e) => e.action === 'resolved' && e.caseId === caseId)).toBe(false);
+    expect(repo.sha('module/cg')).toBe(tipBefore); // nothing was merged
+    expect(machineState(dir).phase).toBe('awaiting-pr'); // it goes through report-pr
+  });
+
+  /**
+   * `scopeGuardMode: 'same-files'` on a gate-fix case is likewise doing real
+   * work: it holds the fix to the files the driver named in the briefing. (It
+   * is also the ONLY mode that can apply — `conflict-hunks` bounds the edit by
+   * the conflict-marker spans of the automerge blob, and a gate fix's automerge
+   * tree is the clean tip, with no markers to bound anything.)
+   */
+  it("scope guard 'same-files': a gate fix that edits beyond the named files is escalated, not merged", async () => {
+    const repo = gateFixRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { cmds } = redUntilCleared(ws);
+    const caseId = await serveGateFix(repo, ws, inv, cmds);
+
+    // src/y.ts is on the branch but is NOT one of the named failing files.
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'FIXED\n', 'src/y.ts': 'STRAY\n' });
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true, out }),
+        confirm,
+      ),
+    ).toBe(0);
+    expect((JSON.parse(readFileSync(out, 'utf8')) as { tier: string }).tier).toBe('held');
+    const violation = readJournal(dir).find((e) => e.action === 'scope-violation' && e.caseId === caseId);
+    expect(violation?.mode).toBe('same-files');
+    expect(violation?.extraPaths).toEqual(['src/y.ts']);
   });
 });
 

@@ -71,6 +71,7 @@
  *   local state: the ledger's merge_status field is dead to this driver.
  */
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
@@ -1518,10 +1519,74 @@ const VERIFY_OUTPUT_JOURNAL_CAP = 20000;
 
 /**
  * The `parent` a gate-fix case records. A gate fix is NOT a parent→child merge,
- * so there is no real parent; this sentinel keeps the CaseFile shape intact and
- * makes gate-fix rows obvious in the journal.
+ * so there is no real parent; this LABEL keeps the CaseFile shape intact (a
+ * `case` journal row without a string `parent` is dropped by `journaledCases`
+ * outright) and makes gate-fix rows obvious in the journal.
+ *
+ * It is a LABEL, never a ref: the parentheses are not in `slug()`'s charset and
+ * no registry branch can be named this, so anything that resolves a parent as a
+ * branch must recognise the gate fix FIRST. The one place that used to get this
+ * wrong was the fix-ref name — `fixBranchName` embedded `slug(parent)` and a
+ * height, and `sweep start`'s origin-ref reader then tried to read a scope
+ * branch and a trunk height back out of it. Both now take the gate-fix form
+ * explicitly (see `fixBranchName` / `reissueFromOriginRef`), and the gate-fix
+ * identity everywhere else is the driver's own `gate-fix` journal row.
  */
 const GATE_FIX_PARENT = '(gate-fix)';
+
+/**
+ * A gate fix's IDENTITY: the branch the fix lands on plus the set of failing
+ * files. It is the anti-loop key (`a gate fix was already attempted for this
+ * branch over these files`) AND the seed of the case id, so the two can never
+ * disagree about what "the same gate fix" means.
+ */
+function gateFixKey(branch: string, files: string[]): string {
+  return `${branch}::${[...files].sort().join(',')}`;
+}
+
+/**
+ * A GATE-FIX case id. N5 SHAPE, gate-fix form: `gate-fix-<slug(branch)>-<id8>`.
+ *
+ * A gate fix has NO conflict and therefore NO height, so it cannot honestly
+ * wear the conflict form (`<branch>--<parent>-h<n>`). It was given a FAKE
+ * height of `-1` purely to slip past the id validator — a lie that then had to
+ * be taught to the validator's regex (`-h-?\d+`), to the fix-ref parser, and to
+ * every height reader downstream. The id now carries the case's real identity:
+ * the branch, plus a digest of `gateFixKey` — which is also what keeps two
+ * DIFFERENT gate fixes on ONE branch (same pass, different failing files) from
+ * colliding on an id. A collision there is fatal, not cosmetic: the second case
+ * inherits the first's `resolved` disposition, drops straight out of
+ * `openCases`, and `next-case` can never serve it.
+ */
+function gateFixCaseId(branch: string, files: string[]): string {
+  const id8 = createHash('sha256').update(gateFixKey(branch, files)).digest('hex').slice(0, 8);
+  return `gate-fix-${slug(branch)}-${id8}`;
+}
+
+/** The gate-fix id form (N5). Charset-safe by construction — no `/`, no `.`. */
+const GATE_FIX_CASE_ID_RE = /^gate-fix-[A-Za-z0-9_-]+-[0-9a-f]{8}$/;
+
+function isGateFixCaseId(id: string): boolean {
+  return GATE_FIX_CASE_ID_RE.test(id);
+}
+
+/**
+ * The HEIGHT of a gate-fix case's head. A gate fix's head IS the branch tip
+ * (there is no conflict head to merge), so its height is that tip's COVERAGE on
+ * the pass's pinned chain — the highest trunk head the branch already contains.
+ * That is the same quantity a conflict head's height denotes (a trunk index),
+ * which is what keeps every height reader honest for a gate fix: notably the
+ * D-004 machine block, whose `pendingAbove = heads.length - 1 - head.height`
+ * reported `heads.length` — one MORE than the chain even holds — on every held
+ * gate-fix PR while the placeholder `-1` sat in this field.
+ *
+ * `deriveCoverage` may itself return -1, and that is not a placeholder: it means
+ * the branch contains NO head of this chain, for which "every trunk head is
+ * still pending above it" is the arithmetically correct reading.
+ */
+async function gateFixHeadHeight(cli: Cli, chain: Chain, tip: string): Promise<number> {
+  return (await deriveCoverage(cli.repo, chain, tip)).height;
+}
 
 /**
  * The bounded view of a failing checks run: the failing command names up front
@@ -2698,7 +2763,7 @@ interface ResolvedCase {
  */
 async function reverifyGateFixCase(
   cli: Cli,
-  dir: string,
+  ctx: PassCtx,
   caseFile: CaseFile,
   journal: JournalEntry[],
 ): Promise<{ ok: boolean; rc?: ResolvedCase; errors: string[] }> {
@@ -2712,6 +2777,9 @@ async function reverifyGateFixCase(
   if (!scope.has(branch)) return { ok: false, errors: [`gate-fix branch ${branch} is out of pass scope`] };
   const tip = await revParse(cli.repo, branch);
   const files = Array.isArray(row.files) ? (row.files as string[]) : [];
+  // Same head/height/run derivation as `materializeGateFixCase` — re-derived
+  // from git, never read back from the agent-writable case.json.
+  const head = { sha: tip, height: await gateFixHeadHeight(cli, ctx.chain, tip) };
   return {
     ok: true,
     errors: [],
@@ -2720,15 +2788,32 @@ async function reverifyGateFixCase(
       branch,
       parent: GATE_FIX_PARENT,
       model: 'parents',
-      head: { sha: tip, height: -1 },
-      run: [],
+      head,
+      run: [head], // the run invariant: run[run.length - 1] === head
       conflictedPaths: files,
+      // The BRANCH TIP's tree stands in for the automerge tree, and that is
+      // load-bearing rather than incidental: everything downstream reads this
+      // field as "the tree the agent started from" — the scope guard diffs
+      // against it, `emptyResolution` (nothing was fixed) compares against it,
+      // and the cold read's resolution diff is computed from it. For a gate fix
+      // the agent starts from the clean tip, so the tip's tree is exactly that
+      // tree. (There are no conflict markers in it, which is why the guard mode
+      // below cannot be `conflict-hunks`.)
       automergeTree: await treeOf(cli.repo, tip),
       reproduction: { command: (Array.isArray(row.failedCommands) ? (row.failedCommands as string[]) : []).join(' && ') },
+      // A gate fix is NEW CODE on the branch, never a mechanical merge: the
+      // floor keeps it out of the mechanical tier so it always gets a cold read.
       tierFloor: 'judged',
-      // 'same-files': the gate fix must stay within the files the driver named.
+      // 'same-files' is the only mode that MEANS anything here, not a default
+      // for want of an "off": it confines the fix to the files the driver named
+      // (which is the whole scope statement in the briefing), while
+      // `conflict-hunks` — the other mode, and a legal registry setting for this
+      // branch — reads conflict-marker spans out of the automerge blob to bound
+      // the edit. This "automerge" tree has no markers, so every hunk would land
+      // outside the (empty) marker set and EVERY gate fix would be scope-flagged.
+      // Hence config is deliberately not consulted for a gate fix.
       scopeGuardMode: 'same-files',
-      pendingAbove: 0,
+      pendingAbove: Math.max(0, ctx.chain.heads.length - 1 - head.height),
       scope,
       descendants: transitiveDescendants(scopeResult.edges, branch),
     },
@@ -3058,20 +3143,39 @@ async function freezeHeld(
 }
 
 /**
- * N5: the shape every generated case id has (`slug(branch)--slug(parent)-h<n>`,
- * steps.ts). `--case` is joined into paths under the pass dir, so anything
- * outside the slug charset — path separators, dots, `..` traversal — is
- * refused BEFORE any path join. slug() maps all other characters to `_`, so a
- * genuine id always matches.
+ * N5: the CONFLICT case-id shape (`slug(branch)--slug(parent)-h<n>`, steps.ts).
+ * `<n>` may be NEGATIVE and that is not a sentinel: `deriveCoverage` returns -1
+ * for a head that sits BELOW this pass's pinned chain, which parents-model
+ * cases hit routinely — which is also exactly why a gate fix wearing `-h-1`
+ * was indistinguishable from a real case id.
  */
-const CASE_ID_RE = /^[A-Za-z0-9_-]+-h-?\d+$/;
+const CONFLICT_CASE_ID_RE = /^[A-Za-z0-9_-]+-h-?\d+$/;
+
+/**
+ * N5: does `id` have a shape the DRIVER generates? `--case` is joined into
+ * paths under the pass dir, so anything outside the slug charset — path
+ * separators, dots, `..` traversal — is refused BEFORE any path join. slug()
+ * maps all other characters to `_`, so a generated id always matches.
+ *
+ * There are TWO generated shapes, because there are two kinds of case: the
+ * CONFLICT form above, and the GATE-FIX form (`gateFixCaseId`), which has no
+ * height because a gate fix has no merge. The gate-fix form used to be forced
+ * through the conflict regex by appending a fake height of `-h-1`; before that
+ * it was refused outright with ERR25_BAD_CASE_ID, so no HELD gate fix could
+ * ever publish however green the rest of the pipeline was. Both shapes are
+ * stated as themselves now, so the charset guarantee is unchanged and no case
+ * has to lie about having a height to be publishable.
+ */
+function isGeneratedCaseId(id: string): boolean {
+  return CONFLICT_CASE_ID_RE.test(id) || isGateFixCaseId(id);
+}
 
 export async function cmdResolve(cli: Cli): Promise<number> {
   if (!cli.caseId || !cli.tier) {
     console.error('resolve: --case <id> and --tier <mechanical|judged|held> are required');
     return 2;
   }
-  if (!CASE_ID_RE.test(cli.caseId)) {
+  if (!isGeneratedCaseId(cli.caseId)) {
     console.error(
       `resolve [ERR25_BAD_CASE_ID]: --case '${cli.caseId}' does not match the generated case-id shape (N5) — refused`,
     );
@@ -3454,8 +3558,17 @@ export async function cmdResolve(cli: Cli): Promise<number> {
  * orphan ref. The head sha disambiguates re-occurrences of the same
  * branch/parent/height across watermarks. (The HELD path additionally PINS
  * the name in merge_status.fixBranch at freeze time and prefers that.)
+ *
+ * A GATE FIX has no parent and no height, so it names itself with its own
+ * identity (the case id) after the `<slug(branch)>--` prefix every fix ref
+ * needs — that prefix is what `deriveOriginMergeStatus` maps back to the target
+ * branch. It used to be spelled through the conflict form, which put the
+ * `(gate-fix)` parent LABEL and a `-h-1` height into a ref name that the next
+ * pass's origin reader then tried to parse a real scope branch and a real trunk
+ * height back out of.
  */
-function fixBranchName(rc: Pick<ResolvedCase, 'branch' | 'parent' | 'head'>): string {
+function fixBranchName(id: string, rc: Pick<ResolvedCase, 'branch' | 'parent' | 'head'>): string {
+  if (isGateFixCaseId(id)) return `fix/sweep/${slug(rc.branch)}--${id}`;
   return `fix/sweep/${slug(rc.branch)}--${slug(rc.parent)}-h${rc.head.height}-${rc.head.sha.slice(0, 8)}`;
 }
 
@@ -3472,7 +3585,7 @@ function fixBranchName(rc: Pick<ResolvedCase, 'branch' | 'parent' | 'head'>): st
  * the deterministic fix branch NAME for ledger/urge bookkeeping.
  */
 async function prepareCaseMaterials(cli: Cli, dir: string, rc: ResolvedCase, tier: Tier): Promise<string> {
-  const fixBranch = fixBranchName(rc);
+  const fixBranch = fixBranchName(rc.id, rc);
   const prDir = join(dir, rc.id, 'pr');
   mkdirSync(prDir, { recursive: true });
   const tip = await revParse(cli.repo, rc.branch);
@@ -3977,7 +4090,7 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
     console.error('publish: --case <id> is required');
     return 2;
   }
-  if (!CASE_ID_RE.test(cli.caseId)) {
+  if (!isGeneratedCaseId(cli.caseId)) {
     emit(cli, {
       ok: false,
       issues: [
@@ -4095,7 +4208,7 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
   const caseRow = journal.find((e) => e.action === 'case' && e.caseId === jc.caseId) ?? null;
   const reissue = caseRow?.reissue === true;
   const fixBranch =
-    reissue && typeof caseRow!.fixBranch === 'string' ? (caseRow!.fixBranch as string) : fixBranchName(jc);
+    reissue && typeof caseRow!.fixBranch === 'string' ? (caseRow!.fixBranch as string) : fixBranchName(jc.caseId, jc);
 
   if (issues.some((i) => isBlocking(i.id))) {
     emit(cli, { ok: false, issues });
@@ -5695,6 +5808,18 @@ async function materializeReissueCase(
   // (a) parent + height + conflict-head sha8 from the deterministic ref name
   // (fixBranchName shape) — the identity survives owner pushes onto the ref.
   const rest = args.ref.slice('fix/sweep/'.length).slice(slug(args.branch).length + 2); // past '<slug(branch)>--'
+  // A GATE-FIX ref names a case with NO parent and NO conflict head, so there is
+  // nothing here to parse and nothing to REVISE: a reissue re-probes a live
+  // conflict, and this PR never had one. Say that, rather than reporting the
+  // driver's own ref name as unparseable — which is what happened while the ref
+  // spelled the `(gate-fix)` parent label and a `-h-1` height in the conflict
+  // form (the parent lookup below searches SCOPE BRANCHES; no branch is or can
+  // be named that, so every reviewed gate-fix PR escalated with a bogus reason).
+  if (isGateFixCaseId(rest)) {
+    return escalateOnce(
+      `'${args.ref}' is a GATE-FIX PR (case ${rest}): it carries a fix, not a conflict resolution, so there is no revision case to serve — merge or close it`,
+    );
+  }
   const parentEntry = args.parentCandidates.find((c) => rest.startsWith(`${c.slug}-h`));
   const hm = /-h(-?\d+)-([0-9a-f]{8})$/.exec(rest);
   if (!parentEntry || !hm) {
@@ -6482,7 +6607,7 @@ export async function cmdSweepStart(
       });
       return 1;
     }
-    const gate = await materializeGateFixCase(cli, ctx.dir, baseRed.output, baseRed.failed, null, {
+    const gate = await materializeGateFixCase(cli, ctx.dir, ctx.chain, baseRed.output, baseRed.failed, null, {
       rootBranch: baseRed.anchor,
     });
     if (gate.served) {
@@ -6765,7 +6890,7 @@ export async function cmdSweepReportCase(
   // a pointer). Reuses the flag-path's reverifyCase verbatim.
   const isGateFixCase = caseRow?.gateFix === true;
   const rv = isGateFixCase
-    ? await reverifyGateFixCase(cli, dir, caseFile, journal)
+    ? await reverifyGateFixCase(cli, ctx, caseFile, journal)
     : isReissue
       ? await reverifyReissueCase(cli, ctx, caseFile, journal, caseRow!)
       : await reverifyCase(cli, ctx, dir, caseFile, journal);
@@ -7554,6 +7679,7 @@ function rootChecksOutput(output: string, commands: VerifyCommand[]): string {
 async function materializeGateFixCase(
   cli: Cli,
   dir: string,
+  chain: Chain,
   failedOutput: string,
   failedCommands: VerifyCommand[],
   accused: string | null,
@@ -7594,7 +7720,7 @@ async function materializeGateFixCase(
   const reason = rooted
     ? `${a.reason}; rooted on the base ${rooted} — a commit on a descendant can never turn the base green`
     : a.reason;
-  const key = `${branch}::${[...files].sort().join(',')}`;
+  const key = gateFixKey(branch, files);
   if (journal.some((e) => e.action === 'gate-fix' && e.key === key)) {
     return {
       ...none,
@@ -7603,26 +7729,32 @@ async function materializeGateFixCase(
       detail: `verify RED again after a gate fix on ${branch} — not re-serving`,
     };
   }
-  // N5 SHAPE. The id is joined into paths AND passed to `publish --case`, whose
-  // path guard requires the generated `…-h<n>` form: a bare `gate-fix-<branch>`
-  // was refused with ERR25_BAD_CASE_ID, so a HELD gate fix could never publish
-  // however green the rest of the pipeline was. `-h-1` is the gate-fix height
-  // sentinel (there is no merge height here) and `slug` is the id builder every
-  // other case already uses (it also keeps `.` out of the path).
-  const caseId = `gate-fix-${slug(branch)}-h-1`;
+  // N5 SHAPE: the gate-fix id form (`gateFixCaseId` — branch + file-set digest,
+  // never a height). The id is joined into paths AND passed to `publish --case`.
+  const caseId = gateFixCaseId(branch, files);
   const tip = await revParse(cli.repo, branch);
+  // The head's HEIGHT (see `gateFixHeadHeight`): the tip's coverage on this
+  // pass's pinned chain, not the `-1` placeholder that used to stand here.
+  const head = { sha: tip, height: await gateFixHeadHeight(cli, chain, tip) };
   await createGateFixWorktree(cli, dir, caseId, tip);
   const caseFile: CaseFile = {
     schemaVersion: 1,
     id: caseId,
     branch,
     parent: GATE_FIX_PARENT,
-    head: { sha: tip, height: -1 },
+    head,
+    // `run[run.length - 1] === head` is the run invariant (types.ts). A gate fix
+    // stacks nothing, so its run is the head alone — NOT the empty array, which
+    // breaks the invariant and prints "0 height(s)" into the case materials.
+    run: [head],
     tierFloor: 'judged',
     conflictedPaths: files,
     automergeTree: await treeOf(cli.repo, tip),
     reproduction: { command: commandNames.join(' && ') },
-    deferredCheck: { firstConflictHeight: -1, transitiveAncestors: [] },
+    // firstConflictHeight is documented as "the run's TOP height" — that is
+    // `head.height`, whatever kind of case this is. (Nothing reads a gate fix's
+    // DEFERRED inputs: it has no transitive ancestors to defer against.)
+    deferredCheck: { firstConflictHeight: head.height, transitiveAncestors: [] },
   };
   mkdirSync(join(dir, caseId), { recursive: true });
   writeFileSync(join(dir, caseId, 'case.json'), JSON.stringify(caseFile, null, 2) + '\n');
@@ -7642,8 +7774,9 @@ async function materializeGateFixCase(
     branch,
     parent: GATE_FIX_PARENT,
     gateFix: true,
-    head: { sha: tip, height: -1 },
-    height: -1,
+    head,
+    height: head.height,
+    run: caseFile.run,
     conflictedPaths: files,
   });
   writeFileSync(join(dir, caseId, 'gate-fix-output.txt'), failedOutput);
@@ -7890,7 +8023,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     // PR that blocks the next pass until the owner merges).
     if (verifyRc !== 0) {
       const failedOutput = typeof attrib?.failedOutput === 'string' ? attrib.failedOutput : '';
-      const gate = await materializeGateFixCase(cli, dir, failedOutput, failedChecksOf(attrib), offender ?? null);
+      const gate = await materializeGateFixCase(cli, dir, ctx.chain, failedOutput, failedChecksOf(attrib), offender ?? null);
       if (gate.served) {
         writeMachineState(dir, { ...st, phase: 'open', currentCase: null, finishStep: 'verify' });
         progress(`verify: RED (unattributed) — gate-fix case prepared on ${gate.branch}`);
