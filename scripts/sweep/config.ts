@@ -19,6 +19,23 @@ export const DEFAULT_SCOPE_FILE = join(SWEEP_DIR, 'registry', 'scope.yaml');
 export const DEFAULT_CASES_DIR = join(SWEEP_DIR, 'test-cases', 'cases');
 
 /**
+ * Owner-approved CUT-POINT EXCEPTIONS (cut-points.ts) — facts about this fork's
+ * GIT HISTORY that topology alone cannot express (a rebase copy of another
+ * branch's commit; a branch its parent has already merged down).
+ *
+ * HOME: `scripts/sweep/`, beside checks.json — NOT `registry/`, NOT the
+ * generator's seeds. It is DRIVER-read config that blame consumes, exactly like
+ * checks.json is driver-read config that the checks gate consumes. `registry/`
+ * holds the inventory's own JUDGEMENT (routing weights, scope policy) and
+ * `.claude/skills/fork-registry-generate/seeds.yaml` feeds the GENERATOR, which
+ * never runs in the driver's path; putting measured history facts in either
+ * would make the driver depend on a file its own consumers do not own. Resolved
+ * module-relative from the version-controlled toolkit tree, like every other
+ * durable config here (see the header).
+ */
+export const DEFAULT_CUT_POINT_EXCEPTIONS_FILE = join(SWEEP_DIR, 'cut-point-exceptions.yaml');
+
+/**
  * Default live inventory = the latest committed bootstrap snapshot
  * (scripts/sweep/bootstrap/fork-registry@<hash>/features). Groups pass
  * --inventory to point at a regenerated inventory in their workspace.

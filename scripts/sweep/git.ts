@@ -166,9 +166,39 @@ export async function newStyleMergeTree(repo: string, ours: string, theirs: stri
   return { clean: false, treeOid, conflictFiles: [...new Set(conflictFiles)] };
 }
 
-/** First-parent chain of `ref` excluding commits reachable from `not`, OLDEST first. */
+/**
+ * First-parent chain of `ref` excluding commits reachable from `not`, OLDEST first.
+ *
+ * ORDER IS LOAD-BEARING, AND IT IS A HISTORY ORDER — NOT A DATE ONE. Every
+ * consumer walks this list as a sequence of CUT POINTS: heights.ts numbers the
+ * watermarks from it, interval.ts/steps.ts pick the next merge target off it,
+ * scan.ts and stop-points.ts step through it. A commit listed BEFORE one it
+ * descends from turns a legal cut into a merge of the future.
+ *
+ * `--reverse` alone yields COMMIT-DATE order. That is safe here ONLY because
+ * `--first-parent` restricts the traversal to a single linear chain, where there
+ * are no parallel lines to misorder — safety by ACCIDENT, not by construction.
+ * `--topo-order` states the requirement explicitly, so widening the traversal
+ * later (dropping `--first-parent`, following a second parent) cannot silently
+ * reintroduce date ordering.
+ *
+ * THE FAILURE SHAPE THIS FORECLOSES, measured on the live fork 2026-07-29 —
+ * `feat/mitm-credential-proxy ^main_patched` with `--first-parent` dropped:
+ *
+ *     position   date order (--reverse)   topological order
+ *        6       9a661b02                 …
+ *        8       …                        2fe44d15
+ *        9       2fe44d15                 …
+ *       15       …                        9a661b02
+ *
+ * `9a661b02` is an egress-lockdown commit AUTHORED 06-13 but COMMITTED 06-19 by
+ * a rebase; `2fe44d15` is mitm's own first commit. Date order puts the rebased
+ * import 3 places AHEAD of the branch's own root, topological order puts it 7
+ * places behind — 9 positions apart, and NEITHER is an ancestor of the other, so
+ * no consumer could have recovered the right order from the list itself.
+ */
 export async function firstParentChain(repo: string, ref: string, not: string): Promise<string[]> {
-  const res = await git(repo, ['rev-list', '--first-parent', '--reverse', ref, `^${not}`]);
+  const res = await git(repo, ['rev-list', '--first-parent', '--topo-order', '--reverse', ref, `^${not}`]);
   return res.stdout.split('\n').filter(Boolean);
 }
 

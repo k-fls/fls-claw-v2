@@ -119,6 +119,7 @@ import {
   reconcileCandidates,
 } from './candidates.js';
 import { attributeFailure, parseFailingFiles } from './attribute.js';
+import { malformedCutPointExceptionsIssue, resolveCutPointExceptions, staleWarnings } from './cut-points.js';
 import { readLedger, writeLedger, defaultLedgerBranch } from './ledger.js';
 import { installRrCache } from './merge.js';
 import { loadRegistry } from './registry.js';
@@ -7705,10 +7706,47 @@ async function materializeGateFixCases(
 ): Promise<{ served: boolean; cases: GateFixCaseSummary[]; reason: string; detail: string }> {
   const journal = readJournal(dir);
   const { features } = loadRegistry({ inventoryDir: cli.inventory, scopeFile: cli.scopeFile, routingFile: cli.routingFile });
-  const a = await attributeFailure(cli.repo, rootChecksOutput(failedOutput, failedCommands), features, accused);
+  const none = { served: false as const, cases: [] as GateFixCaseSummary[], reason: '', detail: '' };
+  // CUT-POINT EXCEPTIONS (cut-points.ts). A MALFORMED file is LOUD and stops
+  // this command — the ERR43_CHECKS_MALFORMED contract. Blaming with the
+  // exceptions silently dropped is not "blame without them": it is blame that
+  // credits `module/credentials` with `module/host-rpc`'s rebased `3b8c5896`
+  // and then mints a gate-fix case on the wrong branch, which is a worse
+  // outcome than stopping and saying so. An ABSENT file skips in silence.
+  const badCutPoints = malformedCutPointExceptionsIssue();
+  if (badCutPoints) {
+    appendJournal(dir, { action: 'warning', id: badCutPoints.id, message: badCutPoints.detail });
+    console.error(`gate-fix [${badCutPoints.id}]: ${badCutPoints.detail}`);
+    return {
+      ...none,
+      reason: 'the cut-point exceptions file is unreadable — blame cannot be trusted',
+      detail: badCutPoints.detail,
+    };
+  }
+  const cutPoints = await resolveCutPointExceptions(cli.repo);
+  // STALE entries are journaled, never applied: a claim git now contradicts must
+  // not suppress a real answer. NOT-APPLICABLE ones (refs absent in this clone)
+  // stay quiet — they suppress nothing.
+  for (const w of staleWarnings(cutPoints)) {
+    appendJournal(dir, {
+      action: 'warning',
+      id: 'WARN08_CUT_POINT_EXCEPTION_STALE',
+      message: `${w.branch}/${w.kind}: ${w.detail}`,
+    });
+    console.error(`gate-fix [WARN08_CUT_POINT_EXCEPTION_STALE]: ${w.branch}/${w.kind}: ${w.detail}`);
+  }
+  if (cutPoints.applied.length > 0) {
+    appendJournal(dir, { action: 'cutPointExceptions', applied: cutPoints.applied });
+  }
+  const a = await attributeFailure(
+    cli.repo,
+    rootChecksOutput(failedOutput, failedCommands),
+    features,
+    accused,
+    cutPoints.duplicates,
+  );
   const files = a.files;
   const commandNames = failedCommands.map((c) => c.cmd);
-  const none = { served: false as const, cases: [] as GateFixCaseSummary[], reason: '', detail: '' };
   // NO FILES, NO CASE. `cmdVerify`'s ROLLBACK arm (an offender isolated, rolled
   // back, HELD(gate), and the re-verify STILL red) journals no attributionFailed
   // row, so `failedOutput` arrives empty: attribution parses nothing, falls back

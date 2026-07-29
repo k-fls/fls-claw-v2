@@ -1,0 +1,59 @@
+# Cut-point exceptions — OWNER-APPROVED facts about this fork's git history that
+# topology cannot express. Loader + re-verification: scripts/sweep/cut-points.ts.
+#
+# HOME. This file lives beside checks.json, in scripts/sweep/, because it is
+# DRIVER-read config: the driver loads it and blame (attribute.ts) consumes it,
+# exactly as the driver loads checks.json and the checks gate consumes it.
+# registry/ holds the inventory's own JUDGEMENT (routing weights, scope policy);
+# .claude/skills/fork-registry-generate/seeds.yaml feeds the GENERATOR, which
+# never runs in the driver's path. Neither is the right owner for measured
+# history facts the driver must read on every blame.
+#
+# SHAPE: branch -> kind -> LIST. Several exceptions per branch, several kinds per
+# branch, and a new kind is a new key — no restructuring.
+#
+# NOTHING HERE IS TRUSTED. Every entry is RE-VERIFIED against the repo before it
+# is applied: duplicates by recomputing `git patch-id --stable` for both commits,
+# absorbed by re-asking whether `as_of` still contains the branch. A falsified
+# entry is dropped with a STALE warning rather than applied — a stale exception
+# must never silently suppress a real answer. An entry whose refs are simply not
+# in the repo at hand is skipped quietly: it can suppress nothing.
+#
+# A MALFORMED file is LOUD (ERR45_CUT_POINTS_MALFORMED) and stops the command,
+# the ERR43_CHECKS_MALFORMED precedent. An ABSENT file is a silent skip.
+
+cut_point_exceptions:
+  # DUPLICATE — a rebase/cherry-pick COPY of another branch's commit, sitting on
+  # THIS branch's own first-parent line. Blame counts that line
+  # (`rev-list --count --first-parent --no-merges <branch> ^main -- <file>`), so
+  # without this entry the copy is credited to the copying branch and NO
+  # exclusion of the original's branch can remove it.
+  #
+  # Measured on the live fork 2026-07-29: `3b8c5896` and `dc3cb7f6` have the
+  # identical patch-id 25c7b6481c3a and the identical subject. `dc3cb7f6` is on
+  # module/host-rpc; `3b8c5896` is on module/credentials and on
+  # module/runtime-updater. 23 of 458 non-merge commits (5%) are duplicates of
+  # this shape.
+  module/credentials:
+    duplicate:
+      - sha: 3b8c5896
+        patch_id: 25c7b6481c3a
+        twin: dc3cb7f6
+        authored_on: module/host-rpc
+        why: rebase copy; excluding module/host-rpc does not remove it
+
+  # ABSORBED — the parent has merged this branch down, so its remainder is empty:
+  # `git rev-list --count module/crypto ^main_patched` is 0 and module/crypto is
+  # an ancestor of main_patched (tip e4c82f34, live server clone 2026-07-29).
+  # 5 of that clone's 25 branches are in this state (module/crypto,
+  # module/command-gate, module/container-queue, module/interaction-status,
+  # module/agent-group-contributions); only the owner-approved one is listed.
+  #
+  # NOTE: the driver has NO CONSUMER for `absorbed` — the cut-point derivation
+  # that would use it is analysis, not driver code. Schema, re-verification and
+  # reporting are implemented; no decision is made from it.
+  module/crypto:
+    absorbed:
+      - into: main_patched
+        as_of: e4c82f34
+        why: parent merged this branch down; remainder is empty

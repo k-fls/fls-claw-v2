@@ -164,16 +164,35 @@ async function resolveRef(repo: string, branch: string, cache: Map<string, strin
  * making one. Live check: `main_patched` scores 6 with a plain `^main` set
  * difference over `src/command-gate.ts` and 0 here, while the branch that wrote
  * the file, `module/command-gate`, scores 0 with the set difference and 3 here.
+ *
+ * `exclude` — OWNER-APPROVED DUPLICATE CUT-POINT EXCEPTIONS (cut-points.ts).
+ * A rebase COPY of another branch's commit sits on the copying branch's own
+ * first-parent line, so this count credits it as that branch's work and no
+ * exclusion of the ORIGINAL's branch can remove it: `3b8c5896` (patch-id
+ * 25c7b6481c3a) is a copy of `dc3cb7f6` on `module/host-rpc`, and it is on
+ * `module/credentials`' first-parent line, so `^module/host-rpc` does nothing.
+ * The exception is re-verified against the repo before it reaches here (both
+ * patch-ids recomputed), so a listed sha is a MEASURED copy, not a claim. With
+ * an exclusion the count must be listed and filtered rather than counted by
+ * git — `--count` returns a number with nothing left to subtract from.
  */
-async function authoredCommits(repo: string, ref: string, rootRef: string, file: string): Promise<number> {
-  const res = await git(
-    repo,
-    ['rev-list', '--count', '--first-parent', '--no-merges', ref, `^${rootRef}`, '--', file],
-    { allowCodes: [1, 128] },
-  );
+async function authoredCommits(
+  repo: string,
+  ref: string,
+  rootRef: string,
+  file: string,
+  exclude?: Set<string>,
+): Promise<number> {
+  const range = ['--first-parent', '--no-merges', ref, `^${rootRef}`, '--', file];
+  if (!exclude || exclude.size === 0) {
+    const res = await git(repo, ['rev-list', '--count', ...range], { allowCodes: [1, 128] });
+    if (res.code !== 0) return 0;
+    const n = parseInt(res.stdout.trim(), 10);
+    return Number.isFinite(n) ? n : 0;
+  }
+  const res = await git(repo, ['rev-list', ...range], { allowCodes: [1, 128] });
   if (res.code !== 0) return 0;
-  const n = parseInt(res.stdout.trim(), 10);
-  return Number.isFinite(n) ? n : 0;
+  return res.stdout.split('\n').filter((sha) => sha && !exclude.has(sha)).length;
 }
 
 /**
@@ -193,12 +212,18 @@ async function authoredCommits(repo: string, ref: string, rootRef: string, file:
  * of upstream's history over the file. `main` itself failing to resolve is the
  * same case for everyone at once — nothing can be blamed, so nothing is, and
  * every file falls to the trunk rather than to a fabricated candidate.
+ *
+ * `duplicates` — branch -> shas that are REBASE COPIES carried by that branch,
+ * from the owner-approved, re-verified cut-point exceptions (cut-points.ts).
+ * Absent by default: with no exceptions file the counts are exactly what they
+ * were. See `authoredCommits`.
  */
 export async function blameCandidates(
   repo: string,
   files: string[],
   features: FeatureEntry[],
   h?: Hierarchy,
+  duplicates?: Map<string, Set<string>>,
 ): Promise<Map<string, BranchCandidate[]>> {
   const hier = h ?? branchHierarchy(features);
   const order = byHierarchy(hier);
@@ -213,8 +238,9 @@ export async function blameCandidates(
     if (node.branch === ROOT_BRANCH) continue;
     const ref = await resolveRef(repo, node.branch, refs);
     if (!ref) continue;
+    const exclude = duplicates?.get(node.branch);
     for (const file of files) {
-      const commits = await authoredCommits(repo, ref, rootRef, file);
+      const commits = await authoredCommits(repo, ref, rootRef, file, exclude);
       if (commits === 0) continue;
       byFile.get(file)!.push({
         branch: node.branch,
@@ -312,12 +338,18 @@ function blameFile(file: string, candidates: BranchCandidate[]): FileBlame {
  * history is the evidence. `accused` — the branch verify pointed at — is used
  * ONLY when the output named no files at all; it is a report of what was being
  * built, not evidence about who broke it.
+ *
+ * `duplicates` — re-verified duplicate cut-point exceptions, threaded to
+ * `blameCandidates`. The caller loads and verifies them (cut-points.ts) because
+ * the LOUD/quiet split for a malformed or stale file is a command-level
+ * decision, not one blame can make from inside a count.
  */
 export async function attributeFailure(
   repo: string,
   output: string,
   features: FeatureEntry[],
   accused?: string | null,
+  duplicates?: Map<string, Set<string>>,
 ): Promise<Attribution> {
   const files = parseFailingFiles(output);
   if (files.length === 0) {
@@ -333,7 +365,7 @@ export async function attributeFailure(
   }
   const hier = branchHierarchy(features);
   const order = byHierarchy(hier);
-  const byFile = await blameCandidates(repo, files, features, hier);
+  const byFile = await blameCandidates(repo, files, features, hier, duplicates);
   const perFile = files.map((f) => blameFile(f, byFile.get(f) ?? []));
 
   const grouped = new Map<string, FileBlame[]>();
