@@ -90,6 +90,7 @@ import { dirname, join, resolve as pathResolve, sep } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 
 import {
+  DEFAULT_CUT_POINT_EXCEPTIONS_FILE,
   DEFAULT_STACK_CAP,
   DEFAULT_UPSTREAM_REF,
   FORK_POINT,
@@ -3495,7 +3496,7 @@ export async function cmdResolve(cli: Cli): Promise<number> {
         .filter(Boolean);
       const bad = ungroundedFeedback(feedback, resolutionPaths);
       if (bad !== null) {
-        console.error(`resolve [ERR43_COLDREAD_UNGROUNDED]: cold-read verdict rejects but ${bad}`);
+        console.error(`resolve [ERR46_COLDREAD_UNGROUNDED]: cold-read verdict rejects but ${bad}`);
         console.error(COLDREAD_VERDICT_GUIDANCE);
         return 2;
       }
@@ -3726,7 +3727,7 @@ async function prepareCaseMaterials(cli: Cli, dir: string, rc: ResolvedCase, tie
     sides.theirs,
     '```',
     '',
-    'Write pr/title.txt and pr/body.md YOURSELF from studying the case, then run',
+    'Write pr/title.txt and pr/body.md YOURSELF from studying the case (how: /workspace/agent/PR-DESCRIPTIONS.md), then run',
     `\`propagate publish --case ${rc.id}\` (PROPAGATION.md §14, D-048).`,
   ].join('\n');
   writeFileSync(join(prDir, 'materials.md'), materials + '\n');
@@ -4265,7 +4266,7 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
   if (title === '' || body === '') {
     push({
       id: 'ERR08_TEXT_MISSING',
-      detail: `write ${titlePath} and ${bodyPath} YOURSELF from studying the case (worktree + pr/materials.md) — the driver never generates PR prose (D-048)`,
+      detail: `write ${titlePath} and ${bodyPath} YOURSELF from studying the case (worktree + pr/materials.md; how: /workspace/agent/PR-DESCRIPTIONS.md) — the driver never generates PR prose (D-048)`,
     });
   } else {
     issues.push(...advisoryTextIssues(title, body, jc.conflictedPaths));
@@ -7233,7 +7234,7 @@ export async function cmdSweepReportCase(
     console.error(`report-case: held ${caseId} (pristine conflict — draft)`);
     result(cli, {
       instruction:
-        'provide PR description — base it on the PRISTINE conflict state (the worktree is now pristine); do NOT describe a resolution',
+        'provide PR description (how: /workspace/agent/PR-DESCRIPTIONS.md) — base it on the PRISTINE conflict state (the worktree is now pristine); do NOT describe a resolution',
       tier: 'held',
       issues,
     });
@@ -7282,7 +7283,7 @@ export async function cmdSweepReportCase(
           progress(`checks failing ${n}x -> held (gate fix kept): ${rc.branch}`);
           console.error(`report-case: held ${caseId} (gate fix, checks ${kind} failing ${n}x, escalated)`);
           result(cli, {
-            instruction: `provide PR description — the ${kind} still fails (${r.failedNames.join(', ')}); say so plainly`,
+            instruction: `provide PR description (how: /workspace/agent/PR-DESCRIPTIONS.md) — the ${kind} still fails (${r.failedNames.join(', ')}); say so plainly`,
             tier: 'held',
             issues,
           });
@@ -7309,7 +7310,7 @@ export async function cmdSweepReportCase(
         console.error(`report-case: held ${caseId} (checks ${kind} failing ${n}x, escalated, pristine)`);
         result(cli, {
           instruction:
-            'provide PR description — base it on the PRISTINE conflict state (the worktree is now pristine); do NOT describe a resolution',
+            'provide PR description (how: /workspace/agent/PR-DESCRIPTIONS.md) — base it on the PRISTINE conflict state (the worktree is now pristine); do NOT describe a resolution',
           tier: 'held',
           issues,
         });
@@ -7350,7 +7351,7 @@ export async function cmdSweepReportCase(
     writeMachineState(dir, { ...st, phase: 'awaiting-pr', currentCase: { caseId, branch: rc.branch, tier: 'held' } });
     progress(`cap exceeded -> held: ${rc.branch}`);
     console.error(`report-case: held ${caseId} (resolution did not converge)`);
-    result(cli, { instruction: 'provide PR description', tier: 'held', issues });
+    result(cli, { instruction: 'provide PR description (how: /workspace/agent/PR-DESCRIPTIONS.md)', tier: 'held', issues });
     return 0;
   }
 
@@ -7405,11 +7406,11 @@ export async function cmdSweepReportCase(
     const bad = ungroundedFeedback(feedback, resolutionPaths);
     if (bad !== null) {
       const detail = `cold-read verdict rejects but ${bad}`;
-      console.error(`report-case [ERR43_COLDREAD_UNGROUNDED]: ${detail}`);
+      console.error(`report-case [ERR46_COLDREAD_UNGROUNDED]: ${detail}`);
       result(cli, {
         instruction: `${detail} ${COLDREAD_VERDICT_GUIDANCE}`,
         tier: claimed,
-        issues: [...issues, { id: 'ERR43_COLDREAD_UNGROUNDED', detail }],
+        issues: [...issues, { id: 'ERR46_COLDREAD_UNGROUNDED', detail }],
       });
       return 1;
     }
@@ -7443,7 +7444,7 @@ export async function cmdSweepReportCase(
       writeMachineState(dir, { ...st, phase: 'awaiting-pr', currentCase: { caseId, branch: rc.branch, tier: 'held' } });
       progress(`demoted: ${rc.branch} -> held (cold-read rejected ${rejections}x)`);
       console.error(`report-case: held ${caseId} (cold-read rejected ${rejections}x, escalated)`);
-      result(cli, { instruction: 'provide PR description', tier: 'held', issues });
+      result(cli, { instruction: 'provide PR description (how: /workspace/agent/PR-DESCRIPTIONS.md)', tier: 'held', issues });
       return 0;
     }
     const instruction = `cold read rejected — revise the resolution in the worktree, then re-run report-case${feedback ? `: ${feedback}` : ''}`;
@@ -7472,7 +7473,7 @@ export async function cmdSweepReportCase(
     writeMachineState(dir, { ...st, phase: 'awaiting-pr', currentCase: { caseId, branch: rc.branch, tier: 'held' } });
     progress(`demoted: ${rc.branch} -> held (scope exceeded; resolution kept for owner review)`);
     console.error(`report-case: held ${caseId} (scope exceeded — cold read agreed; resolution kept)`);
-    result(cli, { instruction: 'provide PR description', tier: 'held', scopeGuard: guard, issues });
+    result(cli, { instruction: 'provide PR description (how: /workspace/agent/PR-DESCRIPTIONS.md)', tier: 'held', scopeGuard: guard, issues });
     return 0;
   }
   // Confirm + in-scope → dispatch by effective tier.
@@ -7481,7 +7482,7 @@ export async function cmdSweepReportCase(
     await prepareCaseMaterials(cli, dir, rc, 'judged');
     writeMachineState(dir, { ...st, phase: 'awaiting-pr', currentCase: { caseId, branch: rc.branch, tier: 'judged' } });
     console.error(`report-case: ${caseId} judged — provide PR description`);
-    result(cli, { instruction: 'provide PR description', tier: 'judged', issues });
+    result(cli, { instruction: 'provide PR description (how: /workspace/agent/PR-DESCRIPTIONS.md)', tier: 'judged', issues });
     return 0;
   }
   //  - HELD (explicit held-claim on a marker-clean resolution, or a reissue):
@@ -7494,7 +7495,7 @@ export async function cmdSweepReportCase(
     writeMachineState(dir, { ...st, phase: 'awaiting-pr', currentCase: { caseId, branch: rc.branch, tier: 'held' } });
     progress(`held (resolution kept): ${rc.branch}`);
     console.error(`report-case: held ${caseId} (resolution kept for owner review)`);
-    result(cli, { instruction: 'provide PR description', tier: 'held', issues });
+    result(cli, { instruction: 'provide PR description (how: /workspace/agent/PR-DESCRIPTIONS.md)', tier: 'held', issues });
     return 0;
   }
   //  - MECHANICAL: merge the resolved tree in place.
@@ -7586,7 +7587,7 @@ export async function cmdSweepReportPr(
   }
   if (!title || !body) {
     const detail = `write ${bodyPath} with the H1 title on the first line (\`# <title>\`) and the body below — the driver never generates PR prose (D-048)`;
-    result(cli, { instruction: 'provide PR description', issues: [{ id: 'ERR08_TEXT_MISSING', detail }] });
+    result(cli, { instruction: 'provide PR description (how: /workspace/agent/PR-DESCRIPTIONS.md)', issues: [{ id: 'ERR08_TEXT_MISSING', detail }] });
     return 1;
   }
   // Normalize both files so the finish publish (which reads title.txt + body.md)
@@ -8315,10 +8316,42 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
         return 1;
       }
     }
+    // D-062 ANTI-LOOP. The two ERR18 arms differ in whether a re-run can help:
+    // the ROLLED-BACK arm changes the input (the frozen offender leaves the
+    // publishable set), the NO-CLEAN-ATTRIBUTION arm does not — same refs, same
+    // exceptions file, same result. Doctrine flattened both into "re-run
+    // `finish`", and live 2026-07-29 the agent spent a second full finish
+    // reproducing an identical WARN08 block. Key the attempt on what a fix would
+    // have to change; a repeat says DO NOT re-run, in the message itself.
+    if (verifyRc !== 0) {
+      // The two inputs a fix would have to move: the branch tips, and the
+      // cut-point exceptions that blame reads. Same both -> same verdict.
+      const refs = await git(cli.repo, ['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads']);
+      let exceptionsRaw = '';
+      try {
+        exceptionsRaw = readFileSync(DEFAULT_CUT_POINT_EXCEPTIONS_FILE, 'utf8');
+      } catch {
+        /* absent file is itself a stable input */
+      }
+      const key = createHash('sha1')
+        .update(refs.stdout)
+        .update(exceptionsRaw)
+        .digest('hex')
+        .slice(0, 12);
+      const repeated = readJournal(dir).some((e) => e.action === 'verify-halt' && e.key === key);
+      appendJournal(dir, { action: 'verify-halt', key, offender: offender ?? null });
+      const detail = repeated
+        ? `verify RED (no clean attribution) and NOTHING has changed since the last \`finish\` — same branch tips, ` +
+          `same cut-point exceptions (key ${key}). Re-running produces this identical block. DO NOT re-run: fix the ` +
+          `named cause first, and if it cannot be fixed from inside the pass, report to the owner.`
+        : 'verify RED (no clean attribution) — investigate, fix, then re-run `finish` from the verify phase';
+      progress(`verify: RED ${offender ?? '(unattributed)'} — rolled back`);
+      console.error(`finish: ${detail}`);
+      result(cli, { ok: false, issues: [{ id: 'ERR18_VERIFY_PENDING', detail }], halted: 'verify' });
+      return 1;
+    }
     const detail =
-      verifyRc !== 0
-        ? 'verify RED (no clean attribution) — investigate, fix, then re-run `finish` from the verify phase'
-        : 'verify RED — offender rolled back + HELD(gate); re-run `finish` (the frozen offender drops out of the publishable set)';
+      'verify RED — offender rolled back + HELD(gate); re-run `finish` (the frozen offender drops out of the publishable set)';
     progress(`verify: RED ${offender ?? '(unattributed)'} — rolled back`);
     console.error(`finish: ${detail}`);
     result(cli, { ok: false, issues: [{ id: 'ERR18_VERIFY_PENDING', detail }], halted: 'verify' });

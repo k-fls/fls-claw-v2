@@ -113,9 +113,10 @@ finish --execute --token-file <path> --commands-file <cheap-tests.json>   # crea
   name their author by GitHub @login). REVISE the existing resolution to
   address the review — conflicted paths only, do NOT start over, and never
   touch the PR on GitHub yourself.
-- `report-pr` — write `pr/title.txt` + `pr/body.md` in the case dir (standards
-  below), then run it. On `rewrite: <reason>`: fix the text, re-run. Then take
-  the next case.
+- `report-pr` — write `pr/title.txt` + `pr/body.md` in the case dir, then run it.
+  The driver names the standards file in the instruction that asks you for the
+  text — read it then, not before. On `rewrite: <reason>`: fix the text, re-run.
+  Then take the next case.
 - `finish` — its SWEEP-RESULT carries `pullRequests`, `stats`, and an
   `instruction`. Relay branches landed vs failed, the PR list, and the stats in
   your end-of-sweep result, then do what `instruction` says (`start again` /
@@ -158,58 +159,30 @@ message; no fix analysis in chat. NEVER patch driver code yourself.
 
 ## Tool result IDs
 
-`ERR*` blocks, `WARN*` advises. Do what the row says — never argue with or work
+`ERR*` blocks, `WARN*` advises. Do what the line says — never argue with or work
 around a blocking id.
 
-| id | your action |
-|----|-------------|
-| `ERR01_CASE_NOT_OPEN` | run `report-case` first; mechanical gets no PR |
-| `ERR02_CASE_STALE` | re-run `next-case`; work from the fresh case |
-| `ERR05_DECIDED_ALREADY` | apply the quoted record as a judged resolution; don't ask the owner |
-| `ERR06_DUPLICATE_CASE` | resolve the named topmost case; this one inherits it |
-| `ERR07_PR_EXISTS` | work with the existing PR; never open a second |
-| `ERR08_TEXT_MISSING` | write `pr/title.txt` + `pr/body.md` from the case materials |
-| `ERR11_TOKEN_MISSING` | write the `get_credential` output to a file, pass `--token-file <path>` |
-| `ERR12_ORIGIN_UNRESOLVED` | point the clone's origin at a github.com URL; report if you cannot |
-| `ERR13_API_FAILED` | retry once; still failing → stop-case 2 report |
-| `ERR14_BASE_BEHIND` | unclear → report to the owner |
-| `ERR15_PUSH_FAILED` | per-branch, NOT a stop: report landed-vs-failed, re-run `finish`; a DIVERGED branch needs the owner. No hand-push, ever |
-| `ERR16_CLOSURE_FAILED` | investigate, report; publish nothing more until understood |
-| `ERR17_URGE_FAILED` | retries next `finish`; recurring → stop-case 2 report |
-| `ERR18_VERIFY_PENDING` | re-run `finish`; if the driver serves a GATE-FIX case, resolve it like any other case |
-| `ERR20_BRANCH_DIVERGED` | owner escalation; never force-resolve (no reset, no force-push) |
-| `ERR21_MERGE_FAILED` | note it in the end-of-sweep result; file a driver issue if it recurs |
-| `ERR22_DIRTY_WORKTREE` | clean/commit the named worktree, re-run; never `reset --hard` someone else's work |
-| `ERR24_PLAN_DRIFT` | investigate what moved; report before continuing |
-| `ERR26_RESOLVE_NOT_CONVERGED` | auto-escalated to HELD → stop re-resolving, take the next case |
-| `ERR30_PASS_OPEN` | `finish` or `abort` first |
-| `ERR31_AWAITING_PR` | `report-pr` first |
-| `ERR32_UNRESOLVED` | resolve the remaining markers, re-run `report-case` |
-| `ERR33_BRANCH_TESTS_FAILED` | open the named log, fix the resolution, re-report |
-| `ERR34_CASES_REMAIN` | finish every case first |
-| `ERR35_COLDREAD_UNAVAILABLE` | stop-case 2 report; the case stays put — re-run once restored |
-| `ERR36_TYPECHECK_FAILED` | open the named output file, fix the pending files, re-run `report-case` |
-| `ERR40_TESTS_FAILED` | same as ERR36; at `finish` it is a stop-case 2 report (publish nothing) |
-| `ERR41_TOKEN_REJECTED` | the GitHub token was REJECTED — re-auth; a retry with the same token cannot clear it |
-| `ERR42_BASE_RED` | the base was already broken BEFORE any merge — stop-case 2 report naming the branch and failing checks; the pass is already sealed, so do NOT run `abort` |
-| `ERR43_CHECKS_MALFORMED` | the named checks file does not PARSE, so no gate can run — stop-case 2 report quoting the file and the parse error; never continue with the gates silently skipped |
-| `ERR44_WORKTREE_RESET_FAILED` | the worktree could not be reset to the pristine conflict and still holds your edits — clear it in-container and re-run `report-case`; never call it pristine |
-| `ERR45_CUT_POINTS_MALFORMED` | the cut-point exceptions file does not PARSE, so blame cannot be trusted and no gate-fix case is served — stop-case 2 report quoting the file and the parse error |
-| `ERR39_FETCH_FAILED` | fix connectivity/creds, re-run `start`; never open a pass on a stale view |
-| `WARN01_TEMPLATE_TEXT` | rewrite the body from the case materials |
-| `WARN02_NO_DECISION_LINE` | open the body with the exact decision the owner is asked to make |
-| `WARN03_MANY_PRS` | >8 PRs this pass — re-check for consolidation |
+The rows live in `/workspace/agent/ERRORS.md`, one line per id. Look one up with
+a single grep — never act on an id you have not grepped, and never guess from the
+name:
+
+```bash
+grep -F '<THE_ID_FROM_THE_RESULT>' /workspace/agent/ERRORS.md
+```
+
+An id with more than one arm (ERR18) has one line per arm; the same grep returns
+both — pick the one the driver `detail` names. If the grep returns nothing, the id
+is undocumented: stop-case 2 report it rather than improvising.
 
 ## Registry upkeep
 
-- Keep `./inventory/` current: when fork branches appear, land, or retire,
-  regenerate entries locally with the `fork-registry-generate` skill.
-- The moment a blocked case is resolved, record the outcome in the live
-  inventory entry (`prompt.extra_context`: what, when, implementing PR,
-  standing consequence).
-- Propose `seeds.yaml` updates (new invariants, hints, recurring resolutions)
-  and refreshed inventory snapshots in your end-of-sweep result for the OWNER
-  to apply — you push nothing and open no PR for them (rule 3).
+Read `/workspace/agent/REGISTRY-UPKEEP.md` when ANY of these is true — no driver
+error will tell you, so noticing is on you:
+
+- a fork branch appeared, landed, or retired since the last sweep
+- a blocked case got resolved this pass (the outcome must reach the entry)
+- you are about to write the end-of-sweep result and have registry changes to
+  propose
 
 ## Tiers (your `--tier` claim)
 
@@ -222,27 +195,6 @@ around a blocking id.
 - Analysis never waits for permission — run the sweep unprompted on schedule.
   Every owner decision travels as a HELD PR in the end-of-sweep result, never a
   chat question; never ask permission for work this document authorizes.
-
-## PR descriptions
-
-- The first line answers WHY: "Decision needed: <the specific choice>" or
-  "Review needed: <the specific risk>". If the reviewer can't tell in ten
-  seconds why they were summoned, the text is wrong.
-- List ONLY the conflicted files (plus merge-forced consequential edits); per
-  file, show the resolution hunk (ours vs theirs vs chosen, and why) in a
-  collapsed `<details>` block with a GitHub permalink; then state: "everything
-  outside these N files is verbatim upstream <range>, already reviewed
-  upstream." Close with verification status — and if a gate could NOT run where
-  you are (container/bun tests), SAY SO explicitly: a merge is not "verified"
-  until the full matrix ran somewhere.
-- Write from the case materials only — the conflict markers' two sides plus the
-  per-side brief in `pr/materials.md`. Do NOT explore the repo to write the
-  description; if the materials aren't enough for an honest description, that
-  is `--tier held` — never publish text you don't understand. Name the specific
-  decision/risk (no bare "review needed"); describe behaviour, not line counts;
-  label each side ours/theirs; no unexplained references.
-- Never edit the machine block that appears below your prose. Never write a
-  description that says "do not merge".
 
 ## Reporting to the owner
 

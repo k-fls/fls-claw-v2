@@ -802,7 +802,10 @@ describe('sweep report-case (D-053 §2)', () => {
       ),
     ).toBe(0);
     const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; tier: string };
-    expect(res.instruction).toBe('provide PR description');
+    expect(res.instruction).toContain('provide PR description');
+    // D-062: the DRIVER carries the how-to path, not doctrine — it knows the
+    // moment the agent needs it, so CLAUDE.local.md no longer mentions PR prose.
+    expect(res.instruction).toContain('/workspace/agent/PR-DESCRIPTIONS.md');
     expect(res.tier).toBe('judged');
     expect(repo.sha('main_patched')).toBe(beforeTip); // NOT merged yet (report-pr merges)
     // D-060: the single quality gate (cold read) now runs at report-case for
@@ -832,7 +835,10 @@ describe('sweep report-case (D-053 §2)', () => {
     ).toBe(0);
     const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; tier: string; issues?: Array<{ id: string }> };
     expect(res.tier).toBe('judged');
-    expect(res.instruction).toBe('provide PR description');
+    expect(res.instruction).toContain('provide PR description');
+    // D-062: the DRIVER carries the how-to path, not doctrine — it knows the
+    // moment the agent needs it, so CLAUDE.local.md no longer mentions PR prose.
+    expect(res.instruction).toContain('/workspace/agent/PR-DESCRIPTIONS.md');
     expect((res.issues ?? []).some((i) => i.id === 'ERR05_DECIDED_ALREADY')).toBe(false);
     expect(machineState(dir).phase).toBe('awaiting-pr');
   });
@@ -940,7 +946,10 @@ describe('sweep report-case (D-053 §2)', () => {
     ).toBe(0);
     const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; tier: string };
     expect(res.tier).toBe('held');
-    expect(res.instruction).toBe('provide PR description');
+    expect(res.instruction).toContain('provide PR description');
+    // D-062: the DRIVER carries the how-to path, not doctrine — it knows the
+    // moment the agent needs it, so CLAUDE.local.md no longer mentions PR prose.
+    expect(res.instruction).toContain('/workspace/agent/PR-DESCRIPTIONS.md');
     expect(repo.sha('main_patched')).toBe(postRun); // no merge
     // Blocked ⇔ the journaled held disposition; nothing is published here and
     // the ledger is never written (D-058).
@@ -1037,7 +1046,7 @@ describe('sweep report-case (D-053 §2)', () => {
       ),
     ).toBe(1);
     const res = JSON.parse(readFileSync(out, 'utf8')) as { issues?: Array<{ id: string }> };
-    expect(res.issues?.some((i) => i.id === 'ERR43_COLDREAD_UNGROUNDED')).toBe(true);
+    expect(res.issues?.some((i) => i.id === 'ERR46_COLDREAD_UNGROUNDED')).toBe(true);
     // No strike spent: nothing journaled, the case is still the agent's.
     expect(readJournal(dir).some((e) => e.action === 'coldread' && e.caseId === caseId)).toBe(false);
     expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
@@ -1059,7 +1068,7 @@ describe('sweep report-case (D-053 §2)', () => {
       ),
     ).toBe(1);
     const res = JSON.parse(readFileSync(out, 'utf8')) as { issues?: Array<{ id: string }> };
-    expect(res.issues?.some((i) => i.id === 'ERR43_COLDREAD_UNGROUNDED')).toBe(true);
+    expect(res.issues?.some((i) => i.id === 'ERR46_COLDREAD_UNGROUNDED')).toBe(true);
     expect(readJournal(dir).some((e) => e.action === 'coldread' && e.caseId === caseId)).toBe(false);
   });
 
