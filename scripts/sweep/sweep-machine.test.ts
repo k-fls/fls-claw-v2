@@ -473,6 +473,71 @@ describe('sweep start — the base gate (D-061 A)', () => {
   });
 
   /**
+   * A base-red REFUSAL must not WEDGE the next start. Since the red base is
+   * carried forward (D-061), both ERR42 refusal arms fire AFTER `openPass` has
+   * written phase `open` — so the pass was left in flight, the next `start` hit
+   * the "a pass is already open" guard and returned ERR30_PASS_OPEN, and nothing
+   * in the ERR42 result told the agent to `abort`. That wedged the agent on the
+   * exact path a broken base takes. Both arms now SEAL the pass (files kept for
+   * inspection until the next start clean-slates the dir) and say so.
+   */
+  it('base-red refusal (unattributable) seals the pass — the next start is NOT ERR30-wedged', async () => {
+    const repo = gateFixRepoForBase();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
+    const checks = baseChecks(ws);
+    const noDiagnostics: ChecksRunner = async (commands) => ({
+      ok: false,
+      failedNames: commands.map((c) => c.cmd),
+      output: 'ELIFECYCLE Command failed.\nsh: 1: tsc: not found\n',
+    });
+    const out1 = join(ws, 'start1.json');
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks, out: out1 }), undefined, noDiagnostics)).toBe(1);
+    const res1 = JSON.parse(readFileSync(out1, 'utf8')) as { status: string; instruction: string; passDir: string };
+    expect(res1.status).toBe('stopped');
+    // The instruction names the next action explicitly — no `abort` needed.
+    expect(res1.instruction).toContain('REPORT to the owner');
+    expect(res1.instruction).toContain('Do NOT run `abort`');
+    const dir = dirOf(repo, ws);
+    expect(res1.passDir).toBe(dir);
+    // Sealed, not left open — and the pass's own record survives for inspection.
+    expect(machineState(dir).phase).toBe('complete');
+    expect(readJournal(dir).some((e) => e.action === 'pass-complete')).toBe(true);
+    expect(existsSync(join(dir, 'plan-initial.json'))).toBe(true);
+
+    const out2 = join(ws, 'start2.json');
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks, out: out2 }), undefined, noDiagnostics)).toBe(1);
+    const res2 = JSON.parse(readFileSync(out2, 'utf8')) as { status: string; issues: Array<{ id: string }> };
+    // The same honest STOP again (the base is still red) — never the ERR30 wedge.
+    expect(res2.issues.map((i) => i.id)).not.toContain('ERR30_PASS_OPEN');
+    expect(res2.issues[0].id).toBe('ERR42_BASE_RED');
+    expect(res2.status).toBe('stopped');
+  });
+
+  it('base-red refusal (anti-loop) seals the pass — the next start is NOT ERR30-wedged', async () => {
+    const repo = gateFixRepoForBase();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
+    const checks = baseChecks(ws);
+    // Pass 1 serves the gate-fix case; the agent fixes nothing and aborts.
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }), undefined, baseRunner())).toBe(0);
+    expect(await cmdSweepAbort(baseCli(repo, ws, inv, { cmd: 'sweep-abort' }))).toBe(0);
+    // Pass 2 hits the ANTI-LOOP arm (same base SHA, case already served).
+    const out2 = join(ws, 'start2.json');
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks, out: out2 }), undefined, baseRunner())).toBe(1);
+    const res2 = JSON.parse(readFileSync(out2, 'utf8')) as { status: string; instruction: string };
+    expect(res2.status).toBe('stopped');
+    expect(res2.instruction).toContain('Do NOT run `abort`');
+    expect(machineState(dirOf(repo, ws)).phase).toBe('complete');
+    // Pass 3: still refused for the SAME reason, but not blocked behind ERR30.
+    const out3 = join(ws, 'start3.json');
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks, out: out3 }), undefined, baseRunner())).toBe(1);
+    const res3 = JSON.parse(readFileSync(out3, 'utf8')) as { issues: Array<{ id: string }> };
+    expect(res3.issues.map((i) => i.id)).not.toContain('ERR30_PASS_OPEN');
+    expect(res3.issues[0].id).toBe('ERR42_BASE_RED');
+  });
+
+  /**
    * DEFECT 6 (MED) — the shipped checks.json runs
    * `{ cmd: 'bun test', cwd: 'container/agent-runner' }`, so that command's
    * diagnostics print paths relative to THAT subdirectory (`src/auth/x.ts`).

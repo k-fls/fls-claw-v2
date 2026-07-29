@@ -191,7 +191,10 @@ around a blocking id.
 | `ERR36_TYPECHECK_FAILED` | open the named output file, fix the pending files, re-run `report-case` |
 | `ERR40_TESTS_FAILED` | same as ERR36; at `finish` it is a stop-case 2 report (publish nothing) |
 | `ERR41_TOKEN_REJECTED` | the GitHub token was REJECTED — re-auth; a retry with the same token cannot clear it |
-| `ERR42_BASE_RED` | the base was already broken BEFORE any merge; no pass was opened — stop-case 2 report naming the branch and failing checks |
+| `ERR42_BASE_RED` | the base was already broken BEFORE any merge — stop-case 2 report naming the branch and failing checks; the pass is already sealed, so do NOT run `abort` |
+| `ERR43_CHECKS_MALFORMED` | the named checks file does not PARSE, so no gate can run — stop-case 2 report quoting the file and the parse error; never continue with the gates silently skipped |
+| `ERR44_WORKTREE_RESET_FAILED` | the worktree could not be reset to the pristine conflict and still holds your edits — clear it in-container and re-run `report-case`; never call it pristine |
+| `ERR45_CUT_POINTS_MALFORMED` | the cut-point exceptions file does not PARSE, so blame cannot be trusted and no gate-fix case is served — stop-case 2 report quoting the file and the parse error |
 | `ERR39_FETCH_FAILED` | fix connectivity/creds, re-run `start`; never open a pass on a stale view |
 | `WARN01_TEMPLATE_TEXT` | rewrite the body from the case materials |
 | `WARN02_NO_DECISION_LINE` | open the body with the exact decision the owner is asked to make |

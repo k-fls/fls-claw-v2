@@ -177,8 +177,10 @@ visible today as blame refusing a tie rather than as a wrong answer.
 propagation), `ERR43_CHECKS_MALFORMED` (an unparseable checks file is loud at `start`,
 `report-case` and `finish`; an ABSENT one still skips silently, which is intended),
 `ERR44_WORKTREE_RESET_FAILED` (a failed reset is never reported as "the worktree is
-pristine"), and from D-060 `ERR41_TOKEN_REJECTED` (a networked 401/403 names the token
-SOURCE — `--token-file` / `$GH_TOKEN` / `$GITHUB_TOKEN` — and never echoes the token;
+pristine"), `ERR45_CUT_POINTS_MALFORMED` (an unparseable cut-point exceptions file stops the
+blame it feeds — silently dropped exceptions put blame back on the answers they exist to
+correct; an ABSENT one still skips silently), and from D-060 `ERR41_TOKEN_REJECTED` (a
+networked 401/403 names the token SOURCE — `--token-file` / `$GH_TOKEN` / `$GITHUB_TOKEN` — and never echoes the token;
 retrying with the same token cannot clear it).
 
 ## 1. Merge tiers (per parent→branch merge attempt)

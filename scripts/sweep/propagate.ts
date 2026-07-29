@@ -6387,6 +6387,26 @@ async function deriveOriginMergeStatus(
  * from the durable group-root ledger + rr-cache, which killed rerere and
  * diverged the ledger). A group root inside an OUTER git repo is accepted.
  */
+/**
+ * Seal a pass that `start` OPENED and then REFUSED (the two D-061 base-red arms).
+ * Since the red base is carried forward, both refusals fire AFTER `openPass` has
+ * written machine state with phase `open` — so the pass was left in flight and the
+ * NEXT `sweep start` hit the "a pass is already open" guard and returned
+ * ERR30_PASS_OPEN, wedging the agent on the exact path a broken base takes (and
+ * nothing in the ERR42 result told it to `abort`). Sealing writes the same
+ * `pass-complete` row + machine phase `complete` that `abort`/`finish` write, so
+ * the next `start` is allowed through. Nothing is rolled back and nothing is
+ * deleted: `start` refuses before any merge, and every file (journal, machine
+ * state, the base checks output) stays on disk for whoever investigates until the
+ * next `start` clean-slates the dir anyway.
+ */
+function sealRefusedPass(dir: string, st: MachineState): void {
+  if (!readJournal(dir).some((e) => e.action === 'pass-complete')) {
+    appendJournal(dir, { action: 'pass-complete', watermark: st.watermark });
+  }
+  writeMachineState(dir, { ...st, phase: 'complete', currentCase: null });
+}
+
 export async function cmdSweepStart(
   cli: Cli,
   makeTransport?: (token: string) => GithubTransport,
@@ -6600,11 +6620,16 @@ export async function cmdSweepStart(
         `GATE-FIX case was already served for that exact base — the base has not changed since, so re-serving it ` +
         `would hand out the identical case forever. Not re-serving.`;
       console.error(`sweep start [ERR42_BASE_RED]: ${detail}`);
+      sealRefusedPass(ctx.dir, st);
       result(cli, {
         ok: false,
         status: 'stopped',
+        passDir: ctx.dir,
         issues: [{ id: 'ERR42_BASE_RED', detail }],
-        instruction: `REPORT to the owner: the base ${baseRed.anchor} is broken and the previous gate-fix attempt did not land`,
+        instruction:
+          `REPORT to the owner: the base ${baseRed.anchor} is broken and the previous gate-fix attempt did not land. ` +
+          `Do NOT run \`abort\` — the pass is already sealed; read ${ctx.dir} for the failing output, and run \`start\` ` +
+          `again only once the owner says the base is fixed.`,
       });
       return 1;
     }
@@ -6628,14 +6653,20 @@ export async function cmdSweepStart(
       });
       return 0;
     }
-    // Nothing blameable: fall back to the refusal, with the pass left open so
-    // the failing output stays inspectable.
+    // Nothing blameable: fall back to the refusal. The pass is SEALED rather than
+    // left open — its files stay inspectable either way, but an open pass wedged
+    // the next `start` behind ERR30_PASS_OPEN (see sealRefusedPass).
     console.error(`sweep start [ERR42_BASE_RED]: ${baseRed.anchor} red and unattributable — ${gate.reason}`);
+    sealRefusedPass(ctx.dir, st);
     result(cli, {
       ok: false,
       status: 'stopped',
+      passDir: ctx.dir,
       issues: [{ id: 'ERR42_BASE_RED', detail: `${baseRed.anchor} is red before any merge and ${gate.reason}` }],
-      instruction: `REPORT to the owner: the base ${baseRed.anchor} is broken (${baseRed.failedNames.join(', ')}) and could not be attributed`,
+      instruction:
+        `REPORT to the owner: the base ${baseRed.anchor} is broken (${baseRed.failedNames.join(', ')}) and could not ` +
+        `be attributed. Do NOT run \`abort\` — the pass is already sealed; read ${ctx.dir} for the failing output, ` +
+        `and run \`start\` again only once the owner says the base is fixed.`,
     });
     return 1;
   }

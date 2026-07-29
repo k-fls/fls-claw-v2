@@ -97,8 +97,11 @@ trigger at `finish`, which a refusing `start` never reaches, so the pass is open
 red is carried forward — a case needs a pass to live in. `ERR42_BASE_RED` remains the
 refusal for the two states that have no servable case: nothing could be blamed for the
 failing files, or the SAME base sha was already served a gate fix that did not land
-(anti-loop). Both refuse with `status:"stopped"` and LEAVE THE PASS OPEN so the failing
-output stays inspectable — `abort` before the next `start`. The anti-loop record is a
+(anti-loop). Both refuse with `status:"stopped"` and SEAL the pass (`pass-complete` + phase
+`complete`, exactly as `abort` does): the failing output stays inspectable until the next
+`start` clean-slates the dir, and NO `abort` is needed. Leaving it open instead wedged the
+next `start` behind `ERR30_PASS_OPEN` — on the exact path a broken base takes, with nothing
+in the ERR42 result saying so. The anti-loop record is a
 WORKSPACE-ROOT file (`sweep-base-gate-attempts.json`, keyed `<anchor>@<sha>`, capped): the
 pass journal cannot hold it because `start` wipes the pass dir before the case is minted, so
 an unfixed base re-minted an identical case on every `start` forever; a base that was
@@ -150,6 +153,10 @@ at all three consumers (`start`, `report-case`, `finish`), because a silent skip
 every gate and the pass then reported green having typechecked and tested nothing; an ABSENT
 file still skips silently, which is intended. `ERR44_WORKTREE_RESET_FAILED` — a failed
 worktree reset is never announced as "the worktree is now pristine".
+`ERR45_CUT_POINTS_MALFORMED` — a cut-point exceptions file that does not PARSE stops the
+gate-fix blame it feeds, for the ERR43 reason: silently dropping owner-approved exceptions
+puts blame straight back on the answers they exist to correct; an ABSENT file skips in
+silence.
 
 ## 1. Principle
 
@@ -187,8 +194,9 @@ worktree reset is never announced as "the worktree is now pristine".
   `status:"gate-fix-required"` + `ERR42_BASE_RED` + `run next-case`. `ERR42_BASE_RED` is a
   hard `status:"stopped"` in exactly two states: nothing could be blamed for the failing
   files, or the same base sha was already served a gate fix that never landed (the
-  workspace-root anti-loop record, which survives the pass-dir wipe). Both leave the pass
-  OPEN with the failing output on disk — `abort` before the next `start`.
+  workspace-root anti-loop record, which survives the pass-dir wipe). Both SEAL the pass
+  with the failing output on disk — inspectable until the next `start` clean-slates the dir,
+  and no `abort` first (an open pass wedged that next `start` behind `ERR30_PASS_OPEN`).
 - **NETWORKED + origin-derived (D-058):** `start` first `git fetch`es origin and
   upstream (a fetch failure is `ERR39`, so a pass never opens on a stale view), then
   reconstructs the blocked set from the origin `fix/sweep/*` refs BEFORE planning
