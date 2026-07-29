@@ -668,6 +668,45 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
 }
 
 /**
+ * UNRESOLVED gate-fix cases, branch → 'open' | 'held' (D-062 / B2).
+ *
+ * A gate-fix case is ROOTED on the branch whose base check failed, and its
+ * worktree is cut from that branch's tip AT THE MOMENT THE CASE WAS MINTED. If
+ * the pass then advances that branch (the `main` → `main_patched` prefix merge),
+ * the case's anchor no longer exists on the branch: `resolve` re-derives the
+ * automerge tree against the MOVED tip, so a correct 1-file fix reads as a mass
+ * deletion of everything the merge brought in. Live 2026-07-29: a +4/-3 fix to
+ * `src/command-gate.ts` diffed as 24 files / -399 lines, was cold-read rejected
+ * twice on that phantom, and auto-escalated to held — while the feedback handed
+ * to the agent ("strip ~23 out-of-scope files") named files its worktree had
+ * never touched, so it re-submitted the identical tree.
+ *
+ * `held` does NOT release the block. The base is still red, and propagating onto
+ * a red base poisons every downstream case: each must either carry the base fix
+ * (cold-read rejects it as out-of-scope) or fail its own typecheck on an error it
+ * did not cause. Live 2026-07-29 again — `module/host-rpc` failed typecheck at
+ * 14:23 on the inherited error, pulled `src/command-gate.ts` in to go green, and
+ * was held at 14:44 for exactly that. A sealed pass beats one that holds every
+ * branch.
+ */
+function gateFixBlocks(journal: JournalEntry[]): Map<string, 'open' | 'held'> {
+  const rooted = new Map<string, string>(); // caseId -> branch
+  for (const e of journal) {
+    if (e.action === 'gate-fix' && typeof e.caseId === 'string' && typeof e.branch === 'string') {
+      rooted.set(e.caseId, e.branch);
+    }
+  }
+  const out = new Map<string, 'open' | 'held'>();
+  for (const [caseId, branch] of rooted) {
+    // `resolved` is the judged landing (tier 'judged', gateFix: true) — the fix
+    // is ON the branch, the base is green again, the block clears.
+    if (journal.some((e) => e.action === 'resolved' && e.caseId === caseId)) continue;
+    out.set(branch, journal.some((e) => e.action === 'held' && e.caseId === caseId) ? 'held' : 'open');
+  }
+  return out;
+}
+
+/**
  * The pass's merge_status view (branch → PR_ID | DEFERRED; absence = NONE),
  * derived from the journal alone (D-058):
  *  - PR_ID: `blockedRows` (origin-derived rows + this-pass holds).
@@ -1672,6 +1711,31 @@ function boundedFeedback(v: { feedback?: unknown }): string | null {
 }
 
 /**
+ * D-062: a REJECT must carry GROUNDED feedback, because the agent's only route
+ * back is that one string. `notes` has always been validated non-empty; feedback
+ * never was, and the schema explicitly sanctioned omitting it ("omit when nothing
+ * is") — so a reject could reach the agent as a bare "cold read rejected — revise
+ * the resolution", which buys nothing but a wasted retry into auto-escalation.
+ * Worse on the fail-closed path: an UNVERIFIABLE answer rejects even under
+ * `verdict: "confirm"`, and a CONFIRMING reader has every reason to omit
+ * feedback — the agent is then told it was rejected with no reason at all.
+ *
+ * Grounded = names something the agent can act on: a path that actually appears
+ * in the resolution diff, or one of the questions it failed. Prose alone ("the
+ * resolution is out of scope") is not actionable and is refused here rather than
+ * spent on a retry.
+ */
+function ungroundedFeedback(feedback: string | null, resolutionPaths: string[]): string | null {
+  if (feedback === null) return 'feedback is required on a reject (the agent has no other route back)';
+  if (resolutionPaths.some((p) => feedback.includes(p))) return null;
+  if (/\bq[123]\b/i.test(feedback)) return null;
+  return (
+    'feedback must be GROUNDED — name a path that appears in the resolution diff, or the question (q1/q2/q3) ' +
+    'the resolution failed. Prose with no anchor gives the agent nothing to act on.'
+  );
+}
+
+/**
  * Cold-read REJECTIONS of the RESOLUTION journaled for a case (fail-closed
  * UNVERIFIABLE counts). EVERY reject counts toward COLDREAD_REJECT_LIMIT.
  *
@@ -2121,6 +2185,21 @@ export async function cmdRun(cli: Cli): Promise<number> {
     return 0;
   }
 
+  // D-062 / B2: an unresolved gate-fix case FREEZES the whole propagation, not
+  // just its own branch. Per-branch skipping is wrong here — `arrived` is the
+  // loop's completion marker, so a branch that never arrives leaves the pass
+  // unfinishable; and descendants must not merge off a base that is still red
+  // anyway. Nothing is journaled: the pass is untouched until the fix lands
+  // (`resolved` clears the block) or `next-case` seals it (held).
+  const gfOpen = gateFixBlocks(readJournal(dir));
+  if (gfOpen.size > 0) {
+    console.error(
+      `run: gate-fix unresolved on ${[...gfOpen.keys()].join(', ')} — propagation frozen until the base is green`,
+    );
+    emit(cli, { gateFixPending: [...gfOpen.entries()].map(([branch, state]) => ({ branch, state })) });
+    return 0;
+  }
+
   // EXECUTE. Repo-wide rerere first (D-050, owner (b) 2026-07-22): BEFORE the
   // first mutation, idempotently enable rerere in the agent clone so every
   // merge — driver or case worktree — records/replays resolutions. Journaled
@@ -2282,6 +2361,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
         arrived.add(snap.branch);
         continue;
       }
+
 
       // Re-derive THIS branch against LIVE tips so a child sees its parents'
       // just-merged tips (breadth-wise cascade, like merge.ts probes live sources).
@@ -3402,6 +3482,24 @@ export async function cmdResolve(cli: Cli): Promise<number> {
     );
     const coldreadRejected = coldread.verdict === 'reject' || unverifiable.length > 0;
     const feedback = boundedFeedback(coldread);
+
+    // D-062: same grounding requirement as report-case — a reject reaches the
+    // agent as one string, so it must name a path in the resolution diff or the
+    // failed question. Refusing the verdict spends no strike.
+    if (coldreadRejected) {
+      const resolutionPaths = (
+        await git(cli.repo, ['diff', '--name-only', rc.automergeTree, resolvedTree], { allowCodes: [1] })
+      ).stdout
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean);
+      const bad = ungroundedFeedback(feedback, resolutionPaths);
+      if (bad !== null) {
+        console.error(`resolve [ERR43_COLDREAD_UNGROUNDED]: cold-read verdict rejects but ${bad}`);
+        console.error(COLDREAD_VERDICT_GUIDANCE);
+        return 2;
+      }
+    }
 
     // Scope guard (§7 → D-057 #3): recomputed automerge/paths + config-derived
     // mode. A violation is NOT an instant hold any more — the verdict above
@@ -6787,6 +6885,36 @@ export async function cmdSweepNextCase(cli: Cli): Promise<number> {
   // above resolved heights and lands new clean prefixes/skips/defers). D-054: the
   // MAJOR transitions cmdRun runs internally, announced as progress; the batched
   // merge/skip/defer summary comes from the journal delta below.
+  // D-062 / B2: a gate-fix that ended HELD did not land — the base is still red.
+  // Propagating onto it forces every downstream case to either carry the base fix
+  // (cold-read rejects it as out-of-scope) or fail its own typecheck on an error
+  // it did not cause, so the pass produces nothing but holds. Stop serving cases
+  // and route to `finish`.
+  //
+  // NOT a seal. `sealRefusedPass` writes `pass-complete` + phase 'complete', which
+  // is for a pass REFUSED at `start` with nothing in it. Using it here would mark
+  // a pass that holds real fixes as finished-normally AND make `finish`
+  // unattachable — stranding the held fix as a `pr-intent` note that can never
+  // become a PR, so the base could never go green. `finish` is the one path that
+  // ends a pass, and its `held-prs` step is what publishes the fix the owner has
+  // to merge.
+  const gfHeld = [...gateFixBlocks(readJournal(dir)).entries()].filter(([, s]) => s === 'held');
+  if (gfHeld.length > 0) {
+    const branches = gfHeld.map(([b]) => b).join(', ');
+    st = { ...st, phase: 'open', currentCase: null };
+    writeMachineState(dir, st);
+    progress(`gate-fix HELD on ${branches} — no further cases this pass`);
+    console.error(`next-case: gate-fix HELD on ${branches} — finalize (run \`finish\`)`);
+    result(cli, {
+      status: 'finalize',
+      instruction:
+        `the gate-fix rooted on ${branches} ended HELD, so the base is still red and no branch can be ` +
+        `propagated onto it. Run \`finish\` — it publishes the held fix as a PR. Tell the owner that PR ` +
+        `must merge before the next sweep can open.`,
+    });
+    return 0;
+  }
+
   progress('scanning upstream');
   let planBranches = 0;
   try {
@@ -7264,6 +7392,28 @@ export async function cmdSweepReportCase(
   }
   const { rejected, unverifiable } = coldReadRejected(verdict);
   const feedback = boundedFeedback(verdict);
+  // D-062: a reject the agent cannot act on is worse than no reject — it costs a
+  // retry and then auto-escalates. Refuse the VERDICT (not the resolution) and
+  // make the reader answer again; nothing is journaled, so no strike is spent.
+  if (rejected) {
+    const resolutionPaths = (
+      await git(cli.repo, ['diff', '--name-only', rc.automergeTree, resolvedTree], { allowCodes: [1] })
+    ).stdout
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+    const bad = ungroundedFeedback(feedback, resolutionPaths);
+    if (bad !== null) {
+      const detail = `cold-read verdict rejects but ${bad}`;
+      console.error(`report-case [ERR43_COLDREAD_UNGROUNDED]: ${detail}`);
+      result(cli, {
+        instruction: `${detail} ${COLDREAD_VERDICT_GUIDANCE}`,
+        tier: claimed,
+        issues: [...issues, { id: 'ERR43_COLDREAD_UNGROUNDED', detail }],
+      });
+      return 1;
+    }
+  }
   appendJournal(dir, {
     action: 'coldread',
     caseId,

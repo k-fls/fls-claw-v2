@@ -587,7 +587,7 @@ describe('propagate resolve — cold-read infra failure ≠ content reject (D-05
     const { caseId, caseFile } = await openCase(repo, ws, inv, dir);
     const postRun = repo.sha('main_patched');
     const resolvedRef = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'RESOLVED\n' });
-    writeVerdict(dir, caseId, repo, resolvedRef, 'reject'); // a real judged reject
+    writeVerdict(dir, caseId, repo, resolvedRef, 'reject', undefined, 'src/x.ts drops the fork guard'); // a real judged reject
     // FIRST rejection (D-057 #4): no freeze, no halt — the agent revises and retries.
     expect(
       await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef })),
@@ -597,7 +597,7 @@ describe('propagate resolve — cold-read infra failure ≠ content reject (D-05
     expect(j.some((e) => e.action === 'halt' && e.id === 'ERR35_COLDREAD_UNAVAILABLE')).toBe(false);
     expect(j.some((e) => e.action === 'coldread' && e.caseId === caseId && e.rejected === true)).toBe(true);
     // SECOND rejection: stop retrying → HELD (escalated), still never an ERR35 halt.
-    writeVerdict(dir, caseId, repo, resolvedRef, 'reject');
+    writeVerdict(dir, caseId, repo, resolvedRef, 'reject', undefined, 'src/x.ts drops the fork guard');
     expect(
       await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef })),
     ).toBe(0);
@@ -2288,7 +2288,7 @@ describe('propagate resolve — cold-read rejections: retry once, HELD (escalate
 
     // A VALID-SHAPE reject verdict (correct freshness binding) on a valid resolution.
     const resolvedRef = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'RESOLVED\n' });
-    writeVerdict(dir, caseId, repo, resolvedRef, 'reject', undefined, 'the fork guard was dropped — needs a second look');
+    writeVerdict(dir, caseId, repo, resolvedRef, 'reject', undefined, 'src/x.ts: the fork guard was dropped — needs a second look');
     const outFile = join(ws, 'reject-out.json');
     // FIRST rejection: no freeze — the reviewer's feedback is surfaced to the agent.
     expect(
@@ -2306,7 +2306,7 @@ describe('propagate resolve — cold-read rejections: retry once, HELD (escalate
     expect(repo.sha('main_patched')).toBe(postRun); // NOT merged
 
     // SECOND rejection: stop retrying — HELD via the unified publish, escalated.
-    writeVerdict(dir, caseId, repo, resolvedRef, 'reject', undefined, 'the fork guard was dropped — needs a second look');
+    writeVerdict(dir, caseId, repo, resolvedRef, 'reject', undefined, 'src/x.ts: the fork guard was dropped — needs a second look');
     expect(
       await cmdResolve(cli({ cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef, out: outFile })),
     ).toBe(0);
@@ -2782,7 +2782,7 @@ describe('propagate resolve — D-050: focused cold-read contract', () => {
     const postRun = repo.sha('main_patched');
     const resolvedRef = await buildResolution(repo, caseFile.automergeTree, { 'src/x.ts': 'RESOLVED\n' });
     const unverifiableAnswers = { q1: 'ok', q2: 'UNVERIFIABLE-FROM-REQUEST', q3: 'ok' };
-    writeVerdict(dir, caseId, repo, resolvedRef, 'confirm', unverifiableAnswers);
+    writeVerdict(dir, caseId, repo, resolvedRef, 'confirm', unverifiableAnswers, 'q2 could not be judged from the request');
     // FIRST strike: treated as a rejection (fail-closed) — no merge, no freeze.
     expect(
       await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef })),
@@ -2793,7 +2793,7 @@ describe('propagate resolve — D-050: focused cold-read contract', () => {
       readJournal(dir).some((e) => e.action === 'coldread' && e.caseId === caseId && e.rejected === true),
     ).toBe(true);
     // SECOND strike: HELD (fail-closed, escalated).
-    writeVerdict(dir, caseId, repo, resolvedRef, 'confirm', unverifiableAnswers);
+    writeVerdict(dir, caseId, repo, resolvedRef, 'confirm', unverifiableAnswers, 'q2 could not be judged from the request');
     expect(
       await cmdResolve(baseCli(repo, ws, inv, { cmd: 'resolve', execute: true, caseId, tier: 'mechanical', resolvedRef })),
     ).toBe(0);

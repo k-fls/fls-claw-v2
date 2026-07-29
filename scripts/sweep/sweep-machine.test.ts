@@ -180,7 +180,27 @@ const confirm: ColdReadInvoker = async () => ({
 const rejectCode: ColdReadInvoker = async () => ({
   verdict: 'reject',
   notes: 'silently drops the fork behaviour',
-  feedback: 'restore the fork-side guard before re-reporting',
+  feedback: 'restore the fork-side guard in src/x.ts before re-reporting',
+  defect: 'code',
+});
+/**
+ * D-062: a reject whose feedback anchors on NOTHING — no path from the
+ * resolution diff, no failed question. The agent's only route back from a reject
+ * is this one string, so an unanchored one costs a retry and then auto-escalates
+ * for free. Live 2026-07-29: the agent was told to "strip ~23 out-of-scope files"
+ * that its worktree had never touched, could act on none of it, and re-submitted
+ * the identical tree into the 2nd strike.
+ */
+const rejectUngrounded: ColdReadInvoker = async () => ({
+  verdict: 'reject',
+  notes: 'the resolution is not acceptable',
+  feedback: 'this resolution is out of scope and should be reduced',
+  defect: 'code',
+});
+/** D-062: a reject with NO feedback at all — `feedback` was never validated. */
+const rejectNoFeedback: ColdReadInvoker = async () => ({
+  verdict: 'reject',
+  notes: 'the resolution is not acceptable',
   defect: 'code',
 });
 // D-060: the cold read is the SINGLE quality gate and it lives at `report-case`.
@@ -315,6 +335,64 @@ describe('sweep start — the base gate (D-061 A)', () => {
     cleanups.push(() => repo.destroy());
     return repo;
   }
+
+  /**
+   * D-062: `gateFixRepoForBase` + an UPSTREAM commit that `main_patched` does
+   * NOT have, so the pass has a real `main` -> `main_patched` prefix merge to
+   * perform while a gate-fix case is open.
+   *
+   * This one commit is the whole reason 456 green tests missed the drift: with
+   * no upstream delta the branch CANNOT move under an open case, so every
+   * gate-fix test was blind to what happens when it does.
+   */
+  function gateFixRepoWithUpstream(): FixtureRepo {
+    const repo = gateFixRepoForBase(); // leaves `main` checked out
+    repo.commit('main: tz feature', { 'src/tz.ts': 'timezone\n' });
+    return repo;
+  }
+
+  /**
+   * D-062 / B2 — the anchor must not move under an open gate-fix case.
+   *
+   * Live 2026-07-29: `start` minted the case against `main_patched@e4c82f34`;
+   * `next-case` then merged `main` in (-> d0df574a) before serving it. The case
+   * worktree stayed cut from the PRE-merge tree, so `resolve` diffed the
+   * resolution against the MOVED tip and a correct +4/-3 fix to one file read as
+   * 24 files / -399 lines. Cold-read rejected it twice on that phantom and
+   * auto-escalated to held; the feedback named ~23 files the agent's worktree had
+   * never touched, so the agent re-submitted the identical tree.
+   */
+  it('D-062 — an OPEN gate-fix freezes propagation: the base anchor cannot move under the case', async () => {
+    const repo = gateFixRepoWithUpstream();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
+    const out = join(ws, 'start.json');
+    expect(
+      await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: baseChecks(ws), out }), undefined, baseRunner()),
+    ).toBe(0);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; gateFix: { caseId: string } };
+    expect(res.status).toBe('gate-fix-required');
+    const anchor = repo.sha('main_patched');
+
+    // The upstream commit IS pending — without it this test proves nothing.
+    expect(await isAncestor(repo.dir, repo.sha('main'), anchor)).toBe(false);
+
+    const nc = join(ws, 'nc.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: nc }))).toBe(0);
+    expect((JSON.parse(readFileSync(nc, 'utf8')) as { status: string }).status).toBe('case-ready');
+
+    // The anchor held, and nothing merged anywhere in the pass.
+    expect(repo.sha('main_patched')).toBe(anchor);
+    expect(readJournal(dirOf(repo, ws)).some((e) => e.action === 'merge')).toBe(false);
+
+    // The case's baseline is still the anchor's tree, so `src/tz.ts` — which the
+    // pending merge would have introduced — cannot surface as a phantom deletion
+    // in the resolution diff.
+    const caseFile = JSON.parse(readFileSync(join(dirOf(repo, ws), res.gateFix.caseId, 'case.json'), 'utf8')) as {
+      automergeTree: string;
+    };
+    expect(caseFile.automergeTree).toBe(repo.git('rev-parse', `${anchor}^{tree}`));
+  });
 
   it('base RED -> a GATE-FIX case on the blamed branch (D-061: not a dead end)', async () => {
     const repo = gateFixRepoForBase();
@@ -932,6 +1010,57 @@ describe('sweep report-case (D-053 §2)', () => {
     expect((held.escalation as { feedback: string }).feedback).toContain('restore the fork-side guard');
     expect(held.resolution).toMatchObject({ markerClean: true }); // active review PR at publish
     expect(machineState(dir).currentCase?.tier).toBe('held');
+  });
+
+  /**
+   * D-062 — a reject must be GROUNDED, and the driver must refuse it when it is
+   * not. `notes` has always been validated non-empty; `feedback` never was, and
+   * the request schema explicitly sanctioned omitting it ("omit when nothing
+   * is"). So a reject could reach the agent as a bare "cold read rejected —
+   * revise the resolution", which buys nothing but a wasted strike.
+   *
+   * Refusing the VERDICT (not the resolution) must cost no strike: the reader is
+   * asked again, and no `coldread` row is journaled.
+   */
+  it('D-062 — a reject whose feedback anchors on nothing is REFUSED, and costs no strike', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    const caseId = await toCase(repo, ws, inv);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        rejectUngrounded,
+      ),
+    ).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues?: Array<{ id: string }> };
+    expect(res.issues?.some((i) => i.id === 'ERR43_COLDREAD_UNGROUNDED')).toBe(true);
+    // No strike spent: nothing journaled, the case is still the agent's.
+    expect(readJournal(dir).some((e) => e.action === 'coldread' && e.caseId === caseId)).toBe(false);
+    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
+    expect(machineState(dir).phase).toBe('case-ready');
+  });
+
+  it('D-062 — a reject with NO feedback at all is REFUSED (feedback was never validated)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    const caseId = await toCase(repo, ws, inv);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        rejectNoFeedback,
+      ),
+    ).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues?: Array<{ id: string }> };
+    expect(res.issues?.some((i) => i.id === 'ERR43_COLDREAD_UNGROUNDED')).toBe(true);
+    expect(readJournal(dir).some((e) => e.action === 'coldread' && e.caseId === caseId)).toBe(false);
   });
 
   it('judged cold-read reject (D-060: the gate is HERE, not at report-pr): 1st -> revise, 2nd -> HELD escalated, never merged', async () => {
