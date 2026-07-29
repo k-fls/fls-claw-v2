@@ -117,6 +117,70 @@ reject counts as a resolution reject toward the 2× HELD escalation. At `finish`
 tests with no attributable single-branch offender STOP the pass (`ERR40_TESTS_FAILED`,
 publish nothing, report to the owner) rather than halting resumably.
 
+D-061 amendment (2026-07-28): a RED BUILD becomes a GATE-FIX CASE, and a pass never
+opens on a base that is already red. Tier semantics are unchanged; what is new is a case
+KIND that is not a merge at all, and a base gate in front of the pass.
+
+(a) **BASE GATE.** `sweep start` typechecks the FORK TRUNK TIP (`main_patched`, else
+`--upstream`) in isolation before anything is merged — the pinned checks file's `typecheck`
+list only; tests stay at `finish`; no checks-file / an empty list skips it. Checked before
+any merge, whatever fails is unambiguously PRE-EXISTING (`ERR42_BASE_RED`), so it is
+reported as such instead of surfacing at `finish` as a red verify nobody can attribute.
+Live 2026-07-28: a type error on the trunk since 2026-07-04 was merged into 11 branches and
+only discovered at `finish` — an hour of work and no usable output.
+
+(b) **GATE-FIX CASE — a case that is not a merge.** An unattributable red (at `finish`, or
+on the base at `start`) used to dead-end in an ERR18/ERR40 asking a HUMAN to fix something
+the agent may not deliver — it can neither push nor open a PR. It is now a CASE: a worktree
+AT THE BLAMED BRANCH'S TIP, no merge, nothing pending, no markers, the failing build as
+materials. §7 (G1) governs textual CONFLICTS and does not apply; the scope is the files the
+driver named plus what fixing them DIRECTLY forces, guarded `same-files` (`conflict-hunks`
+bounds edits by marker spans, and there are no markers here). The floor is JUDGED — new
+code is never MECHANICAL — so every gate fix takes a cold read. Tiers:
+- **judged** → a SINGLE-PARENT commit on the branch (not a propagation merge; a second
+  parent would fabricate a self-merge) + `reopen` of every descendant so the fix is pulled
+  through the DAG. NO judged history PR and no pr-intent: that PR exists only to be
+  auto-flipped by the target push landing the SAME merge commit, which a single-parent
+  commit never does. The commit is the record, and the SAME pass can still complete.
+- **held** → a `fix/sweep/<slug(branch)>--<caseId>` ref + ACTIVE PR at a single-parent
+  commit, created at `finish` like every other PR, which BLOCKS the next sweep until the
+  owner merges it. There is no pristine-conflict DRAFT fallback — a gate fix has no
+  conflict exhibit to build one from. At `CHECKS_FAIL_LIMIT` the attempted fix is KEPT and
+  frozen HELD ACTIVE (`[AUTO-ESCALATED: checks failing]`), never reset.
+A red BASE produces one gate-fix case ROOTED ON THE BASE ANCHOR carrying every failing file
+(a commit on a descendant can never turn the base green). ANTI-LOOP: one attempt per
+(branch, file-set) per pass; for the base, one per `<anchor>@<sha>` recorded at the
+workspace root, because `start` wipes the pass dir the journal lives in.
+
+(c) **BLAME = GIT HISTORY, NOT `owned_paths`/`touch_paths`.** Which branch a fix belongs on
+is decided by authorship on the first-parent line —
+`rev-list --count --first-parent --no-merges <branch> ^main -- <file>` — over every branch
+in the hierarchy, the trunk included, with `^main` (upstream, never ours to fix) as the one
+exclusion for all of them. Registry path declarations say where a feature INTENDS to live
+and were measurably wrong where it mattered; they still drive routing and validation, but
+they no longer decide blame. Shallowest by hierarchy depth wins, so the fix lands closest to
+the root and propagates instead of being applied on N leaves; no candidate → the trunk
+`main_patched`; a TIE at the shallowest depth REFUSES by name, never breaks by spelling.
+Failing files are grouped per attributed branch — one case each, shallowest first, because a
+judged trunk fix plus its reopen can moot a descendant's case before it is worked.
+
+(d) **ONE HIERARCHY** (`scripts/sweep/hierarchy.ts`), keyed by BRANCH — inventory `parents`
+hold branch NAMES, not entry ids. `depth = 1 + MAX(parent depths)`: a branch merges only
+after ALL its parents, so its position is governed by its DEEPEST one (MIN produced 8 parent
+inversions on the live inventory). `minPath` = the shortest chain to `main`, excluding
+`main` — what a report or an escalation names. Unresolvable → `null`, sorted LAST, never 0.
+Note the consequence for §3's ordering claims: `parents` is MERGE topology and a branch
+CUT from another that its entry does not declare as a parent lands at the wrong depth —
+visible today as blame refusing a tie rather than as a wrong answer.
+
+(e) **New error ids:** `ERR42_BASE_RED` (red before any merge — pre-existing, not caused by
+propagation), `ERR43_CHECKS_MALFORMED` (an unparseable checks file is loud at `start`,
+`report-case` and `finish`; an ABSENT one still skips silently, which is intended),
+`ERR44_WORKTREE_RESET_FAILED` (a failed reset is never reported as "the worktree is
+pristine"), and from D-060 `ERR41_TOKEN_REJECTED` (a networked 401/403 names the token
+SOURCE — `--token-file` / `$GH_TOKEN` / `$GITHUB_TOKEN` — and never echoes the token;
+retrying with the same token cannot clear it).
+
 ## 1. Merge tiers (per parent→branch merge attempt)
 
 | Tier | Trigger | Action | Review | PR |

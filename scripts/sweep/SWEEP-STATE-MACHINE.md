@@ -81,6 +81,76 @@ silently, the detail NAMES THE SOURCE (`--token-file <path>` / `$GH_TOKEN` /
 `$GITHUB_TOKEN`) and never echoes the token, so a stale ambient `$GITHUB_TOKEN` is
 distinguishable from a revoked grant. Fail-closed behavior is unchanged.
 
+D-061 amendment (2026-07-28): a RED BUILD IS A CASE, not a dead end — plus a base gate
+before the pass opens, and blame by GIT HISTORY.
+(a) BASE GATE at `start`. Before anything is merged, the driver typechecks the FORK TRUNK
+TIP (`main_patched`; `--upstream` when there is no trunk ref) in a throwaway worktree from
+the pinned checks file's `typecheck` list ONLY — tests are far slower and the `finish`
+verify still runs them; no checks-file / an empty list skips the gate exactly as before.
+Checked in ISOLATION before any merge, whatever fails is unambiguously PRE-EXISTING, so the
+report names a culprit instead of shrugging. Motive (live 2026-07-28): the trunk had carried
+a type error since 2026-07-04, nothing checked it, the pass merged it into 11 branches and
+only found out at `finish` — an hour of work, zero usable output, and a message asking a
+human to go fix something.
+(b) A RED BASE OPENS THE PASS. The gate does NOT refuse at the check: gate-fix cases (c)
+trigger at `finish`, which a refusing `start` never reaches, so the pass is opened and the
+red is carried forward — a case needs a pass to live in. `ERR42_BASE_RED` remains the
+refusal for the two states that have no servable case: nothing could be blamed for the
+failing files, or the SAME base sha was already served a gate fix that did not land
+(anti-loop). Both refuse with `status:"stopped"` and LEAVE THE PASS OPEN so the failing
+output stays inspectable — `abort` before the next `start`. The anti-loop record is a
+WORKSPACE-ROOT file (`sweep-base-gate-attempts.json`, keyed `<anchor>@<sha>`, capped): the
+pass journal cannot hold it because `start` wipes the pass dir before the case is minted, so
+an unfixed base re-minted an identical case on every `start` forever; a base that was
+actually fixed has a new sha and is served normally. This RETIRES the D-061-as-first-shipped
+invariant "a base-red refusal destroys nothing" — the clean-slate wipe of a prior COMPLETE
+pass now happens as it always does.
+(c) GATE-FIX CASES. An unattributable red at `finish` used to dead-end in an ERR18/ERR40
+whose message asked a HUMAN to fix something the agent is forbidden to deliver (it may not
+push or open a PR). It is now a CASE: the driver blames a branch (d), materializes a
+worktree AT THAT BRANCH'S TIP with the failing build as materials — no merge, nothing
+pending, no markers — and the agent fixes it through the machinery that already exists
+(checks gate PROVES it green → cold read → tier). `judged` commits a SINGLE-PARENT commit on
+the branch and reopens its descendants so the fix is pulled through, and THE SAME PASS can
+still complete; `held` publishes a `fix/sweep/<slug(branch)>--<caseId>` ref + PR that BLOCKS
+the next sweep until the owner merges it. A red base (b) produces a gate-fix case too, ROOTED
+ON THE BASE ANCHOR ITSELF (a commit on a descendant can never turn the base green), hence
+exactly one case carrying every failing file. ANTI-LOOP: one attempt per (branch, file-set)
+per pass — a second red over the same set is not re-served and falls through to the STOP
+path.
+(d) BLAME IS GIT HISTORY, NOT THE REGISTRY. Registry `owned_paths`/`touch_paths` are
+DECLARATIONS of where a feature intends to live and were wrong in the live case that
+mattered (four entries declared `src/command-gate.ts`; two had never modified it, one had no
+git ref at all). Blame now reads authorship off the first-parent line:
+`authored(branch, file) = rev-list --count --first-parent --no-merges <branch> ^main
+-- <file>`, for every branch in the hierarchy INCLUDING the trunk, with `^main` — upstream,
+never ours to fix — as the one exclusion for everybody. Shallowest by hierarchy depth wins
+(the fix lands closest to the root and propagates to every descendant instead of being
+applied on N leaves); NO candidate → the trunk `main_patched`; a genuine TIE at the
+shallowest depth REFUSES, naming the tied branches, instead of being broken by spelling.
+Failing files are GROUPED PER ATTRIBUTED BRANCH — one case each, shallowest branch first, so
+a judged trunk fix plus its reopen can moot a descendant's case before it is worked. A
+branch whose ref (or `main`) does not resolve is SKIPPED, never counted with the exclusion
+silently dropped. `owned_paths`/`touch_paths` still drive routing and validation; they no
+longer decide blame.
+(e) ONE HIERARCHY (`scripts/sweep/hierarchy.ts`). Branch depth and minPath have a single
+implementation, keyed by BRANCH (inventory `parents` hold branch NAMES, not entry ids —
+keying by id dropped every edge and collapsed every depth to 0, after which the "earliest by
+hierarchy" rule was decided ALPHABETICALLY). `main`=0, `main_patched`=1;
+depth = 1 + MAX(parent depths) — a branch merges only after ALL its parents, and MIN produced
+8 parent inversions on the live inventory; minPath = the SHORTEST chain to `main`, excluding
+`main`, which is what a report names. Unresolvable → `null`, sorted LAST, NEVER 0.
+`assertNoParentInversion` ships with the module.
+(f) NEW ERROR IDS. `ERR41_TOKEN_REJECTED` (D-060) — a networked 401/403 is the TOKEN being
+rejected, not the generic `ERR13_API_FAILED` whose contract is "retry once"; the detail NAMES
+THE SOURCE (`--token-file <path>` / `$GH_TOKEN` / `$GITHUB_TOKEN`) and never echoes the
+token. `ERR42_BASE_RED` — the base was already red BEFORE any merge; pre-existing, not
+caused by propagation. `ERR43_CHECKS_MALFORMED` — a checks file that does not PARSE is loud
+at all three consumers (`start`, `report-case`, `finish`), because a silent skip disabled
+every gate and the pass then reported green having typechecked and tested nothing; an ABSENT
+file still skips silently, which is intended. `ERR44_WORKTREE_RESET_FAILED` — a failed
+worktree reset is never announced as "the worktree is now pristine".
+
 ## 1. Principle
 
 - The DRIVER is a resumable state machine owning ALL state (pinned watermark, current
@@ -106,6 +176,19 @@ distinguishable from a revoked grant. Fail-closed behavior is unchanged.
   blind-wipe an in-flight pass (that stranded resolved-but-unpushed merges before).
 - Pin the top upstream commit = watermark; ALL downstream work is against it.
 - Reset working state to a known base; initialize the journal.
+- **BASE GATE (D-061):** typecheck the FORK TRUNK TIP (`main_patched`, else `--upstream`)
+  in a throwaway worktree — the pinned checks file's `typecheck` list only; the
+  finish-time verify still runs the tests. The anchor is the live TRUNK TIP, not
+  `resolveBase()`'s merge-base commit: a build has to be green at what it actually builds
+  on. A malformed checks file refuses here (`ERR43_CHECKS_MALFORMED`) BEFORE the
+  clean-slate wipe — a gate that cannot parse its config is a gate that silently checks
+  nothing. A RED base does not refuse at the check; it is carried forward and becomes a
+  GATE-FIX case rooted on the anchor once the pass is open (see `next-case`), reported as
+  `status:"gate-fix-required"` + `ERR42_BASE_RED` + `run next-case`. `ERR42_BASE_RED` is a
+  hard `status:"stopped"` in exactly two states: nothing could be blamed for the failing
+  files, or the same base sha was already served a gate fix that never landed (the
+  workspace-root anti-loop record, which survives the pass-dir wipe). Both leave the pass
+  OPEN with the failing output on disk — `abort` before the next `start`.
 - **NETWORKED + origin-derived (D-058):** `start` first `git fetch`es origin and
   upstream (a fetch failure is `ERR39`, so a pass never opens on a stale view), then
   reconstructs the blocked set from the origin `fix/sweep/*` refs BEFORE planning
@@ -125,7 +208,10 @@ distinguishable from a revoked grant. Fail-closed behavior is unchanged.
   refs exist = `ERR11`), and every lookup/write is fail-closed (non-200 = `ERR13`). The
   ledger's `merge_status` is no longer read — the pass dir is disposable and `start` is
   idempotent on origin; a pass that crashed before `finish` published nothing, so the
-  re-derived picture is clean.
+  re-derived picture is clean. **A reviewed GATE-FIX PR (D-061)** — its ref is
+  `fix/sweep/<slug(branch)>--<caseId>`, recognized by the gate-fix id form — is ESCALATED
+  ONCE with an honest reason ("it carries a fix, not a conflict resolution — merge or close
+  it") and stays blocked: a reissue re-probes a live conflict, and a gate fix never had one.
 - **Clean-slate boundary (D-055):** the pass lives at ONE canonical location
   `<--workspace>/propagation/pass-<watermark12>`, printed by `start` and `status`.
   `--workspace` is the GROUP ROOT (parent of the clone), defaulted from `--repo`;
@@ -151,6 +237,17 @@ distinguishable from a revoked grant. Fail-closed behavior is unchanged.
   - `case ready` — worktree path, branch, conflicted files, and what changed since
     start/last call (driver-authored case materials, D-048); OR
   - `no more cases — finalize` → agent calls `finish`.
+- **GATE-FIX case (D-061):** the same `case ready` shape with a DIFFERENT briefing, because
+  there is no merge — it states up front that nothing is pending and there are no markers
+  (so the agent does not hunt for them), names the failing checks, the blamed branch and
+  the reason it was blamed, lists the files to fix, states the SCOPE explicitly (those
+  files plus what fixing them DIRECTLY forces — the only case type that changes code this
+  pass did not merge), spells out what each tier means, and carries the failing output
+  (tail in-line, full log at `<caseDir>/gate-fix-output.txt`). Several gate-fix cases can
+  be outstanding at once — one per blamed branch, SHALLOWEST FIRST. The crash-heal
+  "the branch tip already contains the case head, so it was resolved before a crash" rule
+  is SKIPPED for gate-fix cases: their head IS the branch tip by construction, so the
+  heuristic is structurally inapplicable (it silently disposed of every one of them).
 
 ### `report-case --tier mechanical|judged|held`
 - `--tier` is the ONLY agent param — a CLAIM; the driver is demote-only.
@@ -163,6 +260,22 @@ distinguishable from a revoked grant. Fail-closed behavior is unchanged.
   exception is the APPROVED-still-clean case, which the driver already LANDED at `start`
   (no reissue served). The revision then flows `report-pr` → `finish`, which republishes
   to the SAME PR (force-with-lease onto the existing fix ref) — never a second PR.
+- **GATE-FIX case (D-061):** re-verification cannot go through the conflict path (there is
+  no conflict to re-derive — every gate fix would die `ERR02_CASE_STALE` and the agent
+  would loop serve→reject→serve), so the case is re-derived from the driver's OWN
+  `gate-fix` journal row plus the registry: branch, files and failing commands from the
+  row, scope + descendants from the registry, head/height from git — never from the
+  agent-writable `case.json`. Fixed properties, none of them defaults: `tierFloor: judged`
+  (a gate fix is new code, never a mechanical merge, so it always gets a cold read);
+  scope guard `same-files` (config is deliberately not consulted — `conflict-hunks` bounds
+  edits by marker spans and a gate-fix tree has no markers, so every gate fix would be
+  scope-flagged); the branch tip's tree stands in as the "tree the agent started from" for
+  the empty-check, the scope guard and the cold-read diff. An UNCHANGED tree is `ERR32` on
+  ANY claim, `held` included ("nothing was fixed") — branch 4 below would otherwise tell
+  the agent to describe a PRISTINE CONFLICT that never existed. At `CHECKS_FAIL_LIMIT` the
+  driver KEEPS the attempted fix and freezes HELD ACTIVE (`[AUTO-ESCALATED: checks
+  failing]`, "say plainly that the checks still fail") instead of resetting to a pristine
+  conflict that does not exist: a failing fix the owner can read beats an empty exhibit.
 - Driver, blocking, internal (deterministic first): snapshot the worktree tree →
   uncommitted/empty check → scope guard (resolution diff ⊆ conflicted paths; a
   violation no longer demotes to HELD here — `scopeExceeded` is CARRIED forward to
@@ -180,7 +293,11 @@ distinguishable from a revoked grant. Fail-closed behavior is unchanged.
     counter). At `CHECKS_FAIL_LIMIT` (10) consecutive failures the driver stops
     asking: it resets the worktree to the PRISTINE conflict and freezes a HELD
     DRAFT tagged `[AUTO-ESCALATED: checks failing]` — the agent's failing
-    resolution is never published.
+    resolution is never published. D-061: a checks file that does not PARSE is
+    `ERR43_CHECKS_MALFORMED` here (the case stays `case-ready`), never a silent
+    skip; and when the pristine RESET FAILS the driver refuses with
+    `ERR44_WORKTREE_RESET_FAILED` rather than freezing a "pristine" exhibit built
+    from a tree nobody reset.
   - **5b. report-attempt** is recorded HERE, post-checks, so `RESOLVE_COLDREAD_CAP`
     counts only trees that actually reached the reviewer. Beyond the cap → HELD
     ACTIVE, `[AUTO-ESCALATED: resolution did not converge]`.
@@ -196,7 +313,10 @@ distinguishable from a revoked grant. Fail-closed behavior is unchanged.
     ACTIVE → `provide PR description`.
   - A `held` CLAIM on a still-pristine conflict skips 5a-5c entirely (there is no
     resolution to check or read) — straight to HELD DRAFT + `provide PR
-    description`, based on the pristine conflict.
+    description`, based on the pristine conflict. The reset that MAKES it pristine
+    must succeed: a failure is `ERR44_WORKTREE_RESET_FAILED` (D-061) and the case
+    stays `case-ready`, because announcing a pristine worktree that still holds the
+    agent's edits is a plain false statement.
 - Return instructions (examples, authoritative): `merged, take next case` /
   `provide PR description` / `can't report judged with conflicts present, use held` /
   `uncommitted` / `read <output-file> …, fix the pending files, re-run report-case`
@@ -235,6 +355,22 @@ distinguishable from a revoked grant. Fail-closed behavior is unchanged.
     `[AUTO-ESCALATED: …]` prefix + the reviewer feedback to the description. `finish`
     creates it AFTER verify + the target pushes, so the base is current (the HELD diff =
     the case run only) and the ERR14 held-ordering holds for every held PR.
+  - **GATE FIX (D-061), `judged`:** there is no parent to merge and no conflict to
+    re-verify, so the fixed tree is committed as a SINGLE-PARENT commit on the branch (the
+    agent's PR title/body become its message) and every DESCENDANT is reopened so the fix
+    is pulled through the DAG — this is what lets a trunk-rooted fix salvage the pass
+    instead of forcing a restart. NO pr-intent is recorded and `prIntent: false` is
+    returned: the JUDGED history PR exists only to be auto-flipped to merged by the target
+    push landing the SAME merge commit, machinery specific to a propagation merge, so
+    claiming one would promise the owner a PR that is never created. The commit IS the
+    record; it reaches origin with the ordinary target push. Instruction: `take next case —
+    the gate fix must now be pulled through the reopened branches`.
+  - **GATE FIX, `held`:** ordinary held intent → at `finish` a `fix/sweep/<slug(branch)>--
+    <caseId>` ref + ACTIVE PR, whose head is likewise a SINGLE-PARENT commit (a gate-fix
+    head IS the branch tip, so the two-parent form would record a degenerate self-merge
+    whose PR diff reads as an empty merge). It BLOCKS the next sweep until the owner merges
+    it. There is no pristine-conflict DRAFT fallback for a gate fix — a held gate fix with
+    no marker-clean resolution has nothing to publish and says so.
 - Then → `take next case`.
 
 ### `sweep finish`
@@ -247,7 +383,20 @@ distinguishable from a revoked grant. Fail-closed behavior is unchanged.
   1. verify the publishable set (full rebuild, D-051 semantics: this pass's advanced
      branches on main_patched; held/frozen excluded; red on a publishable branch →
      rollback to pre-ref + HELD(gate); red on a non-publishable branch → non-blocking).
-     The gate runs `checks.test` (host + runner) from the pass's pinned `checks.json`.
+     The gate runs `checks.typecheck` THEN `checks.test` (host + runner) from the pass's
+     pinned `checks.json` — D-061 put the TYPECHECK FIRST because pre-D-061 `finish` ran
+     the tests ONLY, so a type error surfaced indirectly or not at all and the verify log
+     held no compiler diagnostics; typecheck output is what makes blame possible, and it
+     is the cheap check besides. An unparseable checks file halts here
+     (`ERR43_CHECKS_MALFORMED`) instead of emptying the list and publishing on a verify
+     that ran nothing — this is the last gate before anything reaches origin.
+     **UNATTRIBUTABLE RED → GATE-FIX CASE(S) (D-061):** the failing files are blamed by
+     git history and one case per blamed branch is prepared, shallowest first; the result
+     is `status:"gate-fix-required"`, `stoppedAt:"verify"`, `ERR18_VERIFY_PENDING`, with
+     `gateFix` (the first case) + `gateFixes` (all of them) and `run next-case`. The pass
+     returns to phase `open`. Only when nothing is servable — no blameable branch, no
+     parseable diagnostics, or these exact files were already attempted — does it fall
+     through to the D-060 STOP below.
      **RED TESTS WITH NO SINGLE-BRANCH OFFENDER STOP THE PASS (D-060):** the failing
      names are journaled (`finish-tests-failed`) and the result is
      `status:"stopped"`, `stoppedAt:"finish-tests"`, `ERR40_TESTS_FAILED`,
@@ -255,7 +404,10 @@ distinguishable from a revoked grant. Fail-closed behavior is unchanged.
      Fixing red tests is code work or an owner decision, never a re-run; that is
      distinct from the attributable red above, which rolls the offender back and
      IS resumable (`halted:"verify"`, `ERR18`).
-  2. create the JUDGED history PRs (non-draft), before the target push.
+  2. create the JUDGED history PRs (non-draft), before the target push. JUDGED GATE FIXES
+     ARE EXCLUDED (D-061): the selection is by DISPOSITION, and a gate fix's disposition is
+     `resolved`/`judged` like any other, so without the exclusion `finish` tried to build a
+     history PR for a single-parent commit with no conflict head and halted at `judged-prs`.
   3. push target branches (CLEAN / MECHANICAL / prefix merges) + JUDGED closure pushes
      (same merge commit → the JUDGED PRs auto-flip merged) + closure checks + urge
      comments (D-004 pending-count) on frozen branches with new pending heads.
@@ -283,6 +435,9 @@ distinguishable from a revoked grant. Fail-closed behavior is unchanged.
   / created-held / reissued / reopened / recovered / open-at-start, targets landed/failed
   by category, upstream-advanced, watermark), and an `instruction` telling the agent to
   REPORT the landed-vs-conflicted branches + the PR list + stats to the owner.
+- **`ERR34_CASES_REMAIN` after a judged gate fix (D-061) says WHY:** the fix advanced its
+  branch, so the descendants were reopened to pull it through — expected, not a driver bug.
+  Run `next-case`, work them, and `finish` again; the same pass still completes.
 - Multi-step and resumable: a red verify or a GLOBAL `finish` halt → report + HALT +
   re-runnable from the stopped phase; pushes and PR-creates never redo. A pass that
   crashes BEFORE `finish` has published nothing — the next `start` re-derives a clean
@@ -299,7 +454,10 @@ and off origin when a pass crashes mid-way. `report-pr` records the publish inte
 
 ## 4. Division of labor
 
-- AGENT (tools, iteration): resolve the conflict code; write the PR description; claim
+- AGENT (tools, iteration): resolve the conflict code; FIX a red build the pass did not
+  cause, on the branch the driver blamed (D-061 gate-fix case — the one case type that
+  edits code this pass did not merge, and the reason the driver no longer asks a human to
+  go fix something the agent is forbidden to deliver); write the PR description; claim
   `--tier`. Nothing else — a one-shot `claude -p` is bad at open-ended resolution, which
   is why this alone stays the agent.
 - DRIVER `claude -p` (one-shot, context-free): the cold read only.
