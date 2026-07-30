@@ -117,17 +117,21 @@ reject counts as a resolution reject toward the 2× HELD escalation. At `finish`
 tests with no attributable single-branch offender STOP the pass (`ERR40_TESTS_FAILED`,
 publish nothing, report to the owner) rather than halting resumably.
 
-D-061 amendment (2026-07-28): a RED BUILD becomes a GATE-FIX CASE, and a pass never
-opens on a base that is already red. Tier semantics are unchanged; what is new is a case
-KIND that is not a merge at all, and a base gate in front of the pass.
+D-061 amendment (2026-07-28), as revised 2026-07-30: a RED BUILD becomes a GATE-FIX CASE.
+Tier semantics are unchanged; what is new is a case KIND that is not a merge at all. The
+base gate this amendment originally put in front of the pass has since been RETIRED — see
+(a).
 
-(a) **BASE GATE.** `sweep start` typechecks the FORK TRUNK TIP (`main_patched`, else
-`--upstream`) in isolation before anything is merged — the pinned checks file's `typecheck`
-list only; tests stay at `finish`; no checks-file / an empty list skips it. Checked before
-any merge, whatever fails is unambiguously PRE-EXISTING (`ERR42_BASE_RED`), so it is
-reported as such instead of surfacing at `finish` as a red verify nobody can attribute.
-Live 2026-07-28: a type error on the trunk since 2026-07-04 was merged into 11 branches and
-only discovered at `finish` — an hour of work and no usable output.
+(a) **BASE GATE — RETIRED (owner decision, 2026-07-30).** `sweep start` no longer
+typechecks the base, no longer refuses a red one, and keeps no anti-loop file. A red base
+is an ORDINARY red: `finish`'s verify finds it, blame names the branch that owns the failing
+files, and a gate-fix case is served there — the trunk included, since it is a scope entry
+and the default parent of every root. The gate was base-only (so every other branch had no
+cross-pass guard), keyed by base SHA (so a HELD fix pinned the key and refused the case
+forever), and local state (which D-058 §2 abolishes). It only existed because a REFUSING
+`start` never reached `finish`; without the refusal, `finish` subsumes it. The anti-loop is
+now the fix's own PR — an unmerged `fix/sweep/<slug(branch)>--gate-fix-*` ref on origin is
+an ACTIVE GATE that skips the branch, is reported by `next-case`, and self-clears on merge.
 
 (b) **GATE-FIX CASE — a case that is not a merge.** An unattributable red (at `finish`, or
 on the base at `start`) used to dead-end in an ERR18/ERR40 asking a HUMAN to fix something
@@ -173,8 +177,8 @@ Note the consequence for §3's ordering claims: `parents` is MERGE topology and 
 CUT from another that its entry does not declare as a parent lands at the wrong depth —
 visible today as blame refusing a tie rather than as a wrong answer.
 
-(e) **New error ids:** `ERR42_BASE_RED` (red before any merge — pre-existing, not caused by
-propagation), `ERR43_CHECKS_MALFORMED` (an unparseable checks file is loud at `start`,
+(e) **New error ids:** `ERR42_BASE_RED` (RETIRED 2026-07-30 with the base gate; nothing
+emits it and the number is not reused), `ERR43_CHECKS_MALFORMED` (an unparseable checks file is loud at `start`,
 `report-case` and `finish`; an ABSENT one still skips silently, which is intended),
 `ERR44_WORKTREE_RESET_FAILED` (a failed reset is never reported as "the worktree is
 pristine"), `ERR45_CUT_POINTS_MALFORMED` (an unparseable cut-point exceptions file stops the

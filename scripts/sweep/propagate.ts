@@ -355,120 +355,32 @@ export function arrivedSet(journal: JournalEntry[]): Set<string> {
 // --------------------------------------------------------------------------
 
 /**
- * The branch whose CURRENT state the pass will build everything on top of — the
- * fork trunk when it exists. `resolveBase` returns a merge-base COMMIT (the cut
- * point for height math); this is the live TRUNK TIP, which is what a build
- * actually has to be green at.
+ * D-061's BASE GATE and its anti-loop record are GONE (owner decision,
+ * 2026-07-30).
+ *
+ * `start` used to typecheck the base and, when it was red, either refuse the
+ * pass or mint a gate-fix case on the spot — with a group-root JSON
+ * (`sweep-base-gate-attempts.json`, keyed `<anchor>@<sha>`) as the cross-pass
+ * anti-loop, because `start` wipes the journal the finish-time guard lives in.
+ *
+ * Three things were wrong with it. It was BASE-ONLY, while a gate fix is
+ * per-branch and `finish` can mint one anywhere — so the base over-blocked
+ * while every other branch had no cross-pass guard at all. Its SHA key wedged
+ * by construction: a HELD fix means the base never goes green, so the sha never
+ * moves, so the key never changes and the case is refused forever (live
+ * 2026-07-30: a case that had never even been published was refused). And it
+ * was LOCAL STATE, which D-058 §2 exists to abolish — the blocked picture is
+ * derived from ORIGIN at start, never from a side-car file.
+ *
+ * A red base is now discovered where every other red is: `finish`'s verify,
+ * which blames the failing files and mints a gate-fix case on the branch that
+ * owns them — the base included, since `main_patched` is a scope entry and the
+ * default parent of every root (scope.ts). The start-time gate only existed
+ * because a REFUSING start never reached `finish`; with the refusal gone,
+ * `finish` subsumes it. The anti-loop is the fix's own PR: an active gate-fix
+ * ref on origin blocks its branch through the machinery that already blocks
+ * every other fix PR, and self-clears when the owner merges it.
  */
-async function baseCheckAnchor(cli: Cli): Promise<string> {
-  return (await refExists(cli.repo, 'main_patched')) ? 'main_patched' : cli.upstream;
-}
-
-/**
- * D-061 (A): typecheck the pass's BASE before opening the pass.
- *
- * `start` used to pin a watermark and begin merging without ever asking whether
- * the thing it builds on is green. Live evidence 2026-07-28: the fork trunk had
- * carried a type error since `fcee39ea` (2026-07-04) — `isAdmin` passing
- * `string | null | undefined` into `hasAdminPrivilege(userId: string, …)`. The
- * pass merged the trunk into 11 branches, produced 8 cases and 3 HELD, and only
- * discovered it at `finish`, where verify went red with NO CLEAN ATTRIBUTION
- * (the offender was not any branch the pass had mutated) — an hour of work and a
- * dead end whose message asked a human to go fix something.
- *
- * Checked IN ISOLATION, before any merge, whatever fails is unambiguously
- * pre-existing, so the report names a culprit instead of shrugging. Costs one
- * `tsc --noEmit`. Only the TYPECHECK list runs — tests are far slower and the
- * finish-time verify still covers them.
- *
- * Returns null when there is nothing to check (no checks-file / empty list), so
- * a repo without one behaves exactly as before.
- */
-async function runBaseChecks(
-  cli: Cli,
-  checksFile: string | undefined,
-  runChecks: ChecksRunner,
-): Promise<{
-  ok: boolean;
-  failedNames: string[];
-  /** The failing commands WITH their cwds — blame re-roots their paths (D-061 B). */
-  failed: VerifyCommand[];
-  output: string;
-  anchor: string;
-  sha: string;
-} | null> {
-  const checks = loadChecksConfig(checksFile);
-  if (!checks || checks.typecheck.length === 0) return null;
-  const anchor = await baseCheckAnchor(cli);
-  if (!(await refExists(cli.repo, anchor))) return null;
-  const sha = await revParse(cli.repo, anchor);
-  const wt = join(tmpdir(), `sweep-basecheck-${sha.slice(0, 12)}`);
-  await git(cli.repo, ['worktree', 'remove', '--force', wt], { allowCodes: [1, 128] });
-  rmSync(wt, { recursive: true, force: true });
-  await git(cli.repo, ['worktree', 'add', '--detach', wt, sha]);
-  try {
-    await linkNodeModules(cli.repo, wt);
-    const r = await runChecks(checks.typecheck, wt);
-    const failed = checks.typecheck.filter((c) => r.failedNames.includes(c.cmd));
-    return { ok: r.ok, failedNames: r.failedNames, failed, output: r.output, anchor, sha };
-  } finally {
-    await git(cli.repo, ['worktree', 'remove', '--force', wt], { allowCodes: [1, 128] });
-    rmSync(wt, { recursive: true, force: true });
-  }
-}
-
-/**
- * D-061 (A): the base-gate anti-loop record, at the WORKSPACE (group) ROOT.
- *
- * It cannot live in the pass journal like the finish-time gate-fix guard does:
- * `start` deletes the whole pass dir before the base gate's case is minted, so a
- * journal-side key is gone by the time the next start could read it. Keyed by
- * `<anchor>@<sha>` — a base that actually got fixed has a different sha and is
- * served again; an UNCHANGED red base is refused instead of re-minting the same
- * case every pass forever. Capped: this is a loop guard, not a history.
- */
-const BASE_GATE_ATTEMPTS_FILE = 'sweep-base-gate-attempts.json';
-const BASE_GATE_ATTEMPTS_CAP = 50;
-
-interface BaseGateAttempt {
-  key: string;
-  caseId: string;
-  branch: string;
-  ts: string;
-}
-
-function readBaseGateAttempts(workspace: string): BaseGateAttempt[] {
-  const f = join(workspace, BASE_GATE_ATTEMPTS_FILE);
-  if (!existsSync(f)) return [];
-  try {
-    const raw = JSON.parse(readFileSync(f, 'utf8'));
-    return Array.isArray(raw) ? (raw as BaseGateAttempt[]).filter((a) => a && typeof a.key === 'string') : [];
-  } catch {
-    // A corrupt guard file must not block a pass — the worst case is one extra
-    // gate-fix case, which the operator sees; a hard failure here blocks every
-    // start with no route out.
-    return [];
-  }
-}
-
-function baseGateAttempted(workspace: string, key: string): boolean {
-  return readBaseGateAttempts(workspace).some((a) => a.key === key);
-}
-
-function recordBaseGateAttempt(workspace: string, key: string, caseId: string, branch: string): void {
-  const rows = [...readBaseGateAttempts(workspace), { key, caseId, branch, ts: new Date().toISOString() }];
-  try {
-    mkdirSync(workspace, { recursive: true });
-    writeFileSync(
-      join(workspace, BASE_GATE_ATTEMPTS_FILE),
-      JSON.stringify(rows.slice(-BASE_GATE_ATTEMPTS_CAP), null, 2) + '\n',
-    );
-  } catch (e) {
-    // Losing the record only costs one repeated case next pass — never fail the
-    // start that is otherwise about to hand the agent a usable fix.
-    console.error(`sweep start: could not record the base-gate attempt: ${e instanceof Error ? e.message : String(e)}`);
-  }
-}
 
 async function resolveBase(cli: Cli): Promise<string> {
   if (cli.base) return cli.base;
@@ -5857,7 +5769,6 @@ function sealRefusedPass(dir: string, st: MachineState): void {
 export async function cmdSweepStart(
   cli: Cli,
   makeTransport?: (token: string) => GithubTransport,
-  runChecks: ChecksRunner = defaultChecksRunner,
 ): Promise<number> {
   // D-060: RESOLVE the pass config to flag-or-default up front, then persist the
   // absolute paths into machine state (below) so every later command reads them
@@ -5970,14 +5881,10 @@ export async function cmdSweepStart(
     return 1;
   }
 
-  // D-061 (A): BASE GATE — refuse to open a pass on a base that is already red.
-  // Deliberately BEFORE the clean-slate wipe below: a refusal must destroy
-  // nothing, so a prior pass's records survive for whoever investigates.
-  const baseCheck = await runBaseChecks(cli, resolvedChecksFile, runChecks);
-  // D-061: carry a red base FORWARD instead of refusing here — the pass has to
-  // exist before a gate-fix case can be materialized (see the end of this
-  // function). Only the un-servable case still refuses outright.
-  const baseRed = baseCheck && !baseCheck.ok ? baseCheck : null;
+  // NO BASE GATE HERE — see the note above `attachPass`. `start` opens the pass;
+  // it does not judge the build. A red base surfaces at `finish`'s verify like
+  // any other red, and its fix is served as an ordinary gate-fix case.
+  //
   // Clean-slate boundary (D-055): the refusal above cleared any in-flight pass,
   // so anything still at the canonical location is a COMPLETE or STALE prior
   // pass (or a pre-machine-state leftover with no machine-state.json). Remove the
@@ -6046,91 +5953,6 @@ export async function cmdSweepStart(
     `sweep started — pass ${ctx.watermark12} pinned at ${ctx.watermark.slice(0, 12)} — pass dir: ${ctx.dir}`,
   );
 
-  // D-061 (A+B): a RED BASE now becomes a GATE-FIX case instead of a dead end.
-  // The base gate above (pre-pass) refuses only when there is nowhere to put a
-  // case; here the pass EXISTS, so the same machinery that handles an
-  // unattributable red at `finish` can serve the fix. Without this, a red base
-  // blocked every pass with no agent route to fix it — gate-fix triggers at
-  // `finish`, which a refusing `start` never reaches (live 2026-07-28: the trunk
-  // carried a type error from 2026-07-04 and nothing could proceed).
-  if (baseRed) {
-    // ANTI-LOOP ACROSS PASSES. The within-pass guard lives in the pass JOURNAL,
-    // and `start` rmSync's the whole pass dir — journal included — before it gets
-    // here, so an unfixed red base minted a byte-identical case on EVERY start,
-    // forever, with no memory of the attempt that just failed. The record lives
-    // at the WORKSPACE (group) root, which survives the wipe, and is keyed by the
-    // base SHA: the moment the fix actually lands the anchor moves, the key
-    // changes, and a genuinely new red base is served normally.
-    const attemptKey = `${baseRed.anchor}@${baseRed.sha}`;
-    if (baseGateAttempted(cli.workspace, attemptKey)) {
-      const detail =
-        `${baseRed.anchor} is STILL red at ${baseRed.sha.slice(0, 12)} (${baseRed.failedNames.join(', ')}) and a ` +
-        `GATE-FIX case was already served for that exact base — the base has not changed since, so re-serving it ` +
-        `would hand out the identical case forever. Not re-serving.`;
-      console.error(`sweep start [ERR42_BASE_RED]: ${detail}`);
-      sealRefusedPass(ctx.dir, st);
-      result(cli, {
-        ok: false,
-        status: 'stopped',
-        passDir: ctx.dir,
-        issues: [{ id: 'ERR42_BASE_RED', detail }],
-        instruction:
-          `REPORT to the owner: the base ${baseRed.anchor} is broken and the previous gate-fix attempt did not land. ` +
-          `Do NOT run \`abort\` — the pass is already sealed; read ${ctx.dir} for the failing output, and run \`start\` ` +
-          `again only once the owner says the base is fixed.`,
-      });
-      return 1;
-    }
-    const gate = await materializeGateFixCases(cli, ctx.dir, ctx.chain, baseRed.output, baseRed.failed, null, {
-      rootBranch: baseRed.anchor,
-    });
-    if (gate.served) {
-      // A base-red gate fix is ROOTED on the anchor, so there is exactly one case.
-      const first = gate.cases[0];
-      recordBaseGateAttempt(cli.workspace, attemptKey, first.caseId, first.branch);
-      progress(`base RED on ${baseRed.anchor} — gate-fix case prepared on ${first.branch}`);
-      console.error(`sweep start: base red — gate-fix case ${first.caseId} on ${first.branch}`);
-      // `ERR*` BLOCKS, `WARN*` ADVISES — and this is a PROCEED arm: a case was
-      // materialized and the agent is told to run `next-case`. It used to carry
-      // `ERR42_BASE_RED`, the SAME id the two refusal arms above/below use, whose
-      // doctrine row reads "stop-case 2 report; the pass is already sealed". The
-      // agent obeyed the row, filed a stop case, and idled for 52 minutes while a
-      // served case sat untouched (live 2026-07-30). An advisory id keeps the
-      // diagnosis without commandeering the agent: doctrine already tells it how
-      // to work a GATE-FIX case, and `instruction` names the next command.
-      result(cli, {
-        status: 'gate-fix-required',
-        watermark: ctx.watermark,
-        watermark12: ctx.watermark12,
-        passDir: ctx.dir,
-        issues: [
-          {
-            id: 'WARN09_GATE_FIX_SERVED',
-            detail: `${baseRed.anchor} was already red BEFORE any merge — ${gate.detail}`,
-          },
-        ],
-        gateFix: { caseId: first.caseId, branch: first.branch, files: first.files, reason: gate.reason },
-        instruction: `the base ${baseRed.anchor} is broken; a GATE-FIX case has been prepared on ${first.branch} — run \`next-case\``,
-      });
-      return 0;
-    }
-    // Nothing blameable: fall back to the refusal. The pass is SEALED rather than
-    // left open — its files stay inspectable either way, but an open pass wedged
-    // the next `start` behind ERR30_PASS_OPEN (see sealRefusedPass).
-    console.error(`sweep start [ERR42_BASE_RED]: ${baseRed.anchor} red and unattributable — ${gate.reason}`);
-    sealRefusedPass(ctx.dir, st);
-    result(cli, {
-      ok: false,
-      status: 'stopped',
-      passDir: ctx.dir,
-      issues: [{ id: 'ERR42_BASE_RED', detail: `${baseRed.anchor} is red before any merge and ${gate.reason}` }],
-      instruction:
-        `REPORT to the owner: the base ${baseRed.anchor} is broken (${baseRed.failedNames.join(', ')}) and could not ` +
-        `be attributed. Do NOT run \`abort\` — the pass is already sealed; read ${ctx.dir} for the failing output, ` +
-        `and run \`start\` again only once the owner says the base is fixed.`,
-    });
-    return 1;
-  }
 
   result(cli, { status: 'started', watermark: ctx.watermark, watermark12: ctx.watermark12, passDir: ctx.dir });
   return 0;
@@ -6278,13 +6100,29 @@ export async function cmdSweepNextCase(cli: Cli): Promise<number> {
   const skippedN = delta.filter((e) => e.action === 'skip').length;
   const deferredN = delta.filter((e) => e.action === 'defer').length;
   progress(`merged ${mergedN} clean / skipped ${skippedN} / deferred ${deferredN}`);
+  // ACTIVE GATES, read from ORIGIN at the moment of asking. A branch whose gate
+  // fix is already written and waiting on the owner is SKIPPED, not re-served —
+  // and the agent is told, so "nothing to serve" is never mistaken for "nothing
+  // is wrong". A gate on the trunk skips everything beneath it: `main_patched`
+  // is the default parent of every root (scope.ts), and a blocked direct parent
+  // already defers its descendants.
+  const activeGates = await activeGateFixRefs(cli.repo);
+  const gateNote =
+    activeGates.length > 0
+      ? ` ${activeGates.length} branch(es) have an OPEN gate-fix PR (${activeGates.join(', ')}) and are SKIPPED until the owner merges it — REPORT that to the owner, do not try to fix them here.`
+      : '';
+
   const open = openCases(journal);
   if (open.length === 0) {
     st = { ...st, phase: 'open', currentCase: null };
     writeMachineState(dir, st);
-    progress('no more cases');
-    console.error('next-case: no more cases — finalize (run `finish`)');
-    result(cli, { status: 'finalize' });
+    progress(`no more cases${activeGates.length ? ` (${activeGates.length} branch(es) gated)` : ''}`);
+    console.error(`next-case: no more cases — finalize (run \`finish\`)${gateNote}`);
+    result(cli, {
+      status: 'finalize',
+      ...(activeGates.length ? { activeGates } : {}),
+      instruction: `no case is open — run \`finish\`.${gateNote}`,
+    });
     return 0;
   }
 
@@ -6322,6 +6160,7 @@ export async function cmdSweepNextCase(cli: Cli): Promise<number> {
     conflictedPaths: caseFile.conflictedPaths,
     run: caseFile.run ?? [caseFile.head],
     ...(isReissue ? { reissue: true, prNumber: caseRow!.prNumber ?? null } : {}),
+    ...(activeGates.length ? { activeGates } : {}),
     materials,
     materialsPath: join(dir, jc.caseId, 'materials.md'),
   });
@@ -7190,6 +7029,46 @@ interface GateFixCaseSummary {
  * `rootBranch` (the BASE GATE at `start`): the case is rooted THERE rather than
  * on the blamed branch — see the rooting comment below.
  */
+/**
+ * The ACTIVE GATE on a branch: an unmerged gate-fix ref on ORIGIN.
+ *
+ * This is the cross-pass anti-loop, and it replaces the group-root JSON the base
+ * gate used to keep. Three properties that file did not have:
+ *
+ *  - PER-BRANCH, so it covers every gate fix `finish` can mint rather than the
+ *    base alone — the file guarded the base and nothing else, which left every
+ *    other branch re-mintable on every pass;
+ *  - DERIVED FROM ORIGIN (D-058 §2), not local state a pass wipe or a fresh
+ *    clone silently loses;
+ *  - SELF-CLEARING. The file was keyed by base SHA, so a HELD fix — which by
+ *    definition leaves the branch red until the owner merges it — pinned the key
+ *    forever and refused the case for good. A ref disappears when its PR merges.
+ *
+ * Keyed on the BRANCH, not the case id: a gate fix IS per-branch (blame groups
+ * the failing files by owner and mints one case per owner), so "does this branch
+ * already have a fix awaiting the owner" is the whole question. The id stays in
+ * the ref NAME only to keep it unique and deterministic — nothing looks it up.
+ */
+async function activeGateFixRef(repo: string, branch: string): Promise<string | null> {
+  const refs = await gateFixRefs(repo, slug(branch));
+  return refs[0] ?? null;
+}
+
+/** Every ACTIVE gate on origin, any branch — one ref read, no scope mapping. */
+async function activeGateFixRefs(repo: string): Promise<string[]> {
+  return gateFixRefs(repo, '*');
+}
+
+async function gateFixRefs(repo: string, branchSlug: string): Promise<string[]> {
+  const pattern = `refs/remotes/origin/fix/sweep/${branchSlug}--gate-fix-*`;
+  const res = await git(repo, ['for-each-ref', '--format=%(refname:short)', pattern], { allowCodes: [1] });
+  return res.stdout
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((r) => r.replace(/^origin\//, ''));
+}
+
 async function materializeGateFixCases(
   cli: Cli,
   dir: string,
@@ -7198,10 +7077,10 @@ async function materializeGateFixCases(
   failedCommands: VerifyCommand[],
   accused: string | null,
   opts: { rootBranch?: string } = {},
-): Promise<{ served: boolean; cases: GateFixCaseSummary[]; reason: string; detail: string }> {
+): Promise<{ served: boolean; cases: GateFixCaseSummary[]; reason: string; detail: string; gated: string[] }> {
   const journal = readJournal(dir);
   const { features } = loadRegistry({ inventoryDir: cli.inventory, scopeFile: cli.scopeFile, routingFile: cli.routingFile });
-  const none = { served: false as const, cases: [] as GateFixCaseSummary[], reason: '', detail: '' };
+  const none = { served: false as const, cases: [] as GateFixCaseSummary[], reason: '', detail: '', gated: [] as string[] };
   // CUT-POINT EXCEPTIONS (cut-points.ts). A MALFORMED file is LOUD and stops
   // this command — the ERR43_CHECKS_MALFORMED contract. Blaming with the
   // exceptions silently dropped is not "blame without them": it is blame that
@@ -7277,7 +7156,19 @@ async function materializeGateFixCases(
 
   const cases: GateFixCaseSummary[] = [];
   const looping: string[] = [];
+  const gated: string[] = [];
   for (const g of groups) {
+    // ACTIVE GATE (cross-pass): this branch already has a gate fix on origin
+    // awaiting the owner. Minting a second one would hand the agent a case whose
+    // fix is already written and under review. Skip the BRANCH and report it —
+    // `next-case` has nothing to serve here until the PR merges.
+    const gateRef = await activeGateFixRef(cli.repo, g.branch);
+    if (gateRef) {
+      gated.push(g.branch);
+      appendJournal(dir, { action: 'gate-fix-skipped', branch: g.branch, ref: gateRef, files: g.files });
+      console.error(`gate-fix: ${g.branch} already has an ACTIVE gate '${gateRef}' — not minting a second case`);
+      continue;
+    }
     const key = gateFixKey(g.branch, g.files);
     if (journal.some((e) => e.action === 'gate-fix' && e.key === key)) {
       looping.push(g.branch);
@@ -7338,6 +7229,19 @@ async function materializeGateFixCases(
     cases.push({ caseId, branch: g.branch, files: g.files, reason: g.reason });
   }
   if (cases.length === 0) {
+    // Two distinct reasons nothing was minted, and they mean opposite things to
+    // the agent. GATED: the fix already exists and is waiting on the OWNER —
+    // there is nothing for the agent to do and nothing is wrong. LOOPING: a fix
+    // was attempted THIS pass and the build is still red — that is a dead end.
+    if (gated.length > 0) {
+      const who = gated.join(', ');
+      return {
+        ...none,
+        gated,
+        reason: `${who} already has an OPEN gate-fix PR — the fix is written and awaiting the owner`,
+        detail: `verify RED, but every blamed branch (${who}) already has a gate fix on origin awaiting the owner — nothing to serve`,
+      };
+    }
     const who = looping.join(', ');
     return {
       ...none,
@@ -7354,6 +7258,7 @@ async function materializeGateFixCases(
     cases,
     reason,
     detail: `verify RED (no clean attribution) — ${reason}`,
+    gated,
   };
 }
 
@@ -7614,6 +7519,28 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
           gateFix: { caseId: first.caseId, branch: first.branch, files: first.files, reason: gate.reason },
           gateFixes: gate.cases.map((c) => ({ caseId: c.caseId, branch: c.branch, files: c.files })),
           instruction: `${gate.cases.length} GATE-FIX case(s) have been prepared (shallowest branch first: ${branches}) — run \`next-case\``,
+        });
+        return 1;
+      }
+      // GATED: every blamed branch already has a gate fix on origin awaiting the
+      // owner. The build is red and stays red, but nothing is broken and there is
+      // nothing for the agent to do — the fix is written and under review. Said
+      // plainly here, because the ERR40 fallthrough below would tell the agent
+      // "checks failed, publish nothing" and invite it to fix what it already
+      // fixed. No ERR id: this is a WAIT, not a fault.
+      if (gate.gated.length > 0) {
+        const who = gate.gated.join(', ');
+        progress(`verify: RED — ${who} gated on an open gate-fix PR; nothing to serve`);
+        console.error(`finish: RED but gated — ${who} awaiting the owner`);
+        result(cli, {
+          ok: false,
+          status: 'stopped',
+          stoppedAt: 'verify',
+          gatedBranches: gate.gated,
+          instruction:
+            `REPORT to the owner: the build is RED and the fix is ALREADY WRITTEN — ${who} has an open gate-fix PR ` +
+            `waiting to be merged. Nothing can land until it is. Do NOT re-fix it and do NOT open another PR; ` +
+            `re-run \`start\` after the owner merges.`,
         });
         return 1;
       }

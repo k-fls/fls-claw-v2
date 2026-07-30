@@ -88,31 +88,29 @@ distinguishable from a revoked grant. Fail-closed behavior is unchanged.
 
 D-061 amendment (2026-07-28): a RED BUILD IS A CASE, not a dead end — plus a base gate
 before the pass opens, and blame by GIT HISTORY.
-(a) BASE GATE at `start`. Before anything is merged, the driver typechecks the FORK TRUNK
-TIP (`main_patched`; `--upstream` when there is no trunk ref) in a throwaway worktree from
-the pinned checks file's `typecheck` list ONLY — tests are far slower and the `finish`
-verify still runs them; no checks-file / an empty list skips the gate exactly as before.
-Checked in ISOLATION before any merge, whatever fails is unambiguously PRE-EXISTING, so the
-report names a culprit instead of shrugging. Motive (live 2026-07-28): the trunk had carried
-a type error since 2026-07-04, nothing checked it, the pass merged it into 11 branches and
-only found out at `finish` — an hour of work, zero usable output, and a message asking a
-human to go fix something.
-(b) A RED BASE OPENS THE PASS. The gate does NOT refuse at the check: gate-fix cases (c)
-trigger at `finish`, which a refusing `start` never reaches, so the pass is opened and the
-red is carried forward — a case needs a pass to live in. `ERR42_BASE_RED` remains the
-refusal for the two states that have no servable case: nothing could be blamed for the
-failing files, or the SAME base sha was already served a gate fix that did not land
-(anti-loop). Both refuse with `status:"stopped"` and SEAL the pass (`pass-complete` + phase
-`complete`, exactly as `abort` does): the failing output stays inspectable until the next
-`start` clean-slates the dir, and NO `abort` is needed. Leaving it open instead wedged the
-next `start` behind `ERR30_PASS_OPEN` — on the exact path a broken base takes, with nothing
-in the ERR42 result saying so. The anti-loop record is a
-WORKSPACE-ROOT file (`sweep-base-gate-attempts.json`, keyed `<anchor>@<sha>`, capped): the
-pass journal cannot hold it because `start` wipes the pass dir before the case is minted, so
-an unfixed base re-minted an identical case on every `start` forever; a base that was
-actually fixed has a new sha and is served normally. This RETIRES the D-061-as-first-shipped
-invariant "a base-red refusal destroys nothing" — the clean-slate wipe of a prior COMPLETE
-pass now happens as it always does.
+(a) BASE GATE at `start` — RETIRED (owner decision, 2026-07-30; see (b)). D-061 shipped a
+typecheck of the fork trunk tip before the pass opened, plus a workspace-root anti-loop
+record (`sweep-base-gate-attempts.json`, keyed `<anchor>@<sha>`) and the `ERR42_BASE_RED`
+refusal. None of it survives.
+(b) A RED BASE IS AN ORDINARY RED. `start` opens the pass and does not judge the build.
+A red base — like any other red — is found by `finish`'s verify, blamed to the branch that
+owns the failing files, and served as a gate-fix case there. The trunk is eligible: it is a
+scope entry and the default parent of every root (`scope.ts`).
+
+Why the gate went: it was BASE-ONLY, while `finish` can mint a gate fix on any branch, so
+the base over-blocked while every other branch had NO cross-pass guard at all. Its SHA key
+wedged by construction — a HELD fix leaves the base red until the owner merges, so the sha
+never moved, the key never changed, and the case was refused forever (live 2026-07-30: a
+case that had never even been published was refused). And it was LOCAL STATE, which D-058 §2
+exists to abolish. The start-time gate only ever existed because a REFUSING `start` never
+reached `finish`; with the refusal gone, `finish` subsumes it.
+
+The cross-pass anti-loop is now the fix's own PR. An unmerged gate-fix ref on ORIGIN
+(`fix/sweep/<slug(branch)>--gate-fix-*`) is an ACTIVE GATE on that branch: no second case is
+minted, the branch is skipped, and `next-case` REPORTS it (`activeGates`) so "nothing to
+serve" is never mistaken for "nothing is wrong". It is keyed on the BRANCH — a gate fix is
+per-branch — and it SELF-CLEARS when the owner merges the PR. A gate on the trunk skips
+everything beneath it, since a blocked direct parent already defers its descendants.
 (c) GATE-FIX CASES. An unattributable red at `finish` used to dead-end in an ERR18/ERR40
 whose message asked a HUMAN to fix something the agent is forbidden to deliver (it may not
 push or open a PR). It is now a CASE: the driver blames a branch (d), materializes a
@@ -152,8 +150,8 @@ depth = 1 + MAX(parent depths) — a branch merges only after ALL its parents, a
 (f) NEW ERROR IDS. `ERR41_TOKEN_REJECTED` (D-060) — a networked 401/403 is the TOKEN being
 rejected, not the generic `ERR13_API_FAILED` whose contract is "retry once"; the detail NAMES
 THE SOURCE (`--token-file <path>` / `$GH_TOKEN` / `$GITHUB_TOKEN`) and never echoes the
-token. `ERR42_BASE_RED` — the base was already red BEFORE any merge; pre-existing, not
-caused by propagation. `ERR43_CHECKS_MALFORMED` — a checks file that does not PARSE is loud
+token. `ERR42_BASE_RED` — RETIRED 2026-07-30 with the base gate; nothing emits it and the
+number is not reused. `ERR43_CHECKS_MALFORMED` — a checks file that does not PARSE is loud
 at all three consumers (`start`, `report-case`, `finish`), because a silent skip disabled
 every gate and the pass then reported green having typechecked and tested nothing; an ABSENT
 file still skips silently, which is intended. `ERR44_WORKTREE_RESET_FAILED` — a failed
@@ -188,20 +186,12 @@ silence.
   blind-wipe an in-flight pass (that stranded resolved-but-unpushed merges before).
 - Pin the top upstream commit = watermark; ALL downstream work is against it.
 - Reset working state to a known base; initialize the journal.
-- **BASE GATE (D-061):** typecheck the FORK TRUNK TIP (`main_patched`, else `--upstream`)
-  in a throwaway worktree — the pinned checks file's `typecheck` list only; the
-  finish-time verify still runs the tests. The anchor is the live TRUNK TIP, not
-  `resolveBase()`'s merge-base commit: a build has to be green at what it actually builds
-  on. A malformed checks file refuses here (`ERR43_CHECKS_MALFORMED`) BEFORE the
-  clean-slate wipe — a gate that cannot parse its config is a gate that silently checks
-  nothing. A RED base does not refuse at the check; it is carried forward and becomes a
-  GATE-FIX case rooted on the anchor once the pass is open (see `next-case`), reported as
-  `status:"gate-fix-required"` + `ERR42_BASE_RED` + `run next-case`. `ERR42_BASE_RED` is a
-  hard `status:"stopped"` in exactly two states: nothing could be blamed for the failing
-  files, or the same base sha was already served a gate fix that never landed (the
-  workspace-root anti-loop record, which survives the pass-dir wipe). Both SEAL the pass
-  with the failing output on disk — inspectable until the next `start` clean-slates the dir,
-  and no `abort` first (an open pass wedged that next `start` behind `ERR30_PASS_OPEN`).
+- **NO BASE GATE** (retired 2026-07-30): `start` opens the pass and does not judge the
+  build — it typechecks nothing and refuses nothing for redness. A red base is found by
+  `finish`'s verify and served as a gate-fix case on the branch that owns the failing
+  files (see `next-case`). A malformed checks file DOES still refuse here
+  (`ERR43_CHECKS_MALFORMED`) BEFORE the clean-slate wipe — that check READS the file, it
+  does not run it, and a gate that cannot parse its config silently checks nothing.
 - **NETWORKED + origin-derived (D-058):** `start` first `git fetch`es origin and
   upstream (a fetch failure is `ERR39`, so a pass never opens on a stale view), then
   reconstructs the blocked set from the origin `fix/sweep/*` refs BEFORE planning

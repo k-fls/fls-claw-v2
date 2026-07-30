@@ -89,7 +89,11 @@ finish --execute --token-file <path> --commands-file <cheap-tests.json>   # crea
   `parents:`) without owner approval; on approval, regenerate the entry locally
   with the `fork-registry-generate` skill and propose the matching `seeds.yaml`
   change in your end-of-sweep result for the owner to apply.
-- `next-case` — `case-ready`: resolve it; `finalize`: run `finish`.
+- `next-case` — `case-ready`: resolve it; `finalize`: run `finish`. An
+  `activeGates` list means those branches already have an OPEN gate-fix PR and
+  are SKIPPED until the owner merges it: relay them in your result, never try to
+  re-fix them. A gate on the trunk skips everything below it, so a pass with
+  nothing to do and a trunk gate is EXPECTED, not a fault.
 - `report-case` — resolve the pending files in the worktree FIRST (no commit
   needed), then run it. `--tier` is your only param; demotions are final — a
   demotion just means you write a HELD PR next. **mechanical**: on confirm,
@@ -194,7 +198,6 @@ around a blocking id.
 | `ERR38_PASS_CLEAR_FAILED` | the prior pass dir could not be cleared — pass files are container-uid-owned, so teardown must run IN-CONTAINER; clear it there, then re-run `start` |
 | `ERR40_TESTS_FAILED` | same as ERR36; at `finish` it is a stop-case 2 report (publish nothing) |
 | `ERR41_TOKEN_REJECTED` | the GitHub token was REJECTED — re-auth; a retry with the same token cannot clear it |
-| `ERR42_BASE_RED` | the base was already broken BEFORE any merge — stop-case 2 report naming the branch and failing checks; the pass is already sealed, so do NOT run `abort` |
 | `ERR43_CHECKS_MALFORMED` | the named checks file does not PARSE, so no gate can run — stop-case 2 report quoting the file and the parse error; never continue with the gates silently skipped |
 | `ERR44_WORKTREE_RESET_FAILED` | the worktree could not be reset to the pristine conflict and still holds your edits — clear it in-container and re-run `report-case`; never call it pristine |
 | `ERR45_CUT_POINTS_MALFORMED` | the cut-point exceptions file does not PARSE, so blame cannot be trusted and no gate-fix case is served — stop-case 2 report quoting the file and the parse error |

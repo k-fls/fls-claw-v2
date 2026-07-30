@@ -193,7 +193,6 @@ const rejectCode: ColdReadInvoker = async () => ({
  * the PER-CASE gate need the base to pass, or `start` refuses with ERR42 and no
  * pass ever opens. Injected at start only; report-case gets its own runner.
  */
-const greenBase: ChecksRunner = async () => ({ ok: true, failedNames: [], output: '' });
 
 const neverInvoked: ColdReadInvoker = async () => {
   throw new Error('cold read invoked where D-060 forbids one');
@@ -274,342 +273,41 @@ describe('sweep start / abort (D-053 §2)', () => {
 // — an hour of work, no usable output, and a report asking a human to go fix it.
 // ---------------------------------------------------------------------------
 
-describe('sweep start — the base gate (D-061 A)', () => {
-  function baseChecks(ws: string): string {
-    const f = join(ws, 'checks.json');
-    writeFileSync(
-      f,
-      JSON.stringify({ typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }], test: [{ cmd: 'vitest', cwd: '.' }] }),
-    );
-    return f;
-  }
-  function runner(failing: string[]): { fn: ChecksRunner; ran: string[][] } {
-    const ran: string[][] = [];
-    const fn: ChecksRunner = async (commands) => {
-      const names = commands.map((c) => c.cmd);
-      ran.push(names);
-      const failedNames = names.filter((n) => failing.includes(n));
-      return {
-        ok: failedNames.length === 0,
-        failedNames,
-        output: failedNames.map((n) => `$ ${n}\ntype error\n`).join(''),
-      };
-    };
-    return { fn, ran };
-  }
-  /** A base runner failing with a REAL tsc diagnostic, so blame can parse it. */
-  function baseRunner(): ChecksRunner {
-    return async (commands) => ({
-      ok: false,
-      failedNames: commands.map((c) => c.cmd),
-      output: "src/x.ts(343,45): error TS2345: Argument of type 'string | null' is not assignable to parameter of type 'string'.\n",
-    });
-  }
-  /** main_patched plus a feature branch that OWNS the failing file. */
-  function gateFixRepoForBase(): FixtureRepo {
-    const repo = initFixtureRepo();
-    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
-    repo.checkout('main_patched', { create: true, at: 'main' });
-    repo.commit('mp: y', { 'src/y.ts': 'fork\n' });
-    repo.checkout('module/cg', { create: true, at: 'main_patched' });
-    repo.commit('cg: own x', { 'src/x.ts': 'cg\n' });
-    repo.checkout('main');
-    cleanups.push(() => repo.destroy());
-    return repo;
-  }
-
-  it('base RED -> a GATE-FIX case on the blamed branch (D-061: not a dead end)', async () => {
-    const repo = gateFixRepoForBase();
-    const ws = mkWorkspace();
-    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
-    const beforeTip = repo.sha('main_patched');
-    const out = join(ws, 'start.json');
-    // A red BASE used to refuse outright, which blocked every pass with no agent
-    // route to a fix: gate-fix triggers at `finish`, which a refusing `start`
-    // never reaches. Live 2026-07-28 — the trunk carried a 24-day-old type error
-    // and nothing could proceed.
-    expect(
-      await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: baseChecks(ws), out }), undefined, baseRunner()),
-    ).toBe(0);
-    const res = JSON.parse(readFileSync(out, 'utf8')) as {
-      status: string;
-      gateFix: { branch: string; files: string[]; caseId: string };
-      issues: Array<{ id: string }>;
-      instruction: string;
-    };
-    expect(res.status).toBe('gate-fix-required');
-    // A PROCEED arm must ADVISE, never BLOCK. This assertion used to demand
-    // `ERR42_BASE_RED` — the id the refusal arms carry, whose doctrine row says
-    // "stop-case 2 report". The agent obeyed the row and idled 52 minutes with a
-    // served case unworked (live 2026-07-30). `ERR*` here is the regression.
-    expect(res.issues[0].id).toBe('WARN09_GATE_FIX_SERVED');
-    expect(res.issues.some((i) => i.id.startsWith('ERR'))).toBe(false);
-    // Blame must still find an OWNER for the failing path (that is what separates
-    // this from the "nothing owns it" refusal below), but the CASE is rooted on
-    // the base anchor — see DEFECT 4a: a commit on module/cg can never turn
-    // main_patched green.
-    expect(res.gateFix.branch).toBe('main_patched');
-    expect(res.gateFix.files).toEqual(['src/x.ts']);
-    expect(res.instruction).toContain('next-case');
-    // The pass IS open (a case needs somewhere to live) but nothing merged yet.
-    expect(existsSync(join(dirOf(repo, ws), 'machine-state.json'))).toBe(true);
-    expect(repo.sha('main_patched')).toBe(beforeTip);
-    // next-case serves it with the gate-fix briefing.
-    const nc = join(ws, 'nc.json');
-    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: nc }))).toBe(0);
-    expect((JSON.parse(readFileSync(nc, 'utf8')) as { status: string }).status).toBe('case-ready');
-    expect(readFileSync(join(dirOf(repo, ws), res.gateFix.caseId, 'materials.md'), 'utf8')).toContain('GATE-FIX');
-  });
-
-  it('base GREEN -> the pass opens normally', async () => {
+/**
+ * The D-061 BASE GATE IS GONE (owner decision, 2026-07-30). `start` no longer
+ * typechecks the base, no longer refuses or gates a red one, and keeps no
+ * `sweep-base-gate-attempts.json`. A red base is found at `finish`'s verify and
+ * served as an ordinary gate-fix case on the branch that owns the failing files
+ * — see 'sweep finish — gate-fix on an unattributable red', which also covers
+ * the sub-cwd path normalisation this block used to test through the base gate.
+ *
+ * What remains at `start` is the MALFORMED-checks refusal, which never depended
+ * on the gate: it READS the file, it does not run it.
+ */
+describe('sweep start — no base gate; malformed checks still LOUD', () => {
+  it('a RED base no longer refuses, gates, or writes a side-car record', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
-    const r = runner([]);
-    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: baseChecks(ws) }), undefined, r.fn)).toBe(0);
-    expect(existsSync(join(dirOf(repo, ws), 'machine-state.json'))).toBe(true);
-    expect(r.ran).toEqual([['tsc --noEmit']]);
-  });
-
-  /**
-   * Blame is by GIT HISTORY now (owner-approved 2026-07-28), so "the registry
-   * owns nothing matching the path" is no longer a state: an untouched failing
-   * file falls to the trunk, which for a base red is the anchor being fixed
-   * anyway. What still has to refuse is a red whose output names NO source file
-   * — there is nothing to hand an agent, and inventing a case for it would
-   * pre-empt the honest STOP. (Previously this test starved blame by pointing
-   * `owned_paths` elsewhere; that starves nothing now, because module/cg really
-   * did commit src/x.ts.)
-   */
-  it('base RED that names no source files -> still REFUSES (ERR42) rather than invent a case', async () => {
-    const repo = gateFixRepoForBase();
-    const ws = mkWorkspace();
-    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
-    const out = join(ws, 'start.json');
-    const noDiagnostics: ChecksRunner = async (commands) => ({
-      ok: false,
-      failedNames: commands.map((c) => c.cmd),
-      output: 'ELIFECYCLE Command failed.\nsh: 1: tsc: not found\n',
-    });
-    expect(
-      await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: baseChecks(ws), out }), undefined, noDiagnostics),
-    ).toBe(1);
-    const res = JSON.parse(readFileSync(out, 'utf8')) as {
-      status: string;
-      issues: Array<{ id: string; detail: string }>;
-      instruction: string;
-    };
-    expect(res.status).toBe('stopped');
-    expect(res.issues[0].id).toBe('ERR42_BASE_RED');
-    expect(res.issues[0].detail).toContain('red before any merge');
-    expect(res.issues[0].detail).toContain('named no source files');
-    expect(res.instruction).toContain('REPORT to the owner');
-    // No gate-fix case was invented on a guessed branch.
-    expect(readJournal(dirOf(repo, ws)).some((e) => e.action === 'gate-fix')).toBe(false);
-  });
-
-  it('no checks-file -> the base gate is SKIPPED (pre-D-061 behavior, nothing runs)', async () => {
-    const repo = conflictFixture();
-    const ws = mkWorkspace();
-    const inv = emptyInventory();
-    const r = runner(['tsc --noEmit']); // would fail if it ever ran
-    expect(await cmdSweepStart(baseCli(repo, ws, inv), undefined, r.fn)).toBe(0);
-    expect(r.ran).toEqual([]);
-    expect(existsSync(join(dirOf(repo, ws), 'machine-state.json'))).toBe(true);
-  });
-
-  /**
-   * DEFECT 4a (HIGH) — a BASE-RED gate fix targets a branch that can never BE
-   * the base. `runBaseChecks` typechecks the base anchor (main_patched) in
-   * isolation, but `materializeGateFixCases` blames the failing FILE — here to
-   * module/cg, which really did commit it — and committing the fix there does
-   * nothing for the trunk: the next `start` re-runs the same base typecheck on
-   * the same red main_patched and fails identically. (Blame CAN now name the
-   * trunk, since git history includes it; ROOTING is what guarantees it.)
-   *
-   * CORRECT BEHAVIOUR: a base-red gate fix targets the BASE BRANCH ITSELF (the
-   * anchor that was checked), because that is the only place a commit can turn
-   * the base green.
-   */
-  it('DEFECT 4a — a base-RED gate fix targets the BASE branch, not a descendant feature branch', async () => {
-    const repo = gateFixRepoForBase(); // main_patched is the base anchor and contains src/x.ts
-    const ws = mkWorkspace();
-    // The registry owns src/x.ts on a FEATURE branch; nothing claims main_patched.
-    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
-    const out = join(ws, 'start.json');
-    expect(
-      await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: baseChecks(ws), out }), undefined, baseRunner()),
-    ).toBe(0);
-    const res = JSON.parse(readFileSync(out, 'utf8')) as { gateFix: { branch: string } };
-    // Today: 'module/cg' — a branch whose tip is NOT the base, so fixing it
-    // leaves the base red forever.
-    expect(res.gateFix.branch).toBe('main_patched');
-  });
-
-  /**
-   * DEFECT 4b (HIGH) — the gate-fix ANTI-LOOP key lives in the PASS JOURNAL
-   * (`materializeGateFixCase` refuses when a `gate-fix` row with the same
-   * `key` exists), but `cmdSweepStart` rmSync's the whole pass dir — journal
-   * included — on every start. So a red base that was never fixed mints a
-   * byte-identical gate-fix case on EVERY pass, forever: the anti-loop guard
-   * can never see the previous attempt.
-   *
-   * CORRECT BEHAVIOUR: a second start against the SAME unchanged red base must
-   * not silently re-serve the identical case; it has to refuse (ERR42 stopped)
-   * or otherwise surface the prior failed attempt, exactly like the
-   * within-pass ANTI-LOOP arm at finish.
-   */
-  it('DEFECT 4b — a second start on the same unchanged red base does NOT re-mint the same gate-fix case', async () => {
-    const repo = gateFixRepoForBase();
-    const ws = mkWorkspace();
-    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
-    const checks = baseChecks(ws);
-    const out1 = join(ws, 'start1.json');
-    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks, out: out1 }), undefined, baseRunner())).toBe(0);
-    const res1 = JSON.parse(readFileSync(out1, 'utf8')) as { status: string; gateFix: { caseId: string } };
-    expect(res1.status).toBe('gate-fix-required');
-    // The agent gives up on the case and ends the pass (nothing was fixed — the
-    // base is still exactly as red as it was).
-    expect(await cmdSweepAbort(baseCli(repo, ws, inv, { cmd: 'sweep-abort' }))).toBe(0);
-
-    const out2 = join(ws, 'start2.json');
-    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks, out: out2 }), undefined, baseRunner());
-    const res2 = JSON.parse(readFileSync(out2, 'utf8')) as { status: string; gateFix?: { caseId: string } };
-    // Today: 'gate-fix-required' again with the SAME caseId — an infinite loop.
-    expect(res2.status).not.toBe('gate-fix-required');
-  });
-
-  /**
-   * A base-red REFUSAL must not WEDGE the next start. Since the red base is
-   * carried forward (D-061), both ERR42 refusal arms fire AFTER `openPass` has
-   * written phase `open` — so the pass was left in flight, the next `start` hit
-   * the "a pass is already open" guard and returned ERR30_PASS_OPEN, and nothing
-   * in the ERR42 result told the agent to `abort`. That wedged the agent on the
-   * exact path a broken base takes. Both arms now SEAL the pass (files kept for
-   * inspection until the next start clean-slates the dir) and say so.
-   */
-  it('base-red refusal (unattributable) seals the pass — the next start is NOT ERR30-wedged', async () => {
-    const repo = gateFixRepoForBase();
-    const ws = mkWorkspace();
-    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
-    const checks = baseChecks(ws);
-    const noDiagnostics: ChecksRunner = async (commands) => ({
-      ok: false,
-      failedNames: commands.map((c) => c.cmd),
-      output: 'ELIFECYCLE Command failed.\nsh: 1: tsc: not found\n',
-    });
-    const out1 = join(ws, 'start1.json');
-    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks, out: out1 }), undefined, noDiagnostics)).toBe(1);
-    const res1 = JSON.parse(readFileSync(out1, 'utf8')) as { status: string; instruction: string; passDir: string };
-    expect(res1.status).toBe('stopped');
-    // The instruction names the next action explicitly — no `abort` needed.
-    expect(res1.instruction).toContain('REPORT to the owner');
-    expect(res1.instruction).toContain('Do NOT run `abort`');
-    const dir = dirOf(repo, ws);
-    expect(res1.passDir).toBe(dir);
-    // Sealed, not left open — and the pass's own record survives for inspection.
-    expect(machineState(dir).phase).toBe('complete');
-    expect(readJournal(dir).some((e) => e.action === 'pass-complete')).toBe(true);
-    expect(existsSync(join(dir, 'plan-initial.json'))).toBe(true);
-
-    const out2 = join(ws, 'start2.json');
-    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks, out: out2 }), undefined, noDiagnostics)).toBe(1);
-    const res2 = JSON.parse(readFileSync(out2, 'utf8')) as { status: string; issues: Array<{ id: string }> };
-    // The same honest STOP again (the base is still red) — never the ERR30 wedge.
-    expect(res2.issues.map((i) => i.id)).not.toContain('ERR30_PASS_OPEN');
-    expect(res2.issues[0].id).toBe('ERR42_BASE_RED');
-    expect(res2.status).toBe('stopped');
-  });
-
-  it('base-red refusal (anti-loop) seals the pass — the next start is NOT ERR30-wedged', async () => {
-    const repo = gateFixRepoForBase();
-    const ws = mkWorkspace();
-    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
-    const checks = baseChecks(ws);
-    // Pass 1 serves the gate-fix case; the agent fixes nothing and aborts.
-    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }), undefined, baseRunner())).toBe(0);
-    expect(await cmdSweepAbort(baseCli(repo, ws, inv, { cmd: 'sweep-abort' }))).toBe(0);
-    // Pass 2 hits the ANTI-LOOP arm (same base SHA, case already served).
-    const out2 = join(ws, 'start2.json');
-    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks, out: out2 }), undefined, baseRunner())).toBe(1);
-    const res2 = JSON.parse(readFileSync(out2, 'utf8')) as { status: string; instruction: string };
-    expect(res2.status).toBe('stopped');
-    expect(res2.instruction).toContain('Do NOT run `abort`');
-    expect(machineState(dirOf(repo, ws)).phase).toBe('complete');
-    // Pass 3: still refused for the SAME reason, but not blocked behind ERR30.
-    const out3 = join(ws, 'start3.json');
-    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks, out: out3 }), undefined, baseRunner())).toBe(1);
-    const res3 = JSON.parse(readFileSync(out3, 'utf8')) as { issues: Array<{ id: string }> };
-    expect(res3.issues.map((i) => i.id)).not.toContain('ERR30_PASS_OPEN');
-    expect(res3.issues[0].id).toBe('ERR42_BASE_RED');
-  });
-
-  /**
-   * DEFECT 6 (MED) — the shipped checks.json runs
-   * `{ cmd: 'bun test', cwd: 'container/agent-runner' }`, so that command's
-   * diagnostics print paths relative to THAT subdirectory (`src/auth/x.ts`).
-   * Those strings are handed to `attributeFailure` unchanged and matched
-   * against repo-root-relative registry patterns, so they either miss entirely
-   * or (worse) collide with a root-level `src/…` owner and blame the wrong
-   * branch.
-   *
-   * CORRECT BEHAVIOUR: a failing path produced by a command with a non-`.` cwd
-   * is normalised to repo-root-relative (`container/agent-runner/src/auth/x.ts`)
-   * BEFORE attribution.
-   */
-  it('DEFECT 6 — failing paths from a sub-cwd checks command are normalised to repo-root-relative', async () => {
-    const repo = initFixtureRepo();
-    repo.commit('base', { 'container/agent-runner/src/auth/x.ts': 'orig\n' });
-    repo.checkout('main_patched', { create: true, at: 'main' });
-    repo.commit('mp: y', { 'src/y.ts': 'fork\n' });
-    repo.checkout('module/runner', { create: true, at: 'main_patched' });
-    repo.commit('runner: own the sub-package', { 'container/agent-runner/src/auth/x.ts': 'runner\n' });
-    repo.checkout('main');
-    cleanups.push(() => repo.destroy());
-
-    const ws = mkWorkspace();
     const checks = join(ws, 'checks.json');
-    // Exactly the shape of the shipped checks.json: a command rooted in a
-    // sub-directory of the clone.
-    writeFileSync(
-      checks,
-      JSON.stringify({ typecheck: [{ cmd: 'tsc --noEmit', cwd: 'container/agent-runner' }], test: [] }),
-    );
-    // The sub-package's own compiler prints paths relative to ITS cwd.
-    const subCwdRunner: ChecksRunner = async (commands) => ({
-      ok: false,
-      failedNames: commands.map((c) => c.cmd),
-      output: "src/auth/x.ts(12,3): error TS2345: Argument of type 'string | null' is not assignable.\n",
-    });
-    // A literal owned_paths directory (no glob) so this test isolates the cwd
-    // defect from the glob defect (5).
-    const inv = writeInventory([{ id: 'runner', branch: 'module/runner', owned: ['container/agent-runner'] }]);
+    // A typecheck that would FAIL if start still ran it.
+    writeFileSync(checks, JSON.stringify({ typecheck: [{ cmd: 'exit 1' }], test: [] }));
     const out = join(ws, 'start.json');
-    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks, out }), undefined, subCwdRunner)).toBe(0);
-    const res = JSON.parse(readFileSync(out, 'utf8')) as {
-      status: string;
-      gateFix: { branch: string; files: string[]; reason: string };
-    };
-    expect(res.status).toBe('gate-fix-required');
-    expect(res.gateFix.files).toEqual(['container/agent-runner/src/auth/x.ts']);
-    // The normalised path blames the SUB-PACKAGE's owner — not a root-level
-    // `src/…` owner, which is the collision this test exists for. The CASE is
-    // rooted on the base anchor (DEFECT 4a: a base-red fix can only land there),
-    // so the owner blame is reported in `reason`.
-    expect(res.gateFix.reason).toContain('module/runner');
-    expect(res.gateFix.branch).toBe('main_patched');
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks, out }))).toBe(0);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; issues?: Array<{ id: string }> };
+    expect(res.status).toBe('started');
+    expect((res.issues ?? []).some((i) => i.id === 'ERR42_BASE_RED')).toBe(false);
+    // The side-car anti-loop record is GONE — never written, by any path.
+    expect(existsSync(join(ws, 'sweep-base-gate-attempts.json'))).toBe(false);
   });
 
   /**
    * DEFECT 7 (MED) — `loadChecksConfig` swallows a JSON parse error and returns
-   * null, which is the SAME value as "there is no checks file". That silently
-   * disables BOTH gates (the per-case checks gate at report-case and the finish
-   * verify command list) with no journal row, no issue and no warning: the pass
-   * then runs to completion reporting everything green while nothing was ever
+   * null, the SAME value as "there is no checks file". That silently disables
+   * BOTH gates (the per-case checks gate at report-case and the finish verify
+   * command list) with no journal row, no issue and no warning: the pass then
+   * runs to completion reporting everything green while nothing was ever
    * typechecked or tested.
-   *
-   * CORRECT BEHAVIOUR: a malformed checks file is LOUD — an error/issue or at
-   * minimum a journaled warning — never an indistinguishable silent skip.
    */
   it('DEFECT 7 — a MALFORMED checks file is LOUD, never a silent skip', async () => {
     const repo = conflictFixture();
@@ -617,10 +315,8 @@ describe('sweep start — the base gate (D-061 A)', () => {
     const inv = emptyInventory();
     const bad = join(ws, 'checks.json');
     writeFileSync(bad, '{ "typecheck": [ {"cmd": "tsc --noEmit"} ,,, ]\n'); // truncated/invalid JSON
-    const r = runner(['tsc --noEmit']);
     const out = join(ws, 'start.json');
-    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: bad, out }), undefined, r.fn);
-    expect(r.ran).toEqual([]); // (documents the silent skip: the gate never ran)
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: bad, out }));
     const res = JSON.parse(readFileSync(out, 'utf8')) as { issues?: Array<{ id: string; detail?: string }> };
     const journal = readJournal(dirOf(repo, ws));
     const loud =
@@ -629,6 +325,7 @@ describe('sweep start — the base gate (D-061 A)', () => {
     expect(loud).toBe(true);
   });
 });
+
 
 describe('sweep next-case (D-053 §2)', () => {
   it('advances the clean prefix and serves the conflict case with materials', async () => {
@@ -1049,7 +746,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     inv: string,
     checks: string,
   ): Promise<{ dir: string; caseId: string }> {
-    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }), undefined, greenBase);
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
     await cmdSweepNextCase(baseCli(repo, ws, inv));
     const dir = dirOf(repo, ws);
     const caseId = currentCaseId(dir);
@@ -1204,7 +901,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     const ws = mkWorkspace();
     const inv = emptyInventory();
     const checks = checksFile(ws);
-    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }), undefined, greenBase);
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
     await cmdSweepNextCase(baseCli(repo, ws, inv));
     const dir = dirOf(repo, ws);
     const caseId = currentCaseId(dir);
@@ -4384,6 +4081,108 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     const violation = readJournal(dir).find((e) => e.action === 'scope-violation' && e.caseId === caseId);
     expect(violation?.mode).toBe('same-files');
     expect(violation?.extraPaths).toEqual(['src/y.ts']);
+  });
+
+  /**
+   * CROSS-PASS ANTI-LOOP (replaces `sweep-base-gate-attempts.json`). The branch
+   * already has a gate fix on ORIGIN awaiting the owner, so a second case must
+   * NOT be minted: the fix is written and under review. Created AFTER `start` so
+   * the origin-derivation/token path is not what is under test here.
+   */
+  it('an ACTIVE gate-fix ref on origin -> no second case; the branch is reported as gated', async () => {
+    const repo = gateFixRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { cmds } = redUntilCleared(ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    // The gate: any ref matching `<slug(branch)>--gate-fix-*`. The id8 is NOT
+    // looked up — a gate fix is per BRANCH, so its presence is the whole answer.
+    repo.git('push', 'origin', `${repo.sha('module/cg')}:refs/heads/fix/sweep/module__cg--gate-fix-module__cg-deadbeef`);
+    const out = join(ws, 'f1.json');
+    expect(
+      await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out })),
+    ).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      status: string;
+      gatedBranches?: string[];
+      gateFix?: unknown;
+      instruction: string;
+    };
+    // NOT 'gate-fix-required': there is nothing to serve.
+    expect(res.status).toBe('stopped');
+    expect(res.gateFix).toBeUndefined();
+    expect(res.gatedBranches).toEqual(['module/cg']);
+    // And it must not read as "checks failed, go fix them" (the ERR40 fallthrough).
+    expect(res.instruction).toContain('ALREADY WRITTEN');
+    expect(res.instruction).toContain('do NOT open another PR');
+    // No case dir was minted for a second gate fix.
+    const journal = readJournal(dirOf(repo, ws));
+    expect(journal.some((e) => e.action === 'gate-fix-skipped' && e.branch === 'module/cg')).toBe(true);
+    expect(journal.filter((e) => e.action === 'gate-fix').length).toBe(0);
+  });
+
+  it('next-case REPORTS an active gate instead of silently serving nothing', async () => {
+    const repo = gateFixRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    repo.git('push', 'origin', `${repo.sha('module/cg')}:refs/heads/fix/sweep/module__cg--gate-fix-module__cg-deadbeef`);
+    const out = join(ws, 'nc.json');
+    await cmdSweepNextCase(baseCli(repo, ws, inv, { out }));
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { activeGates?: string[]; instruction?: string };
+    expect(res.activeGates).toEqual(['fix/sweep/module__cg--gate-fix-module__cg-deadbeef']);
+    expect(res.instruction).toContain('REPORT that to the owner');
+  });
+
+  /**
+   * DEFECT 6 — ported from the deleted base-gate block. A failing path produced
+   * by a command with a non-`.` cwd must be normalised to repo-root-relative
+   * BEFORE attribution, or it blames a root-level `src/…` owner instead of the
+   * sub-package's. The logic is shared, so the finish path exercises it now.
+   */
+  it('DEFECT 6 — failing paths from a sub-cwd checks command are normalised to repo-root-relative', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base', { 'container/agent-runner/src/auth/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: y', { 'src/y.ts': 'fork\n' });
+    repo.checkout('module/runner', { create: true, at: 'main_patched' });
+    repo.commit('runner: own the sub-package', { 'container/agent-runner/src/auth/x.ts': 'runner\n' });
+    repo.checkout('main');
+    repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+    cleanups.push(() => repo.destroy());
+
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'runner', branch: 'module/runner', owned: ['container/agent-runner'] }]);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    // The sub-package's own compiler prints paths relative to ITS cwd.
+    const cmds = join(ws, 'cmds.json');
+    writeFileSync(
+      cmds,
+      JSON.stringify([
+        {
+          cmd: `echo "src/auth/x.ts(12,3): error TS2345: Argument of type 'string | null' is not assignable."; exit 1`,
+          cwd: 'container/agent-runner',
+        },
+      ]),
+    );
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const out = join(ws, 'f1.json');
+    await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out }));
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      status: string;
+      gateFix?: { branch: string; files: string[] };
+    };
+    expect(res.status).toBe('gate-fix-required');
+    // Normalised to repo-root-relative, and blamed to the SUB-PACKAGE's owner.
+    expect(res.gateFix!.files).toEqual(['container/agent-runner/src/auth/x.ts']);
+    expect(res.gateFix!.branch).toBe('module/runner');
   });
 });
 
