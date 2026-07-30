@@ -428,7 +428,11 @@ describe('sweep report-case (D-053 §2)', () => {
       ),
     ).toBe(0);
     const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; tier: string };
-    expect(res.instruction).toBe('provide PR description');
+    // The instruction now carries the case's own PR template path — the agent is
+    // given ONE template rather than left to find the repo's (live: PR #61).
+    expect(res.instruction).toContain('provide PR description');
+    expect(res.instruction).toContain('pr/TEMPLATE.md');
+    expect(res.instruction).toContain('use only this template');
     expect(res.tier).toBe('judged');
     expect(repo.sha('main_patched')).toBe(beforeTip); // NOT merged yet (report-pr merges)
     // D-060: the single quality gate (cold read) now runs at report-case for
@@ -458,7 +462,11 @@ describe('sweep report-case (D-053 §2)', () => {
     ).toBe(0);
     const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; tier: string; issues?: Array<{ id: string }> };
     expect(res.tier).toBe('judged');
-    expect(res.instruction).toBe('provide PR description');
+    // The instruction now carries the case's own PR template path — the agent is
+    // given ONE template rather than left to find the repo's (live: PR #61).
+    expect(res.instruction).toContain('provide PR description');
+    expect(res.instruction).toContain('pr/TEMPLATE.md');
+    expect(res.instruction).toContain('use only this template');
     expect((res.issues ?? []).some((i) => i.id === 'ERR05_DECIDED_ALREADY')).toBe(false);
     expect(machineState(dir).phase).toBe('awaiting-pr');
   });
@@ -566,7 +574,11 @@ describe('sweep report-case (D-053 §2)', () => {
     ).toBe(0);
     const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; tier: string };
     expect(res.tier).toBe('held');
-    expect(res.instruction).toBe('provide PR description');
+    // The instruction now carries the case's own PR template path — the agent is
+    // given ONE template rather than left to find the repo's (live: PR #61).
+    expect(res.instruction).toContain('provide PR description');
+    expect(res.instruction).toContain('pr/TEMPLATE.md');
+    expect(res.instruction).toContain('use only this template');
     expect(repo.sha('main_patched')).toBe(postRun); // no merge
     // Blocked ⇔ the journaled held disposition; nothing is published here and
     // the ledger is never written (D-058).
@@ -4123,6 +4135,50 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     expect(journal.some((e) => e.action === 'gate-fix-skipped' && e.branch === 'module/cg')).toBe(true);
     expect(journal.filter((e) => e.action === 'gate-fix').length).toBe(0);
   });
+
+  /**
+   * PR #61: with no template named, the agent wrote the PR from the repo's
+   * contribution guide (skill types, "tested on a fresh clone") — the most
+   * template-shaped file in the clone. The driver now writes ONE per case.
+   */
+  it('a gate-fix case gets its OWN PR template — no ours/theirs, which it does not have', async () => {
+    const repo = gateFixRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { cmds } = redUntilCleared(ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    const f1 = join(ws, 'f1.json');
+    await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out: f1 }));
+    const caseId = (JSON.parse(readFileSync(f1, 'utf8')) as { gateFix: { caseId: string } }).gateFix.caseId;
+    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    // Resolve the gate fix and claim held so a PR is asked for.
+    writeFileSync(join(dir, caseId, 'worktree', 'src/x.ts'), 'fixed\n');
+    const rc = join(ws, 'rc.json');
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true, out: rc }),
+      confirm,
+    );
+    const res = JSON.parse(readFileSync(rc, 'utf8')) as { instruction: string; prTemplate?: string };
+    const tpl = join(dir, caseId, 'pr', 'TEMPLATE.md');
+    expect(existsSync(tpl)).toBe(true);
+    expect(res.instruction).toContain(tpl);
+    const text = readFileSync(tpl, 'utf8');
+    // Tailored to a GATE FIX: it resolves no merge, so inviting ours/theirs/chosen
+    // would ask the agent to invent two sides that do not exist.
+    expect(text).not.toContain('ours (');
+    expect(text).not.toContain('theirs (');
+    expect(text).toContain('## What is broken');
+    expect(text).toContain('GATE FIX');
+    expect(text).toContain('src/x.ts'); // the case's real file, not a placeholder
+    // And it carries none of the contribution guide's shape.
+    expect(text).not.toContain('Type of Change');
+    expect(text).not.toContain('SKILL.md');
+  });
+
 
   it('next-case REPORTS an active gate instead of silently serving nothing', async () => {
     const repo = gateFixRepo();

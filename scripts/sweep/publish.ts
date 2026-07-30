@@ -232,17 +232,41 @@ export const TAUTOLOGY_PHRASES = [
   'The unmergeable state IS the conflict exhibit',
 ];
 
+/**
+ * Markers of a FOREIGN template — one a sweep PR must never be written from.
+ * `.github/PULL_REQUEST_TEMPLATE.md` is UPSTREAM's CONTRIBUTION guidance for new
+ * skills: it asks for a skill type and whether SKILL.md is under 500 lines,
+ * none of which describes a merge resolution or a gate fix. It is also the most
+ * template-shaped file in the clone, so an agent told only to "write it
+ * yourself" reaches for it (live: PR #61). The driver now hands over an explicit
+ * per-case `pr/TEMPLATE.md`; these markers catch the other one being used anyway.
+ */
+export const FOREIGN_TEMPLATE_MARKERS = [
+  'contributing-guide:',
+  '## Type of Change',
+  'Feature skill',
+  'Utility skill',
+  'Operational/container skill',
+  '## For Skills',
+  'SKILL.md is under 500 lines',
+  'I tested this skill on a fresh clone',
+];
+
 /** Advisory text checks (WARN01/WARN02) — returned, never blocking (D-050: the only text checks besides ERR08). */
 export function advisoryTextIssues(title: string, body: string, conflictedPaths: string[]): Issue[] {
   const issues: Issue[] = [];
   const mentions = conflictedPaths.filter((p) => body.includes(p) || body.includes(p.split('/').pop() ?? p));
   const tautology = TAUTOLOGY_PHRASES.find((t) => body.includes(t) || title.includes(t));
-  if (mentions.length === 0 || tautology) {
+  const foreign = FOREIGN_TEMPLATE_MARKERS.find((m) => body.includes(m) || title.includes(m));
+  if (mentions.length === 0 || tautology || foreign) {
     issues.push({
       id: 'WARN01_TEMPLATE_TEXT',
-      detail: tautology
-        ? `body/title contains a retired template phrase ("${tautology}") — rewrite from the case materials`
-        : 'body references none of the conflicted files — rewrite from the case materials',
+      detail: foreign
+        ? `body/title came from the WRONG template ("${foreign}" belongs to upstream's contribution guide for new ` +
+          `skills) — rewrite it from this case's pr/TEMPLATE.md, the only template that applies here`
+        : tautology
+          ? `body/title contains a retired template phrase ("${tautology}") — rewrite from the case materials`
+          : 'body references none of the conflicted files — rewrite from the case materials',
     });
   }
   const firstLine = body

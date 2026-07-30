@@ -832,6 +832,37 @@ describe('propagate publish — check battery (blocking ids reachable)', () => {
     expect(res.issues.every((i) => !isBlocking(i.id))).toBe(true);
   });
 
+  it("the WRONG template is named as such: the contribution guide's markers trip WARN01", async () => {
+    const { ws, caseId, prDir, cli } = await setupHeldCase();
+    // Verbatim shape of the repo's contribution template — what PR #61 was
+    // written from. It says nothing about a merge, so it must not pass silently.
+    const body = [
+      '<!-- contributing-guide: v1 -->',
+      '## Type of Change',
+      '',
+      '- [ ] **Feature skill** - adds a channel or integration',
+      '- [x] **Fix** - bug fix or security fix to source code',
+      '',
+      '## Description',
+      '',
+      'Resolves the conflict in src/x.ts.',
+      '',
+      '## For Skills',
+      '',
+      '- [ ] I tested this skill on a fresh clone',
+    ].join('\n');
+    writeText(prDir, 'sweep freeze h1', body);
+    const out = join(ws, 'out.json');
+    expect(await cmdPublish(cli({ cmd: 'publish', caseId, out }))).toBe(0);
+    const res = readOut(out);
+    const warn = res.issues.find((i) => i.id === 'WARN01_TEMPLATE_TEXT');
+    expect(warn).toBeDefined();
+    // The detail must say WHICH mistake was made — "rewrite from the materials"
+    // is the generic advice and would not tell the agent it used the wrong file.
+    expect(warn!.detail).toContain('WRONG template');
+    expect(warn!.detail).toContain('pr/TEMPLATE.md');
+  });
+
   it('ERR11: --execute without a token file blocks before any network call', async () => {
     const { ws, caseId, prDir, cli } = await setupHeldCase();
     writeText(prDir, GOOD_TITLE, GOOD_BODY);

@@ -3068,10 +3068,82 @@ function fixBranchName(id: string, rc: Pick<ResolvedCase, 'branch' | 'parent' | 
  * head (D-049 — HELD: the run's top commit; JUDGED: the merge commit). Returns
  * the deterministic fix branch NAME for ledger/urge bookkeeping.
  */
+/** Where the case's PR template is written — the ONE template the agent may use. */
+function prTemplatePath(dir: string, caseId: string): string {
+  return join(dir, caseId, 'pr', 'TEMPLATE.md');
+}
+
+/**
+ * The PR-description handoff, appended to every result that asks for PR text.
+ * With no template named, the agent used the repo's contribution template
+ * instead (live: PR #61). Name the one to use; say nothing about the rest.
+ */
+function prHandoff(dir: string, caseId: string, base: string): string {
+  return `${base}. Write \`pr/body.md\` from ${prTemplatePath(dir, caseId)} — use only this template.`;
+}
+
+/**
+ * The case's PR template. Written per case, and TAILORED to its kind: a gate fix
+ * has no merge, so ours/theirs/chosen is meaningless there and inviting it
+ * produces invented content. The section set IS the instruction.
+ */
+function prTemplateFor(rc: ResolvedCase, tier: Tier): string {
+  const gateFix = isGateFixCaseId(rc.id);
+  const head = [
+    '<!-- sweep-pr-template: v1 — the only template for a sweep PR. -->',
+    '<!-- The FIRST line below is the PR title. Keep the `# ` and replace the text. -->',
+    '<!-- Delete every comment and every <angle-bracket> placeholder before publishing. -->',
+    '',
+  ];
+  const body = gateFix
+    ? [
+        `# Decision needed: <the specific choice the owner must make about this fix>`,
+        '',
+        '## What is broken',
+        '<the failing check and what it reports, from gate-fix-output.txt — not a guess>',
+        '',
+        `## The fix (\`${rc.branch}\`)`,
+        ...rc.conflictedPaths.map((p) => `\n### \`${p}\`\n\n<what you changed and WHY it makes the check pass>`),
+        '',
+        '## Scope',
+        `This is a GATE FIX: it repairs a pre-existing defect, it resolves no merge conflict.`,
+        `Nothing outside the ${rc.conflictedPaths.length} file(s) above is touched.`,
+        '',
+        '## Verification',
+        '<which checks you ran and their result; name any gate that could NOT run here and why>',
+      ]
+    : [
+        `# Decision needed: <the specific choice> | Review needed: <the specific risk>`,
+        '',
+        '## What this merge is',
+        `\`${rc.parent}\` → \`${rc.branch}\` at height ${rc.head.height}. <what the upstream change does>`,
+        '',
+        '## Resolutions',
+        ...rc.conflictedPaths.map(
+          (p) =>
+            `\n### \`${p}\`\n\n<details>\n<summary>ours vs theirs vs chosen</summary>\n\n` +
+            `**ours (\`${rc.branch}\`)** — <behaviour>\n\n` +
+            `**theirs (\`${rc.parent}\`)** — <behaviour>\n\n` +
+            `**chosen** — <what you kept, and WHY>\n\n</details>`,
+        ),
+        '',
+        '## Scope',
+        `Everything outside these ${rc.conflictedPaths.length} file(s) is verbatim upstream, already reviewed upstream.`,
+        '',
+        '## Verification',
+        '<which checks you ran and their result; name any gate that could NOT run here and why>',
+      ];
+  return [...head, ...body, ''].join('\n');
+}
+
 async function prepareCaseMaterials(cli: Cli, dir: string, rc: ResolvedCase, tier: Tier): Promise<string> {
   const fixBranch = fixBranchName(rc.id, rc);
   const prDir = join(dir, rc.id, 'pr');
   mkdirSync(prDir, { recursive: true });
+  // The template is REWRITTEN every time: it embeds this case's branch, parent
+  // and conflicted paths, so a stale copy from a prior disposition would name
+  // the wrong files.
+  writeFileSync(prTemplatePath(dir, rc.id), prTemplateFor(rc, tier));
   const tip = await revParse(cli.repo, rc.branch);
   const sides = await perSideLog(cli.repo, tip, rc.head.sha, rc.conflictedPaths);
   const materials = [
@@ -6408,7 +6480,7 @@ export async function cmdSweepReportCase(
     console.error(`report-case: held ${caseId} (pristine conflict — draft)`);
     result(cli, {
       instruction:
-        'provide PR description — base it on the PRISTINE conflict state (the worktree is now pristine); do NOT describe a resolution',
+        prHandoff(dir, caseId, 'provide PR description — base it on the PRISTINE conflict state (the worktree is now pristine); do NOT describe a resolution'),
       tier: 'held',
       issues,
     });
@@ -6457,7 +6529,7 @@ export async function cmdSweepReportCase(
           progress(`checks failing ${n}x -> held (gate fix kept): ${rc.branch}`);
           console.error(`report-case: held ${caseId} (gate fix, checks ${kind} failing ${n}x, escalated)`);
           result(cli, {
-            instruction: `provide PR description — the ${kind} still fails (${r.failedNames.join(', ')}); say so plainly`,
+            instruction: prHandoff(dir, caseId, `provide PR description — the ${kind} still fails (${r.failedNames.join(', ')}); say so plainly`),
             tier: 'held',
             issues,
           });
@@ -6484,7 +6556,7 @@ export async function cmdSweepReportCase(
         console.error(`report-case: held ${caseId} (checks ${kind} failing ${n}x, escalated, pristine)`);
         result(cli, {
           instruction:
-            'provide PR description — base it on the PRISTINE conflict state (the worktree is now pristine); do NOT describe a resolution',
+            prHandoff(dir, caseId, 'provide PR description — base it on the PRISTINE conflict state (the worktree is now pristine); do NOT describe a resolution'),
           tier: 'held',
           issues,
         });
@@ -6525,7 +6597,7 @@ export async function cmdSweepReportCase(
     writeMachineState(dir, { ...st, phase: 'awaiting-pr', currentCase: { caseId, branch: rc.branch, tier: 'held' } });
     progress(`cap exceeded -> held: ${rc.branch}`);
     console.error(`report-case: held ${caseId} (resolution did not converge)`);
-    result(cli, { instruction: 'provide PR description', tier: 'held', issues });
+    result(cli, { instruction: prHandoff(dir, caseId, 'provide PR description'), prTemplate: prTemplatePath(dir, caseId), tier: 'held', issues });
     return 0;
   }
 
@@ -6596,7 +6668,7 @@ export async function cmdSweepReportCase(
       writeMachineState(dir, { ...st, phase: 'awaiting-pr', currentCase: { caseId, branch: rc.branch, tier: 'held' } });
       progress(`demoted: ${rc.branch} -> held (cold-read rejected ${rejections}x)`);
       console.error(`report-case: held ${caseId} (cold-read rejected ${rejections}x, escalated)`);
-      result(cli, { instruction: 'provide PR description', tier: 'held', issues });
+      result(cli, { instruction: prHandoff(dir, caseId, 'provide PR description'), prTemplate: prTemplatePath(dir, caseId), tier: 'held', issues });
       return 0;
     }
     const instruction = `cold read rejected — revise the resolution in the worktree, then re-run report-case${feedback ? `: ${feedback}` : ''}`;
@@ -6625,7 +6697,13 @@ export async function cmdSweepReportCase(
     writeMachineState(dir, { ...st, phase: 'awaiting-pr', currentCase: { caseId, branch: rc.branch, tier: 'held' } });
     progress(`demoted: ${rc.branch} -> held (scope exceeded; resolution kept for owner review)`);
     console.error(`report-case: held ${caseId} (scope exceeded — cold read agreed; resolution kept)`);
-    result(cli, { instruction: 'provide PR description', tier: 'held', scopeGuard: guard, issues });
+    result(cli, {
+      instruction: prHandoff(dir, caseId, 'provide PR description'),
+      prTemplate: prTemplatePath(dir, caseId),
+      tier: 'held',
+      scopeGuard: guard,
+      issues,
+    });
     return 0;
   }
   // Confirm + in-scope → dispatch by effective tier.
@@ -6634,7 +6712,7 @@ export async function cmdSweepReportCase(
     await prepareCaseMaterials(cli, dir, rc, 'judged');
     writeMachineState(dir, { ...st, phase: 'awaiting-pr', currentCase: { caseId, branch: rc.branch, tier: 'judged' } });
     console.error(`report-case: ${caseId} judged — provide PR description`);
-    result(cli, { instruction: 'provide PR description', tier: 'judged', issues });
+    result(cli, { instruction: prHandoff(dir, caseId, 'provide PR description'), prTemplate: prTemplatePath(dir, caseId), tier: 'judged', issues });
     return 0;
   }
   //  - HELD (explicit held-claim on a marker-clean resolution, or a reissue):
@@ -6647,7 +6725,7 @@ export async function cmdSweepReportCase(
     writeMachineState(dir, { ...st, phase: 'awaiting-pr', currentCase: { caseId, branch: rc.branch, tier: 'held' } });
     progress(`held (resolution kept): ${rc.branch}`);
     console.error(`report-case: held ${caseId} (resolution kept for owner review)`);
-    result(cli, { instruction: 'provide PR description', tier: 'held', issues });
+    result(cli, { instruction: prHandoff(dir, caseId, 'provide PR description'), prTemplate: prTemplatePath(dir, caseId), tier: 'held', issues });
     return 0;
   }
   //  - MECHANICAL: merge the resolved tree in place.
@@ -6738,8 +6816,14 @@ export async function cmdSweepReportPr(
     }
   }
   if (!title || !body) {
-    const detail = `write ${bodyPath} with the H1 title on the first line (\`# <title>\`) and the body below — the driver never generates PR prose (D-048)`;
-    result(cli, { instruction: 'provide PR description', issues: [{ id: 'ERR08_TEXT_MISSING', detail }] });
+    const detail =
+      `write ${bodyPath} with the H1 title on the first line (\`# <title>\`) and the body below, ` +
+      `FROM ${prTemplatePath(dir, caseId)} — the driver never generates PR prose (D-048)`;
+    result(cli, {
+      instruction: prHandoff(dir, caseId, 'provide PR description'),
+      prTemplate: prTemplatePath(dir, caseId),
+      issues: [{ id: 'ERR08_TEXT_MISSING', detail }],
+    });
     return 1;
   }
   // Normalize both files so the finish publish (which reads title.txt + body.md)
