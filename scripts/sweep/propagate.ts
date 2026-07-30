@@ -4814,9 +4814,9 @@ export const defaultColdReadInvoker: ColdReadInvoker = (prompt) =>
   });
 
 /**
- * Fail-closed reduction shared by both cold reads (mirrors cmdResolve's D-050
- * gate): an overall `reject`, OR an `UNVERIFIABLE-FROM-REQUEST` answer on any of
- * Q1-Q3, is a reject. Returns the unverifiable question list for the notes.
+ * Fail-closed reduction shared by both cold reads (the D-050 gate): an overall
+ * `reject`, OR an `UNVERIFIABLE-FROM-REQUEST` answer on any of Q1-Q3, is a
+ * reject. Returns the unverifiable question list for the notes.
  */
 function coldReadRejected(v: MachineVerdict): { rejected: boolean; unverifiable: string[] } {
   const unverifiable = (['q1', 'q2', 'q3'] as const).filter((q) =>
@@ -5983,8 +5983,9 @@ export async function cmdSweepStart(
   // pass (or a pre-machine-state leftover with no machine-state.json). Remove the
   // WHOLE tree — journal + machine-state + every case dir with its
   // `coldread-*.json`/`.md` + `pr/` — so NOTHING is inherited: not the leaked
-  // HELD journal, and not a poisoned `coldread-verdict.json` (an infra failure
-  // recorded as a reject, the D-055 poison `cmdResolve` would read as authentic).
+  // HELD journal, and not a poisoned `coldread-verdict.json` (the D-055 poison:
+  // an infra failure recorded on disk as a reject, which a later read of that
+  // file would take for an authentic content decision).
   // `start` is the ONLY place this happens; the driver owns the lifecycle.
   if (existsSync(canonicalDir)) {
     // De-register the prior pass's worktrees FIRST so removing the tree does not

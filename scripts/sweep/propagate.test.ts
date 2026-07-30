@@ -22,7 +22,11 @@ import {
   appendJournal,
   cmdPlan,
   cmdPush,
+  cmdReport,
   cmdRun,
+  cmdSweepNextCase,
+  cmdSweepReportCase,
+  cmdSweepStart,
   cmdVerify,
   coldReadWithRetry,
   conflictHunks,
@@ -33,6 +37,7 @@ import {
   readJournal,
   supersededCaseIds,
   type Cli,
+  type ColdReadInvoker,
   type JournalEntry,
   type MachineVerdict,
 } from './propagate.js';
@@ -126,6 +131,288 @@ function conflictFixture(): { repo: FixtureRepo } {
   cleanups.push(() => repo.destroy());
   return { repo };
 }
+
+// --- §7 trust boundary: case.json is a POINTER, re-derived from git+registry ---
+// Reached through the surviving surface (`report-case`); the flag-based `resolve`
+// these used to call is gone. The forgery and the guard are unchanged — only the
+// refusal's shape differs: report-case emits ERR02_CASE_STALE instead of
+// journaling a `case-reverification-failed` halt.
+
+function machineState(dir: string): { phase: string; currentCase: { caseId: string; tier?: string } | null } {
+  return JSON.parse(readFileSync(join(dir, 'machine-state.json'), 'utf8')) as {
+    phase: string;
+    currentCase: { caseId: string; tier?: string } | null;
+  };
+}
+function currentCaseId(dir: string): string {
+  return machineState(dir).currentCase!.caseId;
+}
+/** The agent's edit: write files into the case worktree `next-case` handed over. */
+function resolveWorktree(dir: string, caseId: string, files: Record<string, string>): void {
+  const wt = join(dir, caseId, 'worktree');
+  for (const [p, content] of Object.entries(files)) {
+    mkdirSync(join(wt, p, '..'), { recursive: true });
+    writeFileSync(join(wt, p), content);
+  }
+}
+function readCase(dir: string, caseId: string): { automergeTree: string; conflictedPaths: string[] } & Record<string, unknown> {
+  return JSON.parse(readFileSync(join(dir, caseId, 'case.json'), 'utf8')) as {
+    automergeTree: string;
+    conflictedPaths: string[];
+  } & Record<string, unknown>;
+}
+function editCase(dir: string, caseId: string, mut: (c: Record<string, unknown>) => void): void {
+  const path = join(dir, caseId, 'case.json');
+  const c = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+  mut(c);
+  writeFileSync(path, JSON.stringify(c, null, 2));
+}
+
+const confirm: ColdReadInvoker = async () => ({
+  verdict: 'confirm',
+  notes: 'behaviour preserved; every hunk explained',
+});
+
+describe('report-case — case re-verification rejects forged pointers (§7, FIX A)', () => {
+  async function setupCase(): Promise<{ repo: FixtureRepo; ws: string; inv: string; dir: string; caseId: string }> {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { cmd: 'sweep-start' }))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { cmd: 'next-case' }))).toBe(0);
+    return { repo, ws, inv, dir, caseId: currentCaseId(dir) };
+  }
+  /** Resolve in the worktree, then report — the surviving resolution path. */
+  async function reportWith(
+    repo: FixtureRepo,
+    ws: string,
+    inv: string,
+    dir: string,
+    caseId: string,
+    out?: string,
+  ): Promise<number> {
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    return cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+      confirm,
+    );
+  }
+  const issuesOf = (out: string): Array<{ id: string; detail: string }> =>
+    (JSON.parse(readFileSync(out, 'utf8')) as { issues?: Array<{ id: string; detail: string }> }).issues ?? [];
+  const staleIds = (out: string): string[] => issuesOf(out).map((i) => i.id);
+  /** report-case surfaces each reverify error verbatim as an ERR02 detail. */
+  const staleDetails = (out: string): string[] => issuesOf(out).map((i) => i.detail);
+
+  it('rejects a forged head sha', async () => {
+    const { repo, ws, inv, dir, caseId } = await setupCase();
+    const tip = repo.sha('main_patched');
+    editCase(dir, caseId, (c) => {
+      (c.head as { sha: string }).sha = '0'.repeat(40);
+    });
+    const out = join(ws, 'rc.json');
+    expect(await reportWith(repo, ws, inv, dir, caseId, out)).toBe(1);
+    expect(staleIds(out)).toContain('ERR02_CASE_STALE');
+    expect(readJournal(dir).some((e) => e.action === 'resolved')).toBe(false);
+    expect(repo.sha('main_patched')).toBe(tip); // nothing merged on a forged pointer
+  });
+
+  it('rejects forged conflicted paths (extra file allowed)', async () => {
+    const { repo, ws, inv, dir, caseId } = await setupCase();
+    editCase(dir, caseId, (c) => {
+      (c.conflictedPaths as string[]).push('src/anything.ts');
+    });
+    const out = join(ws, 'rc.json');
+    expect(await reportWith(repo, ws, inv, dir, caseId, out)).toBe(1);
+    expect(staleIds(out)).toContain('ERR02_CASE_STALE');
+    expect(readJournal(dir).some((e) => e.action === 'resolved')).toBe(false);
+  });
+
+  it('rejects a forged tier floor', async () => {
+    const { repo, ws, inv, dir, caseId } = await setupCase();
+    editCase(dir, caseId, (c) => {
+      c.tierFloor = 'judged';
+    });
+    const out = join(ws, 'rc.json');
+    expect(await reportWith(repo, ws, inv, dir, caseId, out)).toBe(1);
+    expect(staleIds(out)).toContain('ERR02_CASE_STALE');
+    expect(readJournal(dir).some((e) => e.action === 'resolved')).toBe(false);
+  });
+
+  it('rejects a replayed report after success (double-resolve guard)', async () => {
+    const { repo, ws, inv, dir, caseId } = await setupCase();
+    expect(await reportWith(repo, ws, inv, dir, caseId)).toBe(0); // first: success
+    const afterFirst = repo.sha('main_patched');
+    expect(repo.git('show', 'main_patched:src/x.ts')).toBe('RESOLVED');
+    expect(readJournal(dir).filter((e) => e.action === 'resolved').length).toBe(1);
+    // Replay: the case is disposed and the machine holds no ready case, so a
+    // second report is REFUSED — no second merge, no second `resolved` row.
+    // (reverifyCase's own "the resolution already landed" arm is exercised by
+    // publish.test.ts's ERR02 test, which publishes a case whose head landed.)
+    expect(await reportWith(repo, ws, inv, dir, caseId)).not.toBe(0);
+    expect(readJournal(dir).filter((e) => e.action === 'resolved').length).toBe(1);
+    expect(repo.sha('main_patched')).toBe(afterFirst);
+  });
+
+  it('rejects a report for a case that was never journaled', async () => {
+    const { repo, ws, inv, dir, caseId } = await setupCase();
+    // Forge the machine's current case: a fabricated id + a case.json copied from
+    // the real one. The pass journal has no `case` row for it, which is what
+    // reverifyCase refuses — before any worktree or checks work happens.
+    const fakeId = 'main_patched-h99';
+    mkdirSync(join(dir, fakeId), { recursive: true });
+    const real = readCase(dir, caseId);
+    writeFileSync(join(dir, fakeId, 'case.json'), JSON.stringify({ ...real, id: fakeId }, null, 2));
+    const st = machineState(dir);
+    writeFileSync(
+      join(dir, 'machine-state.json'),
+      JSON.stringify({ ...st, currentCase: { ...st.currentCase, caseId: fakeId } }, null, 2),
+    );
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        confirm,
+      ),
+    ).toBe(1);
+    expect(staleIds(out)).toContain('ERR02_CASE_STALE');
+    expect(readJournal(dir).some((e) => e.action === 'resolved')).toBe(false);
+  });
+
+  // N2: plan.json is a SNAPSHOT, not authority — parents and scope are
+  // re-derived from the registry, so forging the plan buys nothing.
+  it('halts on a forged parent edge in plan.json (drift vs the registry)', async () => {
+    const { repo, ws, inv, dir, caseId } = await setupCase();
+    const planPath = join(dir, 'plan.json');
+    const plan = JSON.parse(readFileSync(planPath, 'utf8')) as {
+      branches: Array<{ branch: string; parents: unknown[] }>;
+    };
+    plan.branches
+      .find((b) => b.branch === 'main_patched')!
+      .parents.push({
+        parent: 'feat/fake',
+        model: 'parents',
+        mergePoint: null,
+        verdict: 'skip',
+        case: null,
+        deferredTo: null,
+        skipReason: null,
+      });
+    writeFileSync(planPath, JSON.stringify(plan, null, 2));
+
+    const out = join(ws, 'rc.json');
+    expect(await reportWith(repo, ws, inv, dir, caseId, out)).toBe(1);
+    expect(staleIds(out)).toContain('ERR02_CASE_STALE');
+    expect(staleDetails(out).some((d) => d.includes('plan drift'))).toBe(true);
+    expect(readJournal(dir).some((e) => e.action === 'resolved')).toBe(false); // no merge
+  });
+
+  it('a branch smuggled into plan.json (+ forged case/journal) is refused by the registry scope', async () => {
+    const { repo } = conflictFixture();
+    repo.checkout('feat/evil', { create: true, at: 'main_patched' }); // exists in the repo, NOT in the registry
+    repo.checkout('main');
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { cmd: 'sweep-start' }))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { cmd: 'next-case' }))).toBe(0);
+    const real = readCase(dir, currentCaseId(dir));
+
+    // Forge: plan.json grows a feat/evil row; a case + journal entry are forged
+    // for it, and the machine is pointed at that fabricated case.
+    const planPath = join(dir, 'plan.json');
+    const plan = JSON.parse(readFileSync(planPath, 'utf8')) as { branches: unknown[]; order: string[] };
+    plan.order.push('feat/evil');
+    plan.branches.push({
+      branch: 'feat/evil',
+      kind: 'inventory',
+      tierFloor: 'clean',
+      isLeaf: true,
+      alwaysMerge: false,
+      ancestors: [],
+      parents: [
+        {
+          parent: 'main',
+          model: 'entry',
+          mergePoint: null,
+          verdict: 'case',
+          case: null,
+          deferredTo: null,
+          skipReason: null,
+        },
+      ],
+    });
+    writeFileSync(planPath, JSON.stringify(plan, null, 2));
+    const fakeId = 'feat__evil--main-h1';
+    mkdirSync(join(dir, fakeId), { recursive: true });
+    writeFileSync(
+      join(dir, fakeId, 'case.json'),
+      JSON.stringify({ ...real, id: fakeId, branch: 'feat/evil', parent: 'main' }, null, 2),
+    );
+    appendFileSync(
+      join(dir, 'journal.jsonl'),
+      JSON.stringify({ ts: new Date().toISOString(), action: 'case', branch: 'feat/evil', caseId: fakeId }) + '\n',
+    );
+    const st = machineState(dir);
+    writeFileSync(
+      join(dir, 'machine-state.json'),
+      JSON.stringify({ ...st, currentCase: { ...st.currentCase, caseId: fakeId, branch: 'feat/evil' } }, null, 2),
+    );
+
+    const before = repo.sha('feat/evil');
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true, out }),
+        confirm,
+      ),
+    ).toBe(1);
+    expect(staleIds(out)).toContain('ERR02_CASE_STALE');
+    expect(staleDetails(out).some((d) => d.includes('registry-derived pass scope'))).toBe(true);
+    expect(repo.sha('feat/evil')).toBe(before);
+    expect(readJournal(dir).some((e) => e.action === 'held' && e.branch === 'feat/evil')).toBe(false);
+  });
+});
+
+describe('report (D-052 FIX 4) — journal-derived owner summary', () => {
+  it('prints a journal-derived summary incl. open/unresolved cases', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { cmd: 'sweep-start' }))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { cmd: 'next-case' }))).toBe(0);
+    const caseId = currentCaseId(dir);
+
+    // Case still open: report shows a merged clean prefix + one open case.
+    const out1 = join(ws, 'report-open.json');
+    expect(await cmdReport(baseCli(repo, ws, inv, { cmd: 'report', out: out1 }))).toBe(0);
+    const r1 = JSON.parse(readFileSync(out1, 'utf8')) as {
+      mergedCount: number;
+      openCases: Array<{ caseId: string }>;
+      held: unknown[];
+      resolved: unknown[];
+      sealed: boolean;
+    };
+    expect(r1.mergedCount).toBeGreaterThanOrEqual(1);
+    expect(r1.openCases.map((o) => o.caseId)).toContain(caseId);
+    expect(r1.resolved.length).toBe(0);
+    expect(r1.held.length).toBe(0);
+
+    // Freeze it HELD; report now reflects the disposition (open -> held).
+    expect(
+      await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true }), confirm),
+    ).toBe(0);
+    const out2 = join(ws, 'report-held.json');
+    expect(await cmdReport(baseCli(repo, ws, inv, { cmd: 'report', out: out2 }))).toBe(0);
+    const r2 = JSON.parse(readFileSync(out2, 'utf8')) as {
+      openCases: unknown[];
+      held: Array<{ caseId: string }>;
+    };
+    expect(r2.openCases.length).toBe(0);
+    expect(r2.held.map((h) => h.caseId)).toContain(caseId);
+  });
+});
 
 describe('propagate run — no-op skip + leaf un-skip chain (§6)', () => {
   it('un-skips the cheapest parent chain so the leaf lands a real (empty) merge', async () => {
