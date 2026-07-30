@@ -6090,12 +6090,25 @@ export async function cmdSweepStart(
       recordBaseGateAttempt(cli.workspace, attemptKey, first.caseId, first.branch);
       progress(`base RED on ${baseRed.anchor} — gate-fix case prepared on ${first.branch}`);
       console.error(`sweep start: base red — gate-fix case ${first.caseId} on ${first.branch}`);
+      // `ERR*` BLOCKS, `WARN*` ADVISES — and this is a PROCEED arm: a case was
+      // materialized and the agent is told to run `next-case`. It used to carry
+      // `ERR42_BASE_RED`, the SAME id the two refusal arms above/below use, whose
+      // doctrine row reads "stop-case 2 report; the pass is already sealed". The
+      // agent obeyed the row, filed a stop case, and idled for 52 minutes while a
+      // served case sat untouched (live 2026-07-30). An advisory id keeps the
+      // diagnosis without commandeering the agent: doctrine already tells it how
+      // to work a GATE-FIX case, and `instruction` names the next command.
       result(cli, {
         status: 'gate-fix-required',
         watermark: ctx.watermark,
         watermark12: ctx.watermark12,
         passDir: ctx.dir,
-        issues: [{ id: 'ERR42_BASE_RED', detail: `${baseRed.anchor} was already red BEFORE any merge — ${gate.detail}` }],
+        issues: [
+          {
+            id: 'WARN09_GATE_FIX_SERVED',
+            detail: `${baseRed.anchor} was already red BEFORE any merge — ${gate.detail}`,
+          },
+        ],
         gateFix: { caseId: first.caseId, branch: first.branch, files: first.files, reason: gate.reason },
         instruction: `the base ${baseRed.anchor} is broken; a GATE-FIX case has been prepared on ${first.branch} — run \`next-case\``,
       });
@@ -7585,11 +7598,16 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
         const branches = gate.cases.map((c) => c.branch).join(', ');
         progress(`verify: RED (unattributed) — ${gate.cases.length} gate-fix case(s) prepared on ${branches}`);
         console.error(`finish: gate-fix case${gate.cases.length > 1 ? 's' : ''} prepared on ${branches}`);
+        // PROCEED arm — same rule as the base-red arm in `cmdSweepStart`: cases
+        // were materialized and the agent is told to run `next-case`, so the id
+        // must ADVISE, not BLOCK. `ERR18_VERIFY_PENDING` also still marks the two
+        // genuine blocks (an ungated push, and a halted verify below), and an id
+        // cannot mean "stop" in one arm and "continue" in another.
         result(cli, {
           ok: false,
           status: 'gate-fix-required',
           stoppedAt: 'verify',
-          issues: [{ id: 'ERR18_VERIFY_PENDING', detail: gate.detail }],
+          issues: [{ id: 'WARN09_GATE_FIX_SERVED', detail: gate.detail }],
           gateFix: { caseId: first.caseId, branch: first.branch, files: first.files, reason: gate.reason },
           gateFixes: gate.cases.map((c) => ({ caseId: c.caseId, branch: c.branch, files: c.files })),
           instruction: `${gate.cases.length} GATE-FIX case(s) have been prepared (shallowest branch first: ${branches}) — run \`next-case\``,

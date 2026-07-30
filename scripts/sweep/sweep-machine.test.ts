@@ -336,7 +336,12 @@ describe('sweep start — the base gate (D-061 A)', () => {
       instruction: string;
     };
     expect(res.status).toBe('gate-fix-required');
-    expect(res.issues[0].id).toBe('ERR42_BASE_RED');
+    // A PROCEED arm must ADVISE, never BLOCK. This assertion used to demand
+    // `ERR42_BASE_RED` — the id the refusal arms carry, whose doctrine row says
+    // "stop-case 2 report". The agent obeyed the row and idled 52 minutes with a
+    // served case unworked (live 2026-07-30). `ERR*` here is the regression.
+    expect(res.issues[0].id).toBe('WARN09_GATE_FIX_SERVED');
+    expect(res.issues.some((i) => i.id.startsWith('ERR'))).toBe(false);
     // Blame must still find an OWNER for the failing path (that is what separates
     // this from the "nothing owns it" refusal below), but the CASE is rooted on
     // the base anchor — see DEFECT 4a: a commit on module/cg can never turn
@@ -3834,12 +3839,19 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     const res = JSON.parse(readFileSync(out, 'utf8')) as {
       status: string;
       gateFix: { branch: string; files: string[]; caseId: string };
+      issues: Array<{ id: string }>;
       instruction: string;
     };
     expect(res.status).toBe('gate-fix-required');
     expect(res.gateFix.branch).toBe('module/cg'); // blamed from the tsc path via owned_paths
     expect(res.gateFix.files).toEqual(['src/x.ts']);
     expect(res.instruction).toContain('next-case');
+    // PROCEED arm: it hands out a case and says `next-case`, so its id must ADVISE.
+    // It carried `ERR18_VERIFY_PENDING` — an id that elsewhere marks a genuine
+    // block (ungated push, halted verify), and doctrine's rule is "never work
+    // around a blocking id". Same defect class as the base-red arm above.
+    expect(res.issues[0].id).toBe('WARN09_GATE_FIX_SERVED');
+    expect(res.issues.some((i) => i.id.startsWith('ERR'))).toBe(false);
     // The red verify still gates everything else: nothing published or pushed.
     expect(readJournal(dir).some((e) => e.action === 'pr-published')).toBe(false);
     expect(readJournal(dir).some((e) => e.action === 'push')).toBe(false);
