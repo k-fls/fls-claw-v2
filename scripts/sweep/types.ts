@@ -99,7 +99,7 @@ export type MergeStatus =
 /**
  * Group-owned ledger branch override. Absence of an entry = active.
  * lastMergedUpstream is NOT stored — it is derived as
- * `git merge-base <branch> upstream/main` (see ledger.derivedLastMerged).
+ * `git merge-base <branch> upstream/main`, never read from this record.
  * Blockedness is ORIGIN/JOURNAL-DERIVED (D-058); the pre-D-057 independent
  * freeze fields (status:'frozen', frozenBy, heldHead, heldPaths, fixBranch,
  * pendingBehindFreeze) are retired; readLedger up-converts legacy files.

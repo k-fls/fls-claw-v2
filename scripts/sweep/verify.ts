@@ -10,8 +10,8 @@
  * static sweep-scope.yaml `recipe` is only a planless fallback). On failure,
  * attributes the breakage by re-building with one
  * recipe branch removed at a time (reverse recipe order); the offender is
- * reported so the caller can roll it back (merge.rollbackBranch) and demote
- * it to a gate-PoI. The `everything` branch itself is NEVER committed to,
+ * reported so the caller can roll it back to its journaled pre-ref and demote
+ * it to a gate-PoI (the propagation driver's §9 gate does exactly that). The `everything` branch itself is NEVER committed to,
  * reset, or pushed — the rebuild happens only in the temp worktree.
  */
 import { execFile } from 'node:child_process';
@@ -62,8 +62,8 @@ export interface VerifyOptions {
   /**
    * Workspace rr-cache directory (D-051): installed into `.git/rr-cache` BEFORE
    * the recipe build so the rebuild replays the sweep's RECORDED resolutions
-   * (mirrors merge.ts's `executeMerges`), not merely whatever preimages happen
-   * to already live in the shared cache. Null/omitted → no seeding (fixtures).
+   * (the same install the driver's own merges do), not merely whatever preimages
+   * happen to already live in the shared cache. Null/omitted → no seeding (fixtures).
    */
   rrCacheDir?: string | null;
 }
