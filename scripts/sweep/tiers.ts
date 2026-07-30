@@ -27,11 +27,6 @@ export function severity(tier: Exclude<Tier, 'deferred'>): number {
   return SEVERITY[tier];
 }
 
-/** The only tiers a resolving agent may claim (§7). */
-export function isClaimableTier(tier: string): tier is 'mechanical' | 'judged' {
-  return tier === 'mechanical' || tier === 'judged';
-}
-
 /**
  * Tier floor for a branch (§1, D-015). `edition/*` and any inventory entry
  * flagged `tier_floor: judged` never merge below JUDGED; everyone else floors

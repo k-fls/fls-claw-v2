@@ -1,9 +1,8 @@
 /**
  * scripts/sweep/types.ts — shared types for the upstream-sweep toolkit.
  *
- * Boundary artifact between the scripted core and the agentic layer is the
- * sweep report (SweepReport); mutable state is the group-owned Ledger file
- * (no state branch — dissolved 2026-07-10).
+ * Mutable state is the group-owned Ledger file (no state branch — dissolved
+ * 2026-07-10); everything else a pass produces lives in the pass dir.
  */
 
 /** PoI routing classes (feature-inventory design §4) plus pipeline extensions. */
@@ -66,38 +65,6 @@ export interface ScopeEntry {
    * mutation. Absent/false for locally-present branches.
    */
   materialize?: boolean;
-}
-
-export interface BranchScan {
-  branch: string;
-  kind: ScopeKind;
-  mergeModel: MergeModel;
-  parents: string[];
-  /** true when merge-tree vs the branch's ACTUAL merge source(s) produced no conflicts. */
-  clean: boolean;
-  /** Conflicts vs the actual merge source(s) — what the merge stage will hit. */
-  conflictFiles: string[];
-  /** Largest clean first-parent upstream commit to merge (upstream-chain model only). */
-  stopPoint: string | null;
-  /** Merge source(s) already reachable from the branch (nothing to do). */
-  upToDate: boolean;
-  /** Informational upstream/main forecast for parents-model branches (cheap merge-tree). */
-  upstreamInfo?: { clean: boolean; conflictFiles: string[] };
-}
-
-export interface SweepReport {
-  schemaVersion: 1;
-  generatedAt: string;
-  repo: string;
-  upstreamRef: string;
-  upstreamTip: string;
-  /** Base of the PoI-extraction range (exclusive). */
-  rangeBase: string;
-  branches: Record<string, BranchScan>;
-  /** Non-inventory branches ignored by the scope rule (digest drift line only). */
-  ignoredBranches: string[];
-  pois: Poi[];
-  warnings: string[];
 }
 
 /**
@@ -237,21 +204,6 @@ export interface SweepScope {
   recipe?: string[];
 }
 
-export interface RouteResult {
-  poiId: string;
-  featureId: string;
-  score: number;
-  components: { owned: number; touch: number; symbol: number; keyword: number; forced: boolean };
-}
-
-export interface RoutingOutcome {
-  routes: RouteResult[];
-  /** PoI ids that matched nothing above threshold (or only ALERTed entries). */
-  catchAll: string[];
-  /** featureId -> poiIds batched for one subagent invocation per (feature, sweep). */
-  byFeature: Record<string, string[]>;
-}
-
 export interface ValidationIssue {
   level: 'ALERT' | 'WARN';
   featureId: string | null;
@@ -264,45 +216,6 @@ export interface ValidationResult {
   /** Entries with at least one ALERT — routing fails closed for these. */
   alertedFeatureIds: string[];
   ok: boolean;
-}
-
-/** fork-registry/test-cases/*.yaml (replay harness). */
-export interface ReplayCase {
-  id: string;
-  taxonomy: string;
-  /** May carry prose ("branch (pre-sweep tip, tag ...)"); fork_base_commit is the real pin. */
-  fork_branch: string;
-  fork_base_commit: string;
-  /** "<base>..<tip>" or { from, to } — refs resolvable in the repo. Absent for propagation cases. */
-  upstream_range?: string | { from: string; to: string };
-  /** Fork-internal propagation case: merge this ref into fork_base_commit instead of an upstream range. */
-  merge_source?: string;
-  /** Commit whose tree carries the canonical resolution (rerere seeding via `seed-rerere`). */
-  resolution_ref?: string;
-  expected: {
-    /**
-     * Mechanical labels: clean | conflict | up-to-date. Registry-taxonomy
-     * labels are normalized (see replay.ts CLASSIFICATION_ALIASES);
-     * 'excluded' cases are skipped (policy, not mechanics).
-     */
-    classification: string;
-    conflicts?: string[];
-    /**
-     * Subset assertions: each object must match an actual PoI by type
-     * (+ path containment). Plain strings are prose notes and are ignored.
-     */
-    pois?: Array<{ type: PoiType; paths?: string[] } | string>;
-    stop_point?: string | null;
-  };
-}
-
-export interface ReplayResult {
-  caseId: string;
-  pass: boolean;
-  /** Case not mechanically replayable (e.g. expected classification 'excluded'). */
-  skipped?: boolean;
-  failures: string[];
-  actual: { classification: string; conflicts: string[]; poiTypes: string[]; stopPoint: string | null };
 }
 
 // ---------------------------------------------------------------------------
@@ -472,36 +385,4 @@ export interface HeldRecord {
   height: number;
   conflictedPaths: string[];
   caseId: string;
-}
-
-/**
- * Context-free cold-read verdict the driver requires before accepting
- * MECHANICAL/JUDGED (§7). The ONLY cold read since D-050: the PR-TEXT cold
- * read (`PrTextVerdict`, `prtext-*` artifacts, ERR09/ERR10/WARN04) is retired
- * — zero unique catches ever; text checks at `publish` are mechanical.
- */
-export interface ColdReadVerdict {
-  verdict: 'confirm' | 'reject';
-  /**
-   * Optional per-question answers to the three bounded questions (D-050).
-   * An `UNVERIFIABLE-FROM-REQUEST` answer on any of q1-q3 is fail-closed:
-   * the driver treats the verdict as a reject even under an overall confirm.
-   */
-  answers?: Partial<Record<'q1' | 'q2' | 'q3', string>>;
-  /** Non-empty reviewer notes (validated at resolve). */
-  notes: string;
-  /**
-   * Short (1-2 line) reviewer feedback for the RESOLVING AGENT (D-057): why
-   * the rejection / what is off. Surfaced to the agent on a reject so it can
-   * act, and reused as the PR-description prefix on a HELD escalation
-   * (scope-exceeded / rejected-2x / cap). Bounded — the driver caps it.
-   */
-  feedback?: string;
-  /**
-   * Freshness binding (§7, tightened 2026-07-20): the tree OID of the
-   * resolution the verdict attests to. Must equal `treeOf(--resolved-ref)` at
-   * resolve, so a stale verdict from an earlier resolution attempt cannot be
-   * replayed against a different tree.
-   */
-  resolvedTree: string;
 }

@@ -1,9 +1,14 @@
 # Sweep state machine — canonical agent interface (D-053)
 
-Status: owner-settled 2026-07-22. AUTHORITY on the agent-facing sweep interface.
-Supersedes the flag-based `propagate plan/run/resolve/publish/push` as the AGENT
-surface; those internals (merge-tree, heights, stacking, MERGE-POLICY tiers, D-030
-heads, verify, push) become the driver's implementation, wrapped by this machine.
+Status: owner-settled 2026-07-22. AUTHORITY on the agent-facing sweep interface —
+and, since the undoctrined command surface was removed, the ONLY interface: the
+flag-based `plan/run/resolve/publish/push/verify/unfreeze/status/report` entry points no
+longer exist. Those internals (merge-tree, heights, stacking, MERGE-POLICY tiers, D-030
+heads, verify, push) are the driver's implementation, reachable only through this
+machine's six commands — `start` runs plan, `next-case` runs run, `finish` runs
+verify → publish → push → report. `resolve` had no caller inside the machine (the
+`report-case` gate is the resolution path) and was deleted with its parallel cold
+read / scope guard / held escalation.
 MERGE-POLICY.md still governs tiers/merge/publication semantics; this file governs the
 command surface and who-does-what.
 

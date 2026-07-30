@@ -1,18 +1,20 @@
 # Mechanical propagation driver — specification
 
-> **Agent surface (D-053):** the canonical AGENT-facing interface is now the
-> five-command SWEEP STATE MACHINE — `start` / `next-case` / `report-case
-> --tier` / `report-pr` / `finish` (`scripts/sweep/sweep-machine.ts`; spec
-> `SWEEP-STATE-MACHINE.md`). The flag-based `plan`/`run`/`resolve`/`publish`/
-> `push` subcommands described below are UNCHANGED — they are the driver's
-> deterministic INTERNALS, which the state machine wraps (it drives the same
-> merge-tree/heights/DAG/tier/verify/push code). The behavioural differences on
-> the state-machine path: the cold read is run by the driver as a synchronous
-> `claude -p` subprocess (injectable), so there is NO `coldread-verdict.json`
-> file and NO freshness binding there; and HELD draft PRs publish at `report-pr`
-> (they land nothing on a target branch), ahead of the target push. On any
-> conflict of who-does-what, `SWEEP-STATE-MACHINE.md` wins for the command
-> surface.
+> **Agent surface (D-053):** the ONLY interface is the six-command SWEEP STATE
+> MACHINE — `start` / `next-case` / `report-case --tier` / `report-pr` /
+> `finish` / `abort` (`scripts/sweep/sweep-machine.ts`; spec
+> `SWEEP-STATE-MACHINE.md`). The `plan`/`run`/`publish`/`push`/`verify`/`report`
+> stages described below are UNCHANGED in behaviour but have NO standalone entry
+> point: they are the driver's deterministic INTERNALS, run by the six commands
+> (`start` → plan; `next-case` → run; `finish` → verify, publish, push, report).
+> The old `resolve`, `unfreeze` and `status` subcommands are GONE — `resolve` was
+> a second resolution path the state machine never invoked (its own
+> `coldread-verdict.json` file, freshness binding, scope guard and held
+> escalation), and the `report-case` gate is the resolution path. Where this file
+> still describes `resolve`'s verdict FILE and freshness binding, read it as
+> historical: on the state-machine path the cold read is a synchronous
+> `claude -p` subprocess (injectable) with no verdict file. On any conflict of
+> who-does-what, `SWEEP-STATE-MACHINE.md` wins for the command surface.
 
 Status: v1 (2026-07-18, owner-settled design; §13 remote branches + inventory candidates
 added 2026-07-21, D-045; §14 publish tool + result-ID contract added 2026-07-21,
@@ -22,7 +24,8 @@ pass's publishable result on the fork-trunk base, 2026-07-22, D-051). Decision r
 D-035..D-040, D-045, D-048, D-049, D-050 and D-051 point to the decision log
 (`self-maintenance-decisions.md`). Supersedes the agent-sequenced merge
 loop of DESIGN.md §5-6 for propagation ordering, merge execution, and case handling;
-scan/PoI routing/inventory/verify machinery is reused, not replaced.
+the inventory + verify machinery is reused, not replaced (the scan/PoI-routing stages of
+DESIGN.md §5 are retired outright — see §10).
 
 **Motivation (owner, 2026-07-18):** the sweep relied on agent behavior for sequencing and
 scope/framing of merges and PRs; the 2026-07-13/14 incidents and the 2026-07-18 rollback
@@ -90,8 +93,8 @@ A **pass** is one driver run over the whole inventory DAG.
 
 "Merging up to height k conflicts" is **not monotonic in k**: a later upstream commit
 can rewrite a disputed region so the tip-level three-way merge is clean again. The
-existing `stop-points.ts` bisection embeds the monotonicity assumption and is therefore
-NOT reused for propagation (it stays for the scan's informational forecast only).
+retired scan's stop-point bisection embedded the monotonicity assumption and was
+therefore never reused for propagation.
 
 Per branch and per parent, over the parent's *eligible line* (§4):
 
@@ -321,7 +324,7 @@ After a JUDGED resolution or a HELD freeze the driver **prepares** the PR MATERI
 never PR prose: it writes `pr/materials.md` (conflicted paths, the case run, per-side
 `git log --oneline` over those paths, reproduction command) into the case dir. The agent
 studies the case and writes `pr/title.txt` + `pr/body.md` itself; the PR is then created
-EXCLUSIVELY by `propagate publish --case <id>` (§14, D-048/D-049). PR heads are REAL
+EXCLUSIVELY by the driver's `publish` stage (§14, D-048/D-049). PR heads are REAL
 commits pushed by the driver via `git push` — never synthetic constructions, never API
 ref fabrication (the 2026-07-21 exhibit-head mechanism is retired by D-049):
 
@@ -346,31 +349,34 @@ journaled, surfaced as `ERR15_PUSH_FAILED`, and REPORTED to the owner (D-046 cas
 
 ## 8. Driver loop
 
+The stages below are INTERNAL — none is invocable on its own; the bracketed command is
+the state-machine command that runs it (SWEEP-STATE-MACHINE.md).
+
 ```
-propagate plan                # pin watermark, enumerate heights, derive coverage, emit plan.json
-propagate run                 # execute plan: CLEAN merges + skips + DEFERRED marks; halt at first
-                              #   case needing judgment per branch; emit case files; continue with
-                              #   other branches (one branch's case never blocks siblings, only
-                              #   descendants via the barrier)
-propagate resolve --case ID --tier T   # scope guard + cold-read gate, then merge (MECHANICAL) or
-                              #   prepare PR materials (JUDGED) or freeze (HELD); reopens the branch
-propagate publish --case ID   # §14 (D-048/D-049): the ONLY PR-creation path — check battery;
-                              #   --execute pushes the fix/sweep ref (git push) and creates
-                              #   the PR via the GitHub API (JUDGED non-draft, HELD draft)
-propagate push                # §14.4 (D-049): verify-gated pass pushes — target branches
-                              #   (flips JUDGED PRs to merged), closure checks, posted urges
-propagate status              # human-readable pass state from journal + derivation
-propagate report              # D-052: journal-ONLY end-of-sweep summary (merged / resolved /
-                              #   held / open-cases / pushed + escalations); no git, no GitHub, so
-                              #   a dead/abnormally-terminated session still leaves a readable
-                              #   status. The D-046 owner message is a thin wrapper over it.
-                              #   --out <file> also writes the summary as JSON
+plan     [start]      # pin watermark, enumerate heights, derive coverage, emit plan.json
+run      [next-case]  # execute plan: CLEAN merges + skips + DEFERRED marks; halt at first
+                      #   case needing judgment per branch; emit case files; continue with
+                      #   other branches (one branch's case never blocks siblings, only
+                      #   descendants via the barrier)
+verify   [finish]     # §9 gate: everything-rebuild + CI commands, leave-one-out attribution;
+                      #   red -> roll back the offender + HELD(gate)
+publish  [finish]     # §14 (D-048/D-049): the ONLY PR-creation path — check battery, then
+                      #   push the fix/sweep ref (git push) and create the PR via the
+                      #   GitHub API (JUDGED non-draft, HELD active-or-draft per D-057)
+push     [finish]     # §14.4 (D-049): verify-gated pass pushes — target branches
+                      #   (flips JUDGED PRs to merged), closure checks, posted urges
+report   [finish]     # D-052: journal-ONLY end-of-sweep summary (merged / resolved /
+                      #   held / open-cases / pushed + escalations); no git, no GitHub, so
+                      #   a dead/abnormally-terminated session still leaves a readable
+                      #   status. The D-046 owner message is a thin wrapper over it.
 ```
 
-`--tier held` is the direct freeze path: no resolution commit required, no scope guard
-or cold-read gate — the driver prepares the PR materials (§14) and journals HELD. This
-is how an agent declares "cannot resolve" without a resolution attempt; the freeze PR
-itself is published separately via `publish`.
+The resolution stage is `report-case` (SWEEP-STATE-MACHINE.md): checks gate, then the
+cold read, then merge (MECHANICAL), PR materials (JUDGED) or freeze (HELD), reopening the
+branch and its descendants. `--tier held` is the direct freeze path: no resolution commit
+required, no scope guard or cold-read gate — the driver prepares the PR materials (§14)
+and journals HELD, and `finish` publishes it. This is how an agent declares "cannot
+resolve" without a resolution attempt.
 
 **Same-pass continuation:** a gated branch is still journaled `arrived` (barrier
 semantics — descendants may proceed on its partial progress), but every `resolve`
@@ -429,8 +435,8 @@ branch, its pre-pass tip is journaled (`pre-ref`) — the §9 rollback target.
 **Unfreeze paths:** (a) DERIVED — at plan/attach time, a ledger-frozen branch whose
 current tip already CONTAINS its `heldHead` (the resolution landed externally, e.g.
 the owner merged the freeze PR) is auto-unfrozen (journaled, reason `derived`);
-(b) a mechanical/judged `resolve` on the branch unfreezes it; (c) manual override via
-a journaled subcommand. Freezes are never cleared silently.
+(b) a mechanical/judged `report-case` on the branch unfreezes it. Freezes are never
+cleared silently (the manual-override subcommand is gone).
 
 **Urging (owner 2026-07-20; posting mechanized 2026-07-21, D-049):** the
 ledger-frozen entry also carries `lastUrgedHead` and the freeze PR's `prNumber`.
@@ -461,14 +467,14 @@ resolved scope — regardless of what a step/case file or CLI flag says.
 
 ## 9. Verification gate
 
-Implemented as `propagate verify` (reusing the existing `verify.ts` everything-rebuild
-+ CI command list with leave-one-out attribution): run it after `run` completes the
-executable portion of a pass and after each `resolve` that lands a merge. Red result →
+Implemented as the driver's `verify` stage, run by `finish` (reusing `verify.ts`'s
+everything-rebuild + CI command list with leave-one-out attribution), after `run` has
+completed the executable portion of the pass. Red result →
 the offending branch is rolled back to its journaled `pre-ref` (recorded before its
 first mutation this pass) and journaled HELD(gate) + ledger-frozen (D-012); re-verify
 without it. A pass is only `pass-complete` when the gate is green. Nothing is pushed
 before verification passes (D-034 gate 1-2 additionally apply to any push):
-`propagate push` refuses (`ERR18_VERIFY_PENDING`) unless the journal shows a green
+the push stage refuses (`ERR18_VERIFY_PENDING`) unless the journal shows a green
 `verify` after the pass's last mutation (§14.4).
 
 **The recipe = THIS PASS'S PUBLISHABLE RESULT (D-051, 2026-07-22).** The gate must
@@ -502,15 +508,16 @@ ONLY for a publishable branch that WOULD be pushed this pass. The static `recipe
 | `deferred.ts` | ancestor-HELD matching rule (§5) |
 | `scope-guard.ts` | automerge-vs-resolved subset check (§7) |
 | `steps.ts` | step/case JSON schemas + first-principles re-verification |
-| `propagate.ts` | CLI (`plan/run/resolve/publish/push/status`), journal, worktree + PR-materials preparation, pass pushes |
+| `propagate.ts` | the six-command surface + the internal plan/run/publish/push/verify/report stages, journal, worktree + PR-materials preparation, pass pushes |
 | `candidates.ts` | inventory-candidate discovery + inheritance derivation + report throttle (§13, D-045) |
 | `publish.ts` | §14 (D-048/D-049/D-050): result-id registry + halt-id mapping, mechanical text checks (ERR08 + lint WARNs + ERR05/ERR06; the PR-text cold read is retired), pre-PR height check, D-004 machine block, GitHub REST transport (injectable) |
 
-Reused as-is: `git.ts` (merge-tree, rev-list, worktree helpers), `merge.ts` (merge-tree
-+ commit-tree + update-ref execution, rerere install), `scan.ts`/`routing.ts` (PoI
-annotate flow, unchanged), `scope.ts` (inventory scope + D-032b/D-033 composition),
-`verify.ts`, `ledger.ts` (freeze bookkeeping), `record.ts`, `registry.ts`.
-`stop-points.ts` remains for the scan forecast; propagation never calls it.
+Reused as-is: `git.ts` (merge-tree, rev-list, worktree helpers), `merge.ts` (the shared
+rerere cache), `scope.ts` (inventory scope + D-032b/D-033 composition), `verify.ts`,
+`ledger.ts` (freeze bookkeeping), `registry.ts`. The retired scan/PoI-routing modules
+(`scan.ts`, `routing.ts`, `record.ts`, `replay.ts`, `stop-points.ts`) and the `sweep.ts`
+pipeline they served are gone; propagation never called them. `validate.ts` stays as
+`sweep.ts validate-registry` — the `fork-registry-generate` skill runs it.
 
 ## 11. Testing
 
@@ -547,10 +554,8 @@ afterthought:
 
 - a wrapper (or separate OS/service identity) that pins the CLI flags (`--repo`,
   `--workspace`, `--upstream`, `--ledger`, config paths), owns the pass directory and
-  ledger read-write, and is the only principal allowed to run `run`/`resolve`/`verify`
-  with `--execute`;
-- `unfreeze` gated on owner action (the driver journals reason and requires
-  `--execute`, but cannot distinguish principals — N2);
+  ledger read-write, and is the only principal allowed to run the mutating commands
+  (`next-case`/`report-case`/`finish`);
 - cold-read PROVENANCE attested outside the workspace (the driver validates shape and
   freshness only);
 - push/PR execution behind the fork's enforcement layer: agent identity separation,
@@ -689,7 +694,7 @@ back-door). (b) and (c) — the agent-writes-prose principle, ERR05/ERR06 — st
 (The PR-text cold read that D-048 added for (b) is itself retired by D-050 — it never
 caught anything ERR05/ERR06 did not; text checks are now mechanical, §14.2.)
 
-### 14.1 `propagate publish --case <id>` — the ONLY sanctioned PR-creation path
+### 14.1 The `publish` stage — the ONLY sanctioned PR-creation path
 
 **Agent-writes-prose principle:** the driver NEVER generates PR prose. At
 resolve/freeze it writes `pr/materials.md` (structured facts only: conflicted paths,
@@ -805,14 +810,14 @@ human text stays in `detail`; the journal keeps the raw reason plus the id):
 | `ERR24_PLAN_DRIFT` | plan drift — git moved under us (§8) |
 | `ERR25_BAD_CASE_ID` | `--case` does not match the generated case-id shape (N5) |
 
-### 14.4 `propagate push` — the pass publication stage (D-049)
+### 14.4 The `push` stage — pass publication (D-049)
 
 The DRIVER pushes; the agent never hand-pushes anything. Per-pass order (owner,
 D-049): **verify green → JUDGED PRs created (`publish`, non-draft, head = the real
 merge commit on a pushed fix/sweep ref) → `push` pushes the target branches (the
 same commits land on the bases; GitHub auto-flips the JUDGED PRs to merged, D-040)
 → HELD draft PRs created (`publish`; bases now current, diff = the case run) →
-urge comments posted.** `propagate push --execute [--token-file <path>]`:
+urge comments posted.** The push stage (run by `finish`):
 
 1. **Verify gate**: refuses (`ERR18_VERIFY_PENDING`) unless the journal shows a
    green `verify` after the pass's last `merge`/`resolved` (nothing is pushed

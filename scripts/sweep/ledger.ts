@@ -5,16 +5,13 @@
  *  - DERIVED: lastMergedUpstream = `git merge-base <branch> <upstream>` —
  *    never stored, always computed.
  *  - GROUP-OWNED: freeze/exclude overrides, open PoIs, last-sweep record →
- *    the ledger JSON file in the group workspace (--ledger), plus an
- *    append-only sweep-log.jsonl journal next to it.
+ *    the ledger JSON file in the group workspace (--ledger).
  *  - CONFIG: exclusion policy lives in scripts/sweep/registry/scope.yaml
  *    (committed), not here.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 
-import { LOG_FILENAME, REPORTS_DIRNAME } from './config.js';
-import { git } from './git.js';
 import type { Ledger, LedgerBranch, MergeStatus } from './types.js';
 
 export function emptyLedger(): Ledger {
@@ -28,15 +25,6 @@ export function defaultLedgerBranch(): LedgerBranch {
     notes: '',
     lastUrgedHead: null,
   };
-}
-
-/**
- * Legacy blocked predicate over the ledger CACHE — used by the old sweep merge
- * stage only. The propagation driver derives blockedness from origin + the
- * pass journal instead (D-058) and never consults this.
- */
-export function isBlocked(b: LedgerBranch | undefined): boolean {
-  return (b?.merge_status ?? null) !== null;
 }
 
 /**
@@ -85,40 +73,4 @@ export function readLedger(path: string): Ledger {
 export function writeLedger(path: string, ledger: Ledger): void {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(ledger, null, 2) + '\n');
-}
-
-export interface LogEntry {
-  ts: string;
-  action: string;
-  [key: string]: unknown;
-}
-
-/** Append a journal row to <workspace>/sweep-log.jsonl. */
-export function appendSweepLog(workspace: string, entry: Omit<LogEntry, 'ts'>): void {
-  mkdirSync(workspace, { recursive: true });
-  appendFileSync(join(workspace, LOG_FILENAME), JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n');
-}
-
-export function readSweepLog(workspace: string): LogEntry[] {
-  const path = join(workspace, LOG_FILENAME);
-  if (!existsSync(path)) return [];
-  return readFileSync(path, 'utf8')
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as LogEntry);
-}
-
-/** Archive path for a sweep report inside the workspace. */
-export function reportArchivePath(workspace: string, sweepId: string): string {
-  return join(workspace, REPORTS_DIRNAME, `${sweepId.replace(/[:]/g, '')}.json`);
-}
-
-/**
- * DERIVED state: the last upstream first-parent commit already merged into
- * the branch = merge-base(branch, upstreamRef). Replaces the previously
- * stored lastMergedUpstream field.
- */
-export async function derivedLastMerged(repo: string, branch: string, upstreamRef: string): Promise<string | null> {
-  const res = await git(repo, ['merge-base', branch, upstreamRef], { allowCodes: [1, 128] });
-  return res.code === 0 ? res.stdout.trim() : null;
 }

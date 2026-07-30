@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { defaultInventoryDir } from './config.js';
-import { loadFeatures, loadRegistry, loadReplayCases, loadRoutingConfig, parseFeatureEntry } from './registry.js';
+import { loadFeatures, loadRegistry, loadRoutingConfig, parseFeatureEntry } from './registry.js';
 
 const scratch = mkdtempSync(join(tmpdir(), 'sweep-registry-'));
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
@@ -67,19 +67,6 @@ describe('local-tree loaders', () => {
     expect(warnings[0]).toContain('does not exist');
     const { routing } = loadRoutingConfig(join(scratch, 'no-routing.yaml'));
     expect(routing.threshold).toBe(6);
-  });
-
-  it('loads replay cases from a local directory', () => {
-    const casesDir = join(scratch, 'cases');
-    mkdirSync(casesDir, { recursive: true });
-    writeFileSync(
-      join(casesDir, 'ok.yaml'),
-      'id: c1\ntaxonomy: T1\nfork_branch: feat/x\nfork_base_commit: abc\nupstream_range: a..b\nexpected:\n  classification: clean\n',
-    );
-    writeFileSync(join(casesDir, 'bad.yaml'), 'id: c2\ntaxonomy: T1\n');
-    const { cases, warnings } = loadReplayCases(casesDir);
-    expect(cases.map((c) => c.id)).toEqual(['c1']);
-    expect(warnings.some((w) => w.includes('bad.yaml'))).toBe(true);
   });
 
   it('the committed bootstrap snapshot is the default inventory and parses clean', () => {

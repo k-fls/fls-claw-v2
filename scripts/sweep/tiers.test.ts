@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { applyFloor, demoteToHeld, isClaimableTier, severity, tierFloor } from './tiers.js';
+import { applyFloor, demoteToHeld, severity, tierFloor } from './tiers.js';
 import type { FeatureEntry } from './types.js';
 
 describe('tier floors (D-015)', () => {
@@ -32,14 +32,6 @@ describe('legal transitions are demote-only (D-035)', () => {
     // Scope violation is HELD-with-no-merge (2026-07-20): a one-tier demotion
     // would still land the out-of-scope content.
     expect(demoteToHeld()).toBe('held');
-  });
-
-  it('only mechanical/judged are claimable by the agent', () => {
-    expect(isClaimableTier('mechanical')).toBe(true);
-    expect(isClaimableTier('judged')).toBe(true);
-    expect(isClaimableTier('clean')).toBe(false);
-    expect(isClaimableTier('held')).toBe(false);
-    expect(isClaimableTier('deferred')).toBe(false);
   });
 
   it('severity ladder is clean<mechanical<judged<held', () => {

@@ -4,17 +4,7 @@ import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { makeSweepFixture } from './fixtures.js';
-import {
-  appendSweepLog,
-  defaultLedgerBranch,
-  derivedLastMerged,
-  emptyLedger,
-  isBlocked,
-  readLedger,
-  readSweepLog,
-  reportArchivePath,
-  writeLedger,
-} from './ledger.js';
+import { defaultLedgerBranch, emptyLedger, readLedger, writeLedger } from './ledger.js';
 
 const workspace = mkdtempSync(join(tmpdir(), 'sweep-ws-'));
 const { repo, chain } = makeSweepFixture();
@@ -47,19 +37,6 @@ describe('ledger round-trip (plain files, no git)', () => {
     const bad = join(workspace, 'bad-ledger.json');
     writeLedger(bad, { ...emptyLedger(), schemaVersion: 99 as unknown as 1 });
     expect(() => readLedger(bad)).toThrow(/schemaVersion 99/);
-  });
-
-  it('appends journal rows to sweep-log.jsonl', () => {
-    appendSweepLog(workspace, { action: 'test-1' });
-    appendSweepLog(workspace, { action: 'test-2', extra: 42 });
-    const log = readSweepLog(workspace);
-    expect(log.map((l) => l.action)).toEqual(['test-1', 'test-2']);
-    expect(log[1].extra).toBe(42);
-    expect(log.every((l) => typeof l.ts === 'string')).toBe(true);
-  });
-
-  it('report archive paths strip colons', () => {
-    expect(reportArchivePath('/ws', '2026-07-10T12:00:00.000Z')).toBe('/ws/reports/2026-07-10T120000.000Z.json');
   });
 });
 
@@ -100,33 +77,5 @@ describe('readLedger — legacy freeze-field up-convert (D-057)', () => {
     expect('heldPaths' in b).toBe(false); // DEFER is pure height-MIN — paths retired
     expect('frozenBy' in b).toBe(false);
     expect('pendingBehindFreeze' in b).toBe(false);
-  });
-
-  it('isBlocked ⇔ merge_status != NONE, for both states', () => {
-    expect(isBlocked(undefined)).toBe(false);
-    expect(isBlocked({ ...defaultLedgerBranch() })).toBe(false);
-    expect(isBlocked({ ...defaultLedgerBranch(), merge_status: { state: 'DEFERRED' } })).toBe(true);
-    expect(
-      isBlocked({
-        ...defaultLedgerBranch(),
-        merge_status: { state: 'PR_ID', caseId: 'c', headSha: null, fixBranch: null, prNumber: null },
-      }),
-    ).toBe(true);
-  });
-});
-
-describe('derivedLastMerged (merge-base, replaces stored lastMergedUpstream)', () => {
-  it('is the fork point before any merge, and the merged stop point after', async () => {
-    const base = repo.sha('main');
-    expect(await derivedLastMerged(repo.dir, 'feat/two', 'upstream-main')).toBe(base);
-    // Merge U2 into feat/two -> merge-base moves to U2.
-    repo.checkout('feat/two');
-    repo.git('merge', '--no-edit', chain[1]);
-    repo.checkout('main');
-    expect(await derivedLastMerged(repo.dir, 'feat/two', 'upstream-main')).toBe(chain[1]);
-  });
-
-  it('returns null for a missing branch', async () => {
-    expect(await derivedLastMerged(repo.dir, 'no/such-branch', 'upstream-main')).toBeNull();
   });
 });

@@ -114,6 +114,14 @@ every mutation is validated + journaled). Every sweep appends a row to
 
 ## 5. Scripted core — stages
 
+> **RETIRED (2026-07-30).** The `fetch|ff-main|scan|stop-points|merge|verify|record|
+> status|route|replay|seed-rerere` pipeline below no longer exists: nothing outside this
+> document invoked it and none of it was on the agent's doctrined surface. Propagation,
+> verification and publication are the propagation driver's (`PROPAGATION.md`), driven by
+> the six-command state machine (`SWEEP-STATE-MACHINE.md`). `sweep.ts` survives with ONE
+> subcommand — `validate-registry` (stage 0 of the runbook, step 3 of the
+> `fork-registry-generate` skill). Kept as historical record.
+
 `sweep.ts` subcommands (each idempotent; a crashed sweep re-runs from the top and
 converges — no partial-state corruption):
 
@@ -211,10 +219,10 @@ registry updates made. HIGH-PRIORITY overlaps are called out on top.
 ## 7. Registries the group maintains
 
 - **Feature inventory** — spec from design subagent (separate doc).
-- **Test-case registry** — mined cases (separate doc); `sweep.ts test <case-id>`
-  creates a throwaway worktree at the case's base commit, replays the upstream range,
-  asserts the pipeline's classification matches `expected`. Run before changing sweep
-  tooling itself (the pipeline tests the pipeline).
+- **Test-case registry** — mined cases (separate doc). The `replay`/`seed-rerere`
+  harness that consumed `test-cases/cases/*.yaml` is retired with `sweep.ts`; the
+  propagation cases under `test-cases/propagation/` are still exercised by
+  `propagation-cases.test.ts`.
 - **rerere cache** — `sweep/rr-cache/` committed on the maintenance branch; installed
   into the clone's .git/rr-cache (or via rerere.rrCachePath equivalent symlink) before
   stage 5; new resolutions from case-2 PRs are exported back.
@@ -222,7 +230,8 @@ registry updates made. HIGH-PRIORITY overlaps are called out on top.
 ## 8. Safety rails / policy
 
 - Push policy (rewritten by D-049 §5): the DRIVER pushes — verify-gated,
-  journaled pass pushes (`propagate push` + `publish`) are the ONLY pushes; the
+  journaled pass pushes (the driver's `push` + `publish` stages, run by `finish`)
+  are the ONLY pushes; the
   agent never hand-pushes anything. `edition/*` merges floor at JUDGED and
   AUTO-MERGE (D-049 — owner-gating only by escalation to HELD; supersedes the
   earlier "case-3 minimum"). NOTHING is deployed by this procedure; "ready to
@@ -230,8 +239,8 @@ registry updates made. HIGH-PRIORITY overlaps are called out on top.
 - The group never force-pushes, never rebases published branches, never touches
   `everything` except scripted rebuilds in temp worktrees, never writes to `main`
   except FF.
-- All destructive-ish git (update-ref, worktree add/remove) happens inside sweep.ts
-  with journaling; agents call subcommands, not raw git, for state mutations.
+- All destructive-ish git (update-ref, worktree add/remove) happens inside the driver
+  with journaling; agents call its commands, not raw git, for state mutations.
 - API-error resilience (D-008): the group's orchestration retries dead subagents (≤2),
   checkpoints between stages (state file), and every stage is resumable.
 
@@ -240,10 +249,11 @@ registry updates made. HIGH-PRIORITY overlaps are called out on top.
 The estate topology, credentials (GitHub App per-child scopes), trust chain, updater,
 and bootstrap sequence are already designed in `docs/design/02-self-maintaining-flsclaw.md`
 (§3, §6-8, §11) — this spec does not redesign them. The sweep scripts slot in as:
-watcher runs `sweep.ts fetch|scan` in its no-push clone; maintainer consumes the report
-and runs PoI classification subagents (feature-inventory prompts); change-author runs
-`sweep.ts merge|verify|record` in its RW working clone and opens the PRs. At M0, the
-operator runs all stages by hand. Estate scaffolds live under `estate/` per doc 02 §11
+watcher runs the fetch/scan stages in its no-push clone; maintainer consumes the report
+and runs PoI classification subagents (feature-inventory prompts); change-author runs the
+merge/verify/record stages in its RW working clone and opens the PRs. (Retired with
+`sweep.ts` — see the §5 banner; the live shape is one group running the state machine.)
+Estate scaffolds live under `estate/` per doc 02 §11
 (to be authored when the estate is bootstrapped; blocked on feat/dependent-groups
 recovery — out of scope for this implementation round beyond the directory layout).
 
@@ -312,9 +322,9 @@ deviations from the letter of this spec and the feature-registry design:
      telegram branch). Scope = inventory branches UNION include-glob matches,
      minus exclusions — no state file participates.
    - The rerere cache is local/ephemeral under the workspace
-     (`<workspace>/rr-cache/`); `seed-rerere` rebuilds it from pinned T2
-     resolution cases (`resolution_ref` = the recorded merge commit carrying
-     the canonical resolution), replayed in detached temp worktrees.
+     (`<workspace>/rr-cache/`); the driver installs it into `.git/rr-cache`
+     before merging (`merge.ts`). The `seed-rerere` rebuild-from-pinned-cases
+     stage is retired with `sweep.ts`.
    - `--state-branch` no longer exists anywhere in the CLI.
 
 6. **2026-07-14 merge-source correction (owner directive).** The original

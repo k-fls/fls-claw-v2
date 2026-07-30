@@ -15,14 +15,8 @@ import { join } from 'node:path';
 
 import { parse } from 'yaml';
 
-import {
-  DEFAULT_CASES_DIR,
-  DEFAULT_ROUTING,
-  DEFAULT_ROUTING_FILE,
-  DEFAULT_SCOPE_FILE,
-  defaultInventoryDir,
-} from './config.js';
-import type { FeatureEntry, ReplayCase, RoutingConfig, SweepScope } from './types.js';
+import { DEFAULT_ROUTING, DEFAULT_ROUTING_FILE, DEFAULT_SCOPE_FILE, defaultInventoryDir } from './config.js';
+import type { FeatureEntry, RoutingConfig, SweepScope } from './types.js';
 
 export interface RegistryLoad {
   features: FeatureEntry[];
@@ -143,35 +137,4 @@ export function loadRegistry(opts: LoadRegistryOptions = {}): RegistryLoad {
     scope: scope.scope,
     warnings: [...feat.warnings, ...routing.warnings, ...scope.warnings],
   };
-}
-
-/** Replay cases from a local directory (one case or a list per file). */
-export function loadReplayCases(casesDir: string = DEFAULT_CASES_DIR): { cases: ReplayCase[]; warnings: string[] } {
-  const warnings: string[] = [];
-  const cases: ReplayCase[] = [];
-  if (!existsSync(casesDir)) {
-    warnings.push(`cases directory '${casesDir}' does not exist`);
-    return { cases, warnings };
-  }
-  const files = readdirSync(casesDir)
-    .filter((f) => f.endsWith('.yaml') || f.endsWith('.yml'))
-    .sort();
-  for (const file of files) {
-    try {
-      const doc = parse(readFileSync(join(casesDir, file), 'utf8')) as ReplayCase | ReplayCase[] | null;
-      const list = Array.isArray(doc) ? doc : doc ? [doc] : [];
-      for (const c of list) {
-        if (!c.id || !c.fork_branch || !c.expected || (!c.upstream_range && !c.merge_source)) {
-          warnings.push(
-            `${file}: case missing required fields (id/fork_branch/expected + upstream_range|merge_source)`,
-          );
-          continue;
-        }
-        cases.push(c);
-      }
-    } catch (err) {
-      warnings.push(`${file}: YAML parse error: ${(err as Error).message}`);
-    }
-  }
-  return { cases, warnings };
 }

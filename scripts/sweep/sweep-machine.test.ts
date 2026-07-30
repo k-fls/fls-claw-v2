@@ -3668,8 +3668,8 @@ describe('sweep start — canonical pass location + clean-slate boundary (D-055)
   });
 
   it('C-1: --workspace defaults to the GROUP ROOT (parent of --repo); an explicit one is honored', () => {
-    expect(parseCli(['status', '--repo', '/srv/grp/repo']).workspace).toBe('/srv/grp');
-    expect(parseCli(['status', '--repo', '/srv/grp/repo', '--workspace', '/srv/grp']).workspace).toBe('/srv/grp');
+    expect(parseCli(['next-case', '--repo', '/srv/grp/repo']).workspace).toBe('/srv/grp');
+    expect(parseCli(['next-case', '--repo', '/srv/grp/repo', '--workspace', '/srv/grp']).workspace).toBe('/srv/grp');
   });
 
   it('C-1: start REFUSES a --workspace that IS the --repo clone (never lands in the clone)', async () => {

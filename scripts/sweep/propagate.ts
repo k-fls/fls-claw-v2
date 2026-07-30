@@ -1,35 +1,16 @@
 /**
- * scripts/sweep/propagate.ts — mechanical propagation driver CLI
+ * scripts/sweep/propagate.ts — mechanical propagation driver
  * (PROPAGATION.md §8, D-035..D-040).
  *
  * Usage:
- *   pnpm exec tsx scripts/sweep/propagate.ts <plan|run|resolve|verify|status> [flags]
+ *   pnpm exec tsx scripts/sweep/propagate.ts <sweep-start|next-case|report-case|report-pr|sweep-finish|sweep-abort> [flags]
  *
- * Subcommands:
- *   plan                          OPEN a pass: pin watermark + fork point, derive coverage,
- *                                 emit plan-initial.json + plan.json (only plan opens a pass)
- *   run                           attach to the open pass; CLEAN merges + skips + DEFERRED;
- *                                 halt at the first case PER BRANCH; emit case files (MUTATES)
- *   resolve --case ID --tier T    re-verify the case from git+registry, scope-guard + cold-read
- *                                 gate, then merge (MECHANICAL), prepare PR materials (JUDGED),
- *                                 or freeze (HELD, --tier held direct)                 (MUTATES)
- *   publish --case ID             §14 (D-048/D-049, unified per D-057): the ONLY sanctioned
- *                                 PR-creation path — verify the case, run the check battery +
- *                                 pre-PR height check (machine-readable {ok, issues, pr?}), and
- *                                 with --execute push the fix/sweep ref (git push) at the REAL
- *                                 head and create the PR via the GitHub API. HELD with a
- *                                 marker-clean resolution: ACTIVE PR at the resolved merge
- *                                 commit (owner reviews & merges); HELD without one: DRAFT PR
- *                                 from the pristine conflict; JUDGED: non-draft at the merge
- *                                 commit                                               (MUTATES)
- *   push                          §14.4 (D-049): verify-gated pass publication — push target
- *                                 branches (flips JUDGED PRs to merged), closure checks, post
- *                                 urge comments + D-004 machine-block refresh           (MUTATES)
- *   verify                        §9 gate: everything-rebuild + CI commands, leave-one-out
- *                                 attribution; red -> rollback offender + HELD(gate)   (MUTATES)
- *   unfreeze --branch <b>         manually clear a branch's block for THIS pass (journaled;
- *                                 origin re-derives at the next start, D-058)          (MUTATES)
- *   status                        human-readable pass state from journal + ledger
+ * The D-053 state machine (SWEEP-STATE-MACHINE.md) is the ONLY command surface —
+ * the same six commands `sweep-machine.ts` wraps under their agent-facing names.
+ * The deterministic stages (plan, run, publish, push, verify, report) are
+ * INTERNAL steps of those six and have no standalone entry point: `sweep-start`
+ * runs plan, `next-case` runs run, `sweep-finish` runs verify → publish → push →
+ * report.
  *
  * Flags:
  *   --repo <path>            repo to operate on                (default: cwd)
@@ -39,29 +20,25 @@
  *   --inventory <dir>        live feature inventory            (default: latest bootstrap snapshot)
  *   --scope-config <file>    scope policy                      (default: registry/scope.yaml)
  *   --routing-config <file>  router/scan tuning                (default: registry/routing.yaml)
- *   --upstream <ref>         upstream ref (plan only)          (default: upstream/main)
- *   --base <ref>             trunk-chain fork point (plan only)(default: FORK_POINT else merge-base)
- *   --execute                perform mutations (run/resolve/verify); without it, dry-run
- *   --case <id>              resolve/publish: the case id
- *   --tier <mechanical|judged|held>  resolve: the agent's claimed tier (held = direct freeze)
- *   --resolved-ref <ref>     resolve: commit carrying the agent's resolution (tree source)
- *   --token-file <path>      every networked subcommand (publish/push, and sweep start's
- *                            origin PR checks — D-049/D-058): file holding the substitute
+ *   --upstream <ref>         upstream ref (sweep-start only)   (default: upstream/main)
+ *   --base <ref>             trunk-chain fork point            (default: FORK_POINT else merge-base)
+ *   --dry-run                compute without writing (execute is the default, D-060)
+ *   --tier <mechanical|judged|held>  report-case: the agent's claimed tier
+ *   --token-file <path>      sweep-start/sweep-finish: file holding the substitute
  *                            GitHub token (the agent writes the get_credential output there
  *                            once per session; the credential proxy swaps the Authorization
  *                            header on the wire)
- *   --branch <name>          unfreeze: the branch to clear
- *   --recipe <a,b,c>         verify: everything-rebuild recipe (default: scope.yaml recipe)
- *   --commands-file <file>   verify: CI command list JSON [{cmd,cwd?}] (test injection)
- *   --out <file>             write the subcommand's JSON artifact to a file
+ *   --checks-file <path>     sweep-start: the checks config    (default: scripts/sweep/checks.json)
+ *   --commands-file <file>   sweep-finish: CI command list JSON [{cmd,cwd?}] (test injection)
+ *   --out <file>             write the command's JSON artifact to a file
  *
  * Artifacts live under <workspace>/propagation/pass-<watermark12>/:
  *   plan-initial.json (immutable opening snapshot), plan.json (working), step files,
  *   case-<id>/case.json (+ coldread-request.md, pr/materials.md), journal.jsonl
- *   (append-only). case.json is a POINTER only — resolve re-derives everything from
+ *   (append-only). case.json is a POINTER only — report-case re-derives everything from
  *   git+registry (§7 trust boundary). The driver NEVER generates PR prose (D-048): the
- *   agent writes pr/title.txt + pr/body.md from studying the case. `publish`, `push`
- *   and `sweep start` are the only subcommands that touch the network (git push/fetch +
+ *   agent writes pr/title.txt + pr/body.md from studying the case. `sweep-start` and
+ *   `sweep-finish` are the only commands that touch the network (git push/fetch +
  *   GitHub REST — §14/§14.4, D-049/D-058); refs move via git push ONLY, and any push
  *   failure is a hard halt reported to the owner (D-046 case 2), never worked around.
  *
@@ -79,7 +56,6 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
-  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -115,7 +91,6 @@ import {
   CANDIDATE_STANDING_INSTRUCTION,
   candidateSectionLines,
   deriveCandidates,
-  readCandidateFiles,
   reconcileCandidates,
 } from './candidates.js';
 import { attributeFailure, parseFailingFiles } from './attribute.js';
@@ -157,7 +132,7 @@ import {
   type PrReview,
 } from './publish.js';
 import { buildStepFile, caseId, readCaseFile, slug, verifyStepFile, writeJsonFile } from './steps.js';
-import { applyFloor, isClaimableTier, tierFloor } from './tiers.js';
+import { applyFloor, tierFloor } from './tiers.js';
 import {
   allParentsSkipped,
   deriveBranch,
@@ -173,7 +148,6 @@ import { verifyEverything, type VerifyCommand } from './verify.js';
 import type {
   BranchPlan,
   CaseFile,
-  ColdReadVerdict,
   FeatureEntry,
   Head,
   HeldRecord,
@@ -235,7 +209,7 @@ interface Cli {
 }
 
 const USAGE =
-  'Usage: pnpm exec tsx scripts/sweep/propagate.ts <plan|run|resolve|publish|push|verify|unfreeze|status|report> [--repo <path>] [--workspace <dir>] [--ledger <file>] [--pass <wm12>] [--dry-run] [--case <id>] [--tier <t>] [--inventory <dir>] [--checks-file <path>] [--branch <b>] [flags]';
+  'Usage: pnpm exec tsx scripts/sweep/propagate.ts <sweep-start|next-case|report-case|report-pr|sweep-finish|sweep-abort> [--repo <path>] [--workspace <dir>] [--ledger <file>] [--pass <wm12>] [--dry-run] [--tier <t>] [--inventory <dir>] [--checks-file <path>] [flags]';
 
 function parseCli(argv: string[]): Cli {
   const [cmd, ...rest] = argv;
@@ -301,23 +275,11 @@ function parseCli(argv: string[]): Cli {
       case '--checks-file':
         cli.checksFile = pathResolve(need());
         break;
-      case '--case':
-        cli.caseId = need();
-        break;
       case '--tier':
         cli.tier = need();
         break;
-      case '--resolved-ref':
-        cli.resolvedRef = need();
-        break;
       case '--token-file':
         cli.tokenFile = pathResolve(need());
-        break;
-      case '--branch':
-        cli.branch = need();
-        break;
-      case '--recipe':
-        cli.recipe = need().split(',').filter(Boolean);
         break;
       case '--commands-file':
         cli.commandsFile = need();
@@ -1397,18 +1359,6 @@ function coldReadRequest(
     'An `UNVERIFIABLE-FROM-REQUEST` answer on any of q1-q3 is treated as a reject (fail-closed, D-050).',
   ].join('\n');
 }
-
-/**
- * D-052 FIX 2: every verdict error names the artifact to WRITE and forbids
- * deleting the request. The 2026-07-22 clean-run loop came from an agent told
- * "stale" deleting `coldread-request.md` (the wrong file — the stale one was the
- * VERDICT) and regenerating it, so the tree mismatch never cleared and the
- * delete/regenerate/re-read cycle ran unbounded. Naming the right file in the
- * message kills that ambiguity at the source.
- */
-const COLDREAD_VERDICT_GUIDANCE =
-  "Write coldread-verdict.json (attesting THIS resolution's tree). The driver regenerates " +
-  'coldread-request.md automatically on every `resolve --execute`; NEVER delete coldread-request.md yourself.';
 
 /**
  * D-052 FIX 3: anti-thrash cap (defense in depth, mirroring the kind-2 repro
@@ -3171,385 +3121,6 @@ function isGeneratedCaseId(id: string): boolean {
   return CONFLICT_CASE_ID_RE.test(id) || isGateFixCaseId(id);
 }
 
-export async function cmdResolve(cli: Cli): Promise<number> {
-  if (!cli.caseId || !cli.tier) {
-    console.error('resolve: --case <id> and --tier <mechanical|judged|held> are required');
-    return 2;
-  }
-  if (!isGeneratedCaseId(cli.caseId)) {
-    console.error(
-      `resolve [ERR25_BAD_CASE_ID]: --case '${cli.caseId}' does not match the generated case-id shape (N5) — refused`,
-    );
-    return 2;
-  }
-  const ctx = await passContext(cli);
-  const dir = ctx.dir;
-  const caseDir = join(dir, cli.caseId);
-  const casePath = join(caseDir, 'case.json');
-  if (!existsSync(casePath)) {
-    console.error(`resolve: case file not found: ${casePath}`);
-    return 2;
-  }
-  const caseFile = readCaseFile(casePath);
-  const journal = readJournal(dir);
-
-  // §7 case re-verification (trust boundary): treat case.json as a pointer.
-  const rv = await reverifyCase(cli, ctx, dir, caseFile, journal);
-  if (!rv.ok) {
-    // N7: dry-run stays write-free — report the failure without journaling.
-    if (cli.execute) {
-      appendJournal(dir, {
-        action: 'halt',
-        branch: caseFile.branch,
-        caseId: caseFile.id,
-        reason: 'case-reverification-failed',
-        errors: rv.errors,
-      });
-    }
-    console.error(`HALT: case re-verification failed for ${caseFile.id}:\n  ${rv.errors.join('\n  ')}`);
-    return 1;
-  }
-  const rc = rv.rc!;
-
-  // Reopen targets = the branch + its transitive descendants (registry-derived, N2).
-  const reopenTargets = [rc.branch, ...rc.descendants];
-  const preReffed = preReffedSet(journal);
-  const scope = rc.scope; // registry-derived pass scope (N2), never plan.json's
-
-  try {
-    // Direct HELD freeze path (§8): "cannot resolve" — no resolution commit, no
-    // scope guard, no cold-read gate; prepare the real-diff draft PR and freeze.
-    if (cli.tier === 'held') {
-      if (!cli.execute) {
-        console.error('DRY-RUN (no --execute): would freeze HELD and reopen descendants');
-        emit(cli, { case: rc.id, tier: 'held', reopen: reopenTargets });
-        return 0;
-      }
-      await freezeHeld(cli, dir, rc, ['agent declared cannot-resolve (--tier held)']);
-      await removeCaseWorktree(cli, dir, rc.id);
-      reopen(dir, reopenTargets);
-      console.error(`held ${rc.id} (direct); branch frozen, real-diff draft PR prepared`);
-      emit(cli, { case: rc.id, tier: 'held', reopen: reopenTargets });
-      return 0;
-    }
-
-    if (!isClaimableTier(cli.tier)) {
-      console.error(`resolve: --tier must be 'mechanical', 'judged' or 'held' (got '${cli.tier}')`);
-      return 2;
-    }
-    if (!cli.resolvedRef) {
-      console.error('resolve: --resolved-ref <ref> (the agent resolution commit) is required');
-      return 2;
-    }
-    const resolvedTree = await treeOf(cli.repo, cli.resolvedRef);
-    const verdictPath = join(caseDir, 'coldread-verdict.json');
-
-    // §7 spec promise: the cold-read request contains conflict hunks AND the
-    // resolution diff. REGENERATE it here — BEFORE the verdict is required —
-    // from the recomputed automerge tree and THIS resolution's tree, so the
-    // cold reader always sees the diff its verdict will attest to (a verdict
-    // predating this tree is rejected by the freshness binding below anyway).
-    // Execute-gated so a dry-run resolve stays write-free (N7).
-    if (cli.execute) {
-      // D-052 FIX 3 (anti-thrash cap): count the DISTINCT resolution trees this
-      // case has been cold-read against (journaled `coldread-attempt`). A case
-      // whose resolution keeps changing never converges — beyond the cap we
-      // STOP retrying and force it HELD for the owner instead of looping (the
-      // 2026-07-22 unbounded cycle). Checked BEFORE regenerating anything.
-      const priorTrees = new Set(
-        journal
-          .filter((e) => e.action === 'coldread-attempt' && e.caseId === rc.id && typeof e.resolvedTree === 'string')
-          .map((e) => e.resolvedTree as string),
-      );
-      const distinctTrees = new Set([...priorTrees, resolvedTree]);
-      if (distinctTrees.size > RESOLVE_COLDREAD_CAP) {
-        const reason =
-          `resolution cold-read did not converge in ${RESOLVE_COLDREAD_CAP} attempts ` +
-          `(${distinctTrees.size} distinct resolution trees) — owner review`;
-        appendJournal(dir, {
-          action: 'resolve-not-converged',
-          id: 'ERR26_RESOLVE_NOT_CONVERGED',
-          branch: rc.branch,
-          caseId: rc.id,
-          distinctTrees: [...distinctTrees],
-        });
-        await freezeHeld(cli, dir, rc, [reason], {
-          resolvedTree,
-          escalation: { tag: ESCALATE_CAP, feedback: null },
-        });
-        await removeCaseWorktree(cli, dir, rc.id);
-        reopen(dir, reopenTargets);
-        console.error(`held ${rc.id} [ERR26_RESOLVE_NOT_CONVERGED]: ${reason}`);
-        emit(cli, { case: rc.id, tier: 'held', notes: [reason], reopen: reopenTargets });
-        return 0;
-      }
-      if (!priorTrees.has(resolvedTree)) {
-        appendJournal(dir, { action: 'coldread-attempt', branch: rc.branch, caseId: rc.id, resolvedTree });
-      }
-
-      // D-052 FIX 1 (root cause): a verdict on disk that attests to a DIFFERENT
-      // resolution tree than THIS --resolved-ref is stale the moment the agent
-      // re-resolves (amend / different --resolved-ref). Retire it to
-      // coldread-verdict.stale.json (RENAMED, not destroyed — a mis-passed
-      // --resolved-ref stays recoverable) and journal it, so the "missing
-      // verdict; produce it" path below fires cleanly for the NEW tree instead
-      // of the "stale" rejection the agent could not diagnose (it deleted the
-      // REQUEST — the wrong file — and looped). A verdict whose tree MATCHES is
-      // left untouched, so an idempotent re-run still confirms in one shot.
-      if (existsSync(verdictPath)) {
-        let priorTree: unknown;
-        try {
-          priorTree = (JSON.parse(readFileSync(verdictPath, 'utf8')) as Partial<ColdReadVerdict>).resolvedTree;
-        } catch {
-          priorTree = undefined; // unparseable -> treat as stale, retire it
-        }
-        if (priorTree !== resolvedTree) {
-          renameSync(verdictPath, join(caseDir, 'coldread-verdict.stale.json'));
-          appendJournal(dir, {
-            action: 'stale-verdict-cleared',
-            id: 'WARN05_STALE_VERDICT_CLEARED',
-            branch: rc.branch,
-            caseId: rc.id,
-            staleTree: typeof priorTree === 'string' ? priorTree : null,
-            resolvedTree,
-          });
-          console.error(
-            `WARN05_STALE_VERDICT_CLEARED: retired stale coldread-verdict.json (attested ${String(priorTree).slice(0, 12)} != this resolution's tree ${resolvedTree.slice(0, 12)}) -> coldread-verdict.stale.json`,
-          );
-        }
-      }
-
-      const conflictDiff = await conflictHunks(cli.repo, rc.automergeTree, rc.conflictedPaths);
-      const resolutionDiff = await git(cli.repo, ['diff', rc.automergeTree, resolvedTree], { allowCodes: [1] });
-      writeFileSync(
-        join(caseDir, 'coldread-request.md'),
-        coldReadRequest(
-          rc,
-          conflictDiff.slice(0, 60000),
-          resolutionDiff.stdout.slice(0, 60000),
-          await caseContextLines(cli, rc), // D-048: driver-derived context, regenerated fresh
-        ),
-      );
-    }
-
-    // Cold-read verdict VALIDATION (§7, D2): shape + freshness before it can gate.
-    if (!existsSync(verdictPath)) {
-      console.error(
-        `resolve: cold-read verdict missing (${verdictPath}); produce it before resolving. ${COLDREAD_VERDICT_GUIDANCE}`,
-      );
-      return 2;
-    }
-    const coldread = JSON.parse(readFileSync(verdictPath, 'utf8')) as Partial<ColdReadVerdict> & {
-      verdict?: string;
-      reason?: string;
-    };
-    // D-055 INVARIANT: a COLD-READ INFRA FAILURE must be reported and HALT — it
-    // must NEVER become a HELD (or a reject, or the confirm/reject "invalid
-    // verdict" return-2). A verdict file whose shape is `error` (D-054) OR whose
-    // notes/reason read as a `claude -p` failure (a pre-D-054 leftover that
-    // fail-closed to `reject` — the 2026-07-22 bug journaled `held … "cold-read
-    // rejected -> HELD: claude -p failed (status 1) …"`) is a tooling failure:
-    // hard-halt (ERR35), report to the owner (D-046 case 2), leave the case
-    // retryable. Only a cold read that actually RAN and judged rejects → HELD.
-    if (coldReadInfraFailure(coldread)) {
-      const reason =
-        coldread.reason ??
-        (typeof coldread.notes === 'string' && coldread.notes.trim() ? coldread.notes : 'unknown');
-      const detail = `cold-read tooling unavailable: ${reason} — report to owner (D-046 case 2) and stop; NOT a content decision`;
-      if (cli.execute) {
-        appendJournal(dir, {
-          action: 'halt',
-          reason: 'coldread-unavailable',
-          id: 'ERR35_COLDREAD_UNAVAILABLE',
-          caseId: rc.id,
-          branch: rc.branch,
-          phase: 'resolve',
-          message: detail,
-        });
-      }
-      console.error(`resolve HALT [ERR35_COLDREAD_UNAVAILABLE]: ${detail}`);
-      emit(cli, { case: rc.id, halt: 'coldread-unavailable', issues: [{ id: 'ERR35_COLDREAD_UNAVAILABLE', detail }] });
-      return 1;
-    }
-    if (coldread.verdict !== 'confirm' && coldread.verdict !== 'reject') {
-      console.error(
-        `resolve: invalid cold-read verdict (must be 'confirm' or 'reject', got ${JSON.stringify(coldread.verdict)})`,
-      );
-      return 2;
-    }
-    if (typeof coldread.notes !== 'string' || coldread.notes.trim() === '') {
-      console.error('resolve: cold-read verdict must carry non-empty notes');
-      return 2;
-    }
-    if (coldread.resolvedTree !== resolvedTree) {
-      // Reachable only on a dry-run resolve (--execute clears a stale verdict
-      // above, D-052 FIX 1); still name the right artifact so the agent never
-      // goes after the request.
-      console.error(
-        `resolve: cold-read verdict is stale — resolvedTree ${String(coldread.resolvedTree).slice(0, 12)} != this resolution's tree ${resolvedTree.slice(0, 12)}. ${COLDREAD_VERDICT_GUIDANCE}`,
-      );
-      return 2;
-    }
-    if (coldread.answers !== undefined && (typeof coldread.answers !== 'object' || coldread.answers === null)) {
-      console.error('resolve: cold-read verdict answers must be an object of per-question strings (q1..q3)');
-      return 2;
-    }
-    // D-050 fail-closed: UNVERIFIABLE-FROM-REQUEST on any of Q1-Q3 is a reject
-    // reason even under an overall confirm — the reader could not judge that
-    // point from the request, and researching beyond the request is forbidden.
-    const unverifiable = (['q1', 'q2', 'q3'] as const).filter((q) =>
-      /UNVERIFIABLE-FROM-REQUEST/i.test(String(coldread.answers?.[q] ?? '')),
-    );
-    const coldreadRejected = coldread.verdict === 'reject' || unverifiable.length > 0;
-    const feedback = boundedFeedback(coldread);
-
-    // Scope guard (§7 → D-057 #3): recomputed automerge/paths + config-derived
-    // mode. A violation is NOT an instant hold any more — the verdict above
-    // already judged THE RESOLUTION, so: cold read agrees + scope exceeded →
-    // HELD publishing the resolution (active PR, escalated); cold read rejects
-    // → the rejection path below (retry once, escalate on the 2nd).
-    const guard = await scopeGuard(cli.repo, rc.automergeTree, resolvedTree, rc.conflictedPaths, rc.scopeGuardMode);
-    const scopeExceeded = !guard.ok;
-    const badPaths = [...guard.extraPaths, ...guard.hunkViolations.map((p) => `${p} (out-of-hunk)`)];
-    const notes: string[] = [];
-
-    if (!cli.execute) {
-      const priorRejections = coldReadRejectionCount(journal, rc.id);
-      const wouldEscalate = coldreadRejected && priorRejections + 1 >= COLDREAD_REJECT_LIMIT;
-      const tier: Tier =
-        wouldEscalate || (!coldreadRejected && scopeExceeded)
-          ? 'held'
-          : applyFloor(cli.tier, rc.tierFloor === 'judged' ? 'judged' : 'clean');
-      console.error('DRY-RUN (no --execute): resolve decision follows');
-      emit(cli, {
-        case: rc.id,
-        claimed: cli.tier,
-        tier,
-        rejected: coldreadRejected,
-        scopeGuard: guard,
-        coldread,
-        reopen: reopenTargets,
-      });
-      return 0;
-    }
-
-    // Audit every consumed verdict (the #4 rejection counter reads these).
-    appendJournal(dir, {
-      action: 'coldread',
-      caseId: rc.id,
-      branch: rc.branch,
-      phase: 'resolve',
-      verdict: coldread.verdict,
-      unverifiable,
-      rejected: coldreadRejected,
-      feedback,
-    });
-
-    // Cold-read rejection (incl. the D-050 fail-closed UNVERIFIABLE path):
-    // FIRST rejection → no freeze; surface the reviewer's feedback so the agent
-    // can revise and re-resolve. SECOND rejection → stop retrying, HELD via the
-    // unified publish with the escalation prefix (D-057 #4).
-    if (coldreadRejected) {
-      const rejections = coldReadRejectionCount(readJournal(dir), rc.id);
-      const rejectNote =
-        coldread.verdict === 'reject'
-          ? `cold-read rejected: ${coldread.notes}`
-          : `cold-read UNVERIFIABLE-FROM-REQUEST on ${unverifiable.join(', ')} (fail-closed): ${coldread.notes}`;
-      if (rejections >= COLDREAD_REJECT_LIMIT) {
-        notes.push(`${rejectNote} — rejected ${rejections}x, escalated to HELD`);
-        await freezeHeld(cli, dir, rc, notes, {
-          resolvedTree,
-          escalation: { tag: ESCALATE_REJECTED_2X, feedback },
-        });
-        await removeCaseWorktree(cli, dir, rc.id);
-        reopen(dir, reopenTargets);
-        console.error(`held ${rc.id}: cold-read rejected ${rejections}x (escalated)`);
-        emit(cli, { case: rc.id, tier: 'held', escalated: true, notes, feedback, reopen: reopenTargets });
-        return 0;
-      }
-      const instruction = `cold read rejected — revise the resolution and re-run resolve${feedback ? `: ${feedback}` : ''}`;
-      console.error(`resolve: ${instruction}`);
-      emit(cli, {
-        case: rc.id,
-        rejected: true,
-        instruction,
-        feedback,
-        coldread: { verdict: coldread.verdict, notes: coldread.notes },
-      });
-      return 1;
-    }
-
-    // Cold read agrees + scope exceeded (#3): HELD publishing THE RESOLUTION —
-    // the unified publish ships it as an ACTIVE PR (owner reviews & merges),
-    // prefixed with the scope escalation naming the extra files.
-    if (scopeExceeded) {
-      notes.push(`scope-guard violation [${guard.mode}]: out-of-scope [${badPaths}] -> HELD (resolution published for owner review)`);
-      appendJournal(dir, {
-        action: 'scope-violation',
-        branch: rc.branch,
-        caseId: rc.id,
-        mode: guard.mode,
-        extraPaths: guard.extraPaths,
-        hunkViolations: guard.hunkViolations,
-      });
-      const scopeFeedback = [feedback, `resolution touches beyond the conflicted files: ${badPaths.join(', ')}`]
-        .filter(Boolean)
-        .join(' — ')
-        .slice(0, COLDREAD_FEEDBACK_CAP);
-      await freezeHeld(cli, dir, rc, notes, {
-        resolvedTree,
-        escalation: { tag: ESCALATE_SCOPE, feedback: scopeFeedback },
-      });
-      await removeCaseWorktree(cli, dir, rc.id);
-      reopen(dir, reopenTargets);
-      console.error(`held ${rc.id}: scope-guard violation [${guard.mode}] (${badPaths.join(', ')}) — resolution kept for owner review`);
-      emit(cli, { case: rc.id, tier: 'held', scopeGuard: guard, notes, reopen: reopenTargets });
-      return 0;
-    }
-
-    // MECHANICAL/JUDGED: floor-raised, merge the RESOLVED tree at the recomputed head.
-    const tier: Tier = applyFloor(cli.tier, rc.tierFloor === 'judged' ? 'judged' : 'clean');
-    const msg = `Merge ${rc.parent} into ${rc.branch} (propagation, ${tier} resolution of ${rc.id})`;
-    await recordPreRef(cli, dir, preReffed, rc.branch);
-    const mergeCommit = await journaledResolvedMerge(cli.repo, rc.branch, rc.head.sha, resolvedTree, msg, scope);
-    // §7: the resolved entry carries the confirming verdict's content, so the
-    // audit trail shows WHAT the cold reader attested, not just that it did.
-    appendJournal(dir, {
-      action: 'resolved',
-      branch: rc.branch,
-      caseId: rc.id,
-      tier,
-      mergeCommit,
-      notes,
-      coldread: { verdict: coldread.verdict, notes: coldread.notes },
-    });
-    // The resolve LANDED. Blockedness is derived (D-058): a still-blocked
-    // defer this pass keeps the branch DEFERRED via its journaled `defer`
-    // rows + the fixpoint view — no stored flag to settle.
-    if (tier === 'judged') await prepareCaseMaterials(cli, dir, rc, tier);
-    await removeCaseWorktree(cli, dir, rc.id);
-    reopen(dir, reopenTargets);
-    console.error(`resolved ${rc.id} as ${tier}; merge commit ${mergeCommit.slice(0, 12)}`);
-    emit(cli, { case: rc.id, tier, mergeCommit, scopeGuard: guard, reopen: reopenTargets });
-    return 0;
-  } catch (e) {
-    if (e instanceof DriverHalt) {
-      const id = haltIdFor(e.reason);
-      appendJournal(dir, {
-        action: 'halt',
-        branch: rc.branch,
-        caseId: rc.id,
-        reason: e.reason,
-        ...(id ? { id } : {}),
-        message: e.message,
-      });
-      console.error(`HALT${id ? ` [${id}]` : ''}: ${e.reason} — ${e.message}`);
-      return 1;
-    }
-    throw e;
-  }
-}
-
 /**
  * The deterministic fix/sweep branch name for a case (naming rule of §8:
  * branch+PARENT+height so two parents of one branch conflicting at the same
@@ -4946,107 +4517,6 @@ export async function cmdVerify(cli: Cli): Promise<number> {
   return re.ok ? 0 : 1;
 }
 
-export async function cmdUnfreeze(cli: Cli): Promise<number> {
-  if (!cli.branch) {
-    console.error('unfreeze: --branch <name> is required');
-    return 2;
-  }
-  const { dir } = await passContext(cli); // attaches to the open pass (for the journal)
-  const journal = readJournal(dir);
-  const view = passStatusView(cli, journal);
-  const st = view.get(cli.branch) ?? null;
-  if (!st) {
-    console.error(`unfreeze: '${cli.branch}' is not blocked (merge_status is NONE)`);
-    return 2;
-  }
-  const blockedBy =
-    st === 'PR_ID'
-      ? (blockedRows(journal).get(cli.branch) ?? []).map((r) => r.caseId).join(', ') || 'held'
-      : 'deferred';
-  if (!cli.execute) {
-    console.error(`DRY-RUN (no --execute): would manually unfreeze ${cli.branch} (blocked by ${blockedBy})`);
-    emit(cli, { branch: cli.branch, blockedBy });
-    return 0;
-  }
-  // The journaled row clears the block for THIS pass only (D-058): an origin
-  // fix/sweep ref with an open PR re-derives the branch blocked at the next
-  // `start` — the durable unfreeze is resolving/closing that PR on origin.
-  appendJournal(dir, { action: 'unfrozen', branch: cli.branch, reason: 'manual', blockedBy });
-  // Reopen the branch + its transitive inventory descendants (finding #2b,
-  // as the retired reconcileMergeStatus did): an unfreeze AFTER the branch
-  // already `arrived` this pass must re-process it — arrivedSet honors the
-  // later `reopened` rows, so the next `run` re-derives them.
-  const edges: Record<string, string[]> = Object.fromEntries(directParentEdges(cli));
-  reopen(dir, [cli.branch, ...transitiveDescendants(edges, cli.branch)]);
-  console.error(`unfroze ${cli.branch} (manual — this pass only; origin re-derives at the next start)`);
-  emit(cli, { branch: cli.branch, unfrozen: true, reason: 'manual' });
-  return 0;
-}
-
-export async function cmdStatus(cli: Cli): Promise<number> {
-  const { chain, dir } = await passContext(cli);
-  const journal = readJournal(dir);
-  const complete = journal.some((e) => e.action === 'pass-complete');
-  console.log(`repo:       ${cli.repo}`);
-  console.log(`watermark:  ${chain.watermark} (${chain.heads.length} trunk heights from ${chain.base.slice(0, 12)})`);
-  console.log(`pass dir:   ${dir}  [${complete ? 'COMPLETE' : 'OPEN'}]`);
-  console.log(`ledger:     ${ledgerPathOf(cli)}`);
-  console.log(`journal:    ${journal.length} entries`);
-  const counts: Record<string, number> = {};
-  for (const e of journal) counts[e.action] = (counts[e.action] ?? 0) + 1;
-  for (const [action, n] of Object.entries(counts).sort()) console.log(`  ${action.padEnd(12)} ${n}`);
-  // merge_status view (D-058): derived from origin rows + this-pass journal —
-  // PR_ID (own PR pending) and DEFERRED (sticky behind a blocked parent);
-  // heights are live-derived, never stored/shown here.
-  const view = passStatusView(cli, journal);
-  const rows = blockedRows(journal);
-  const prBlocked = [...view.entries()].filter(([, s]) => s === 'PR_ID').map(([b]) => b);
-  if (prBlocked.length) {
-    console.log('merge_status PR_ID (blocked on their own PR; origin/journal-derived):');
-    for (const branch of prBlocked) {
-      const rs = rows.get(branch) ?? [];
-      if (rs.length === 0) console.log(`  ${branch} (held)`);
-      for (const r of rs) {
-        console.log(`  ${branch} (${r.caseId})${r.fixBranch ? ` PR head ${r.fixBranch}` : ''}${r.prNumber ? ` #${r.prNumber}` : ''}`);
-      }
-    }
-  }
-  const deferred = [...view.entries()].filter(([, s]) => s === 'DEFERRED').map(([b]) => b);
-  if (deferred.length) console.log(`merge_status DEFERRED (sticky behind a blocked parent): ${deferred.join(', ')}`);
-  const annotates = journal.filter((e) => e.action === 'annotate');
-  if (annotates.length) {
-    console.log('annotate-class (clean merge THROUGH a HELD-ancestor height, D-002):');
-    for (const a of annotates)
-      console.log(`  ${a.branch} <- ${a.parent}: passes height ${a.height} held by ${a.heldAncestor}`);
-  }
-  const urges = journal.filter((e) => e.action === 'urge');
-  if (urges.length) console.log(`urges posted: ${urges.length}`);
-  const pushes = journal.filter((e) => e.action === 'push');
-  if (pushes.length) console.log(`pushes (driver-journaled, D-049): ${pushes.length}`);
-  const openCases = journal.filter((e) => e.action === 'case').map((e) => e.caseId as string);
-  const resolvedCases = new Set(
-    journal.filter((e) => e.action === 'resolved' || e.action === 'held').map((e) => e.caseId as string),
-  );
-  const supersededCases = supersededCaseIds(journal);
-  const open = openCases.filter((c) => !resolvedCases.has(c) && !supersededCases.has(c));
-  console.log(`open cases: ${open.length}${open.length ? ` — ${open.join(', ')}` : ''}`);
-  const divergedHalts = journal.filter((e) => e.action === 'halt' && e.reason === 'sync-diverged');
-  if (divergedHalts.length) {
-    console.log('diverged branches (§13 sync — skipped this pass, owner escalation):');
-    for (const d of divergedHalts) console.log(`  ${d.branch}: ${d.message}`);
-  }
-  const mergeFailedHalts = journal.filter((e) => e.action === 'halt' && e.reason === 'merge-failed');
-  if (mergeFailedHalts.length) {
-    console.log('merge-failed branches (D-047/B11 backstop — halted branch-local, journaled):');
-    for (const m of mergeFailedHalts) console.log(`  ${m.branch}: ${m.message}`);
-  }
-  // D-045 (§13): STATUS shows the full current candidate state (a human state
-  // view, unthrottled); `plan` prints only newly-reported candidates.
-  const openCandidates = readCandidateFiles(cli.workspace).filter((c) => !c.resolved);
-  for (const line of candidateSectionLines(openCandidates)) console.log(line);
-  return 0;
-}
-
 /**
  * D-052 FIX 4: the end-of-sweep owner summary, derived PURELY from the journal
  * (no git, no GitHub) so a dead or abnormally-terminated session still leaves a
@@ -5245,29 +4715,6 @@ export interface MachineVerdict {
 
 /** Auth/login failure text a broken `claude -p` prints (often at exit 0) — infra, not content. */
 const COLDREAD_AUTH_FAILURE = /not logged in|invalid api key|authentication_error|unauthorized|please run.*login|login expired|credit balance is too low/i;
-
-/**
- * D-055: the notes/reason a cold-read INFRA failure leaves behind — a `claude -p`
- * that could not RUN, NOT a content decision. `verdict:'error'` (D-054) is the
- * canonical shape; this regex ALSO recognizes a pre-D-054 leftover verdict FILE
- * that fail-closed a `claude -p` failure to `reject` — the 2026-07-22 bug, whose
- * `coldread-verdict.json` read `{"verdict":"reject","notes":"claude -p failed
- * (status 1) — fail-closed (D-053)"}`. Either shape MUST hard-halt (ERR35), never
- * freeze HELD. Only a cold read that actually RAN and judged the content rejects.
- */
-const COLDREAD_INFRA_NOTE = /claude -p failed|no parseable verdict|tooling (error|unavailable)|cold read auth\/login failure/i;
-
-/**
- * True when a verdict (parsed `MachineVerdict` OR a `coldread-verdict.json` read
- * off disk) is an INFRA failure rather than a content decision (D-055). The
- * `verdict:'error'` form is authoritative; the notes/reason regexes catch a
- * stale/legacy verdict file that recorded an infra failure as a `reject`.
- */
-function coldReadInfraFailure(v: { verdict?: unknown; notes?: unknown; reason?: unknown }): boolean {
-  if (v.verdict === 'error') return true;
-  const text = `${typeof v.reason === 'string' ? v.reason : ''} ${typeof v.notes === 'string' ? v.notes : ''}`;
-  return COLDREAD_INFRA_NOTE.test(text) || COLDREAD_AUTH_FAILURE.test(text);
-}
 
 /** Injectable cold-read invoker: prompt in, verdict out (default shells `claude -p`). */
 export type ColdReadInvoker = (prompt: string) => Promise<MachineVerdict>;
@@ -8488,17 +7935,10 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   return 0;
 }
 
+// D-053 state machine (SWEEP-STATE-MACHINE.md) — the ONLY command surface. The
+// deterministic stages (plan/run/publish/push/verify/report) are internal steps
+// of these six; they have no standalone entry point.
 const HANDLERS: Record<string, (cli: Cli) => Promise<number>> = {
-  plan: cmdPlan,
-  run: cmdRun,
-  resolve: cmdResolve,
-  publish: (cli) => cmdPublish(cli), // real transport unless a test injects one (§14)
-  push: (cli) => cmdPush(cli), // §14.4 (D-049): verify-gated pass pushes + closure checks + urges
-  verify: cmdVerify,
-  unfreeze: cmdUnfreeze,
-  status: cmdStatus,
-  report: cmdReport, // §14 (D-052 FIX 4): journal-derived end-of-sweep owner summary
-  // D-053 state machine (SWEEP-STATE-MACHINE.md) — the agent-facing surface.
   'sweep-start': (cli) => cmdSweepStart(cli), // real transport unless a test injects one (D-058)
   'sweep-abort': cmdSweepAbort,
   'next-case': cmdSweepNextCase,

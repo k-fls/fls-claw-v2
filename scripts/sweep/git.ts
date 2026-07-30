@@ -89,10 +89,6 @@ export async function listTreePaths(repo: string, ref: string, subdir?: string):
   return res.stdout.split('\n').filter(Boolean);
 }
 
-export async function listTopLevel(repo: string, ref: string): Promise<string[]> {
-  return (await git(repo, ['ls-tree', '--name-only', ref])).stdout.split('\n').filter(Boolean);
-}
-
 export async function localBranches(repo: string): Promise<string[]> {
   const res = await git(repo, ['branch', '--list', '--format=%(refname:short)']);
   return res.stdout.split('\n').filter(Boolean);
@@ -248,12 +244,6 @@ export async function diffText(
   if (paths.length > 0) args.push('--', ...paths);
   const res = await git(repo, args);
   return res.stdout.length > maxBytes ? res.stdout.slice(0, maxBytes) : res.stdout;
-}
-
-/** Byte size of a blob at ref:path, or null when absent. */
-export async function blobSize(repo: string, ref: string, path: string): Promise<number | null> {
-  const res = await git(repo, ['cat-file', '-s', `${ref}:${path}`], { allowCodes: [128] });
-  return res.code === 0 ? parseInt(res.stdout.trim(), 10) : null;
 }
 
 /**

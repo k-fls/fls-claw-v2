@@ -16,7 +16,6 @@ export const SWEEP_DIR = dirname(fileURLToPath(import.meta.url));
 
 export const DEFAULT_ROUTING_FILE = join(SWEEP_DIR, 'registry', 'routing.yaml');
 export const DEFAULT_SCOPE_FILE = join(SWEEP_DIR, 'registry', 'scope.yaml');
-export const DEFAULT_CASES_DIR = join(SWEEP_DIR, 'test-cases', 'cases');
 
 /**
  * Owner-approved CUT-POINT EXCEPTIONS (cut-points.ts) — facts about this fork's
@@ -53,9 +52,7 @@ export function defaultInventoryDir(): string | null {
 
 /** Group-workspace file/dir names (all under --workspace, default cwd). */
 export const LEDGER_FILENAME = 'sweep-ledger.json';
-export const LOG_FILENAME = 'sweep-log.jsonl';
 export const RR_CACHE_DIRNAME = 'rr-cache';
-export const REPORTS_DIRNAME = 'reports';
 
 export const DEFAULT_UPSTREAM_REF = 'upstream/main';
 
@@ -73,43 +70,6 @@ export const FORK_POINT = 'd85efea229ea63fb0bd4f57a039f4ef73ece563b';
  * inventory entry (mirroring the scope-guard lever).
  */
 export const DEFAULT_STACK_CAP = 5;
-
-/** New-file size thresholds (spec D-002; annotate-PoI "large file"). */
-export const LARGE_SOURCE_BYTES = 15 * 1024;
-export const LARGE_ANY_BYTES = 40 * 1024;
-export const SOURCE_EXTENSIONS = ['.ts', '.js', '.tsx', '.jsx', '.py', '.sh', '.go', '.rs', '.c', '.h', '.sql'];
-
-/** Roots under which a new directory containing SKILL.md counts as a new skill. */
-export const SKILL_ROOTS = ['.claude/skills/', 'container/skills/', '.agents/skills/'];
-
-/**
- * Sensitive surfaces (spec D-002): upstream touches to these paths always
- * produce an annotate-PoI of type sensitive-surface-touch.
- */
-export const SENSITIVE_PATHS = [
-  // credentials / auth
-  '**/*credential*',
-  '**/*oauth*',
-  '**/auth/**',
-  'src/providers/**',
-  // mitm proxy / egress / firewall
-  '**/*mitm*',
-  '**/egress*',
-  '**/*firewall*',
-  // container spawn surface
-  'src/container-runner.ts',
-  'src/container-runtime.ts',
-  'src/container-config.ts',
-  'container/Dockerfile',
-  'container/entrypoint.sh',
-  'container/shims/**',
-  // host-rpc auth surface
-  'src/host-rpc/**',
-  'src/mcp-tools/**',
-];
-
-/** Paths whose change counts as a dependency/SDK bump PoI. */
-export const DEP_PATHS = ['package.json', '**/package.json', 'pnpm-lock.yaml', '**/bun.lock', '**/bun.lockb'];
 
 /**
  * Branch name globs never swept, never merged into, never enumerated as
@@ -138,9 +98,6 @@ export const DEFAULT_ROUTING = {
   threshold: 6,
   top_k: 4,
 };
-
-/** Cap on diff text fetched per PoI for symbol_watch matching. */
-export const DIFF_TEXT_CAP_BYTES = 64 * 1024;
 
 /** Authoritative CI verification commands (pipeline spec, placement section). */
 export const VERIFY_COMMANDS: { cmd: string; cwd?: string }[] = [
