@@ -2115,7 +2115,16 @@ function emit(cli: Cli, artifact: unknown): void {
   // D-054: a flag command run INTERNALLY by a state-machine command
   // (next-case→run, finish→verify/publish/push) produces no output — only the
   // outer command emits its single SWEEP-RESULT line.
-  if (cli.internal) return;
+  if (cli.internal) {
+    // D-062: an internal command still writes to `--out` when the CALLER asked
+    // for one, so the outer command can lift its issues instead of discarding
+    // the cause. Live 2026-07-30: a held publish failed and the only record was
+    // "see the publish output above" — there was no output above, and the real
+    // reason (ERR14_BASE_BEHIND: origin/main_patched 212 commits behind local)
+    // was only recoverable by re-running publish by hand.
+    if (cli.out) writeFileSync(cli.out, JSON.stringify(artifact, null, 2) + '\n');
+    return;
+  }
   const json = JSON.stringify(artifact, null, 2);
   if (cli.out) {
     writeFileSync(cli.out, json + '\n');
@@ -8535,11 +8544,22 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     let closuresN = 0;
     for (const jc of judged) {
       if (journal.some((e) => e.action === 'pr-published' && e.caseId === jc.caseId)) continue;
+      // D-062: give the internal publish an `--out` so its issues survive. Without
+      // it the failure below could only say "see the publish output above", and
+      // there is no output above — an internal emit is suppressed.
+      const pubOut = join(dir, jc.caseId, 'publish-result.json');
       const rcPub = await cmdPublish(
-        { ...cli, cmd: 'publish', caseId: jc.caseId, execute: true, internal: true },
+        { ...cli, cmd: 'publish', caseId: jc.caseId, execute: true, internal: true, out: pubOut },
         makeTransport,
       );
       if (rcPub !== 0) {
+        let why = '';
+        try {
+          const art = JSON.parse(readFileSync(pubOut, 'utf8')) as { issues?: Array<{ id: string; detail: string }> };
+          why = (art.issues ?? []).map((i) => `${i.id}: ${i.detail}`).join(' | ');
+        } catch {
+          /* no artifact — fall back to the generic detail */
+        }
         console.error(`finish: JUDGED publish failed for ${jc.caseId} — re-run finish after fixing`);
         result(cli, { ok: false, halted: 'judged-prs', caseId: jc.caseId });
         return 1;
@@ -8643,11 +8663,22 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
         progress(`held PR skipped — duplicate of published PR #${dup.duplicateOf.number} (${jc.caseId})`);
         continue;
       }
+      // D-062: give the internal publish an `--out` so its issues survive. Without
+      // it the failure below could only say "see the publish output above", and
+      // there is no output above — an internal emit is suppressed.
+      const pubOut = join(dir, jc.caseId, 'publish-result.json');
       const rcPub = await cmdPublish(
-        { ...cli, cmd: 'publish', caseId: jc.caseId, execute: true, internal: true },
+        { ...cli, cmd: 'publish', caseId: jc.caseId, execute: true, internal: true, out: pubOut },
         makeTransport,
       );
       if (rcPub !== 0) {
+        let why = '';
+        try {
+          const art = JSON.parse(readFileSync(pubOut, 'utf8')) as { issues?: Array<{ id: string; detail: string }> };
+          why = (art.issues ?? []).map((i) => `${i.id}: ${i.detail}`).join(' | ');
+        } catch {
+          /* no artifact — fall back to the generic detail */
+        }
         // PUSH RESILIENCE (D-059 FINAL): a failed held publish (e.g. its base
         // push failed → ERR14, or a transient API error) no longer halts the
         // whole finish — journal it, finish the rest, report factually; the
@@ -8656,9 +8687,12 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
           action: 'publish-failed',
           caseId: jc.caseId,
           branch: jc.branch,
-          detail: 'held publish failed at finish — retries on the next finish (see the publish output above)',
+          detail: why
+            ? `held publish failed at finish — ${why}`
+            : 'held publish failed at finish — retries on the next finish (no publish artifact was written)',
+          issues: why ? why.split(' | ') : undefined,
         });
-        publishFailures.push({ caseId: jc.caseId, branch: jc.branch });
+        publishFailures.push({ caseId: jc.caseId, branch: jc.branch, ...(why ? { detail: why } : {}) });
         progress(`held PR FAILED for ${jc.caseId} — finishing the rest`);
         continue;
       }
