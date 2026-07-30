@@ -294,9 +294,19 @@ async function patchId(repo: string, ref: string): Promise<string | null> {
  * branch really did write — suppressing a real answer, which is worse than the
  * misattribution the exception was for.
  *
- * absorbed: `as_of` must still CONTAIN the branch (`merge-base --is-ancestor`).
- * A branch that has since moved on is no longer absorbed, and the entry is
- * stale by definition.
+ * absorbed: the branch must have NO OWN WORK outside `into` —
+ * `rev-list --count --no-merges <branch> ^<into>` is 0.
+ *
+ * D-062: this used to test `merge-base --is-ancestor <branch-tip> <as_of>`, which
+ * a propagation pass falsifies by doing its job. Every pass merges the parent
+ * DOWN into the branch, so the tip advances past `as_of` on the first merge and
+ * the entry reads stale from then on. Live 2026-07-29: module/crypto was flagged
+ * STALE at verify while its remainder under --no-merges was still 0 — the only
+ * commit outside main_patched was the pass's own "Merge main_patched into
+ * module/crypto (propagation)". Re-anchoring `as_of` cannot fix that; the next
+ * pass falsifies the new value too. Absorption is about the branch's OWN
+ * commits, so the count must ignore merges, and `as_of` becomes provenance (when
+ * the owner measured it) rather than the thing tested.
  */
 export async function verifyCutPointExceptions(
   repo: string,
@@ -364,31 +374,35 @@ export async function verifyCutPointExceptions(
 
   for (const [branch, entries] of ex.absorbed) {
     for (const e of entries) {
-      const asOf = await resolveCommit(repo, e.as_of);
+      const into = await resolveCommit(repo, e.into);
       const tip = await resolveCommit(repo, branch);
-      if (!asOf || !tip) {
+      if (!into || !tip) {
         v.warnings.push({
           branch,
           kind: 'absorbed',
-          detail: `${!asOf ? e.as_of : branch} is not in this repo — absorbed exception not applicable here`,
+          detail: `${!into ? e.into : branch} is not in this repo — absorbed exception not applicable here`,
           stale: false,
         });
         continue;
       }
-      const res = await git(repo, ['merge-base', '--is-ancestor', tip, asOf], { allowCodes: [1] });
-      if (res.code !== 0) {
+      // The branch's OWN commits outside the parent. `--no-merges` is what makes
+      // this survive propagation: the merges a pass creates ON this branch carry
+      // the parent's content down, they are not work the branch authored.
+      const own = await git(repo, ['rev-list', '--count', '--no-merges', tip, `^${into}`]);
+      const remainder = Number(own.stdout.trim());
+      if (!Number.isFinite(remainder) || remainder > 0) {
         v.warnings.push({
           branch,
           kind: 'absorbed',
           detail:
-            `STALE: ${e.as_of} (${e.into}) no longer contains ${branch} — the branch has moved on and its ` +
-            `remainder is not empty; exception NOT applied`,
+            `STALE: ${branch} has ${own.stdout.trim()} own commit(s) not in ${e.into} — its remainder is not ` +
+            `empty; exception NOT applied`,
           stale: true,
         });
         continue;
       }
       push(v.absorbed, branch, e);
-      v.applied.push(`absorbed: ${branch} is contained in ${e.into} as of ${e.as_of} — ${e.why}`);
+      v.applied.push(`absorbed: ${branch} has no own commits outside ${e.into} (measured ${e.as_of}) — ${e.why}`);
     }
   }
   return v;

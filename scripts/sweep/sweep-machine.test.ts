@@ -301,6 +301,19 @@ describe('sweep start — the base gate (D-061 A)', () => {
     );
     return f;
   }
+  /**
+   * D-062: a checks file whose commands really pass. `start`'s base gate uses the
+   * INJECTED ChecksRunner (so it can still be red), but `report-case` has no
+   * injection point — it runs the file's commands for real.
+   */
+  function passingChecks(ws: string): string {
+    const f = join(ws, 'checks-pass.json');
+    writeFileSync(
+      f,
+      JSON.stringify({ typecheck: [{ cmd: 'true tsc-stub', cwd: '.' }], test: [{ cmd: 'true vitest-stub', cwd: '.' }] }),
+    );
+    return f;
+  }
   function runner(failing: string[]): { fn: ChecksRunner; ran: string[][] } {
     const ran: string[][] = [];
     const fn: ChecksRunner = async (commands) => {
@@ -392,6 +405,53 @@ describe('sweep start — the base gate (D-061 A)', () => {
       automergeTree: string;
     };
     expect(caseFile.automergeTree).toBe(repo.git('rev-parse', `${anchor}^{tree}`));
+  });
+
+  /**
+   * D-062 — the gate-fix cold-read request must be framed as a CHECK failure.
+   *
+   * Live 2026-07-29 it was the MERGE form with every merge-specific field empty:
+   * `Parent: (gate-fix)`, "Conflict hunks" an empty fence, ours and theirs both
+   * `(no commits)`. The reader answered Q1 ("within the conflicted hunks…")
+   * UNVERIFIABLE-FROM-REQUEST because there was nothing to read — which rejects
+   * fail-closed regardless of verdict, so NO gate-fix resolution could ever pass.
+   * It also reached for merge doctrine it was never given ("merge-forced
+   * consequential edits"), because the request never said a check had failed.
+   */
+  it('D-062 — the gate-fix cold-read request is framed as a CHECK failure, not a merge', async () => {
+    const repo = gateFixRepoForBase();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
+    const dir = dirOf(repo, ws);
+    const out = join(ws, 'start.json');
+    expect(
+      await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: passingChecks(ws), out }), undefined, baseRunner()),
+    ).toBe(0);
+    const caseId = (JSON.parse(readFileSync(out, 'utf8')) as { gateFix: { caseId: string } }).gateFix.caseId;
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv))).toBe(0);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'FIXED\n' });
+    expect(
+      await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true }), confirm),
+    ).toBe(0);
+    const request = readFileSync(join(dir, caseId, 'coldread-request.md'), 'utf8');
+    // Says what kind of case it is, and names the check.
+    expect(request).toContain('Kind: GATE-FIX');
+    expect(request).toContain('This is NOT a merge');
+    expect(request).toContain('Failing check: true tsc-stub');
+    // The failing output is IN the request — the reader could not see it before.
+    expect(request).toContain('## The failing check output');
+    expect(request).toContain('error TS2345');
+    // None of the merge scaffolding that framed it as a merge.
+    expect(request).not.toContain('## Conflict hunks');
+    expect(request).not.toContain('### ours (');
+    expect(request).not.toContain('### theirs (');
+    expect(request).not.toContain('Parent: (gate-fix)');
+    // Gate-fix questions, not the merge ones.
+    expect(request).toContain('AT ITS CAUSE');
+    expect(request).not.toContain('Within the conflicted hunks');
+    // The inventory block SURVIVES — it is what caught a real recorded-decision
+    // contradiction on the live run.
+    expect(request).toContain('### Inventory');
   });
 
   it('base RED -> a GATE-FIX case on the blamed branch (D-061: not a dead end)', async () => {
@@ -1164,6 +1224,19 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     return f;
   }
   /** Fails exactly the named commands; records every list it was handed, in order. */
+  /**
+   * D-062: a checks file whose commands really pass. `start`'s base gate uses the
+   * INJECTED ChecksRunner (so it can still be red), but `report-case` has no
+   * injection point — it runs the file's commands for real.
+   */
+  function passingChecks(ws: string): string {
+    const f = join(ws, 'checks-pass.json');
+    writeFileSync(
+      f,
+      JSON.stringify({ typecheck: [{ cmd: 'true tsc-stub', cwd: '.' }], test: [{ cmd: 'true vitest-stub', cwd: '.' }] }),
+    );
+    return f;
+  }
   function runner(failing: string[]): { fn: ChecksRunner; ran: string[][] } {
     const ran: string[][] = [];
     const fn: ChecksRunner = async (commands) => {

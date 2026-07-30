@@ -305,10 +305,52 @@ describe('verifyCutPointExceptions — re-verified against git, never trusted fo
     const v = await verifyCutPointExceptions(f.repo.dir, ex);
     expect(staleWarnings(v)).toEqual([]);
     expect(v.absorbed.get('module/host-rpc')![0].into).toBe('main_patched');
-    expect(v.applied[0]).toContain('is contained in main_patched');
+    expect(v.applied[0]).toContain('has no own commits outside main_patched');
   });
 
-  it('STALE ABSORBED: `as_of` no longer contains the branch (it moved on) — WARN, do NOT apply', async () => {
+  /**
+   * D-062 — a PROPAGATION MERGE on the branch must not falsify `absorbed`.
+   *
+   * Every pass merges the parent DOWN into each branch. Under the old predicate
+   * (`merge-base --is-ancestor <tip> <as_of>`) that advanced the tip past `as_of`,
+   * so the entry read STALE from the first merge onward — the exception could only
+   * ever hold before the pass did any work, and re-anchoring `as_of` would be
+   * falsified again on the very next pass. Live 2026-07-29: module/crypto was
+   * flagged STALE at verify while its own remainder was still 0, the sole commit
+   * outside main_patched being "Merge main_patched into module/crypto".
+   */
+  it('D-062 — a propagation merge on the branch does NOT make `absorbed` stale', async () => {
+    const f = duplicateRepo();
+    f.repo.checkout('main_patched');
+    f.repo.merge('module/host-rpc', 'verify: merge module/host-rpc');
+    const asOf = f.repo.sha('main_patched');
+    // The pass now merges the parent DOWN into the branch — its job, every pass.
+    f.repo.checkout('module/host-rpc');
+    f.repo.merge('main_patched', 'Merge main_patched into module/host-rpc (propagation)');
+    f.repo.checkout('main');
+    // The tip has moved past `as_of` ...
+    expect(f.repo.sha('module/host-rpc')).not.toBe(asOf);
+    // ... but the branch authored nothing new, so it is still absorbed.
+    const ex = loadCutPointExceptions(
+      tmpFile(
+        'cut-point-exceptions.yaml',
+        [
+          'cut_point_exceptions:',
+          '  module/host-rpc:',
+          '    absorbed:',
+          `      - into: main_patched`,
+          `        as_of: ${asOf}`,
+          '        why: parent merged this branch down; remainder is empty',
+          '',
+        ].join('\n'),
+      ),
+    )!;
+    const v = await verifyCutPointExceptions(f.repo.dir, ex);
+    expect(staleWarnings(v)).toEqual([]);
+    expect(v.absorbed.get('module/host-rpc')![0].into).toBe('main_patched');
+  });
+
+  it('STALE ABSORBED: the branch AUTHORED new work outside the parent — WARN, do NOT apply', async () => {
     const f = duplicateRepo();
     f.repo.checkout('main_patched');
     f.repo.merge('module/host-rpc', 'verify: merge module/host-rpc');
@@ -335,7 +377,7 @@ describe('verifyCutPointExceptions — re-verified against git, never trusted fo
     const v = await verifyCutPointExceptions(f.repo.dir, ex);
     expect(v.absorbed.size).toBe(0);
     expect(staleWarnings(v)).toHaveLength(1);
-    expect(staleWarnings(v)[0].detail).toContain('no longer contains module/host-rpc');
+    expect(staleWarnings(v)[0].detail).toContain('module/host-rpc has 1 own commit(s) not in main_patched');
   });
 
   it('a NULL config (absent file) verifies to an empty, warning-free result', async () => {

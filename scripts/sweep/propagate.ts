@@ -1223,6 +1223,26 @@ const COLD_READ_QUESTIONS = [
   '3. Does the resolution contradict any record included in this request?',
 ];
 
+/**
+ * D-062: the GATE-FIX questions. A gate-fix case is not a merge — there are no
+ * conflict hunks and no two sides, so Q1/Q2 above are category errors against it.
+ * Live 2026-07-29 the reader was handed the merge form with every merge-specific
+ * field empty ("Conflict hunks" an empty fence, ours and theirs both
+ * `(no commits)`), answered Q1 `UNVERIFIABLE-FROM-REQUEST` because there was
+ * nothing to read, and that alone rejects fail-closed regardless of verdict — so
+ * no gate-fix resolution could pass as prompted. It also reached for merge
+ * doctrine it had not been given ("merge-forced consequential edits") because
+ * the request never said a CHECK had failed or which one.
+ *
+ * Q3 is deliberately identical: it is the one that transferred, and the one that
+ * landed a real objection on the live run.
+ */
+const GATE_FIX_COLD_READ_QUESTIONS = [
+  '1. Does the resolution make the named failing check pass, AT ITS CAUSE? A suppression is a reject — name any `@ts-ignore`, `any`, `eslint-disable`, skipped/deleted test, loosened type or widened signature used to silence the error rather than fix it.',
+  '2. Is every change NECESSARY for that check to pass? A gate-fix touches the failing files and whatever they force. Name any change that is not needed for the check — behavioural edits smuggled in alongside are the failure mode here.',
+  '3. Does the resolution contradict any record included in this request?',
+];
+
 /** D-050 preamble: the reader judges from the request ONLY — never researches. */
 const COLD_READ_PREAMBLE = [
   'Judge ONLY from the materials in this request. Do NOT explore the repository or search',
@@ -1361,13 +1381,23 @@ async function caseContextLines(
     scopeFile: cli.scopeFile,
     routingFile: cli.routingFile,
   });
-  const tip = await revParse(cli.repo, c.branch);
-  const sides = await perSideLog(cli.repo, tip, c.head.sha, c.conflictedPaths);
-  return [
+  const inventory = [
     '## Case context (driver-derived — D-048)',
     '',
     '### Inventory',
     ...inventoryContextLines(registry.features, c.branch, c.parent, c.conflictedPaths),
+  ];
+  // D-062: a GATE-FIX case has no two sides — it is one branch failing a CHECK,
+  // and `parent` is the literal `(gate-fix)`. Emitting the ours/theirs ranges
+  // anyway printed `(no commits)` under both, which reads as "neither side wrote
+  // anything" and framed the request as a merge the reader then judged as a merge.
+  // The inventory block stays: it is what let the live 2026-07-29 reader catch a
+  // real contradiction of a recorded decision.
+  if (isGateFixCase(c)) return inventory;
+  const tip = await revParse(cli.repo, c.branch);
+  const sides = await perSideLog(cli.repo, tip, c.head.sha, c.conflictedPaths);
+  return [
+    ...inventory,
     '',
     `### ours (\`${c.branch}\`) — \`git log --oneline\` over the conflicted paths since the merge base`,
     '```',
@@ -1379,6 +1409,20 @@ async function caseContextLines(
     sides.theirs,
     '```',
   ];
+}
+
+/** The captured failing-check output for a gate-fix case; '' when there is none. */
+function gateFixCheckOutput(caseDir: string): string {
+  try {
+    return readFileSync(join(caseDir, 'gate-fix-output.txt'), 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+/** A gate-fix case: rooted on the branch whose CHECK failed, so it has no parent side. */
+function isGateFixCase(c: { id?: string; parent: string }): boolean {
+  return c.parent === GATE_FIX_PARENT || (typeof c.id === 'string' && c.id.startsWith('gate-fix-'));
 }
 
 /**
@@ -1396,33 +1440,59 @@ async function caseContextLines(
  * can only ever attest to the resolution the regenerated request shows.
  */
 function coldReadRequest(
-  c: { id: string; branch: string; parent: string; head: { height: number }; conflictedPaths: string[] },
+  c: {
+    id: string;
+    branch: string;
+    parent: string;
+    head: { height: number };
+    conflictedPaths: string[];
+    reproduction?: { command?: string };
+  },
   conflictDiff: string,
   resolutionDiff: string | null,
   contextLines: string[],
+  checkOutput?: string,
 ): string {
+  const gateFix = isGateFixCase(c);
   return [
     `# Cold-read request — ${c.id}`,
     '',
     ...COLD_READ_PREAMBLE,
     '',
-    `Branch: ${c.branch}   Parent: ${c.parent}   Height: ${c.head.height}`,
-    `Conflicted paths: ${c.conflictedPaths.join(', ')}`,
+    // D-062: say what KIND of case this is, in the first line the reader reads.
+    // Without it the reader inferred "merge" from the form and judged accordingly.
+    ...(gateFix
+      ? [
+          `Kind: GATE-FIX — \`${c.branch}\` FAILED A CHECK. This is NOT a merge: there are no two sides,`,
+          'no conflict hunks, and nothing to preserve from a parent. The agent wrote new code to make',
+          'the check pass. Judge THAT.',
+          '',
+          `Branch: ${c.branch}   Failing check: ${c.reproduction?.command ?? '(not recorded)'}`,
+          `Failing files: ${c.conflictedPaths.join(', ')}`,
+        ]
+      : [
+          `Branch: ${c.branch}   Parent: ${c.parent}   Height: ${c.head.height}`,
+          `Conflicted paths: ${c.conflictedPaths.join(', ')}`,
+        ]),
     '',
     ...contextLines,
     '',
-    '## Conflict hunks (branch tip -> automerge tree)',
-    '```diff',
-    conflictDiff,
-    '```',
+    ...(gateFix
+      ? [
+          '## The failing check output',
+          '```',
+          (checkOutput ?? '').trim() || '_not captured — judge from the resolution diff alone_',
+          '```',
+        ]
+      : ['## Conflict hunks (branch tip -> automerge tree)', '```diff', conflictDiff, '```']),
     '',
-    '## Resolution diff (automerge tree -> resolved tree)',
+    `## Resolution diff (${gateFix ? 'branch tree -> resolved tree' : 'automerge tree -> resolved tree'})`,
     ...(resolutionDiff === null
       ? ['_No resolution attempt yet — `resolve` regenerates this file with the diff before requiring a verdict (§7)._']
       : ['```diff', resolutionDiff, '```']),
     '',
     '## Cold-reader questions',
-    ...COLD_READ_QUESTIONS,
+    ...(gateFix ? GATE_FIX_COLD_READ_QUESTIONS : COLD_READ_QUESTIONS),
     '',
     '## Verdict',
     '',
@@ -2533,7 +2603,13 @@ export async function cmdRun(cli: Cli): Promise<number> {
           join(caseDir, 'coldread-request.md'),
           // Resolution diff added at resolve (§7); D-048 context block included
           // from emission so the reader is never context-starved.
-          coldReadRequest(caseFile, diffText.slice(0, 60000), null, await caseContextLines(cli, caseFile)),
+          coldReadRequest(
+            caseFile,
+            diffText.slice(0, 60000),
+            null,
+            await caseContextLines(cli, caseFile),
+            gateFixCheckOutput(caseDir),
+          ),
         );
         appendJournal(dir, {
           action: 'case',
@@ -3409,6 +3485,7 @@ export async function cmdResolve(cli: Cli): Promise<number> {
           conflictDiff.slice(0, 60000),
           resolutionDiff.stdout.slice(0, 60000),
           await caseContextLines(cli, rc), // D-048: driver-derived context, regenerated fresh
+          gateFixCheckOutput(caseDir),
         ),
       );
     }
@@ -5495,23 +5572,43 @@ function machineColdReadPrompt(opts: {
   contextLines: string[];
   conflictDiff: string;
   resolutionDiff: string | null;
+  failingCheck?: string;
+  checkOutput?: string;
 }): string {
+  // D-062: a GATE-FIX case is one branch failing a CHECK, not a merge. See
+  // GATE_FIX_COLD_READ_QUESTIONS for what the merge form did to it live.
+  const gateFix = isGateFixCase(opts);
   const lines: string[] = [
     `# Cold-read request — ${opts.id} (state-machine path, D-053)`,
     '',
     ...COLD_READ_PREAMBLE,
     '',
-    `Branch: ${opts.branch}   Parent: ${opts.parent}   Height: ${opts.height}`,
-    `Conflicted paths: ${opts.conflictedPaths.join(', ')}`,
+    ...(gateFix
+      ? [
+          `Kind: GATE-FIX — \`${opts.branch}\` FAILED A CHECK. This is NOT a merge: there are no two sides,`,
+          'no conflict hunks, and nothing to preserve from a parent. The agent wrote new code to make',
+          'the check pass. Judge THAT.',
+          '',
+          `Branch: ${opts.branch}   Failing check: ${opts.failingCheck ?? '(not recorded)'}`,
+          `Failing files: ${opts.conflictedPaths.join(', ')}`,
+        ]
+      : [
+          `Branch: ${opts.branch}   Parent: ${opts.parent}   Height: ${opts.height}`,
+          `Conflicted paths: ${opts.conflictedPaths.join(', ')}`,
+        ]),
     '',
     ...opts.contextLines,
     '',
-    '## Conflict hunks (branch tip -> automerge tree)',
-    '```diff',
-    opts.conflictDiff,
-    '```',
+    ...(gateFix
+      ? [
+          '## The failing check output',
+          '```',
+          (opts.checkOutput ?? '').trim() || '_not captured — judge from the resolution diff alone_',
+          '```',
+        ]
+      : ['## Conflict hunks (branch tip -> automerge tree)', '```diff', opts.conflictDiff, '```']),
     '',
-    '## Resolution diff (automerge tree -> resolved tree)',
+    `## Resolution diff (${gateFix ? 'branch tree -> resolved tree' : 'automerge tree -> resolved tree'})`,
     ...(opts.resolutionDiff === null
       ? [
           '_No resolution — this is a frozen-conflict (HELD) exhibit; judge the description against the conflict above._',
@@ -5521,7 +5618,7 @@ function machineColdReadPrompt(opts: {
   lines.push(
     '',
     '## Cold-reader questions',
-    ...COLD_READ_QUESTIONS,
+    ...(gateFix ? GATE_FIX_COLD_READ_QUESTIONS : COLD_READ_QUESTIONS),
     '',
     '## Output',
     'Print ONLY a JSON object on the final line — no prose around it:',
@@ -7367,6 +7464,8 @@ export async function cmdSweepReportCase(
     contextLines: await caseContextLines(cli, rc),
     conflictDiff: conflictDiff.slice(0, 60000),
     resolutionDiff: resolutionDiff.slice(0, 60000),
+    failingCheck: rc.reproduction?.command,
+    checkOutput: gateFixCheckOutput(caseDir),
   });
   writeFileSync(join(caseDir, 'coldread-request.md'), prompt);
   progress(`cold-read: ${rc.branch}`);

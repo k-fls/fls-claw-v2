@@ -14,7 +14,7 @@
 #
 # NOTHING HERE IS TRUSTED. Every entry is RE-VERIFIED against the repo before it
 # is applied: duplicates by recomputing `git patch-id --stable` for both commits,
-# absorbed by re-asking whether `as_of` still contains the branch. A falsified
+# absorbed by re-counting the branch's OWN commits outside its parent. A falsified
 # entry is dropped with a STALE warning rather than applied — a stale exception
 # must never silently suppress a real answer. An entry whose refs are simply not
 # in the repo at hand is skipped quietly: it can suppress nothing.
@@ -42,9 +42,15 @@ cut_point_exceptions:
         authored_on: module/host-rpc
         why: rebase copy; excluding module/host-rpc does not remove it
 
-  # ABSORBED — the parent has merged this branch down, so its remainder is empty:
-  # `git rev-list --count module/crypto ^main_patched` is 0 and module/crypto is
-  # an ancestor of main_patched (tip e4c82f34, live server clone 2026-07-29).
+  # ABSORBED — the parent has merged this branch down, so the branch authored
+  # nothing outside it: `git rev-list --count --no-merges module/crypto
+  # ^main_patched` is 0 (measured on the live server clone 2026-07-29, when
+  # main_patched was e4c82f34).
+  #
+  # `--no-merges` is load-bearing, and `as_of` is PROVENANCE not a test (D-062):
+  # every pass merges the parent DOWN into the branch, which advances its tip and
+  # would falsify any ancestor-of-`as_of` check on the first merge. Re-anchoring
+  # `as_of` does not help — the next pass falsifies the new value too.
   # 5 of that clone's 25 branches are in this state (module/crypto,
   # module/command-gate, module/container-queue, module/interaction-status,
   # module/agent-group-contributions); only the owner-approved one is listed.

@@ -57,4 +57,4 @@ WARN01_TEMPLATE_TEXT :: rewrite the body from the case materials
 WARN02_NO_DECISION_LINE :: open the body with the exact decision the owner is asked to make
 WARN03_MANY_PRS :: >8 PRs this pass — re-check for consolidation
 WARN05_STALE_VERDICT_CLEARED :: a cold-read verdict attesting a DIFFERENT tree was retired; produce a fresh verdict for the tree you actually resolved
-WARN08_CUT_POINT_EXCEPTION_STALE :: a cut-point exception no longer holds against the current refs, so it was NOT applied and blame may be wrong — do not re-run blindly; report the stale entry to the owner
+WARN08_CUT_POINT_EXCEPTION_STALE :: a cut-point exception no longer holds against the current refs, so it was NOT applied and blame may be wrong. Do NOT re-run blindly and do NOT edit the entry yourself — quote the warning to the owner in the end-of-sweep result. An `absorbed` entry going stale means the branch AUTHORED new work outside its parent (propagation merges alone never make it stale)
