@@ -6167,9 +6167,12 @@ export async function cmdSweepAbort(cli: Cli): Promise<number> {
       rolledBack.push(branch);
     } catch (err) {
       if (err instanceof DriverHalt) {
+        // The journal keeps the BRANCH (the result line is command-level); the
+        // shared reporter emits the one SWEEP-RESULT. Previously this arm
+        // journaled and returned 1 with no result line at all, so even the one
+        // command that DID catch a halt told the agent nothing.
         appendJournal(dir, { action: 'halt', branch, reason: err.reason, message: err.message });
-        console.error(`sweep abort HALT: ${err.reason} — ${err.message}`);
-        return 1;
+        return reportDriverHalt(cli, err);
       }
       throw err;
     }
@@ -7954,6 +7957,39 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   return 0;
 }
 
+/**
+ * Turn a caught `DriverHalt` into the command's ONE `SWEEP-RESULT` line, and
+ * return the exit code.
+ *
+ * A DriverHalt is an EXPECTED, journaled refusal — a protected or out-of-scope
+ * ref, a dirty worktree, a diverged branch, a surprise merge conflict. Only
+ * `sweep-abort` caught it, so the other five commands let it reach the
+ * top-level rejection handler, which printed a raw stack and NO `SWEEP-RESULT`
+ * line at all: the two-prefix contract (SWEEP-STEP relays, SWEEP-RESULT is
+ * parsed and acted on) broke, and the agent was left with nothing actionable
+ * at the exact moment the driver refused to proceed.
+ *
+ * No new id is minted. `haltIdFor` supplies the mapped ERR when one exists —
+ * `out-of-scope` has none, and inventing an id would need a doctrine row to be
+ * actionable — and the raw reason always travels in `halted`. Doctrine already
+ * routes "a global halt reported in the output" to a stop-case 2 report, which
+ * is exactly what this is.
+ */
+export function reportDriverHalt(cli: Cli, err: DriverHalt): number {
+  const id = haltIdFor(err.reason);
+  console.error(`sweep ${cli.cmd} HALT${id ? ` [${id}]` : ''}: ${err.reason} — ${err.message}`);
+  result(cli, {
+    ok: false,
+    status: 'stopped',
+    halted: err.reason,
+    ...(id ? { issues: [{ id, detail: err.message }] } : {}),
+    instruction:
+      `REPORT to the owner: the driver HALTED (${err.reason}) — ${err.message}. This is a refusal, not a crash: ` +
+      `nothing further ran and no ref was moved. Do NOT retry the command until the owner has resolved it.`,
+  });
+  return 1;
+}
+
 // D-053 state machine (SWEEP-STATE-MACHINE.md) — the ONLY command surface. The
 // deterministic stages (plan/run/publish/push/verify/report) are internal steps
 // of these six; they have no standalone entry point.
@@ -7978,6 +8014,9 @@ if (invokedDirectly) {
   handler(cli).then(
     (code) => process.exit(code),
     (err) => {
+      // A halt is a refusal the agent must REPORT; anything else is a genuine
+      // crash and keeps its stack.
+      if (err instanceof DriverHalt) process.exit(reportDriverHalt(cli, err));
       console.error(err instanceof Error ? err.stack || err.message : String(err));
       process.exit(1);
     },

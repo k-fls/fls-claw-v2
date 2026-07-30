@@ -33,10 +33,12 @@ import {
   cmdSweepReportCase,
   cmdSweepReportPr,
   cmdSweepStart,
+  DriverHalt,
   parseCli,
   parseMachineVerdict,
   passDir,
   readJournal,
+  reportDriverHalt,
   RESOLVE_COLDREAD_CAP,
   type Cli,
   type ChecksRunner,
@@ -4497,5 +4499,54 @@ describe('report-case — a FAILED pristine reset is not reported as success (de
     const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string };
     expect(rc).not.toBe(0);
     expect(res.instruction).not.toContain('the worktree is now pristine');
+  });
+});
+
+/**
+ * A DriverHalt is a REFUSAL, not a crash. Only `sweep-abort` caught it, so the
+ * other five commands hit the top-level rejection handler: raw stack, no
+ * `SWEEP-RESULT` line, nothing for the agent to parse or act on at the exact
+ * moment the driver refused to move a ref.
+ */
+describe('DriverHalt reporting', () => {
+  const haltCli = (out: string): Cli => ({
+    cmd: 'sweep-finish',
+    repo: '/nonexistent',
+    workspace: '/nonexistent',
+    upstream: 'main',
+    execute: false,
+    out,
+  });
+
+  function halted(out: string): { ok: boolean; status: string; halted: string; issues?: Array<{ id: string }>; instruction: string } {
+    return JSON.parse(readFileSync(out, 'utf8')) as ReturnType<typeof halted>;
+  }
+
+  it('a MAPPED halt reason emits its ERR id on the one SWEEP-RESULT line', () => {
+    const ws = mkWorkspace();
+    const out = join(ws, 'halt.json');
+    expect(reportDriverHalt(haltCli(out), new DriverHalt('protected-ref', "refuse to move protected ref 'main'"))).toBe(1);
+    const res = halted(out);
+    expect(res.ok).toBe(false);
+    expect(res.status).toBe('stopped');
+    expect(res.halted).toBe('protected-ref');
+    expect(res.issues![0].id).toBe('ERR23_PROTECTED_REF');
+    // Doctrine routes "a global halt reported in the output" to a stop-case report.
+    expect(res.instruction).toContain('REPORT to the owner');
+    expect(res.instruction).toContain('Do NOT retry');
+  });
+
+  it('an UNMAPPED reason still reports — no id is invented', () => {
+    const ws = mkWorkspace();
+    const out = join(ws, 'halt2.json');
+    // `out-of-scope` is thrown by guardRef but absent from HALT_IDS. It must
+    // still produce an actionable result: minting an id here would need a
+    // doctrine row to mean anything, and a silent raw stack is what broke.
+    expect(reportDriverHalt(haltCli(out), new DriverHalt('out-of-scope', "refuse to move 'x' — outside scope"))).toBe(1);
+    const res = halted(out);
+    expect(res.halted).toBe('out-of-scope');
+    expect(res.issues).toBeUndefined();
+    expect(res.instruction).toContain('REPORT to the owner');
+    expect(res.instruction).toContain('outside scope');
   });
 });
