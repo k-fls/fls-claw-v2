@@ -1132,6 +1132,83 @@ describe('sweep report-case (D-053 §2)', () => {
     expect(readJournal(dir).some((e) => e.action === 'coldread' && e.caseId === caseId)).toBe(false);
   });
 
+  /**
+   * D-062 — feedback grounded by a CODE IDENTIFIER is accepted.
+   *
+   * Live 2026-07-30: the first grounding rule took only paths and q-refs, and
+   * refused the best cold read either run produced — "Remove the
+   * classifyAtMessagingGroup reorder (the FILTERED_COMMANDS block move) — it is not
+   * needed to fix the typecheck". Naming the function and the constant is MORE
+   * actionable than the filename when the case has one file. The token must occur
+   * in the resolution diff, so a reader inventing a symbol still fails.
+   */
+  it('D-062 — a reject grounded by a code identifier in the diff is ACCEPTED', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    const caseId = await toCase(repo, ws, inv);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'export const classifyThing = 1;\n' });
+    const out = join(ws, 'rc.json');
+    const byIdentifier: ColdReadInvoker = async () => ({
+      verdict: 'reject',
+      notes: 'the reorder changes behaviour',
+      feedback: 'Remove the classifyThing reorder — it is not needed for the check',
+      defect: 'code',
+    });
+    // Accepted as a real reject: the strike IS spent and the feedback reaches the
+    // agent verbatim, instead of ERR46 throwing the verdict away.
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        byIdentifier,
+      ),
+    ).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; issues?: Array<{ id: string }> };
+    expect(res.issues?.some((i) => i.id === 'ERR46_COLDREAD_UNGROUNDED')).toBeFalsy();
+    expect(res.instruction).toContain('classifyThing');
+    expect(readJournal(dir).some((e) => e.action === 'coldread' && e.caseId === caseId && e.rejected === true)).toBe(
+      true,
+    );
+  });
+
+  /**
+   * D-062 — refusing an ungrounded verdict is BOUNDED.
+   *
+   * Refusing costs no strike, which is the point — but live 2026-07-30 ERR46 fired
+   * EIGHT times on one case and the pass sat idle, because nothing was journaled
+   * and nothing escalated. Past the limit the verdict is taken as a normal reject
+   * and the strike is spent, so an ungrounded reader cannot hold a pass open.
+   */
+  it('D-062 — repeated ungrounded verdicts stop being refused and spend a strike', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    const caseId = await toCase(repo, ws, inv);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    const out = join(ws, 'rc.json');
+    const call = (): Promise<number> =>
+      cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        rejectUngrounded,
+      );
+    // Refusals 1 and 2: no strike, nothing judged.
+    for (const _ of [1, 2]) {
+      expect(await call()).toBe(1);
+      expect(
+        (JSON.parse(readFileSync(out, 'utf8')) as { issues?: Array<{ id: string }> }).issues?.some(
+          (i) => i.id === 'ERR46_COLDREAD_UNGROUNDED',
+        ),
+      ).toBe(true);
+    }
+    expect(readJournal(dir).filter((e) => e.action === 'coldread-ungrounded').length).toBe(2);
+    expect(readJournal(dir).some((e) => e.action === 'coldread')).toBe(false);
+    // Third: the reader has had its chances — taken as a reject, strike spent.
+    await call();
+    expect(readJournal(dir).some((e) => e.action === 'coldread' && e.rejected === true)).toBe(true);
+  });
+
   it('judged cold-read reject (D-060: the gate is HERE, not at report-pr): 1st -> revise, 2nd -> HELD escalated, never merged', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();

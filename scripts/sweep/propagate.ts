@@ -1796,15 +1796,58 @@ function boundedFeedback(v: { feedback?: unknown }): string | null {
  * resolution is out of scope") is not actionable and is refused here rather than
  * spent on a retry.
  */
-function ungroundedFeedback(feedback: string | null, resolutionPaths: string[]): string | null {
-  if (feedback === null) return 'feedback is required on a reject (the agent has no other route back)';
-  if (resolutionPaths.some((p) => feedback.includes(p))) return null;
-  if (/\bq[123]\b/i.test(feedback)) return null;
-  return (
-    'feedback must be GROUNDED — name a path that appears in the resolution diff, or the question (q1/q2/q3) ' +
-    'the resolution failed. Prose with no anchor gives the agent nothing to act on.'
+function isGrounded(text: string, resolutionPaths: string[], resolutionDiff: string): boolean {
+  if (resolutionPaths.some((p) => text.includes(p))) return true;
+  if (/\bq[123]\b/i.test(text)) return true;
+  // A CODE IDENTIFIER the agent can search for, which must actually occur in the
+  // resolution diff. Live 2026-07-30: the first rule accepted only paths and
+  // q-refs, and refused "Remove the classifyAtMessagingGroup reorder (the
+  // FILTERED_COMMANDS block move)" — naming the function and the constant, which
+  // is MORE actionable than the filename when the case has one file. Requiring the
+  // token to be present in the diff is what keeps this from accepting any prose:
+  // a reader inventing a symbol still fails.
+  const tokens = text.match(/\b[A-Za-z_][A-Za-z0-9_]{3,}\b/g) ?? [];
+  return tokens.some(
+    (t) => (/[a-z][A-Z]/.test(t) || /^[A-Z][A-Z0-9_]{3,}$/.test(t)) && resolutionDiff.includes(t),
   );
 }
+
+/**
+ * The GROUNDED feedback for a reject, or null when there is none. `notes` is the
+ * fallback: it has always been validated non-empty, and a reader that put its
+ * specifics there rather than in `feedback` has still said something actionable —
+ * better to forward that than to refuse and cost a round.
+ */
+function groundedRejectFeedback(
+  feedback: string | null,
+  notes: string,
+  resolutionPaths: string[],
+  resolutionDiff: string,
+): string | null {
+  if (feedback !== null && isGrounded(feedback, resolutionPaths, resolutionDiff)) return feedback;
+  if (isGrounded(notes, resolutionPaths, resolutionDiff)) return notes.slice(0, COLDREAD_FEEDBACK_CAP);
+  return null;
+}
+
+/** Ungrounded-verdict refusals already spent on this exact resolution (D-062). */
+function ungroundedCount(journal: JournalEntry[], caseId: string, resolvedTree: string): number {
+  return journal.filter(
+    (e) => e.action === 'coldread-ungrounded' && e.caseId === caseId && e.resolvedTree === resolvedTree,
+  ).length;
+}
+
+/**
+ * Refusing a verdict costs no strike — which is the point, but also a LOOP if the
+ * reader keeps producing ungrounded feedback. Live 2026-07-30: ERR46 fired 8 times
+ * on one case and the pass sat idle, because nothing was journaled and nothing
+ * escalated. Past this many refusals the verdict is taken as a normal reject (the
+ * reader has had its chances) and the strike is spent.
+ */
+const UNGROUNDED_REFUSAL_LIMIT = 2;
+
+const UNGROUNDED_DETAIL =
+  'feedback must be GROUNDED — name a path from the resolution diff, a code identifier that appears in it, ' +
+  'or the question (q1/q2/q3) the resolution failed. Prose with no anchor gives the agent nothing to act on.';
 
 /**
  * Cold-read REJECTIONS of the RESOLUTION journaled for a case (fail-closed
@@ -3559,24 +3602,25 @@ export async function cmdResolve(cli: Cli): Promise<number> {
       /UNVERIFIABLE-FROM-REQUEST/i.test(String(coldread.answers?.[q] ?? '')),
     );
     const coldreadRejected = coldread.verdict === 'reject' || unverifiable.length > 0;
-    const feedback = boundedFeedback(coldread);
+    let feedback = boundedFeedback(coldread);
 
     // D-062: same grounding requirement as report-case — a reject reaches the
-    // agent as one string, so it must name a path in the resolution diff or the
-    // failed question. Refusing the verdict spends no strike.
+    // agent as one string, so it must name something in the resolution diff or the
+    // failed question. Refusing the verdict spends no strike, so it is BOUNDED.
     if (coldreadRejected) {
-      const resolutionPaths = (
-        await git(cli.repo, ['diff', '--name-only', rc.automergeTree, resolvedTree], { allowCodes: [1] })
-      ).stdout
-        .split('\n')
-        .map((l) => l.trim())
-        .filter(Boolean);
-      const bad = ungroundedFeedback(feedback, resolutionPaths);
-      if (bad !== null) {
-        console.error(`resolve [ERR46_COLDREAD_UNGROUNDED]: cold-read verdict rejects but ${bad}`);
+      const nameOnly = await git(cli.repo, ['diff', '--name-only', rc.automergeTree, resolvedTree], {
+        allowCodes: [1],
+      });
+      const fullDiff = await git(cli.repo, ['diff', rc.automergeTree, resolvedTree], { allowCodes: [1] });
+      const resolutionPaths = nameOnly.stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+      const grounded = groundedRejectFeedback(feedback, coldread.notes ?? '', resolutionPaths, fullDiff.stdout);
+      if (grounded === null && ungroundedCount(journal, rc.id, resolvedTree) < UNGROUNDED_REFUSAL_LIMIT) {
+        appendJournal(dir, { action: 'coldread-ungrounded', branch: rc.branch, caseId: rc.id, resolvedTree });
+        console.error(`resolve [ERR46_COLDREAD_UNGROUNDED]: cold-read verdict rejects but ${UNGROUNDED_DETAIL}`);
         console.error(COLDREAD_VERDICT_GUIDANCE);
         return 2;
       }
+      feedback = grounded;
     }
 
     // Scope guard (§7 → D-057 #3): recomputed automerge/paths + config-derived
@@ -7491,20 +7535,22 @@ export async function cmdSweepReportCase(
     return 1;
   }
   const { rejected, unverifiable } = coldReadRejected(verdict);
-  const feedback = boundedFeedback(verdict);
+  let feedback = boundedFeedback(verdict);
   // D-062: a reject the agent cannot act on is worse than no reject — it costs a
   // retry and then auto-escalates. Refuse the VERDICT (not the resolution) and
   // make the reader answer again; nothing is journaled, so no strike is spent.
   if (rejected) {
-    const resolutionPaths = (
-      await git(cli.repo, ['diff', '--name-only', rc.automergeTree, resolvedTree], { allowCodes: [1] })
-    ).stdout
-      .split('\n')
-      .map((l) => l.trim())
-      .filter(Boolean);
-    const bad = ungroundedFeedback(feedback, resolutionPaths);
-    if (bad !== null) {
-      const detail = `cold-read verdict rejects but ${bad}`;
+    const nameOnly = await git(cli.repo, ['diff', '--name-only', rc.automergeTree, resolvedTree], {
+      allowCodes: [1],
+    });
+    const fullDiff = await git(cli.repo, ['diff', rc.automergeTree, resolvedTree], { allowCodes: [1] });
+    const resolutionPaths = nameOnly.stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+    const grounded = groundedRejectFeedback(feedback, verdict.notes ?? '', resolutionPaths, fullDiff.stdout);
+    // BOUNDED: past the limit the verdict is taken as a normal reject and the
+    // strike IS spent, so an ungrounded reader cannot hold the pass open forever.
+    if (grounded === null && ungroundedCount(readJournal(dir), caseId, resolvedTree) < UNGROUNDED_REFUSAL_LIMIT) {
+      appendJournal(dir, { action: 'coldread-ungrounded', branch: rc.branch, caseId, resolvedTree });
+      const detail = `cold-read verdict rejects but ${UNGROUNDED_DETAIL}`;
       console.error(`report-case [ERR46_COLDREAD_UNGROUNDED]: ${detail}`);
       result(cli, {
         instruction: `${detail} ${COLDREAD_VERDICT_GUIDANCE}`,
@@ -7513,6 +7559,7 @@ export async function cmdSweepReportCase(
       });
       return 1;
     }
+    feedback = grounded;
   }
   appendJournal(dir, {
     action: 'coldread',
