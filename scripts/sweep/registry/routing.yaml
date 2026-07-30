@@ -1,58 +1,18 @@
-# Router configuration for the upstream-sweep PoI -> feature-entry matcher.
-# Tuning lives here so weight changes never touch code.
+# Global driver levers, read by loadRoutingConfig (scripts/sweep/registry.ts).
+# Tuning lives here so lever changes never touch code.
+#
+# The PoI -> feature-entry matcher this file used to configure (weights,
+# threshold, top_k, poi_classes, large_new_file_kb, sensitive_surfaces,
+# catch_all) went out with the `route`/`scan` commands; nothing read it.
 
 schemaVersion: 1
-
-weights:
-  owned: 10     # PoI path matches an entry's owned_paths glob
-  touch: 6      # PoI path matches an entry's touch_paths
-  symbol: 3     # an entry symbol_watch regex hits the PoI diff text or a new file basename
-  keyword: 1    # an entry routing.keyword appears in commit subjects or new top-level dir names
-
-threshold: 6    # entries scoring >= threshold get the PoI
-top_k: 4        # cap per PoI (highest scores win); merge-conflict PoIs are uncapped
-
-# PoI classes the watcher emits. `always_check_on` in an entry force-routes
-# (score = max(score, threshold)) for the listed classes.
-poi_classes:
-  - new-top-level-dir
-  - new-skill               # anything under .claude/skills/ or container/skills/
-  - large-new-file          # > large_new_file_kb
-  - sensitive-surface-touch # paths in sensitive_surfaces below
-  - dep-change              # package.json / pnpm-lock.yaml dependency delta
-  - dockerfile-change       # container/Dockerfile, container/entrypoint.sh
-  - merge-conflict          # conflict encountered while merging upstream into a fork branch
-  - generic-diff
-
-large_new_file_kb: 32
 
 # Case stacking (D-049 §2): a case is the maximal run of consecutive
 # path-intersecting conflicting heights, capped here. Per-feature override:
 # `stack_cap:` on the inventory entry (mirrors the scope-guard lever).
 stack_cap: 5
 
-sensitive_surfaces:
-  - src/container-runner.ts
-  - src/container-runtime.ts
-  - src/host-sweep.ts
-  - src/router.ts
-  - src/command-gate.ts
-  - src/channels/chat-sdk-bridge.ts
-  - src/db/migrations/**
-  - container/agent-runner/src/poll-loop.ts
-  - container/Dockerfile
-  - container/entrypoint.sh
-
-catch_all:
-  prompt: prompts/catch-all-triage.md
-  # The triage prompt embeds an index of ALL non-retired entries:
-  index_fields: [id, name, status, summary, routing.keywords]
-  # PoI classes that ALWAYS also go to catch-all, even when entries matched
-  # (new surface area deserves a global look):
-  always_include: [new-top-level-dir, new-skill]
-
-# Batching: one subagent invocation per (feature, sweep) pair; all PoIs routed to
-# the same feature are passed together in the {{pois}} slot.
-
-# Fail-closed: entries with validator ALERTs are removed from matching for that
-# sweep and their would-be PoIs go to catch-all instead.
+# Global scope-guard mode (PROPAGATION.md §7 lever): `same-files` (the default
+# when this key is absent) or `conflict-hunks` (strict). Per-feature override:
+# `scope_guard:` on the inventory entry.
+# scope_guard_mode: same-files

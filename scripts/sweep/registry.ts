@@ -3,8 +3,7 @@
  * config from the LOCAL WORKING TREE (no state branch; dissolved
  * 2026-07-10). The live inventory is a directory of <id>.yaml entries
  * (--inventory; default = the committed bootstrap snapshot), routing/scope
- * config live in scripts/sweep/registry/, replay cases in
- * scripts/sweep/test-cases/cases/.
+ * config live in scripts/sweep/registry/.
  *
  * Fail-closed loader in the feat/ops-registry idiom: a malformed entry never
  * crashes the sweep — it is dropped and surfaced as a load warning, and the
@@ -15,7 +14,7 @@ import { join } from 'node:path';
 
 import { parse } from 'yaml';
 
-import { DEFAULT_ROUTING, DEFAULT_ROUTING_FILE, DEFAULT_SCOPE_FILE, defaultInventoryDir } from './config.js';
+import { DEFAULT_ROUTING_FILE, DEFAULT_SCOPE_FILE, defaultInventoryDir } from './config.js';
 import type { FeatureEntry, RoutingConfig, SweepScope } from './types.js';
 
 export interface RegistryLoad {
@@ -73,27 +72,13 @@ export function loadRoutingConfig(routingFile: string = DEFAULT_ROUTING_FILE): {
   warnings: string[];
 } {
   const warnings: string[] = [];
-  let routing: RoutingConfig = { ...DEFAULT_ROUTING, weights: { ...DEFAULT_ROUTING.weights } };
+  const routing: RoutingConfig = {};
   if (existsSync(routingFile)) {
     try {
       const doc = parse(readFileSync(routingFile, 'utf8')) as
-        | (Partial<RoutingConfig> & {
-            catch_all?: { always_include?: string[] };
-            large_new_file_kb?: number;
-            sensitive_surfaces?: string[];
-            scope_guard_mode?: string;
-            stack_cap?: number;
-          })
+        | { scope_guard_mode?: string; stack_cap?: number }
         | null;
       if (doc && typeof doc === 'object') {
-        routing = {
-          weights: { ...routing.weights, ...(doc.weights ?? {}) },
-          threshold: typeof doc.threshold === 'number' ? doc.threshold : routing.threshold,
-          top_k: typeof doc.top_k === 'number' ? doc.top_k : routing.top_k,
-        };
-        if (Array.isArray(doc.catch_all?.always_include)) routing.catchAllAlwaysInclude = doc.catch_all.always_include;
-        if (typeof doc.large_new_file_kb === 'number') routing.largeNewFileKb = doc.large_new_file_kb;
-        if (Array.isArray(doc.sensitive_surfaces)) routing.sensitiveSurfaces = doc.sensitive_surfaces;
         if (doc.scope_guard_mode === 'same-files' || doc.scope_guard_mode === 'conflict-hunks')
           routing.scopeGuardMode = doc.scope_guard_mode;
         if (typeof doc.stack_cap === 'number' && Number.isInteger(doc.stack_cap) && doc.stack_cap >= 1)

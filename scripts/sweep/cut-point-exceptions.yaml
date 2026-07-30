@@ -4,7 +4,7 @@
 # HOME. This file lives beside checks.json, in scripts/sweep/, because it is
 # DRIVER-read config: the driver loads it and blame (attribute.ts) consumes it,
 # exactly as the driver loads checks.json and the checks gate consumes it.
-# registry/ holds the inventory's own JUDGEMENT (routing weights, scope policy);
+# registry/ holds the inventory's own JUDGEMENT (driver levers, scope policy);
 # .claude/skills/fork-registry-generate/seeds.yaml feeds the GENERATOR, which
 # never runs in the driver's path. Neither is the right owner for measured
 # history facts the driver must read on every blame.

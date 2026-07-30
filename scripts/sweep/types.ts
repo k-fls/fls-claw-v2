@@ -165,16 +165,8 @@ export interface FeatureEntry {
   maintenance?: { owner?: string; last_verified?: string; verified_against?: string; notes?: string };
 }
 
-/** scripts/sweep/registry/routing.yaml. */
+/** scripts/sweep/registry/routing.yaml — the two global driver levers. */
 export interface RoutingConfig {
-  weights: { owned: number; touch: number; symbol: number; keyword: number };
-  threshold: number;
-  top_k: number;
-  /** PoI classes that ALWAYS also go to catch-all, even when entries matched. */
-  catchAllAlwaysInclude?: string[];
-  /** Scan tuning carried in routing.yaml (single-knob new-file threshold). */
-  largeNewFileKb?: number;
-  sensitiveSurfaces?: string[];
   /** Global default scope-guard mode (§7 lever); per-feature `scope_guard` overrides. */
   scopeGuardMode?: ScopeGuardMode;
   /** Global case-stacking cap (D-049 §2, `stack_cap`); per-feature `stack_cap` overrides. */

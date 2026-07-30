@@ -25,7 +25,7 @@ export const DEFAULT_SCOPE_FILE = join(SWEEP_DIR, 'registry', 'scope.yaml');
  * HOME: `scripts/sweep/`, beside checks.json — NOT `registry/`, NOT the
  * generator's seeds. It is DRIVER-read config that blame consumes, exactly like
  * checks.json is driver-read config that the checks gate consumes. `registry/`
- * holds the inventory's own JUDGEMENT (routing weights, scope policy) and
+ * holds the inventory's own JUDGEMENT (driver levers, scope policy) and
  * `.claude/skills/fork-registry-generate/seeds.yaml` feeds the GENERATOR, which
  * never runs in the driver's path; putting measured history facts in either
  * would make the driver depend on a file its own consumers do not own. Resolved
@@ -92,12 +92,6 @@ export const EXCLUDED_BRANCH_GLOBS = [
 
 /** Branch namespaces expected to have a registry entry (validator rule 5). */
 export const REGISTRY_REQUIRED_GLOBS = ['module/**', 'feat/**', 'edition/**'];
-
-export const DEFAULT_ROUTING = {
-  weights: { owned: 10, touch: 6, symbol: 3, keyword: 1 },
-  threshold: 6,
-  top_k: 4,
-};
 
 /** Authoritative CI verification commands (pipeline spec, placement section). */
 export const VERIFY_COMMANDS: { cmd: string; cwd?: string }[] = [

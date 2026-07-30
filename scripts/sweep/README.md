@@ -46,14 +46,11 @@ scripts/sweep/
   cut-point-exceptions.yaml  owner-approved cut-point exceptions (blame input)
   registry/
     schema/feature-entry.schema.json
-    routing.yaml             router weights/threshold/top_k + driver levers
-                             (scope_guard_mode, stack_cap)
+    routing.yaml             global driver levers (scope_guard_mode, stack_cap)
     scope.yaml               scope POLICY: exclusions + extra_edges + everything recipe
     prompts/                 overlap-check.md, catch-all-triage.md
   test-cases/
     propagation/cases/*.yaml propagation cases (propagation-cases.test.ts)
-    README.md  cases/*.yaml  upstream-range replay cases — the `replay`/`seed-rerere`
-                             harness that read them is retired; kept as recon material
     fixtures/                dated recon snapshots
   bootstrap/
     fork-registry@<hash12>/  stamped verbatim inventory snapshot + MANIFEST.md
@@ -91,11 +88,10 @@ the loop in `SWEEP-STATE-MACHINE.md`; the clone, the inventory and
 
 Registry-schema notes (verified against the live authored content):
 
-- `routing.yaml` extras are honored: `catch_all.always_include`,
-  `large_new_file_kb` and `sensitive_surfaces` (still parsed into
-  `RoutingConfig`; their `scan` consumer is retired), plus the two live driver
-  levers `scope_guard_mode` (§7) and `stack_cap` (D-049 §2). `key_symbols` may
-  list several symbols per anchor (`"SymA / SymB — path"`).
+- `routing.yaml` carries the two live driver levers `scope_guard_mode` (§7) and
+  `stack_cap` (D-049 §2); the retired matcher's tuning (`weights`, `threshold`,
+  `top_k`, `large_new_file_kb`, `sensitive_surfaces`, `catch_all`) is gone.
+  `key_symbols` may list several symbols per anchor (`"SymA / SymB — path"`).
 
 **Execute is the DEFAULT** on the agent surface (D-060); `--dry-run` opts into
 computing without writing.

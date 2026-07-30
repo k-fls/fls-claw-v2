@@ -39,10 +39,7 @@ describe('local-tree loaders', () => {
   );
   writeFileSync(join(inventory, 'feat.broken.yaml'), 'id: feat.broken\nname: no kind or status\n');
   const routingFile = join(scratch, 'routing.yaml');
-  writeFileSync(
-    routingFile,
-    'weights:\n  owned: 20\nthreshold: 8\nlarge_new_file_kb: 32\nsensitive_surfaces:\n  - src/router.ts\ncatch_all:\n  always_include: [new-skill]\n',
-  );
+  writeFileSync(routingFile, 'schemaVersion: 1\nscope_guard_mode: conflict-hunks\nstack_cap: 3\n');
   const scopeFile = join(scratch, 'scope.yaml');
   writeFileSync(scopeFile, 'include: [main_patched, "fix/**"]\nrecipe: [module/a, feat/b]\n');
 
@@ -50,14 +47,7 @@ describe('local-tree loaders', () => {
     const reg = loadRegistry({ inventoryDir: inventory, routingFile, scopeFile });
     expect(reg.features.map((f) => f.id)).toEqual(['feat.good']);
     expect(reg.warnings.some((w) => w.includes('feat.broken'))).toBe(true);
-    expect(reg.routing).toEqual({
-      weights: { owned: 20, touch: 6, symbol: 3, keyword: 1 },
-      threshold: 8,
-      top_k: 4,
-      largeNewFileKb: 32,
-      sensitiveSurfaces: ['src/router.ts'],
-      catchAllAlwaysInclude: ['new-skill'],
-    });
+    expect(reg.routing).toEqual({ scopeGuardMode: 'conflict-hunks', stackCap: 3 });
     expect(reg.scope).toEqual({ include: ['main_patched', 'fix/**'], recipe: ['module/a', 'feat/b'] });
   });
 
@@ -66,7 +56,7 @@ describe('local-tree loaders', () => {
     expect(features).toEqual([]);
     expect(warnings[0]).toContain('does not exist');
     const { routing } = loadRoutingConfig(join(scratch, 'no-routing.yaml'));
-    expect(routing.threshold).toBe(6);
+    expect(routing).toEqual({}); // both levers unset -> consumers apply their own defaults
   });
 
   it('the committed bootstrap snapshot is the default inventory and parses clean', () => {

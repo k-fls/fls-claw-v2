@@ -220,9 +220,9 @@ registry updates made. HIGH-PRIORITY overlaps are called out on top.
 
 - **Feature inventory** — spec from design subagent (separate doc).
 - **Test-case registry** — mined cases (separate doc). The `replay`/`seed-rerere`
-  harness that consumed `test-cases/cases/*.yaml` is retired with `sweep.ts`; the
-  propagation cases under `test-cases/propagation/` are still exercised by
-  `propagation-cases.test.ts`.
+  harness is retired with `sweep.ts` and the `test-cases/cases/*.yaml` corpus it
+  consumed is deleted (recoverable from history); the propagation cases under
+  `test-cases/propagation/` are still exercised by `propagation-cases.test.ts`.
 - **rerere cache** — `sweep/rr-cache/` committed on the maintenance branch; installed
   into the clone's .git/rr-cache (or via rerere.rrCachePath equivalent symlink) before
   stage 5; new resolutions from case-2 PRs are exported back.
@@ -279,9 +279,7 @@ deviations from the letter of this spec and the feature-registry design:
    fails, never silently passes); expected conflict paths may carry
    `(modify/delete)`-style annotations; `expected.pois` prose strings are
    notes, not assertions; `key_symbols` may pack several symbols per anchor
-   (`"A / B — path"`, any hit passes rule 4); `routing.yaml` extras are
-   honored (`catch_all.always_include`, `large_new_file_kb`,
-   `sensitive_surfaces` as scan tuning).
+   (`"A / B — path"`, any hit passes rule 4).
 
 3. **Leave-one-out verify attribution.** Stage 6 maps a red test matrix to
    the offending branch by re-building the recipe with one branch removed at

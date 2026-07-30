@@ -382,8 +382,9 @@ Any single trigger escalates the whole case.
   depends on; A5 fails and A1 fails. Includes modify/delete of fork-modified files
   (first occurrence) and seam-threatening invariant trips.
 - **F2 security-semantics change** — conflicted hunks alter ENFORCEMENT behavior on
-  a sensitive surface (routing.yaml `sensitive_surfaces` / seeds security
-  invariants) with no covering record. A sensitive PATH alone does not force HELD —
+  a sensitive surface (seeds security invariants; the retired `route`/`scan`
+  stage's `sensitive_surfaces` path list is gone from routing.yaml, recoverable
+  from history) with no covering record. A sensitive PATH alone does not force HELD —
   it floors the claim at JUDGED.
 - **F3 contradicts a recorded decision** — would drop/invert/re-decide anything a
   record settles; never re-open a decided question (D-030).
