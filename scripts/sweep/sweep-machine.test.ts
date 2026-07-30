@@ -474,7 +474,14 @@ describe('sweep start — the base gate (D-061 A)', () => {
       instruction: string;
     };
     expect(res.status).toBe('gate-fix-required');
-    expect(res.issues[0].id).toBe('ERR42_BASE_RED');
+    // D-062: this arm ADVISES, it does not block — so it must not carry an `ERR*`
+    // id. It used to emit ERR42_BASE_RED, indistinguishable from the refusal arm,
+    // whose doctrine row says "stop-case 2 report; the pass is already sealed".
+    // Live 2026-07-30 the agent read that row, told the owner the pass was sealed
+    // while THIS case sat unserved, and stopped for 52 minutes.
+    expect(res.issues[0].id).toBe('WARN09_BASE_RED_GATE_FIX');
+    expect(res.issues.every((i) => !i.id.startsWith('ERR'))).toBe(true);
+    expect(res.instruction).toContain('NOT a stop');
     // Blame must still find an OWNER for the failing path (that is what separates
     // this from the "nothing owns it" refusal below), but the CASE is rooted on
     // the base anchor — see DEFECT 4a: a commit on module/cg can never turn

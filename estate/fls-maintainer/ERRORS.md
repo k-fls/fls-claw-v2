@@ -46,9 +46,10 @@ ERR34_CASES_REMAIN :: finish every case first
 ERR35_COLDREAD_UNAVAILABLE :: stop-case 2 report; the case stays put — re-run once restored
 ERR36_TYPECHECK_FAILED :: open the named output file, fix the pending files, re-run `report-case`
 ERR39_FETCH_FAILED :: fix connectivity/creds, re-run `start`; never open a pass on a stale view
-ERR40_TESTS_FAILED :: same as ERR36; at `finish` it is a stop-case 2 report (publish nothing)
+ERR40_TESTS_FAILED [per-case, at report-case] :: same as ERR36 — open the named output file, fix the pending files, re-run `report-case`. NOT a stop
+ERR40_TESTS_FAILED [at finish] :: stop-case 2 report and publish NOTHING — the whole-suite gate failed, so no branch is safe to land
 ERR41_TOKEN_REJECTED :: the GitHub token was REJECTED — re-auth; a retry with the same token cannot clear it
-ERR42_BASE_RED :: the base was already broken BEFORE any merge — stop-case 2 report naming the branch and failing checks; the pass is already sealed, so do NOT run `abort`
+ERR42_BASE_RED :: the base is broken and NOTHING can be blamed for it (or the identical base was already served once and the fix did not land) — the pass IS sealed: stop-case 2 report naming the branch and failing checks, and do NOT run `abort`. If the result carries `status: gate-fix-required` you are in the OTHER arm and this row does not apply — see WARN09
 ERR43_CHECKS_MALFORMED :: the named checks file does not PARSE, so no gate can run — stop-case 2 report quoting the file and the parse error; never continue with the gates silently skipped
 ERR44_WORKTREE_RESET_FAILED :: the worktree could not be reset to the pristine conflict and still holds your edits — clear it in-container and re-run `report-case`; never call it pristine
 ERR45_CUT_POINTS_MALFORMED :: the cut-point exceptions file does not PARSE, so blame cannot be trusted and no gate-fix case is served — stop-case 2 report quoting the file and the parse error
@@ -57,4 +58,5 @@ WARN01_TEMPLATE_TEXT :: rewrite the body from the case materials
 WARN02_NO_DECISION_LINE :: open the body with the exact decision the owner is asked to make
 WARN03_MANY_PRS :: >8 PRs this pass — re-check for consolidation
 WARN05_STALE_VERDICT_CLEARED :: a cold-read verdict attesting a DIFFERENT tree was retired; produce a fresh verdict for the tree you actually resolved
+WARN09_BASE_RED_GATE_FIX :: the base was red before any merge AND a GATE-FIX case has been prepared for it — run `next-case` and resolve it like any other case. This is NOT a stop and the pass is NOT sealed. Do not report-and-stop: live 2026-07-30 that left an unserved case idle for 52 minutes
 WARN08_CUT_POINT_EXCEPTION_STALE :: a cut-point exception no longer holds against the current refs, so it was NOT applied and blame may be wrong. Do NOT re-run blindly and do NOT edit the entry yourself — quote the warning to the owner in the end-of-sweep result. An `absorbed` entry going stale means the branch AUTHORED new work outside its parent (propagation merges alone never make it stale)

@@ -6887,9 +6887,22 @@ export async function cmdSweepStart(
         watermark: ctx.watermark,
         watermark12: ctx.watermark12,
         passDir: ctx.dir,
-        issues: [{ id: 'ERR42_BASE_RED', detail: `${baseRed.anchor} was already red BEFORE any merge — ${gate.detail}` }],
+        // D-062: this arm is ADVISORY, not a block — a case is waiting and the
+        // instruction says to serve it. Emitting `ERR42_BASE_RED` here made it
+        // indistinguishable from the refusal arm below, and doctrine's ERR42 row
+        // says "stop-case 2 report; the pass is already sealed". Live 2026-07-30
+        // the agent read the id, reported "the pass is sealed" to the owner (it was
+        // not — this very case was waiting), and stopped: 52 minutes idle with an
+        // unserved case. `ERR*` blocks and `WARN*` advises, so a proceed arm must
+        // never carry an ERR id.
+        issues: [
+          {
+            id: 'WARN09_BASE_RED_GATE_FIX',
+            detail: `${baseRed.anchor} was already red BEFORE any merge — ${gate.detail}`,
+          },
+        ],
         gateFix: { caseId: first.caseId, branch: first.branch, files: first.files, reason: gate.reason },
-        instruction: `the base ${baseRed.anchor} is broken; a GATE-FIX case has been prepared on ${first.branch} — run \`next-case\``,
+        instruction: `the base ${baseRed.anchor} is broken; a GATE-FIX case has been prepared on ${first.branch} — run \`next-case\` and resolve it like any other case. This is NOT a stop: the pass is OPEN.`,
       });
       return 0;
     }
