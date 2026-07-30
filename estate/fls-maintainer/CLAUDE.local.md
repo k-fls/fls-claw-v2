@@ -180,6 +180,7 @@ around a blocking id.
 | `ERR20_BRANCH_DIVERGED` | owner escalation; never force-resolve (no reset, no force-push) |
 | `ERR21_MERGE_FAILED` | note it in the end-of-sweep result; file a driver issue if it recurs |
 | `ERR22_DIRTY_WORKTREE` | clean/commit the named worktree, re-run; never `reset --hard` someone else's work |
+| `ERR23_PROTECTED_REF` | the driver REFUSED to move a protected ref — a refusal, not a crash: nothing ran and no ref moved. Stop-case 2 report; never move the ref by hand |
 | `ERR24_PLAN_DRIFT` | investigate what moved; report before continuing |
 | `ERR26_RESOLVE_NOT_CONVERGED` | auto-escalated to HELD → stop re-resolving, take the next case |
 | `ERR30_PASS_OPEN` | `finish` or `abort` first |
@@ -189,6 +190,8 @@ around a blocking id.
 | `ERR34_CASES_REMAIN` | finish every case first |
 | `ERR35_COLDREAD_UNAVAILABLE` | stop-case 2 report; the case stays put — re-run once restored |
 | `ERR36_TYPECHECK_FAILED` | open the named output file, fix the pending files, re-run `report-case` |
+| `ERR37_WORKSPACE_IN_CLONE` | `--workspace` points at the `--repo` clone (or inside it) — the group ROOT is the correct workspace. Stop-case 2 report; do NOT re-run with the same paths |
+| `ERR38_PASS_CLEAR_FAILED` | the prior pass dir could not be cleared — pass files are container-uid-owned, so teardown must run IN-CONTAINER; clear it there, then re-run `start` |
 | `ERR40_TESTS_FAILED` | same as ERR36; at `finish` it is a stop-case 2 report (publish nothing) |
 | `ERR41_TOKEN_REJECTED` | the GitHub token was REJECTED — re-auth; a retry with the same token cannot clear it |
 | `ERR42_BASE_RED` | the base was already broken BEFORE any merge — stop-case 2 report naming the branch and failing checks; the pass is already sealed, so do NOT run `abort` |
@@ -199,6 +202,7 @@ around a blocking id.
 | `WARN01_TEMPLATE_TEXT` | rewrite the body from the case materials |
 | `WARN02_NO_DECISION_LINE` | open the body with the exact decision the owner is asked to make |
 | `WARN03_MANY_PRS` | >8 PRs this pass — re-check for consolidation |
+| `WARN09_GATE_FIX_SERVED` | a GATE-FIX case has been PREPARED and is waiting — run `next-case` and work it like any other case. This is NOT a stop: the accompanying text explains why the build is red, and reporting that diagnosis instead of working the case is the failure mode this id exists to prevent |
 
 ## Registry upkeep
 
