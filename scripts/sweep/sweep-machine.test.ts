@@ -3654,6 +3654,43 @@ describe('next-case — a participating branch that is RED before any merge', ()
     ).toBe(true);
   });
 
+  /**
+   * A HELD fix only reaches the owner when `finish` pushes its ref and opens the
+   * PR. Live 2026-07-31: the agent fixed the red trunk, the case was held for an
+   * unrelated hunk, and `next-case` then said "the pass stopped, report to the
+   * owner" — so the agent reported and never ran `finish`. pr-intent journaled,
+   * zero refs pushed, zero PRs: the fix existed only in the pass directory.
+   */
+  it('a red branch with an UNPUBLISHED held fix points at `finish`, not at a stop', async () => {
+    const repo = redBaseRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/cg.ts'] }]);
+    const dir = dirOf(repo, ws);
+    const checks = join(ws, 'checks.json');
+    writeFileSync(checks, JSON.stringify({ typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }], test: [] }));
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }))).toBe(0);
+    // Serve the gate-fix, then dispose it HELD without publishing.
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), markerRunner)).toBe(0);
+    const caseId = currentCaseId(dir);
+    appendFileSync(
+      join(dir, 'journal.jsonl'),
+      JSON.stringify({ ts: new Date().toISOString(), action: 'held', branch: 'main_patched', caseId }) + '\n',
+    );
+
+    const out = join(ws, 'nc2.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), markerRunner)).toBe(0);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      status: string;
+      heldAwaitingPublish?: Array<{ branch: string }>;
+      instruction: string;
+    };
+    // Points at finish — the command that actually publishes it.
+    expect(res.status).toBe('finalize');
+    expect(res.instruction).toContain('finish');
+    expect(res.instruction).toContain('NOT yet published');
+    expect(res.heldAwaitingPublish!.map((h) => h.branch)).toContain('main_patched');
+  });
+
   it('no checks file -> the check is skipped entirely (repos without one behave as before)', async () => {
     const repo = redBaseRepo();
     const ws = mkWorkspace();

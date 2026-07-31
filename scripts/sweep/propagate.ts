@@ -6510,11 +6510,41 @@ export async function cmdSweepNextCase(cli: Cli, runChecks: ChecksRunner = defau
 
   const open = openCases(journal);
   if (open.length === 0 && redBranch) {
-    // Red, and nothing to serve for it — already gated on origin, or nothing
-    // blameable. Never report `finalize` here: that reads as "all done" when the
-    // branch is broken and nothing was merged.
+    // Red, and nothing left to SERVE for it. Two very different endings:
+    //
+    //  (a) a fix for it is already written and HELD but not yet PUBLISHED —
+    //      `finish` is what pushes the fix/sweep ref and opens the PR, so the
+    //      pass is not over and saying "report to the owner" strands the fix in
+    //      the pass dir. Live 2026-07-31: the agent wrote the trunk fix, was told
+    //      the pass had stopped, reported that faithfully, and never ran
+    //      `finish` — pr-intent journaled, zero refs pushed, zero PRs. The work
+    //      existed and the owner could not see it.
+    //  (b) nothing to publish either (already gated on origin, or nothing
+    //      blameable) — then it really is a stop.
+    //
+    // Never `finalize` in either case: that reads as "all done" while the branch
+    // is broken and nothing merged.
+    const unpublishedHeld = [...journaledCases(journal).values()].filter(
+        (jc) =>
+          lastDisposition(journal, jc.caseId)?.action === 'held' &&
+          !journal.some((e) => e.action === 'pr-published' && e.caseId === jc.caseId),
+      );
     st = { ...st, phase: 'open', currentCase: null };
     writeMachineState(dir, st);
+    if (unpublishedHeld.length > 0) {
+      const who = unpublishedHeld.map((jc) => jc.branch).join(', ');
+      progress(`${redBranch.branch} still RED — ${unpublishedHeld.length} held fix(es) awaiting publication`);
+      console.error(`next-case: ${redBranch.branch} red; ${unpublishedHeld.length} held fix(es) not yet published — finish`);
+      result(cli, {
+        status: 'finalize',
+        heldAwaitingPublish: unpublishedHeld.map((jc) => ({ caseId: jc.caseId, branch: jc.branch })),
+        instruction:
+          `run \`finish\` — ${redBranch.branch} is still RED (${redBranch.failedNames.join(', ')}) and the fix for it ` +
+          `is HELD on ${who} but NOT yet published. \`finish\` opens the PR that puts it in front of the owner; ` +
+          `until it runs, the fix exists only in the pass directory. Report AFTER it completes.`,
+      });
+      return 0;
+    }
     console.error(`next-case: ${redBranch.branch} red, no case servable — ${redGate?.reason ?? ''}`);
     result(cli, {
       ok: false,
