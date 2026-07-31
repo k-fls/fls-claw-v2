@@ -42,18 +42,22 @@ cut_point_exceptions:
         authored_on: module/host-rpc
         why: rebase copy; excluding module/host-rpc does not remove it
 
-  # ABSORBED — the parent has merged this branch down, so its remainder is empty:
-  # `git rev-list --count module/crypto ^main_patched` is 0 and module/crypto is
-  # an ancestor of main_patched (tip e4c82f34, live server clone 2026-07-29).
-  # 5 of that clone's 25 branches are in this state (module/crypto,
-  # module/command-gate, module/container-queue, module/interaction-status,
-  # module/agent-group-contributions); only the owner-approved one is listed.
+  # ABSORBED — REMOVED 2026-07-31, falsified by the repo it describes.
   #
-  # NOTE: the driver has NO CONSUMER for `absorbed` — the cut-point derivation
-  # that would use it is analysis, not driver code. Schema, re-verification and
-  # reporting are implemented; no decision is made from it.
-  module/crypto:
-    absorbed:
-      - into: main_patched
-        as_of: e4c82f34
-        why: parent merged this branch down; remainder is empty
+  # The entry claimed module/crypto was absorbed into main_patched as of
+  # e4c82f34: an ancestor, remainder empty. Both halves are now false —
+  # main_patched is at 11d82a65, module/crypto is NOT an ancestor of it, and
+  # `git rev-list --count module/crypto ^main_patched` is 7, not 0. The branch
+  # carried on after the observation.
+  #
+  # The re-verification caught it on the live 2026-07-31 run and refused to
+  # apply it (WARN08_CUT_POINT_EXCEPTION_STALE, journaled), which is the
+  # file's own contract working: "NOTHING HERE IS TRUSTED ... A falsified entry
+  # is dropped with a STALE warning rather than applied." It is removed rather
+  # than corrected because a true `absorbed` claim would say nothing the
+  # topology does not already say, and nothing reads the field.
+  #
+  # `absorbed` has NO DRIVER CONSUMER: the schema, re-verification and reporting
+  # exist, but the cut-point derivation that would use it is analysis, not
+  # driver code. If a future entry is added, expect the same drift — an absorbed
+  # claim is only true until the branch's next commit.
