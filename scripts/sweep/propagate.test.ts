@@ -17,7 +17,7 @@ import { initFixtureRepo, type FixtureRepo } from './fixtures.js';
 import { addTempWorktree, commitInfo, isAncestor } from './git.js';
 import { readLedger } from './ledger.js';
 import { exportRrCache, writeRrCacheDir } from './merge.js';
-import { DriverHalt, guardRef } from './propagate.js';
+import { DriverHalt, failureSummary, guardRef } from './propagate.js';
 import {
   appendJournal,
   cmdPlan,
@@ -2617,3 +2617,51 @@ describe('materials token-opt helpers (#3)', () => {
     expect(hunks).not.toContain('bottom of file'); // far below → excluded
   });
 })
+
+describe('failing-output capture: summary + regions, nothing cropped before blame', () => {
+  /**
+   * `verify.ts` kept only `output.slice(-4000)` and that was the ONLY copy, so
+   * blame (a pure text scrape) could not see files whose diagnostics fell
+   * outside the window — a gate-fix case got scoped to whatever landed in the
+   * last 4000 characters (live 2026-07-31).
+   */
+  const bigTscOutput = (files: number, perFile: number): string => {
+    const out: string[] = ['$ pnpm run typecheck'];
+    for (let f = 0; f < files; f++) {
+      for (let e = 0; e < perFile; e++) {
+        out.push(`src/mod-${f}.ts(${e + 10},3): error TS2580: Cannot find name 'process'. Do you need to install type definitions for node?`);
+      }
+    }
+    return out.join('\n');
+  };
+
+  it('summarises every failing file, not just the tail', () => {
+    const output = bigTscOutput(40, 3); // ~120 diagnostics, far past a 4000-char tail
+    expect(output.length).toBeGreaterThan(4000);
+    const s = failureSummary(output, '/tmp/full.txt');
+    expect(s).toContain('120 diagnostic(s) across 40 file(s)');
+    // The FIRST file is the one a tail would have dropped — it must be present.
+    expect(s).toContain('src/mod-0.ts');
+    expect(s).toContain('src/mod-39.ts');
+    expect(s).toContain('/tmp/full.txt');
+  });
+
+  it('gives each file a line RANGE into the full log', () => {
+    const output = ['$ pnpm run typecheck', "src/a.ts(1,1): error TS2304: Cannot find name 'x'.", "src/b.ts(2,1): error TS2307: Cannot find module 'y'.", "src/a.ts(9,1): error TS2304: Cannot find name 'z'."].join('\n');
+    const s = failureSummary(output, null);
+    // src/a.ts: 2 diagnostics on log lines 2 and 4 -> range 2-4.
+    expect(s).toMatch(/src\/a\.ts\s+2 err\s+TS2304\s+lines 2-4/);
+    expect(s).toMatch(/src\/b\.ts\s+1 err\s+TS2307\s+lines 3-3/);
+  });
+
+  it('makes a BROKEN TOOLCHAIN legible as such', () => {
+    // The real 2026-07-31 shape: every file failing on missing node types.
+    const s = failureSummary(bigTscOutput(38, 1), null);
+    expect(s).toContain('38 file(s)');
+    expect(s).toContain('TS2580'); // one code across the board = environment, not code
+  });
+
+  it('returns empty for output with no diagnostics (callers omit the section)', () => {
+    expect(failureSummary('$ pnpm test\nall good\n', null)).toBe('');
+  });
+});

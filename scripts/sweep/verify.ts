@@ -32,7 +32,22 @@ export interface VerifyCommand {
 export interface CommandResult {
   cmd: string;
   code: number;
-  outputTail: string;
+  /**
+   * The command's FULL stdout+stderr — deliberately uncapped.
+   *
+   * This was `outputTail: output.slice(-4000)`, and that truncation was the ONLY
+   * copy kept. Blame (`attributeFailure` → `parseFailingFiles`) is a pure text
+   * scrape, so its whole view of "what failed" is this string: files whose
+   * diagnostics fell outside the window could not be attributed at all, and a
+   * gate-fix case ended up scoped to whichever files happened to land in the
+   * last 4000 characters. `.slice()` also cut mid-line, so the first surviving
+   * line was a severed fragment.
+   *
+   * Capping belongs at the DISPLAY boundary (what the agent is handed), not at
+   * CAPTURE — see `boundedChecksOutput` / `failureSummary` in propagate.ts,
+   * which bound the view and leave the full log on disk.
+   */
+  output: string;
 }
 
 export interface RecipeBuildResult {
@@ -66,6 +81,25 @@ export interface VerifyOptions {
    * happen to already live in the shared cache. Null/omitted → no seeding (fixtures).
    */
   rrCacheDir?: string | null;
+  /**
+   * Prepare the freshly-created temp worktree before anything is built in it.
+   *
+   * A `git worktree add` checkout holds TRACKED FILES ONLY — `node_modules` is
+   * gitignored, so it is absent. The case and gate-fix worktrees have always
+   * symlinked the clone's dependency trees in (`linkNodeModules`, D-060); THIS
+   * worktree never did, so `finish`'s verify ran `tsc` with no `@types/node`
+   * and no `vitest` and could not compile on ANY pass. Its output was a wall of
+   * "Cannot find name 'process'" / "Cannot find module 'vitest'" — which blame
+   * then attributed to whichever source files those lines named, minting
+   * gate-fix cases for a defect that was never in the code (live 2026-07-31:
+   * pnpm said it outright — "Local package.json exists, but node_modules
+   * missing").
+   *
+   * Injected rather than imported: `linkNodeModules` lives in propagate.ts,
+   * which imports THIS module. Omitted → no preparation (fixtures, whose stub
+   * commands need no dependencies).
+   */
+  prepareWorktree?: (wtPath: string) => Promise<unknown>;
 }
 
 async function runRecipe(repo: string, wtPath: string, baseRef: string, recipe: string[]): Promise<RecipeBuildResult> {
@@ -110,7 +144,7 @@ async function runCommands(wtPath: string, commands: VerifyCommand[]): Promise<C
       code = typeof e.code === 'number' ? e.code : 1;
       output = (e.stdout ?? '') + (e.stderr ?? '');
     }
-    results.push({ cmd, code, outputTail: output.slice(-4000) });
+    results.push({ cmd, code, output });
     if (code !== 0) break;
   }
   return results;
@@ -145,6 +179,10 @@ export async function verifyEverything(repo: string, opts: VerifyOptions): Promi
   await installRrCache(repo, opts.rrCacheDir ?? null);
   const wt = await addTempWorktree(repo, baseRef);
   try {
+    // Dependencies FIRST: every command below runs in this worktree, and
+    // without them the very first typecheck fails for want of `@types/node`
+    // rather than for anything in the tree being verified.
+    if (opts.prepareWorktree) await opts.prepareWorktree(wt.path);
     const first = await buildAndTest(repo, wt.path, baseRef, opts.recipe, commands);
     if (first.green) return { ok: true, build: first.build, commands: first.commands };
     // A merge conflict in the recipe is directly attributable.

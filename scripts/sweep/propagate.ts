@@ -1497,6 +1497,80 @@ async function gateFixHeadHeight(cli: Cli, chain: Chain, tip: string): Promise<n
 }
 
 /**
+ * A MECHANICAL digest of a failing checks run: one line per failing file, with
+ * how many diagnostics it carries, which error codes, and the LINE RANGE those
+ * diagnostics occupy in the full log.
+ *
+ * A tail answers "what were the last N lines"; this answers "what failed, and
+ * where do I read about it" — which is the question both readers actually have.
+ * The agent gets regions to open instead of a window someone else chose, and
+ * the SHAPE of a failure becomes legible: 38 files all reporting TS2580
+ * "Cannot find name 'process'" reads instantly as a broken toolchain, where the
+ * last 4000 characters of the same run looked like four files with type errors
+ * (live 2026-07-31 — that misreading is what minted a gate-fix case against a
+ * defect that did not exist).
+ *
+ * Pure text in, pure text out — no git, no fs.
+ */
+export function failureSummary(output: string, fullFile: string | null): string {
+  const lines = output.split('\n');
+  type Agg = { count: number; codes: Set<string>; first: number; last: number };
+  const perFile = new Map<string, Agg>();
+  lines.forEach((line, i) => {
+    const m = TSC_DIAG_RE.exec(line);
+    if (!m) return;
+    const file = m[1].replace(/^\.\//, '');
+    const code = m[2];
+    const agg = perFile.get(file);
+    if (agg) {
+      agg.count += 1;
+      agg.codes.add(code);
+      agg.last = i + 1;
+    } else {
+      perFile.set(file, { count: 1, codes: new Set([code]), first: i + 1, last: i + 1 });
+    }
+  });
+  if (perFile.size === 0) return '';
+  const rows = [...perFile.entries()].sort((a, b) => b[1].count - a[1].count);
+  const width = Math.min(60, Math.max(...rows.map(([f]) => f.length)));
+  const body = rows.map(
+    ([file, a]) =>
+      `  ${file.padEnd(width)}  ${String(a.count).padStart(3)} err  ` +
+      `${[...a.codes].sort().join(',').slice(0, 40).padEnd(40)}  lines ${a.first}-${a.last}`,
+  );
+  const total = rows.reduce((n, [, a]) => n + a.count, 0);
+  return [
+    `SUMMARY: ${total} diagnostic(s) across ${rows.length} file(s), ${lines.length} lines of output` +
+      (fullFile ? ` — full log: ${fullFile}` : ''),
+    ...body,
+  ].join('\n');
+}
+
+/** `src/x.ts(12,3): error TS2345: …` and `src/x.ts:12:3 - error TS2345: …`. */
+const TSC_DIAG_RE = /^\s*([\w./@-]+\.[cm]?tsx?)(?:\(\d+,\d+\)|:\d+:\d+\s*-)\s*:?\s*error\s+(TS\d+)/;
+
+/**
+ * The text BLAME reads for a failed verify: the full log from disk when it is
+ * there, else the journal's bounded copy.
+ *
+ * Blame is a pure text scrape (`parseFailingFiles`), so a file whose
+ * diagnostics were cropped out is not merely under-reported — it cannot be
+ * attributed, named in a case, or fixed. The journal field stays capped so a
+ * chatty runner cannot bloat it; the file carries everything.
+ */
+function attributionOutput(row: JournalEntry | null): string {
+  const f = typeof row?.failedOutputFile === 'string' ? row.failedOutputFile : null;
+  if (f && existsSync(f)) {
+    try {
+      return readFileSync(f, 'utf8');
+    } catch {
+      /* fall through to the journal copy */
+    }
+  }
+  return typeof row?.failedOutput === 'string' ? row.failedOutput : '';
+}
+
+/**
  * The bounded view of a failing checks run: the failing command names up front
  * (the thing the agent must act on), then the tail of the raw output, then a
  * pointer to the full log on disk for when the tail is not enough.
@@ -1505,11 +1579,16 @@ function boundedChecksOutput(r: ChecksRunResult, fullFile: string): string {
   const lines = r.output.split('\n');
   const truncated = lines.length > CHECKS_OUTPUT_TAIL_LINES;
   const tail = truncated ? lines.slice(-CHECKS_OUTPUT_TAIL_LINES) : lines;
+  const summary = failureSummary(r.output, fullFile);
   return [
     `FAILED: ${r.failedNames.join(', ')}`,
     truncated
       ? `(showing the last ${CHECKS_OUTPUT_TAIL_LINES} of ${lines.length} lines — full log: ${fullFile})`
       : `(full output below — also at ${fullFile})`,
+    // The digest goes ABOVE the tail: when a run fails in hundreds of places the
+    // tail is the least informative part of it, and the per-file line ranges are
+    // what let the agent open the right region of the full log.
+    ...(summary ? ['', summary] : []),
     '',
     ...tail,
   ].join('\n');
@@ -4395,7 +4474,16 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     : cli.commandsFile
       ? (JSON.parse(readFileSync(cli.commandsFile, 'utf8')) as VerifyCommand[])
       : VERIFY_COMMANDS;
-  const verifyOpts = { commands, baseRef, rrCacheDir };
+  // D-060's dependency links, applied to the VERIFY worktree too. The case and
+  // gate-fix worktrees have always had them; this one never did, so every
+  // finish-time verify typechecked without `@types/node` or `vitest` and was
+  // red on every pass regardless of content (see VerifyOptions.prepareWorktree).
+  const verifyOpts = {
+    commands,
+    baseRef,
+    rrCacheDir,
+    prepareWorktree: (wtPath: string) => linkNodeModules(cli.repo, wtPath),
+  };
 
   if (recipe.length === 0) {
     if (order.length === 0) {
@@ -4439,11 +4527,30 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     // paths relative to ITS directory; without the cwd here, finish hands blame a
     // `src/…` that means something else at the repo root (rootChecksOutput).
     const failedCwds = failedCmds.map((c) => commands.find((v) => v.cmd === c.cmd)?.cwd ?? '');
-    const failedOutput = failedCmds
-      .map((c) => `$ ${c.cmd}\n${c.outputTail}`)
-      .join('\n')
-      .slice(-VERIFY_OUTPUT_JOURNAL_CAP);
-    appendJournal(dir, { action: 'verify', ok: false, attributionFailed: true, failedCommands, failedCwds, failedOutput });
+    const fullText = failedCmds.map((c) => `$ ${c.cmd}\n${c.output}`).join('\n');
+    // The FULL log goes to disk; the journal keeps a bounded view plus the path.
+    // Blame reads the FILE (see `attributionOutput`), so a long failure is
+    // attributed completely instead of being scoped to whatever fitted in the
+    // journal cap — the defect that scoped a gate-fix case to the four files
+    // that happened to land in the last 4000 characters (live 2026-07-31).
+    const failedOutputFile = join(dir, 'verify-output.full.txt');
+    try {
+      writeFileSync(failedOutputFile, fullText);
+    } catch (e) {
+      console.error(`verify: could not write the full log: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    const summary = failureSummary(fullText, failedOutputFile);
+    const failedOutput = [summary, '', fullText].join('\n').slice(-VERIFY_OUTPUT_JOURNAL_CAP);
+    appendJournal(dir, {
+      action: 'verify',
+      ok: false,
+      attributionFailed: true,
+      failedCommands,
+      failedCwds,
+      failedOutput,
+      failedOutputFile,
+      ...(summary ? { failureSummary: summary } : {}),
+    });
     console.error('verify: RED — no single-branch attribution (leave-one-out did not isolate an offender)');
     emit(cli, { ok: false, attributionFailed: true, commands: first.commands });
     return 1;
@@ -7669,7 +7776,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     // cold read → judged (merge in place + re-propagate) or held (fix/sweep ref +
     // PR that blocks the next pass until the owner merges).
     if (verifyRc !== 0) {
-      const failedOutput = typeof attrib?.failedOutput === 'string' ? attrib.failedOutput : '';
+      const failedOutput = attributionOutput(attrib ?? null);
       const gate = await materializeGateFixCases(cli, dir, ctx.chain, failedOutput, failedChecksOf(attrib), offender ?? null);
       if (gate.served) {
         writeMachineState(dir, { ...st, phase: 'open', currentCase: null, finishStep: 'verify' });

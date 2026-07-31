@@ -1,3 +1,6 @@
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { initFixtureRepo } from './fixtures.js';
@@ -66,5 +69,56 @@ describe('verifyEverything', () => {
     expect(await revParse(repo.dir, 'module/good')).toBe(before.good);
     expect(await revParse(repo.dir, 'module/bad')).toBe(before.bad);
     expect(repo.git('status', '--porcelain')).toBe('');
+  });
+});
+
+describe('verifyEverything — worktree preparation (D-060 gap)', () => {
+  /**
+   * ROOT CAUSE, live 2026-07-31: a `git worktree add` checkout holds TRACKED
+   * FILES ONLY, so `node_modules` is absent. The case and gate-fix worktrees
+   * have symlinked the clone's dependency trees in since D-060; this one never
+   * did, so `finish`'s verify ran `tsc` with no `@types/node` and no `vitest`
+   * and was red on EVERY pass regardless of content. pnpm said so outright:
+   * "Local package.json exists, but node_modules missing".
+   */
+  it('prepares the temp worktree, and the deps SURVIVE runRecipe\'s clean', async () => {
+    const seen: string[] = [];
+    const res = await verifyEverything(repo.dir, {
+      recipe: ['module/good'],
+      // Asserted INSIDE the worktree after the recipe build, so this passes only
+      // if preparation ran first AND its output survived. That survival is not
+      // incidental: `runRecipe` does `git clean -fdx --exclude=node_modules`
+      // between preparation and the commands, which deletes every untracked
+      // path EXCEPT node_modules — which is exactly what linkNodeModules
+      // creates. A marker under any other name would be wiped.
+      commands: [{ cmd: 'test -f node_modules/DEPS_READY' }],
+      prepareWorktree: async (wtPath) => {
+        seen.push(wtPath);
+        mkdirSync(join(wtPath, 'node_modules'), { recursive: true });
+        writeFileSync(join(wtPath, 'node_modules', 'DEPS_READY'), 'ok\n');
+      },
+    });
+    expect(seen.length).toBe(1);
+    expect(res.ok).toBe(true);
+  });
+
+  it('without preparation the same command fails — the gap this closes', async () => {
+    const res = await verifyEverything(repo.dir, {
+      recipe: ['module/good'],
+      commands: [{ cmd: 'test -f node_modules/DEPS_READY' }],
+    });
+    expect(res.ok).toBe(false);
+  });
+
+  it('captures the FULL command output, not a tail', async () => {
+    // 5000 chars of stdout: a 4000-char tail would drop the head marker.
+    const res = await verifyEverything(repo.dir, {
+      recipe: ['module/good'],
+      commands: [{ cmd: 'echo HEAD_MARKER; printf \'x%.0s\' $(seq 1 5000); echo; exit 1' }],
+    });
+    expect(res.ok).toBe(false);
+    const out = res.commands[res.commands.length - 1].output;
+    expect(out.length).toBeGreaterThan(4000);
+    expect(out).toContain('HEAD_MARKER'); // survives only because nothing is cropped
   });
 });
