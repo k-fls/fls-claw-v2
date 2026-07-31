@@ -175,6 +175,9 @@ function currentCaseId(dir: string): string {
   return machineState(dir).currentCase!.caseId;
 }
 
+/** Pre-merge branch check stub: fixtures that are not testing IT inject green. */
+const greenPreMerge: ChecksRunner = async () => ({ ok: true, failedNames: [], output: '' });
+
 const confirm: ColdReadInvoker = async () => ({
   verdict: 'confirm',
   notes: 'behaviour preserved; every hunk explained',
@@ -369,7 +372,7 @@ describe('sweep next-case (D-053 §2)', () => {
 describe('sweep report-case (D-053 §2)', () => {
   async function toCase(repo: FixtureRepo, ws: string, inv: string): Promise<string> {
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     return currentCaseId(dirOf(repo, ws));
   }
 
@@ -525,7 +528,7 @@ describe('sweep report-case (D-053 §2)', () => {
     ]);
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const first = currentCaseId(dir); // topmost duplicate (DAG order)
     // Freeze the topmost HELD, then clear awaiting-pr so the twin can be served.
     resolveWorktree(dir, first, { 'src/x.ts': 'HELD variant\n' });
@@ -536,7 +539,7 @@ describe('sweep report-case (D-053 §2)', () => {
     expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
 
     // Serve the twin — identical conflict to the now-HELD topmost.
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const second = currentCaseId(dir);
     expect(second).not.toBe(first);
     const out = join(ws, 'rc.json');
@@ -759,7 +762,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     checks: string,
   ): Promise<{ dir: string; caseId: string }> {
     await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const dir = dirOf(repo, ws);
     const caseId = currentCaseId(dir);
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
@@ -914,7 +917,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     const inv = emptyInventory();
     const checks = checksFile(ws);
     await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const dir = dirOf(repo, ws);
     const caseId = currentCaseId(dir);
     const r = runner(['tsc --noEmit', 'vitest run']); // would fail if ever called
@@ -944,7 +947,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
       writeFileSync(join(repo.dir, rel, 'tsc'), '#!/bin/sh\nexit 0\n');
     }
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const dir = dirOf(repo, ws);
     const caseId = currentCaseId(dir);
     const wt = join(dir, caseId, 'worktree');
@@ -983,7 +986,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
       writeFileSync(join(repo.dir, rel, 'marker.txt'), 'x\n');
     }
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const dir = dirOf(repo, ws);
     const wt = join(dir, currentCaseId(dir), 'worktree');
     // COMMON dir: git reads info/exclude from the shared .git, not from a
@@ -1004,7 +1007,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     // start with NO --checks-file: the default <repo>/scripts/sweep/checks.json
     // does not exist in the fixture, so loadChecksConfig yields null.
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const dir = dirOf(repo, ws);
     const caseId = currentCaseId(dir);
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
@@ -1032,7 +1035,7 @@ describe('sweep report-pr (D-053 §2)', () => {
     tier: 'judged' | 'held',
   ): Promise<{ dir: string; caseId: string }> {
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const dir = dirOf(repo, ws);
     const caseId = currentCaseId(dir);
     if (tier === 'judged') resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
@@ -1066,7 +1069,7 @@ describe('sweep report-pr (D-053 §2)', () => {
 
     // finish: verify green -> push targets -> the ONE publish phase creates the
     // held DRAFT PR (fix/sweep ref pushed + PR, never merged by the driver).
-    await cmdSweepNextCase(baseCli(repo, ws, inv)); // finalize
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge); // finalize
     const cmds = join(ws, 'cmds.json');
     writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }]));
     const gh = fakeGithub();
@@ -1104,7 +1107,7 @@ describe('sweep report-pr (D-053 §2)', () => {
     const tokenFile = join(ws, 'tok.txt');
     writeFileSync(tokenFile, 'tok\n');
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const dir = dirOf(repo, ws);
     const caseId = currentCaseId(dir);
     // Marker-clean resolution that exceeds the conflict scope (#3) + confirm.
@@ -1124,7 +1127,7 @@ describe('sweep report-pr (D-053 §2)', () => {
 
     // finish creates the ACTIVE (non-draft) review PR at the resolved merge
     // commit, with the escalation prefix — the owner reviews & MERGES it.
-    await cmdSweepNextCase(baseCli(repo, ws, inv)); // finalize
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge); // finalize
     const cmds = join(ws, 'cmds.json');
     writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }]));
     const gh = fakeGithub();
@@ -1198,7 +1201,7 @@ describe('sweep report-pr (D-053 §2)', () => {
     const ws = mkWorkspace();
     const inv = emptyInventory();
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const dir = dirOf(repo, ws);
     const caseId = currentCaseId(dir);
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
@@ -1252,13 +1255,13 @@ describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
     const tokenFile = join(ws, 'tok.txt');
     writeFileSync(tokenFile, 'tok\n');
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const caseId = currentCaseId(dir);
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
     await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true }), confirm);
     writePr(dir, caseId, 'judged x', 'Decision needed: keep the fork line in src/x.ts.');
     await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm);
-    expect((await cmdSweepNextCase(baseCli(repo, ws, inv))) === 0).toBe(true); // finalize
+    expect((await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge)) === 0).toBe(true); // finalize
 
     const gh = fakeGithub();
     const out = join(ws, 'finish.json');
@@ -1289,7 +1292,7 @@ describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
     repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv)); // clean, finalize
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge); // clean, finalize
     const out1 = join(ws, 'f1.json');
     expect(
       await cmdSweepFinish(
@@ -1335,14 +1338,14 @@ describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const caseId = currentCaseId(dir);
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
     await cmdSweepReportCase(
       baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true }),
       confirm,
     );
-    await cmdSweepNextCase(baseCli(repo, ws, inv)); // finalize
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge); // finalize
 
     // Break the transport (credential-proxy failure mode) DETERMINISTICALLY:
     // the rewrite now points at a dead local path — never the real github.com.
@@ -1390,12 +1393,12 @@ describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
     const tokenFile = join(ws, 'tok.txt');
     writeFileSync(tokenFile, 'tok\n');
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const caseId = currentCaseId(dir);
     await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true }), confirm);
     writePr(dir, caseId, 'held x', 'Decision needed: resolution of src/x.ts — study before merge.');
     expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
-    await cmdSweepNextCase(baseCli(repo, ws, inv)); // finalize
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge); // finalize
 
     // Simulate the prior-run crash: GitHub already has the open PR for the
     // deterministic head branch (created just before the crash), while the
@@ -1455,7 +1458,7 @@ describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
 
     await cmdSweepStart(baseCli(repo, ws, inv));
     // Case 1 (feat/a): resolve JUDGED — merged locally at report-pr, PR at finish.
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const caseA = currentCaseId(dir);
     resolveWorktree(dir, caseA, { 'src/x.ts': 'RESOLVED\n' });
     await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true }), confirm);
@@ -1463,13 +1466,13 @@ describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
     expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
     // Case 2 (feat/b): the SAME conflict signature — freeze it HELD. This
     // passes report-case (the judged sibling is resolved, not yet published).
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const caseB = currentCaseId(dir);
     expect(caseB).not.toBe(caseA);
     await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true }), confirm);
     writePr(dir, caseB, 'held x', 'Decision needed: resolution of src/x.ts — study before merge.');
     expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
-    await cmdSweepNextCase(baseCli(repo, ws, inv)); // finalize
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge); // finalize
 
     const gh = fakeGithub();
     const out = join(ws, 'finish.json');
@@ -1504,10 +1507,10 @@ describe('sweep — crash resume (machine-state drives re-entry, D-053 §5)', ()
     const inv = emptyInventory();
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const caseId1 = currentCaseId(dir);
     // "dead container resumes": a fresh next-case reads the machine state + journal.
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     expect(currentCaseId(dir)).toBe(caseId1);
     // resolve + report picks up from the persisted state.
     resolveWorktree(dir, caseId1, { 'src/x.ts': 'RESOLVED\n' });
@@ -1567,7 +1570,7 @@ describe('sweep progress — SWEEP-STEP observability (D-054)', () => {
     const inv = emptyInventory();
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const caseId = currentCaseId(dir);
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
 
@@ -1605,7 +1608,7 @@ describe('sweep progress — SWEEP-STEP observability (D-054)', () => {
     const cap = captureStdout();
     let rc: number;
     try {
-      rc = await cmdSweepNextCase(baseCli(repo, ws, inv));
+      rc = await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     } finally {
       cap.restore();
     }
@@ -1631,7 +1634,7 @@ describe('sweep progress — SWEEP-STEP observability (D-054)', () => {
 
     const cap = captureStdout();
     try {
-      expect(await cmdSweepNextCase(baseCli(repo, ws, inv))).toBe(0);
+      expect(await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge)).toBe(0);
     } finally {
       cap.restore();
     }
@@ -1656,13 +1659,13 @@ describe('sweep progress — SWEEP-STEP observability (D-054)', () => {
     writeFileSync(cmdsFile, JSON.stringify([{ cmd: 'true' }]));
 
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const caseId = currentCaseId(dir);
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
     await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true }), confirm);
     writePr(dir, caseId, 'judged x', 'Decision needed: keep the fork line in src/x.ts.');
     await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm);
-    await cmdSweepNextCase(baseCli(repo, ws, inv)); // finalize
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge); // finalize
 
     const gh = fakeGithub();
     const cap = captureStdout();
@@ -1727,7 +1730,7 @@ describe('cold-read infra failure ≠ content reject (D-054, ERR35_COLDREAD_UNAV
     const inv = emptyInventory();
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const caseId = currentCaseId(dir);
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
     const out = join(ws, 'rc.json');
@@ -1753,7 +1756,7 @@ describe('cold-read infra failure ≠ content reject (D-054, ERR35_COLDREAD_UNAV
     const inv = emptyInventory();
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const caseId = currentCaseId(dir);
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
     // A genuine reject is a content decision: first strike -> revise-and-retry
@@ -1786,7 +1789,7 @@ describe('cold-read infra failure ≠ content reject (D-054, ERR35_COLDREAD_UNAV
     const inv = emptyInventory();
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const caseId = currentCaseId(dir);
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
     expect(
@@ -1805,7 +1808,7 @@ describe('cold-read infra failure ≠ content reject (D-054, ERR35_COLDREAD_UNAV
     const inv = emptyInventory();
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const caseId = currentCaseId(dir);
     const beforeTip = repo.sha('main_patched');
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
@@ -1924,7 +1927,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     expect(repo.git('-C', bare, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep')).toBe('');
     // The branch is unblocked: next-case ff-syncs to the owner's merge and
     // processes normally (U1 landed via the owner resolution -> clean pass).
-    expect(await cmdSweepNextCase(baseCli(repo, ws, inv))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge)).toBe(0);
     expect(readJournal(dir).some((e) => e.action === 'skip' && e.branch === 'main_patched' && e.reason === 'held')).toBe(
       false,
     );
@@ -2938,7 +2941,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     expect(await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile }), gh.factory)).toBe(0);
     const dir = dirOf(repo, ws);
     const caseId = readJournal(dir).find((e) => e.action === 'case')!.caseId as string;
-    expect(await cmdSweepNextCase(baseCli(repo, ws, inv))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge)).toBe(0);
     resolveWorktree(dir, caseId, { 'src/x.ts': 'REVISED\n' });
     expect(
       await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true }), confirm),
@@ -3012,7 +3015,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     // Pass 1: hold the case, provide the PR text, record the intent — then the
     // pass dies before finish (abort = the sanctioned crash-equivalent).
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const caseId = currentCaseId(dir);
     await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true }), confirm);
     writePr(dir, caseId, 'held x', 'Decision needed: resolution of src/x.ts — study before merge.');
@@ -3065,7 +3068,7 @@ describe('sweep finish — owner-facing PR + stats summary on the success SWEEP-
     expect(readJournal(dir).some((e) => e.action === 'origin-blocked' && e.branch === 'feat/other')).toBe(true);
 
     // main_patched's conflict -> held (pristine draft) -> intent.
-    expect(await cmdSweepNextCase(baseCli(repo, ws, inv))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge)).toBe(0);
     const caseId = currentCaseId(dir);
     expect(
       await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true }), confirm),
@@ -3226,14 +3229,14 @@ describe('sweep finish — push resilience (D-059 FINAL): per-branch, categorize
     const tokenFile = join(ws, 'tok.txt');
     writeFileSync(tokenFile, 'tok\n');
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const caseId = currentCaseId(dir);
     expect(
       await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true }), confirm),
     ).toBe(0);
     writePr(dir, caseId, 'held x', 'Decision needed: resolution of src/x.ts — study before merge.');
     expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
-    await cmdSweepNextCase(baseCli(repo, ws, inv)); // finalize
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge); // finalize
 
     repo.breakOriginTransport(bare); // the outage
     const gh = fakeGithub();
@@ -3288,14 +3291,14 @@ describe('sweep finish — push resilience (D-059 FINAL): per-branch, categorize
     const tokenFile = join(ws, 'tok.txt');
     writeFileSync(tokenFile, 'tok\n');
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const caseId = currentCaseId(dir);
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
     await cmdSweepReportCase(
       baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true }),
       confirm,
     );
-    await cmdSweepNextCase(baseCli(repo, ws, inv)); // finalize
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge); // finalize
     // A judged PR published by a PRIOR crashed run (journal row without a
     // matching case) whose closure check will fail (merged: false -> ERR16)…
     appendFileSync(
@@ -3478,7 +3481,7 @@ describe('sweep start — canonical pass location + clean-slate boundary (D-055)
     const inv = emptyInventory();
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv)); // merges the U0 prefix, serves the conflict case
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge); // merges the U0 prefix, serves the conflict case
     expect(await cmdSweepAbort(baseCli(repo, ws, inv, { cmd: 'sweep-abort' }))).toBe(0);
     // WITHOUT this row attachPass ("open" = plan-initial.json AND no pass-complete)
     // would keep re-attaching to the aborted pass — the C-4 bug.
@@ -3600,6 +3603,57 @@ describe('next-case — a participating branch that is RED before any merge', ()
     expect(new Set(keys).size).toBe(keys.length); // no (branch, sha) checked twice
   });
 
+  /**
+   * REGRESSION (live 2026-07-31): the check silently did nothing in production
+   * while every fixture passed. `applyPassConfig` RETURNS the pass's checks file
+   * rather than assigning it onto `cli`, so reading `cli.checksFile` in
+   * `next-case` got undefined, `loadChecksConfig` returned null, and the check
+   * exited at its first line — indistinguishable from "no checks file".
+   *
+   * This test resolves the path the way production does: `start` persists it
+   * into machine state and later commands read it FROM THERE. `next-case` is
+   * given no --checks-file flag at all.
+   */
+  it('resolves the checks file from MACHINE STATE, not from a flag on next-case', async () => {
+    const repo = redBaseRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/cg.ts'] }]);
+    const dir = dirOf(repo, ws);
+    const checks = join(ws, 'checks.json');
+    writeFileSync(checks, JSON.stringify({ typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }], test: [] }));
+    const mpBefore = repo.sha('main_patched');
+
+    // start records checksFile in machine state...
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }))).toBe(0);
+    expect(JSON.parse(readFileSync(join(dir, 'machine-state.json'), 'utf8')).checksFile).toBe(checks);
+
+    // ...and next-case must pick it up from there, with NO flag of its own.
+    const out = join(ws, 'nc.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), markerRunner)).toBe(0);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; gateFix?: { branch: string } };
+    expect(res.status).toBe('gate-fix-required');
+    expect(res.gateFix!.branch).toBe('main_patched');
+    expect(repo.sha('main_patched')).toBe(mpBefore); // nothing merged
+    expect(readJournal(dir).some((e) => e.action === 'branch-check')).toBe(true);
+  });
+
+  it('a CONFIGURED but unreadable checks file is LOUD, never a silent skip', async () => {
+    const repo = redBaseRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/cg.ts'] }]);
+    const dir = dirOf(repo, ws);
+    const checks = join(ws, 'checks.json');
+    writeFileSync(checks, JSON.stringify({ typecheck: [], test: [] })); // configured, but no gate
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }))).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv), markerRunner);
+    // The pass proceeds (an empty list is not fatal) but it must SAY the gate
+    // did not run — a disabled gate that looks like a passing one is the ERR43
+    // failure mode.
+    expect(
+      readJournal(dir).some((e) => e.action === 'warning' && e.id === 'WARN11_PRE_MERGE_CHECK_SKIPPED'),
+    ).toBe(true);
+  });
+
   it('no checks file -> the check is skipped entirely (repos without one behave as before)', async () => {
     const repo = redBaseRepo();
     const ws = mkWorkspace();
@@ -3664,7 +3718,7 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     repo.git('push', 'origin', 'main_patched');
     const { cmds } = redUntilCleared(ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const out = join(ws, 'f1.json');
     expect(
       await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out })),
@@ -3734,7 +3788,7 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
       ]),
     );
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const out = join(ws, 'f1.json');
     expect(
       await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out })),
@@ -3777,12 +3831,12 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     repo.git('push', 'origin', 'main_patched');
     const { cmds, clear } = redUntilCleared(ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const f1 = join(ws, 'f1.json');
     await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out: f1 }));
     const gf = JSON.parse(readFileSync(f1, 'utf8')) as { status: string; gateFix: { caseId: string } };
     expect(gf.status).toBe('gate-fix-required');
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
 
     const tipBefore = repo.sha('module/cg');
     resolveWorktree(dir, gf.gateFix.caseId, { 'src/x.ts': 'FIXED\n' });
@@ -3804,7 +3858,7 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     // The point of the judged tier: the fix is IN the branches, so once the build
     // is green the SAME pass completes — no restart, unlike the held tier.
     clear();
-    await cmdSweepNextCase(baseCli(repo, ws, inv)); // pull the fix through -> finalize
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge); // pull the fix through -> finalize
     const tokenFile = join(ws, 'tok.txt');
     writeFileSync(tokenFile, 'tok\n');
     const gh = fakeGithub();
@@ -3830,7 +3884,7 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     repo.git('push', 'origin', 'main_patched');
     const { cmds } = redUntilCleared(ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const f1 = join(ws, 'f1.json');
     await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out: f1 }));
     expect((JSON.parse(readFileSync(f1, 'utf8')) as { status: string }).status).toBe('gate-fix-required');
@@ -3852,12 +3906,12 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     cmds: string,
   ): Promise<string> {
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const f1 = join(ws, 'gf.json');
     await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out: f1 }));
     const res = JSON.parse(readFileSync(f1, 'utf8')) as { status: string; gateFix: { caseId: string } };
     expect(res.status).toBe('gate-fix-required');
-    await cmdSweepNextCase(baseCli(repo, ws, inv)); // serve it
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge); // serve it
     return res.gateFix.caseId;
   }
 
@@ -3894,7 +3948,7 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
 
     clear(); // the held branch is out of the publishable set; the rest is green
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const tokenFile = join(ws, 'tok.txt');
     writeFileSync(tokenFile, 'tok\n');
     const gh = fakeGithub();
@@ -4083,7 +4137,7 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
 
     rmSync(flagX, { force: true }); // x is fixed; now y fails
-    await cmdSweepNextCase(baseCli(repo, ws, inv)); // pull the fix through the reopened DAG
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge); // pull the fix through the reopened DAG
     const f2 = join(ws, 'f2.json');
     await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out: f2 }));
     const res2 = JSON.parse(readFileSync(f2, 'utf8')) as { status: string; gateFix: { caseId: string; files: string[] } };
@@ -4130,7 +4184,7 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
 
     clear();
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const tokenFile = join(ws, 'tok.txt');
     writeFileSync(tokenFile, 'tok\n');
     const gh = fakeGithub();
@@ -4300,7 +4354,7 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     repo.git('push', 'origin', 'main_patched');
     const { cmds } = redUntilCleared(ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     // The gate: any ref matching `<slug(branch)>--gate-fix-*`. The id8 is NOT
     // looked up — a gate fix is per BRANCH, so its presence is the whole answer.
     repo.git('push', 'origin', `${repo.sha('module/cg')}:refs/heads/fix/sweep/module__cg--gate-fix-module__cg-deadbeef`);
@@ -4341,11 +4395,11 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     repo.git('push', 'origin', 'main_patched');
     const { cmds } = redUntilCleared(ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const f1 = join(ws, 'f1.json');
     await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out: f1 }));
     const caseId = (JSON.parse(readFileSync(f1, 'utf8')) as { gateFix: { caseId: string } }).gateFix.caseId;
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     // Resolve the gate fix and claim held so a PR is asked for.
     writeFileSync(join(dir, caseId, 'worktree', 'src/x.ts'), 'fixed\n');
     const rc = join(ws, 'rc.json');
@@ -4419,7 +4473,7 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
       ]),
     );
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const out = join(ws, 'f1.json');
     await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out }));
     const res = JSON.parse(readFileSync(out, 'utf8')) as {
@@ -4489,7 +4543,7 @@ describe('sweep finish — a gate-fix case is never served with NO files (defect
     repo.git('push', 'origin', 'main_patched', 'feat/other');
     const cmds = redGreenRed(ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
-    await cmdSweepNextCase(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const out = join(ws, 'f1.json');
     expect(
       await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out })),
@@ -4523,7 +4577,7 @@ describe('report-case — a FAILED pristine reset is not reported as success (de
     const inv = emptyInventory();
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
-    expect(await cmdSweepNextCase(baseCli(repo, ws, inv))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge)).toBe(0);
     const caseId = currentCaseId(dir);
     const wt = join(dir, caseId, 'worktree');
     // The agent left work behind but could not resolve the markers -> --tier held,

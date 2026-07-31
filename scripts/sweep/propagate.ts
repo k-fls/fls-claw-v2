@@ -6350,10 +6350,25 @@ function participatingBranches(dir: string): string[] {
 async function firstRedParticipant(
   cli: Cli,
   dir: string,
+  checksFile: string | undefined,
   runChecks: ChecksRunner,
 ): Promise<{ branch: string; sha: string; output: string; failed: VerifyCommand[]; failedNames: string[] } | null> {
-  const checks = loadChecksConfig(cli.checksFile);
-  if (!checks || checks.typecheck.length === 0) return null;
+  // An ABSENT checks file is a deliberate skip (a repo without one behaves as
+  // before). A CONFIGURED one that will not load is a silently disabled gate —
+  // the ERR43 lesson — so say so instead of returning null indistinguishably.
+  const checks = loadChecksConfig(checksFile);
+  if (!checks || checks.typecheck.length === 0) {
+    if (checksFile && (!checks || checks.typecheck.length === 0)) {
+      const why = checks ? 'its `typecheck` list is empty' : 'it could not be read';
+      appendJournal(dir, {
+        action: 'warning',
+        id: 'WARN11_PRE_MERGE_CHECK_SKIPPED',
+        message: `pre-merge branch check SKIPPED: ${checksFile} — ${why}; branches merge unverified`,
+      });
+      console.error(`next-case [WARN11_PRE_MERGE_CHECK_SKIPPED]: ${checksFile} — ${why}`);
+    }
+    return null;
+  }
   const branches = participatingBranches(dir);
   if (branches.length === 0) return null;
   const journal = readJournal(dir);
@@ -6395,7 +6410,12 @@ export async function cmdSweepNextCase(cli: Cli, runChecks: ChecksRunner = defau
   const ctx = await attachPass(cli);
   const dir = ctx.dir;
   let st = readMachineState(dir);
-  applyPassConfig(cli, st);
+  // applyPassConfig RETURNS the pass's checks file; it does not assign it onto
+  // `cli` (it only does that for `inventory`). Dropping the return value left
+  // `checksFile` undefined here, so the pre-merge check below loaded no config
+  // and silently did nothing — live 2026-07-31, zero `branch-check` rows while
+  // the merges ran on regardless. `report-case` and `finish` both capture it.
+  const passChecksFile = applyPassConfig(cli, st);
   if (!st) {
     console.error('next-case: no machine state — run `sweep start` first');
     return 2;
@@ -6423,7 +6443,7 @@ export async function cmdSweepNextCase(cli: Cli, runChecks: ChecksRunner = defau
   // scope. Serve the fix as a case on the branch that owns it instead; the
   // branch is thereby blocked, and the existing DEFERRED path holds its
   // descendants back (D-057/D-058) with no extra machinery.
-  const redBranch = await firstRedParticipant(cli, dir, runChecks);
+  const redBranch = await firstRedParticipant(cli, dir, passChecksFile, runChecks);
   if (redBranch) {
     const gate = await materializeGateFixCases(cli, dir, ctx.chain, redBranch.output, redBranch.failed, null, {
       rootBranch: redBranch.branch,
