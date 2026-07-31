@@ -4605,12 +4605,20 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     throw e;
   }
   appendJournal(dir, { action: 'pre-ref-rollback', branch: offender, to: preRef });
+  // A GATE hold is not a case: the branch was rolled back and dropped from the
+  // publishable set, with no conflict, no head and no merge behind it. It used
+  // to carry `height: -1` and `conflictedPaths: []` — placeholders claiming a
+  // measurement nobody took. Nothing read them (no `case` row is ever journaled
+  // for a `gate-*` id, so the head lookup in `deriveLive` correctly misses and
+  // records a null headSha), but a fake height in a typed-looking field is the
+  // exact shape D-061 spent a decision removing from gate-fix cases, where it
+  // WAS load-bearing: `pendingAbove = heads.length - 1 - head.height` reported
+  // one more than the chain held on every held gate-fix PR. Omit them instead:
+  // absent says "not applicable", `-1` says "measured, and the answer is -1".
   appendJournal(dir, {
     action: 'held',
     branch: offender,
     caseId: `gate-${offender.replace(/\//g, '__')}`,
-    height: -1,
-    conflictedPaths: [],
     reason: 'gate',
   });
   // APPROVED-LANDING offender (D-059 FINAL finding 2): the rolled-back merge

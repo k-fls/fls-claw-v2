@@ -1164,6 +1164,13 @@ describe('propagate verify — §9 gate rolls back a red offender (FIX B)', () =
     // nothing written to the ledger.
     const gateRow = journal.find((e) => e.action === 'held' && e.branch === 'feat/off')!;
     expect(gateRow.reason).toBe('gate');
+    // A gate hold is NOT a case — no conflict, no head, no merge. It used to
+    // carry `height: -1` and `conflictedPaths: []`, placeholders asserting a
+    // measurement nobody took. Absent means "not applicable"; -1 means
+    // "measured, answer -1", and that is the shape D-061 had to unpick from
+    // gate-fix cases where readers really did do arithmetic on it.
+    expect(gateRow.height).toBeUndefined();
+    expect(gateRow.conflictedPaths).toBeUndefined();
     expect(readLedger(join(ws, 'sweep-ledger.json')).branches['feat/off']?.merge_status ?? null).toBeNull();
   });
 });
