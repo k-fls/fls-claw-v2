@@ -3544,18 +3544,18 @@ describe('next-case — a participating branch that is RED before any merge', ()
 
     const res = JSON.parse(readFileSync(out, 'utf8')) as {
       status: string;
-      gateFix?: { branch: string; caseId: string };
-      issues?: Array<{ id: string }>;
+      caseId?: string;
+      branch?: string;
+      worktree?: string;
       instruction: string;
     };
-    expect(res.status).toBe('gate-fix-required');
-    // Rooted on the branch that is red — NOT on a descendant, and not on
-    // whichever branch blame says authored the file.
-    expect(res.gateFix!.branch).toBe('main_patched');
-    // A PROCEED arm: it hands out a case, so it must ADVISE, never BLOCK.
-    expect(res.issues![0].id).toBe('WARN09_GATE_FIX_SERVED');
-    expect(res.issues!.some((i) => i.id.startsWith('ERR'))).toBe(false);
-    expect(res.instruction).toContain('before this pass merges anything');
+    // SERVED ON THIS CALL — not "run next-case again". Returning a pointer here
+    // stranded the case: the next call re-ran the check, hit the mint dedup, and
+    // could never hand it over (live 2026-07-31).
+    expect(res.status).toBe('case-ready');
+    expect(res.caseId).toContain('gate-fix-main_patched');
+    expect(res.branch).toBe('main_patched');
+    expect(existsSync(res.worktree!)).toBe(true);
 
     // NOTHING was merged — the whole point. A red branch must not propagate.
     expect(repo.sha('main_patched')).toBe(mpBefore);
@@ -3630,9 +3630,9 @@ describe('next-case — a participating branch that is RED before any merge', ()
     // ...and next-case must pick it up from there, with NO flag of its own.
     const out = join(ws, 'nc.json');
     expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), markerRunner)).toBe(0);
-    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; gateFix?: { branch: string } };
-    expect(res.status).toBe('gate-fix-required');
-    expect(res.gateFix!.branch).toBe('main_patched');
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; branch?: string };
+    expect(res.status).toBe('case-ready');
+    expect(res.branch).toBe('main_patched');
     expect(repo.sha('main_patched')).toBe(mpBefore); // nothing merged
     expect(readJournal(dir).some((e) => e.action === 'branch-check')).toBe(true);
   });

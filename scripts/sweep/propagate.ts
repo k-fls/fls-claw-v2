@@ -6444,44 +6444,25 @@ export async function cmdSweepNextCase(cli: Cli, runChecks: ChecksRunner = defau
   // branch is thereby blocked, and the existing DEFERRED path holds its
   // descendants back (D-057/D-058) with no extra machinery.
   const redBranch = await firstRedParticipant(cli, dir, passChecksFile, runChecks);
+  let redGate: { reason: string; gated: string[] } | null = null;
   if (redBranch) {
+    // Ensure a gate-fix case EXISTS for the red branch — idempotent, since
+    // materializeGateFixCases dedups on its own key — and then FALL THROUGH to
+    // the ordinary case-serving path below.
+    //
+    // Returning here instead told the agent to "run `next-case`", but the very
+    // next call re-ran this check, hit that dedup, and could never hand the case
+    // over: it was minted and then STRANDED (live 2026-07-31 — phase stayed
+    // `open` with currentCase null while the agent improvised its own diagnosis).
+    // Serving it on THIS call also means the tree is typechecked once, not once
+    // per round-trip.
     const gate = await materializeGateFixCases(cli, dir, ctx.chain, redBranch.output, redBranch.failed, null, {
       rootBranch: redBranch.branch,
     });
-    if (gate.served) {
-      const first = gate.cases[0];
-      st = { ...st, phase: 'open', currentCase: null };
-      writeMachineState(dir, st);
-      progress(`${redBranch.branch} is RED before any merge — gate-fix case prepared`);
-      console.error(`next-case: ${redBranch.branch} red (${redBranch.failedNames.join(', ')}) — gate-fix ${first.caseId}`);
-      result(cli, {
-        status: 'gate-fix-required',
-        issues: [
-          {
-            id: 'WARN09_GATE_FIX_SERVED',
-            detail: `${redBranch.branch} is red BEFORE any merge (${redBranch.failedNames.join(', ')}) — ${gate.detail}`,
-          },
-        ],
-        gateFix: { caseId: first.caseId, branch: first.branch, files: first.files, reason: gate.reason },
-        instruction: `${redBranch.branch} is broken before this pass merges anything — a GATE-FIX case has been prepared on it; run \`next-case\` to work it`,
-      });
-      return 0;
-    }
-    // Red but nothing servable (already gated on origin, or nothing blameable).
-    // Say so plainly rather than merging into a branch known to be broken.
-    progress(`${redBranch.branch} is RED and no case could be served — ${gate.reason}`);
-    console.error(`next-case: ${redBranch.branch} red, unservable — ${gate.reason}`);
-    result(cli, {
-      ok: false,
-      status: 'stopped',
-      ...(gate.gated.length ? { gatedBranches: gate.gated } : {}),
-      instruction:
-        `REPORT to the owner: ${redBranch.branch} is RED before this pass merges anything ` +
-        `(${redBranch.failedNames.join(', ')}) and no gate-fix case could be served — ${gate.reason}. ` +
-        `Nothing was merged.`,
-    });
-    return 1;
-  }
+    redGate = { reason: gate.reason, gated: gate.gated };
+    progress(`${redBranch.branch} is RED before any merge (${redBranch.failedNames.join(', ')}) — merging nothing`);
+    console.error(`next-case: ${redBranch.branch} red — serving its gate-fix; no merges this call`);
+  } else {
 
   // Advance the deterministic machinery (idempotent; continues reopened branches
   // above resolved heights and lands new clean prefixes/skips/defers). D-054: the
@@ -6507,13 +6488,14 @@ export async function cmdSweepNextCase(cli: Cli, runChecks: ChecksRunner = defau
     result(cli, { status: 'run-halted', instruction: 'run halted — inspect the journal for the ERR2x halt', passDir: dir });
     return runRc;
   }
-
-  const journal = readJournal(dir);
-  const delta = journal.slice(journalLenBefore);
+  const delta = readJournal(dir).slice(journalLenBefore);
   const mergedN = delta.filter((e) => e.action === 'merge').length;
   const skippedN = delta.filter((e) => e.action === 'skip').length;
   const deferredN = delta.filter((e) => e.action === 'defer').length;
   progress(`merged ${mergedN} clean / skipped ${skippedN} / deferred ${deferredN}`);
+  }
+
+  const journal = readJournal(dir);
   // ACTIVE GATES, read from ORIGIN at the moment of asking. A branch whose gate
   // fix is already written and waiting on the owner is SKIPPED, not re-served —
   // and the agent is told, so "nothing to serve" is never mistaken for "nothing
@@ -6527,6 +6509,24 @@ export async function cmdSweepNextCase(cli: Cli, runChecks: ChecksRunner = defau
       : '';
 
   const open = openCases(journal);
+  if (open.length === 0 && redBranch) {
+    // Red, and nothing to serve for it — already gated on origin, or nothing
+    // blameable. Never report `finalize` here: that reads as "all done" when the
+    // branch is broken and nothing was merged.
+    st = { ...st, phase: 'open', currentCase: null };
+    writeMachineState(dir, st);
+    console.error(`next-case: ${redBranch.branch} red, no case servable — ${redGate?.reason ?? ''}`);
+    result(cli, {
+      ok: false,
+      status: 'stopped',
+      ...(redGate?.gated.length ? { gatedBranches: redGate.gated } : {}),
+      instruction:
+        `REPORT to the owner: ${redBranch.branch} is RED before this pass merges anything ` +
+        `(${redBranch.failedNames.join(', ')}) and no gate-fix case could be served — ${redGate?.reason ?? 'no reason recorded'}. ` +
+        `Nothing was merged.`,
+    });
+    return 1;
+  }
   if (open.length === 0) {
     st = { ...st, phase: 'open', currentCase: null };
     writeMachineState(dir, st);
