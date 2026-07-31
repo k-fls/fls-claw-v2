@@ -160,7 +160,12 @@ whole scope — reads and edits — is what this merge causes:
 
 ### Driver bugs
 
-On a crash, wrong verdict, or impossible state: file a GitHub issue immediately
+A build failure in code OUTSIDE your case is NOT a driver bug — it is a code
+defect, and the driver serves it as a gate-fix on the branch that owns it.
+Report it as such (see `ERR36`); never file it against the driver.
+
+On a driver crash, a wrong verdict, or a state that contradicts the driver's own
+output: file a GitHub issue immediately
 via the raw API (`POST /repos/k-fls/fls-claw-v2/issues`, label `sweep-driver`)
 — title = the broken invariant; body = exact command, its full output, observed
 vs expected, minimal reproduction. Reference the issue number in your final
@@ -199,7 +204,7 @@ around a blocking id.
 | `ERR33_BRANCH_TESTS_FAILED` | open the named log, fix the resolution, re-report |
 | `ERR34_CASES_REMAIN` | finish every case first |
 | `ERR35_COLDREAD_UNAVAILABLE` | stop-case 2 report; the case stays put — re-run once restored |
-| `ERR36_TYPECHECK_FAILED` | open the named output file, fix the pending files, re-run `report-case` |
+| `ERR36_TYPECHECK_FAILED` | open the named output file, fix the pending files, re-run `report-case`. If the failing file is NOT one of your pending files you cannot fix it and must not try: claim `--tier held`, naming the file and saying it is outside your case. That is a CODE defect the driver routes as its own gate-fix — it is not a driver bug and not yours to work around |
 | `ERR37_WORKSPACE_IN_CLONE` | `--workspace` points at the `--repo` clone (or inside it) — the group ROOT is the correct workspace. Stop-case 2 report; do NOT re-run with the same paths |
 | `ERR38_PASS_CLEAR_FAILED` | the prior pass dir could not be cleared — pass files are container-uid-owned, so teardown must run IN-CONTAINER; clear it there, then re-run `start` |
 | `ERR40_TESTS_FAILED` | same as ERR36; at `finish` it is a stop-case 2 report (publish nothing) |

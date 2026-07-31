@@ -6284,7 +6284,114 @@ export async function cmdSweepAbort(cli: Cli): Promise<number> {
 const CHECKS_HANDOFF_LINE =
   'After editing, run the typechecks and fix any issues. Do NOT run tests before report-case — it runs them itself.';
 
-export async function cmdSweepNextCase(cli: Cli): Promise<number> {
+/**
+ * The branches this pass will actually touch, in the plan's topological order.
+ *
+ * A branch PARTICIPATES if the pass merges something INTO it (a `merge`/`case`
+ * verdict on one of its parents) or if it is the SOURCE such a merge reads. The
+ * source half is not decoration: a branch that is red and static — nothing
+ * pending into it — would otherwise be skipped and then propagated FROM, which
+ * is precisely how a red trunk reaches every descendant while each descendant's
+ * own pre-merge tip still looks green.
+ *
+ * Branches the pass does not touch are not checked. The sweep validates what it
+ * changes; a branch nobody merges and nobody reads is not this pass's business.
+ */
+function participatingBranches(dir: string): string[] {
+  const f = existsSync(join(dir, 'plan.json')) ? join(dir, 'plan.json') : join(dir, 'plan-initial.json');
+  if (!existsSync(f)) return [];
+  let plan: PropagationPlan;
+  try {
+    plan = JSON.parse(readFileSync(f, 'utf8')) as PropagationPlan;
+  } catch {
+    return [];
+  }
+  const participants = new Set<string>();
+  for (const bp of plan.branches ?? []) {
+    for (const pp of bp.parents ?? []) {
+      if (pp.verdict !== 'merge' && pp.verdict !== 'case') continue;
+      participants.add(bp.branch); // target: content lands here
+      participants.add(pp.parent); // source: content is read from here
+    }
+  }
+  const order = plan.order ?? [];
+  const ordered = order.filter((b) => participants.has(b));
+  // Anything the order does not name still gets checked, after the ordered set.
+  return [...ordered, ...[...participants].filter((b) => !ordered.includes(b))];
+}
+
+/**
+ * PRE-MERGE BRANCH CHECK — the first participating branch that is already RED.
+ *
+ * Detection runs FORWARD, with the sweep, instead of backwards from a symptom.
+ * The sweep propagates down from the trunk, so a defect on a branch reaches
+ * every descendant that merges it; checking each participant BEFORE its content
+ * moves catches it at the one branch that can actually fix it, and no
+ * descendant ever inherits an unfixable failure.
+ *
+ * This replaces D-061's base gate, which had the right instinct and three wrong
+ * parts: it looked only at the trunk (so any other red branch went unseen until
+ * `finish`), it lived at `start` (which has no pass to put a case in, so it
+ * could only REFUSE), and its anti-loop was a sha-keyed file that wedged the
+ * moment a held fix left the trunk red. Removing it (84e60cd7) left nothing
+ * looking: there is exactly ONE `runChecks` call in this driver and it is the
+ * per-case gate, so a CLEAN merge is never typechecked and a red propagates in
+ * silence — live 2026-07-31, a trunk defect from 2026-07-04 surfaced only when
+ * an unrelated conflict case tripped over it and could not fix it in scope.
+ *
+ * TYPECHECK ONLY, as the base gate did: tests are far slower and `finish`'s
+ * verify still runs them. Results are memoised as `branch-check` journal rows
+ * keyed by (branch, tip sha) — a PASS-LOCAL fact, not a ledger. `start` wipes
+ * the journal, so it cannot go stale across passes, and a judged fix moves the
+ * tip so the key changes and the branch is re-checked. (A stored green set is
+ * the same mistake as the sha-keyed attempts file that D-058 §2 exists to rule
+ * out.)
+ */
+async function firstRedParticipant(
+  cli: Cli,
+  dir: string,
+  runChecks: ChecksRunner,
+): Promise<{ branch: string; sha: string; output: string; failed: VerifyCommand[]; failedNames: string[] } | null> {
+  const checks = loadChecksConfig(cli.checksFile);
+  if (!checks || checks.typecheck.length === 0) return null;
+  const branches = participatingBranches(dir);
+  if (branches.length === 0) return null;
+  const journal = readJournal(dir);
+  const checked = new Map<string, boolean>();
+  for (const e of journal) {
+    if (e.action === 'branch-check' && typeof e.branch === 'string' && typeof e.sha === 'string') {
+      checked.set(`${e.branch}@${e.sha}`, e.ok === true);
+    }
+  }
+  let wt: { path: string; remove: () => Promise<void> } | null = null;
+  try {
+    for (const branch of branches) {
+      if (!(await refExists(cli.repo, branch))) continue;
+      const sha = await revParse(cli.repo, branch);
+      const key = `${branch}@${sha}`;
+      if (checked.has(key)) {
+        if (checked.get(key) === true) continue;
+      }
+      if (!wt) {
+        wt = await addTempWorktree(cli.repo, sha);
+        await linkNodeModules(cli.repo, wt.path);
+      } else {
+        await git(cli.repo, ['reset', '--hard', sha], { cwd: wt.path });
+      }
+      const r = await runChecks(checks.typecheck, wt.path);
+      appendJournal(dir, { action: 'branch-check', branch, sha, ok: r.ok, ...(r.ok ? {} : { failed: r.failedNames }) });
+      if (!r.ok) {
+        const failed = checks.typecheck.filter((c) => r.failedNames.includes(c.cmd));
+        return { branch, sha, output: r.output, failed, failedNames: r.failedNames };
+      }
+    }
+  } finally {
+    if (wt) await wt.remove();
+  }
+  return null;
+}
+
+export async function cmdSweepNextCase(cli: Cli, runChecks: ChecksRunner = defaultChecksRunner): Promise<number> {
   const ctx = await attachPass(cli);
   const dir = ctx.dir;
   let st = readMachineState(dir);
@@ -6306,6 +6413,53 @@ export async function cmdSweepNextCase(cli: Cli): Promise<number> {
   if (st.phase === 'complete') {
     console.error('next-case: pass is complete — run `sweep start` for a new pass');
     result(cli, { status: 'complete' });
+    return 1;
+  }
+
+  // PRE-MERGE BRANCH CHECK — BEFORE cmdRun, which is where the merging happens.
+  // A branch that is already red must not have content merged into it and must
+  // not be propagated FROM: either spreads the defect to every descendant, and
+  // the descendant is then handed a failure it cannot fix inside its own case
+  // scope. Serve the fix as a case on the branch that owns it instead; the
+  // branch is thereby blocked, and the existing DEFERRED path holds its
+  // descendants back (D-057/D-058) with no extra machinery.
+  const redBranch = await firstRedParticipant(cli, dir, runChecks);
+  if (redBranch) {
+    const gate = await materializeGateFixCases(cli, dir, ctx.chain, redBranch.output, redBranch.failed, null, {
+      rootBranch: redBranch.branch,
+    });
+    if (gate.served) {
+      const first = gate.cases[0];
+      st = { ...st, phase: 'open', currentCase: null };
+      writeMachineState(dir, st);
+      progress(`${redBranch.branch} is RED before any merge — gate-fix case prepared`);
+      console.error(`next-case: ${redBranch.branch} red (${redBranch.failedNames.join(', ')}) — gate-fix ${first.caseId}`);
+      result(cli, {
+        status: 'gate-fix-required',
+        issues: [
+          {
+            id: 'WARN09_GATE_FIX_SERVED',
+            detail: `${redBranch.branch} is red BEFORE any merge (${redBranch.failedNames.join(', ')}) — ${gate.detail}`,
+          },
+        ],
+        gateFix: { caseId: first.caseId, branch: first.branch, files: first.files, reason: gate.reason },
+        instruction: `${redBranch.branch} is broken before this pass merges anything — a GATE-FIX case has been prepared on it; run \`next-case\` to work it`,
+      });
+      return 0;
+    }
+    // Red but nothing servable (already gated on origin, or nothing blameable).
+    // Say so plainly rather than merging into a branch known to be broken.
+    progress(`${redBranch.branch} is RED and no case could be served — ${gate.reason}`);
+    console.error(`next-case: ${redBranch.branch} red, unservable — ${gate.reason}`);
+    result(cli, {
+      ok: false,
+      status: 'stopped',
+      ...(gate.gated.length ? { gatedBranches: gate.gated } : {}),
+      instruction:
+        `REPORT to the owner: ${redBranch.branch} is RED before this pass merges anything ` +
+        `(${redBranch.failedNames.join(', ')}) and no gate-fix case could be served — ${gate.reason}. ` +
+        `Nothing was merged.`,
+    });
     return 1;
   }
 

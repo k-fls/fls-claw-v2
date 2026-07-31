@@ -3493,6 +3493,128 @@ describe('sweep start — canonical pass location + clean-slate boundary (D-055)
 // cannot push or open a PR). It now becomes a case.
 // ---------------------------------------------------------------------------
 
+/**
+ * PRE-MERGE BRANCH CHECK (owner decision 2026-07-31). Detection runs FORWARD,
+ * with the sweep, at the one place merging actually happens — `next-case`, which
+ * calls cmdRun. A branch already red must not be merged into or propagated from:
+ * either way every descendant inherits a defect it cannot fix inside its own
+ * conflict scope, which is what livelocked the live 2026-07-31 pass.
+ */
+describe('next-case — a participating branch that is RED before any merge', () => {
+  /** main_patched carries a defect; module/cg branches off it and has work pending. */
+  function redBaseRepo(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: carries the defect', { 'src/x.ts': 'broken\n', 'BROKEN.marker': 'x\n' });
+    repo.checkout('module/cg', { create: true, at: 'main_patched' });
+    repo.commit('cg work', { 'src/cg.ts': 'cg\n' });
+    repo.checkout('main');
+    repo.commit('U0: upstream moves', { 'src/util.ts': 'u\n' });
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+
+  /** Red exactly when the checked-out tree carries the marker — i.e. per BRANCH. */
+  const markerRunner: ChecksRunner = async (commands, cwd) => {
+    const broken = existsSync(join(cwd, 'BROKEN.marker'));
+    return {
+      ok: !broken,
+      failedNames: broken ? commands.map((c) => c.cmd) : [],
+      output: broken ? 'src/x.ts(1,1): error TS2345: the tree is broken before any merge.\n' : '',
+    };
+  };
+
+  it('serves a gate-fix on the RED branch and merges NOTHING', async () => {
+    const repo = redBaseRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/cg.ts'] }]);
+    const dir = dirOf(repo, ws);
+    const checks = join(ws, 'checks.json');
+    writeFileSync(checks, JSON.stringify({ typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }], test: [] }));
+    const mpBefore = repo.sha('main_patched');
+    const cgBefore = repo.sha('module/cg');
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }))).toBe(0);
+    const out = join(ws, 'nc.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { checksFile: checks, out }), markerRunner)).toBe(0);
+
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      status: string;
+      gateFix?: { branch: string; caseId: string };
+      issues?: Array<{ id: string }>;
+      instruction: string;
+    };
+    expect(res.status).toBe('gate-fix-required');
+    // Rooted on the branch that is red — NOT on a descendant, and not on
+    // whichever branch blame says authored the file.
+    expect(res.gateFix!.branch).toBe('main_patched');
+    // A PROCEED arm: it hands out a case, so it must ADVISE, never BLOCK.
+    expect(res.issues![0].id).toBe('WARN09_GATE_FIX_SERVED');
+    expect(res.issues!.some((i) => i.id.startsWith('ERR'))).toBe(false);
+    expect(res.instruction).toContain('before this pass merges anything');
+
+    // NOTHING was merged — the whole point. A red branch must not propagate.
+    expect(repo.sha('main_patched')).toBe(mpBefore);
+    expect(repo.sha('module/cg')).toBe(cgBefore);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'merge')).toBe(false);
+    expect(journal.some((e) => e.action === 'branch-check' && e.branch === 'main_patched' && e.ok === false)).toBe(true);
+  });
+
+  it('a GREEN participant is checked once and the pass proceeds to merge', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: clean', { 'src/mp.ts': 'mp\n' });
+    repo.checkout('main');
+    repo.commit('U0: upstream moves', { 'src/util.ts': 'u\n' });
+    cleanups.push(() => repo.destroy());
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    const checks = join(ws, 'checks.json');
+    writeFileSync(checks, JSON.stringify({ typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }], test: [] }));
+
+    const ran: string[] = [];
+    const countingRunner: ChecksRunner = async (commands, cwd) => {
+      ran.push(cwd);
+      return { ok: true, failedNames: [], output: '' };
+    };
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { checksFile: checks }), countingRunner)).toBe(0);
+    // It merged (the pass proceeded past the check).
+    expect(readJournal(dir).some((e) => e.action === 'merge')).toBe(true);
+    // And the green result is memoised per (branch, sha) in the PASS journal —
+    // a pass-local fact, not a ledger: `start` wipes it, so it cannot go stale.
+    const checkRows = readJournal(dir).filter((e) => e.action === 'branch-check');
+    expect(checkRows.length).toBeGreaterThan(0);
+    expect(checkRows.every((e) => e.ok === true)).toBe(true);
+    // The memo is keyed by (branch, TIP SHA), so a tip that MOVED is re-checked —
+    // correct, since the tree it attests to is a different tree. What must never
+    // happen is checking the same (branch, sha) twice.
+    await cmdSweepNextCase(baseCli(repo, ws, inv, { checksFile: checks }), countingRunner);
+    const keys = readJournal(dir)
+      .filter((e) => e.action === 'branch-check')
+      .map((e) => `${e.branch}@${e.sha}`);
+    expect(new Set(keys).size).toBe(keys.length); // no (branch, sha) checked twice
+  });
+
+  it('no checks file -> the check is skipped entirely (repos without one behave as before)', async () => {
+    const repo = redBaseRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/cg.ts'] }]);
+    let called = false;
+    const spy: ChecksRunner = async () => {
+      called = true;
+      return { ok: false, failedNames: ['x'], output: '' };
+    };
+    expect(await cmdSweepStart(baseCli(repo, ws, inv))).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv), spy);
+    expect(called).toBe(false);
+  });
+});
+
 describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
   // ROOT CAUSE of the serving bug, fixed 2026-07-28: `crashHeal` journaled `resolved` for every
   // gate-fix case on the next command. Its heuristic is "the ref already
