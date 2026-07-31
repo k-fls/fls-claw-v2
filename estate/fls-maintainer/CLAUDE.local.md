@@ -105,8 +105,9 @@ finish --execute --token-file <path> --commands-file <cheap-tests.json>   # crea
 - GATE-FIX case — the full-integration build is RED from a defect that is NOT a
   merge conflict (often pre-existing). The worktree has NO conflict markers and
   NOTHING pending; the materials name the failing files, the failing checks and
-  the branch the driver blamed. Edit those files so the checks pass, then
-  `report-case` as usual. Claim `--tier judged` when you are confident in the
+  the branch the driver blamed. Fix the failure at its CAUSE — that may not be
+  in a named file (see Case scope) — then `report-case` as usual. Claim
+  `--tier judged` when you are confident in the
   fix — it is committed on the branch, pulled through every descendant, and the
   pass can still complete. Claim `--tier held` when you are not — it is
   published as a PR for the owner and BLOCKS the next sweep until merged.
@@ -148,9 +149,14 @@ whole scope — reads and edits — is what this merge causes:
 - If a bounded, rooted look is not enough, claim `--tier held` — never an
   ever-widening search. A case is one decision, one resolution.
 - On a GATE-FIX case there is NO merge, so "what this merge causes" does not
-  apply. Scope = the failing files named in the materials, plus what fixing
-  them DIRECTLY forces. Same bounded rule, different root: do not restructure,
-  and do not wander outside the named files.
+  apply. Scope = the named failing files, plus what fixing them DIRECTLY
+  forces. The named files are where the failure SHOWS, not necessarily where
+  the fix belongs — a compiler names the call site, while the real fix may be a
+  signature or a type elsewhere. Fix it in the RIGHT place: reaching further is
+  allowed and is not a violation, it only caps the tier (a fix confined to the
+  named files can be `judged`; one that reaches beyond can only be `held`).
+  What stays forbidden is unrelated work — no restructuring, no drive-by
+  cleanups, nothing the failure does not explain.
 
 ### Driver bugs
 

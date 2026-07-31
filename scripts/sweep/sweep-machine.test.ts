@@ -4064,13 +4064,20 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
   });
 
   /**
-   * `scopeGuardMode: 'same-files'` on a gate-fix case is likewise doing real
-   * work: it holds the fix to the files the driver named in the briefing. (It
-   * is also the ONLY mode that can apply — `conflict-hunks` bounds the edit by
-   * the conflict-marker spans of the automerge blob, and a gate fix's automerge
-   * tree is the clean tip, with no markers to bound anything.)
+   * On a GATE FIX the scope guard measures BLAST RADIUS; it does not police a
+   * boundary. The file a compiler NAMES is often not the file that must change
+   * — a signature, a type or a caller elsewhere may be the real fix — so
+   * confining the edit to the named files would force the fix into the wrong
+   * place. Reaching further is legitimate; what it costs is the tier: confined
+   * to the named files a fix may land in place (judged), otherwise the owner
+   * reviews it (held). So this is journaled as REACH, not as a violation, and
+   * carries no escalation tag.
+   *
+   * (`same-files` is also the only mode that can apply — `conflict-hunks`
+   * bounds edits by conflict-marker spans, and a gate fix's automerge tree is
+   * the clean tip, with no markers to bound anything.)
    */
-  it("scope guard 'same-files': a gate fix that edits beyond the named files is escalated, not merged", async () => {
+  it('scope guard on a gate fix: reaching beyond the named files caps the tier at held, and is not a violation', async () => {
     const repo = gateFixRepo();
     const ws = mkWorkspace();
     const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
@@ -4089,10 +4096,72 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
         confirm,
       ),
     ).toBe(0);
+    // Demoted, not refused — the fix is kept and published for the owner.
     expect((JSON.parse(readFileSync(out, 'utf8')) as { tier: string }).tier).toBe('held');
-    const violation = readJournal(dir).find((e) => e.action === 'scope-violation' && e.caseId === caseId);
-    expect(violation?.mode).toBe('same-files');
-    expect(violation?.extraPaths).toEqual(['src/y.ts']);
+    const journal = readJournal(dir);
+    // REACH, not a violation: a gate fix editing outside the named files is
+    // expected, so it must not be journaled as (or reported as) a fault.
+    const reach = journal.find((e) => e.action === 'gate-fix-reach' && e.caseId === caseId);
+    expect(reach?.mode).toBe('same-files');
+    expect(reach?.extraPaths).toEqual(['src/y.ts']);
+    expect(journal.some((e) => e.action === 'scope-violation' && e.caseId === caseId)).toBe(false);
+    // ...and no `[AUTO-ESCALATED: scope exceeded]` tag rides along with it.
+    expect(JSON.stringify(journal)).not.toContain('AUTO-ESCALATED: scope exceeded');
+  });
+
+  it('the cold read judges a gate fix on the FAILING CHECK, not on conflict hunks it has none of', async () => {
+    const repo = gateFixRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { cmds } = redUntilCleared(ws);
+    const caseId = await serveGateFix(repo, ws, inv, cmds);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'FIXED\n' });
+    let prompt = '';
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true }),
+      async (p) => {
+        prompt = p;
+        return { verdict: 'confirm', notes: '', feedback: '' };
+      },
+    );
+    // The gate-fix questions, NOT the conflict ones. Q2 of the shared set —
+    // "no content from outside the two sides/base" — is unanswerable here: the
+    // conflict section is EMPTY by construction, so every hunk would read as
+    // unexplained.
+    expect(prompt).toContain('Does the change plausibly make the named failing check pass');
+    expect(prompt).toContain('nothing unrelated fixed, cleaned up or refactored');
+    expect(prompt).not.toContain('Within the conflicted hunks');
+    expect(prompt).not.toContain('the two sides/base');
+    // The EVIDENCE is the checks output, standing where conflict hunks stand.
+    expect(prompt).toContain('The failure this fix must clear');
+    expect(prompt).toContain('error TS2345'); // from redUntilCleared's diagnostic
+    expect(prompt).not.toContain('## Conflict hunks');
+    // And the reader is told a hunk outside the failing files is not by itself wrong.
+    expect(prompt).toContain('is often not the file that must change');
+  });
+
+  it('a gate fix CONFINED to the named files is NOT demoted — judged still stands', async () => {
+    const repo = gateFixRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { cmds } = redUntilCleared(ws);
+    const caseId = await serveGateFix(repo, ws, inv, cmds);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'FIXED\n' }); // named file only
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true, out }),
+        confirm,
+      ),
+    ).toBe(0);
+    expect((JSON.parse(readFileSync(out, 'utf8')) as { tier: string }).tier).toBe('judged');
+    expect(readJournal(dir).some((e) => e.action === 'gate-fix-reach')).toBe(false);
   });
 
   /**

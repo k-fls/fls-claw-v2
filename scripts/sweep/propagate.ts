@@ -1057,6 +1057,49 @@ const COLD_READ_QUESTIONS = [
   '3. Does the resolution contradict any record included in this request?',
 ];
 
+/**
+ * A GATE FIX is judged on different questions, because it is not a merge.
+ *
+ * The shared set asks about "the conflicted hunks" and "the two sides/base". A
+ * gate fix has neither: its `automergeTree` IS the branch tip, so the conflict
+ * section of its request is EMPTY. Q1 is then unanswerable and Q2 is worse —
+ * with no conflict to explain anything, EVERY hunk reads as "content from
+ * outside the two sides". The reader has coped in practice (live 2026-07-30 it
+ * confirmed the fix and rejected only a smuggled unrelated edit), but it was
+ * coping despite the questions, not because of them.
+ *
+ * What actually needs judging is: does this change fix the named failure, and
+ * ONLY that. Q2 is deliberately the sharp one — a gate-fix case is the place an
+ * agent is most tempted to smuggle in an unrelated fix, since it is the one case
+ * kind that edits code the pass did not merge.
+ */
+const GATE_FIX_COLD_READ_QUESTIONS = [
+  '1. Does the change plausibly make the named failing check pass? Name anything that would still fail.',
+  '2. Is every hunk explained by THAT failure — nothing unrelated fixed, cleaned up or refactored along the way? Name any unexplained hunk.',
+  '3. Does the change contradict any record included in this request?',
+];
+
+/**
+ * A gate fix's EVIDENCE is the failing check's own output — it stands where the
+ * conflict hunks stand for a merge case. Without it the reader is asked whether
+ * a change fixes a failure it was never shown.
+ */
+function gateFixEvidenceLines(failedOutput: string): string[] {
+  return [
+    '## The failure this fix must clear (checks output, verbatim)',
+    '```',
+    failedOutput.trim() || '(no output was captured)',
+    '```',
+    '',
+    'There are NO conflict hunks and no two sides: this branch is not being merged.',
+    'The change below edits code the pass did not merge, which is legitimate for a',
+    'gate fix. The file a compiler NAMES is often not the file that must change —',
+    'a signature, a type or a caller elsewhere may be the real fix — so a hunk',
+    'outside the failing files is NOT by itself wrong. Judge whether it is',
+    'explained by THIS failure.',
+  ];
+}
+
 /** D-050 preamble: the reader judges from the request ONLY — never researches. */
 const COLD_READ_PREAMBLE = [
   'Judge ONLY from the materials in this request. Do NOT explore the repository or search',
@@ -1234,29 +1277,36 @@ function coldReadRequest(
   conflictDiff: string,
   resolutionDiff: string | null,
   contextLines: string[],
+  gateFix?: { failedOutput: string } | null,
 ): string {
   return [
     `# Cold-read request — ${c.id}`,
     '',
     ...COLD_READ_PREAMBLE,
     '',
-    `Branch: ${c.branch}   Parent: ${c.parent}   Height: ${c.head.height}`,
-    `Conflicted paths: ${c.conflictedPaths.join(', ')}`,
+    ...(gateFix
+      ? [
+          `Branch: ${c.branch}   GATE FIX (no merge — this change resolves no conflict)`,
+          `Failing files: ${c.conflictedPaths.join(', ')}`,
+        ]
+      : [
+          `Branch: ${c.branch}   Parent: ${c.parent}   Height: ${c.head.height}`,
+          `Conflicted paths: ${c.conflictedPaths.join(', ')}`,
+        ]),
     '',
     ...contextLines,
     '',
-    '## Conflict hunks (branch tip -> automerge tree)',
-    '```diff',
-    conflictDiff,
-    '```',
+    ...(gateFix
+      ? gateFixEvidenceLines(gateFix.failedOutput)
+      : ['## Conflict hunks (branch tip -> automerge tree)', '```diff', conflictDiff, '```']),
     '',
-    '## Resolution diff (automerge tree -> resolved tree)',
+    gateFix ? '## The fix (branch tip -> resolved tree)' : '## Resolution diff (automerge tree -> resolved tree)',
     ...(resolutionDiff === null
       ? ['_No resolution attempt yet — `resolve` regenerates this file with the diff before requiring a verdict (§7)._']
       : ['```diff', resolutionDiff, '```']),
     '',
     '## Cold-reader questions',
-    ...COLD_READ_QUESTIONS,
+    ...(gateFix ? GATE_FIX_COLD_READ_QUESTIONS : COLD_READ_QUESTIONS),
     '',
     '## Verdict',
     '',
@@ -1380,20 +1430,15 @@ const CHECKS_OUTPUT_TAIL_LINES = 250;
  */
 const VERIFY_OUTPUT_JOURNAL_CAP = 20000;
 
+
 /**
- * The `parent` a gate-fix case records. A gate fix is NOT a parent→child merge,
- * so there is no real parent; this LABEL keeps the CaseFile shape intact (a
- * `case` journal row without a string `parent` is dropped by `journaledCases`
- * outright) and makes gate-fix rows obvious in the journal.
- *
- * It is a LABEL, never a ref: the parentheses are not in `slug()`'s charset and
- * no registry branch can be named this, so anything that resolves a parent as a
- * branch must recognise the gate fix FIRST. The one place that used to get this
- * wrong was the fix-ref name — `fixBranchName` embedded `slug(parent)` and a
- * height, and `sweep start`'s origin-ref reader then tried to read a scope
- * branch and a trunk height back out of it. Both now take the gate-fix form
- * explicitly (see `fixBranchName` / `reissueFromOriginRef`), and the gate-fix
- * identity everywhere else is the driver's own `gate-fix` journal row.
+ * A gate fix has NO parent — it is not a merge. `CaseFile.parent` is a required
+ * string, so it carries this self-describing label rather than a branch name.
+ * It is WRITE-ONLY: nothing reads it (case KIND comes from the `gateFix: true`
+ * journal flag, and the ref name from `isGateFixCaseId`), so it cannot mislead
+ * a code path the way it once did — it only has to be legible in the journal.
+ * Deleting it would mean making `parent` optional across CaseFile/ResolvedCase
+ * and every reader, which is churn for no behavioural gain.
  */
 const GATE_FIX_PARENT = '(gate-fix)';
 
@@ -4827,23 +4872,31 @@ function machineColdReadPrompt(opts: {
   contextLines: string[];
   conflictDiff: string;
   resolutionDiff: string | null;
+  gateFix?: { failedOutput: string } | null;
 }): string {
+  const gf = opts.gateFix ?? null;
   const lines: string[] = [
     `# Cold-read request — ${opts.id} (state-machine path, D-053)`,
     '',
     ...COLD_READ_PREAMBLE,
     '',
-    `Branch: ${opts.branch}   Parent: ${opts.parent}   Height: ${opts.height}`,
-    `Conflicted paths: ${opts.conflictedPaths.join(', ')}`,
+    ...(gf
+      ? [
+          `Branch: ${opts.branch}   GATE FIX (no merge — this change resolves no conflict)`,
+          `Failing files: ${opts.conflictedPaths.join(', ')}`,
+        ]
+      : [
+          `Branch: ${opts.branch}   Parent: ${opts.parent}   Height: ${opts.height}`,
+          `Conflicted paths: ${opts.conflictedPaths.join(', ')}`,
+        ]),
     '',
     ...opts.contextLines,
     '',
-    '## Conflict hunks (branch tip -> automerge tree)',
-    '```diff',
-    opts.conflictDiff,
-    '```',
+    ...(gf
+      ? gateFixEvidenceLines(gf.failedOutput)
+      : ['## Conflict hunks (branch tip -> automerge tree)', '```diff', opts.conflictDiff, '```']),
     '',
-    '## Resolution diff (automerge tree -> resolved tree)',
+    gf ? '## The fix (branch tip -> resolved tree)' : '## Resolution diff (automerge tree -> resolved tree)',
     ...(opts.resolutionDiff === null
       ? [
           '_No resolution — this is a frozen-conflict (HELD) exhibit; judge the description against the conflict above._',
@@ -4853,7 +4906,7 @@ function machineColdReadPrompt(opts: {
   lines.push(
     '',
     '## Cold-reader questions',
-    ...COLD_READ_QUESTIONS,
+    ...(gf ? GATE_FIX_COLD_READ_QUESTIONS : COLD_READ_QUESTIONS),
     '',
     '## Output',
     'Print ONLY a JSON object on the final line — no prose around it:',
@@ -6356,11 +6409,24 @@ export async function cmdSweepReportCase(
   // reject follows the 2-strike rejection path.
   const conflictsPresent = emptyResolution || markers.length > 0;
   const scopeExceeded = !guard.ok;
+  // BLAST RADIUS, not a violation — for a GATE FIX. The file a compiler NAMES is
+  // often not the file that must change (a signature, a type, a caller
+  // elsewhere), so bounding a gate fix's edits to the failing files would force
+  // the fix into the wrong place. Here the guard MEASURES reach instead: a fix
+  // confined to the named files may land in place (`judged`); one that reaches
+  // further is legitimate but goes to the owner (`held`). The wording matters —
+  // this text is fed to the cold read below, and calling a correct gate fix a
+  // "violation" primes a reject.
   const scopeFeedback = scopeExceeded
-    ? `resolution touches beyond the conflicted files: ${[...guard.extraPaths, ...guard.hunkViolations.map((p) => `${p} (out-of-hunk)`)].join(', ')}`.slice(
-        0,
-        COLDREAD_FEEDBACK_CAP,
-      )
+    ? isGateFixCase
+      ? `the fix reaches beyond the failing files (${[...guard.extraPaths, ...guard.hunkViolations].join(', ')}) — legitimate for a gate fix when the failure explains it; it caps the tier at held`.slice(
+          0,
+          COLDREAD_FEEDBACK_CAP,
+        )
+      : `resolution touches beyond the conflicted files: ${[...guard.extraPaths, ...guard.hunkViolations.map((p) => `${p} (out-of-hunk)`)].join(', ')}`.slice(
+          0,
+          COLDREAD_FEEDBACK_CAP,
+        )
     : null;
   // Effective tier: a claim of `held`, a reissue revision (D-059: never merges
   // in place — republished to the existing review PR at finish), or a checks/cap
@@ -6613,6 +6679,9 @@ export async function cmdSweepReportCase(
     contextLines: await caseContextLines(cli, rc),
     conflictDiff: conflictDiff.slice(0, 60000),
     resolutionDiff: resolutionDiff.slice(0, 60000),
+    // A gate fix is judged on the FAILING CHECK, not on conflict hunks it has
+    // none of — its conflictDiff is empty by construction.
+    gateFix: isGateFixCase ? { failedOutput: gateFixFailedOutput(dir, caseId) } : null,
   });
   writeFileSync(join(caseDir, 'coldread-request.md'), prompt);
   progress(`cold-read: ${rc.branch}`);
@@ -6680,9 +6749,15 @@ export async function cmdSweepReportCase(
   // unified publish ships it as an ACTIVE PR (owner reviews & merges),
   // prefixed with the scope escalation naming the extra files.
   if (scopeExceeded) {
-    const note = `cold read confirmed but the resolution exceeds the conflict scope [${guard.mode}] -> HELD (resolution published for owner review)`;
+    // A gate fix reaching past the failing files is EXPECTED (the compiler names
+    // the symptom, not the cause), so it is journaled as REACH and demoted
+    // without an escalation tag — the demotion IS the policy, not a fault. A
+    // merge resolution doing the same is still a violation.
+    const note = isGateFixCase
+      ? `gate fix reaches beyond the failing files [${guard.mode}] -> HELD (owner reviews; a fix confined to them could have landed judged)`
+      : `cold read confirmed but the resolution exceeds the conflict scope [${guard.mode}] -> HELD (resolution published for owner review)`;
     appendJournal(dir, {
-      action: 'scope-violation',
+      action: isGateFixCase ? 'gate-fix-reach' : 'scope-violation',
       branch: rc.branch,
       caseId,
       mode: guard.mode,
@@ -6691,7 +6766,14 @@ export async function cmdSweepReportCase(
     });
     await freezeHeld(cli, dir, rc, [note], {
       resolvedTree,
-      escalation: { tag: ESCALATE_SCOPE, feedback: [feedback, scopeFeedback].filter(Boolean).join(' — ').slice(0, COLDREAD_FEEDBACK_CAP) },
+      ...(isGateFixCase
+        ? {}
+        : {
+            escalation: {
+              tag: ESCALATE_SCOPE,
+              feedback: [feedback, scopeFeedback].filter(Boolean).join(' — ').slice(0, COLDREAD_FEEDBACK_CAP),
+            },
+          }),
     });
     reopen(dir, reopenTargets);
     writeMachineState(dir, { ...st, phase: 'awaiting-pr', currentCase: { caseId, branch: rc.branch, tier: 'held' } });
@@ -6980,6 +7062,15 @@ export async function cmdSweepReportPr(
  * not hunt for markers, and it states the scope explicitly because the standard
  * "your scope is what this merge causes" rule does not apply here.
  */
+/** The captured checks output for a gate-fix case (its cold-read evidence). */
+function gateFixFailedOutput(dir: string, caseId: string): string {
+  const f = join(dir, caseId, 'gate-fix-output.txt');
+  const raw = existsSync(f) ? readFileSync(f, 'utf8') : '';
+  // TAIL, like the materials: a compiler can emit thousands of lines and the
+  // diagnostics that matter are the last ones.
+  return raw.split('\n').slice(-120).join('\n').slice(0, 60000);
+}
+
 function gateFixCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEntry): string {
   const gf = readJournal(dir).find((e) => e.action === 'gate-fix' && e.caseId === jc.caseId);
   const files = Array.isArray(gf?.files) ? (gf.files as string[]) : (caseRow.conflictedPaths as string[]) ?? [];
@@ -7270,12 +7361,12 @@ async function materializeGateFixCases(
       schemaVersion: 1,
       id: caseId,
       branch: g.branch,
-      parent: GATE_FIX_PARENT,
       head,
       // `run[run.length - 1] === head` is the run invariant (types.ts). A gate fix
       // stacks nothing, so its run is the head alone — NOT the empty array, which
       // breaks the invariant and prints "0 height(s)" into the case materials.
       run: [head],
+      parent: GATE_FIX_PARENT,
       tierFloor: 'judged',
       conflictedPaths: g.files,
       automergeTree: await treeOf(cli.repo, tip),
