@@ -289,10 +289,46 @@ export async function gitPush(
   dstBranch: string,
   opts: { forceWithLease?: string } = {},
 ): Promise<void> {
-  const args = ['push'];
+  const args = [...pushCredentialArgs(), 'push'];
   if (opts.forceWithLease) args.push(`--force-with-lease=refs/heads/${dstBranch}:${opts.forceWithLease}`);
   args.push('origin', `${src}:refs/heads/${dstBranch}`);
-  await git(repo, args);
+  await git(repo, args, { env: { GIT_TERMINAL_PROMPT: '0' } });
+}
+
+/** Delete a remote ref — a push, so it needs the same credentials. */
+export async function gitPushDelete(repo: string, ref: string): Promise<void> {
+  await git(repo, [...pushCredentialArgs(), 'push', 'origin', '--delete', ref], {
+    env: { GIT_TERMINAL_PROMPT: '0' },
+  });
+}
+
+/**
+ * Credentials for a driver push, supplied per-invocation via `-c`.
+ *
+ * The clone's origin is plain `https://github.com/...` with no credential
+ * helper anywhere — not in the clone, the image, or the container config — so
+ * `git push` had nothing to authenticate with and died on
+ * `could not read Username for 'https://github.com'`. That is why no pass has
+ * ever published: every fix/sweep ref now on origin was pushed by hand in July.
+ *
+ * The token is the SUBSTITUTE `GH_TOKEN` the credential proxy already swaps on
+ * the wire for this driver's API calls; a push is the same path (HTTPS_PROXY is
+ * set in the container), so it needs no special handling here.
+ *
+ * Passed with `-c` rather than written to config: nothing persists in
+ * `.git/config` for a later reader to find, and the helper reads the variable at
+ * call time instead of baking a value in. The empty helper first RESETS the
+ * chain, so a stale helper configured elsewhere cannot take precedence. With
+ * `GIT_TERMINAL_PROMPT=0` a missing token fails immediately and legibly instead
+ * of blocking on a prompt no one can answer.
+ */
+function pushCredentialArgs(): string[] {
+  return [
+    '-c',
+    'credential.helper=',
+    '-c',
+    'credential.helper=!f() { echo username=x-access-token; echo "password=${GH_TOKEN:-$GITHUB_TOKEN}"; }; f',
+  ];
 }
 
 /** Reset a branch ref (rollback) with compare-and-swap on the expected current value. */

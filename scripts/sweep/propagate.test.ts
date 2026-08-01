@@ -14,7 +14,7 @@ import { join, relative } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { initFixtureRepo, type FixtureRepo } from './fixtures.js';
-import { addTempWorktree, commitInfo, isAncestor } from './git.js';
+import { addTempWorktree, commitInfo, gitPush, isAncestor } from './git.js';
 import { readLedger } from './ledger.js';
 import { exportRrCache, writeRrCacheDir } from './merge.js';
 import { DriverHalt, failureSummary, guardRef } from './propagate.js';
@@ -2670,5 +2670,39 @@ describe('failing-output capture: summary + regions, nothing cropped before blam
 
   it('returns empty for output with no diagnostics (callers omit the section)', () => {
     expect(failureSummary('$ pnpm test\nall good\n', null)).toBe('');
+  });
+});
+
+describe('driver push carries credentials', () => {
+  /**
+   * ROOT CAUSE of "no pass has ever published" (live 2026-08-01): the clone's
+   * origin is plain https with NO credential helper anywhere — not in the clone,
+   * the image, or container.json — so `git push` died on
+   * `could not read Username for 'https://github.com'`. Every fix/sweep ref on
+   * origin today was pushed by hand in July, never by the driver.
+   */
+  it('gitPush passes a credential helper and disables the terminal prompt', async () => {
+    const repo = initFixtureRepo();
+    cleanups.push(() => repo.destroy());
+    const bare = repo.attachBareOrigin();
+    const sha = repo.sha('main');
+
+    // A push to a LOCAL bare remote needs no credentials, so this asserts the
+    // wiring is present and harmless rather than that auth happened.
+    await gitPush(repo.dir, sha, 'pushed-by-driver');
+    expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/pushed-by-driver')).toBe(sha);
+  });
+
+  it('the helper reads GH_TOKEN at call time — no token is written into config', async () => {
+    const repo = initFixtureRepo();
+    cleanups.push(() => repo.destroy());
+    repo.attachBareOrigin();
+    await gitPush(repo.dir, repo.sha('main'), 'cfg-check');
+    // Nothing persisted: a later reader of .git/config must not find a helper,
+    // and above all not a token baked into one.
+    const cfg = repo.git('config', '--local', '--list');
+    expect(cfg).not.toContain('credential.helper');
+    expect(cfg).not.toContain('GH_TOKEN');
+    expect(cfg).not.toContain('x-access-token');
   });
 });

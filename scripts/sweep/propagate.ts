@@ -75,6 +75,7 @@ import {
 } from './config.js';
 import {
   addTempWorktree,
+  gitPushDelete,
   commitInfo,
   commitTreeMerge,
   git,
@@ -5649,7 +5650,7 @@ async function deriveOriginMergeStatus(
 
   const deleteOriginRef = async (ref: string): Promise<string | null> => {
     try {
-      await git(cli.repo, ['push', 'origin', '--delete', ref]);
+      await gitPushDelete(cli.repo, ref);
       return null;
     } catch (e) {
       return e instanceof Error ? e.message : String(e);
