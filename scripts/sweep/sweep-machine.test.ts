@@ -911,6 +911,48 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     expect(machineState(dir).phase).toBe('case-ready');
   });
 
+  /**
+   * DEADLOCK (live 2026-08-01). `--tier held` is the documented escape when the
+   * agent cannot make a case green, and doctrine's ERR36 row explicitly sends it
+   * here when the failing file is out of scope. But the pristine-held branch
+   * requires `conflictsPresent`, so an agent that HAS resolved the conflict fell
+   * through to the checks gate and got ERR40 "fix the pending files" — which was
+   * impossible: the conflict was `src/cli/resources/groups.ts`, the failing test
+   * `container/agent-runner/src/poll-loop.test.ts` from upstream. It claimed held
+   * twice, was refused twice, and filed a stop-case. It was right.
+   */
+  it('an explicit --tier held with FAILING checks is honoured now, not after 10 tries', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const checks = checksFile(ws, { typecheck: ['true'], test: ['false'] }); // tests fail
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }), undefined);
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
+    const caseId = currentCaseId(dir);
+    // A real resolution: not pristine, so the pristine-held escape does not apply.
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true, out }), confirm),
+    ).toBe(0);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { tier: string; instruction: string };
+    expect(res.tier).toBe('held');
+    // The PR text must SAY the checks still fail — a held PR the owner can read.
+    expect(res.instruction).toContain('still fails');
+    expect(machineState(dir).phase).toBe('awaiting-pr');
+
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
+    // Honoured on the FIRST claim — not after CHECKS_FAIL_LIMIT failures.
+    expect(journal.filter((e) => e.action === 'checks-fail' && e.caseId === caseId).length).toBeLessThan(CHECKS_FAIL_LIMIT);
+    // And the RESOLUTION is kept: a conflict the agent already solved must not be
+    // thrown away and re-shipped as an empty pristine exhibit.
+    const held = journal.find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect(String(held.notes ?? '')).toContain('resolution kept');
+  });
+
   it('a HELD claim on a pristine conflict SKIPS the gate entirely (nothing to typecheck)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();

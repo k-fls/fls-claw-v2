@@ -7022,7 +7022,26 @@ export async function cmdSweepReportCase(
       writeFileSync(outFile, boundedChecksOutput(r, fullFile));
       appendJournal(dir, { action: 'checks-fail', caseId, resolvedTree, kind, failed: r.failedNames });
       const n = checksFailCount(readJournal(dir), caseId);
-      if (n >= CHECKS_FAIL_LIMIT) {
+      // An EXPLICIT `--tier held` claim is the agent saying it cannot make this
+      // green — which is exactly what the counter below infers after ten tries.
+      // Honour it now, keeping the fix, instead of demanding nine more failures.
+      //
+      // Without this the two escape routes cancel out: the pristine-held branch
+      // above needs `conflictsPresent` (markers, or no resolution at all), so an
+      // agent that HAS resolved the conflict falls through to this gate, and the
+      // gate answers ERR36/ERR40 — "fix the pending files" — which is impossible
+      // when the failing file is not one of them. Live 2026-08-01: the conflict
+      // was `src/cli/resources/groups.ts`, the failing test was
+      // `container/agent-runner/src/poll-loop.test.ts` from upstream 3d4b349b,
+      // the agent claimed held twice, was refused twice, and filed a stop-case
+      // reporting the deadlock. It was right. Doctrine's own ERR36 row tells it
+      // to claim held here, so refusing that is the driver contradicting itself.
+      //
+      // HELD work is not merged — it goes out as a PR for the owner, whose text
+      // must say the checks still fail (the instruction below requires it). A
+      // failing fix the owner can read beats a case nobody can close.
+      const heldByClaim = claimed === 'held' && n < CHECKS_FAIL_LIMIT;
+      if (n >= CHECKS_FAIL_LIMIT || heldByClaim) {
         // Backstop: stop asking the agent to fix and escalate to the owner.
         // D-061 (B): a GATE-FIX case has NO pristine conflict to reset to — the
         // "pristine" reset would rebuild a merge that never happened and the
@@ -7030,10 +7049,23 @@ export async function cmdSweepReportCase(
         // exist. Keep the attempted fix instead and ship it as the held
         // ACTIVE PR: a failing fix the owner can read beats an empty exhibit.
         if (isGateFixCase) {
-          await freezeHeld(cli, dir, rc, [`checks (${kind}) failing ${n}x on a gate fix -> HELD (escalated, fix kept)`], {
-            resolvedTree,
-            escalation: { tag: ESCALATE_CHECKS, feedback: `${kind} failing: ${r.failedNames.join(', ')}`.slice(0, COLDREAD_FEEDBACK_CAP) },
-          });
+          await freezeHeld(
+            cli,
+            dir,
+            rc,
+            [
+              heldByClaim
+                ? `agent claimed --tier held with ${kind} failing (${r.failedNames.join(', ')}) -> HELD (fix kept for owner review)`
+                : `checks (${kind}) failing ${n}x on a gate fix -> HELD (escalated, fix kept)`,
+            ],
+            {
+              resolvedTree,
+              escalation: {
+                tag: ESCALATE_CHECKS,
+                feedback: `${kind} failing: ${r.failedNames.join(', ')}`.slice(0, COLDREAD_FEEDBACK_CAP),
+              },
+            },
+          );
           reopen(dir, reopenTargets);
           writeMachineState(dir, { ...st, phase: 'awaiting-pr', currentCase: { caseId, branch: rc.branch, tier: 'held' } });
           progress(`checks failing ${n}x -> held (gate fix kept): ${rc.branch}`);
@@ -7045,9 +7077,42 @@ export async function cmdSweepReportCase(
           });
           return 0;
         }
-        // Conflict case: reset to pristine (the failing resolution is NOT
-        // published) and freeze a HELD DRAFT, escalated. A failed reset must not
-        // be announced as pristine — same rule as branch 4.
+        // A conflict case held BY CLAIM keeps its resolution: the agent resolved
+        // the conflict and is escalating a failure it does not own, so throwing
+        // that work away and shipping an empty exhibit would lose the useful part
+        // and tell the owner to resolve a conflict that is already resolved.
+        if (heldByClaim) {
+          await freezeHeld(
+            cli,
+            dir,
+            rc,
+            [`agent claimed --tier held with ${kind} failing (${r.failedNames.join(', ')}) -> HELD (resolution kept for owner review)`],
+            {
+              resolvedTree,
+              escalation: {
+                tag: ESCALATE_CHECKS,
+                feedback: `${kind} failing: ${r.failedNames.join(', ')}`.slice(0, COLDREAD_FEEDBACK_CAP),
+              },
+            },
+          );
+          reopen(dir, reopenTargets);
+          writeMachineState(dir, { ...st, phase: 'awaiting-pr', currentCase: { caseId, branch: rc.branch, tier: 'held' } });
+          progress(`held by claim (${kind} failing): ${rc.branch}`);
+          console.error(`report-case: held ${caseId} by claim (${kind} failing: ${r.failedNames.join(', ')})`);
+          result(cli, {
+            instruction: prHandoff(
+              dir,
+              caseId,
+              `provide PR description — the ${kind} still fails (${r.failedNames.join(', ')}); say so plainly and name what you could not fix`,
+            ),
+            tier: 'held',
+            issues,
+          });
+          return 0;
+        }
+        // Conflict case at the LIMIT: reset to pristine (the failing resolution
+        // is NOT published) and freeze a HELD DRAFT, escalated. A failed reset
+        // must not be announced as pristine — same rule as branch 4.
         if (!(await createCaseWorktree(cli, dir, caseFile, await revParse(cli.repo, rc.branch)))) {
           const detail =
             `checks (${kind}) failed ${n}x and the worktree at ${wtPath} could not be reset to the pristine ` +
