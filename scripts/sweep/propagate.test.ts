@@ -17,7 +17,7 @@ import { initFixtureRepo, type FixtureRepo } from './fixtures.js';
 import { addTempWorktree, commitInfo, gitPush, isAncestor } from './git.js';
 import { readLedger } from './ledger.js';
 import { exportRrCache, writeRrCacheDir } from './merge.js';
-import { DriverHalt, failureSummary, guardRef } from './propagate.js';
+import { depsKey, DriverHalt, ensureDepsPool, failureSummary, guardRef } from './propagate.js';
 import {
   appendJournal,
   cmdPlan,
@@ -2704,5 +2704,86 @@ describe('driver push carries credentials', () => {
     expect(cfg).not.toContain('credential.helper');
     expect(cfg).not.toContain('GH_TOKEN');
     expect(cfg).not.toContain('x-access-token');
+  });
+});
+
+describe('dependency pools — a tree is checked against ITS OWN manifests', () => {
+  /**
+   * Live 2026-08-01: `feat/mitm-credential-proxy` declares node-forge, which the
+   * base does not. Checking it against the clone's node_modules reported TS2307
+   * and minted a gate-fix blaming the branch for an ENVIRONMENT gap. Worse, the
+   * agent then ran an install in the shared clone and the SAME sha flipped
+   * red -> green, so the check was not even reproducible.
+   */
+  function repoWithManifests(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base manifests', {
+      'package.json': JSON.stringify({ name: 'x', dependencies: { a: '1' } }),
+      'pnpm-lock.yaml': 'lockfileVersion: 9\npackages:\n  a@1: {}\n',
+    });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.checkout('feat/extra-dep', { create: true, at: 'main' });
+    repo.commit('declare its own dependency', {
+      'package.json': JSON.stringify({ name: 'x', dependencies: { a: '1', 'node-forge': '1' } }),
+      'pnpm-lock.yaml': 'lockfileVersion: 9\npackages:\n  a@1: {}\n  node-forge@1: {}\n',
+    });
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+
+  it('keys on manifest CONTENT: differing deps differ, identical deps share', async () => {
+    const repo = repoWithManifests();
+    const base = await depsKey(repo.dir, 'main_patched');
+    const extra = await depsKey(repo.dir, 'feat/extra-dep');
+    expect(base).not.toBe(extra); // a branch with its own dependency gets its own pool
+    expect(await depsKey(repo.dir, 'main_patched')).toBe(base); // stable
+    // Content-keyed, so an identical tree under another name reuses the pool.
+    repo.checkout('feat/same-deps', { create: true, at: 'main_patched' });
+    repo.checkout('main');
+    expect(await depsKey(repo.dir, 'feat/same-deps')).toBe(base);
+  });
+
+  it('builds a pool per key and never installs into the clone', async () => {
+    const repo = repoWithManifests();
+    const ws = mkWorkspace();
+    const installed: string[] = [];
+    const fakeInstall = async (dir: string) => {
+      installed.push(dir);
+      mkdirSync(join(dir, 'node_modules'), { recursive: true });
+      writeFileSync(join(dir, 'node_modules', 'MARKER'), 'x\n');
+      return true;
+    };
+    const cli = { repo: repo.dir, workspace: ws, upstream: 'main', execute: false, cmd: 'plan' } as Cli;
+
+    const p1 = await ensureDepsPool(cli, 'main_patched', fakeInstall);
+    const p2 = await ensureDepsPool(cli, 'feat/extra-dep', fakeInstall);
+    expect(p1).toBeTruthy();
+    expect(p2).toBeTruthy();
+    expect(p1).not.toBe(p2); // separate trees
+    expect(existsSync(join(p1!, 'node_modules', 'MARKER'))).toBe(true);
+
+    // The manifests inside the pool are the BRANCH's, not the clone's.
+    expect(readFileSync(join(p2!, 'package.json'), 'utf8')).toContain('node-forge');
+    expect(readFileSync(join(p1!, 'package.json'), 'utf8')).not.toContain('node-forge');
+
+    // Nothing was installed into the clone — that shared mutable tree is what
+    // made an unchanged sha change its answer.
+    expect(installed.every((d) => !d.startsWith(repo.dir))).toBe(true);
+    expect(existsSync(join(repo.dir, 'node_modules'))).toBe(false);
+
+    // Second call for the same key reuses; no extra install.
+    const before = installed.length;
+    expect(await ensureDepsPool(cli, 'main_patched', fakeInstall)).toBe(p1);
+    expect(installed.length).toBe(before);
+  });
+
+  it('a failed install yields no pool (callers fall back) and leaves no half-built dir', async () => {
+    const repo = repoWithManifests();
+    const ws = mkWorkspace();
+    const cli = { repo: repo.dir, workspace: ws, upstream: 'main', execute: false, cmd: 'plan' } as Cli;
+    const pool = await ensureDepsPool(cli, 'main_patched', async () => false);
+    expect(pool).toBeNull();
+    expect(readdirSync(join(ws, 'deps-pool')).filter((d) => d.endsWith('.building'))).toEqual([]);
   });
 });

@@ -47,23 +47,25 @@
  *   blocked (merge_status) picture is derived from ORIGIN at `sweep start`, never from
  *   local state: the ledger's merge_status field is dead to this driver.
  */
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
-  appendFileSync,
 } from 'node:fs';
 import { dirname, join, resolve as pathResolve, sep } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
+import { promisify } from 'node:util';
 
 import {
   DEFAULT_STACK_CAP,
@@ -1751,6 +1753,114 @@ async function cleanPrefixTree(
 const WORKTREE_DEP_LINKS = ['node_modules', 'container/agent-runner/node_modules'];
 
 /**
+ * The dependency MANIFESTS that decide what `node_modules` must contain. Two
+ * independent trees: the root (pnpm) and container/agent-runner (bun).
+ */
+const DEP_MANIFESTS = [
+  'pnpm-lock.yaml',
+  'package.json',
+  'pnpm-workspace.yaml',
+  'container/agent-runner/bun.lock',
+  'container/agent-runner/package.json',
+];
+
+/**
+ * A DEPENDENCY POOL key for a tree: the digest of its manifests.
+ *
+ * Branches do not share dependencies. Measured on this fork: four branches
+ * carry lockfiles differing from the base, and `feat/mitm-credential-proxy`
+ * declares `node-forge` that the base does not. Checking such a branch against
+ * the base's node_modules reports `TS2307 Cannot find module 'node-forge'` —
+ * an ENVIRONMENT gap read as a code defect, which is exactly what minted a
+ * bogus gate-fix case on 2026-08-01.
+ *
+ * Keyed by CONTENT, not by branch: two branches with identical manifests share
+ * one pool (mitm-credential-proxy and onecli-broker do), and a branch whose
+ * deps never change reuses the same pool across passes forever.
+ */
+export async function depsKey(repo: string, ref: string): Promise<string> {
+  const h = createHash('sha256');
+  for (const f of DEP_MANIFESTS) {
+    const r = await git(repo, ['show', `${ref}:${f}`], { allowCodes: [128] });
+    h.update(f).update('\0').update(r.code === 0 ? r.stdout : '').update('\0');
+  }
+  return h.digest('hex').slice(0, 12);
+}
+
+/** Where a pool lives: beside the pnpm store, so it survives clean-slate too. */
+function depsPoolDir(workspace: string, key: string): string {
+  return join(workspace, 'deps-pool', key);
+}
+
+/**
+ * Ensure a dependency pool exists for `ref`, and return its directory.
+ *
+ * The pool is a bare directory holding only the manifests plus the installed
+ * trees — never a checkout. Installs run INSIDE it, so nothing is copied or
+ * moved afterwards and pnpm's hardlinks into its content-addressable store
+ * survive (measured: `links=2`, store 151MB on a persistent mount). A warm
+ * store means an install links rather than downloads.
+ *
+ * Returns null when the manifests cannot be read or an install fails — callers
+ * fall back to the clone's node_modules, which is what every worktree used
+ * before this existed.
+ */
+export async function ensureDepsPool(cli: Cli, ref: string, runInstall: InstallRunner): Promise<string | null> {
+  let key: string;
+  try {
+    key = await depsKey(cli.repo, ref);
+  } catch {
+    return null;
+  }
+  const pool = depsPoolDir(cli.workspace, key);
+  // node_modules present => already built. Cheap idempotence: a pool is only
+  // ever completed or absent, never half-written under its final name.
+  if (existsSync(join(pool, 'node_modules'))) return pool;
+  const staging = `${pool}.building`;
+  rmSync(staging, { recursive: true, force: true });
+  mkdirSync(join(staging, 'container', 'agent-runner'), { recursive: true });
+  for (const f of DEP_MANIFESTS) {
+    const r = await git(cli.repo, ['show', `${ref}:${f}`], { allowCodes: [128] });
+    if (r.code !== 0) continue;
+    writeFileSync(join(staging, f), r.stdout);
+  }
+  if (!existsSync(join(staging, 'package.json'))) {
+    rmSync(staging, { recursive: true, force: true });
+    return null;
+  }
+  const ok = await runInstall(staging);
+  if (!ok || !existsSync(join(staging, 'node_modules'))) {
+    rmSync(staging, { recursive: true, force: true });
+    return null;
+  }
+  rmSync(pool, { recursive: true, force: true });
+  mkdirSync(dirname(pool), { recursive: true });
+  renameSync(staging, pool); // same filesystem: atomic, and hardlinks survive
+  return pool;
+}
+
+/** Runs the installs for a prepared pool directory. Injectable for tests. */
+export type InstallRunner = (dir: string) => Promise<boolean>;
+
+const defaultInstallRunner: InstallRunner = async (dir) => {
+  const run = async (cmd: string, cwd: string): Promise<boolean> => {
+    try {
+      await promisify(execFile)('bash', ['-c', cmd], { cwd, maxBuffer: 64 * 1024 * 1024 });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  // Root (pnpm) is required; agent-runner (bun) is best-effort — a repo without
+  // it simply has no second tree to link.
+  const rootOk = await run('pnpm install --frozen-lockfile --ignore-scripts', dir);
+  if (!rootOk) return false;
+  const ar = join(dir, 'container', 'agent-runner');
+  if (existsSync(join(ar, 'package.json'))) await run('bun install --frozen-lockfile', ar);
+  return true;
+};
+
+/**
  * Make paths invisible to `git add -A`, via `$GIT_COMMON_DIR/info/exclude` —
  * NOT a `.gitignore` edit (that would be committed and leak into every PR).
  * `info/exclude` is repo-local and never committed.
@@ -1797,11 +1907,16 @@ async function excludeInWorktree(repo: string, wtPath: string, patterns: string[
  * Best-effort and per-tree: a missing tree in the clone is simply not linked
  * (and its check then fails loudly and correctly, rather than silently).
  */
-async function linkNodeModules(repo: string, wtPath: string): Promise<string[]> {
+async function linkNodeModules(repo: string, wtPath: string, poolDir?: string | null): Promise<string[]> {
   await excludeInWorktree(repo, wtPath, WORKTREE_DEP_LINKS);
   const linked: string[] = [];
   for (const rel of WORKTREE_DEP_LINKS) {
-    const src = join(repo, rel);
+    // Prefer the tree's OWN dependency pool; fall back to the clone's installed
+    // trees. The fallback is what every worktree used before pools existed, and
+    // it is wrong whenever the tree's manifests differ from the clone's — that
+    // is the bug pools fix — but a missing pool must degrade to the old
+    // behaviour rather than leave a worktree with no dependencies at all.
+    const src = poolDir && existsSync(join(poolDir, rel)) ? join(poolDir, rel) : join(repo, rel);
     const dest = join(wtPath, rel);
     if (!existsSync(src) || existsSync(dest)) continue;
     try {
@@ -1872,7 +1987,8 @@ async function createCaseWorktree(
     // shared .git so rerere-enabled operations in the case worktree see the
     // recorded resolutions. Best-effort, like the worktree itself.
     const seeded = await installRrCache(cli.repo, join(cli.workspace, RR_CACHE_DIRNAME));
-    const linkedDeps = await linkNodeModules(cli.repo, wtPath);
+    const casePool = await ensureDepsPool(cli, caseFile.branch, defaultInstallRunner);
+    const linkedDeps = await linkNodeModules(cli.repo, wtPath, casePool);
     appendJournal(dir, {
       action: 'case-worktree',
       caseId: caseFile.id,
@@ -6353,6 +6469,7 @@ async function firstRedParticipant(
   dir: string,
   checksFile: string | undefined,
   runChecks: ChecksRunner,
+  runInstall: InstallRunner = defaultInstallRunner,
 ): Promise<{ branch: string; sha: string; output: string; failed: VerifyCommand[]; failedNames: string[] } | null> {
   // An ABSENT checks file is a deliberate skip (a repo without one behaves as
   // before). A CONFIGURED one that will not load is a silently disabled gate —
@@ -6388,12 +6505,19 @@ async function firstRedParticipant(
       if (checked.has(key)) {
         if (checked.get(key) === true) continue;
       }
+      // Dependencies for THIS branch's manifests, not the clone's. Without
+      // this a branch declaring its own package (node-forge on
+      // feat/mitm-credential-proxy) reports TS2307 and is blamed for an
+      // environment gap — and worse, an unchanged sha flips red->green the
+      // moment anything installs into the shared clone (live 2026-08-01).
+      const pool = await ensureDepsPool(cli, branch, runInstall);
       if (!wt) {
         wt = await addTempWorktree(cli.repo, sha);
-        await linkNodeModules(cli.repo, wt.path);
       } else {
         await git(cli.repo, ['reset', '--hard', sha], { cwd: wt.path });
+        for (const rel of WORKTREE_DEP_LINKS) rmSync(join(wt.path, rel), { recursive: true, force: true });
       }
+      await linkNodeModules(cli.repo, wt.path, pool);
       const r = await runChecks(checks.typecheck, wt.path);
       appendJournal(dir, { action: 'branch-check', branch, sha, ok: r.ok, ...(r.ok ? {} : { failed: r.failedNames }) });
       if (!r.ok) {
@@ -7768,7 +7892,7 @@ async function createGateFixWorktree(cli: Cli, dir: string, caseId: string, tip:
   await git(cli.repo, ['worktree', 'prune'], { allowCodes: [1, 128] });
   rmSync(wtPath, { recursive: true, force: true });
   await git(cli.repo, ['worktree', 'add', '--detach', wtPath, tip]);
-  await linkNodeModules(cli.repo, wtPath);
+  await linkNodeModules(cli.repo, wtPath, await ensureDepsPool(cli, tip, defaultInstallRunner));
 }
 
 /** One related PR in a finished pass's owner-facing summary (D-059 owner request). */
