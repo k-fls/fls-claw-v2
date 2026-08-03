@@ -96,7 +96,14 @@ import {
   deriveCandidates,
   reconcileCandidates,
 } from './candidates.js';
-import { attributeFailure, parseFailingFiles } from './attribute.js';
+import { attributeFailure, countFailingFiles, parseFailingFiles } from './attribute.js';
+import {
+  classifyFailure,
+  findIntroducingCommit,
+  locateOwner,
+  type History,
+  type SubsetProbe,
+} from './not-my-bug.js';
 import { malformedCutPointExceptionsIssue, resolveCutPointExceptions, staleWarnings } from './cut-points.js';
 import { readLedger, writeLedger, defaultLedgerBranch } from './ledger.js';
 import { installRrCache } from './merge.js';
@@ -179,6 +186,17 @@ interface Cli {
   execute: boolean;
   caseId?: string;
   tier?: string;
+  /**
+   * `report-case --not-my-bug` — the agent's claim that the checks failure the
+   * driver just reported is not caused by its resolution. ADDITIONAL to `--tier`,
+   * never a replacement: the tier classifies the agent's EDIT, this classifies
+   * the driver's TEST REPORT. The claim is adjudicated mechanically
+   * (`not-my-bug.ts`) and decides nothing on its own; it only says which case is
+   * worth paying a comparison for. It cannot be raised on the first
+   * `report-case` — the agent may not run tests, so before the gate answers it
+   * does not know a test failed at all.
+   */
+  notMyBug?: boolean;
   resolvedRef?: string;
   /**
    * publish: file holding the substitute GitHub token (§14, D-048). The agent
@@ -212,7 +230,7 @@ interface Cli {
 }
 
 const USAGE =
-  'Usage: pnpm exec tsx scripts/sweep/propagate.ts <sweep-start|next-case|report-case|report-pr|sweep-finish|sweep-abort> [--repo <path>] [--workspace <dir>] [--ledger <file>] [--pass <wm12>] [--dry-run] [--tier <t>] [--inventory <dir>] [--checks-file <path>] [flags]';
+  'Usage: pnpm exec tsx scripts/sweep/propagate.ts <sweep-start|next-case|report-case|report-pr|sweep-finish|sweep-abort> [--repo <path>] [--workspace <dir>] [--ledger <file>] [--pass <wm12>] [--dry-run] [--tier <t>] [--not-my-bug] [--inventory <dir>] [--checks-file <path>] [flags]';
 
 function parseCli(argv: string[]): Cli {
   const [cmd, ...rest] = argv;
@@ -280,6 +298,9 @@ function parseCli(argv: string[]): Cli {
         break;
       case '--tier':
         cli.tier = need();
+        break;
+      case '--not-my-bug':
+        cli.notMyBug = true;
         break;
       case '--token-file':
         cli.tokenFile = pathResolve(need());
@@ -1630,6 +1651,202 @@ export const defaultChecksRunner: ChecksRunner = async (commands, baseDir) => {
   return { ok: failedNames.length === 0, failedNames, output };
 };
 
+/** Single-quote a path for `bash -c`. Paths here come from git, but never trust. */
+function shellQuote(p: string): string {
+  return `'${p.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Narrow a checks command list to the FILES that failed (`VerifyCommand.filter`).
+ *
+ * Each file is assigned to the command with the LONGEST matching `cwd`, so a
+ * failure under `container/agent-runner` re-runs bun alone and not the root pnpm
+ * suite as well — every command's cwd is a prefix of it and without the
+ * longest-match rule both would run, which is most of the cost this is avoiding.
+ *
+ * A command with no `filter` still runs WHOLE when one of its files failed. That
+ * is deliberate for `tsc`: a project typecheck cannot be narrowed to a file list
+ * without changing what it means (it would drop the tsconfig), so it pays full
+ * price and stays correct. Commands with no failing file are dropped entirely.
+ */
+export function subsetCommands(commands: VerifyCommand[], files: string[]): VerifyCommand[] {
+  const norm = (cwd: string | undefined): string => (cwd ?? '').replace(/^\.\/?/, '').replace(/\/+$/, '');
+  const under = (f: string, cwd: string): boolean => cwd === '' || f === cwd || f.startsWith(`${cwd}/`);
+  const cwds = commands.map((c) => norm(c.cwd));
+  const ownerOf = (f: string): string =>
+    cwds.filter((c) => under(f, c)).sort((a, b) => b.length - a.length)[0] ?? '';
+  const out: VerifyCommand[] = [];
+  for (const c of commands) {
+    const cwd = norm(c.cwd);
+    const mine = files.filter((f) => under(f, cwd) && ownerOf(f) === cwd);
+    if (mine.length === 0) continue;
+    if (!c.filter) {
+      out.push({ cmd: c.cmd, cwd: c.cwd });
+      continue;
+    }
+    const rel = mine.map((f) => (cwd && f.startsWith(`${cwd}/`) ? f.slice(cwd.length + 1) : f));
+    // Function replacement, not a string one: `String.replace` expands `$&`,
+    // "$`" and `$'` INSIDE the replacement text, so a path containing them would
+    // rewrite the command.
+    const joined = rel.map(shellQuote).join(' ');
+    out.push({ cmd: c.filter.replace('{files}', () => joined), cwd: c.cwd });
+  }
+  return out;
+}
+
+/** One recorded subset run — journaled so the verdict can be audited after the fact. */
+export interface ProbeRun {
+  target: string;
+  files: string[];
+  usable: boolean;
+  failing: string[];
+  /** The run failed but named no file — unusable, and worth seeing in the journal. */
+  unparseable?: boolean;
+}
+
+/**
+ * A `SubsetProbe` bound to this pass: runs the failing checks, narrowed to the
+ * files in question, against the case worktree or any committed tree.
+ *
+ * ONE temp worktree is created lazily and reset between probes (the same shape
+ * `firstRedParticipant` uses) — a bisect can ask for a dozen trees and creating
+ * a worktree each time is the expensive part.
+ *
+ * DEPENDENCIES ARE PER TREE. `ensureDepsPool` keys on the manifest digest, so
+ * probing across a range where `package.json` moves re-pools exactly when it has
+ * to and reuses the pool otherwise. A tree whose pool cannot be built is
+ * UNUSABLE, not green: falling back to the clone's `node_modules` is what
+ * reported `TS2307 Cannot find module 'node-forge'` as a code defect and minted
+ * a bogus gate-fix case on 2026-08-01 (bc92eed8). For a probe, an environment we
+ * cannot trust must be skipped rather than believed.
+ */
+function makeSubsetProbe(
+  cli: Cli,
+  commands: VerifyCommand[],
+  runChecks: ChecksRunner,
+  caseWorktree: string,
+  runInstall: InstallRunner = defaultInstallRunner,
+  opts: {
+    /**
+     * Narrow each run to the files in question (`VerifyCommand.filter`). OFF for
+     * the ADJUDICATION and ownership probes: the gate's own counts come from the
+     * FULL command, and comparing a full-suite count against a narrowed one
+     * compares two different populations — the difference decides the verdict.
+     * The 2026-08-01 test is the proof: it fails only under whole-suite load
+     * (5000 ms internal deadline, 5000 ms runner timeout) and passes in ~250 ms
+     * on its own, so a narrowed baseline would have called the very failure this
+     * exists for `flaky` and never `pre-existing`.
+     *
+     * ON for the BISECT, where every probe is narrowed on BOTH sides of the
+     * comparison and the tip-determinism gate rejects anything that does not
+     * reproduce under that same narrowing.
+     */
+    narrow?: boolean;
+    /**
+     * Force a specific dependency pool instead of deriving one per tree. The
+     * adjudication passes the CASE's pool so both sides of the comparison run
+     * with identical dependencies; otherwise a lockfile the merge brought down
+     * gives the baseline packages the case worktree does not have, and the
+     * environment gap is reported as the agent's regression.
+     */
+    poolRef?: string;
+  } = {},
+): { probe: SubsetProbe; runs: ProbeRun[]; dispose: () => Promise<void> } {
+  const runs: ProbeRun[] = [];
+  let wt: { path: string; remove: () => Promise<void> } | null = null;
+  const probe: SubsetProbe = async (target, files) => {
+    const cmds = opts.narrow ? subsetCommands(commands, files) : commands;
+    const empty = { usable: false, counts: new Map<string, number>(), output: '' };
+    if (cmds.length === 0 || files.length === 0) {
+      runs.push({ target: target.kind === 'worktree' ? 'worktree' : target.sha.slice(0, 12), files, usable: false, failing: [] });
+      return empty;
+    }
+    let baseDir: string;
+    if (target.kind === 'worktree') {
+      baseDir = caseWorktree;
+    } else {
+      const pool = await ensureDepsPool(cli, opts.poolRef ?? target.sha, runInstall);
+      if (!pool) {
+        // No pool has two causes and they mean opposite things. A tree that
+        // DECLARES dependencies and could not have them installed is untrusted —
+        // skip it (falling back to the clone's node_modules is what reported
+        // `TS2307 Cannot find module 'node-forge'` as a code defect). A tree with
+        // no manifests at all needs nothing installed and runs as it is.
+        const declares = await git(cli.repo, ['cat-file', '-e', `${target.sha}:package.json`], { allowCodes: [1, 128] });
+        if (declares.code === 0) {
+          runs.push({ target: target.sha.slice(0, 12), files, usable: false, failing: [] });
+          return empty;
+        }
+      }
+      try {
+        if (!wt) {
+          wt = await addTempWorktree(cli.repo, target.sha);
+        } else {
+          await git(cli.repo, ['reset', '--hard', target.sha], { cwd: wt.path });
+          // `reset --hard` leaves UNTRACKED files behind, so a previous probe's
+          // build output, coverage or generated fixtures would still be sitting
+          // in the tree when the next commit is checked out — and could decide
+          // its result. The dep links are re-created right after, so exclude them.
+          await git(cli.repo, ['clean', '-fdx', ...WORKTREE_DEP_LINKS.flatMap((rel) => ['-e', rel])], {
+            cwd: wt.path,
+            allowCodes: [1, 128],
+          });
+          for (const rel of WORKTREE_DEP_LINKS) rmSync(join(wt.path, rel), { recursive: true, force: true });
+        }
+        await linkNodeModules(cli.repo, wt.path, pool);
+      } catch {
+        runs.push({ target: target.sha.slice(0, 12), files, usable: false, failing: [] });
+        return empty;
+      }
+      baseDir = wt.path;
+    }
+    const r = await runChecks(cmds, baseDir);
+    const counts = countFailingFiles(rootChecksOutput(r.output, cmds));
+    const label = target.kind === 'worktree' ? 'worktree' : target.sha.slice(0, 12);
+    // A command that FAILED but named no file is UNINTERPRETABLE, and reading it
+    // as "no failures" reads a red tree as green — the one thing rule 3 forbids.
+    // Two real shapes: `vitest run <path that matches nothing>` exits 1 with "No
+    // test files found", and a bun module-load error prints `1 fail` with no
+    // `(fail)` line at all. Either would have made a failing baseline look clean
+    // and refused a true claim, or made a failing tip look like a bisect anchor.
+    if (!r.ok && counts.size === 0) {
+      runs.push({ target: label, files, usable: false, failing: [], unparseable: true });
+      return { usable: false, counts, output: r.output };
+    }
+    runs.push({ target: label, files, usable: true, failing: [...counts.keys()] });
+    return { usable: true, counts, output: r.output };
+  };
+  return {
+    probe,
+    runs,
+    dispose: async () => {
+      if (wt) await wt.remove().catch(() => undefined);
+      wt = null;
+    },
+  };
+}
+
+/** `History` over the real clone, for `findIntroducingCommit`. */
+function repoHistory(repo: string): History {
+  return {
+    ancestor: async (ref, back) => {
+      const r = await git(repo, ['rev-parse', '--verify', '--quiet', `${ref}~${back}^{commit}`], { allowCodes: [1, 128] });
+      return r.code === 0 ? r.stdout.trim() : null;
+    },
+    listFirstParent: async (from, to) => {
+      const r = await git(repo, ['rev-list', '--first-parent', '--reverse', `${from}..${to}`], { allowCodes: [128] });
+      return r.code === 0 ? r.stdout.split('\n').map((l) => l.trim()).filter(Boolean) : [];
+    },
+    hasAnyFile: async (sha, files) => {
+      for (const f of files) {
+        const r = await git(repo, ['cat-file', '-e', `${sha}:${f}`], { allowCodes: [1, 128] });
+        if (r.code === 0) return true;
+      }
+      return false;
+    },
+  };
+}
+
 /**
  * D-060: how many `checks-fail` rows a case has accumulated since its most recent
  * `checks-pass` (a pass resets the count) — else from the case's start. Shared by
@@ -1856,7 +2073,12 @@ const defaultInstallRunner: InstallRunner = async (dir) => {
   const rootOk = await run('pnpm install --frozen-lockfile --ignore-scripts', dir);
   if (!rootOk) return false;
   const ar = join(dir, 'container', 'agent-runner');
-  if (existsSync(join(ar, 'package.json'))) await run('bun install --frozen-lockfile', ar);
+  // A repo without the second tree simply has nothing to install. When it HAS
+  // one and the install FAILS, the pool is incomplete: `linkNodeModules` then
+  // silently falls back to the CLONE's node_modules for that tree, which is the
+  // untrusted-environment case the pool exists to rule out. Swallowing the
+  // result reported it as a healthy pool.
+  if (existsSync(join(ar, 'package.json')) && !(await run('bun install --frozen-lockfile', ar))) return false;
   return true;
 };
 
@@ -5105,6 +5327,14 @@ function machineColdReadPrompt(opts: {
   conflictDiff: string;
   resolutionDiff: string | null;
   gateFix?: { failedOutput: string } | null;
+  /**
+   * `--not-my-bug` widening: files added to the edit scope because the merge
+   * itself is red while both sides are green in isolation. Without telling the
+   * reviewer, it sees a resolution diff touching files it was told are not part
+   * of the conflict — the standard reject shape — and two rejects escalate the
+   * case to HELD for doing exactly what the driver instructed.
+   */
+  widenedPaths?: { files: string[]; reason: string } | null;
 }): string {
   const gf = opts.gateFix ?? null;
   const lines: string[] = [
@@ -5122,6 +5352,15 @@ function machineColdReadPrompt(opts: {
           `Conflicted paths: ${opts.conflictedPaths.join(', ')}`,
         ]),
     '',
+    ...(opts.widenedPaths && opts.widenedPaths.files.length > 0
+      ? [
+          `SCOPE WIDENED BY THE DRIVER: ${opts.widenedPaths.files.join(', ')}`,
+          `Reason: ${opts.widenedPaths.reason}`,
+          'Edits to those files are IN SCOPE for this case and resolve no conflict markers —',
+          'judge them as the fix for the failure named above, not as a scope violation.',
+          '',
+        ]
+      : []),
     ...opts.contextLines,
     '',
     ...(gf
@@ -6531,7 +6770,12 @@ async function firstRedParticipant(
   return null;
 }
 
-export async function cmdSweepNextCase(cli: Cli, runChecks: ChecksRunner = defaultChecksRunner): Promise<number> {
+export async function cmdSweepNextCase(
+  cli: Cli,
+  runChecks: ChecksRunner = defaultChecksRunner,
+  /** Pre-merge branch check installs per-branch dependencies; injectable for tests. */
+  runInstall: InstallRunner = defaultInstallRunner,
+): Promise<number> {
   const ctx = await attachPass(cli);
   const dir = ctx.dir;
   let st = readMachineState(dir);
@@ -6568,9 +6812,27 @@ export async function cmdSweepNextCase(cli: Cli, runChecks: ChecksRunner = defau
   // scope. Serve the fix as a case on the branch that owns it instead; the
   // branch is thereby blocked, and the existing DEFERRED path holds its
   // descendants back (D-057/D-058) with no extra machinery.
-  const redBranch = await firstRedParticipant(cli, dir, passChecksFile, runChecks);
+  //
+  // AN OPEN GATE FIX IS THE SAME STATEMENT, already proven. The pre-merge check
+  // is TYPECHECK ONLY (tests are far slower and `finish` runs them), so a branch
+  // whose TESTS are red passes it — which is exactly the branch a `--not-my-bug`
+  // adjudication has just proved red and minted a gate fix for. Without this,
+  // `cmdRun` merges into it anyway and RE-EMITS the very conflict case that was
+  // aborted; the re-emission gives that case a newer `case` row, so it is no
+  // longer superseded, it sorts ahead of the gate fix by first-seen order, and
+  // `next-case` serves it instead of the fix. Caught by the end-to-end walk of
+  // the 2026-08-01 incident, which is what that test exists for.
+  const openGateFixCase = ((): boolean => {
+    const j = readJournal(dir);
+    const gateFixIds = new Set(j.filter((e) => e.action === 'case' && e.gateFix === true).map((e) => e.caseId as string));
+    return openCases(j).some((c) => gateFixIds.has(c.caseId));
+  })();
+  const redBranch = openGateFixCase ? null : await firstRedParticipant(cli, dir, passChecksFile, runChecks, runInstall);
   let redGate: { reason: string; gated: string[] } | null = null;
-  if (redBranch) {
+  if (openGateFixCase) {
+    progress('a gate fix is open — merging nothing until it lands');
+    console.error('next-case: an open gate-fix case blocks its branch — no merges this call');
+  } else if (redBranch) {
     // Ensure a gate-fix case EXISTS for the red branch — idempotent, since
     // materializeGateFixCases dedups on its own key — and then FALL THROUGH to
     // the ordinary case-serving path below.
@@ -6737,6 +6999,356 @@ export async function cmdSweepNextCase(cli: Cli, runChecks: ChecksRunner = defau
 }
 
 // --------------------------------------------------------------------------
+// `report-case --not-my-bug` — adjudicate the claim, then route the failure.
+// --------------------------------------------------------------------------
+
+/** PR-description prefix for a hold caused by an UNSTABLE check, not a defect. */
+const ESCALATE_FLAKY = '[AUTO-ESCALATED: check unstable]';
+
+/**
+ * What the gate should do with the claim. `handled` means this function already
+ * emitted the result and the command is over; otherwise the gate falls through
+ * to its normal ERR36/ERR40 answer, enriched with `note`/`yours`.
+ */
+interface NotMyBugOutcome {
+  handled: boolean;
+  code?: number;
+  note?: string;
+  /** Refused: the failing files that ARE the agent's, so the gate can name them. */
+  yours?: string[];
+}
+
+/**
+ * Adjudicate `--not-my-bug` and route the outcome.
+ *
+ * FEEDBACK IS PART OF THE CONTRACT here, not decoration. Everything this does
+ * is invisible to the agent — it runs test suites across trees the agent never
+ * sees, for minutes at a time — and the agent is the only thing that can tell
+ * the owner what is happening. So every stage emits a `SWEEP-STEP:` line, every
+ * verdict is journaled with the probe log that produced it, and the result
+ * carries a `notMyBug` block the agent can report verbatim.
+ */
+async function adjudicateNotMyBug(p: {
+  cli: Cli;
+  ctx: PassCtx;
+  dir: string;
+  caseId: string;
+  caseDir: string;
+  /**
+   * The RE-DERIVED case (§7 trust boundary), never `case.json`. Ownership routing
+   * reads `parent` and `head.sha` from here: `case.json` is agent-writable, and
+   * those two values choose which branch gets a gate-fix case minted on it.
+   */
+  rc: ResolvedCase;
+  wtPath: string;
+  resolvedTree: string;
+  kind: 'typecheck' | 'test';
+  failedCommands: VerifyCommand[];
+  failingOutput: string;
+  runChecks: ChecksRunner;
+  runInstall: InstallRunner;
+}): Promise<NotMyBugOutcome> {
+  const { cli, ctx, dir, caseId, rc, wtPath, kind, failedCommands, failingOutput } = p;
+  const branch = rc.branch;
+  const all = countFailingFiles(rootChecksOutput(failingOutput, failedCommands));
+
+  // A failure IN A CONFLICTED PATH is never adjudicable, and must be dropped
+  // before anything else. The baseline is the clean prefix, which holds each
+  // conflicted path at the branch's PRE-MERGE blob (or omits it, when the path
+  // was added on theirs) against an otherwise fully merged tree — precisely the
+  // incompatibility the conflict is about. So a conflicted file fails there for
+  // reasons that have nothing to do with the agent's resolution being right or
+  // wrong: a genuine regression in it would be "confirmed" pre-existing, and a
+  // path added on theirs can never fail there, guaranteeing a false refuse.
+  // Those files are inside the agent's own edit scope anyway — they are its work
+  // by definition, so there is no claim to make about them.
+  const conflicted = new Set(rc.conflictedPaths);
+  const resolved = new Map([...all].filter(([f]) => !conflicted.has(f)));
+  const files = [...resolved.keys()];
+  const dropped = [...all.keys()].filter((f) => conflicted.has(f));
+  if (files.length === 0) {
+    const why = dropped.length
+      ? `every failure is in a file you are resolving (${dropped.join(', ')}) — that is your work by definition`
+      : 'the failing output named no source file outside your conflicted paths';
+    appendJournal(dir, { action: 'not-my-bug', caseId, branch, kind, verdict: 'refused', files: dropped, detail: why });
+    progress(`not-my-bug: REFUSED — ${why}`);
+    return { handled: false, note: why, yours: dropped };
+  }
+  progress(
+    `not-my-bug: adjudicating ${files.length} failing file(s) [${files.join(', ')}] against the pre-conflict tree` +
+      (dropped.length ? ` (${dropped.length} in your conflicted paths are yours and were dropped)` : ''),
+  );
+
+  // The baseline: the case worktree's own HEAD — the CLEAN PREFIX commit, the
+  // whole merge minus the agent's resolution. Its parent is the branch tip the
+  // merge was attempted from, which is the first ownership probe below.
+  const headSha = (await git(cli.repo, ['rev-parse', 'HEAD'], { cwd: wtPath, allowCodes: [128] })).stdout.trim();
+  const branchTip = (await git(cli.repo, ['rev-parse', 'HEAD^'], { cwd: wtPath, allowCodes: [128] })).stdout.trim();
+  if (!headSha) {
+    return { handled: false, note: 'the pre-conflict tree could not be resolved from the case worktree' };
+  }
+
+  // TWO probes over ONE temp worktree. The adjudication runs the failed commands
+  // WHOLE, with the CASE's dependency pool, so both sides of the comparison are
+  // the same population the gate measured. The bisect narrows to the failing
+  // files and re-pools per commit — it compares a commit against its own history,
+  // where per-tree dependencies are the correct choice and full-suite cost is not
+  // affordable across a dozen probes.
+  const casePool = await depsKey(cli.repo, rc.branch).catch(() => null);
+  const { probe, runs, dispose } = makeSubsetProbe(cli, failedCommands, p.runChecks, wtPath, p.runInstall, {
+    poolRef: casePool ? rc.branch : undefined,
+  });
+  const { probe: narrowProbe, runs: narrowRuns, dispose: disposeNarrow } = makeSubsetProbe(
+    cli,
+    failedCommands,
+    p.runChecks,
+    wtPath,
+    p.runInstall,
+    { narrow: true },
+  );
+  try {
+    const verdict = await classifyFailure(resolved, headSha, probe);
+    appendJournal(dir, {
+      action: 'not-my-bug',
+      caseId,
+      branch,
+      kind,
+      verdict: verdict.verdict,
+      files: verdict.files,
+      probes: verdict.probes,
+      detail: verdict.detail,
+      runs,
+    });
+    progress(`not-my-bug: ${verdict.verdict.toUpperCase()} — ${verdict.detail}`);
+    console.error(`report-case [not-my-bug]: ${verdict.verdict} — ${verdict.detail}`);
+
+    if (verdict.verdict === 'caused-by-case') {
+      // Refused — and the driver now knows exactly WHICH failures are the
+      // agent's, which is strictly better steering than "read the output".
+      return { handled: false, note: verdict.detail, yours: verdict.files };
+    }
+    if (verdict.verdict === 'undecidable') {
+      return { handled: false, note: verdict.detail };
+    }
+    if (verdict.verdict === 'flaky') {
+      // Nobody's defect: it did not reproduce on either tree. There is no owner
+      // to root a fix on and no reason to make the agent keep trying, so the
+      // case goes to the owner with its resolution INTACT and the instability
+      // named. Over-blocking, visibly, with an artifact — the safe direction.
+      await freezeHeld(cli, dir, rc, [`checks unstable (${verdict.files.join(', ')}) -> HELD (resolution kept)`], {
+        resolvedTree: p.resolvedTree,
+        escalation: { tag: ESCALATE_FLAKY, feedback: verdict.detail.slice(0, COLDREAD_FEEDBACK_CAP) },
+      });
+      reopen(dir, [rc.branch, ...rc.descendants]);
+      const st = readMachineState(dir);
+      writeMachineState(dir, { ...st!, phase: 'awaiting-pr', currentCase: { caseId, branch, tier: 'held' } });
+      progress(`not-my-bug: held (unstable check) — ${branch}`);
+      result(cli, {
+        instruction: prHandoff(
+          dir,
+          caseId,
+          `provide PR description — your resolution stands; the hold is an UNSTABLE check (${verdict.files.join(', ')}) that ` +
+            `passes and fails on the same tree. Say that plainly and name it.`,
+        ),
+        tier: 'held',
+        notMyBug: { verdict: verdict.verdict, files: verdict.files, probes: verdict.probes, detail: verdict.detail },
+        issues: [],
+      });
+      return { handled: true, code: 0 };
+    }
+
+    // CONFIRMED pre-existing. The prefix proves it is not the agent's; it cannot
+    // say whose. Two probes settle that, and the third answer is not a gate fix.
+    progress('not-my-bug: confirmed — locating the owner (branch tip, then parent head)');
+    const owner = await locateOwner(verdict.files, branchTip, rc.head.sha, probe, {
+      // A file that does not EXIST at a tip cannot fail there, and a runner asked
+      // for a path it cannot find exits non-zero with nothing parseable — which
+      // the probe reports as unusable. The ordinary case is exactly this: the
+      // failing test arrived WITH the merge, so it is absent from the branch tip.
+      // Answering "absent" from git is both cheaper and unambiguous.
+      hasAnyFile: async (sha, fs) => {
+        for (const f of fs) {
+          const r = await git(cli.repo, ['cat-file', '-e', `${sha}:${f}`], { allowCodes: [1, 128] });
+          if (r.code === 0) return true;
+        }
+        return false;
+      },
+    });
+    appendJournal(dir, {
+      action: 'not-my-bug-owner',
+      caseId,
+      branch,
+      owner: owner.owner,
+      ref: owner.ref,
+      files: owner.files,
+      probes: owner.probes,
+      detail: owner.detail,
+    });
+    progress(`not-my-bug: owner = ${owner.owner} — ${owner.detail}`);
+
+    if (owner.owner === 'unknown') {
+      return { handled: false, note: `${verdict.detail}; but ${owner.detail}` };
+    }
+
+    if (owner.owner === 'interaction') {
+      // Neither side is red alone: this merge produced it, so it belongs to THIS
+      // case. Widen the edit scope to the failing files (the scope guard reads
+      // the widening from the journal) and hand the failure back — the one
+      // special case the owner sanctioned: let the agent edit files that are not
+      // conflicted, and let the cold read accept a change that resolves no markers.
+      appendJournal(dir, { action: 'scope-widened', caseId, branch, files: owner.files, reason: owner.detail });
+      progress(`not-my-bug: scope widened — you may now edit ${owner.files.join(', ')}`);
+      console.error(`report-case [WARN12_SCOPE_WIDENED]: ${caseId} may now edit ${owner.files.join(', ')}`);
+      result(cli, {
+        status: 'scope-widened',
+        instruction:
+          `${owner.detail}. Your EDIT SCOPE now also includes ${owner.files.join(', ')} — fix the failure there, ` +
+          `then re-run report-case. The cold reader is told these files were added to the scope and why.`,
+        widenedPaths: owner.files,
+        notMyBug: { verdict: verdict.verdict, files: verdict.files, owner: owner.owner, probes: verdict.probes + owner.probes },
+        issues: [{ id: 'WARN12_SCOPE_WIDENED', detail: owner.detail }],
+      });
+      return { handled: true, code: 1 };
+    }
+
+    // The owner is a BRANCH (this one, or the parent it is merging from). Name
+    // the commit that introduced it before minting the case: a gate fix whose
+    // briefing is "this branch is red, here is a log" costs the agent an
+    // open-ended search, and the commit is also what tells the owner whether the
+    // fix belongs on this branch at all.
+    const ownerBranch = owner.owner === 'branch' ? branch : rc.parent;
+    progress(`not-my-bug: searching ${ownerBranch} for the commit that introduced ${owner.files.join(', ')}`);
+    const bisect = await findIntroducingCommit(owner.ref!, owner.files, narrowProbe, repoHistory(cli.repo));
+    let introduced: { sha: string; subject: string; author: string } | null = null;
+    if (bisect.status === 'found' && bisect.sha) {
+      const info = await git(cli.repo, ['show', '-s', '--format=%s%n%an', bisect.sha], { allowCodes: [128] });
+      const [subject = '', author = ''] = info.stdout.split('\n');
+      introduced = { sha: bisect.sha, subject, author };
+      progress(`not-my-bug: introduced by ${bisect.sha.slice(0, 12)} "${subject}" (${author})`);
+    } else {
+      progress(`not-my-bug: bisect ${bisect.status} — ${bisect.detail}`);
+    }
+    appendJournal(dir, {
+      action: 'not-my-bug-bisect',
+      caseId,
+      branch: ownerBranch,
+      status: bisect.status,
+      sha: bisect.sha ?? null,
+      anchor: bisect.anchor ?? null,
+      probes: bisect.probes,
+      scanned: bisect.scanned ?? null,
+      detail: bisect.detail,
+      runs: narrowRuns,
+    });
+
+    // A bisect that lands on "the test never passes consistently" is the same
+    // finding as a flaky classification, one level down: there is no defect to
+    // root a fix on. Say so rather than minting a case for a coin flip.
+    if (bisect.status === 'flaky') {
+      return {
+        handled: false,
+        note:
+          `${verdict.detail}, but ${bisect.detail} — no gate-fix case was minted; ` +
+          `report this to the owner (the check itself needs fixing, which is not this case's work)`,
+      };
+    }
+
+    const gateOutput =
+      `${failingOutput}\n\n--- not-my-bug ---\n${verdict.detail}\n${owner.detail}\n${bisect.detail}\n` +
+      (introduced ? `introduced by ${introduced.sha} "${introduced.subject}" (${introduced.author})\n` : '');
+
+    // ABORT THE MERGE, **BEFORE** minting the gate fix. The case's merge was
+    // never made — it lives only as the clean prefix in the worktree — so
+    // aborting it is a `reopened` row, which supersedes this pass's
+    // undispositioned case (`supersededCaseIds`) and drops it out of
+    // `openCases` so `next-case` re-derives the branch once the fix has landed.
+    //
+    // ORDER IS LOAD-BEARING. `supersededCaseIds` supersedes every undispositioned
+    // case whose `case` row PRECEDES its branch's last `reopened`. When the owner
+    // is this branch, the gate fix is journaled on the SAME branch — so minting
+    // it first and reopening second superseded the gate fix TOO, the instant it
+    // was created: `next-case` would never serve it, the conflict case would be
+    // re-emitted, and the pass would loop through a full re-adjudication (bisect
+    // included) until the ten-strike backstop. Reopen first and the gate fix's
+    // rows land after it, untouched.
+    reopen(dir, [branch]);
+
+    // PRESERVE THE AGENT'S WORK. Reopening re-derives the branch, and the next
+    // `createCaseWorktree` wipes and rebuilds this worktree from the automerge
+    // tree — so the resolution the agent already got right is otherwise lost to
+    // `git gc` (nothing else references the tree; the driver commits by plumbing,
+    // so rerere never recorded this resolution). Pin it under a ref instead: the
+    // owner and the next attempt can both recover it by name.
+    const keepRef = `refs/sweep/abandoned/${caseId}`;
+    let preserved = false;
+    try {
+      const commit = await deterministicCommit(cli.repo, p.resolvedTree, [headSha], `abandoned resolution for ${caseId}`);
+      const pinned = await git(cli.repo, ['update-ref', keepRef, commit], { allowCodes: [1, 128] });
+      preserved = pinned.code === 0;
+      if (preserved) appendJournal(dir, { action: 'not-my-bug-preserved', caseId, ref: keepRef, tree: p.resolvedTree });
+    } catch {
+      /* best-effort: losing the pin costs the agent a re-resolve, not correctness */
+    }
+
+    const gate = await materializeGateFixCases(cli, dir, ctx.chain, gateOutput, failedCommands, null, {
+      rootBranch: ownerBranch,
+    });
+    if (!gate.served) {
+      // Already gated on origin, or already attempted this pass. Both are real
+      // answers the agent must relay rather than retry. The reopen above already
+      // superseded this case, so say so plainly instead of implying a retry: the
+      // agent's next move is `next-case`, which re-derives the branch.
+      progress(`not-my-bug: no gate-fix case served — ${gate.reason}`);
+      const stNow = readMachineState(dir);
+      writeMachineState(dir, { ...stNow!, phase: 'open', currentCase: null });
+      result(cli, {
+        status: 'stopped',
+        issues: [{ id: 'WARN09_GATE_FIX_SERVED', detail: gate.detail }],
+        notMyBug: { verdict: verdict.verdict, files: verdict.files, owner: owner.owner, ownerBranch, detail: verdict.detail },
+        instruction:
+          `REPORT to the owner: ${verdict.detail}. ${owner.detail}. But ${gate.reason} — no new case could be prepared. ` +
+          (preserved ? `Your resolution is preserved at ${keepRef}. ` : '') +
+          `Run \`next-case\` to continue with the rest of the pass.`,
+      });
+      return { handled: true, code: 1 };
+    }
+
+    const st = readMachineState(dir);
+    writeMachineState(dir, { ...st!, phase: 'open', currentCase: null });
+    const first = gate.cases[0];
+    progress(`not-my-bug: merge aborted; gate-fix case prepared on ${first.branch} — run next-case`);
+    console.error(`report-case: gate-fix ${first.caseId} prepared on ${first.branch}; case ${caseId} superseded`);
+    result(cli, {
+      status: 'gate-fix-required',
+      // A PROCEED arm must never carry an ERR id — the agent obeys the id's
+      // doctrine row, and an ERR row says "stop and report". WARN advises.
+      issues: [{ id: 'WARN09_GATE_FIX_SERVED', detail: gate.detail }],
+      notMyBug: {
+        verdict: verdict.verdict,
+        files: verdict.files,
+        owner: owner.owner,
+        ownerBranch,
+        probes: verdict.probes + owner.probes + bisect.probes,
+        detail: verdict.detail,
+      },
+      introducedBy: introduced,
+      gateFix: { caseId: first.caseId, branch: first.branch, files: first.files, reason: gate.reason },
+      instruction:
+        `Your resolution was not the problem: ${verdict.detail}. ${owner.detail}. ` +
+        (introduced
+          ? `Introduced by ${introduced.sha.slice(0, 12)} "${introduced.subject}" (${introduced.author}). `
+          : `${bisect.detail}. `) +
+        `This case's merge is ABORTED and a gate-fix case is prepared on ${first.branch} — run \`next-case\`.` +
+        (preserved ? ` Your resolution is preserved at ${keepRef} if this case comes back.` : ''),
+    });
+    return { handled: true, code: 1 };
+  } finally {
+    await dispose();
+    await disposeNarrow();
+  }
+}
+
+// --------------------------------------------------------------------------
 // `report-case --tier mechanical|judged|held` (SWEEP-STATE-MACHINE.md §2).
 // --------------------------------------------------------------------------
 
@@ -6766,6 +7378,8 @@ export async function cmdSweepReportCase(
   cli: Cli,
   invoke: ColdReadInvoker = defaultColdReadInvoker,
   runChecks: ChecksRunner = defaultChecksRunner,
+  /** `--not-my-bug` probes install per-tree dependencies; injectable for tests. */
+  runInstall: InstallRunner = defaultInstallRunner,
 ): Promise<number> {
   const claimed = cli.tier;
   if (claimed !== 'mechanical' && claimed !== 'judged' && claimed !== 'held') {
@@ -6829,7 +7443,27 @@ export async function cmdSweepReportCase(
   const markers = await unresolvedMarkers(cli.repo, resolvedTree, rc.conflictedPaths);
 
   // Scope guard (recomputed automerge/paths + config-derived mode).
-  const guard = await scopeGuard(cli.repo, rc.automergeTree, resolvedTree, rc.conflictedPaths, rc.scopeGuardMode);
+  //
+  // WIDENED PATHS (`--not-my-bug`, owner = interaction): when both sides of the
+  // merge are green in isolation and only the merged tree is red, no upstream
+  // branch owns the failure — it is this merge's own, and the fix lives in files
+  // that are not conflicted. The driver journals the widening; the guard reads it
+  // back so those edits pass instead of reading as a scope violation. This is the
+  // one special case the owner sanctioned (2026-07-29 §1): let the agent edit
+  // non-conflicted files, and let the cold read accept it.
+  const widenRows = journal.filter(
+    (e) => e.action === 'scope-widened' && e.caseId === caseId && Array.isArray(e.files),
+  );
+  const widenedPaths = [...new Set(widenRows.flatMap((e) => e.files as string[]))];
+  const widenedReason = String(widenRows[widenRows.length - 1]?.reason ?? '');
+  const allowedPaths = [...new Set([...rc.conflictedPaths, ...widenedPaths])];
+  // `conflict-hunks` mode bounds edits to the automerge blob's MARKER SPANS. A
+  // widened file has no markers, so every edit in it would be a hunk violation
+  // and the widening would be inert — the extra-file violation simply renamed.
+  // They are exempt from the hunk check and file-level allowed instead.
+  const guard = await scopeGuard(cli.repo, rc.automergeTree, resolvedTree, allowedPaths, rc.scopeGuardMode, {
+    hunkExempt: widenedPaths,
+  });
 
   // Adequacy: recorded-decision (ERR05) + duplicate (ERR06) — mechanical.
   const registry = loadRegistry({
@@ -7022,6 +7656,45 @@ export async function cmdSweepReportCase(
       writeFileSync(outFile, boundedChecksOutput(r, fullFile));
       appendJournal(dir, { action: 'checks-fail', caseId, resolvedTree, kind, failed: r.failedNames });
       const n = checksFailCount(readJournal(dir), caseId);
+
+      // ---- `--not-my-bug`: adjudicate the claim, then route the failure -----
+      // A GATE FIX case is exempt: it has no clean prefix to compare against
+      // (there was no merge), and the failure it is fixing is by construction
+      // not the agent's — that is the whole premise of the case.
+      let notMyBug: NotMyBugOutcome = { handled: false };
+      // A REISSUE is exempt for the same reason a gate fix is: it is a revision of
+      // an ALREADY PUBLISHED resolution against an open PR, and the abort path
+      // (reopen + phase `open`) would supersede the driver-manufactured reissue
+      // case, discard the revision and strand the review.
+      if (cli.notMyBug && !isGateFixCase && !isReissue) {
+        if (n < 2) {
+          // The agent may not run tests (CHECKS_HANDOFF_LINE), so before this
+          // gate has reported a failure it cannot have an informed opinion about
+          // one. The claim is not refused as false — it is premature, and saying
+          // which it is keeps the agent from concluding the flag does not work.
+          appendJournal(dir, { action: 'not-my-bug-premature', caseId, branch: rc.branch, kind });
+          progress('not-my-bug: ignored on the first failure — nothing had been reported to you yet');
+        } else {
+          const failedCmds = list.filter((c) => r.failedNames.includes(c.cmd));
+          notMyBug = await adjudicateNotMyBug({
+            cli,
+            ctx,
+            dir,
+            caseId,
+            caseDir,
+            rc,
+            wtPath,
+            resolvedTree,
+            kind,
+            failedCommands: failedCmds,
+            failingOutput: r.output,
+            runChecks,
+            runInstall,
+          });
+          if (notMyBug.handled) return notMyBug.code ?? 1;
+        }
+      }
+
       // An EXPLICIT `--tier held` claim is the agent saying it cannot make this
       // green — which is exactly what the counter below infers after ten tries.
       // Honour it now, keeping the fix, instead of demanding nine more failures.
@@ -7138,13 +7811,26 @@ export async function cmdSweepReportCase(
         return 0;
       }
       const id = kind === 'typecheck' ? 'ERR36_TYPECHECK_FAILED' : 'ERR40_TESTS_FAILED';
-      const detail = `${kind} failed: ${r.failedNames.join(', ')} (see ${outFile})`;
+      const detail = `${kind} failed: ${r.failedNames.join(', ')} (see ${outFile})${notMyBug.note ? ` — ${notMyBug.note}` : ''}`;
       console.error(`report-case [${id}]: ${detail}`);
+      // The escape hatch is ADVERTISED HERE, in the same message that reports the
+      // failure. This is the only moment the agent learns a check failed at all,
+      // so an escape it has to remember from a doctrine row is one it will not
+      // find — the same failure mode as the ERR42 proceed-arm that idled a pass
+      // for 52 minutes. A refused claim names the agent's own failures instead,
+      // which beats "read the output and work out which half is yours".
+      const yours = notMyBug.yours?.length
+        ? ` These failures are YOURS — they pass without your resolution: ${notMyBug.yours.join(', ')}.`
+        : '';
+      const hatch = notMyBug.handled || notMyBug.yours?.length
+        ? ''
+        : ` If you believe this failure is not caused by your resolution, re-run with \`--not-my-bug\` (alongside your --tier) and the driver will PROVE it against the pre-conflict tree.`;
       // NO report-attempt is recorded on a checks failure (5b counts only trees
       // that reach the cold read). Phase stays case-ready.
       result(cli, {
-        instruction: `read ${outFile} and the named files, fix the pending files, re-run report-case`,
+        instruction: `read ${outFile} and the named files, fix the pending files, re-run report-case.${yours}${hatch}`,
         tier: claimed,
+        ...(notMyBug.note ? { notMyBug: { verdict: 'refused', detail: notMyBug.note, files: notMyBug.yours ?? [] } } : {}),
         issues: [...issues, { id, detail }],
       });
       return 1;
@@ -7186,6 +7872,7 @@ export async function cmdSweepReportCase(
     height: rc.head.height,
     conflictedPaths: rc.conflictedPaths,
     contextLines: await caseContextLines(cli, rc),
+    widenedPaths: widenedPaths.length > 0 ? { files: widenedPaths, reason: widenedReason } : null,
     conflictDiff: conflictDiff.slice(0, 60000),
     resolutionDiff: resolutionDiff.slice(0, 60000),
     // A gate fix is judged on the FAILING CHECK, not on conflict hunks it has

@@ -17,9 +17,18 @@
  *                                 ../inventory), --checks-file <path> (default scripts/sweep/checks.json)
  *   next-case                     advance the deterministic machinery; returns {status:"case-ready",…}
  *                                 (worktree/branch/conflictedPaths/materials) or {status:"finalize"}
- *   report-case --tier T          T ∈ mechanical|judged|held (the ONLY agent param) — the SINGLE quality
- *                                 gate: checks (typecheck THEN tests) then the cold read (mechanical →
- *                                 merge; judged/held → provide PR description). D-060
+ *   report-case --tier T          T ∈ mechanical|judged|held — the SINGLE quality gate: checks
+ *              [--not-my-bug]     (typecheck THEN tests) then the cold read (mechanical → merge;
+ *                                 judged/held → provide PR description). D-060
+ *                                 `--not-my-bug` is ADDITIONAL to the tier, never instead of it: the
+ *                                 tier classifies your EDIT, the flag classifies the DRIVER'S TEST
+ *                                 REPORT. Raise it when a reported failure is not caused by your
+ *                                 resolution; the driver PROVES or DISPROVES it against the tree
+ *                                 without your changes, then either aborts the merge and prepares a
+ *                                 gate-fix case on the branch that owns it (naming the commit that
+ *                                 introduced it), widens your edit scope when the merge itself is at
+ *                                 fault, or tells you which failures are yours. No effect on the
+ *                                 FIRST report-case — nothing has been reported to you yet.
  *   report-pr                     PR AUTHORING ONLY — reads pr/body.md (first line is the H1 title,
  *                                 `# <title>`; rest is the body), records PR intent, PUBLISHES NOTHING
  *                                 (every PR is created at finish). No cold read, no tests. D-060
@@ -54,7 +63,7 @@ const SUBCOMMANDS: Record<string, (cli: Cli) => Promise<number>> = {
 };
 
 const USAGE =
-  'Usage: pnpm exec tsx scripts/sweep/sweep-machine.ts <start|next-case|report-case|report-pr|finish|abort> [--repo <path>] [--workspace <dir>] [--inventory <dir>] [--checks-file <path>] [--tier <t>] [--dry-run] [--out <file>]';
+  'Usage: pnpm exec tsx scripts/sweep/sweep-machine.ts <start|next-case|report-case|report-pr|finish|abort> [--repo <path>] [--workspace <dir>] [--inventory <dir>] [--checks-file <path>] [--tier <t>] [--not-my-bug] [--dry-run] [--out <file>]';
 
 const invokedDirectly = process.argv[1] && /sweep-machine\.ts$/.test(process.argv[1]);
 if (invokedDirectly) {

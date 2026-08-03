@@ -4,7 +4,7 @@
     { "cmd": "tsc -p container/agent-runner/tsconfig.json --noEmit", "cwd": "." }
   ],
   "test": [
-    { "cmd": "pnpm test", "cwd": "." },
-    { "cmd": "bun test", "cwd": "container/agent-runner" }
+    { "cmd": "pnpm test", "cwd": ".", "filter": "pnpm test {files}" },
+    { "cmd": "bun test", "cwd": "container/agent-runner", "filter": "bun test {files}" }
   ]
 }

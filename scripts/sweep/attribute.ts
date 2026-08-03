@@ -100,6 +100,20 @@ const TSC_BRACKET = /^(?:\s*)([\w./@-]+\.[cm]?tsx?)\((\d+),(\d+)\):\s*error\s+TS
 const TSC_COLON = /^(?:\s*)([\w./@-]+\.[cm]?tsx?):(\d+):(\d+)\s*-\s*error\s+TS\d+/;
 /** A vitest file-level failure: ` FAIL  src/x.test.ts [ src/x.test.ts ]`. */
 const VITEST_FAIL = /^\s*FAIL\s+([\w./@-]+\.[cm]?tsx?)/;
+/**
+ * `bun test` names the file ONCE as a section header and then prints one
+ * `(fail) <test name>` line per failing test underneath it — the file itself is
+ * never repeated on the failure line. Parsing it needs the two together, which
+ * is why this runner is stateful where the others are line-local.
+ *
+ * Without it a bun failure named NO file at all: `parseFailingFiles` returned
+ * empty, so blame fell through to the trunk, `rootChecksOutput` re-rooted
+ * nothing, and the not-my-bug comparison had no identity to compare. Live
+ * 2026-08-01 that was the ENTIRE failure — `container/agent-runner`'s suite is
+ * bun, and the one failing test was invisible to every reader in this file.
+ */
+const BUN_FILE_HEADER = /^([\w./@-]+\.[cm]?tsx?):\s*$/;
+const BUN_FAIL = /^\((?:fail|error)\)\s/;
 
 /**
  * The distinct source files named by a failing checks run, first-seen order.
@@ -109,14 +123,49 @@ const VITEST_FAIL = /^\s*FAIL\s+([\w./@-]+\.[cm]?tsx?)/;
  * per command cwd (`rootChecksOutput`).
  */
 export function parseFailingFiles(output: string): string[] {
-  const files: string[] = [];
+  return [...countFailingFiles(output).keys()];
+}
+
+/**
+ * The same files, with HOW MANY failures each one accounts for (insertion-
+ * ordered, so `keys()` is `parseFailingFiles`).
+ *
+ * The count is what makes a subset comparison safe. Comparing file SETS alone,
+ * a file that already fails once absorbs a newly-introduced second failure
+ * silently — the set is unchanged, the claim "this is not my bug" is confirmed,
+ * and a real regression rides out inside a pre-existing red. Counting is the
+ * cheapest thing that closes that hole without a per-runner test-name parser.
+ */
+export function countFailingFiles(output: string): Map<string, number> {
+  const counts = new Map<string, number>();
+  const bump = (raw: string): void => {
+    const f = raw.replace(/^\.\//, '');
+    counts.set(f, (counts.get(f) ?? 0) + 1);
+  };
+  let bunFile: string | null = null;
   for (const line of output.split('\n')) {
+    // `$ <cmd>` separates one command's output from the next (`defaultChecksRunner`).
+    // Without disarming here, a bun file header from one command stayed armed into
+    // the NEXT command's block and collected its failures under the wrong file.
+    if (line.startsWith('$ ')) {
+      bunFile = null;
+      continue;
+    }
+    const header = BUN_FILE_HEADER.exec(line);
+    if (header) {
+      // A header is not itself a failure — every file bun runs gets one. It only
+      // arms the `(fail)` lines that follow, until the next header.
+      bunFile = header[1].replace(/^\.\//, '');
+      continue;
+    }
+    if (BUN_FAIL.test(line)) {
+      if (bunFile) bump(bunFile);
+      continue;
+    }
     const m = TSC_BRACKET.exec(line) ?? TSC_COLON.exec(line) ?? VITEST_FAIL.exec(line);
-    if (!m) continue;
-    const f = m[1].replace(/^\.\//, '');
-    if (!files.includes(f)) files.push(f);
+    if (m) bump(m[1]);
   }
-  return files;
+  return counts;
 }
 
 /** A branch that AUTHORED commits over a failing file, with why and how deep it sits. */

@@ -100,14 +100,27 @@ export async function scopeGuard(
   resolvedTree: string,
   conflictedPaths: string[],
   mode: ScopeGuardMode = 'same-files',
+  opts: {
+    /**
+     * Allowed paths that must NOT be hunk-checked in `conflict-hunks` mode —
+     * files the driver itself added to the scope (`--not-my-bug` widening, where
+     * both sides of the merge are green and only the merged tree is red). They
+     * carry no conflict markers, so `markerLines` is empty for them and EVERY
+     * edit reads as a hunk violation: the widening would be inert, turning an
+     * extra-file violation into a hunk violation with the same HELD outcome.
+     * File-level allowed is the entire point for these.
+     */
+    hunkExempt?: string[];
+  } = {},
 ): Promise<ScopeGuardResult> {
   const allowed = new Set(conflictedPaths);
+  const exempt = new Set(opts.hunkExempt ?? []);
   const changedPaths = await diffNameOnly(repo, automergeTree, resolvedTree);
   const extraPaths = changedPaths.filter((p) => !allowed.has(p));
   const hunkViolations: string[] = [];
   if (mode === 'conflict-hunks') {
     for (const p of changedPaths) {
-      if (!allowed.has(p)) continue; // already an extra-file violation
+      if (!allowed.has(p) || exempt.has(p)) continue; // extra-file violation already, or driver-widened
       if (!(await hunkWithinMarkers(repo, automergeTree, resolvedTree, p))) hunkViolations.push(p);
     }
   }

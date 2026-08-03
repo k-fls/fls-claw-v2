@@ -1,0 +1,544 @@
+/**
+ * scripts/sweep/not-my-bug.ts — adjudicating `report-case --not-my-bug`.
+ *
+ * THE DEADLOCK THIS EXISTS FOR (live 2026-08-01, pass 87175bdb89ad). A case
+ * resolved `src/cli/resources/groups.ts` cleanly; the checks gate then failed on
+ * `container/agent-runner/src/poll-loop.test.ts`, a test the case never touched
+ * and the agent was not allowed to edit. The gate's answer to a test failure is
+ * "fix the pending files" — impossible when the failure is not in them — and the
+ * only other exit was ten more deliberate failures. The agent claimed `--tier
+ * held` twice, was refused twice, filed a stop-case and idled for four hours.
+ *
+ * THE SHAPE OF THE FIX (owner, 2026-08-03). The agent gets a flag it can raise
+ * ALONGSIDE its tier — the tier classifies the agent's EDIT, the flag classifies
+ * the driver's TEST REPORT, and they are independent axes. The claim is then
+ * ADJUDICATED MECHANICALLY here; the agent's belief decides nothing. It cannot:
+ * the agent is forbidden to run tests (`CHECKS_HANDOFF_LINE`), so on its first
+ * `report-case` it does not even know a test failed. That is why the flag can
+ * only ever be raised on the SECOND iteration — not a policy knob, a consequence
+ * of who can see what.
+ *
+ * WHAT IS COMPARED, AND WHY THAT TREE. The baseline is the case's own CLEAN
+ * PREFIX commit — the worktree's HEAD, everything of the merge that landed
+ * cleanly, with the conflicted paths still pending. It holds the entire merge
+ * constant and removes only the agent's resolution, so it isolates exactly the
+ * variable the claim is about. It is also already on disk with its dependencies
+ * linked, which makes it the cheapest tree in the pass to re-probe.
+ *
+ * THREE RULES THAT KEEP IT HONEST:
+ *
+ *  1. SUBSET, NOT "IT REPRODUCES". Confirmation requires the resolved tree's
+ *     failures to be covered by the baseline's, counted PER FILE. A file that
+ *     already fails once must not be allowed to absorb a newly-introduced second
+ *     failure — "the bug reproduces" would be literally true and the regression
+ *     would ship inside someone else's red.
+ *  2. CONFIRM ON ONE OBSERVATION, NEVER REFUSE ON ONE. A red on the baseline
+ *     cannot have been caused by edits that tree does not contain, so one red
+ *     run settles it. The damaging error is the false REFUSE — the baseline
+ *     coming back green by luck and shoving the agent back into the deadlock —
+ *     so every refusing observation is re-run before it is believed. The 08-01
+ *     test has an internal 5000 ms deadline under a 5000 ms runner timeout: it
+ *     is a coin flip under load, and a single run decides nothing.
+ *  3. UNBUILDABLE IS NOT GREEN. A tree whose dependencies cannot be prepared, or
+ *     whose checks failed without naming a single file, is SKIPPED. Reading it as
+ *     a pass is how a bisect converges on the commit that touched `package.json`,
+ *     and how `vitest run <path matching nothing>` — which exits 1 saying "No test
+ *     files found" — becomes a green anchor. A commit that PREDATES the failing
+ *     file is the opposite case and is genuinely green: absence is proof the
+ *     failure is not there, stronger than any run.
+ *
+ * The module is pure logic over injected probes: `propagate.ts` supplies the
+ * worktrees, dependency pools and git reads, so every rule above is testable
+ * without a runner.
+ */
+
+/** Which tree a probe runs against. */
+export type ProbeTarget =
+  /** The case worktree AS IT STANDS — with the agent's edits. */
+  | { kind: 'worktree' }
+  /** A committed tree: the clean prefix, a branch tip, a bisect candidate. */
+  | { kind: 'commit'; sha: string };
+
+/** What one subset run reports back. */
+export interface ProbeResult {
+  /**
+   * FALSE when the tree could not be prepared or run at all (dependencies would
+   * not install, the checkout failed, none of the files exist yet). Distinct
+   * from "ran and passed" — see rule 3. A caller must SKIP an unusable probe,
+   * never count it as green.
+   */
+  usable: boolean;
+  /** Failures per file, as `countFailingFiles` reports them. */
+  counts: Map<string, number>;
+  /** Raw output, for the journal and the agent-facing summary. */
+  output: string;
+}
+
+export type SubsetProbe = (target: ProbeTarget, files: string[]) => Promise<ProbeResult>;
+
+/** Git reads the search needs. Injected so the search is testable without a repo. */
+export interface History {
+  /** `<ref>~<back>`, or null when the history is shorter than that. */
+  ancestor(ref: string, back: number): Promise<string | null>;
+  /** First-parent commits in `(from, to]`, OLDEST first. */
+  listFirstParent(from: string, to: string): Promise<string[]>;
+  /** Does at least one of these paths exist at this commit? (rule 3.) */
+  hasAnyFile(sha: string, files: string[]): Promise<boolean>;
+}
+
+export type NotMyBugVerdict =
+  /** Proven: the failures are there without the agent's resolution. */
+  | 'pre-existing'
+  /** Disproven: at least one failure appears only WITH the resolution. */
+  | 'caused-by-case'
+  /** Neither — the failures did not reproduce anywhere consistently. */
+  | 'flaky'
+  /** The comparison could not be made (no parseable files, unbuildable tree). */
+  | 'undecidable';
+
+export interface NotMyBugClassification {
+  verdict: NotMyBugVerdict;
+  /**
+   * `pre-existing`: the files proven to fail without the resolution.
+   * `caused-by-case`: the files that fail ONLY with it — the agent's own work.
+   * `flaky`: the files that stopped failing when asked again.
+   */
+  files: string[];
+  /** How many subset runs it took, for the agent's report and the journal. */
+  probes: number;
+  /** One line, agent-facing. */
+  detail: string;
+}
+
+/** Fold a probe's counts into a running maximum (rule 2's merge of two runs). */
+function mergeCounts(a: Map<string, number>, b: Map<string, number>): Map<string, number> {
+  const out = new Map(a);
+  for (const [f, n] of b) out.set(f, Math.max(out.get(f) ?? 0, n));
+  return out;
+}
+
+/** Files whose resolved-tree failure count the baseline does NOT account for. */
+function uncovered(resolved: Map<string, number>, baseline: Map<string, number>): string[] {
+  return [...resolved.entries()].filter(([f, n]) => (baseline.get(f) ?? 0) < n).map(([f]) => f);
+}
+
+/**
+ * Adjudicate the claim. At most three subset runs, and the common confirming
+ * case costs exactly one.
+ */
+export async function classifyFailure(
+  resolved: Map<string, number>,
+  prefixSha: string,
+  probe: SubsetProbe,
+): Promise<NotMyBugClassification> {
+  const files = [...resolved.keys()];
+  if (files.length === 0) {
+    return {
+      verdict: 'undecidable',
+      files: [],
+      probes: 0,
+      detail:
+        'the failing output named no source file, so there is nothing to compare — ' +
+        'the claim cannot be adjudicated (read the output and fix the pending files, or claim --tier held)',
+    };
+  }
+  const prefix = { kind: 'commit', sha: prefixSha } as const;
+
+  const b1 = await probe(prefix, files);
+  if (!b1.usable) {
+    return {
+      verdict: 'undecidable',
+      files,
+      probes: 1,
+      detail: `the pre-conflict tree (${prefixSha.slice(0, 12)}) could not be built, so the comparison could not be made`,
+    };
+  }
+  // Rule 2, confirming half: one red on a tree that does not contain the agent's
+  // edits is proof enough. No repetition — repeating it cannot change the answer.
+  if (uncovered(resolved, b1.counts).length === 0) {
+    return {
+      verdict: 'pre-existing',
+      files,
+      probes: 1,
+      detail: `every failure also fails at the pre-conflict tree ${prefixSha.slice(0, 12)} — not caused by this resolution`,
+    };
+  }
+
+  // Rule 2, refusing half: re-run ONLY what looked green before believing it.
+  const u1 = uncovered(resolved, b1.counts);
+  const b2 = await probe(prefix, u1);
+  if (!b2.usable) {
+    return {
+      verdict: 'undecidable',
+      files,
+      probes: 2,
+      detail: `the pre-conflict tree (${prefixSha.slice(0, 12)}) became unbuildable on the second probe`,
+    };
+  }
+  const merged = mergeCounts(b1.counts, b2.counts);
+  if (uncovered(resolved, merged).length === 0) {
+    return {
+      verdict: 'pre-existing',
+      files,
+      probes: 2,
+      detail:
+        `every failure also fails at the pre-conflict tree ${prefixSha.slice(0, 12)} — ` +
+        `not caused by this resolution (${u1.join(', ')} needed a second run: unstable there too)`,
+    };
+  }
+
+  // Still unaccounted for. Before calling them the agent's, make sure they are
+  // not a flake on the RESOLVED side either — that misfire refuses a true claim.
+  const u2 = uncovered(resolved, merged);
+  const r2 = await probe({ kind: 'worktree' }, u2);
+  if (!r2.usable) {
+    return {
+      verdict: 'undecidable',
+      files: u2,
+      probes: 3,
+      detail: 'the case worktree could not be re-run, so the remaining failures could not be attributed',
+    };
+  }
+  const still = u2.filter((f) => (r2.counts.get(f) ?? 0) > 0);
+  if (still.length === 0) {
+    return {
+      verdict: 'flaky',
+      files: u2,
+      probes: 3,
+      detail: `${u2.join(', ')} did not fail again when re-run — a flake, not a defect in either tree`,
+    };
+  }
+  return {
+    verdict: 'caused-by-case',
+    files: still,
+    probes: 3,
+    detail: `${still.join(', ')} fail with your resolution and pass without it — these are yours to fix`,
+  };
+}
+
+/** Who owns a proven pre-existing failure — i.e. where its fix has to land. */
+export type OwnerKind =
+  /** Red at the branch's own tip: the branch owns it. */
+  | 'branch'
+  /** Green on the branch, red at the parent's head: the incoming side owns it. */
+  | 'parent'
+  /** Green on both sides in isolation — the MERGE produced it. Nobody upstream owns it. */
+  | 'interaction'
+  /** A probe was unusable; ownership undetermined. */
+  | 'unknown';
+
+export interface OwnershipResult {
+  owner: OwnerKind;
+  /** The commit the fix must be rooted on (null for an interaction). */
+  ref: string | null;
+  /** The subset of files failing there. */
+  files: string[];
+  probes: number;
+  detail: string;
+}
+
+/**
+ * Locate the owner of a pre-existing failure.
+ *
+ * The clean prefix proves the failure is not the AGENT's, but it cannot say
+ * WHOSE it is: it is a synthetic commit, not a branch tip, and it already
+ * contains the merge that is about to be abandoned — rooting a fix there would
+ * commit the very merge being aborted, on a commit no branch points at, where
+ * the fix reaches nobody. Two probes settle it, and the third outcome is not a
+ * gate fix at all.
+ */
+export async function locateOwner(
+  files: string[],
+  branchTip: string,
+  parentHead: string,
+  probe: SubsetProbe,
+  opts: {
+    /**
+     * Does this commit contain any of the files? A tip that does not have the
+     * file cannot be failing in it, and asking a runner about a path it cannot
+     * find produces a non-zero exit with nothing parseable rather than a verdict.
+     * This is the COMMON case for the parent side: the failing test usually
+     * arrived with the merge, so the branch tip predates it.
+     */
+    hasAnyFile?: (sha: string, files: string[]) => Promise<boolean>;
+  } = {},
+): Promise<OwnershipResult> {
+  let probes = 0;
+  /**
+   * One side's answer. Rule 2 applies here too: a RED is conclusive on sight (a
+   * tip that has no part of this merge cannot have been reddened by it), but a
+   * GREEN must be seen twice before it is allowed to push ownership onward —
+   * otherwise a single flaky pass at the branch tip promotes the claim to the
+   * parent, or worse, to `interaction`, which widens the agent's edit scope and
+   * tells it to fix a file nobody has a defect in.
+   */
+  const sideFailures = async (sha: string): Promise<{ failing: string[] | null; absent: boolean }> => {
+    if (opts.hasAnyFile && !(await opts.hasAnyFile(sha, files))) return { failing: [], absent: true };
+    const first = await probe({ kind: 'commit', sha }, files);
+    probes++;
+    if (!first.usable) return { failing: null, absent: false };
+    const failing = files.filter((f) => (first.counts.get(f) ?? 0) > 0);
+    if (failing.length > 0) return { failing, absent: false };
+    const second = await probe({ kind: 'commit', sha }, files);
+    probes++;
+    if (!second.usable) return { failing: null, absent: false };
+    return { failing: files.filter((f) => (second.counts.get(f) ?? 0) > 0), absent: false };
+  };
+
+  const bt = await sideFailures(branchTip);
+  if (bt.failing === null) {
+    return {
+      owner: 'unknown',
+      ref: null,
+      files,
+      probes,
+      detail: `the branch tip ${branchTip.slice(0, 12)} could not be built — ownership undetermined`,
+    };
+  }
+  if (bt.failing.length > 0) {
+    return {
+      owner: 'branch',
+      ref: branchTip,
+      files: bt.failing,
+      probes,
+      detail: `already red at the branch tip ${branchTip.slice(0, 12)} — the branch owns this`,
+    };
+  }
+  const ph = await sideFailures(parentHead);
+  if (ph.failing === null) {
+    return {
+      owner: 'unknown',
+      ref: null,
+      files,
+      probes,
+      detail: `the parent head ${parentHead.slice(0, 12)} could not be built — ownership undetermined`,
+    };
+  }
+  if (ph.failing.length > 0) {
+    return {
+      owner: 'parent',
+      ref: parentHead,
+      files: ph.failing,
+      probes,
+      // Rooting here is what stops the same red being fixed once per descendant:
+      // the parent propagates to all of them, a fix on this branch to none.
+      detail: `green at the branch tip but red at the parent head ${parentHead.slice(0, 12)} — the incoming side owns this`,
+    };
+  }
+  const absent = [bt.absent ? 'the branch tip' : '', ph.absent ? 'the parent head' : ''].filter(Boolean).join(' and ');
+  return {
+    owner: 'interaction',
+    ref: null,
+    files,
+    probes,
+    detail:
+      'green on BOTH sides in isolation and red once merged — nobody upstream owns this; ' +
+      `it is this merge’s own defect and belongs in this case${absent ? ` (the files do not exist at ${absent})` : ''}`,
+  };
+}
+
+/**
+ * How far back to look for a green anchor, in first-parent steps. Exponential
+ * because there is no anchor to start from: `branch-check` only ever typechecks,
+ * `finish`'s verify is the sole test run and its journal is wiped by `start`, so
+ * the last commit known to pass the failing test is unknown and may be hundreds
+ * back. Doubling finds a window in a handful of probes and bounds the worst case.
+ */
+const WALK_BACK_STEPS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
+
+/** Hard ceiling on subset runs for one search. Bounds a pathological history. */
+const BISECT_PROBE_BUDGET = 24;
+
+export interface BisectOutcome {
+  status:
+    /** Converged: `sha` is the first commit where the failure appears. */
+    | 'found'
+    /** The failure does not reproduce consistently — nothing to bisect. */
+    | 'flaky'
+    /** No green commit within the walk-back: the failure predates the window. */
+    | 'no-anchor'
+    /** Ran out of probe budget, or every candidate was unbuildable. */
+    | 'inconclusive';
+  sha?: string;
+  /** The green commit the search worked forward from. */
+  anchor?: string;
+  probes: number;
+  /** Commits in the searched window. */
+  scanned?: number;
+  detail: string;
+}
+
+/**
+ * Find the commit that introduced a failure, so the gate-fix case can name it.
+ *
+ * The point is not blame for its own sake: the agent is handed a case whose
+ * briefing otherwise says only "this branch is red, here is a log". A commit
+ * gives it a diff to read and the owner a reviewable claim, and it names the
+ * branch that actually introduced the defect rather than the one where it
+ * surfaced — the difference between fixing it once and fixing it in every
+ * descendant.
+ */
+export async function findIntroducingCommit(
+  tip: string,
+  files: string[],
+  probe: SubsetProbe,
+  history: History,
+): Promise<BisectOutcome> {
+  let probes = 0;
+  const red = (r: ProbeResult): boolean => files.some((f) => (r.counts.get(f) ?? 0) > 0);
+
+  // Determinism first. Bisecting a coin flip converges on a random commit and
+  // presents it as the cause — worse than no answer, because it reads as one.
+  const t1 = await probe({ kind: 'commit', sha: tip }, files);
+  probes++;
+  if (!t1.usable) {
+    return { status: 'inconclusive', probes, detail: `the tip ${tip.slice(0, 12)} could not be built` };
+  }
+  const t2 = await probe({ kind: 'commit', sha: tip }, files);
+  probes++;
+  if (!red(t1) || !red(t2)) {
+    return {
+      status: 'flaky',
+      probes,
+      detail:
+        `${files.join(', ')} does not fail consistently at ${tip.slice(0, 12)} — ` +
+        'there is no commit that introduced it; the test itself is unstable',
+    };
+  }
+
+  // Walk back for a green anchor.
+  //
+  // ABSENCE OF THE FILE IS A GREEN BOUNDARY, not a skip. A commit that predates
+  // the failing file cannot be failing in it — that is a stronger statement than
+  // any test run, and it is the COMMON history ("someone added a failing test").
+  // Skipping those instead, as the first cut did, left every ancestor of such an
+  // addition unprobed and reported `no-anchor` for a commit the search can name
+  // exactly. What must never be read as green is a tree that HAS the file and
+  // could not be built — that one is skipped below.
+  let anchor: string | null = null;
+  for (const step of WALK_BACK_STEPS) {
+    if (probes >= BISECT_PROBE_BUDGET) break;
+    const sha = await history.ancestor(tip, step);
+    if (!sha) break;
+    if (!(await history.hasAnyFile(sha, files))) {
+      anchor = sha;
+      break;
+    }
+    const r = await probe({ kind: 'commit', sha }, files);
+    probes++;
+    if (!r.usable) continue;
+    if (!red(r)) {
+      // Rule 2 at the anchor: a single flaky pass here poisons the entire search
+      // — everything after it is bisected inside a window whose lower bound is
+      // wrong, and the result is a confidently named innocent commit.
+      const again = await probe({ kind: 'commit', sha }, files);
+      probes++;
+      if (again.usable && !red(again)) {
+        anchor = sha;
+        break;
+      }
+    }
+  }
+  if (!anchor) {
+    return {
+      status: 'no-anchor',
+      probes,
+      detail:
+        `no commit in the last ${WALK_BACK_STEPS[WALK_BACK_STEPS.length - 1]} first-parent commits passes ` +
+        `${files.join(', ')} — the failure predates the search window`,
+    };
+  }
+
+  // Binary search the window. `anchor` is green, `tip` is red, so the first red
+  // commit exists inside it.
+  const commits = await history.listFirstParent(anchor, tip);
+  if (commits.length === 0) {
+    return { status: 'inconclusive', anchor, probes, detail: 'the search window came back empty' };
+  }
+  let lo = 0;
+  let hi = commits.length - 1;
+  while (lo < hi) {
+    if (probes >= BISECT_PROBE_BUDGET) {
+      return {
+        status: 'inconclusive',
+        anchor,
+        probes,
+        scanned: commits.length,
+        detail: `probe budget (${BISECT_PROBE_BUDGET}) spent with the window narrowed to ${hi - lo + 1} commits`,
+      };
+    }
+    // An unbuildable candidate is skipped, not counted — try later commits
+    // first (keeps the window shrinking), then earlier ones.
+    //
+    // Candidates stop at `hi - 1`: `commits[hi]` is ALREADY KNOWN RED (the tip,
+    // or whatever the last red probe set it to), so probing it again learns
+    // nothing and re-assigns `hi = hi`. With `hi` in the candidate list, a run of
+    // unbuildable commits below it made every iteration pick `hi`, leave the
+    // window unchanged, and spin until the probe budget ran out — reported as
+    // `inconclusive` for a history the search could actually resolve.
+    let mid = (lo + hi) >> 1;
+    let r: ProbeResult | null = null;
+    let exhausted = false;
+    let missing: number | null = null;
+    for (const cand of [...range(mid, hi - 1), ...range(mid - 1, lo, -1)]) {
+      if (probes >= BISECT_PROBE_BUDGET) {
+        exhausted = true;
+        break;
+      }
+      // The file does not exist here, so it cannot fail here: a green boundary,
+      // exactly as in the walk-back. Treated as a skip it would stall the search
+      // over any range that adds the file.
+      if (!(await history.hasAnyFile(commits[cand], files))) {
+        missing = cand;
+        break;
+      }
+      const attempt = await probe({ kind: 'commit', sha: commits[cand] }, files);
+      probes++;
+      if (attempt.usable) {
+        mid = cand;
+        r = attempt;
+        break;
+      }
+    }
+    if (missing !== null) {
+      lo = missing + 1;
+      continue;
+    }
+    if (!r) {
+      return {
+        status: 'inconclusive',
+        anchor,
+        probes,
+        scanned: commits.length,
+        // These are different failures and an operator acts on them differently:
+        // a spent budget means "the history is long", an unbuildable window means
+        // "these commits cannot be checked out and tested at all".
+        detail: exhausted
+          ? `probe budget (${BISECT_PROBE_BUDGET}) spent with the window narrowed to ${hi - lo + 1} commits`
+          : `no buildable commit in the remaining window of ${hi - lo + 1}`,
+      };
+    }
+    if (red(r)) hi = mid;
+    else lo = mid + 1;
+  }
+  return {
+    status: 'found',
+    sha: commits[lo],
+    anchor,
+    probes,
+    scanned: commits.length,
+    // `red` is ANY of the files, so with several the answer is the first commit
+    // where the first of them appears — say that rather than implying all.
+    detail:
+      `${commits[lo].slice(0, 12)} is the first commit where ` +
+      (files.length === 1 ? `${files[0]} fails` : `any of ${files.join(', ')} fails`),
+  };
+}
+
+/** Inclusive integer range, ascending or descending. */
+function range(from: number, to: number, step = 1): number[] {
+  const out: number[] = [];
+  if (step > 0) for (let i = from; i <= to; i += step) out.push(i);
+  else for (let i = from; i >= to; i += step) out.push(i);
+  return out;
+}

@@ -34,15 +34,18 @@ import {
   cmdSweepReportPr,
   cmdSweepStart,
   DriverHalt,
+  openCases,
   parseCli,
   parseMachineVerdict,
   passDir,
   readJournal,
   reportDriverHalt,
   RESOLVE_COLDREAD_CAP,
+  supersededCaseIds,
   type Cli,
   type ChecksRunner,
   type ColdReadInvoker,
+  type InstallRunner,
 } from './propagate.js';
 import type { GithubTransport } from './publish.js';
 
@@ -1066,6 +1069,207 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     expect(journal.some((e) => e.action === 'checks-pass' || e.action === 'checks-fail')).toBe(false);
     expect(journal.some((e) => e.action === 'coldread' && e.caseId === caseId)).toBe(true);
     expect(repo.git('show', 'main_patched:src/x.ts')).toBe('RESOLVED');
+  });
+
+  // ---- `--not-my-bug` (2026-08-03) ---------------------------------------
+  //
+  // The 08-01 deadlock end to end: a failure the case did not cause, which the
+  // agent may not fix in scope and could not escape. `runner` above emits output
+  // that names no file, so these use a variant that does — the comparison is
+  // file-identity based and there is nothing to compare without it.
+  /** Fails the named commands, with output naming `file` (so blame/counts work). */
+  function namingRunner(failing: string[], file: string): { fn: ChecksRunner; ran: string[][] } {
+    const ran: string[][] = [];
+    const fn: ChecksRunner = async (commands) => {
+      const names = commands.map((c) => c.cmd);
+      ran.push(names);
+      const failedNames = names.filter((n) => failing.includes(n));
+      return {
+        ok: failedNames.length === 0,
+        failedNames,
+        output: failedNames.map((n) => `$ ${n}\n${file}(1,1): error TS2345: boom\n`).join(''),
+      };
+    };
+    return { fn, ran };
+  }
+  /**
+   * Stub dependency install: the probes refuse to trust a tree that DECLARES
+   * dependencies it could not install (the bc92eed8 rule), and the fixture repo
+   * carries a package.json, so without this every probe is correctly unusable.
+   */
+  const fakeInstall: InstallRunner = async (dir) => {
+    mkdirSync(join(dir, 'node_modules'), { recursive: true });
+    return true;
+  };
+  /** Seed a prior checks-fail so the flag is no longer "premature". */
+  function seedPriorFailure(dir: string, caseId: string, kind: string, failed: string[]): void {
+    appendFileSync(
+      join(dir, 'journal.jsonl'),
+      JSON.stringify({ ts: new Date().toISOString(), action: 'checks-fail', caseId, kind, failed }) + '\n',
+    );
+  }
+
+  it('--not-my-bug on the FIRST failure is ignored, and says why (the agent may not run tests)', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    const r = namingRunner(['tsc --noEmit'], 'src/util.ts');
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', notMyBug: true, execute: true, out }),
+        neverInvoked,
+        r.fn,
+      ),
+    ).toBe(1);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'not-my-bug-premature' && e.caseId === caseId)).toBe(true);
+    // No adjudication ran: nothing had been reported to the agent yet.
+    expect(journal.some((e) => e.action === 'not-my-bug')).toBe(false);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> };
+    expect(res.issues.some((i) => i.id === 'ERR36_TYPECHECK_FAILED')).toBe(true);
+  });
+
+  it('the ERR payload ADVERTISES the hatch — the only message that tells the agent a check failed', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const checks = checksFile(ws);
+    const { dir } = await toResolvedCase(repo, ws, inv, checks);
+    expect(dir).toBeTruthy();
+    const r = namingRunner(['tsc --noEmit'], 'src/util.ts');
+    const out = join(ws, 'rc.json');
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+      neverInvoked,
+      r.fn,
+    );
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string };
+    expect(res.instruction).toContain('--not-my-bug');
+  });
+
+  it('CONFIRMED pre-existing -> merge aborted, gate-fix case minted, case superseded', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    seedPriorFailure(dir, caseId, 'typecheck', ['tsc --noEmit']);
+    // The failure names a file the case never touched, and it fails on EVERY
+    // tree — including the clean prefix and the branch tip. That is the proof.
+    const r = namingRunner(['tsc --noEmit'], 'src/util.ts');
+    const out = join(ws, 'rc.json');
+    const rc = await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+      neverInvoked,
+      r.fn,
+      fakeInstall,
+    );
+    expect(rc).toBe(1);
+    const journal = readJournal(dir);
+    const verdict = journal.find((e) => e.action === 'not-my-bug')!;
+    expect(verdict.verdict).toBe('pre-existing');
+    expect(journal.find((e) => e.action === 'not-my-bug-owner')!.owner).toBe('branch');
+    // A gate-fix case exists, the old case is superseded by the reopen, and the
+    // machine is back at `open` so `next-case` serves the gate fix.
+    const gateFix = journal.find((e) => e.action === 'gate-fix');
+    expect(gateFix).toBeTruthy();
+    expect(gateFix!.branch).toBe('main_patched');
+    expect(supersededCaseIds(journal).has(caseId)).toBe(true);
+    // ...and the GATE FIX itself is NOT superseded. When the owner is this same
+    // branch, journaling the gate-fix case BEFORE the `reopened` row superseded it
+    // the instant it was created: `next-case` would never serve it, the conflict
+    // case would be re-emitted, and the pass would re-adjudicate (bisect included)
+    // every round until the ten-strike backstop — the 08-01 deadlock, restored.
+    expect(supersededCaseIds(journal).has(gateFix!.caseId as string)).toBe(false);
+    expect(openCases(journal).map((c) => c.caseId)).toContain(gateFix!.caseId);
+    // The agent's resolution is PINNED, not discarded: reopening rebuilds the
+    // worktree from the automerge tree, and nothing else references that tree.
+    const preserved = journal.find((e) => e.action === 'not-my-bug-preserved')!;
+    expect(preserved).toBeTruthy();
+    expect(repo.git('rev-parse', '--verify', `${preserved.ref as string}^{tree}`)).toBe(preserved.tree);
+    expect(machineState(dir).phase).toBe('open');
+    expect(machineState(dir).currentCase).toBeNull();
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      status: string;
+      issues: Array<{ id: string }>;
+      instruction: string;
+    };
+    expect(res.status).toBe('gate-fix-required');
+    // PROCEED arm: WARN advises, ERR blocks. An ERR id here is the ERR42 bug.
+    expect(res.issues.every((i) => i.id.startsWith('WARN'))).toBe(true);
+    expect(res.instruction).toContain('next-case');
+  });
+
+  it('REFUSED -> the gate names which failures are the agent’s own', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    seedPriorFailure(dir, caseId, 'typecheck', ['tsc --noEmit']);
+    // Fails ONLY in the case worktree, in a file OUTSIDE the conflicted set: the
+    // probes against committed trees see a green build, so the claim is disproved.
+    const ran: string[][] = [];
+    const wtPath = join(dir, caseId, 'worktree');
+    const fn: ChecksRunner = async (commands, baseDir) => {
+      ran.push(commands.map((c) => c.cmd));
+      if (baseDir !== wtPath) return { ok: true, failedNames: [], output: '' };
+      return {
+        ok: false,
+        failedNames: ['tsc --noEmit'],
+        output: '$ tsc --noEmit\nsrc/util.ts(1,1): error TS2345: boom\n',
+      };
+    };
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+        neverInvoked,
+        fn,
+        fakeInstall,
+      ),
+    ).toBe(1);
+    const journal = readJournal(dir);
+    expect(journal.find((e) => e.action === 'not-my-bug')!.verdict).toBe('caused-by-case');
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    expect(machineState(dir).phase).toBe('case-ready');
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string };
+    expect(res.instruction).toContain('These failures are YOURS');
+    expect(res.instruction).toContain('src/util.ts');
+  });
+
+  it('a failure IN a conflicted path is refused without probing — it is the agent’s by definition', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    seedPriorFailure(dir, caseId, 'typecheck', ['tsc --noEmit']);
+    // `src/x.ts` IS the conflict. The clean prefix holds it at the branch's
+    // pre-merge blob against an otherwise merged tree — the very incompatibility
+    // the conflict is about — so it fails there too and a genuine regression in
+    // it would be "confirmed" pre-existing on the first probe.
+    const r = namingRunner(['tsc --noEmit'], 'src/x.ts');
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+        neverInvoked,
+        r.fn,
+        fakeInstall,
+      ),
+    ).toBe(1);
+    const journal = readJournal(dir);
+    expect(journal.find((e) => e.action === 'not-my-bug')!.verdict).toBe('refused');
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    // Nothing was probed: the whole adjudication is skipped for these files.
+    expect(r.ran).toHaveLength(1);
+    expect(machineState(dir).phase).toBe('case-ready');
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string };
+    expect(res.instruction).toContain('src/x.ts');
   });
 });
 

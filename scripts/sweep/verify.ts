@@ -27,6 +27,19 @@ const execFileP = promisify(execFile);
 export interface VerifyCommand {
   cmd: string;
   cwd?: string;
+  /**
+   * How to run this command over a SUBSET of files — a template whose `{files}`
+   * placeholder is replaced by the cwd-relative paths to re-run (e.g.
+   * `bun test {files}`). Optional: a command without one is simply re-run whole.
+   *
+   * This is what makes re-probing affordable. The not-my-bug comparison and the
+   * bisect below it run the failing checks a dozen or more times across
+   * different trees; at full-suite cost that is minutes per probe and the whole
+   * mechanism is unaffordable, while one test file is seconds. Nothing else
+   * about the command list changes — verify and the case gate still run the
+   * full `cmd`.
+   */
+  filter?: string;
 }
 
 export interface CommandResult {

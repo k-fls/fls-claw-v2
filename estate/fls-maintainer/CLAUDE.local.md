@@ -204,10 +204,10 @@ around a blocking id.
 | `ERR33_BRANCH_TESTS_FAILED` | open the named log, fix the resolution, re-report |
 | `ERR34_CASES_REMAIN` | finish every case first |
 | `ERR35_COLDREAD_UNAVAILABLE` | stop-case 2 report; the case stays put — re-run once restored |
-| `ERR36_TYPECHECK_FAILED` | open the named output file, fix the pending files, re-run `report-case`. If the failing file is NOT one of your pending files you cannot fix it and must not try: claim `--tier held`, naming the file and saying it is outside your case. That is a CODE defect the driver routes as its own gate-fix — it is not a driver bug and not yours to work around |
+| `ERR36_TYPECHECK_FAILED` | open the named output file, fix the pending files, re-run `report-case`. If the failing file is NOT one of your pending files you cannot fix it and must not try: re-run with `--not-my-bug` (see below) — the driver then PROVES or disproves it. `--tier held` remains the fallback if the driver cannot decide. That is a CODE defect the driver routes as its own gate-fix — it is not a driver bug and not yours to work around |
 | `ERR37_WORKSPACE_IN_CLONE` | `--workspace` points at the `--repo` clone (or inside it) — the group ROOT is the correct workspace. Stop-case 2 report; do NOT re-run with the same paths |
 | `ERR38_PASS_CLEAR_FAILED` | the prior pass dir could not be cleared — pass files are container-uid-owned, so teardown must run IN-CONTAINER; clear it there, then re-run `start` |
-| `ERR40_TESTS_FAILED` | same as ERR36; at `finish` it is a stop-case 2 report (publish nothing) |
+| `ERR40_TESTS_FAILED` | same as ERR36 — including `--not-my-bug` for a failure outside your pending files; at `finish` it is a stop-case 2 report (publish nothing) |
 | `ERR41_TOKEN_REJECTED` | the GitHub token was REJECTED — re-auth; a retry with the same token cannot clear it |
 | `ERR43_CHECKS_MALFORMED` | the named checks file does not PARSE, so no gate can run — stop-case 2 report quoting the file and the parse error; never continue with the gates silently skipped |
 | `ERR44_WORKTREE_RESET_FAILED` | the worktree could not be reset to the pristine conflict and still holds your edits — clear it in-container and re-run `report-case`; never call it pristine |
@@ -216,7 +216,38 @@ around a blocking id.
 | `WARN01_TEMPLATE_TEXT` | rewrite the body from the case materials |
 | `WARN02_NO_DECISION_LINE` | open the body with the exact decision the owner is asked to make |
 | `WARN03_MANY_PRS` | >8 PRs this pass — re-check for consolidation |
+| `WARN12_SCOPE_WIDENED` | your `--not-my-bug` claim was proven AND the failure belongs to no branch — both sides of the merge are green alone and only the merged tree is red, so it is THIS merge's defect. The named files are now IN your edit scope: fix the failure there, re-run `report-case`. The cold reader has been told |
 | `WARN09_GATE_FIX_SERVED` | a GATE-FIX case has been PREPARED and is waiting — run `next-case` and work it like any other case. This is NOT a stop: the accompanying text explains why the build is red, and reporting that diagnosis instead of working the case is the failure mode this id exists to prevent |
+
+## `--not-my-bug` — a check failure you did not cause
+
+You may not run tests (`report-case` runs them), so the FIRST time a case is
+reported you cannot know a check failed. When the driver comes back with
+`ERR36`/`ERR40` naming a file that is NOT one of your pending files, re-run
+
+    report-case --tier <your tier> --not-my-bug
+
+It is ADDITIONAL to `--tier`, never instead of it: the tier classifies YOUR EDIT,
+the flag classifies the DRIVER'S TEST REPORT. Claim it only when the failing file
+is outside your pending set — a failure inside them is yours by definition and
+the driver refuses the claim without probing.
+
+Your belief decides nothing. The driver re-runs the failing checks on the tree
+WITHOUT your resolution and answers one of:
+
+- **proven** — it aborts this merge, finds which branch owns the failure, names
+  the commit that introduced it, and prepares a GATE-FIX case there. You get
+  `WARN09` and run `next-case`: the failing file IS the edit scope of that case.
+  Your resolution is kept at `refs/sweep/abandoned/<caseId>` and the case comes
+  back afterwards — do not re-do it from memory.
+- **disproven** — the reply NAMES the failures that are yours. Fix those.
+- **the check is unstable** (passes and fails on the same tree) — the case is
+  HELD with your resolution intact; write the PR saying exactly that.
+- **undecidable** — the reply says why. `--tier held` is then the fallback.
+
+Report what the driver concluded, not what you suspected. Each stage prints a
+`SWEEP-STEP:` line (adjudication, owner, bisect) — those are the progress the
+owner wants to hear, and a run can take minutes while the checks re-run.
 
 ## Registry upkeep
 

@@ -301,6 +301,83 @@ silence.
     skip; and when the pristine RESET FAILS the driver refuses with
     `ERR44_WORKTREE_RESET_FAILED` rather than freezing a "pristine" exhibit built
     from a tree nobody reset.
+  - **5a′. `--not-my-bug` (2026-08-03).** The escape hatch for a checks failure the
+    case did NOT cause. It is ADDITIONAL to `--tier`, never instead of it: the tier
+    classifies the agent's EDIT, the flag classifies the DRIVER'S TEST REPORT, and
+    they are independent axes — a confirmed claim leaves the tier claim standing.
+    It has no effect on the FIRST `report-case`: the agent may not run tests, so
+    before the gate answers it cannot know a check failed (`not-my-bug-premature`).
+    The claim decides nothing by itself; the driver ADJUDICATES it:
+    - **Baseline = the CLEAN PREFIX commit** — the case worktree's own HEAD, the
+      whole merge minus the resolution. It holds the merge constant and removes
+      only the agent's edits, and it is already on disk with dependencies linked.
+    - **Failures IN the conflicted paths are dropped first**, never adjudicated.
+      The prefix holds each conflicted path at the branch's PRE-MERGE blob (or
+      omits it, when the path was added on theirs) against an otherwise merged
+      tree — the very incompatibility the conflict is about — so it is red there
+      for reasons unrelated to whether the resolution is right: a genuine
+      regression would be "confirmed" pre-existing, and a path added on theirs
+      could never fail there, guaranteeing a false refuse. Those files are the
+      agent's own edit scope anyway, so there is no claim to make about them.
+    - **Subset, not "it reproduces".** Confirmation needs the resolved tree's
+      failures COVERED BY the baseline's, counted PER FILE (`countFailingFiles`) —
+      otherwise a file that already fails once absorbs a newly introduced second
+      failure and a real regression ships inside someone else's red.
+    - **The comparison runs the failing commands WHOLE**, with the case's own
+      dependency pool. Comparing a full-suite count against a narrowed re-run
+      compares two different populations, and the difference alone would decide
+      the verdict — the 2026-08-01 test fails only under whole-suite load and
+      passes in ~250 ms on its own, so a narrowed baseline would have called the
+      very failure this exists for `flaky`. Narrowing (`VerifyCommand.filter`) is
+      used only in the BISECT, where both sides are narrowed alike and the
+      tip-determinism gate rejects anything that stops reproducing under it.
+    - **Confirm on one observation, never refuse on one.** A red baseline cannot
+      have been broken by edits that tree does not contain. The damaging error is
+      the false REFUSE, so every refusing observation is re-run (the 2026-08-01
+      test is a coin flip: a 5000 ms internal deadline under a 5000 ms timeout).
+    - Verdicts: `pre-existing` → route below; `caused-by-case` → ERR36/ERR40 as
+      usual, but naming WHICH failures are the agent's; `flaky` (reproduces
+      nowhere) → HELD with the resolution KEPT, `[AUTO-ESCALATED: check unstable]`;
+      `undecidable` (nothing parseable, or a tree that will not build) → say so.
+    - **OWNERSHIP** (the prefix proves it is not the agent's; it cannot say whose —
+      it is a synthetic commit no branch points at): probe the branch's pre-merge
+      tip, then the parent head. Branch red → gate fix on the BRANCH. Branch green
+      + parent red → gate fix on the PARENT (else the same red is fixed once per
+      descendant). BOTH green → an INTERACTION owned by this merge: no gate fix,
+      the case's edit scope is WIDENED to the failing files (`scope-widened`, read
+      back by the scope guard, exempted from its `conflict-hunks` marker check
+      since a widened file has none, and carried into the COLD-READ REQUEST so the
+      reviewer judges the extra edits as the fix rather than as a scope
+      violation) — the one sanctioned special case, "let the agent edit
+      non-conflicted files and let the cold read accept it".
+    - **BISECT** before minting a branch/parent gate fix, so the briefing names a
+      commit instead of a log: determinism at the tip (a coin flip converges on a
+      random commit and reads as an answer — refused), exponential walk-back for a
+      green anchor (there is none recorded: `branch-check` only typechecks and
+      `finish`'s verify is wiped by `start`), then binary search. A commit that is
+      UNBUILDABLE — or whose checks failed without naming a file — is SKIPPED,
+      never read as green (`vitest run <path matching nothing>` exits 1 saying
+      "No test files found"). A commit that PREDATES the failing file is the
+      opposite: absence is proof, so it is a green BOUNDARY, which is what lets
+      the search name the commit that ADDED a failing test.
+    - **ABORT** = a `reopened` row: the case's merge was never made (it exists only
+      as the clean prefix), so the reopen supersedes the undispositioned case, the
+      machine returns to `open`, and `next-case` serves the gate fix. **The reopen
+      is journaled BEFORE the gate-fix case** — when the owner is this same branch
+      the reverse order supersedes the gate fix the instant it is created, and the
+      pass loops through a full re-adjudication every round instead of serving it.
+      The agent's resolution is PINNED at `refs/sweep/abandoned/<caseId>` first:
+      the reopen rebuilds the worktree from the automerge tree and nothing else
+      references that tree (the driver commits by plumbing, so rerere never
+      recorded this resolution).
+    - Every stage emits `SWEEP-STEP:` progress and journals (`not-my-bug`,
+      `not-my-bug-owner`, `not-my-bug-bisect`, with the probe log); the result
+      carries a `notMyBug` block plus `introducedBy` for the agent to relay. The
+      proceed arm carries `WARN09_GATE_FIX_SERVED` — never an `ERR` id.
+    - Cheap by construction: probes re-run ONLY the failing commands, narrowed to
+      the failing files via `VerifyCommand.filter` (`bun test {files}`), and the
+      common confirming case costs a single run. A command with no `filter` (a
+      project typecheck cannot be narrowed without dropping its tsconfig) runs whole.
   - **5b. report-attempt** is recorded HERE, post-checks, so `RESOLVE_COLDREAD_CAP`
     counts only trees that actually reached the reviewer. Beyond the cap → HELD
     ACTIVE, `[AUTO-ESCALATED: resolution did not converge]`.

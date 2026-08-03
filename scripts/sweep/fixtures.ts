@@ -229,3 +229,91 @@ export function makePropagationFixture(): {
   repo.checkout('main');
   return { repo, base, upstream: 'upstream-main', chain };
 }
+
+/**
+ * THE 2026-08-01 INCIDENT, as a repo (pass `87175bdb89ad`, case
+ * `main_patched--main-h174`). Everything a sweep needs to walk straight into the
+ * deadlock `--not-my-bug` exists for, with real commits and REAL check commands:
+ *
+ *   main            base  groups.ts = "base", poll-loop.test.ts GREEN
+ *                   U1    groups.ts = "upstream"        <- theirs, conflicts
+ *
+ *   main_patched    P1    groups.ts = "fork"            <- ours, the conflict
+ *                   P2    unrelated
+ *                   P3    poll-loop.test.ts -> BROKEN   <- THE INTRODUCER
+ *                   P4    unrelated
+ *                   P5    unrelated                        (branch tip)
+ *
+ * So the case's conflict is `src/cli/resources/groups.ts`, while the checks fail
+ * on `container/agent-runner/src/poll-loop.test.ts` — a file the case never
+ * touches, already red on the branch three commits before the tip, exactly as
+ * upstream `3d4b349b` left it live. A bisect over `main_patched` has a genuine
+ * green anchor (P1/P2) and one right answer (P3).
+ *
+ * The checks are real programs, not a stubbed `ChecksRunner`: `run-tests.sh`
+ * prints BUN-SHAPED output (a `<file>:` header, then `(fail)` lines under it),
+ * because parsing that shape is itself part of what broke — a bun failure named
+ * no file at all, so blame fell to the trunk and there was nothing to compare.
+ * The test file is the ONLY input, so any tree can be probed and the answer is
+ * a property of that tree.
+ */
+export function makeNotMyBugIncidentFixture(): {
+  repo: FixtureRepo;
+  /** The commit that broke the test — what the bisect must name. */
+  introducer: string;
+  /** Path of the failing test, repo-rooted (as the driver sees it). */
+  failingTest: string;
+  /** Path of the conflicted file. */
+  conflictedPath: string;
+} {
+  const failingTest = 'container/agent-runner/src/poll-loop.test.ts';
+  const conflictedPath = 'src/cli/resources/groups.ts';
+  // Ignores any file arguments: the filtered form (`… {files}`) and the whole
+  // form must answer identically, so a narrowed probe and a full run agree.
+  const runTests = [
+    '#!/bin/sh',
+    'echo "src/poll-loop.test.ts:"',
+    'if grep -q BROKEN src/poll-loop.test.ts 2>/dev/null; then',
+    '  echo "(fail) task-run turn wiring (real processQuery) > logs and conditionally nudges a second task run [5000.64ms]"',
+    '  echo "  ^ this test timed out after 5000ms."',
+    '  echo " 1 fail"',
+    '  exit 1',
+    'fi',
+    'echo " 1 pass"',
+    'exit 0',
+    '',
+  ].join('\n');
+
+  const dir = mkdtempSync(join(tmpdir(), 'sweep-incident-'));
+  const repo = new FixtureRepo(dir);
+  repo.git('init', '-b', 'main');
+  repo.git('config', 'user.name', 'fixture');
+  repo.git('config', 'user.email', 'fixture@test.invalid');
+  repo.git('config', 'commit.gpgsign', 'false');
+  repo.commit('base', {
+    'package.json': '{"name":"fixture","version":"1.0.0"}\n',
+    'container/agent-runner/package.json': '{"name":"agent-runner","version":"1.0.0"}\n',
+    'tools/typecheck.sh': '#!/bin/sh\nexit 0\n',
+    'container/agent-runner/run-tests.sh': runTests,
+    [failingTest]: 'test("task-run turn wiring", () => ok);\n',
+    [conflictedPath]: 'export const createGroup = () => "base";\n',
+  });
+
+  repo.checkout('main_patched', { create: true, at: 'main' });
+  repo.commit('fix(ncl): groups create now provisions container_configs', {
+    [conflictedPath]: 'export const createGroup = () => "fork";\n',
+  });
+  repo.commit('chore: unrelated', { 'docs/a.md': 'a\n' });
+  const introducer = repo.commit('test(tasks): cover one-door task turns', {
+    [failingTest]: 'test("task-run turn wiring", () => BROKEN);\n',
+  });
+  repo.commit('chore: unrelated two', { 'docs/b.md': 'b\n' });
+  repo.commit('chore: unrelated three', { 'docs/c.md': 'c\n' });
+
+  repo.checkout('main');
+  repo.commit('feat: support scheduled tasks in templates', {
+    [conflictedPath]: 'export const createGroup = () => "upstream";\n',
+  });
+  repo.checkout('main_patched');
+  return { repo, introducer, failingTest, conflictedPath };
+}
