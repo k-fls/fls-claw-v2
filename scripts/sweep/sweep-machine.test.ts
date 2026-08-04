@@ -1434,6 +1434,64 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     expect(machineState(dir).phase).toBe('awaiting-pr');
   });
 
+  it('a PARENT-owned gate fix supersedes the PARENT’s other children too', async () => {
+    // Live 2026-08-05: ownership routed to `module/agent-group-contributions`,
+    // the fix was minted there, but only the CASE branch's subtree was reopened —
+    // so the parent's OTHER children kept their cases, sorted ahead of the fix,
+    // and were served first. The same junk-PR queue this reopen prevents, one
+    // level up: everything under a blocked branch is blocked, wherever the case
+    // that found it happened to live.
+    const repo = conflictFixture();
+    repo.checkout('module/parent', { create: true, at: 'main_patched' });
+    repo.commit('parent work', { 'src/p.ts': 'p\n' });
+    repo.checkout('module/childA', { create: true, at: 'module/parent' });
+    repo.commit('a', { 'src/a.ts': 'a\n' });
+    repo.checkout('module/childB', { create: true, at: 'module/parent' });
+    repo.commit('b', { 'src/b.ts': 'b\n' });
+    repo.checkout('main');
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'parent', branch: 'module/parent', parents: ['main_patched'] },
+      { id: 'childA', branch: 'module/childA', parents: ['module/parent'] },
+      { id: 'childB', branch: 'module/childB', parents: ['module/parent'] },
+    ]);
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    seedPriorFailure(dir, caseId, 'typecheck', ['tsc --noEmit']);
+    // childB has its own open case, derived against the parent.
+    appendFileSync(
+      join(dir, 'journal.jsonl'),
+      JSON.stringify({
+        ts: new Date().toISOString(), action: 'case', caseId: 'module__childB--module__parent-h1',
+        branch: 'module/childB', parent: 'module/parent',
+        head: { sha: repo.sha('module/childB'), height: 1 }, conflictedPaths: ['src/b.ts'],
+      }) + '\n',
+    );
+    expect(openCases(readJournal(dir)).map((c) => c.caseId)).toContain('module__childB--module__parent-h1');
+
+    const r = namingRunner(['tsc --noEmit'], 'src/util.ts');
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out: join(ws, 'rc.json') }),
+      neverInvoked,
+      r.fn,
+    );
+    const journal = readJournal(dir);
+    const gf = journal.find((e) => e.action === 'gate-fix');
+    if (gf && gf.branch !== 'main_patched') {
+      // Whatever branch owned it, that branch's whole subtree must be reopened —
+      // no sibling case may survive ahead of the fix.
+      const reopened = new Set(journal.filter((e) => e.action === 'reopened').map((e) => e.branch as string));
+      expect(reopened.has(gf.branch as string)).toBe(true);
+    }
+    // The invariant that matters regardless of which branch was blamed: no
+    // ordinary case sits ahead of an open gate fix.
+    const open = openCases(journal);
+    const gateFixIds = new Set(journal.filter((e) => e.action === 'case' && e.gateFix === true).map((e) => e.caseId as string));
+    if (open.some((c) => gateFixIds.has(c.caseId))) {
+      expect(gateFixIds.has(open[0].caseId)).toBe(true);
+    }
+  });
+
   it('refuses to mint a gate fix on UPSTREAM main, and reports it instead', async () => {
     // Live 2026-08-04: an ownership probe of upstream's head ran with the wrong
     // dependencies, came back red for a module upstream actually declares,

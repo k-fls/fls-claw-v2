@@ -2956,6 +2956,17 @@ function planEdges(plan: PropagationPlan): Record<string, string[]> {
 }
 
 /** Transitive inventory descendants of `branch` over child->parents edges. */
+/** The pass plan's parent edges, or {} when the plan is unreadable. */
+function planEdgesOf(dir: string): Record<string, string[]> {
+  const planPath = join(dir, 'plan.json');
+  if (!existsSync(planPath)) return {};
+  try {
+    return planEdges(JSON.parse(readFileSync(planPath, 'utf8')) as PropagationPlan);
+  } catch {
+    return {};
+  }
+}
+
 function transitiveDescendants(edges: Record<string, string[]>, branch: string): string[] {
   const children: Record<string, string[]> = {};
   for (const [child, parents] of Object.entries(edges)) {
@@ -7415,7 +7426,20 @@ async function adjudicateNotMyBug(p: {
     // re-derived against the blocked parent and the existing DEFERRED path holds
     // them until the fix lands. No priority rule is needed: with the descendants
     // superseded, the gate fix is the only case left to serve.
-    reopen(dir, [branch, ...rc.descendants]);
+    // THE OWNER'S SUBTREE, not just this case's. When ownership routes to the
+    // PARENT, the gate fix lands on a branch this case is not on — and its OTHER
+    // children were never reopened, so they stayed open, sorted ahead of the fix,
+    // and were served first. Live 2026-08-05: the fix went to
+    // `module/agent-group-contributions` while `module/interactions-helpers` and
+    // `module/container-bootstrap` (its other children) kept their cases and the
+    // agent moved to them — the same "junk PRs queued ahead of the fix" bug this
+    // reopen exists to prevent, one level up. Everything under the blocked branch
+    // is blocked, wherever the case that found it happened to live.
+    const ownerSubtree =
+      ownerBranch === branch
+        ? []
+        : [ownerBranch, ...transitiveDescendants(planEdgesOf(dir), ownerBranch)];
+    reopen(dir, [...new Set([branch, ...rc.descendants, ...ownerSubtree])]);
 
     // PRESERVE THE AGENT'S WORK. Reopening re-derives the branch, and the next
     // `createCaseWorktree` wipes and rebuilds this worktree from the automerge
