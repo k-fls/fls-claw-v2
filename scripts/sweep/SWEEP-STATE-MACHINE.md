@@ -415,9 +415,17 @@ silence.
       fix — with `[POSSIBLE DUPLICATE: …]` in the PR text so the owner merges one
       and rebases or drops the rest. `gateFixKey` stays branch-scoped as the
       per-pass anti-loop key: two concerns, two keys.
-    - **ABORT** = a `reopened` row: the case's merge was never made (it exists only
-      as the clean prefix), so the reopen supersedes the undispositioned case, the
-      machine returns to `open`, and `next-case` serves the gate fix. **The reopen
+    - **ABORT** = a `reopened` row over `[branch, ...descendants]` — the SAME scope
+      every other blocking path uses. The case's merge was never made (it exists
+      only as the clean prefix), so the reopen supersedes the undispositioned case,
+      the machine returns to `open`, and `next-case` serves the gate fix.
+      DESCENDANTS ARE INCLUDED because a branch just proven RED is blocked, and
+      their open cases were derived against it: the red commit is in the very
+      content they are merging, so they cannot pass. Left open they are served one
+      by one, each failing the same checks, each paying a full adjudication, each
+      hitting the anti-loop and falling back to `--tier held` — eleven junk HELD
+      PRs for one defect (live 2026-08-04). Superseding them means the gate fix is
+      the only case left, so no service-priority rule is needed. **The reopen
       is journaled BEFORE the gate-fix case** — when the owner is this same branch
       the reverse order supersedes the gate fix the instant it is created, and the
       pass loops through a full re-adjudication every round instead of serving it.

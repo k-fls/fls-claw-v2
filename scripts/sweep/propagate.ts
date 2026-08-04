@@ -7336,7 +7336,20 @@ async function adjudicateNotMyBug(p: {
     // re-emitted, and the pass would loop through a full re-adjudication (bisect
     // included) until the ten-strike backstop. Reopen first and the gate fix's
     // rows land after it, untouched.
-    reopen(dir, [branch]);
+    //
+    // DESCENDANTS TOO — every other path that blocks a branch does this
+    // (`freezeHeld`'s callers, the crash-heal, the resolve path) and reopening
+    // only the branch itself was a bug. A branch that has just been proven RED is
+    // blocked, and its descendants' OPEN cases were derived against it: they
+    // cannot pass, because the red commit is in the very content they are merging.
+    // Left open they are served one by one, each failing the same checks, each
+    // paying a full adjudication, each hitting the `gateFixKey` anti-loop and
+    // falling back to `--tier held` — eleven junk HELD PRs for one defect (live
+    // 2026-08-04, stopped at the second). Reopening supersedes them, so they are
+    // re-derived against the blocked parent and the existing DEFERRED path holds
+    // them until the fix lands. No priority rule is needed: with the descendants
+    // superseded, the gate fix is the only case left to serve.
+    reopen(dir, [branch, ...rc.descendants]);
 
     // PRESERVE THE AGENT'S WORK. Reopening re-derives the branch, and the next
     // `createCaseWorktree` wipes and rebuilds this worktree from the automerge

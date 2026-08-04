@@ -1242,6 +1242,60 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     expect(res.instruction).toContain('src/util.ts');
   });
 
+  it('minting a gate fix SUPERSEDES the descendants’ open cases, so only the fix is left to serve', async () => {
+    // Live 2026-08-04: eleven open cases sat ahead of the gate fix, every one of
+    // them merging from a branch that carried the red commit. Each would fail the
+    // same checks, pay a full adjudication, hit the `gateFixKey` anti-loop and
+    // fall back to `--tier held` — eleven junk PRs for one defect.
+    //
+    // Every other blocking path reopens `[branch, ...descendants]`; this one
+    // reopened the branch alone. Reopening the subtree supersedes their cases,
+    // and the open-gate-fix guard stops `cmdRun` re-deriving them, so no priority
+    // rule is needed — the gate fix is simply the only case left.
+    const repo = conflictFixture();
+    // A descendant of main_patched with a conflict of its own.
+    repo.checkout('module/dep', { create: true, at: 'main_patched' });
+    repo.commit('dep: its own edit', { 'src/dep.ts': 'dep\n' });
+    repo.checkout('main');
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'dep', branch: 'module/dep', parents: ['main_patched'] },
+    ]);
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    seedPriorFailure(dir, caseId, 'typecheck', ['tsc --noEmit']);
+    // Fake an open case on the descendant, as the first `run` would have left it.
+    appendFileSync(
+      join(dir, 'journal.jsonl'),
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        action: 'case',
+        caseId: 'module__dep--main_patched-h1',
+        branch: 'module/dep',
+        parent: 'main_patched',
+        head: { sha: repo.sha('module/dep'), height: 1 },
+        conflictedPaths: ['src/dep.ts'],
+      }) + '\n',
+    );
+    expect(openCases(readJournal(dir)).map((c) => c.caseId)).toContain('module__dep--main_patched-h1');
+
+    const r = namingRunner(['tsc --noEmit'], 'src/util.ts');
+    const out = join(ws, 'rc.json');
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+      neverInvoked,
+      r.fn,
+    );
+    const journal = readJournal(dir);
+    const gateFix = journal.find((e) => e.action === 'gate-fix');
+    expect(gateFix).toBeTruthy();
+    // The descendant's case is superseded — it cannot pass, since the red commit
+    // is in the very content it is merging.
+    expect(supersededCaseIds(journal).has('module__dep--main_patched-h1')).toBe(true);
+    // ...and the gate fix is the ONLY thing left open, so service order is moot.
+    expect(openCases(journal).map((c) => c.caseId)).toEqual([gateFix!.caseId]);
+  });
+
   it('refuses to mint a gate fix on UPSTREAM main, and reports it instead', async () => {
     // Live 2026-08-04: an ownership probe of upstream's head ran with the wrong
     // dependencies, came back red for a module upstream actually declares,
