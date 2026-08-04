@@ -1295,6 +1295,53 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     expect(openCases(journal).map((c) => c.caseId)).toEqual([gateFix!.caseId]);
   });
 
+  it('a TIMEOUT gate fix reaches the agent as DIAGNOSIS ONLY — in the MATERIALS, not just the journal', async () => {
+    // The flag was journaled on the `gate-fix` row while `gateFixCaseMaterials`
+    // reads the `case` row, so it never reached the agent: the journal said
+    // `diagnosisOnly: true` and the briefing still said "fix it". Caught live
+    // 2026-08-05 only because the agent kept investigating. Assert the MATERIALS
+    // — the thing the agent actually reads — not the flag.
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const checks = checksFile(ws);
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
+    const caseId = 'gate-fix-main_patched-cafe1234';
+    const tip = repo.sha('main_patched');
+    appendFileSync(
+      join(dir, 'journal.jsonl'),
+      JSON.stringify({
+        ts: new Date().toISOString(), action: 'gate-fix', key: 'main_patched::src/x.test.ts', caseId,
+        branch: 'main_patched', files: ['src/x.test.ts'], failedCommands: ['vitest run'], rootAt: tip,
+        reason: 'pre-existing', diagnosisOnly: true,
+      }) + '\n' +
+        JSON.stringify({
+          ts: new Date().toISOString(), action: 'case', caseId, branch: 'main_patched', parent: '(gate-fix)',
+          gateFix: true, diagnosisOnly: true, head: { sha: tip, height: 1 }, conflictedPaths: ['src/x.test.ts'],
+        }) + '\n',
+    );
+    mkdirSync(join(dir, caseId), { recursive: true });
+    writeFileSync(join(dir, caseId, 'gate-fix-output.txt'), '(fail) slow thing\n  ^ this test timed out after 5000ms.\n');
+    writeFileSync(
+      join(dir, caseId, 'case.json'),
+      JSON.stringify({
+        schemaVersion: 1, id: caseId, branch: 'main_patched', parent: '(gate-fix)',
+        head: { sha: tip, height: 1 }, run: [{ sha: tip, height: 1 }], tierFloor: 'judged',
+        conflictedPaths: ['src/x.test.ts'], automergeTree: repo.git('rev-parse', 'main_patched^{tree}'),
+        reproduction: { command: 'vitest run' },
+        deferredCheck: { firstConflictHeight: 1, transitiveAncestors: [] },
+      }) + '\n',
+    );
+    repo.git('worktree', 'add', '--detach', join(dir, caseId, 'worktree'), tip);
+    const out = join(ws, 'nc.json');
+    await cmdSweepNextCase(baseCli(repo, ws, inv, { checksFile: checks, out }), greenPreMerge);
+    const materials = readFileSync(join(dir, caseId, 'materials.md'), 'utf8');
+    expect(materials).toContain('DIAGNOSIS ONLY');
+    expect(materials).toContain('DO NOT ATTEMPT A FIX');
+    expect(materials).toContain('--tier held');
+  });
+
   it('a gate fix the agent cannot fix IN SCOPE becomes a HELD PR carrying the diagnosis', async () => {
     // Owner, 2026-08-04: "reproducible-but-unfixable-in-scope should lead to held
     // PR — there is no other way." The category is real and had nowhere to go:

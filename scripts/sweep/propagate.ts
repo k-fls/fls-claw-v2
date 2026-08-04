@@ -8911,6 +8911,12 @@ async function materializeGateFixCases(
       branch: g.branch,
       parent: GATE_FIX_PARENT,
       gateFix: true,
+      // ALSO on the `case` row: `gateFixCaseMaterials` is handed the `case` row,
+      // not the `gate-fix` row, so a flag written only to the latter never
+      // reaches the agent. Caught live 2026-08-05 — the journal said
+      // `diagnosisOnly: true` while the materials rendered the ordinary
+      // fix-it briefing and the agent investigated for the third run running.
+      ...(isTimeoutFailure(failedOutput) ? { diagnosisOnly: true } : {}),
       head,
       height: head.height,
       run: caseFile.run,
