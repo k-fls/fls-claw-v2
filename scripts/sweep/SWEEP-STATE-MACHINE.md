@@ -397,6 +397,16 @@ silence.
     - **THE BISECT NEVER GATES THE CASE.** Whether a gate fix is warranted was
       settled by the verdict and the owner probe; naming the commit only improves
       the briefing. Every outcome mints the case, with the status in the text.
+      **THE SEARCH IS FLOORED AT THE CURRENT TRUNK HEAD** (owner, 2026-08-04) —
+      never below it, and the SEARCH is bounded rather than its answer clamped,
+      so no probe is spent on a commit whose answer would be refused. Below that
+      line history is shared and already integrated; a fix rooted there drags
+      every intervening divergence with it. Live 2026-08-04 the unfloored version
+      rooted a case 299 commits behind the tip: the worktree was a three-week-old
+      tree, the checks gate demanded THAT whole suite green, and it was red in a
+      second unrelated file whose fix had not been written yet — one test in
+      scope, a pre-history demanded green, unwinnable. For a gate fix ON the
+      trunk the window is empty, so it roots at the tip and names no commit.
       When no introducer can be named the case roots at the **last failed
       point** — the oldest commit the search OBSERVED red — so the fix lands as
       deep as the evidence supports and branches sharing that ancestor can take

@@ -167,6 +167,8 @@ export interface History {
   listFirstParent(from: string, to: string): Promise<string[]>;
   /** Does at least one of these paths exist at this commit? (rule 3.) */
   hasAnyFile(sha: string, files: string[]): Promise<boolean>;
+  /** Does `sha` contain `ancestor`? Used to enforce the search FLOOR. */
+  contains?(sha: string, ancestor: string): Promise<boolean>;
 }
 
 export type NotMyBugVerdict =
@@ -538,6 +540,21 @@ export async function findIntroducingCommit(
    * Only the FAILED command re-runs, so the fallback costs seconds per probe.
    */
   fullProbe?: SubsetProbe,
+  /**
+   * The OLDEST commit the search may consider — the current trunk head (owner,
+   * 2026-08-04). Below this line history is shared and already integrated, so a
+   * fix rooted there drags every intervening divergence with it: live, a bisect
+   * named a commit 299 behind the branch tip, and the case worktree became a
+   * three-week-old tree whose suite was red in a second, unrelated file nobody
+   * had fixed yet. The agent could not win — one test in scope, a whole
+   * pre-history demanded green.
+   *
+   * Bounding the SEARCH rather than clamping its answer afterwards is the honest
+   * version: it never spends probes on commits whose answer we would refuse, and
+   * for a gate fix ON the trunk the window is empty, so it returns immediately
+   * instead of paying eight probes to be overruled.
+   */
+  floor?: string,
 ): Promise<BisectOutcome> {
   let probes = 0;
   const red = (r: ProbeResult): boolean => files.some((f) => (r.counts.get(f) ?? 0) > 0);
@@ -599,10 +616,22 @@ export async function findIntroducingCommit(
   // exactly. What must never be read as green is a tree that HAS the file and
   // could not be built — that one is skipped below.
   let anchor: string | null = null;
+  let hitFloor = false;
+  const aboveFloor = async (sha: string): Promise<boolean> => {
+    if (!floor || !history.contains) return true;
+    if (sha === floor) return true;
+    return history.contains(sha, floor);
+  };
   for (const step of WALK_BACK_STEPS) {
     if (probes >= BISECT_PROBE_BUDGET) break;
     const sha = await history.ancestor(tip, step);
     if (!sha) break;
+    // At or below the floor: stop. Everything older is shared history the fix
+    // must not be rooted in, so probing it could only produce a refused answer.
+    if (!(await aboveFloor(sha))) {
+      hitFloor = true;
+      break;
+    }
     if (!(await history.hasAnyFile(sha, files))) {
       anchor = sha;
       break;
@@ -630,9 +659,11 @@ export async function findIntroducingCommit(
       probes,
       lastFailed,
       usedFullCommand,
-      detail:
-        `no commit in the last ${WALK_BACK_STEPS[WALK_BACK_STEPS.length - 1]} first-parent commits passes ` +
-        `${files.join(', ')} — the failure predates the search window`,
+      detail: hitFloor
+        ? `${files.join(', ')} already fails at the trunk head — the failure predates this branch's own history, ` +
+          `so there is no commit HERE that introduced it and the fix belongs at the tip`
+        : `no commit in the last ${WALK_BACK_STEPS[WALK_BACK_STEPS.length - 1]} first-parent commits passes ` +
+          `${files.join(', ')} — the failure predates the search window`,
     };
   }
 

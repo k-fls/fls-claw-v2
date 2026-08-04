@@ -142,12 +142,23 @@ describe('the 2026-08-01 deadlock, end to end (real checks, real commits)', () =
     expect(adjudicated.notMyBug.owner).toBe('branch');
     // A PROCEED arm must never carry an ERR id (the ERR42 defect, 52 idle minutes).
     expect(adjudicated.issues.every((i) => i.id.startsWith('WARN'))).toBe(true);
-    // The bisect found the commit that broke the test — over real history, with a
-    // real green anchor, by actually running the test at each probe.
-    expect(adjudicated.introducedBy?.sha).toBe(introducer);
-    expect(adjudicated.introducedBy?.subject).toBe('test(tasks): cover one-door task turns');
+    // THE SEARCH FLOOR (owner, 2026-08-04). This gate fix is on `main_patched`
+    // ITSELF, so the floor — the current trunk head — IS the branch tip and the
+    // window is empty: no commit below it may be named or rooted on, and the
+    // search returns without probing rather than paying for an answer that would
+    // be refused. `introducer` is P3, below the tip, so it is deliberately NOT
+    // reported here.
+    //
+    // Live 2026-08-04 the unfloored version rooted a case 299 commits behind the
+    // tip: the worktree became a three-week-old tree, the checks gate demanded
+    // THAT whole suite green, and it was red in a second unrelated file whose fix
+    // had not been written yet — one test in scope, a pre-history demanded green.
+    expect(adjudicated.introducedBy).toBeNull();
     expect(adjudicated.gateFix.branch).toBe('main_patched');
     expect(adjudicated.gateFix.files).toEqual([failingTest]);
+    // The case is rooted AT THE TIP, so the agent gets current code.
+    expect(readJournal(dir).find((e) => e.action === 'gate-fix')!.rootAt).toBe(repo.sha('main_patched'));
+    expect(introducer).toBeTruthy(); // fixture sanity: the introducer exists, it is just below the floor
 
     const afterAbort = readJournal(dir);
     // The conflict case is superseded; the gate fix is NOT (the defect that made

@@ -359,6 +359,33 @@ describe('findIntroducingCommit — full-command fallback and last-failed rootin
     expect(r.lastFailed).toBe('c9');
   });
 
+  it('never searches BELOW the floor — a failure older than the trunk head is not this branch’s to root', async () => {
+    // Live 2026-08-04: the bisect named a commit 299 behind the branch tip, so
+    // the case worktree became a three-week-old tree and the checks gate demanded
+    // THAT suite green — red in a second, unrelated file whose fix had not been
+    // written yet. One test in scope, a whole pre-history demanded green.
+    const commits = Array.from({ length: 10 }, (_, i) => `c${i}`);
+    const probed: string[] = [];
+    const alwaysRed: SubsetProbe = async (t) => {
+      if (t.kind === 'commit') probed.push(t.sha);
+      return { usable: true, counts: new Map([[POLL_LOOP, 1]]), output: '' };
+    };
+    const history: History = {
+      ancestor: async (_r, back) => commits[commits.length - 1 - back] ?? null,
+      listFirstParent: async (from, to) => commits.slice(commits.indexOf(from) + 1, commits.indexOf(to) + 1),
+      hasAnyFile: async () => true,
+      // The floor is c7: c8/c9 contain it, c6 and older do not.
+      contains: async (sha, anc) => Number(sha.slice(1)) >= Number(anc.slice(1)),
+    };
+    const r = await findIntroducingCommit('c9', [POLL_LOOP], alwaysRed, history, undefined, 'c7');
+    expect(r.status).toBe('no-anchor');
+    // Nothing below the floor was ever probed — bounding the SEARCH, not
+    // clamping its answer, is what makes the probes cheap.
+    expect(probed.every((c) => Number(c.slice(1)) >= 7)).toBe(true);
+    // ...and the report says the failure predates this branch's own history.
+    expect(r.detail).toContain('trunk head');
+  });
+
   it('reports the OLDEST OBSERVED red as lastFailed when the search cannot converge', async () => {
     // Red everywhere, so no green anchor exists. The walk-back probes c8, c7, c5
     // and c1 (steps 1,2,4,8) and then runs out of history — c0 is never probed.

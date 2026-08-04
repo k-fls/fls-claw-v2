@@ -94,7 +94,7 @@ import {
   reconcileCandidates,
 } from './candidates.js';
 import { attributeFailure, countFailingFiles, parseFailingFiles } from './attribute.js';
-import { ROOT_BRANCH } from './hierarchy.js';
+import { ROOT_BRANCH, TRUNK_BRANCH } from './hierarchy.js';
 import {
   classifyEnvironmentFault,
   classifyFailure,
@@ -1868,6 +1868,8 @@ function repoHistory(repo: string): History {
       }
       return false;
     },
+    contains: async (sha, ancestor) =>
+      (await git(repo, ['merge-base', '--is-ancestor', ancestor, sha], { allowCodes: [1, 128] })).code === 0,
   };
 }
 
@@ -7230,6 +7232,7 @@ async function adjudicateNotMyBug(p: {
     // open-ended search, and the commit is also what tells the owner whether the
     // fix belongs on this branch at all.
     const ownerBranch = owner.owner === 'branch' ? branch : rc.parent;
+    const trunkHead = await revParse(cli.repo, TRUNK_BRANCH).catch(() => '');
     progress(`not-my-bug: searching ${ownerBranch} for the commit that introduced ${owner.files.join(', ')}`);
     const bisect = await findIntroducingCommit(
       owner.ref!,
@@ -7240,6 +7243,10 @@ async function adjudicateNotMyBug(p: {
       // whole-suite load, so a narrowed probe cannot see it and the determinism
       // gate writes it off as a coin flip — live 2026-08-03, exactly that.
       probe,
+      // The FLOOR — bound the SEARCH, do not clamp its answer afterwards: it
+      // never spends probes on commits whose answer would be refused, and for a
+      // gate fix ON the trunk the window is empty so it returns at once.
+      trunkHead,
     );
     let introduced: { sha: string; subject: string; author: string } | null = null;
     if (bisect.status === 'found' && bisect.sha) {
@@ -7277,7 +7284,40 @@ async function adjudicateNotMyBug(p: {
     // fix lands as deep as the evidence supports, so branches sharing that
     // ancestor can take one fix instead of one each. The cost is that the fix is
     // then BEHIND the branch tip, which is what the rebase note below is for.
-    const rootAt = bisect.sha ?? bisect.lastFailed ?? owner.ref!;
+    //
+    // ROOT FLOOR: never deeper than the current trunk head (owner, 2026-08-04).
+    //
+    // Rooting a fix at the commit that INTRODUCED a failure is right in
+    // principle — branches sharing that ancestor take one fix instead of one
+    // each — and catastrophic without a floor. Live 2026-08-04 the bisect named
+    // `11d82a65`, which is 299 commits behind `main_patched`: the case worktree
+    // was a three-week-old tree, so the checks gate demanded THAT tree green,
+    // and it was red in a second, unrelated file whose fix simply had not been
+    // written yet. The agent could not win — its case scope was one test, and
+    // the gate wanted a suite from before half the branch's history existed.
+    //
+    // The floor is the trunk head: a root must CONTAIN it. Below that line the
+    // history is shared and already-integrated, so a fix rooted there carries
+    // every intervening divergence for no benefit. Above it, deep rooting still
+    // works — a feature branch can root back to where it left the current trunk,
+    // which is the case the shared-ancestor argument was actually about.
+    const bisectRoot = bisect.sha ?? bisect.lastFailed ?? owner.ref!;
+    const trunkContained =
+      bisectRoot === owner.ref ||
+      !trunkHead ||
+      (await git(cli.repo, ['merge-base', '--is-ancestor', trunkHead, bisectRoot], { allowCodes: [1, 128] })).code === 0;
+    if (!trunkContained) {
+      appendJournal(dir, {
+        action: 'gate-fix-root-clamped',
+        caseId,
+        branch: ownerBranch,
+        wanted: bisectRoot,
+        usedTip: owner.ref,
+        reason: `root would predate the ${TRUNK_BRANCH} head — clamped to the branch tip`,
+      });
+      progress(`not-my-bug: root ${bisectRoot.slice(0, 12)} predates the ${TRUNK_BRANCH} head — rooting at the tip instead`);
+    }
+    const rootAt = trunkContained ? bisectRoot : owner.ref!;
     const rootedBelowTip = rootAt !== owner.ref;
     const behind = rootedBelowTip
       ? Number(
