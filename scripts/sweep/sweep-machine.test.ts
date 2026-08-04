@@ -1809,7 +1809,7 @@ describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
     expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).toBe(repo.sha('main_patched'));
   });
 
-  it('D-060: RED TESTS at finish STOP the pass (publish nothing, report to the owner); a re-run with a green gate completes', async () => {
+  it('D-060: RED TESTS at finish stop the pass — nothing LANDS, but held escalations still publish; a re-run with a green gate completes', async () => {
     const repo = cleanFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
@@ -1840,10 +1840,18 @@ describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
     expect(f1.failedTests.length).toBeGreaterThan(0);
     expect(f1.halted).toBeUndefined(); // not the ERR18 rollback path
     expect(f1.issues.some((i) => i.id === 'ERR40_TESTS_FAILED')).toBe(true);
-    expect(f1.instruction).toContain('publish nothing');
+    // NOTHING LANDS — that is what the red gate guarantees, and it still holds.
     expect(readJournal(dir).some((e) => e.action === 'finish-tests-failed')).toBe(true);
-    expect(readJournal(dir).some((e) => e.action === 'pr-published')).toBe(false);
     expect(readJournal(dir).some((e) => e.action === 'push')).toBe(false);
+    // ...but the ESCALATIONS are published (2026-08-05). A held PR is a REVIEW
+    // ref the owner merges; it never touches a target branch, and the red is
+    // very often the thing it is ABOUT. Live: a gate fix whose real fix lived
+    // outside the case's named files was correctly claimed `--tier held`, which
+    // meant it was not merged, which kept verify red, which suppressed the
+    // publish — so the PR carrying the two-line fix never reached GitHub and the
+    // sweep reported "nothing published" while holding the answer.
+    expect(f1.instruction).toContain('NOTHING was merged or pushed');
+    expect(f1.instruction).toContain('held review PR');
     // Re-run from the verify phase with a green gate -> completes; push not redone before.
     const out2 = join(ws, 'f2.json');
     expect(

@@ -9269,15 +9269,52 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
       // fall through to the pre-D-061 STOP so a bad fix cannot cycle forever.
       if (failedTests.length > 0) {
         appendJournal(dir, { action: 'finish-tests-failed', failed: failedTests });
-        progress(`verify: RED — ${failedTests.join(', ')} — publish nothing (${gate.reason})`);
-        console.error(`finish: ${failedTests.join(', ')} failed; ${gate.reason}; publishing nothing`);
+        // PUBLISH THE HELD ESCALATIONS ANYWAY — the red is very often the thing
+        // they are ABOUT (2026-08-05).
+        //
+        // The catch-22 this fixes, observed end to end: a gate fix was served for
+        // `groups.create.test.ts`; the agent correctly found the fix lived in
+        // `groups.ts`, OUTSIDE the case's named files, and claimed `--tier held`
+        // exactly as doctrine says. Held means NOT merged, so the failure
+        // persisted, so `finish`'s verify stayed RED, so this arm published
+        // NOTHING — including the held PR that was the entire escalation. The
+        // sweep swallowed its own request for help and reported "nothing
+        // published" while holding the two-line diff that would have fixed it.
+        //
+        // Publishing held cases here is safe: a held publish pushes a
+        // `fix/sweep/*` ref and opens a REVIEW PR the owner merges. It never
+        // pushes a target branch — that is phase (3), which this arm still
+        // refuses. So the red gate keeps doing its job (nothing lands) while the
+        // escalation actually reaches a human.
+        const heldPending = [...journaledCases(readJournal(dir)).values()].filter(
+          (jc) =>
+            lastDisposition(readJournal(dir), jc.caseId)?.action === 'held' &&
+            !readJournal(dir).some((e) => e.action === 'pr-published' && e.caseId === jc.caseId),
+        );
+        let escalated = 0;
+        for (const jc of heldPending) {
+          const rcPub = await cmdPublish(
+            { ...cli, cmd: 'publish', caseId: jc.caseId, execute: true, internal: true },
+            makeTransport,
+          );
+          if (rcPub === 0) escalated++;
+          else appendJournal(dir, { action: 'publish-failed', caseId: jc.caseId, branch: jc.branch, phase: 'finish-tests-red' });
+        }
+        progress(
+          `verify: RED — ${failedTests.join(', ')} — no branch lands; ${escalated}/${heldPending.length} held PR(s) published for the owner`,
+        );
+        console.error(`finish: ${failedTests.join(', ')} failed; ${gate.reason}; ${escalated} held PR(s) escalated, no targets pushed`);
         result(cli, {
           ok: false,
           status: 'stopped',
           stoppedAt: 'finish-tests',
           failedTests,
+          heldPublished: escalated,
           issues: [{ id: 'ERR40_TESTS_FAILED', detail: `checks failed at finish — ${failedTests.join(', ')}` }],
-          instruction: `REPORT to the owner: checks failed at finish — ${failedTests.join(', ')}; ${gate.reason}; publish nothing`,
+          instruction:
+            `REPORT to the owner: checks failed at finish — ${failedTests.join(', ')}; ${gate.reason}. NOTHING was ` +
+            `merged or pushed to any branch. ${escalated} held review PR(s) WERE published — the fix is written and ` +
+            `waiting for the owner to merge; name them and stop.`,
         });
         return 1;
       }
