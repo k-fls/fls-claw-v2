@@ -2620,6 +2620,9 @@ export async function cmdRun(cli: Cli): Promise<number> {
         }
       }
 
+      // The tip the plan was DERIVED AT. Step verification must judge the step
+      // against THIS tip, not a fresh read — see the note at the verify call.
+      const tipAtDerive = await revParse(cli.repo, snap.branch);
       const bp = await deriveLive();
 
       // Leaf / always_merge un-skip (§6): if every parent no-op'd in a pass that
@@ -2688,10 +2691,26 @@ export async function cmdRun(cli: Cli): Promise<number> {
       const step = buildStepFile(bp, plan.watermark);
       writeJsonFile(join(dir, `step-${bp.branch.replace(/\//g, '__')}.json`), step);
 
-      const branchTip = await revParse(cli.repo, bp.branch);
+      // VERIFY AGAINST THE TIP THE PLAN WAS DERIVED AT (2026-08-04).
+      //
+      // `deriveBranch` pins ONE `branchTip` for all of a branch's per-parent
+      // probes (D-047/B11) — verdicts are statements about THAT tip. Verification
+      // used a FRESH `revParse` instead, so any ref movement between derivation
+      // and this line put the two on different trees and they disagreed about the
+      // same merge: the plan said `merge`, the re-probe said "no-op (should be
+      // skip)", and the run HALTED. Live 2026-08-04 on
+      // `module/agent-group-contributions`: planned merge, executed (f3e947ff →
+      // e22b9606), then halted on its own result. It self-healed on the next
+      // `next-case` — the re-derivation saw the landed merge and said
+      // `up-to-date` — but the halt still cost a stop and a spurious driver
+      // issue, because a self-healing halt is indistinguishable from a real one.
+      //
+      // Judging a plan against a tree the plan never saw is the bug; the fix is
+      // to hold the tip fixed across both, which is what makes the two agree by
+      // construction rather than by luck of timing.
       const verdict = await verifyStepFile(cli.repo, step, {
         chain,
-        branchTip,
+        branchTip: tipAtDerive,
         arrivedParents: arrived,
         passHasProgress,
       });
@@ -6852,7 +6871,23 @@ export async function cmdSweepNextCase(
     // cmdRun's own emit is suppressed (internal), so next-case emits the single
     // result itself: the halt is journaled — point the agent at it (D-054).
     console.error('next-case: `run` halted — see the journal');
-    result(cli, { status: 'run-halted', instruction: 'run halted — inspect the journal for the ERR2x halt', passDir: dir });
+    // RESUMABLE BY CONSTRUCTION — say so, because the agent cannot tell a
+    // self-healing halt from a terminal one and will otherwise stop on both.
+    // `cmdRun` is idempotent: it re-derives from git every call, so a halt whose
+    // cause was a mid-run ref movement clears on the next attempt. Live
+    // 2026-08-04 exactly that happened — the run halted on
+    // `module/agent-group-contributions`, the retry drove the pass all the way to
+    // a servable case, and the agent nonetheless filed a driver issue and stopped
+    // while a case sat ready for an hour.
+    result(cli, {
+      status: 'run-halted',
+      instruction:
+        'run halted — RE-RUN `next-case` ONCE first: `run` re-derives from git every call, so a halt caused by a ' +
+        'mid-run ref movement clears on the retry. If it halts AGAIN on the SAME branch, that is a real driver ' +
+        'bug: inspect the journaled halt row and report it. Do not file an issue on the first halt.',
+      passDir: dir,
+      resumable: true,
+    });
     return runRc;
   }
   const delta = readJournal(dir).slice(journalLenBefore);
@@ -7685,18 +7720,57 @@ export async function cmdSweepReportCase(
     return 1;
   }
 
+  // A GATE FIX the agent cannot fix IN SCOPE escalates to a HELD PR (owner,
+  // 2026-08-04: "reproducible-but-unfixable-in-scope should lead to held PR —
+  // there is no other way"). It is a real and common category, and the model had
+  // nowhere to put it: the failure REPRODUCES (so it is not `flaky`), it is
+  // genuinely pre-existing (so it is not the agent's), and yet no edit inside the
+  // named files can fix it — because the driver scopes a gate fix to the files
+  // the failure was REPORTED in, which is not where the fix belongs. `tsc` names
+  // the call site, not the edit; a failing test names the test, not the source.
+  //
+  // Before this, `--tier held` with an unchanged worktree fell into ERR32 below
+  // and was told "edit the files named in the briefing, or report the diagnosis
+  // to the owner" — but reporting is not a driver action, so the case dead-ended
+  // and the agent burned attempts until the container was reaped. The escalation
+  // IS the outcome: the owner gets a PR carrying the diagnosis, which is exactly
+  // what a fix nobody can make in scope should produce.
+  if (isGateFixCase && claimed === 'held') {
+    await freezeHeld(cli, dir, rc, ['gate fix: agent declared cannot-fix-in-scope (--tier held)'], {
+      // An unchanged tree publishes no diff — the PR is the DIAGNOSIS. A tree
+      // with edits keeps them: a partial or wrong attempt the owner can read
+      // beats an empty exhibit (the D-061 B rule, same reasoning).
+      resolvedTree: emptyResolution ? null : resolvedTree,
+      escalation: {
+        tag: ESCALATE_CHECKS,
+        feedback: `cannot be fixed within the case's named files (${rc.conflictedPaths.join(', ')})`.slice(
+          0,
+          COLDREAD_FEEDBACK_CAP,
+        ),
+      },
+    });
+    reopen(dir, reopenTargets);
+    writeMachineState(dir, { ...st, phase: 'awaiting-pr', currentCase: { caseId, branch: rc.branch, tier: 'held' } });
+    progress(`gate fix held (cannot fix in scope): ${rc.branch}`);
+    console.error(`report-case: held ${caseId} (gate fix, cannot fix in scope)`);
+    result(cli, {
+      instruction: prHandoff(
+        dir,
+        caseId,
+        `provide PR description — you could not fix this within ${rc.conflictedPaths.join(', ')}. State WHAT fails, ` +
+          `WHY it cannot be fixed in those files, and WHERE you believe the fix belongs. That diagnosis IS the deliverable`,
+      ),
+      tier: 'held',
+      issues,
+    });
+    return 0;
+  }
+
   // ---- 3. conflicts present + claim ≠ held → ERR32 (resolve first) ----------
   // A marker-laden / unchanged tree has nothing to gate; ask the agent to resolve.
-  // D-061 (B): a GATE-FIX case takes this arm on ANY claim, `held` included. It
-  // never had a conflict, so "conflicts present" here can only mean the agent
-  // changed nothing — and branch 4 below would answer that with "base it on the
-  // PRISTINE conflict state", telling the agent to describe a conflict that does
-  // not exist and freezing a draft PR of an empty diff.
-  if (conflictsPresent && (claimed !== 'held' || isGateFixCase)) {
+  if (conflictsPresent && claimed !== 'held') {
     const detail = emptyResolution
-      ? isGateFixCase
-        ? 'worktree unchanged — nothing was fixed; edit the files named in the briefing, or report the diagnosis to the owner'
-        : 'worktree unchanged — resolve the conflict in the worktree first'
+      ? 'worktree unchanged — resolve the conflict in the worktree first'
       : `unresolved conflict markers remain in [${markers.join(', ')}]`;
     result(cli, { instruction: detail, tier: claimed, issues: [{ id: 'ERR32_UNRESOLVED', detail }] });
     return 1;
@@ -8431,9 +8505,15 @@ function gateFixCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEn
     '',
     '## SCOPE',
     'The files above, plus what fixing them DIRECTLY forces. This is the ONLY case',
-    'type where you change code this pass did not merge. Do NOT restructure, and do',
-    'NOT report a diagnosis to the owner instead of fixing — your fix reaches them',
-    'as a PR.',
+    'type where you change code this pass did not merge. Do NOT restructure.',
+    '',
+    'If the fix genuinely does NOT belong in these files — the failure is REPORTED',
+    'here but caused elsewhere (a failing test names the TEST, not the source) —',
+    'that is `--tier held`, and an unchanged worktree is fine there. The PR then',
+    'carries your DIAGNOSIS instead of a fix: what fails, why it cannot be fixed in',
+    'these files, and where the fix belongs. That is a valid outcome, not a',
+    'failure. What is NOT valid is reporting the diagnosis in chat and stopping —',
+    'the PR is how it reaches the owner.',
     '',
     '## TIER',
     '- `--tier judged` — you are confident. The fix is committed on the branch and',

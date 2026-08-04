@@ -166,6 +166,13 @@ A build failure in code OUTSIDE your case is NOT a driver bug — it is a code
 defect, and the driver serves it as a gate-fix on the branch that owns it.
 Report it as such (see `ERR36`); never file it against the driver.
 
+A `run-halted` from `next-case` is NOT a driver bug on its own. `run` re-derives
+everything from git on every call, so a halt caused by a ref moving mid-run
+clears on the retry. RE-RUN `next-case` ONCE before concluding anything. Only a
+halt that repeats on the SAME branch is real — then report it. Filing on the
+first halt costs a stop for a condition that has already cleared, and the journal
+will show the pass moved on without you.
+
 On a driver crash, a wrong verdict, or a state that contradicts the driver's own
 output: file a GitHub issue immediately
 via the raw API (`POST /repos/k-fls/fls-claw-v2/issues`, label `sweep-driver`)

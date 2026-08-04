@@ -1295,6 +1295,98 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     expect(openCases(journal).map((c) => c.caseId)).toEqual([gateFix!.caseId]);
   });
 
+  it('a gate fix the agent cannot fix IN SCOPE becomes a HELD PR carrying the diagnosis', async () => {
+    // Owner, 2026-08-04: "reproducible-but-unfixable-in-scope should lead to held
+    // PR — there is no other way." The category is real and had nowhere to go:
+    // the failure REPRODUCES (not `flaky`), it is genuinely pre-existing (not the
+    // agent's), and no edit inside the NAMED files can fix it — because a gate
+    // fix is scoped to where the failure was REPORTED, which is not where the fix
+    // belongs (a failing test names the test, not the source).
+    //
+    // Before: `--tier held` on an unchanged tree hit ERR32 and was told to "edit
+    // the files or report to the owner" — but reporting is not a driver action,
+    // so the case dead-ended and the agent burned attempts until it was reaped.
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const checks = checksFile(ws);
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
+    // A driver-minted gate-fix case, as `--not-my-bug` or the pre-merge check
+    // would leave it: named files, no conflict, worktree at the branch tip.
+    const caseId = 'gate-fix-main_patched-deadbeef';
+    const tip = repo.sha('main_patched');
+    appendFileSync(
+      join(dir, 'journal.jsonl'),
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        action: 'gate-fix',
+        key: 'main_patched::src/x.test.ts',
+        caseId,
+        branch: 'main_patched',
+        files: ['src/x.test.ts'],
+        failedCommands: ['vitest run'],
+        rootAt: tip,
+        reason: 'pre-existing failure',
+      }) + '\n' +
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          action: 'case',
+          caseId,
+          branch: 'main_patched',
+          parent: '(gate-fix)',
+          gateFix: true,
+          head: { sha: tip, height: 1 },
+          conflictedPaths: ['src/x.test.ts'],
+        }) + '\n',
+    );
+    mkdirSync(join(dir, caseId), { recursive: true });
+    writeFileSync(join(dir, caseId, 'gate-fix-output.txt'), 'src/x.test.ts > times out\n');
+    // The case file the driver writes alongside the journal rows (a pointer;
+    // `reverifyGateFixCase` re-derives the truth from the journal row above).
+    writeFileSync(
+      join(dir, caseId, 'case.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        id: caseId,
+        branch: 'main_patched',
+        parent: '(gate-fix)',
+        head: { sha: tip, height: 1 },
+        run: [{ sha: tip, height: 1 }],
+        tierFloor: 'judged',
+        conflictedPaths: ['src/x.test.ts'],
+        automergeTree: repo.git('rev-parse', 'main_patched^{tree}'),
+        reproduction: { command: 'vitest run' },
+        deferredCheck: { firstConflictHeight: 1, transitiveAncestors: [] },
+      }) + '\n',
+    );
+    // The worktree the driver would have created at mint time (detached at the
+    // root) — `materializeGateFixCases` is bypassed here, so make it directly.
+    repo.git('worktree', 'add', '--detach', join(dir, caseId, 'worktree'), tip);
+    await cmdSweepNextCase(baseCli(repo, ws, inv, { checksFile: checks }), greenPreMerge);
+    expect(currentCaseId(dir)).toBe(caseId);
+
+    // The agent edits NOTHING — the fix is not in the named files — and escalates.
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', checksFile: checks, execute: true, out }),
+        neverInvoked,
+      ),
+    ).toBe(0);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { tier: string; instruction: string };
+    expect(res.tier).toBe('held');
+    // The DIAGNOSIS is the deliverable — the PR must say what fails, why it
+    // cannot be fixed in those files, and where the fix belongs.
+    expect(res.instruction).toContain('WHY it cannot be fixed');
+    expect(res.instruction).toContain('src/x.test.ts');
+    const held = readJournal(dir).find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect(held).toBeTruthy();
+    // Nothing was fixed, so nothing is published as a resolution — the PR is prose.
+    expect(held.resolution ?? null).toBeNull();
+    expect(machineState(dir).phase).toBe('awaiting-pr');
+  });
+
   it('refuses to mint a gate fix on UPSTREAM main, and reports it instead', async () => {
     // Live 2026-08-04: an ownership probe of upstream's head ran with the wrong
     // dependencies, came back red for a module upstream actually declares,
