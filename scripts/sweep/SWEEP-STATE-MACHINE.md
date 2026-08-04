@@ -350,6 +350,18 @@ silence.
       reviewer judges the extra edits as the fix rather than as a scope
       violation) — the one sanctioned special case, "let the agent edit
       non-conflicted files and let the cold read accept it".
+    - **THE MINT BOUNDARY.** A gate fix is never created on upstream `main` — the
+      sweep cannot commit there and a fix rooted there reaches nobody. Enforced at
+      `materializeGateFixCases`, the ONE place a case is created (the `rootBranch`
+      override bypasses attribution, which already excludes upstream). It is a
+      REFUSAL, not silence: "upstream is red at ⟨sha⟩ for ⟨files⟩" is reported to
+      the owner, because the fork is about to merge a broken upstream commit.
+    - **BREADTH BACKSTOP.** Identical failures on both trees is the NORMAL shape of
+      a confirmed pre-existing defect, so identity alone proves nothing. But when
+      the failure spans ≥10 files and NOTHING passed anywhere, the comparison
+      distinguished nothing — that is a broken toolchain, not one defect — and the
+      verdict is `undecidable`. Sits behind the shape classifier, for the shapes
+      nobody has enumerated.
     - **ENVIRONMENT FAULTS ARE NOT CODE DEFECTS.** Both trees share one dependency
       pool, so a broken pool reproduces on both and the verdict is a correct
       "not caused by your resolution" about a failure no code change can fix.
@@ -358,9 +370,16 @@ silence.
       with NO test assertion anywhere ⇒ `WARN14_ENVIRONMENT_FAULT`, no gate fix,
       stop and report. Live 2026-08-03 this minted a 44-file case on
       `module/container-queue` from a log holding 76 missing bindings and zero
-      assertions. The pool installer no longer passes `--ignore-scripts` (which
-      skipped the native build), and a pool that cannot load its native modules
-      is discarded at build time rather than shipped into probes.
+      assertions. TS RESOLUTION codes (TS2307/2688/5012/6053/2318) count as
+      environment evidence; other `error TS…` still veto, since a blanket veto
+      made the classifier dead code for the whole typecheck kind. DEPENDENCY POOLS
+      ARE GONE (2026-08-04): dependencies are installed INTO each worktree from
+      the manifests that worktree carries, so the environment is a function of the
+      tree under test — no shared cache to poison, no key to invalidate, and no
+      fallback. A tree whose dependencies will not install has NO valid
+      environment and yields no verdict at all, which matters most for a GREEN: a
+      `branch-check` pass is memoised for the whole pass and would skip a branch's
+      only typecheck.
     - **BISECT** before minting a branch/parent gate fix, so the briefing names a
       commit instead of a log: determinism at the tip (a coin flip converges on a
       random commit and reads as an answer — refused), exponential walk-back for a

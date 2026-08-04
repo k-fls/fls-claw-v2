@@ -6,7 +6,7 @@
  * fork branches with synthetic conflicts and PoIs).
  */
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -316,4 +316,84 @@ export function makeNotMyBugIncidentFixture(): {
   });
   repo.checkout('main_patched');
   return { repo, introducer, failingTest, conflictedPath };
+}
+
+/**
+ * An install runner and a checks runner that are FUNCTIONS OF THE TREE — so a
+ * broken or mismatched environment is representable in tests at all.
+ *
+ * Every environment bug this suite has shipped (2026-08-01 → 08-04) was found in
+ * production, and could not have been found here: the stub installer just
+ * `mkdir`ed `node_modules`, so a tree's environment always looked perfect
+ * regardless of what its manifests said. A harness in which the bug cannot be
+ * expressed is a harness that certifies its absence.
+ *
+ * `makeEnvAwareRunners` models the two failures that actually happened:
+ *   - a DECLARED dependency that is not installed  → `TS2307 Cannot find module`
+ *     (live: `yaml`, declared by upstream, absent from the branch's environment)
+ *   - a NATIVE package installed without its addon → `Could not locate the
+ *     bindings file` (live: `--ignore-scripts`, 76 occurrences, 0 assertions)
+ *
+ * No real install, no network: `install` reads the worktree's own manifests and
+ * creates exactly what they declare, and `checks` reports on what it finds on
+ * disk. That is the same philosophy as `makeNotMyBugIncidentFixture`'s shell
+ * programs — real behaviour, driven by the tree.
+ */
+export function makeEnvAwareRunners(opts: { native?: string[]; skipScripts?: boolean; failInstallFor?: string[] } = {}): {
+  install: (worktree: string) => Promise<boolean>;
+  checks: (commands: Array<{ cmd: string; cwd?: string }>, baseDir: string) => Promise<{ ok: boolean; failedNames: string[]; output: string }>;
+  installs: string[];
+} {
+  const native = opts.native ?? [];
+  const installs: string[] = [];
+
+  const declaredDeps = (dir: string): string[] => {
+    try {
+      const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as {
+        dependencies?: Record<string, string>;
+        devDependencies?: Record<string, string>;
+      };
+      return [...Object.keys(pkg.dependencies ?? {}), ...Object.keys(pkg.devDependencies ?? {})];
+    } catch {
+      return [];
+    }
+  };
+
+  const install = async (worktree: string): Promise<boolean> => {
+    installs.push(worktree);
+    const deps = declaredDeps(worktree);
+    if (opts.failInstallFor?.some((d) => deps.includes(d))) return false;
+    for (const d of deps) {
+      mkdirSync(join(worktree, 'node_modules', d), { recursive: true });
+      // A native package needs its compiled addon; `--ignore-scripts` is exactly
+      // the case where the package is present and the addon is not.
+      if (native.includes(d) && !opts.skipScripts) {
+        mkdirSync(join(worktree, 'node_modules', d, 'build'), { recursive: true });
+        writeFileSync(join(worktree, 'node_modules', d, 'build', 'addon.node'), 'x\n');
+      }
+    }
+    return true;
+  };
+
+  const checks = async (
+    commands: Array<{ cmd: string; cwd?: string }>,
+    baseDir: string,
+  ): Promise<{ ok: boolean; failedNames: string[]; output: string }> => {
+    const deps = declaredDeps(baseDir);
+    const missing = deps.filter((d) => !existsSync(join(baseDir, 'node_modules', d)));
+    const brokenNative = deps.filter(
+      (d) => native.includes(d) && existsSync(join(baseDir, 'node_modules', d)) && !existsSync(join(baseDir, 'node_modules', d, 'build')),
+    );
+    if (missing.length === 0 && brokenNative.length === 0) return { ok: true, failedNames: [], output: '' };
+    const lines = [
+      ...missing.map((d) => `src/uses-${d}.ts(3,23): error TS2307: Cannot find module '${d}' or its corresponding type declarations.`),
+      ...brokenNative.flatMap((d) => [
+        `Error: Could not locate the bindings file. Tried:`,
+        ` \u2192 ${baseDir}/node_modules/${d}/build/Release/${d}.node`,
+      ]),
+    ];
+    return { ok: false, failedNames: commands.map((c) => c.cmd), output: lines.join('\n') + '\n' };
+  };
+
+  return { install, checks, installs };
 }

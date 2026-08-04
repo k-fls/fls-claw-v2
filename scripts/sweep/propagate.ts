@@ -97,6 +97,7 @@ import {
   reconcileCandidates,
 } from './candidates.js';
 import { attributeFailure, countFailingFiles, parseFailingFiles } from './attribute.js';
+import { ROOT_BRANCH } from './hierarchy.js';
 import {
   classifyEnvironmentFault,
   classifyFailure,
@@ -7723,6 +7724,34 @@ export async function cmdSweepReportCase(
       const fullFile = join(caseDir, `${kind}-output.full.txt`);
       writeFileSync(fullFile, r.output);
       writeFileSync(outFile, boundedChecksOutput(r, fullFile));
+      // ENVIRONMENT FAULT — checked HERE, on the ORDINARY path, before anything
+      // is counted against the agent. It used to be reachable only inside
+      // `adjudicateNotMyBug`, which needs the flag AND a second failure, so an
+      // agent that never raised the flag marched a broken toolchain all the way
+      // to CHECKS_FAIL_LIMIT and froze a HELD PR for it (10 wasted attempts).
+      const envFaultGate = classifyEnvironmentFault(r.output);
+      if (envFaultGate.isEnvironment) {
+        appendJournal(dir, {
+          action: 'environment-fault',
+          caseId,
+          branch: rc.branch,
+          kind,
+          signature: envFaultGate.signature,
+          detail: envFaultGate.detail,
+        });
+        progress(`ENVIRONMENT FAULT (${envFaultGate.signature}) — not a code defect; nothing counted against the case`);
+        console.error(`report-case [WARN14_ENVIRONMENT_FAULT]: ${envFaultGate.detail}`);
+        result(cli, {
+          ok: false,
+          status: 'stopped',
+          stoppedAt: 'checks',
+          issues: [{ id: 'WARN14_ENVIRONMENT_FAULT', detail: envFaultGate.detail }],
+          instruction:
+            `REPORT to the owner: ${envFaultGate.detail} Your resolution is untouched and this attempt was NOT ` +
+            `counted against the case. Do NOT try to fix this in code and do NOT re-run until the owner says so.`,
+        });
+        return 1;
+      }
       appendJournal(dir, { action: 'checks-fail', caseId, resolvedTree, kind, failed: r.failedNames });
       const n = checksFailCount(readJournal(dir), caseId);
 
@@ -8605,10 +8634,49 @@ async function materializeGateFixCases(
     return { ...none, reason: 'no branch could be blamed for the failing files', detail: `verify RED (no clean attribution); ${a.reason}` };
   }
 
+  // MANDATE BOUNDARY (owner, 2026-08-04). `main` is UPSTREAM — never ours to fix,
+  // and a fix committed there could not be pushed anywhere the fork controls.
+  // Live 2026-08-04 the driver minted `gate-fix-main-c1e3ddc6` on it: a probe of
+  // upstream's head ran with the wrong dependencies, came back red for a module
+  // upstream actually declares, ownership moved to the parent, and a bisect
+  // converged — a fully substantiated case for a defect that did not exist.
+  //
+  // Enforced HERE because this is the one place a case is created, and the
+  // `rootBranch` override bypasses attribution entirely (which already excludes
+  // upstream). Putting it in the callers would give two copies and leave the
+  // pre-merge check's own override uncovered.
+  //
+  // A REFUSAL IS NOT SILENCE. "Upstream is red at <sha> for <files>" is a real
+  // and urgent finding — the fork is about to merge a broken upstream commit —
+  // so it is reported, loudly, as something only the owner can act on. What the
+  // driver must not do is manufacture work against it.
+  const upstreamGroups = groups.filter((g) => g.branch === ROOT_BRANCH);
+  if (upstreamGroups.length > 0) {
+    const files = [...new Set(upstreamGroups.flatMap((g) => g.files))];
+    appendJournal(dir, {
+      action: 'gate-fix-refused',
+      branch: ROOT_BRANCH,
+      files,
+      reason: 'upstream is outside the sweep mandate — no work may be minted there',
+    });
+    console.error(`gate-fix [WARN15_UPSTREAM_RED]: refusing to mint on upstream ${ROOT_BRANCH} (${files.join(', ')})`);
+  }
+  const mintable = groups.filter((g) => g.branch !== ROOT_BRANCH);
+  if (mintable.length === 0) {
+    const files = [...new Set(upstreamGroups.flatMap((g) => g.files))];
+    return {
+      ...none,
+      reason: `the failure is on UPSTREAM ${ROOT_BRANCH} (${files.join(', ')}) — outside this sweep's mandate`,
+      detail:
+        `verify RED and blamed to upstream ${ROOT_BRANCH} over ${files.join(', ')}. The sweep may not commit to ` +
+        `upstream, so no case was created. REPORT to the owner: upstream is red and the fork is merging from it.`,
+    };
+  }
+
   const cases: GateFixCaseSummary[] = [];
   const looping: string[] = [];
   const gated: string[] = [];
-  for (const g of groups) {
+  for (const g of mintable) {
     // ACTIVE GATE (cross-pass): this branch already has a gate fix on origin
     // awaiting the owner. Minting a second one would hand the agent a case whose
     // fix is already written and under review. Skip the BRANCH and report it —

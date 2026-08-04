@@ -1242,6 +1242,34 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     expect(res.instruction).toContain('src/util.ts');
   });
 
+  it('refuses to mint a gate fix on UPSTREAM main, and reports it instead', async () => {
+    // Live 2026-08-04: an ownership probe of upstream's head ran with the wrong
+    // dependencies, came back red for a module upstream actually declares,
+    // ownership moved to the parent, a bisect converged, and the driver minted
+    // `gate-fix-main-c1e3ddc6`. A fix committed to upstream could not be pushed
+    // anywhere the fork controls — the case was unusable by construction.
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    seedPriorFailure(dir, caseId, 'typecheck', ['tsc --noEmit']);
+    // Fails everywhere, including at the parent head -> ownership lands on `main`.
+    const r = namingRunner(['tsc --noEmit'], 'src/util.ts');
+    const out = join(ws, 'rc.json');
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+      neverInvoked,
+      r.fn,
+    );
+    const journal = readJournal(dir);
+    // No case on upstream, and the refusal is journaled rather than swallowed —
+    // "upstream is red" is a real finding the owner must hear.
+    expect(journal.some((e) => e.action === 'gate-fix' && e.branch === 'main')).toBe(false);
+    const refused = journal.find((e) => e.action === 'gate-fix-refused');
+    if (refused) expect(refused.branch).toBe('main');
+  });
+
   it('a failure IN a conflicted path is refused without probing — it is the agent’s by definition', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();

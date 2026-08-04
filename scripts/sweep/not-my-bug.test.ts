@@ -15,7 +15,12 @@
  */
 import { describe, expect, it } from 'vitest';
 
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { countFailingFiles, parseFailingFiles } from './attribute.js';
+import { makeEnvAwareRunners } from './fixtures.js';
 import {
   classifyEnvironmentFault,
   classifyFailure,
@@ -363,5 +368,91 @@ describe('findIntroducingCommit — full-command fallback and last-failed rootin
     const r = await findIntroducingCommit('c9', [POLL_LOOP], redFrom(0), linear());
     expect(r.status).toBe('no-anchor');
     expect(r.lastFailed).toBe('c1');
+  });
+});
+
+describe('environment faults never become code blame (2026-08-03/04)', () => {
+  const { install, checks } = makeEnvAwareRunners({ native: ['better-sqlite3'], skipScripts: true });
+
+  it('a native package installed WITHOUT its addon reads as an environment fault', async () => {
+    // `--ignore-scripts`, exactly: the package is present, the compiled addon is
+    // not, and every suite that opens a database dies at require time.
+    const wt = mkdtempSync(join(tmpdir(), 'env-'));
+    writeFileSync(join(wt, 'package.json'), JSON.stringify({ dependencies: { 'better-sqlite3': '11' } }));
+    expect(await install(wt)).toBe(true);
+    const r = await checks([{ cmd: 'pnpm test' }], wt);
+    expect(r.ok).toBe(false);
+    const v = classifyEnvironmentFault(r.output);
+    expect(v.isEnvironment).toBe(true);
+    rmSync(wt, { recursive: true, force: true });
+  });
+
+  it('a DECLARED dependency that was never installed reads as an environment fault (TS2307)', async () => {
+    // The 2026-08-04 shape: upstream declares `yaml`, the environment predates
+    // the merge that brought it. `error TS…` used to veto this wholesale, which
+    // made the classifier dead code for the entire typecheck kind.
+    const wt = mkdtempSync(join(tmpdir(), 'env-'));
+    writeFileSync(join(wt, 'package.json'), JSON.stringify({ dependencies: { yaml: '2' } }));
+    mkdirSync(join(wt, 'node_modules'), { recursive: true }); // installed, but not `yaml`
+    const r = await checks([{ cmd: 'pnpm run typecheck' }], wt);
+    expect(r.output).toContain('TS2307');
+    expect(classifyEnvironmentFault(r.output).isEnvironment).toBe(true);
+    rmSync(wt, { recursive: true, force: true });
+  });
+
+  it('an ORDINARY compile error is still a code defect, not an environment fault', async () => {
+    expect(classifyEnvironmentFault('src/x.ts(3,1): error TS2345: wrong type').isEnvironment).toBe(false);
+    // ...and a resolution error sitting next to a real one stays code.
+    expect(
+      classifyEnvironmentFault(
+        ["src/a.ts(1,1): error TS2307: Cannot find module 'yaml'", 'src/b.ts(2,2): error TS2345: wrong type'].join('\n'),
+      ).isEnvironment,
+    ).toBe(false);
+  });
+
+  it('ONE environment answers for TWO different trees — the reuse that made it six pools', async () => {
+    // 2026-08-03 was not one bad install, it was one bad environment reused for
+    // every tree that shared its manifests. Two trees, one broken environment,
+    // both must report the fault rather than blaming their own code.
+    const a = mkdtempSync(join(tmpdir(), 'env-a-'));
+    const b = mkdtempSync(join(tmpdir(), 'env-b-'));
+    for (const wt of [a, b]) {
+      writeFileSync(join(wt, 'package.json'), JSON.stringify({ dependencies: { 'better-sqlite3': '11' } }));
+      await install(wt);
+    }
+    for (const wt of [a, b]) {
+      expect(classifyEnvironmentFault((await checks([{ cmd: 'bun test' }], wt)).output).isEnvironment).toBe(true);
+    }
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  });
+});
+
+describe('breadth backstop — an experiment that distinguished nothing', () => {
+  it('44 identical failures with nothing passing is UNDECIDABLE, not pre-existing', async () => {
+    const files = Array.from({ length: 44 }, (_, i) => `src/f${i}.test.ts`);
+    const resolved = new Map(files.map((f) => [f, 1]));
+    const { probe } = scriptedProbe([{ failing: Object.fromEntries(files.map((f) => [f, 1])) }]);
+    const v = await classifyFailure(resolved, 'prefixsha0000', probe);
+    expect(v.verdict).toBe('undecidable');
+    expect(v.detail).toContain('too broad to be one defect');
+  });
+
+  it('the ordinary one-file case is UNAFFECTED — identity is the normal confirming shape', async () => {
+    const { probe } = scriptedProbe([{ failing: { [POLL_LOOP]: 1 } }]);
+    const v = await classifyFailure(new Map([[POLL_LOOP, 1]]), 'prefixsha0000', probe);
+    expect(v.verdict).toBe('pre-existing');
+  });
+
+  it('breadth WITH a discriminating observation still confirms', async () => {
+    // The baseline fails MORE than the case somewhere: the checks demonstrably
+    // still distinguish trees, so breadth alone is not suspicious.
+    const files = Array.from({ length: 44 }, (_, i) => `src/f${i}.test.ts`);
+    const resolved = new Map(files.map((f) => [f, 1]));
+    const baseline = Object.fromEntries(files.map((f) => [f, 1]));
+    baseline['src/f0.test.ts'] = 3;
+    const { probe } = scriptedProbe([{ failing: baseline }]);
+    const v = await classifyFailure(resolved, 'prefixsha0000', probe);
+    expect(v.verdict).toBe('pre-existing');
   });
 });

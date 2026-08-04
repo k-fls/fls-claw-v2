@@ -216,7 +216,8 @@ around a blocking id.
 | `WARN01_TEMPLATE_TEXT` | rewrite the body from the case materials |
 | `WARN02_NO_DECISION_LINE` | open the body with the exact decision the owner is asked to make |
 | `WARN03_MANY_PRS` | >8 PRs this pass — re-check for consolidation |
-| `WARN14_ENVIRONMENT_FAULT` | the checks failed because the ENVIRONMENT is broken (a missing native binding, an unresolvable module, a missing binary) — not the code. No case was created and nothing was merged. Stop-case 2 report: quote the signature and say the dependency trees must be rebuilt. Do NOT try to fix it in code and do NOT re-run |
+| `WARN14_ENVIRONMENT_FAULT` | the checks failed because the ENVIRONMENT is broken (a missing native binding, an unresolvable module, a missing binary) — not the code. Nothing was merged, no case was created, and the attempt was NOT counted against your case. Stop-case 2 report: quote the signature and say the dependency trees must be rebuilt. Do NOT try to fix it in code and do NOT re-run |
+| `WARN15_UPSTREAM_RED` | the failure was blamed to UPSTREAM `main`, which is outside this sweep's mandate — we do not commit there, so no case was created. Stop-case 2 report: upstream is red and the fork is merging from it. Owner action only |
 | `WARN12_SCOPE_WIDENED` | your `--not-my-bug` claim was proven AND the failure belongs to no branch — both sides of the merge are green alone and only the merged tree is red, so it is THIS merge's defect. The named files are now IN your edit scope: fix the failure there, re-run `report-case`. The cold reader has been told |
 | `WARN09_GATE_FIX_SERVED` | a GATE-FIX case has been PREPARED and is waiting — run `next-case` and work it like any other case. This is NOT a stop: the accompanying text explains why the build is red, and reporting that diagnosis instead of working the case is the failure mode this id exists to prevent |
 

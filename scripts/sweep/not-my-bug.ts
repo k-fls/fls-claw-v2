@@ -71,6 +71,10 @@
  */
 const ENV_FAULT_PATTERNS: RegExp[] = [
   /Could not locate the bindings file/i,
+  // TS2307 (cannot find module/declarations), TS2688 (missing @types), TS5012
+  // (cannot read file), TS6053 (file not found), TS2318 (missing global type) —
+  // the compiler failing to RESOLVE its inputs, not to check them.
+  /error TS(?:2307|2688|5012|6053|2318)\b/,
   /was compiled against a different Node\.js version/i,
   /invalid ELF header|wrong ELF class/i,
   /Cannot find module '[^']*'\s*$/im,
@@ -106,9 +110,18 @@ export function classifyEnvironmentFault(output: string): EnvFaultVerdict {
   if (!hit) return { isEnvironment: false, signature: null, detail: '' };
   // A genuine assertion anywhere means code is being exercised and failing on
   // its own terms; the resolution error is then incidental, not the story.
+  //
+  // `error TS…` USED TO VETO WHOLESALE, and that made this function dead code for
+  // the entire typecheck kind — `checks.typecheck` runs before `checks.test` and
+  // short-circuits, so a typecheck failure was the only thing it could ever be
+  // asked about, and every one of them carries `error TS`. Worse, TS2307 "Cannot
+  // find module" IS a resolution diagnostic: exactly this class. Live 2026-08-04,
+  // a missing `yaml` was read as the agent's code defect. So TS codes are split —
+  // resolution codes are environment evidence, everything else is a real
+  // compile error and vetoes as before.
+  const otherTsError = /error TS(?!2307\b|2688\b|5012\b|6053\b|2318\b)\d+/.test(output);
   const asserts =
-    /AssertionError|expected .* (?:to|but)\b|toBe\(|toEqual\(|Expected:.*Received:/is.test(output) ||
-    /error TS\d+/.test(output);
+    /AssertionError|expected .* (?:to|but)\b|toBe\(|toEqual\(|Expected:.*Received:/is.test(output) || otherTsError;
   if (asserts) return { isEnvironment: false, signature: null, detail: '' };
   const framed = ENV_FAULT_FRAME.test(output);
   const signature = String(hit).replace(/^\/|\/[a-z]*$/g, '');
@@ -187,6 +200,26 @@ function mergeCounts(a: Map<string, number>, b: Map<string, number>): Map<string
   return out;
 }
 
+/**
+ * How many simultaneously failing files stops looking like one defect and starts
+ * looking like a broken environment. Deliberately well above anything a real
+ * resolution-blocking defect produces (the live cases were 1 and 3 files) and at
+ * the bottom of the observed environment-fault range (44).
+ */
+const IMPLAUSIBLE_BREADTH = 10;
+
+/**
+ * Did anything DISTINGUISH the two runs? True when the baseline failed strictly
+ * more than the resolved tree somewhere — the control that proves the checks can
+ * still report a difference at all. Without it, "identical failures" carries no
+ * information: it is equally consistent with a real pre-existing defect and with
+ * an environment in which nothing can pass.
+ */
+function hasControl(baseline: Map<string, number>, resolved: Map<string, number>): boolean {
+  for (const [f, n] of baseline) if (n > (resolved.get(f) ?? 0)) return true;
+  return false;
+}
+
 /** Files whose resolved-tree failure count the baseline does NOT account for. */
 function uncovered(resolved: Map<string, number>, baseline: Map<string, number>): string[] {
   return [...resolved.entries()].filter(([f, n]) => (baseline.get(f) ?? 0) < n).map(([f]) => f);
@@ -226,6 +259,32 @@ export async function classifyFailure(
   // Rule 2, confirming half: one red on a tree that does not contain the agent's
   // edits is proof enough. No repetition — repeating it cannot change the answer.
   if (uncovered(resolved, b1.counts).length === 0) {
+    // BREADTH BACKSTOP (owner, 2026-08-04). "Both sides fail identically" is the
+    // NORMAL shape of a confirmed pre-existing defect — the 08-01 poll-loop case
+    // is exactly one file failing the same way on both trees — so identity alone
+    // proves nothing either way and must not be treated as suspicious.
+    //
+    // What was anomalous on 2026-08-03 was BREADTH: 44 files at once, none of
+    // them passing anywhere. A pre-existing defect that blocks a resolution
+    // across dozens of unrelated files simultaneously is vanishingly rare; a
+    // broken toolchain or dependency tree looks exactly like that. So the guard
+    // fires only on implausible breadth WITH no discriminating observation
+    // anywhere — never on the ordinary one- or two-file case.
+    //
+    // This sits BEHIND `classifyEnvironmentFault`, which catches the same class
+    // by diagnostic shape and is the primary defence. It exists for the shapes
+    // nobody has enumerated yet — which is precisely what a heuristic is for.
+    if (resolved.size >= IMPLAUSIBLE_BREADTH && !hasControl(b1.counts, resolved)) {
+      return {
+        verdict: 'undecidable',
+        files,
+        probes: 1,
+        detail:
+          `${files.length} files fail on BOTH trees and nothing passed on either — too broad to be one defect, and ` +
+          `the comparison distinguished nothing. This is what a broken toolchain or dependency tree looks like; ` +
+          `the environment must be checked before any code is blamed`,
+      };
+    }
     return {
       verdict: 'pre-existing',
       files,
