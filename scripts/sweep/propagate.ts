@@ -198,6 +198,13 @@ interface Cli {
    * does not know a test failed at all.
    */
   notMyBug?: boolean;
+  /**
+   * Dependency-install seam. NOT a CLI flag — an injection point, because
+   * `createCaseWorktree` is reached deep inside `cmdRun` and no per-call
+   * parameter can carry a stub that far. Without it every fixture case worktree
+   * spawns a real `pnpm install`.
+   */
+  installRunner?: InstallRunner;
   resolvedRef?: string;
   /**
    * publish: file holding the substitute GitHub token (§14, D-048). The agent
@@ -1757,20 +1764,17 @@ export interface ProbeRun {
  * `firstRedParticipant` uses) — a bisect can ask for a dozen trees and creating
  * a worktree each time is the expensive part.
  *
- * DEPENDENCIES ARE PER TREE. `ensureDepsPool` keys on the manifest digest, so
- * probing across a range where `package.json` moves re-pools exactly when it has
- * to and reuses the pool otherwise. A tree whose pool cannot be built is
- * UNUSABLE, not green: falling back to the clone's `node_modules` is what
- * reported `TS2307 Cannot find module 'node-forge'` as a code defect and minted
- * a bogus gate-fix case on 2026-08-01 (bc92eed8). For a probe, an environment we
- * cannot trust must be skipped rather than believed.
+ * DEPENDENCIES ARE PER TREE, installed into the worktree from the manifests that
+ * tree carries (`installDeps`). A tree whose dependencies will not install is
+ * UNUSABLE, never green — an environment we cannot trust must be skipped rather
+ * than believed, which is the whole admissibility rule this probe enforces.
  */
 function makeSubsetProbe(
   cli: Cli,
   commands: VerifyCommand[],
   runChecks: ChecksRunner,
   caseWorktree: string,
-  runInstall: InstallRunner = defaultInstallRunner,
+  runInstall?: InstallRunner,
   opts: {
     /**
      * Narrow each run to the files in question (`VerifyCommand.filter`). OFF for
@@ -1787,14 +1791,6 @@ function makeSubsetProbe(
      * reproduce under that same narrowing.
      */
     narrow?: boolean;
-    /**
-     * Force a specific dependency pool instead of deriving one per tree. The
-     * adjudication passes the CASE's pool so both sides of the comparison run
-     * with identical dependencies; otherwise a lockfile the merge brought down
-     * gives the baseline packages the case worktree does not have, and the
-     * environment gap is reported as the agent's regression.
-     */
-    poolRef?: string;
   } = {},
 ): { probe: SubsetProbe; runs: ProbeRun[]; dispose: () => Promise<void> } {
   const runs: ProbeRun[] = [];
@@ -1810,19 +1806,6 @@ function makeSubsetProbe(
     if (target.kind === 'worktree') {
       baseDir = caseWorktree;
     } else {
-      const pool = await ensureDepsPool(cli, opts.poolRef ?? target.sha, runInstall);
-      if (!pool) {
-        // No pool has two causes and they mean opposite things. A tree that
-        // DECLARES dependencies and could not have them installed is untrusted —
-        // skip it (falling back to the clone's node_modules is what reported
-        // `TS2307 Cannot find module 'node-forge'` as a code defect). A tree with
-        // no manifests at all needs nothing installed and runs as it is.
-        const declares = await git(cli.repo, ['cat-file', '-e', `${target.sha}:package.json`], { allowCodes: [1, 128] });
-        if (declares.code === 0) {
-          runs.push({ target: target.sha.slice(0, 12), files, usable: false, failing: [] });
-          return empty;
-        }
-      }
       try {
         if (!wt) {
           wt = await addTempWorktree(cli.repo, target.sha);
@@ -1838,7 +1821,10 @@ function makeSubsetProbe(
           });
           for (const rel of WORKTREE_DEP_LINKS) rmSync(join(wt.path, rel), { recursive: true, force: true });
         }
-        await linkNodeModules(cli.repo, wt.path, pool);
+        if (!(await installDeps(cli, wt.path, runInstall))) {
+          runs.push({ target: target.sha.slice(0, 12), files, usable: false, failing: [] });
+          return empty;
+        }
       } catch {
         runs.push({ target: target.sha.slice(0, 12), files, usable: false, failing: [] });
         return empty;
@@ -2015,184 +2001,6 @@ async function cleanPrefixTree(
 const WORKTREE_DEP_LINKS = ['node_modules', 'container/agent-runner/node_modules'];
 
 /**
- * The dependency MANIFESTS that decide what `node_modules` must contain. Two
- * independent trees: the root (pnpm) and container/agent-runner (bun).
- */
-const DEP_MANIFESTS = [
-  'pnpm-lock.yaml',
-  'package.json',
-  'pnpm-workspace.yaml',
-  'container/agent-runner/bun.lock',
-  'container/agent-runner/package.json',
-];
-
-/**
- * A DEPENDENCY POOL key for a tree: the digest of its manifests.
- *
- * Branches do not share dependencies. Measured on this fork: four branches
- * carry lockfiles differing from the base, and `feat/mitm-credential-proxy`
- * declares `node-forge` that the base does not. Checking such a branch against
- * the base's node_modules reports `TS2307 Cannot find module 'node-forge'` —
- * an ENVIRONMENT gap read as a code defect, which is exactly what minted a
- * bogus gate-fix case on 2026-08-01.
- *
- * Keyed by CONTENT, not by branch: two branches with identical manifests share
- * one pool (mitm-credential-proxy and onecli-broker do), and a branch whose
- * deps never change reuses the same pool across passes forever.
- */
-export async function depsKey(repo: string, ref: string): Promise<string> {
-  const h = createHash('sha256');
-  for (const f of DEP_MANIFESTS) {
-    const r = await git(repo, ['show', `${ref}:${f}`], { allowCodes: [128] });
-    h.update(f).update('\0').update(r.code === 0 ? r.stdout : '').update('\0');
-  }
-  return h.digest('hex').slice(0, 12);
-}
-
-/** Where a pool lives: beside the pnpm store, so it survives clean-slate too. */
-function depsPoolDir(workspace: string, key: string): string {
-  return join(workspace, 'deps-pool', key);
-}
-
-/**
- * Ensure a dependency pool exists for `ref`, and return its directory.
- *
- * The pool is a bare directory holding only the manifests plus the installed
- * trees — never a checkout. Installs run INSIDE it, so nothing is copied or
- * moved afterwards and pnpm's hardlinks into its content-addressable store
- * survive (measured: `links=2`, store 151MB on a persistent mount). A warm
- * store means an install links rather than downloads.
- *
- * Returns null when the manifests cannot be read or an install fails — callers
- * fall back to the clone's node_modules, which is what every worktree used
- * before this existed.
- */
-export async function ensureDepsPool(cli: Cli, ref: string, runInstall: InstallRunner): Promise<string | null> {
-  let key: string;
-  try {
-    key = await depsKey(cli.repo, ref);
-  } catch {
-    return null;
-  }
-  const pool = depsPoolDir(cli.workspace, key);
-  // node_modules present => already built. Cheap idempotence: a pool is only
-  // ever completed or absent, never half-written under its final name.
-  if (existsSync(join(pool, 'node_modules'))) return pool;
-  const staging = `${pool}.building`;
-  rmSync(staging, { recursive: true, force: true });
-  mkdirSync(join(staging, 'container', 'agent-runner'), { recursive: true });
-  for (const f of DEP_MANIFESTS) {
-    const r = await git(cli.repo, ['show', `${ref}:${f}`], { allowCodes: [128] });
-    if (r.code !== 0) continue;
-    writeFileSync(join(staging, f), r.stdout);
-  }
-  if (!existsSync(join(staging, 'package.json'))) {
-    rmSync(staging, { recursive: true, force: true });
-    return null;
-  }
-  const ok = await runInstall(staging);
-  if (!ok || !existsSync(join(staging, 'node_modules'))) {
-    rmSync(staging, { recursive: true, force: true });
-    return null;
-  }
-  // SMOKE CHECK before the pool is published under its final name. A pool that
-  // installed "successfully" but cannot actually LOAD its native modules is the
-  // most expensive failure this driver has: it is indistinguishable from a code
-  // defect at the checks gate, so the sweep blames a branch, mints a gate-fix
-  // case and asks an agent to fix source code for a broken environment (live
-  // 2026-08-03 — a 44-file case on `module/container-queue`, every diagnostic a
-  // missing binding). Catch it HERE, where it is one unusable pool, instead of
-  // downstream where it is a confident wrong answer.
-  if (!(await poolLoads(staging))) {
-    // NOT journaled here: `ensureDepsPool` has no pass dir (it is called from
-    // paths that predate one), and `appendJournal` writes `<dir>/journal.jsonl`
-    // — handing it the workspace would scatter a stray journal beside the pass
-    // dirs. The callers journal: a probe records `usable: false` and the
-    // pre-merge check surfaces the branch, both with the pass dir in hand.
-    console.error(`deps-pool [WARN13_DEPS_POOL_UNUSABLE]: ${ref} installed but unusable (native modules do not load) — not published`);
-    rmSync(staging, { recursive: true, force: true });
-    return null;
-  }
-  rmSync(pool, { recursive: true, force: true });
-  mkdirSync(dirname(pool), { recursive: true });
-  renameSync(staging, pool); // same filesystem: atomic, and hardlinks survive
-  return pool;
-}
-
-/**
- * Can this pool's NATIVE modules actually be loaded? `pnpm install` reporting
- * success says the files are on disk, not that a compiled addon exists for this
- * node ABI — and every native package the repo uses is loaded through
- * `bindings`, which fails at REQUIRE time, deep inside a test run, looking
- * exactly like the code under test is broken.
- *
- * Deliberately narrow: it loads the packages listed in the pool's own
- * `package.json` that ship a `binding.gyp`/`prebuilds` marker. A pool with no
- * native dependencies passes trivially.
- */
-async function poolLoads(pool: string): Promise<boolean> {
-  const nm = join(pool, 'node_modules');
-  if (!existsSync(nm)) return false;
-  let names: string[] = [];
-  try {
-    const pkg = JSON.parse(readFileSync(join(pool, 'package.json'), 'utf8')) as {
-      dependencies?: Record<string, string>;
-      devDependencies?: Record<string, string>;
-    };
-    names = [...Object.keys(pkg.dependencies ?? {}), ...Object.keys(pkg.devDependencies ?? {})];
-  } catch {
-    return false;
-  }
-  const native = names.filter((n) => {
-    const d = join(nm, n);
-    return existsSync(join(d, 'binding.gyp')) || existsSync(join(d, 'prebuilds')) || existsSync(join(d, 'build'));
-  });
-  if (native.length === 0) return true;
-  const probe = native.map((n) => `require(${JSON.stringify(n)})`).join(';');
-  try {
-    await promisify(execFile)('node', ['-e', probe], { cwd: pool, maxBuffer: 8 * 1024 * 1024 });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** Runs the installs for a prepared pool directory. Injectable for tests. */
-export type InstallRunner = (dir: string) => Promise<boolean>;
-
-const defaultInstallRunner: InstallRunner = async (dir) => {
-  const run = async (cmd: string, cwd: string): Promise<boolean> => {
-    try {
-      await promisify(execFile)('bash', ['-c', cmd], { cwd, maxBuffer: 64 * 1024 * 1024 });
-      return true;
-    } catch {
-      return false;
-    }
-  };
-  // NO `--ignore-scripts`. Skipping lifecycle scripts skips the NATIVE BUILD:
-  // `better-sqlite3` never compiles its addon, so every suite that opens a
-  // database dies with "Could not locate the bindings file" — in EVERY tree
-  // linked to that pool. Live 2026-08-03: 76 such errors and ZERO assertion
-  // failures in one case, and because a pool is keyed by manifest digest it can
-  // never self-heal — six poisoned pools were reused for every probe.
-  //
-  // The flag is untrusted-code defence, and it buys nothing here: these are the
-  // fork's OWN lockfiles, and the clone the pool stands in for was installed
-  // with scripts. Defending against our own postinstall while shipping a broken
-  // environment into the checks gate is the wrong trade.
-  const rootOk = await run('pnpm install --frozen-lockfile', dir);
-  if (!rootOk) return false;
-  const ar = join(dir, 'container', 'agent-runner');
-  // A repo without the second tree simply has nothing to install. When it HAS
-  // one and the install FAILS, the pool is incomplete: `linkNodeModules` then
-  // silently falls back to the CLONE's node_modules for that tree, which is the
-  // untrusted-environment case the pool exists to rule out. Swallowing the
-  // result reported it as a healthy pool.
-  if (existsSync(join(ar, 'package.json')) && !(await run('bun install --frozen-lockfile', ar))) return false;
-  return true;
-};
-
-/**
  * Make paths invisible to `git add -A`, via `$GIT_COMMON_DIR/info/exclude` —
  * NOT a `.gitignore` edit (that would be committed and leak into every PR).
  * `info/exclude` is repo-local and never committed.
@@ -2224,43 +2032,89 @@ async function excludeInWorktree(repo: string, wtPath: string, patterns: string[
 }
 
 /**
- * D-060 fix: a `git worktree add` checkout has NO `node_modules`, so the checks
- * gate (`pnpm run typecheck` / `pnpm test`, run IN the case worktree) would fail
- * with `tsc: not found` on EVERY resolved case — a failure the agent cannot fix
- * by editing conflicted files, which would march `checksFailCount` to
- * `CHECKS_FAIL_LIMIT` and force-freeze every case as a bogus
- * `[AUTO-ESCALATED: checks failing]` HELD draft.
+ * Install the tree's dependencies INTO THE WORKTREE, from the manifests that are
+ * in that worktree. Returns false when no valid environment could be produced.
  *
- * Symlink the CLONE's installed dependency trees into the worktree so the checks
- * run against the agent's resolved tree with the deps the clone already has. The
- * links are excluded per-worktree FIRST (`excludeInWorktree`) — do NOT rely on
- * `.gitignore`, which does not match them (see above); without the exclude these
- * symlinks land in the resolved tree, the merge, and the PR.
- * Best-effort and per-tree: a missing tree in the clone is simply not linked
- * (and its check then fails loudly and correctly, rather than silently).
+ * THIS REPLACES DEPENDENCY POOLS (2026-08-04), and the reason is worth keeping.
+ * Pools were introduced three days earlier (bc92eed8) against a real bug: every
+ * worktree symlinked the CLONE's `node_modules`, so a branch declaring its own
+ * package was typechecked against the wrong dependency tree and reported
+ * `TS2307 Cannot find module` — an environment gap read as a code defect, which
+ * minted a gate-fix case blaming the branch. The clone's tree is mutable too: an
+ * install run mid-pass made the SAME sha go red at 05:09 and green at 05:30 with
+ * no commit between.
+ *
+ * The diagnosis was right and the cure was worse. A pool is a SHARED, CACHED,
+ * KEYED artifact, and each of those three properties produced a production
+ * incident inside three days:
+ *   - installed with `--ignore-scripts`, so native addons never compiled and
+ *     every DB-touching suite died at require time — in every tree linked to it;
+ *   - keyed on the PRE-MERGE branch tip while the worktree held the MERGED tree,
+ *     so a dependency the merge introduced was simply absent;
+ *   - keyed on manifests alone, so no fix could ever invalidate an existing pool
+ *     — the poisoned ones had to be deleted by hand, and a node upgrade would
+ *     have silently reproduced the first incident with no code change at all.
+ * Each was reported to the sweep as a code failure and turned into branch-
+ * targeted work. A pool is also exactly the LOCAL STATE that D-058 §2 abolishes:
+ * it survived clean-slate by design, keyed by a value that could not change in
+ * response to the bug, and never self-healed.
+ *
+ * Installing into the worktree is correct BY CONSTRUCTION: the environment is a
+ * function of the tree under test and nothing else, there is no cache to poison,
+ * no key to invalidate, and no fallback that can silently restore the original
+ * bug. Measured in the real agent image with a warm store (153 MB, hardlinked):
+ * pnpm 3.5s cold / 2.4s repeat, bun 2s — about five seconds per worktree, which
+ * is not worth a caching layer that costs correctness.
+ *
+ * The dep dirs are excluded from git FIRST: `.gitignore` does not cover them
+ * (it ignores `node_modules/` WITH a trailing slash, which matches directories
+ * only), and without the exclude they land in the resolved tree, the merge and
+ * the PR.
  */
-async function linkNodeModules(repo: string, wtPath: string, poolDir?: string | null): Promise<string[]> {
-  await excludeInWorktree(repo, wtPath, WORKTREE_DEP_LINKS);
-  const linked: string[] = [];
-  for (const rel of WORKTREE_DEP_LINKS) {
-    // Prefer the tree's OWN dependency pool; fall back to the clone's installed
-    // trees. The fallback is what every worktree used before pools existed, and
-    // it is wrong whenever the tree's manifests differ from the clone's — that
-    // is the bug pools fix — but a missing pool must degrade to the old
-    // behaviour rather than leave a worktree with no dependencies at all.
-    const src = poolDir && existsSync(join(poolDir, rel)) ? join(poolDir, rel) : join(repo, rel);
-    const dest = join(wtPath, rel);
-    if (!existsSync(src) || existsSync(dest)) continue;
-    try {
-      mkdirSync(dirname(dest), { recursive: true });
-      symlinkSync(src, dest, 'dir');
-      linked.push(rel);
-    } catch {
-      /* best-effort: an unlinkable tree just leaves that check to fail loudly */
-    }
-  }
-  return linked;
+async function installDeps(cli: Cli, wtPath: string, runInstall?: InstallRunner): Promise<boolean> {
+  await excludeInWorktree(cli.repo, wtPath, WORKTREE_DEP_LINKS);
+  return (runInstall ?? cli.installRunner ?? defaultInstallRunner)(wtPath);
 }
+
+/**
+ * Runs the installs for a prepared worktree. Injectable so tests never spawn a
+ * real pnpm/bun.
+ *
+ * Returns FALSE for any failure. There is no fallback: a tree whose dependencies
+ * could not be installed has NO valid environment, and a check run in it is an
+ * inadmissible observation — not evidence about the code. The previous fallback
+ * (link the clone's `node_modules` instead) is precisely how an environment gap
+ * became a `TS2307` blamed on a branch.
+ */
+export type InstallRunner = (worktree: string) => Promise<boolean>;
+
+const defaultInstallRunner: InstallRunner = async (dir) => {
+  const run = async (cmd: string, cwd: string): Promise<boolean> => {
+    try {
+      await promisify(execFile)('bash', ['-c', cmd], {
+        cwd,
+        maxBuffer: 64 * 1024 * 1024,
+        // corepack needs a writable HOME (it resolves the repo's
+        // `packageManager` pin) and pnpm needs the shared store; both are
+        // ambient in the container today, so state them rather than inherit
+        // them by luck. Measured: without a writable HOME the install dies
+        // `EACCES … /.cache/node/corepack`.
+        env: { ...process.env, HOME: process.env.HOME || tmpdir() },
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  // NO `--ignore-scripts`: it skips the NATIVE BUILD, so `better-sqlite3` never
+  // compiles its addon and every suite that opens a database fails at require
+  // time. These are the fork's own lockfiles; the flag is untrusted-code defence
+  // that buys nothing here and breaks the tree it is meant to protect.
+  if (!(await run('pnpm install --frozen-lockfile', dir))) return false;
+  const ar = join(dir, 'container', 'agent-runner');
+  if (existsSync(join(ar, 'package.json')) && !(await run('bun install --frozen-lockfile', ar))) return false;
+  return true;
+};
 
 /**
  * Prepare a case's resolution worktree. Returns FALSE when it could not be
@@ -2271,12 +2125,14 @@ async function linkNodeModules(repo: string, wtPath: string, poolDir?: string | 
  * over a tree that still held the agent's discarded edits. The claim has to
  * follow the outcome.
  */
-async function createCaseWorktree(
+export async function createCaseWorktree(
   cli: Cli,
   dir: string,
   caseFile: CaseFile,
   baseTip: string,
   contentSource?: string,
+  /** Injectable so tests never spawn a real pnpm/bun. */
+  runInstall?: InstallRunner,
 ): Promise<boolean> {
   const wtPath = join(dir, caseFile.id, 'worktree');
   try {
@@ -2319,8 +2175,11 @@ async function createCaseWorktree(
     // shared .git so rerere-enabled operations in the case worktree see the
     // recorded resolutions. Best-effort, like the worktree itself.
     const seeded = await installRrCache(cli.repo, join(cli.workspace, RR_CACHE_DIRNAME));
-    const casePool = await ensureDepsPool(cli, caseFile.branch, defaultInstallRunner);
-    const linkedDeps = await linkNodeModules(cli.repo, wtPath, casePool);
+    // Installed from the WORKTREE's own manifests — which are the MERGED ones.
+    // Keying this on the pre-merge branch tip is what made a dependency the merge
+    // introduced (`yaml`, live 2026-08-04) look like `TS2307` in the agent's code.
+    const depsOk = await installDeps(cli, wtPath, runInstall);
+    const linkedDeps = depsOk ? WORKTREE_DEP_LINKS : [];
     appendJournal(dir, {
       action: 'case-worktree',
       caseId: caseFile.id,
@@ -4936,7 +4795,13 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     commands,
     baseRef,
     rrCacheDir,
-    prepareWorktree: (wtPath: string) => linkNodeModules(cli.repo, wtPath),
+    // The verify worktree is base + every publishable branch merged, so its
+    // manifests are the MERGED ones and nothing else can describe them. (It
+    // previously linked the clone's trees, which is the same environment gap.)
+    prepareWorktree: async (wtPath: string) => {
+      const ok = await installDeps(cli, wtPath);
+      return ok ? WORKTREE_DEP_LINKS : [];
+    },
   };
 
   if (recipe.length === 0) {
@@ -6818,12 +6683,12 @@ function participatingBranches(dir: string): string[] {
  * the same mistake as the sha-keyed attempts file that D-058 §2 exists to rule
  * out.)
  */
-async function firstRedParticipant(
+export async function firstRedParticipant(
   cli: Cli,
   dir: string,
   checksFile: string | undefined,
   runChecks: ChecksRunner,
-  runInstall: InstallRunner = defaultInstallRunner,
+  runInstall?: InstallRunner,
 ): Promise<{ branch: string; sha: string; output: string; failed: VerifyCommand[]; failedNames: string[] } | null> {
   // An ABSENT checks file is a deliberate skip (a repo without one behaves as
   // before). A CONFIGURED one that will not load is a silently disabled gate —
@@ -6864,14 +6729,21 @@ async function firstRedParticipant(
       // feat/mitm-credential-proxy) reports TS2307 and is blamed for an
       // environment gap — and worse, an unchanged sha flips red->green the
       // moment anything installs into the shared clone (live 2026-08-01).
-      const pool = await ensureDepsPool(cli, branch, runInstall);
+
       if (!wt) {
         wt = await addTempWorktree(cli.repo, sha);
       } else {
         await git(cli.repo, ['reset', '--hard', sha], { cwd: wt.path });
         for (const rel of WORKTREE_DEP_LINKS) rmSync(join(wt.path, rel), { recursive: true, force: true });
       }
-      await linkNodeModules(cli.repo, wt.path, pool);
+      if (!(await installDeps(cli, wt.path, runInstall))) {
+        // No valid environment ⇒ no verdict. Memoising this as a pass would skip
+        // the branch's only typecheck for the whole pass (a bogus GREEN is the
+        // durable one — it ships), and as a failure it would blame the branch.
+        appendJournal(dir, { action: 'warning', id: 'WARN13_DEPS_UNUSABLE', branch, sha, message: `dependencies would not install for ${branch}@${sha.slice(0, 12)} — not checked` });
+        console.error(`next-case [WARN13_DEPS_UNUSABLE]: ${branch} dependencies would not install — branch NOT checked`);
+        continue;
+      }
       const r = await runChecks(checks.typecheck, wt.path);
       appendJournal(dir, { action: 'branch-check', branch, sha, ok: r.ok, ...(r.ok ? {} : { failed: r.failedNames }) });
       if (!r.ok) {
@@ -6889,7 +6761,7 @@ export async function cmdSweepNextCase(
   cli: Cli,
   runChecks: ChecksRunner = defaultChecksRunner,
   /** Pre-merge branch check installs per-branch dependencies; injectable for tests. */
-  runInstall: InstallRunner = defaultInstallRunner,
+  runInstall?: InstallRunner,
 ): Promise<number> {
   const ctx = await attachPass(cli);
   const dir = ctx.dir;
@@ -7161,7 +7033,7 @@ async function adjudicateNotMyBug(p: {
   failedCommands: VerifyCommand[];
   failingOutput: string;
   runChecks: ChecksRunner;
-  runInstall: InstallRunner;
+  runInstall?: InstallRunner;
 }): Promise<NotMyBugOutcome> {
   const { cli, ctx, dir, caseId, rc, wtPath, kind, failedCommands, failingOutput } = p;
   const branch = rc.branch;
@@ -7204,15 +7076,18 @@ async function adjudicateNotMyBug(p: {
   }
 
   // TWO probes over ONE temp worktree. The adjudication runs the failed commands
-  // WHOLE, with the CASE's dependency pool, so both sides of the comparison are
-  // the same population the gate measured. The bisect narrows to the failing
-  // files and re-pools per commit — it compares a commit against its own history,
-  // where per-tree dependencies are the correct choice and full-suite cost is not
-  // affordable across a dozen probes.
-  const casePool = await depsKey(cli.repo, rc.branch).catch(() => null);
-  const { probe, runs, dispose } = makeSubsetProbe(cli, failedCommands, p.runChecks, wtPath, p.runInstall, {
-    poolRef: casePool ? rc.branch : undefined,
-  });
+  // WHOLE, so both sides of the comparison are the population the gate measured;
+  // the bisect narrows to the failing files, since it compares a commit against
+  // its own history and full-suite cost is not affordable across a dozen probes.
+  //
+  // NEITHER forces an environment. An earlier cut pinned the CASE's pool onto
+  // every probe so a lockfile difference could not decide a verdict — but the
+  // clean prefix was the side that was already RIGHT (it carries the merged
+  // manifests), and the case worktree was the broken one. Forcing bought
+  // comparability by corrupting the correct observation, and that is what
+  // produced a false `pre-existing`, a converged bisect and a PR against
+  // upstream `main` on 2026-08-04. Each tree gets its own dependencies.
+  const { probe, runs, dispose } = makeSubsetProbe(cli, failedCommands, p.runChecks, wtPath, p.runInstall);
   const { probe: narrowProbe, runs: narrowRuns, dispose: disposeNarrow } = makeSubsetProbe(
     cli,
     failedCommands,
@@ -7573,7 +7448,7 @@ export async function cmdSweepReportCase(
   invoke: ColdReadInvoker = defaultColdReadInvoker,
   runChecks: ChecksRunner = defaultChecksRunner,
   /** `--not-my-bug` probes install per-tree dependencies; injectable for tests. */
-  runInstall: InstallRunner = defaultInstallRunner,
+  runInstall?: InstallRunner,
 ): Promise<number> {
   const claimed = cli.tier;
   if (claimed !== 'mechanical' && claimed !== 'judged' && claimed !== 'held') {
@@ -8858,7 +8733,7 @@ async function createGateFixWorktree(cli: Cli, dir: string, caseId: string, tip:
   await git(cli.repo, ['worktree', 'prune'], { allowCodes: [1, 128] });
   rmSync(wtPath, { recursive: true, force: true });
   await git(cli.repo, ['worktree', 'add', '--detach', wtPath, tip]);
-  await linkNodeModules(cli.repo, wtPath, await ensureDepsPool(cli, tip, defaultInstallRunner));
+  await installDeps(cli, wtPath);
 }
 
 /** One related PR in a finished pass's owner-facing summary (D-059 owner request). */

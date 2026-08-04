@@ -110,6 +110,10 @@ function baseCli(repo: FixtureRepo, ws: string, inv: string, over: Partial<Cli> 
     scopeFile: join(inv, 'no-scope.yaml'), // non-existent -> empty scope (structural only)
     upstream: 'main',
     execute: false,
+    // Deps are installed INTO each worktree now (pools deleted 2026-08-04), and
+    // `createCaseWorktree` sits deep inside `cmdRun` — without this seam every
+    // fixture case worktree would spawn a real `pnpm install`.
+    installRunner: fakeInstall,
     ...over,
   };
 }
@@ -180,6 +184,20 @@ function currentCaseId(dir: string): string {
 
 /** Pre-merge branch check stub: fixtures that are not testing IT inject green. */
 const greenPreMerge: ChecksRunner = async () => ({ ok: true, failedNames: [], output: '' });
+
+/**
+ * Dependency install stub. Pools were deleted 2026-08-04: deps are installed
+ * INTO the worktree from its own manifests, so the stub creates the two trees
+ * there. Tests must inject it — there is no fallback to the clone any more, and
+ * a tree with no valid environment yields no verdict at all.
+ */
+const fakeInstall: InstallRunner = async (wt) => {
+  for (const rel of ['node_modules/.bin', 'container/agent-runner/node_modules/.bin']) {
+    mkdirSync(join(wt, rel), { recursive: true });
+    writeFileSync(join(wt, rel, 'tsc'), '#!/bin/sh\nexit 0\n');
+  }
+  return true;
+};
 
 const confirm: ColdReadInvoker = async () => ({
   verdict: 'confirm',
@@ -979,18 +997,15 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     expect((JSON.parse(readFileSync(out, 'utf8')) as { tier: string }).tier).toBe('held');
   });
 
-  it('the case worktree gets the clone dep trees LINKED, so the gate can actually run (tsc/vitest resolve)', async () => {
+  it('the case worktree gets its deps INSTALLED (not the clone linked), so the gate can run', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
-    // The clone has installed deps; a `git worktree add` checkout does NOT, so
-    // without the link `pnpm run typecheck` dies with `tsc: not found` on EVERY
-    // resolved case — a failure no agent edit can fix, marching every case to
-    // the CHECKS_FAIL_LIMIT force-HELD. Both trees the shipped checks.json needs.
-    for (const rel of ['node_modules/.bin', 'container/agent-runner/node_modules/.bin']) {
-      mkdirSync(join(repo.dir, rel), { recursive: true });
-      writeFileSync(join(repo.dir, rel, 'tsc'), '#!/bin/sh\nexit 0\n');
-    }
+    // A `git worktree add` checkout has no `node_modules`, so without this the
+    // gate dies `tsc: not found` on EVERY case — a failure no agent edit can fix,
+    // marching every case to the CHECKS_FAIL_LIMIT force-HELD. Pools used to
+    // supply it and were deleted (2026-08-04); the install now runs IN the
+    // worktree, from the manifests that worktree carries.
     await cmdSweepStart(baseCli(repo, ws, inv));
     await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const dir = dirOf(repo, ws);
@@ -998,28 +1013,23 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     const wt = join(dir, caseId, 'worktree');
     for (const rel of ['node_modules', 'container/agent-runner/node_modules']) {
       expect(existsSync(join(wt, rel))).toBe(true);
-      expect(lstatSync(join(wt, rel)).isSymbolicLink()).toBe(true);
-      expect(realpathSync(join(wt, rel))).toBe(realpathSync(join(repo.dir, rel)));
+      // REAL directories in the worktree — NOT symlinks into a shared tree. That
+      // sharing is what let one poisoned install answer for every branch.
+      expect(lstatSync(join(wt, rel)).isSymbolicLink()).toBe(false);
     }
-    expect(existsSync(join(wt, 'node_modules', '.bin', 'tsc'))).toBe(true); // resolves through the link
-    expect(readJournal(dir).find((e) => e.action === 'case-worktree')!.linkedDeps).toEqual([
-      'node_modules',
-      'container/agent-runner/node_modules',
-    ]);
+    expect(existsSync(join(wt, 'node_modules', '.bin', 'tsc'))).toBe(true);
     // REGRESSION (live bug, 2026-07-28): `.gitignore` has `node_modules/` — a
-    // trailing slash matches DIRECTORIES ONLY — while git records a symlink as
-    // mode 120000, a FILE. The ignore rule therefore does NOT cover these links,
-    // and `git add -A` staged both into every resolved tree of the first live
-    // pass. The per-worktree info/exclude is what actually keeps them out.
-    // Assert on TREE MODES, not on a name: the original name-only assertion
-    // passed while the bug shipped.
+    // trailing slash matches DIRECTORIES ONLY. The per-worktree info/exclude is
+    // what actually keeps the installed trees out of the resolved tree, the merge
+    // and the PR. Assert on TREE MODES, not on a name: the original name-only
+    // assertion passed while the bug shipped.
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
     expect(
       await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true }), confirm),
     ).toBe(0);
     const tree = repo.git('ls-tree', '-r', 'main_patched');
-    expect(tree).not.toContain('120000'); // no symlink entry of ANY kind
-    expect(tree).not.toContain('node_modules'); // and none under any path
+    expect(tree).not.toContain('120000');
+    expect(tree).not.toContain('node_modules');
   });
 
   it('the per-worktree info/exclude is what hides the links (anchored, slash-free, uncommitted)', async () => {
@@ -1092,15 +1102,6 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     };
     return { fn, ran };
   }
-  /**
-   * Stub dependency install: the probes refuse to trust a tree that DECLARES
-   * dependencies it could not install (the bc92eed8 rule), and the fixture repo
-   * carries a package.json, so without this every probe is correctly unusable.
-   */
-  const fakeInstall: InstallRunner = async (dir) => {
-    mkdirSync(join(dir, 'node_modules'), { recursive: true });
-    return true;
-  };
   /** Seed a prior checks-fail so the flag is no longer "premature". */
   function seedPriorFailure(dir: string, caseId: string, kind: string, failed: string[]): void {
     appendFileSync(

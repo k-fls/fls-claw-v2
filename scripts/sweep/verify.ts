@@ -98,19 +98,22 @@ export interface VerifyOptions {
    * Prepare the freshly-created temp worktree before anything is built in it.
    *
    * A `git worktree add` checkout holds TRACKED FILES ONLY — `node_modules` is
-   * gitignored, so it is absent. The case and gate-fix worktrees have always
-   * symlinked the clone's dependency trees in (`linkNodeModules`, D-060); THIS
-   * worktree never did, so `finish`'s verify ran `tsc` with no `@types/node`
-   * and no `vitest` and could not compile on ANY pass. Its output was a wall of
-   * "Cannot find name 'process'" / "Cannot find module 'vitest'" — which blame
-   * then attributed to whichever source files those lines named, minting
-   * gate-fix cases for a defect that was never in the code (live 2026-07-31:
-   * pnpm said it outright — "Local package.json exists, but node_modules
-   * missing").
+   * gitignored, so it is absent. The case and gate-fix worktrees have always had
+   * dependencies put in; THIS worktree never did, so `finish`'s verify ran `tsc`
+   * with no `@types/node` and no `vitest` and could not compile on ANY pass. Its
+   * output was a wall of "Cannot find name 'process'" / "Cannot find module
+   * 'vitest'" — which blame then attributed to whichever source files those
+   * lines named, minting gate-fix cases for a defect that was never in the code
+   * (live 2026-07-31: pnpm said it outright — "Local package.json exists, but
+   * node_modules missing").
    *
-   * Injected rather than imported: `linkNodeModules` lives in propagate.ts,
-   * which imports THIS module. Omitted → no preparation (fixtures, whose stub
-   * commands need no dependencies).
+   * This worktree is base + every publishable branch MERGED, so its manifests
+   * are the merged ones and only they can describe what it needs — the driver
+   * installs from them (`installDeps`, 2026-08-04).
+   *
+   * Injected rather than imported: the installer lives in propagate.ts, which
+   * imports THIS module. Omitted → no preparation (fixtures, whose stub commands
+   * need no dependencies).
    */
   prepareWorktree?: (wtPath: string) => Promise<unknown>;
 }

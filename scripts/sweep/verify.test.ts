@@ -89,7 +89,7 @@ describe('verifyEverything — worktree preparation (D-060 gap)', () => {
       // if preparation ran first AND its output survived. That survival is not
       // incidental: `runRecipe` does `git clean -fdx --exclude=node_modules`
       // between preparation and the commands, which deletes every untracked
-      // path EXCEPT node_modules — which is exactly what linkNodeModules
+      // path EXCEPT node_modules — which is exactly what the dep install
       // creates. A marker under any other name would be wiped.
       commands: [{ cmd: 'test -f node_modules/DEPS_READY' }],
       prepareWorktree: async (wtPath) => {

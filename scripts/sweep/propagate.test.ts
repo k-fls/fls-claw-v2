@@ -17,7 +17,14 @@ import { initFixtureRepo, type FixtureRepo } from './fixtures.js';
 import { addTempWorktree, commitInfo, gitPush, isAncestor } from './git.js';
 import { readLedger } from './ledger.js';
 import { exportRrCache, writeRrCacheDir } from './merge.js';
-import { depsKey, DriverHalt, ensureDepsPool, failureSummary, guardRef } from './propagate.js';
+import {
+  createCaseWorktree,
+  DriverHalt,
+  failureSummary,
+  firstRedParticipant,
+  guardRef,
+  type InstallRunner,
+} from './propagate.js';
 import {
   appendJournal,
   cmdPlan,
@@ -2707,13 +2714,18 @@ describe('driver push carries credentials', () => {
   });
 });
 
-describe('dependency pools — a tree is checked against ITS OWN manifests', () => {
+describe('dependencies are installed INTO the worktree, from ITS OWN manifests', () => {
   /**
-   * Live 2026-08-01: `feat/mitm-credential-proxy` declares node-forge, which the
-   * base does not. Checking it against the clone's node_modules reported TS2307
-   * and minted a gate-fix blaming the branch for an ENVIRONMENT gap. Worse, the
-   * agent then ran an install in the shared clone and the SAME sha flipped
-   * red -> green, so the check was not even reproducible.
+   * Pools were deleted 2026-08-04 after three production incidents in three days
+   * (installed with --ignore-scripts so native addons never built; keyed on the
+   * PRE-MERGE tip while the worktree held the MERGED tree; keyed on manifests
+   * alone so no fix could invalidate an existing pool). Each was reported to the
+   * sweep as a code failure and turned into branch-targeted work. Measured, a
+   * per-worktree install with a warm store is ~5s — not worth a caching layer
+   * that costs correctness.
+   *
+   * What must hold now: the environment is a function of the TREE UNDER TEST,
+   * and a tree whose deps will not install yields NO verdict at all.
    */
   function repoWithManifests(): FixtureRepo {
     const repo = initFixtureRepo();
@@ -2722,68 +2734,83 @@ describe('dependency pools — a tree is checked against ITS OWN manifests', () 
       'pnpm-lock.yaml': 'lockfileVersion: 9\npackages:\n  a@1: {}\n',
     });
     repo.checkout('main_patched', { create: true, at: 'main' });
-    repo.checkout('feat/extra-dep', { create: true, at: 'main' });
-    repo.commit('declare its own dependency', {
-      'package.json': JSON.stringify({ name: 'x', dependencies: { a: '1', 'node-forge': '1' } }),
-      'pnpm-lock.yaml': 'lockfileVersion: 9\npackages:\n  a@1: {}\n  node-forge@1: {}\n',
-    });
     repo.checkout('main');
+    repo.commit('upstream adds a dependency', {
+      'package.json': JSON.stringify({ name: 'x', dependencies: { a: '1', yaml: '2' } }),
+      'pnpm-lock.yaml': 'lockfileVersion: 9\npackages:\n  a@1: {}\n  yaml@2: {}\n',
+    });
     cleanups.push(() => repo.destroy());
     return repo;
   }
 
-  it('keys on manifest CONTENT: differing deps differ, identical deps share', async () => {
-    const repo = repoWithManifests();
-    const base = await depsKey(repo.dir, 'main_patched');
-    const extra = await depsKey(repo.dir, 'feat/extra-dep');
-    expect(base).not.toBe(extra); // a branch with its own dependency gets its own pool
-    expect(await depsKey(repo.dir, 'main_patched')).toBe(base); // stable
-    // Content-keyed, so an identical tree under another name reuses the pool.
-    repo.checkout('feat/same-deps', { create: true, at: 'main_patched' });
-    repo.checkout('main');
-    expect(await depsKey(repo.dir, 'feat/same-deps')).toBe(base);
-  });
-
-  it('builds a pool per key and never installs into the clone', async () => {
+  it('installs from the MERGED manifests a case worktree carries, not the pre-merge tip', async () => {
+    // The live 2026-08-04 failure: `yaml` is declared by upstream `main` and not
+    // by `main_patched`. The merge brings both the code that imports it and the
+    // manifest that declares it — but the environment was built from the branch
+    // tip, so `yaml` was absent and the agent was blamed for `TS2307`.
     const repo = repoWithManifests();
     const ws = mkWorkspace();
-    const installed: string[] = [];
-    const fakeInstall = async (dir: string) => {
-      installed.push(dir);
-      mkdirSync(join(dir, 'node_modules'), { recursive: true });
-      writeFileSync(join(dir, 'node_modules', 'MARKER'), 'x\n');
+    const seen: string[] = [];
+    const install: InstallRunner = async (wt) => {
+      seen.push(readFileSync(join(wt, 'package.json'), 'utf8'));
+      mkdirSync(join(wt, 'node_modules'), { recursive: true });
       return true;
     };
-    const cli = { repo: repo.dir, workspace: ws, upstream: 'main', execute: false, cmd: 'plan' } as Cli;
-
-    const p1 = await ensureDepsPool(cli, 'main_patched', fakeInstall);
-    const p2 = await ensureDepsPool(cli, 'feat/extra-dep', fakeInstall);
-    expect(p1).toBeTruthy();
-    expect(p2).toBeTruthy();
-    expect(p1).not.toBe(p2); // separate trees
-    expect(existsSync(join(p1!, 'node_modules', 'MARKER'))).toBe(true);
-
-    // The manifests inside the pool are the BRANCH's, not the clone's.
-    expect(readFileSync(join(p2!, 'package.json'), 'utf8')).toContain('node-forge');
-    expect(readFileSync(join(p1!, 'package.json'), 'utf8')).not.toContain('node-forge');
-
-    // Nothing was installed into the clone — that shared mutable tree is what
-    // made an unchanged sha change its answer.
-    expect(installed.every((d) => !d.startsWith(repo.dir))).toBe(true);
-    expect(existsSync(join(repo.dir, 'node_modules'))).toBe(false);
-
-    // Second call for the same key reuses; no extra install.
-    const before = installed.length;
-    expect(await ensureDepsPool(cli, 'main_patched', fakeInstall)).toBe(p1);
-    expect(installed.length).toBe(before);
+    const cli = { repo: repo.dir, workspace: ws, upstream: 'main', execute: true, cmd: 'plan' } as Cli;
+    const dir = join(ws, 'p');
+    mkdirSync(dir, { recursive: true });
+    const caseFile = {
+      schemaVersion: 1,
+      id: 'main_patched--main-h0',
+      branch: 'main_patched',
+      parent: 'main',
+      head: { sha: repo.sha('main'), height: 0 },
+      run: [{ sha: repo.sha('main'), height: 0 }],
+      tierFloor: 'clean',
+      conflictedPaths: [],
+      automergeTree: repo.git('rev-parse', 'main^{tree}'),
+      reproduction: { command: '' },
+      deferredCheck: { firstConflictHeight: 0, transitiveAncestors: [] },
+    } as unknown as Parameters<typeof createCaseWorktree>[2];
+    mkdirSync(join(dir, caseFile.id), { recursive: true });
+    writeFileSync(join(dir, caseFile.id, 'case.json'), JSON.stringify(caseFile));
+    await createCaseWorktree(cli, dir, caseFile, repo.sha('main_patched'), undefined, install);
+    // The manifest the installer saw must be the one the CHECKS will run against.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain('yaml');
   });
 
-  it('a failed install yields no pool (callers fall back) and leaves no half-built dir', async () => {
+  it('a tree whose dependencies will not install yields NO verdict — never a green, never a blame', async () => {
     const repo = repoWithManifests();
     const ws = mkWorkspace();
-    const cli = { repo: repo.dir, workspace: ws, upstream: 'main', execute: false, cmd: 'plan' } as Cli;
-    const pool = await ensureDepsPool(cli, 'main_patched', async () => false);
-    expect(pool).toBeNull();
-    expect(readdirSync(join(ws, 'deps-pool')).filter((d) => d.endsWith('.building'))).toEqual([]);
+    const dir = join(ws, 'p');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(ws, 'checks.json'), JSON.stringify({ typecheck: [{ cmd: 'tsc', cwd: '.' }], test: [] }));
+    writeFileSync(
+      join(dir, 'plan.json'),
+      JSON.stringify({
+        order: ['main_patched'],
+        branches: [{ branch: 'main_patched', parents: [{ parent: 'main', verdict: 'merge' }] }],
+      }),
+    );
+    const cli = { repo: repo.dir, workspace: ws, upstream: 'main', execute: true, cmd: 'plan' } as Cli;
+    let ranChecks = 0;
+    const red = await firstRedParticipant(
+      cli,
+      dir,
+      join(ws, 'checks.json'),
+      async () => {
+        ranChecks++;
+        return { ok: false, failedNames: ['tsc'], output: 'boom' };
+      },
+      async () => false, // the install fails
+    );
+    // No branch is accused, and the checks never ran in an environment we do not
+    // trust. A bogus GREEN here is the durable one — `branch-check` memoises it
+    // for the whole pass and the branch's only typecheck is skipped.
+    expect(red).toBeNull();
+    expect(ranChecks).toBe(0);
+    expect(readJournal(dir).some((e) => e.id === 'WARN13_DEPS_UNUSABLE')).toBe(true);
+    expect(readJournal(dir).some((e) => e.action === 'branch-check')).toBe(false);
   });
 });
