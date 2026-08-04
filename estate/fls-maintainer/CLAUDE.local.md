@@ -216,6 +216,7 @@ around a blocking id.
 | `WARN01_TEMPLATE_TEXT` | rewrite the body from the case materials |
 | `WARN02_NO_DECISION_LINE` | open the body with the exact decision the owner is asked to make |
 | `WARN03_MANY_PRS` | >8 PRs this pass — re-check for consolidation |
+| `WARN14_ENVIRONMENT_FAULT` | the checks failed because the ENVIRONMENT is broken (a missing native binding, an unresolvable module, a missing binary) — not the code. No case was created and nothing was merged. Stop-case 2 report: quote the signature and say the dependency trees must be rebuilt. Do NOT try to fix it in code and do NOT re-run |
 | `WARN12_SCOPE_WIDENED` | your `--not-my-bug` claim was proven AND the failure belongs to no branch — both sides of the merge are green alone and only the merged tree is red, so it is THIS merge's defect. The named files are now IN your edit scope: fix the failure there, re-run `report-case`. The cold reader has been told |
 | `WARN09_GATE_FIX_SERVED` | a GATE-FIX case has been PREPARED and is waiting — run `next-case` and work it like any other case. This is NOT a stop: the accompanying text explains why the build is red, and reporting that diagnosis instead of working the case is the failure mode this id exists to prevent |
 
@@ -235,11 +236,19 @@ the driver refuses the claim without probing.
 Your belief decides nothing. The driver re-runs the failing checks on the tree
 WITHOUT your resolution and answers one of:
 
-- **proven** — it aborts this merge, finds which branch owns the failure, names
-  the commit that introduced it, and prepares a GATE-FIX case there. You get
-  `WARN09` and run `next-case`: the failing file IS the edit scope of that case.
-  Your resolution is kept at `refs/sweep/abandoned/<caseId>` and the case comes
-  back afterwards — do not re-do it from memory.
+- **proven** — it aborts this merge, finds which branch owns the failure, and
+  prepares a GATE-FIX case there. You get `WARN09` and run `next-case`: the
+  failing file IS the edit scope of that case. Your resolution is kept at
+  `refs/sweep/abandoned/<caseId>` and the case comes back afterwards — do not
+  re-do it from memory. The reply may also carry:
+  - `introducedBy` — the commit that introduced the failure. Read its diff.
+  - `rebaseNote` — the fix is rooted BELOW the branch tip (the search could not
+    name an introducer, so it rooted at the oldest point it saw the failure).
+    Copy that line into the PR body verbatim: the owner must rebase before merging.
+  - `duplicates` — the same failing files already have a fix elsewhere. Say so in
+    the PR body so the owner merges one and rebases or drops the other.
+- **environment fault** — `WARN14`: the failure is a broken dependency tree, not
+  code. Nothing is minted; report it and stop.
 - **disproven** — the reply NAMES the failures that are yours. Fix those.
 - **the check is unstable** (passes and fails on the same tree) — the case is
   HELD with your resolution intact; write the PR saying exactly that.

@@ -350,6 +350,17 @@ silence.
       reviewer judges the extra edits as the fix rather than as a scope
       violation) — the one sanctioned special case, "let the agent edit
       non-conflicted files and let the cold read accept it".
+    - **ENVIRONMENT FAULTS ARE NOT CODE DEFECTS.** Both trees share one dependency
+      pool, so a broken pool reproduces on both and the verdict is a correct
+      "not caused by your resolution" about a failure no code change can fix.
+      Before any routing, the failing output is classified: resolution-shaped
+      diagnostics (missing native binding, unresolvable module, missing binary)
+      with NO test assertion anywhere ⇒ `WARN14_ENVIRONMENT_FAULT`, no gate fix,
+      stop and report. Live 2026-08-03 this minted a 44-file case on
+      `module/container-queue` from a log holding 76 missing bindings and zero
+      assertions. The pool installer no longer passes `--ignore-scripts` (which
+      skipped the native build), and a pool that cannot load its native modules
+      is discarded at build time rather than shipped into probes.
     - **BISECT** before minting a branch/parent gate fix, so the briefing names a
       commit instead of a log: determinism at the tip (a coin flip converges on a
       random commit and reads as an answer — refused), exponential walk-back for a
@@ -359,7 +370,32 @@ silence.
       never read as green (`vitest run <path matching nothing>` exits 1 saying
       "No test files found"). A commit that PREDATES the failing file is the
       opposite: absence is proof, so it is a green BOUNDARY, which is what lets
-      the search name the commit that ADDED a failing test.
+      the search name the commit that ADDED a failing test. A failure that does
+      not reproduce NARROWED is re-probed with the FULL failing command before it
+      is called unstable — a load-dependent failure exists only under whole-suite
+      load, which is exactly the class this serves (2026-08-03: the 5000 ms
+      poll-loop test passed twice narrowed and was written off as a coin flip).
+    - **THE BISECT NEVER GATES THE CASE.** Whether a gate fix is warranted was
+      settled by the verdict and the owner probe; naming the commit only improves
+      the briefing. Every outcome mints the case, with the status in the text.
+      When no introducer can be named the case roots at the **last failed
+      point** — the oldest commit the search OBSERVED red — so the fix lands as
+      deep as the evidence supports and branches sharing that ancestor can take
+      one fix instead of one each. That root is journaled in the driver's own
+      `gate-fix` row (re-verification reads it from there, never from the
+      agent-writable case file, or the scope guard would see every commit up to
+      the tip as an agent edit). A fix rooted below the tip carries
+      `[ROOTED AT <sha>: n commits behind the tip — REBASE before merging]`, and
+      says plainly when the point is an observation rather than a proven cause.
+    - **DUPLICATES ACROSS BRANCHES.** An unstable failure surfaces wherever luck
+      puts it, so one defect can earn a gate fix on several branches. The case id
+      digest covers the FAILING FILES ONLY (not branch+files, which made
+      cross-branch duplicates invisible by construction), so the same defect
+      wears the same digest everywhere and open fix refs on origin can be matched
+      on sight. Both cases are still minted — separate histories each need the
+      fix — with `[POSSIBLE DUPLICATE: …]` in the PR text so the owner merges one
+      and rebases or drops the rest. `gateFixKey` stays branch-scoped as the
+      per-pass anti-loop key: two concerns, two keys.
     - **ABORT** = a `reopened` row: the case's merge was never made (it exists only
       as the clean prefix), so the reopen supersedes the undispositioned case, the
       machine returns to `open`, and `next-case` serves the gate fix. **The reopen

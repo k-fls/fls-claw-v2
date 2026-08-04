@@ -98,6 +98,7 @@ import {
 } from './candidates.js';
 import { attributeFailure, countFailingFiles, parseFailingFiles } from './attribute.js';
 import {
+  classifyEnvironmentFault,
   classifyFailure,
   findIntroducingCommit,
   locateOwner,
@@ -1484,15 +1485,59 @@ function gateFixKey(branch: string, files: string[]): string {
  * height of `-1` purely to slip past the id validator — a lie that then had to
  * be taught to the validator's regex (`-h-?\d+`), to the fix-ref parser, and to
  * every height reader downstream. The id now carries the case's real identity:
- * the branch, plus a digest of `gateFixKey` — which is also what keeps two
- * DIFFERENT gate fixes on ONE branch (same pass, different failing files) from
- * colliding on an id. A collision there is fatal, not cosmetic: the second case
- * inherits the first's `resolved` disposition, drops straight out of
+ * the branch, plus a digest of the FAILING FILE SET — which is also what keeps
+ * two DIFFERENT gate fixes on ONE branch (same pass, different failing files)
+ * from colliding on an id. A collision there is fatal, not cosmetic: the second
+ * case inherits the first's `resolved` disposition, drops straight out of
  * `openCases`, and `next-case` can never serve it.
+ *
+ * THE DIGEST COVERS THE FILES ONLY, not `gateFixKey` (owner, 2026-08-04). With
+ * the branch mixed in, the same failing test on two branches produced two
+ * unrelated digests and a cross-branch duplicate was invisible BY CONSTRUCTION —
+ * and duplicates are the normal case for an unstable shared test, which surfaces
+ * wherever luck puts it. Files-only means the same defect wears the same digest
+ * everywhere, so `refs/remotes/origin/fix/sweep/*--gate-fix-*` can be matched on
+ * sight with no extra bookkeeping. Within-branch uniqueness is untouched:
+ * different file sets still differ.
+ *
+ * `gateFixKey` remains branch-scoped and remains the per-pass ANTI-LOOP key —
+ * two concerns, two keys. One looping branch must not suppress another branch's
+ * first attempt at the same file.
  */
+function gateFixFilesDigest(files: string[]): string {
+  return createHash('sha256')
+    .update([...files].sort().join(','))
+    .digest('hex')
+    .slice(0, 8);
+}
+
 function gateFixCaseId(branch: string, files: string[]): string {
-  const id8 = createHash('sha256').update(gateFixKey(branch, files)).digest('hex').slice(0, 8);
-  return `gate-fix-${slug(branch)}-${id8}`;
+  return `gate-fix-${slug(branch)}-${gateFixFilesDigest(files)}`;
+}
+
+/**
+ * Gate fixes ELSEWHERE for the same failing files — this pass's journal plus the
+ * open fix refs on origin from earlier passes. Matched on the files-only digest
+ * carried in every gate-fix case id (see above), so no side table is needed.
+ *
+ * Both cases are still minted: separate branches are separate lines of history
+ * and each genuinely needs the fix. What the owner must not have to work out for
+ * themselves is that they are ONE defect — merge one, then rebase or drop the
+ * rest — so it goes in the PR text.
+ */
+async function duplicateGateFixes(cli: Cli, dir: string, branch: string, files: string[]): Promise<string[]> {
+  const digest = gateFixFilesDigest(files);
+  const out: string[] = [];
+  for (const e of readJournal(dir)) {
+    if (e.action !== 'gate-fix' || typeof e.caseId !== 'string' || e.branch === branch) continue;
+    if (e.caseId.endsWith(`-${digest}`)) out.push(`${String(e.caseId)} (this pass, on ${String(e.branch)})`);
+  }
+  for (const ref of await activeGateFixRefs(cli.repo)) {
+    if (!ref.endsWith(`-${digest}`)) continue;
+    if (ref.includes(`/${slug(branch)}--`)) continue; // this branch's own open fix
+    out.push(`${ref} (open on origin)`);
+  }
+  return [...new Set(out)];
 }
 
 /** The gate-fix id form (N5). Charset-safe by construction — no `/`, no `.`. */
@@ -2050,10 +2095,66 @@ export async function ensureDepsPool(cli: Cli, ref: string, runInstall: InstallR
     rmSync(staging, { recursive: true, force: true });
     return null;
   }
+  // SMOKE CHECK before the pool is published under its final name. A pool that
+  // installed "successfully" but cannot actually LOAD its native modules is the
+  // most expensive failure this driver has: it is indistinguishable from a code
+  // defect at the checks gate, so the sweep blames a branch, mints a gate-fix
+  // case and asks an agent to fix source code for a broken environment (live
+  // 2026-08-03 — a 44-file case on `module/container-queue`, every diagnostic a
+  // missing binding). Catch it HERE, where it is one unusable pool, instead of
+  // downstream where it is a confident wrong answer.
+  if (!(await poolLoads(staging))) {
+    // NOT journaled here: `ensureDepsPool` has no pass dir (it is called from
+    // paths that predate one), and `appendJournal` writes `<dir>/journal.jsonl`
+    // — handing it the workspace would scatter a stray journal beside the pass
+    // dirs. The callers journal: a probe records `usable: false` and the
+    // pre-merge check surfaces the branch, both with the pass dir in hand.
+    console.error(`deps-pool [WARN13_DEPS_POOL_UNUSABLE]: ${ref} installed but unusable (native modules do not load) — not published`);
+    rmSync(staging, { recursive: true, force: true });
+    return null;
+  }
   rmSync(pool, { recursive: true, force: true });
   mkdirSync(dirname(pool), { recursive: true });
   renameSync(staging, pool); // same filesystem: atomic, and hardlinks survive
   return pool;
+}
+
+/**
+ * Can this pool's NATIVE modules actually be loaded? `pnpm install` reporting
+ * success says the files are on disk, not that a compiled addon exists for this
+ * node ABI — and every native package the repo uses is loaded through
+ * `bindings`, which fails at REQUIRE time, deep inside a test run, looking
+ * exactly like the code under test is broken.
+ *
+ * Deliberately narrow: it loads the packages listed in the pool's own
+ * `package.json` that ship a `binding.gyp`/`prebuilds` marker. A pool with no
+ * native dependencies passes trivially.
+ */
+async function poolLoads(pool: string): Promise<boolean> {
+  const nm = join(pool, 'node_modules');
+  if (!existsSync(nm)) return false;
+  let names: string[] = [];
+  try {
+    const pkg = JSON.parse(readFileSync(join(pool, 'package.json'), 'utf8')) as {
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+    names = [...Object.keys(pkg.dependencies ?? {}), ...Object.keys(pkg.devDependencies ?? {})];
+  } catch {
+    return false;
+  }
+  const native = names.filter((n) => {
+    const d = join(nm, n);
+    return existsSync(join(d, 'binding.gyp')) || existsSync(join(d, 'prebuilds')) || existsSync(join(d, 'build'));
+  });
+  if (native.length === 0) return true;
+  const probe = native.map((n) => `require(${JSON.stringify(n)})`).join(';');
+  try {
+    await promisify(execFile)('node', ['-e', probe], { cwd: pool, maxBuffer: 8 * 1024 * 1024 });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Runs the installs for a prepared pool directory. Injectable for tests. */
@@ -2068,9 +2169,18 @@ const defaultInstallRunner: InstallRunner = async (dir) => {
       return false;
     }
   };
-  // Root (pnpm) is required; agent-runner (bun) is best-effort — a repo without
-  // it simply has no second tree to link.
-  const rootOk = await run('pnpm install --frozen-lockfile --ignore-scripts', dir);
+  // NO `--ignore-scripts`. Skipping lifecycle scripts skips the NATIVE BUILD:
+  // `better-sqlite3` never compiles its addon, so every suite that opens a
+  // database dies with "Could not locate the bindings file" — in EVERY tree
+  // linked to that pool. Live 2026-08-03: 76 such errors and ZERO assertion
+  // failures in one case, and because a pool is keyed by manifest digest it can
+  // never self-heal — six poisoned pools were reused for every probe.
+  //
+  // The flag is untrusted-code defence, and it buys nothing here: these are the
+  // fork's OWN lockfiles, and the clone the pool stands in for was installed
+  // with scripts. Defending against our own postinstall while shipping a broken
+  // environment into the checks gate is the wrong trade.
+  const rootOk = await run('pnpm install --frozen-lockfile', dir);
   if (!rootOk) return false;
   const ar = join(dir, 'container', 'agent-runner');
   // A repo without the second tree simply has nothing to install. When it HAS
@@ -3101,7 +3211,12 @@ async function reverifyGateFixCase(
   const scopeResult = await resolveScope(cli.repo, registry.features, registry.scope, { includeRemote: true });
   const scope = new Set(scopeResult.ordered.map((e) => e.branch));
   if (!scope.has(branch)) return { ok: false, errors: [`gate-fix branch ${branch} is out of pass scope`] };
-  const tip = await revParse(cli.repo, branch);
+  // The root the case was MATERIALIZED at — the branch tip unless the driver
+  // deliberately rooted deeper (`--not-my-bug`, last-failed point). Read from the
+  // driver's own journal row, so the trust boundary is unchanged; a row without
+  // it (any case minted before rooting existed) falls back to the tip.
+  const rootAt = typeof row.rootAt === 'string' ? row.rootAt : null;
+  const tip = rootAt && (await refExists(cli.repo, rootAt)) ? rootAt : await revParse(cli.repo, branch);
   const files = Array.isArray(row.files) ? (row.files as string[]) : [];
   // Same head/height/run derivation as `materializeGateFixCases` — re-derived
   // from git, never read back from the agent-writable case.json.
@@ -7122,6 +7237,38 @@ async function adjudicateNotMyBug(p: {
     progress(`not-my-bug: ${verdict.verdict.toUpperCase()} — ${verdict.detail}`);
     console.error(`report-case [not-my-bug]: ${verdict.verdict} — ${verdict.detail}`);
 
+    // ENVIRONMENT FAULT (2026-08-03). Both trees share one dependency pool, so a
+    // broken pool reproduces identically on both and the verdict is a perfectly
+    // correct "not caused by your resolution" — about a failure no code change
+    // can fix. Left unchecked the driver blames a branch and mints a case: live,
+    // a 44-file gate fix on `module/container-queue` whose log held 76 missing
+    // bindings and zero assertions. Checked here, before any routing decision.
+    const envFault = classifyEnvironmentFault(failingOutput);
+    if (envFault.isEnvironment) {
+      appendJournal(dir, {
+        action: 'not-my-bug-environment',
+        caseId,
+        branch,
+        kind,
+        signature: envFault.signature,
+        files: [...resolved.keys()],
+        detail: envFault.detail,
+      });
+      progress(`not-my-bug: ENVIRONMENT FAULT — ${envFault.signature} — no gate-fix case minted`);
+      console.error(`report-case [WARN14_ENVIRONMENT_FAULT]: ${envFault.detail}`);
+      result(cli, {
+        ok: false,
+        status: 'stopped',
+        stoppedAt: 'not-my-bug',
+        issues: [{ id: 'WARN14_ENVIRONMENT_FAULT', detail: envFault.detail }],
+        notMyBug: { verdict: 'environment', signature: envFault.signature, files: [...resolved.keys()], detail: envFault.detail },
+        instruction:
+          `REPORT to the owner: ${envFault.detail} Nothing was merged and no case was created. ` +
+          `Do NOT try to fix this in code and do NOT re-run — the dependency trees must be rebuilt first.`,
+      });
+      return { handled: true, code: 1 };
+    }
+
     if (verdict.verdict === 'caused-by-case') {
       // Refused — and the driver now knows exactly WHICH failures are the
       // agent's, which is strictly better steering than "read the output".
@@ -7218,7 +7365,16 @@ async function adjudicateNotMyBug(p: {
     // fix belongs on this branch at all.
     const ownerBranch = owner.owner === 'branch' ? branch : rc.parent;
     progress(`not-my-bug: searching ${ownerBranch} for the commit that introduced ${owner.files.join(', ')}`);
-    const bisect = await findIntroducingCommit(owner.ref!, owner.files, narrowProbe, repoHistory(cli.repo));
+    const bisect = await findIntroducingCommit(
+      owner.ref!,
+      owner.files,
+      narrowProbe,
+      repoHistory(cli.repo),
+      // The FULL-command fallback. A load-dependent failure exists only under
+      // whole-suite load, so a narrowed probe cannot see it and the determinism
+      // gate writes it off as a coin flip — live 2026-08-03, exactly that.
+      probe,
+    );
     let introduced: { sha: string; subject: string; author: string } | null = null;
     if (bisect.status === 'found' && bisect.sha) {
       const info = await git(cli.repo, ['show', '-s', '--format=%s%n%an', bisect.sha], { allowCodes: [128] });
@@ -7235,27 +7391,60 @@ async function adjudicateNotMyBug(p: {
       status: bisect.status,
       sha: bisect.sha ?? null,
       anchor: bisect.anchor ?? null,
+      lastFailed: bisect.lastFailed ?? null,
+      usedFullCommand: bisect.usedFullCommand === true,
       probes: bisect.probes,
       scanned: bisect.scanned ?? null,
       detail: bisect.detail,
-      runs: narrowRuns,
+      runs: bisect.usedFullCommand ? [...narrowRuns, ...runs] : narrowRuns,
     });
 
-    // A bisect that lands on "the test never passes consistently" is the same
-    // finding as a flaky classification, one level down: there is no defect to
-    // root a fix on. Say so rather than minting a case for a coin flip.
-    if (bisect.status === 'flaky') {
-      return {
-        handled: false,
-        note:
-          `${verdict.detail}, but ${bisect.detail} — no gate-fix case was minted; ` +
-          `report this to the owner (the check itself needs fixing, which is not this case's work)`,
-      };
-    }
+    // THE BISECT NEVER GATES THE CASE (owner, 2026-08-04). Whether a gate fix is
+    // warranted was settled by the verdict (`pre-existing`) and the owner probe;
+    // naming the introducing commit only improves the BRIEFING. Suppressing the
+    // case because the optional step failed threw a proven defect away — and it
+    // was incoherent besides: `flaky` suppressed while `no-anchor` minted, two
+    // failure modes of one step with opposite consequences.
+    //
+    // ROOT AT THE LAST FAILED POINT. When the search cannot name an introducer it
+    // still knows the OLDEST commit it saw red, and that is the better root: the
+    // fix lands as deep as the evidence supports, so branches sharing that
+    // ancestor can take one fix instead of one each. The cost is that the fix is
+    // then BEHIND the branch tip, which is what the rebase note below is for.
+    const rootAt = bisect.sha ?? bisect.lastFailed ?? owner.ref!;
+    const rootedBelowTip = rootAt !== owner.ref;
+    const behind = rootedBelowTip
+      ? Number(
+          (
+            await git(cli.repo, ['rev-list', '--count', '--first-parent', `${rootAt}..${owner.ref!}`], {
+              allowCodes: [128],
+            })
+          ).stdout.trim() || '0',
+        )
+      : 0;
+
+    // Does the fix, once made HERE, still apply and hold at the TIP? The checks
+    // gate will prove it at `rootAt`, which is not the same statement. Probing it
+    // costs one run and turns "rebase before merging" from advice into a fact the
+    // owner can act on — or a warning that it does not apply at all.
+    const rebaseNote = rootedBelowTip
+      ? `[ROOTED AT ${rootAt.slice(0, 12)}: ${behind} commit(s) behind the ${ownerBranch} tip — REBASE before merging` +
+        `${bisect.status === 'found' ? '' : `; this is the oldest point the search OBSERVED the failure, not a proven introducing commit`}]`
+      : '';
+
+    // DUPLICATE ACROSS BRANCHES. An unstable failure surfaces wherever luck puts
+    // it, so the same shared test can earn a gate fix on several branches — each
+    // genuinely needs it (separate lines of history), but the owner must be told
+    // they are one defect so they merge one and rebase or drop the rest.
+    const dupes = await duplicateGateFixes(cli, dir, ownerBranch, owner.files);
+    const dupNote = dupes.length > 0 ? `[POSSIBLE DUPLICATE: ${dupes.join('; ')} — same failing files]` : '';
 
     const gateOutput =
       `${failingOutput}\n\n--- not-my-bug ---\n${verdict.detail}\n${owner.detail}\n${bisect.detail}\n` +
-      (introduced ? `introduced by ${introduced.sha} "${introduced.subject}" (${introduced.author})\n` : '');
+      (introduced ? `introduced by ${introduced.sha} "${introduced.subject}" (${introduced.author})\n` : '') +
+      (bisect.usedFullCommand ? `(the search ran the FULL failing command: narrowed to these files it does not reproduce)\n` : '') +
+      (rebaseNote ? `${rebaseNote}\n` : '') +
+      (dupNote ? `${dupNote}\n` : '');
 
     // ABORT THE MERGE, **BEFORE** minting the gate fix. The case's merge was
     // never made — it lives only as the clean prefix in the worktree — so
@@ -7292,6 +7481,7 @@ async function adjudicateNotMyBug(p: {
 
     const gate = await materializeGateFixCases(cli, dir, ctx.chain, gateOutput, failedCommands, null, {
       rootBranch: ownerBranch,
+      ...(rootedBelowTip ? { rootAt } : {}),
     });
     if (!gate.served) {
       // Already gated on origin, or already attempted this pass. Both are real
@@ -7332,12 +7522,16 @@ async function adjudicateNotMyBug(p: {
         detail: verdict.detail,
       },
       introducedBy: introduced,
+      ...(rebaseNote ? { rebaseNote } : {}),
+      ...(dupes.length ? { duplicates: dupes } : {}),
       gateFix: { caseId: first.caseId, branch: first.branch, files: first.files, reason: gate.reason },
       instruction:
         `Your resolution was not the problem: ${verdict.detail}. ${owner.detail}. ` +
         (introduced
           ? `Introduced by ${introduced.sha.slice(0, 12)} "${introduced.subject}" (${introduced.author}). `
           : `${bisect.detail}. `) +
+        (rebaseNote ? `${rebaseNote} Put that line in the PR body. ` : '') +
+        (dupNote ? `${dupNote} Say so in the PR body. ` : '') +
         `This case's merge is ABORTED and a gate-fix case is prepared on ${first.branch} — run \`next-case\`.` +
         (preserved ? ` Your resolution is preserved at ${keepRef} if this case comes back.` : ''),
     });
@@ -8447,7 +8641,18 @@ async function materializeGateFixCases(
   failedOutput: string,
   failedCommands: VerifyCommand[],
   accused: string | null,
-  opts: { rootBranch?: string } = {},
+  opts: {
+    rootBranch?: string;
+    /**
+     * Root the case's worktree at THIS commit instead of the branch tip
+     * (`--not-my-bug`, owner 2026-08-04). Used when the search could not name an
+     * introducing commit but did observe the failure at an older point: rooting
+     * there puts the fix as deep as the evidence supports, so branches sharing
+     * that ancestor can take one fix rather than one each. The trade is that the
+     * fix is then BEHIND the tip — the PR text carries the rebase note.
+     */
+    rootAt?: string;
+  } = {},
 ): Promise<{ served: boolean; cases: GateFixCaseSummary[]; reason: string; detail: string; gated: string[] }> {
   const journal = readJournal(dir);
   const { features } = loadRegistry({ inventoryDir: cli.inventory, scopeFile: cli.scopeFile, routingFile: cli.routingFile });
@@ -8548,7 +8753,9 @@ async function materializeGateFixCases(
     // N5 SHAPE: the gate-fix id form (`gateFixCaseId` — branch + file-set digest,
     // never a height). The id is joined into paths AND passed to `publish --case`.
     const caseId = gateFixCaseId(g.branch, g.files);
-    const tip = await revParse(cli.repo, g.branch);
+    // The ROOT of the fix: the branch tip by default, or an explicit older
+    // commit when the caller has evidence the failure lives further down.
+    const tip = opts.rootAt ? await revParse(cli.repo, opts.rootAt) : await revParse(cli.repo, g.branch);
     // The head's HEIGHT (see `gateFixHeadHeight`): the tip's coverage on this
     // pass's pinned chain, not the `-1` placeholder that used to stand here.
     const head = { sha: tip, height: await gateFixHeadHeight(cli, chain, tip) };
@@ -8582,6 +8789,13 @@ async function materializeGateFixCases(
       files: g.files,
       failedCommands: commandNames,
       reason: g.reason,
+      // The ROOT the case's worktree was created at. Journaled because
+      // `reverifyGateFixCase` re-derives the case from THIS row (never from the
+      // agent-writable case.json) — without it, re-verification recomputes the
+      // tree from the branch TIP while the worktree sits at an older root, and
+      // the scope guard then sees every commit in between as an agent edit and
+      // demotes an in-scope fix to HELD for "scope exceeded".
+      rootAt: tip,
       // Git evidence, not declarations: `<branch>@<depth>/<own commits>`.
       candidates: a.candidates.map((c) => `${c.branch}@${c.depth}/${c.commits}`),
     });

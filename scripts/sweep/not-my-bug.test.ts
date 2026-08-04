@@ -17,6 +17,7 @@ import { describe, expect, it } from 'vitest';
 
 import { countFailingFiles, parseFailingFiles } from './attribute.js';
 import {
+  classifyEnvironmentFault,
   classifyFailure,
   findIntroducingCommit,
   locateOwner,
@@ -283,5 +284,84 @@ describe('findIntroducingCommit', () => {
     const r = await findIntroducingCommit('c9', [POLL_LOOP], redFrom(6, new Set(['c7'])), linearHistory());
     expect(r.status).toBe('found');
     expect(r.sha).toBe('c6');
+  });
+});
+
+describe('classifyEnvironmentFault', () => {
+  // The real 2026-08-03 shape: a pool installed with --ignore-scripts, so the
+  // native addon never compiled and every DB-touching suite died at require time.
+  const BINDINGS = [
+    ' FAIL  src/modules/scheduling/recurrence.test.ts > handleRecurrence',
+    'Error: Could not locate the bindings file. Tried:',
+    ' → /workspace/agent/deps-pool/5ab85288ee4a/node_modules/.pnpm/better-sqlite3@11.10.0/node_modules/better-sqlite3/build/Release/better_sqlite3.node',
+    ' ❯ new Database ../../../../deps-pool/5ab85288ee4a/node_modules/.pnpm/better-sqlite3@11.10.0/node_modules/better-sqlite3/lib/database.js:48:64',
+  ].join('\n');
+
+  it('recognises a missing native binding as an ENVIRONMENT fault', () => {
+    const v = classifyEnvironmentFault(BINDINGS);
+    expect(v.isEnvironment).toBe(true);
+    expect(v.detail).toContain('ENVIRONMENT fault');
+    expect(v.detail).toContain('node_modules/deps-pool');
+  });
+
+  it('does NOT claim environment when a real assertion is present', () => {
+    // A resolution that breaks code AND happens to log a resolution error must
+    // stay a code defect — otherwise a real regression is written off as infra.
+    expect(classifyEnvironmentFault(`${BINDINGS}\nAssertionError: expected 3 to be 4`).isEnvironment).toBe(false);
+    expect(classifyEnvironmentFault(`${BINDINGS}\nsrc/x.ts(3,1): error TS2345: nope`).isEnvironment).toBe(false);
+  });
+
+  it('leaves an ordinary test failure alone', () => {
+    const out = ['src/a.test.ts:', '(fail) does the thing', 'AssertionError: expected true to be false'].join('\n');
+    expect(classifyEnvironmentFault(out).isEnvironment).toBe(false);
+  });
+
+  it('recognises an unresolvable module and a missing binary', () => {
+    expect(classifyEnvironmentFault("Error: Cannot find module 'node-forge'").isEnvironment).toBe(true);
+    expect(classifyEnvironmentFault('sh: 1: vitest: command not found').isEnvironment).toBe(true);
+  });
+});
+
+describe('findIntroducingCommit — full-command fallback and last-failed rooting', () => {
+  function linear(): History {
+    const commits = Array.from({ length: 10 }, (_, i) => `c${i}`);
+    return {
+      ancestor: async (_r, back) => commits[commits.length - 1 - back] ?? null,
+      listFirstParent: async (from, to) => commits.slice(commits.indexOf(from) + 1, commits.indexOf(to) + 1),
+      hasAnyFile: async () => true,
+    };
+  }
+  const never: SubsetProbe = async () => ({ usable: true, counts: new Map(), output: '' });
+  const redFrom = (n: number): SubsetProbe => async (t) => ({
+    usable: true,
+    counts: t.kind === 'commit' && Number(t.sha.slice(1)) >= n ? new Map([[POLL_LOOP, 1]]) : new Map(),
+    output: '',
+  });
+
+  it('falls back to the FULL command when the narrowed form does not reproduce', async () => {
+    // Exactly the 2026-08-03 failure: narrowed it passes (no load), whole it fails.
+    const r = await findIntroducingCommit('c9', [POLL_LOOP], never, linear(), redFrom(6));
+    expect(r.status).toBe('found');
+    expect(r.sha).toBe('c6');
+    expect(r.usedFullCommand).toBe(true);
+  });
+
+  it('is flaky only when NEITHER form reproduces — and still names the tip as a root', async () => {
+    const r = await findIntroducingCommit('c9', [POLL_LOOP], never, linear(), never);
+    expect(r.status).toBe('flaky');
+    // The tip is a confirmed failure (the checks gate just reported it), so the
+    // gate fix has somewhere to land even with no commit named.
+    expect(r.lastFailed).toBe('c9');
+  });
+
+  it('reports the OLDEST OBSERVED red as lastFailed when the search cannot converge', async () => {
+    // Red everywhere, so no green anchor exists. The walk-back probes c8, c7, c5
+    // and c1 (steps 1,2,4,8) and then runs out of history — c0 is never probed.
+    // `lastFailed` is c1, NOT c0: it is what the search SAW, never what it could
+    // infer. That distinction is the whole point of rooting there — the PR says
+    // "oldest point the failure was observed", which is a claim we can defend.
+    const r = await findIntroducingCommit('c9', [POLL_LOOP], redFrom(0), linear());
+    expect(r.status).toBe('no-anchor');
+    expect(r.lastFailed).toBe('c1');
   });
 });

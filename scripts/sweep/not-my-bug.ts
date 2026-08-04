@@ -52,6 +52,76 @@
  * without a runner.
  */
 
+/**
+ * ENVIRONMENT-FAULT SIGNATURES. A failure whose diagnostics look like these did
+ * not come from the code under test — it came from the tree it was run in.
+ *
+ * This is the failure MODE the whole mechanism is most dangerous in, and it bit
+ * live on 2026-08-03. The adjudication compares two trees that share ONE
+ * dependency pool, so a broken pool reproduces identically on both: the verdict
+ * is a correct "not caused by your resolution", and the driver then confidently
+ * blames a branch, mints a gate-fix case and asks an agent to fix source code
+ * for a missing compiled addon. One case named 44 files; the log held 76
+ * "Could not locate the bindings file" and NOT ONE assertion failure.
+ *
+ * The discriminator is what a diagnostic is ABOUT. Code defects assert and
+ * type-error; environments fail to RESOLVE — a binding, a module, a binary. The
+ * second tell is location: frames inside `node_modules/` or the driver's
+ * `deps-pool/` rather than repo sources.
+ */
+const ENV_FAULT_PATTERNS: RegExp[] = [
+  /Could not locate the bindings file/i,
+  /was compiled against a different Node\.js version/i,
+  /invalid ELF header|wrong ELF class/i,
+  /Cannot find module '[^']*'\s*$/im,
+  /ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND/,
+  /ERR_DLOPEN_FAILED|dlopen\(/,
+  /\bcommand not found\b|\bENOENT\b.*\bspawn\b/i,
+  /error while loading shared libraries/i,
+];
+
+/** A frame pointing INTO the dependency trees rather than at repo sources. */
+const ENV_FAULT_FRAME = /(?:^|[\s(])(?:[\w./@-]*\/)?(?:node_modules|deps-pool)\//m;
+
+export interface EnvFaultVerdict {
+  isEnvironment: boolean;
+  /** The matched signature, for the journal and the agent's report. */
+  signature: string | null;
+  detail: string;
+}
+
+/**
+ * Does this failing output describe a broken ENVIRONMENT rather than broken code?
+ *
+ * Conservative by construction: it demands a named signature, and it demands
+ * that NOTHING in the output looks like a genuine test assertion. A real defect
+ * that merely happens to mention a missing module (a resolution that deleted an
+ * import, say) still asserts somewhere, so it stays a code defect and keeps its
+ * gate-fix case. The asymmetry is deliberate — mis-classifying an environment
+ * fault as code produces confident branch-targeted nonsense, while
+ * mis-classifying code as environment produces a stop case a human reads.
+ */
+export function classifyEnvironmentFault(output: string): EnvFaultVerdict {
+  const hit = ENV_FAULT_PATTERNS.find((re) => re.test(output));
+  if (!hit) return { isEnvironment: false, signature: null, detail: '' };
+  // A genuine assertion anywhere means code is being exercised and failing on
+  // its own terms; the resolution error is then incidental, not the story.
+  const asserts =
+    /AssertionError|expected .* (?:to|but)\b|toBe\(|toEqual\(|Expected:.*Received:/is.test(output) ||
+    /error TS\d+/.test(output);
+  if (asserts) return { isEnvironment: false, signature: null, detail: '' };
+  const framed = ENV_FAULT_FRAME.test(output);
+  const signature = String(hit).replace(/^\/|\/[a-z]*$/g, '');
+  return {
+    isEnvironment: true,
+    signature,
+    detail:
+      `the failing output is an ENVIRONMENT fault, not a code defect — it matches /${signature}/ ` +
+      `${framed ? 'with frames inside node_modules/deps-pool ' : ''}and contains no test assertion. ` +
+      `No code change can fix this; the dependency tree the checks ran against is broken.`,
+  };
+}
+
 /** Which tree a probe runs against. */
 export type ProbeTarget =
   /** The case worktree AS IT STANDS — with the agent's edits. */
@@ -365,6 +435,22 @@ export interface BisectOutcome {
   probes: number;
   /** Commits in the searched window. */
   scanned?: number;
+  /**
+   * The OLDEST commit actually OBSERVED failing. Always set once anything was
+   * seen red, whatever the status.
+   *
+   * This is what an inconclusive search still knows, and it is enough to root a
+   * gate fix (owner, 2026-08-04): rooting at the oldest confirmed-red point puts
+   * the fix as far down the history as the evidence supports, so branches that
+   * share that ancestor can take one fix instead of one each. It is NOT a claim
+   * about where the defect was introduced — for an unstable failure it is
+   * merely the oldest place the search happened to CATCH it, and the PR text
+   * must say so rather than dress a lower bound up as a bisect result.
+   */
+  lastFailed?: string;
+  /** Whether the probes ran the failing command whole (see `findIntroducingCommit`). */
+  usedFullCommand?: boolean;
+  /** One line, agent- and PR-facing. */
   detail: string;
 }
 
@@ -383,28 +469,66 @@ export async function findIntroducingCommit(
   files: string[],
   probe: SubsetProbe,
   history: History,
+  /**
+   * The same probe with NO file narrowing. A load-dependent failure exists only
+   * under whole-suite load, so the narrowed form cannot see it and the
+   * determinism gate below rejects it as unstable — which is precisely the class
+   * this search exists for. Live 2026-08-03: `poll-loop.test.ts` (5000 ms
+   * internal deadline under a 5000 ms runner timeout) passed twice narrowed at
+   * the tip, and a real, reproducible failure was written off as a coin flip.
+   * Only the FAILED command re-runs, so the fallback costs seconds per probe.
+   */
+  fullProbe?: SubsetProbe,
 ): Promise<BisectOutcome> {
   let probes = 0;
   const red = (r: ProbeResult): boolean => files.some((f) => (r.counts.get(f) ?? 0) > 0);
+  // The OLDEST commit observed red — the fallback root when the search cannot
+  // name an introducer. No ordering bookkeeping is needed: the walk-back probes
+  // strictly older commits each step, and the binary search only ever moves its
+  // known-red bound `hi` DOWN (older), so a plain overwrite at each red
+  // observation always holds the oldest one.
+  let lastFailed: string | undefined;
 
   // Determinism first. Bisecting a coin flip converges on a random commit and
   // presents it as the cause — worse than no answer, because it reads as one.
-  const t1 = await probe({ kind: 'commit', sha: tip }, files);
+  let active = probe;
+  let usedFullCommand = false;
+  let t1 = await probe({ kind: 'commit', sha: tip }, files);
   probes++;
   if (!t1.usable) {
     return { status: 'inconclusive', probes, detail: `the tip ${tip.slice(0, 12)} could not be built` };
   }
-  const t2 = await probe({ kind: 'commit', sha: tip }, files);
+  let t2 = await probe({ kind: 'commit', sha: tip }, files);
   probes++;
+  if ((!red(t1) || !red(t2)) && fullProbe) {
+    // Not reproducible NARROWED — try the whole command before calling it
+    // unstable. If it reproduces twice this way, the search is valid; it just
+    // has to run every probe the same way, or the halves are not comparable.
+    const f1 = await fullProbe({ kind: 'commit', sha: tip }, files);
+    probes++;
+    const f2 = f1.usable ? await fullProbe({ kind: 'commit', sha: tip }, files) : f1;
+    if (f1.usable) probes++;
+    if (f1.usable && f2.usable && red(f1) && red(f2)) {
+      active = fullProbe;
+      usedFullCommand = true;
+      t1 = f1;
+      t2 = f2;
+    }
+  }
   if (!red(t1) || !red(t2)) {
     return {
       status: 'flaky',
       probes,
+      usedFullCommand,
+      // The tip IS a confirmed failure — the checks gate just reported it — so it
+      // is a valid root even though the search cannot narrow further.
+      lastFailed: tip,
       detail:
-        `${files.join(', ')} does not fail consistently at ${tip.slice(0, 12)} — ` +
-        'there is no commit that introduced it; the test itself is unstable',
+        `${files.join(', ')} does not fail consistently at ${tip.slice(0, 12)}` +
+        `${fullProbe ? ' (narrowed or whole)' : ''} — no commit can be named as its cause; the check is unstable`,
     };
   }
+  lastFailed = tip;
 
   // Walk back for a green anchor.
   //
@@ -424,15 +548,17 @@ export async function findIntroducingCommit(
       anchor = sha;
       break;
     }
-    const r = await probe({ kind: 'commit', sha }, files);
+    const r = await active({ kind: 'commit', sha }, files);
     probes++;
     if (!r.usable) continue;
+    if (red(r)) lastFailed = sha; // walking back: each red is older than the last
     if (!red(r)) {
       // Rule 2 at the anchor: a single flaky pass here poisons the entire search
       // — everything after it is bisected inside a window whose lower bound is
       // wrong, and the result is a confidently named innocent commit.
-      const again = await probe({ kind: 'commit', sha }, files);
+      const again = await active({ kind: 'commit', sha }, files);
       probes++;
+      if (again.usable && red(again)) lastFailed = sha;
       if (again.usable && !red(again)) {
         anchor = sha;
         break;
@@ -443,6 +569,8 @@ export async function findIntroducingCommit(
     return {
       status: 'no-anchor',
       probes,
+      lastFailed,
+      usedFullCommand,
       detail:
         `no commit in the last ${WALK_BACK_STEPS[WALK_BACK_STEPS.length - 1]} first-parent commits passes ` +
         `${files.join(', ')} — the failure predates the search window`,
@@ -453,7 +581,7 @@ export async function findIntroducingCommit(
   // commit exists inside it.
   const commits = await history.listFirstParent(anchor, tip);
   if (commits.length === 0) {
-    return { status: 'inconclusive', anchor, probes, detail: 'the search window came back empty' };
+    return { status: 'inconclusive', anchor, probes, lastFailed, usedFullCommand, detail: 'the search window came back empty' };
   }
   let lo = 0;
   let hi = commits.length - 1;
@@ -464,6 +592,8 @@ export async function findIntroducingCommit(
         anchor,
         probes,
         scanned: commits.length,
+        lastFailed,
+        usedFullCommand,
         detail: `probe budget (${BISECT_PROBE_BUDGET}) spent with the window narrowed to ${hi - lo + 1} commits`,
       };
     }
@@ -492,7 +622,7 @@ export async function findIntroducingCommit(
         missing = cand;
         break;
       }
-      const attempt = await probe({ kind: 'commit', sha: commits[cand] }, files);
+      const attempt = await active({ kind: 'commit', sha: commits[cand] }, files);
       probes++;
       if (attempt.usable) {
         mid = cand;
@@ -510,6 +640,8 @@ export async function findIntroducingCommit(
         anchor,
         probes,
         scanned: commits.length,
+        lastFailed,
+        usedFullCommand,
         // These are different failures and an operator acts on them differently:
         // a spent budget means "the history is long", an unbuildable window means
         // "these commits cannot be checked out and tested at all".
@@ -518,8 +650,10 @@ export async function findIntroducingCommit(
           : `no buildable commit in the remaining window of ${hi - lo + 1}`,
       };
     }
-    if (red(r)) hi = mid;
-    else lo = mid + 1;
+    if (red(r)) {
+      hi = mid;
+      lastFailed = commits[mid]; // `hi` only ever moves DOWN, so this is the oldest red
+    } else lo = mid + 1;
   }
   return {
     status: 'found',
@@ -527,6 +661,8 @@ export async function findIntroducingCommit(
     anchor,
     probes,
     scanned: commits.length,
+    lastFailed: lastFailed ?? commits[lo],
+    usedFullCommand,
     // `red` is ANY of the files, so with several the answer is the first commit
     // where the first of them appears — say that rather than implying all.
     detail:
