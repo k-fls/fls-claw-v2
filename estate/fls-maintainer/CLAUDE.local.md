@@ -111,9 +111,23 @@ finish --execute --token-file <path> --commands-file <cheap-tests.json>   # crea
   in a named file (see Case scope) — then `report-case` as usual. Claim
   `--tier judged` when you are confident in the
   fix — it is committed on the branch, pulled through every descendant, and the
-  pass can still complete. Claim `--tier held` when you are not — it is
-  published as a PR for the owner and BLOCKS the next sweep until merged.
+  pass can still complete. Claim `--tier held` when you are not, OR when the fix
+  does not belong in the named files at all — it is published as a PR for the
+  owner and BLOCKS the next sweep until merged. An unchanged worktree is fine
+  there: the PR then carries your DIAGNOSIS (what fails, why it cannot be fixed
+  in those files, where the fix belongs) and that is a valid outcome.
   This is the ONLY case type where you change code this pass did not merge.
+  STOP READING after ONE pass over the implicated code — the failing file, the
+  source it exercises, the definitions of the symbols in the failure, each file
+  ONCE. If you have read those and made no edit, you are done investigating:
+  claim `--tier held` and write the diagnosis. RE-READING A FILE YOU HAVE
+  ALREADY READ is the signal that reading has stopped producing decisions.
+  Live 2026-08-04: an agent read `poll-loop.ts` twelve times across 35 minutes,
+  compacted twice, and never attempted a fix or an escalation — both compactions
+  were spent re-reading what it had already seen.
+  REPORT AS YOU GO: one line when you take the case, one on every `report-case`
+  attempt and its outcome. From outside, working and hung look identical, and
+  silence is what makes a human interrupt you.
 - REISSUED case — the owner reviewed one of your open held PRs. The worktree
   holds your prior resolution as the pending files; the materials carry the
   full time-ordered PR dialog (`you (prior)` = your earlier turns; other turns
