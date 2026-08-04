@@ -461,7 +461,7 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
   const blockHeightOf = new Map<string, number>();
   for (const rec of held) blockHeightOf.set(rec.branch, rec.height);
   // The LIVE blocked set (merge_status != NONE) as of this point in DAG order:
-  // PR_ID branches (ledger + held registry) up front; DEFERRED branches join as
+  // PR_ID branches (origin rows + held registry) up front; DEFERRED branches join as
   // they are sticky-confirmed; freshly-deferring branches join as derived.
   const blockedNow = new Set<string>([
     ...held.map((r) => r.branch),

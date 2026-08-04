@@ -15,7 +15,6 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { initFixtureRepo, type FixtureRepo } from './fixtures.js';
 import { addTempWorktree, commitInfo, gitPush, isAncestor } from './git.js';
-import { readLedger } from './ledger.js';
 import { exportRrCache, writeRrCacheDir } from './merge.js';
 import {
   createCaseWorktree,
@@ -1168,7 +1167,7 @@ describe('propagate verify — §9 gate rolls back a red offender (FIX B)', () =
     expect(journal.some((e) => e.action === 'held' && e.branch === 'feat/off' && e.reason === 'gate')).toBe(true);
     expect(journal.filter((e) => e.action === 'verify').map((e) => e.ok)).toEqual([false, true]);
     // Gate hold (D-058): the journaled held row IS the block — no head, no PR,
-    // nothing written to the ledger.
+    // no durable local state is written.
     const gateRow = journal.find((e) => e.action === 'held' && e.branch === 'feat/off')!;
     expect(gateRow.reason).toBe('gate');
     // A gate hold is NOT a case — no conflict, no head, no merge. It used to
@@ -1178,7 +1177,7 @@ describe('propagate verify — §9 gate rolls back a red offender (FIX B)', () =
     // gate-fix cases where readers really did do arithmetic on it.
     expect(gateRow.height).toBeUndefined();
     expect(gateRow.conflictedPaths).toBeUndefined();
-    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['feat/off']?.merge_status ?? null).toBeNull();
+    expect(existsSync(join(ws, 'sweep-ledger.json'))).toBe(false); // no durable local state (2026-08-04)
   });
 });
 
@@ -1361,7 +1360,7 @@ describe('propagate verify — publishable set (D-051)', () => {
       [{ action: 'held', branch: 'module/held', caseId: 'gate-x', height: -1, conflictedPaths: [] }],
     );
     // Heldness = the journaled `held` disposition above (D-058) — the derived
-    // blocked view reads the journal; the ledger plays no part.
+    // blocked view reads the journal; no local state file is involved.
     const heldTip = repo.sha('module/held');
     const cmds = join(ws, 'cmds.json');
     writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }]));
@@ -1546,19 +1545,31 @@ describe('propagate verify — publishable set (D-051)', () => {
     expect(journal.some((e) => e.action === 'held' && e.branch === 'feat/off' && e.reason === 'gate')).toBe(true);
     expect(repo.sha('feat/off')).toBe(cleanTip); // rolled back to its pre-ref
     // The journaled gate hold blocks the branch for the rest of the pass (D-058).
-    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['feat/off']?.merge_status ?? null).toBeNull();
+    expect(existsSync(join(ws, 'sweep-ledger.json'))).toBe(false); // no durable local state (2026-08-04)
   });
 });
 
 // --- CHANGE 2 / D-049: urging (posted by `push`) + unfreeze paths -----------
 
 /** Fake GitHub transport for cmdPush tests (closure checks + urge posting). */
-function fakePushGithub(overrides: Record<string, { status: number; body: unknown }> = {}): {
+/**
+ * A fake origin for push tests. STATEFUL about comments: a POSTed comment is
+ * served back by the next GET, because that is how origin behaves and the urge
+ * dedup now depends on it (the `sweep-urge` marker replaced the ledger's
+ * `lastUrgedHead`, 2026-08-04). `comments` may be shared between two fakes to
+ * model two pushes against ONE origin.
+ */
+function fakePushGithub(
+  overrides: Record<string, { status: number; body: unknown }> = {},
+  comments: Array<{ body: string }> = [],
+): {
   calls: Array<{ method: string; path: string; body?: unknown }>;
+  comments: Array<{ body: string }>;
   factory: (token: string) => GithubTransport;
 } {
   const state = {
     calls: [] as Array<{ method: string; path: string; body?: unknown }>,
+    comments,
     factory: (_t: string): GithubTransport => ({
       async request(method, path, body) {
         state.calls.push({ method, path, body });
@@ -1571,7 +1582,15 @@ function fakePushGithub(overrides: Record<string, { status: number; body: unknow
         if (method === 'GET' && /\/pulls\/\d+$/.test(path))
           return { status: 200, body: { number: 12, merged: true, body: 'agent prose' } };
         if (method === 'PATCH' && /\/pulls\/\d+$/.test(path)) return { status: 200, body: { ok: true } };
-        if (method === 'POST' && path.includes('/comments')) return { status: 201, body: { id: 1 } };
+        if (method === 'GET' && path.includes('/comments')) {
+          // Page 1 serves everything; later pages are empty (ghPaginated stops).
+          const page = /[?&]page=(\d+)/.exec(path)?.[1] ?? '1';
+          return { status: 200, body: page === '1' ? state.comments : [] };
+        }
+        if (method === 'POST' && path.includes('/comments')) {
+          state.comments.push({ body: String((body as { body?: unknown })?.body ?? '') });
+          return { status: 201, body: { id: state.comments.length } };
+        }
         return { status: 404, body: null };
       },
     }),
@@ -1628,13 +1647,12 @@ describe('propagate — blocked-branch urging is POSTED by push, once per NEW pe
     expect(gh.calls.some((c) => c.method === 'PATCH' && c.path.endsWith('/pulls/12'))).toBe(true);
     const comment = gh.calls.find((c) => c.method === 'POST' && c.path.includes('/comments'))!;
     expect(String((comment.body as { body: string }).body)).toContain('still blocked');
-    const ledger = readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']!;
-    expect(ledger.lastUrgedHead).toBe(repo.sha('main'));
-    // D-058: merge_status is never written — lastUrgedHead is the one cache.
-    expect(ledger.merge_status ?? null).toBeNull();
+    // The dedup record is the COMMENT's own marker on origin — no local file.
+    expect(String((comment.body as { body: string }).body)).toContain(`<!-- sweep-urge: ${repo.sha('main')} -->`);
+    expect(existsSync(join(ws, 'sweep-ledger.json'))).toBe(false);
 
-    // A second push suppresses (no new pending head).
-    const gh2 = fakePushGithub();
+    // A second push suppresses — same origin, so it reads back its own marker.
+    const gh2 = fakePushGithub({}, gh.comments);
     expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, tokenFile, pass: wm12 }), gh2.factory)).toBe(0);
     expect(readJournal(dir).filter((e) => e.action === 'urge').length).toBe(1);
     expect(gh2.calls.filter((c) => c.method === 'POST' && c.path.includes('/comments')).length).toBe(0);
@@ -1675,7 +1693,7 @@ describe('propagate — blocked-branch urging is POSTED by push, once per NEW pe
     ).toBe(1);
     const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> };
     expect(res.issues.some((i) => i.id === 'ERR17_URGE_FAILED')).toBe(true);
-    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.lastUrgedHead ?? null).toBeNull();
+    expect(existsSync(join(ws, 'sweep-ledger.json'))).toBe(false); // urge dedup is origin-derived now
     expect(readJournal(dir).filter((e) => e.action === 'urge').length).toBe(0);
   });
 });
@@ -1911,7 +1929,7 @@ function snapshotTree(root: string): Record<string, string> {
 }
 
 describe('propagate — N4: dry-run run makes NO state changes', () => {
-  it('leaves the workspace + ledger byte-identical', async () => {
+  it('leaves the workspace byte-identical', async () => {
     const { repo } = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
@@ -2049,7 +2067,7 @@ describe('propagate — N1: ref writers keep a checked-out branch worktree consi
   });
 });
 
-// --- B4: merge + defer combined verdict (§5) + ledger-rebuilt HELD (N3) ------
+// --- B4: merge + defer combined verdict (§5) + origin-rebuilt HELD (N3) ------
 describe('propagate run — B4: clean-prefix merge with a DEFERRED conflict above it', () => {
   it('journals BOTH the merge and the defer pointer behind a blocked DIRECT parent (D-057)', async () => {
     // Direct-parent MIN rule: the "clean-prefix merge + defer above" case is
@@ -2247,7 +2265,7 @@ describe('derived merge_status (D-058) — blocked view from origin rows + journ
     cleanups.push(() => repo.destroy());
 
     const ws = mkWorkspace();
-    const ledgerPath = join(ws, 'sweep-ledger.json');
+    const ledgerPath = join(ws, 'sweep-ledger.json'); // must never be created
     const inv = writeInventory([
       { id: 'a', branch: 'feat/a', parents: ['main_patched'] },
       { id: 'b', branch: 'feat/b', parents: ['main_patched'] },
@@ -2264,14 +2282,14 @@ describe('derived merge_status (D-058) — blocked view from origin rows + journ
     };
 
     // PASS 1: A blocked (origin row); C hits its conflict at h1 >= MIN(A@h1)
-    // -> DEFER (journal row = the state; the ledger is NEVER written, D-058).
+    // -> DEFER (journal row = the state; nothing durable is written, D-058).
     const dir1 = passDir(ws, repo.sha('main').slice(0, 12));
     appendJournal(dir1, blockRow);
     await cmdPlan(cli({ cmd: 'plan' }));
     expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
     expect(readJournal(dir1).some((e) => e.action === 'defer' && e.branch === 'feat/c')).toBe(true);
-    expect(readLedger(ledgerPath).branches['feat/c']?.merge_status ?? null).toBeNull();
-    expect(readLedger(ledgerPath).branches['feat/a']?.merge_status ?? null).toBeNull();
+    expect(existsSync(ledgerPath)).toBe(false); // no durable local state (2026-08-04)
+    expect(existsSync(ledgerPath)).toBe(false); // no durable local state (2026-08-04)
     // No case/PR for the deferred branch.
     expect(readJournal(dir1).some((e) => e.action === 'case' && e.branch === 'feat/c')).toBe(false);
     const cTipDeferred = repo.sha('feat/c');
@@ -2314,8 +2332,8 @@ describe('derived merge_status (D-058) — blocked view from origin rows + journ
       false,
     ); // A is unblocked
     // A case alone does not block; only held/defer do. C is mid-case (open) —
-    // the OPEN CASE gates the pass; the ledger stays untouched throughout.
-    expect(readLedger(ledgerPath).branches['feat/c']?.merge_status ?? null).toBeNull();
+    // the OPEN CASE gates the pass; no local state file is ever created.
+    expect(existsSync(ledgerPath)).toBe(false); // no durable local state (2026-08-04)
   });
 
   it('a branch with TWO concurrent blocks contributes its LOWEST height to descendants (finding #4 — no last-row collapse)', async () => {

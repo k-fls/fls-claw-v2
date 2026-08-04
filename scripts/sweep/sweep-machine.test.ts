@@ -23,7 +23,6 @@ import { mkdtempSync } from 'node:fs';
 
 import { initFixtureRepo, type FixtureRepo } from './fixtures.js';
 import { isAncestor } from './git.js';
-import { readLedger } from './ledger.js';
 import {
   CHECKS_FAIL_LIMIT,
   cmdPublish,
@@ -605,9 +604,9 @@ describe('sweep report-case (D-053 §2)', () => {
     expect(res.instruction).toContain('use only this template');
     expect(repo.sha('main_patched')).toBe(postRun); // no merge
     // Blocked ⇔ the journaled held disposition; nothing is published here and
-    // the ledger is never written (D-058).
+    // no durable local state is written (D-058).
     expect(readJournal(dir).some((e) => e.action === 'pr-published')).toBe(false);
-    expect(readLedger(join(ws, 'sweep-ledger.json')).branches['main_patched']?.merge_status ?? null).toBeNull();
+    expect(existsSync(join(ws, 'sweep-ledger.json'))).toBe(false); // no durable local state (2026-08-04)
     // The cold read RAN (not demoted before it) and the held entry carries the
     // marker-clean resolution + the scope escalation for the unified publish.
     expect(readJournal(dir).some((e) => e.action === 'coldread' && e.caseId === caseId)).toBe(true);
@@ -3918,7 +3917,7 @@ describe('next-case — a participating branch that is RED before any merge', ()
     // It merged (the pass proceeded past the check).
     expect(readJournal(dir).some((e) => e.action === 'merge')).toBe(true);
     // And the green result is memoised per (branch, sha) in the PASS journal —
-    // a pass-local fact, not a ledger: `start` wipes it, so it cannot go stale.
+    // a pass-local fact, not durable state: `start` wipes it, so it cannot go stale.
     const checkRows = readJournal(dir).filter((e) => e.action === 'branch-check');
     expect(checkRows.length).toBeGreaterThan(0);
     expect(checkRows.every((e) => e.ok === true)).toBe(true);

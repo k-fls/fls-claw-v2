@@ -462,6 +462,44 @@ export function renderSweepAddressed(id: number): string {
 }
 
 /**
+ * The URGE marker: which upstream head a driver urge comment was about.
+ *
+ * This replaces the sweep ledger's `lastUrgedHead` (2026-08-04). That field was
+ * the last surviving reason for a durable local state file, and it was the same
+ * mistake D-058 §2 abolished everywhere else: a fact about what is ON ORIGIN,
+ * cached locally, where it could go stale, survive a clean-slate, and be read
+ * back by a later session as authority. One did exactly that — a 12-day-old
+ * `sweep-ledger.json` was reported as the current sweep state while an open pass
+ * sat in the same directory.
+ *
+ * The comment IS the record: if the PR already carries an urge for this head,
+ * the urge was posted. Same shape as `sweep-addressed`, same reasoning.
+ */
+export const SWEEP_URGE_LINE_RE = /^<!--\s*sweep-urge:\s*([0-9a-f]{7,40})\s*-->$/;
+
+export function renderSweepUrge(headSha: string): string {
+  return `<!-- sweep-urge: ${headSha} -->`;
+}
+
+/** Heads this PR has already been urged about, read from its comments. */
+export async function urgedHeads(
+  transport: GithubTransport,
+  slug: { owner: string; repo: string },
+  prNumber: number,
+): Promise<Set<string>> {
+  const raw = await ghPaginated(transport, `/repos/${slug.owner}/${slug.repo}/issues/${prNumber}/comments`);
+  const out = new Set<string>();
+  for (const c of raw) {
+    const body = String((c as { body?: unknown }).body ?? '');
+    for (const line of body.split('\n')) {
+      const m = SWEEP_URGE_LINE_RE.exec(line.trim());
+      if (m) out.add(m[1]);
+    }
+  }
+  return out;
+}
+
+/**
  * The sweep-addressed id carried by `body`, or null when no LINE of the body
  * is exactly the marker (hardened detection: an embedded/quoted occurrence
  * does not count). Multiple marker lines take the MAX.

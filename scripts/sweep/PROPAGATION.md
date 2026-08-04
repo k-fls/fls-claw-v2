@@ -203,16 +203,16 @@ direct parent) HELD at height N with conflicted path set S_P:
   has C merge P (fresh resolution + shared rerere, D-006) *before* re-probing Q, so the
   formerly deferred conflict typically auto-resolves.
 
-**Cross-pass DEFERRED (N3, 2026-07-21):** HELD outlives the pass through the ledger
-(§8), and the ledger freeze carries the conflicting head sha (`heldHead`) and its
-conflicted path set (`heldPaths`); at plan/run/resolve the HELD registry is the pass
-journal's records plus records REBUILT from the ledger for branches the journal does
-not know about. The height is re-derived from `heldHead` against the current pass's
-pinned chain — heights are pass-relative (the fork point moves as branches absorb
-upstream) and are never carried numerically across passes. Degradation is still
-possible and is deliberately in the safe direction: gate holds (§9) and pre-upgrade
-ledger entries carry no head/paths and cannot be matched, so a next-pass descendant of
-such a freeze gets an ORDINARY case instead of DEFERRED — extra review, never less.
+**Cross-pass DEFERRED (N3, 2026-07-21; origin-derived since D-058):** HELD outlives
+the pass through ORIGIN — the open `fix/sweep/*` ref and its PR — not through any
+local file. `start` re-derives the blocked set from those refs and journals
+`origin-blocked` rows carrying the conflicting head sha; at plan/run/resolve the HELD
+registry is the pass journal. The height is re-derived from that head against the
+current pass's pinned chain — heights are pass-relative (the fork point moves as
+branches absorb upstream) and are never carried numerically across passes.
+Degradation is still possible and is deliberately in the safe direction: gate holds
+(§9) carry no head/paths and cannot be matched, so a next-pass descendant of such a
+hold gets an ORDINARY case instead of DEFERRED — extra review, never less.
 
 ## 6. No-op skips and the leaf must-merge rule (D-039)
 
@@ -424,25 +424,27 @@ skipped this pass (arriving for the barrier with an empty interval, like HELD) a
 reported; siblings keep processing. Diverged branches are owner escalations, never
 force-resolved by the driver or the agent.
 
-**Durable freezes (ledger):** HELD outlives the pass. On `held` the driver writes the
-group ledger (`ledger.ts`: status `frozen`, `frozenBy` = case id, `heldHead` = the
-conflicting head sha, `heldPaths` = its conflicted paths — the §5 cross-pass DEFERRED
-inputs); `plan`/`run` treat ledger-frozen branches as arriving with an
-empty interval (barrier satisfied, no merges). The per-pass journal remains the
-intra-pass registry; the ledger is the cross-pass one. Before ANY ref mutation on a
-branch, its pre-pass tip is journaled (`pre-ref`) — the §9 rollback target.
+**Durable holds live on ORIGIN (D-058).** HELD outlives the pass as an open
+`fix/sweep/*` ref plus its PR; `start` re-derives the blocked set from those and
+journals `origin-blocked` rows, and `plan`/`run` treat blocked branches as arriving
+with an empty interval (barrier satisfied, no merges). The pass journal is the
+intra-pass registry; ORIGIN is the cross-pass one. There is no local state file —
+the group-owned `sweep-ledger.json` was deleted 2026-08-04 after a 12-day-old copy
+was read back by a fresh session and reported as the current sweep state while an
+open pass sat beside it. Before ANY ref mutation on a branch, its pre-pass tip is
+journaled (`pre-ref`) — the §9 rollback target.
 
-**Unfreeze paths:** (a) DERIVED — at plan/attach time, a ledger-frozen branch whose
-current tip already CONTAINS its `heldHead` (the resolution landed externally, e.g.
-the owner merged the freeze PR) is auto-unfrozen (journaled, reason `derived`);
-(b) a mechanical/judged `report-case` on the branch unfreezes it. Freezes are never
+**Unblock paths:** (a) DERIVED — at `start`, a fix ref merged into its target is
+resolved and the ref deleted; a branch whose tip already CONTAINS the held head
+(the resolution landed externally) is likewise no longer blocked;
+(b) a mechanical/judged `report-case` on the branch clears it. Blocks are never
 cleared silently (the manual-override subcommand is gone).
 
-**Urging (owner 2026-07-20; posting mechanized 2026-07-21, D-049):** the
-ledger-frozen entry also carries `lastUrgedHead` and the freeze PR's `prNumber`.
-When a pass finds NEW pending content for a frozen branch beyond what it was last
-urged about (newest eligible head ≠ `lastUrgedHead` — the pending run's top; a
-frozen branch lands no merges, so that is the newest pending trunk head), `propagate
+**Urging (owner 2026-07-20; posting mechanized 2026-07-21, D-049):** the blocked row
+carries the fix branch and its PR number. When a pass finds NEW pending content for a
+blocked branch beyond what it was last urged about — and "last urged" is read from
+the PR's OWN comments (`sweep-urge: <head>` markers, 2026-08-04), never from a local
+cache — `propagate
 push --execute` POSTS the urge as a PR comment on the freeze PR — pending-commit
 count since the freeze, the newest heads with subjects — refreshes the D-004
 machine block in the PR body (§14.4), journals `urge`, and records the new
@@ -457,7 +459,7 @@ cases on one branch in one day cannot collide; case ids are `branch + parent + h
 branch+height alone, the second would trip the double-resolve guard and deadlock).
 
 **Dry-run purity:** without `--execute`, `run` performs NO state changes at all — no
-merges, no unfreezes, no urge artifacts, no ledger writes, no journal entries.
+merges, no unfreezes, no urge artifacts, no journal entries.
 `resolve` without `--execute` likewise writes nothing (N7): a re-verification failure
 is reported on stderr only, and the cold-read request is not regenerated.
 
@@ -471,7 +473,7 @@ Implemented as the driver's `verify` stage, run by `finish` (reusing `verify.ts`
 everything-rebuild + CI command list with leave-one-out attribution), after `run` has
 completed the executable portion of the pass. Red result →
 the offending branch is rolled back to its journaled `pre-ref` (recorded before its
-first mutation this pass) and journaled HELD(gate) + ledger-frozen (D-012); re-verify
+first mutation this pass) and journaled HELD(gate) (D-012); re-verify
 without it. A pass is only `pass-complete` when the gate is green. Nothing is pushed
 before verification passes (D-034 gate 1-2 additionally apply to any push):
 the push stage refuses (`ERR18_VERIFY_PENDING`) unless the journal shows a green
@@ -481,7 +483,7 @@ the push stage refuses (`ERR18_VERIFY_PENDING`) unless the journal shows a green
 validate what will be published, not a static branch list. The recipe is DERIVED from
 the pass: the branches that ADVANCED this pass (a `pre-ref` was journaled), in the
 plan's DAG order (parents before children), **minus** any branch that is held/frozen
-(ledger or journal) or carries an open case — those are unpublished, frozen-by-design,
+(journal/origin) or carries an open case — those are unpublished, frozen-by-design,
 and still carry unresolved conflicts, so verifying them would recreate historical stack
 conflicts against the base and wedge the gate (a permanently-held branch could never let
 it go green). The rebuild base is the fork trunk `main_patched` per the §3 merge-source
@@ -514,7 +516,7 @@ ONLY for a publishable branch that WOULD be pushed this pass. The static `recipe
 
 Reused as-is: `git.ts` (merge-tree, rev-list, worktree helpers), `merge.ts` (the shared
 rerere cache), `scope.ts` (inventory scope + D-032b/D-033 composition), `verify.ts`,
-`ledger.ts` (freeze bookkeeping), `registry.ts`. The retired scan/PoI-routing modules
+`registry.ts`. The retired scan/PoI-routing modules
 (`scan.ts`, `routing.ts`, `record.ts`, `replay.ts`, `stop-points.ts`) and the `sweep.ts`
 pipeline they served are gone; propagation never called them. `validate.ts` stays as
 `sweep.ts validate-registry` — the `fork-registry-generate` skill runs it.
@@ -546,15 +548,15 @@ pipeline they served are gone; propagation never called them. `validate.ts` stay
 ## 12. Trust model — what the driver enforces vs what must sit outside it
 
 The driver's re-verification recomputes VALUES from git, but its POINTERS — the plan,
-journal, ledger, and every `--flag` — live in the agent-writable workspace and are
+journal and every `--flag` — live in the agent-writable workspace and are
 supplied by whoever invokes the CLI. Inside a single trust domain the driver is a
 correctness core, not an enforcement boundary. It becomes an enforcement core only
 under an owner-controlled invocation layer, which is the ADOPTION CONDITION, not an
 afterthought:
 
 - a wrapper (or separate OS/service identity) that pins the CLI flags (`--repo`,
-  `--workspace`, `--upstream`, `--ledger`, config paths), owns the pass directory and
-  ledger read-write, and is the only principal allowed to run the mutating commands
+  `--workspace`, `--upstream`, config paths), owns the pass directory read-write,
+  and is the only principal allowed to run the mutating commands
   (`next-case`/`report-case`/`finish`);
 - cold-read PROVENANCE attested outside the workspace (the driver validates shape and
   freshness only);

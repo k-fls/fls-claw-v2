@@ -15,7 +15,7 @@ workaround, "merging remains owner-only".
 
 D-057 amendment (2026-07-23): blockedness is now the `merge_status ∈ {PR_ID |
 DEFERRED | NONE}` block model (invariant `blocked ⇔ merge_status != NONE`),
-replacing the independent ledger freeze fields; DEFERRED is pure height-MIN over
+replacing the independent freeze fields; DEFERRED is pure height-MIN over
 blocked DIRECT parents (the `(floor, N′]` path-intersection window is retired);
 HELD publish is unified into one ACTIVE PR at the resolved merge commit when the
 resolution is marker-clean (owner reviews & merges — the driver never auto-merges
@@ -32,11 +32,11 @@ reviewer feedback) into the journal. This SUBSUMES the D-057 open item on held o
 — an ACTIVE HELD-review PR can no longer bypass the verify gate; the ERR14 held-
 ordering (bases current) now applies to every held PR. A pass that crashes before
 `finish` has published NOTHING.
-(b) Blocked state is ORIGIN-DERIVED, not ledger-persisted. `sweep start` (now
+(b) Blocked state is ORIGIN-DERIVED, never persisted locally. `sweep start` (now
 networked, `--token-file`) reconstructs the blocked set from the origin `fix/sweep/*`
 refs: a ref merged into `origin/<target>` → resolved, delete the ref; unmerged WITH an
 open PR → blocked (PR_ID); unmerged WITHOUT an open PR → an orphan, delete it (so a
-branch is never stuck blocked-but-invisible). The ledger's `merge_status` field is no
+branch is never stuck blocked-but-invisible). The retired ledger's `merge_status` field is no
 longer the authority (the D-057 reconcile/settle machinery is retired) — the block-
 model semantics in §1 still describe within-pass blockedness, but persistence across
 passes now lives in origin's refs, so the local pass dir is disposable and `start`
@@ -209,7 +209,7 @@ Tier rules:
   intermediate step; DEFERRED is sticky while any direct parent is blocked. This one
   block replaces the retired independent freeze fields (status:'frozen', frozenBy,
   heldHead, heldPaths, fixBranch, pendingBehindFreeze). D-058: this is the WITHIN-PASS
-  model; the block set is no longer PERSISTED in the ledger's `merge_status` — `sweep
+  model; the block set is no longer PERSISTED anywhere local — `sweep
   start` re-derives it from the origin `fix/sweep/*` refs each pass (see the D-058
   amendment), so PR_ID persistence is carried by the live ref + its open PR, not a
   stored field.

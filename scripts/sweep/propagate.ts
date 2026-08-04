@@ -15,7 +15,6 @@
  * Flags:
  *   --repo <path>            repo to operate on                (default: cwd)
  *   --workspace <dir>        artifacts root = GROUP ROOT       (default: parent of --repo; MUST be outside any git work tree, D-055)
- *   --ledger <file>          group-owned ledger JSON           (default: <workspace>/sweep-ledger.json)
  *   --pass <watermark12>     attach to a specific pass         (default: latest OPEN pass)
  *   --inventory <dir>        live feature inventory            (default: latest bootstrap snapshot)
  *   --scope-config <file>    scope policy                      (default: registry/scope.yaml)
@@ -45,7 +44,6 @@
  *   D-058: NOTHING is published before `finish` — report-pr records intent only, and
  *   finish's single post-verify publish phase creates every PR (judged + held). The
  *   blocked (merge_status) picture is derived from ORIGIN at `sweep start`, never from
- *   local state: the ledger's merge_status field is dead to this driver.
  */
 import { execFile, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -71,7 +69,6 @@ import {
   DEFAULT_STACK_CAP,
   DEFAULT_UPSTREAM_REF,
   FORK_POINT,
-  LEDGER_FILENAME,
   RR_CACHE_DIRNAME,
   VERIFY_COMMANDS,
 } from './config.js';
@@ -107,7 +104,6 @@ import {
   type SubsetProbe,
 } from './not-my-bug.js';
 import { malformedCutPointExceptionsIssue, resolveCutPointExceptions, staleWarnings } from './cut-points.js';
-import { readLedger, writeLedger, defaultLedgerBranch } from './ledger.js';
 import { installRrCache } from './merge.js';
 import { loadRegistry } from './registry.js';
 import { resolveScope } from './scope.js';
@@ -134,8 +130,10 @@ import {
   realGithubTransport,
   renderMachineBlock,
   renderSweepAddressed,
+  renderSweepUrge,
   reopenPullRequest,
   stripSweepAddressed,
+  urgedHeads,
   withMachineBlock,
   type GithubTransport,
   type Issue,
@@ -172,7 +170,6 @@ interface Cli {
   cmd: string;
   repo: string;
   workspace: string;
-  ledgerPath?: string;
   pass?: string;
   /**
    * Live inventory dir. Omitted (undefined) falls back to the committed
@@ -239,7 +236,7 @@ interface Cli {
 }
 
 const USAGE =
-  'Usage: pnpm exec tsx scripts/sweep/propagate.ts <sweep-start|next-case|report-case|report-pr|sweep-finish|sweep-abort> [--repo <path>] [--workspace <dir>] [--ledger <file>] [--pass <wm12>] [--dry-run] [--tier <t>] [--not-my-bug] [--inventory <dir>] [--checks-file <path>] [flags]';
+  'Usage: pnpm exec tsx scripts/sweep/propagate.ts <sweep-start|next-case|report-case|report-pr|sweep-finish|sweep-abort> [--repo <path>] [--workspace <dir>] [--pass <wm12>] [--dry-run] [--tier <t>] [--not-my-bug] [--inventory <dir>] [--checks-file <path>] [flags]';
 
 function parseCli(argv: string[]): Cli {
   const [cmd, ...rest] = argv;
@@ -274,9 +271,6 @@ function parseCli(argv: string[]): Cli {
       case '--workspace':
         cli.workspace = pathResolve(need());
         workspaceExplicit = true;
-        break;
-      case '--ledger':
-        cli.ledgerPath = pathResolve(need());
         break;
       case '--pass':
         cli.pass = need();
@@ -326,10 +320,10 @@ function parseCli(argv: string[]): Cli {
     }
   }
   // D-055 (C-1): the canonical workspace is the GROUP ROOT — the parent of the
-  // git clone (`repo/`), where the DURABLE `sweep-ledger.json` + `rr-cache` live.
-  // When `--workspace` is not given, derive it from `--repo` so the pass, ledger
-  // and rr-cache never land INSIDE the clone (the 2026-07-22 split that killed
-  // rerere and diverged the freeze ledger). An explicit `--workspace` is honored
+  // git clone (`repo/`), where the DURABLE `rr-cache` lives. When `--workspace`
+  // is not given, derive it from `--repo` so the pass and rr-cache never land
+  // INSIDE the clone (the 2026-07-22 split that killed rerere). An explicit
+  // `--workspace` is honored
   // but `sweep start` refuses one inside a git working tree (see cmdSweepStart).
   if (!workspaceExplicit) cli.workspace = dirname(pathResolve(cli.repo));
   return cli;
@@ -483,10 +477,6 @@ async function passContext(cli: Cli): Promise<PassCtx> {
   return cli.cmd === 'plan' ? openPass(cli) : attachPass(cli);
 }
 
-function ledgerPathOf(cli: Cli): string {
-  return cli.ledgerPath ?? join(cli.workspace, LEDGER_FILENAME);
-}
-
 /**
  * Blocked state (D-058): merge_status is NO LONGER stored anywhere local — it
  * is DERIVED. Cross-pass authority is ORIGIN: `sweep start` reconstructs the
@@ -495,7 +485,7 @@ function ledgerPathOf(cli: Cli): string {
  * the fresh pass dir. Within a pass the journal is the working view:
  * `origin-blocked` rows + this-pass `held` dispositions are PR_ID; `defer`
  * rows are DEFERRED while a direct parent is still blocked; a manual
- * `unfrozen` row clears a branch for the rest of the pass. The ledger's
+ * `unfrozen` row clears a branch for the rest of the pass. The retired ledger's
  * `merge_status` field survives only as a non-authoritative legacy cache for
  * the old sweep merge stage — the propagation driver never reads or writes it.
  */
@@ -696,12 +686,12 @@ interface PendingUrge {
  * `plan`/`run` only report these; POSTING (PR comment + D-004 machine-block
  * refresh + `lastUrgedHead` advance) lives exclusively in the networked
  * `push` stage (D-049 — the driver posts, never prepares gh commands).
- * Blocked rows come from the journal (D-058: origin-derived at start);
- * `lastUrgedHead` stays a non-authoritative ledger cache — losing it merely
- * re-urges once.
+ * Blocked rows come from the journal (D-058: origin-derived at start). DEDUP is
+ * done at POST time against the PR's own comments (`urgedHeads`), not from a
+ * local cache: "have I already urged about this head" is a fact about origin,
+ * and the ledger that used to hold it is gone (2026-08-04).
  */
 async function detectUrges(cli: Cli, ctx: PassCtx, journal: JournalEntry[]): Promise<PendingUrge[]> {
-  const ledger = readLedger(ledgerPathOf(cli));
   const due: PendingUrge[] = [];
   for (const row of [...blockedRows(journal).values()].flat()) {
     // Rows without a fix branch have no owner-facing PR to nudge: gate holds,
@@ -714,7 +704,6 @@ async function detectUrges(cli: Cli, ctx: PassCtx, journal: JournalEntry[]): Pro
     const pending = ctx.chain.heads.filter((h) => h.height > coverage);
     if (pending.length === 0) continue;
     const newest = pending[pending.length - 1];
-    if (newest.sha === ledger.branches[row.branch]?.lastUrgedHead) continue; // already urged about this head
     due.push({
       branch: row.branch,
       head: newest.sha,
@@ -749,6 +738,9 @@ async function urgeCommentBody(cli: Cli, urge: PendingUrge): Promise<string> {
     // content-based bot exclusion — same PAT as the human). The urge RE-ASSERTS
     // the current value; classification takes the MAX, so this never regresses.
     renderSweepAddressed(urge.markerId ?? 0),
+    // The record that this head WAS urged — read back by `urgedHeads` instead of
+    // a local ledger field (2026-08-04).
+    renderSweepUrge(urge.head),
   ].join('\n');
 }
 
@@ -2405,7 +2397,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
   const { chain, dir } = ctx;
 
   // DRY-RUN PURITY (N4): without --execute, NO state changes of ANY kind — no
-  // urge artifacts, no ledger/journal writes, no merges. Report what WOULD
+  // urge artifacts, no journal writes, no merges. Report what WOULD
   // happen (detect-only) and return.
   if (!cli.execute) {
     const journal0 = readJournal(dir);
@@ -3394,7 +3386,7 @@ async function reverifyReissueCase(
  * Freeze a branch HELD: prepare the PR materials (D-048) and journal `held` —
  * the journaled disposition IS the blocked state for the rest of the pass
  * (D-058: blockedRows/passStatusView read it; nothing is written to the
- * ledger, and NOTHING is pushed or published here — the PR is created at
+ * journal, and NOTHING is pushed or published here — the PR is created at
  * `finish`, after verify). The journal entry records what the UNIFIED publish
  * needs (D-057):
  *  - `resolution`: the agent's last resolution tree + whether it is
@@ -3504,7 +3496,7 @@ function fixBranchName(id: string, rc: Pick<ResolvedCase, 'branch' | 'parent' | 
  * `propagate publish --case <id>` — the ONLY sanctioned PR-creation path.
  * No fix/sweep ref is created here either: publish pushes the ref at the REAL
  * head (D-049 — HELD: the run's top commit; JUDGED: the merge commit). Returns
- * the deterministic fix branch NAME for ledger/urge bookkeeping.
+ * the deterministic fix branch NAME for urge bookkeeping.
  */
 /** Where the case's PR template is written — the ONE template the agent may use. */
 function prTemplatePath(dir: string, caseId: string): string {
@@ -4685,8 +4677,8 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
     }
   }
 
-  // (3) Urge posting (§8, D-004): post FIRST — journal/ledger (incl.
-  // lastUrgedHead) advance only after a successful post, so a failed urge
+  // (3) Urge posting (§8, D-004): post FIRST — the journal row and the comment's
+  // own `sweep-urge` marker land only after a successful post, so a failed urge
   // retries on the next push.
   const urged: Array<{ branch: string; head: string; prNumber: number }> = [];
   if (transport && slugParts) {
@@ -4700,6 +4692,13 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
         }
         if (!prNumber) {
           appendJournal(dir, { action: 'urge-skip', branch: urge.branch, reason: 'freeze PR not published yet' });
+          continue;
+        }
+        // ORIGIN-DERIVED DEDUP: the PR's own comments say whether this head was
+        // already urged. Cheap (one paginated read per due urge, and urges are
+        // rare), and it cannot go stale the way the ledger field did.
+        if ((await urgedHeads(transport, slugParts, prNumber)).has(urge.head)) {
+          appendJournal(dir, { action: 'urge-skip', branch: urge.branch, head: urge.head, reason: 'already urged for this head' });
           continue;
         }
         const commentBody = await urgeCommentBody(cli, urge);
@@ -4721,19 +4720,11 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
           pending: urge.pending.length,
           prNumber,
         });
-        // lastUrgedHead is the ONE surviving ledger write: a non-authoritative
-        // dedup cache (D-058 §3 — losing it merely re-urges once). merge_status
-        // is never written; blockedness is origin/journal-derived.
-        const path = ledgerPathOf(cli);
-        const fresh = readLedger(path);
-        const cur = fresh.branches[urge.branch] ?? defaultLedgerBranch();
-        fresh.branches[urge.branch] = { ...cur, lastUrgedHead: urge.head };
-        writeLedger(path, fresh);
         urged.push({ branch: urge.branch, head: urge.head, prNumber });
       } catch (err) {
         issues.push({
           id: 'ERR17_URGE_FAILED',
-          detail: `urge for '${urge.branch}' failed: ${err instanceof Error ? err.message : String(err)} — lastUrgedHead not advanced; it retries on the next push`,
+          detail: `urge for '${urge.branch}' failed: ${err instanceof Error ? err.message : String(err)} — no urge marker was posted, so it retries on the next push`,
         });
       }
     }
@@ -4905,7 +4896,7 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     return reOk ? 0 : 1;
   }
   // Offender is a PUBLISHABLE branch with a journaled pre-ref → the gate bites:
-  // roll it back to its pre-ref, HELD(gate), ledger-freeze, then re-verify (its
+  // roll it back to its pre-ref, HELD(gate), then re-verify (its
   // bad merge is gone) per verify.ts's model.
   const current = await revParse(cli.repo, offender);
   try {
@@ -6302,7 +6293,7 @@ async function deriveOriginMergeStatus(
  *
  * D-058: start is NETWORKED — it fetches origin (+ upstream) and reconstructs
  * the blocked set from the origin fix/sweep refs (`deriveOriginMergeStatus`)
- * BEFORE planning; the ledger's merge_status is no longer read, so the local
+ * BEFORE planning; merge_status is origin-derived, so the local
  * pass dir is disposable and `start` is idempotent on origin. A pass that
  * crashed before `finish` published NOTHING, so the re-derived picture is
  * clean and the pass is simply redone.
@@ -6320,8 +6311,8 @@ async function deriveOriginMergeStatus(
  * container-uid-owned files, so teardown MUST run IN-CONTAINER, which `start`
  * does). C-1: it also refuses a `--workspace` that IS the `--repo` clone or a
  * subdirectory of it, so the pass never lands inside the clone (splitting it
- * from the durable group-root ledger + rr-cache, which killed rerere and
- * diverged the ledger). A group root inside an OUTER git repo is accepted.
+ * from the durable group-root rr-cache, which killed rerere). A group root
+ * inside an OUTER git repo is accepted.
  */
 /**
  * Seal a pass that `start` OPENED and then REFUSED (the two D-061 base-red arms).
@@ -6363,9 +6354,8 @@ export async function cmdSweepStart(
 
   // C-1 (D-055): the workspace is the GROUP ROOT and MUST NOT be the FORK CLONE
   // (`--repo`) or a subdirectory of it — the run set --workspace to the clone, so
-  // the pass + a throwaway empty `sweep-ledger.json` + a missing rr-cache all
-  // landed inside the clone, splitting per-pass state from the durable group
-  // ledger/rr-cache and killing rerere. The check is scoped to the CLONE ONLY:
+  // the pass + a missing rr-cache landed inside the clone, splitting per-pass
+  // state from the durable group rr-cache and killing rerere. The check is scoped to the CLONE ONLY:
   // the group root legitimately sits inside an OUTER git work tree (the real
   // server — `~/nanoclaw2` is a git repo, group root `~/nanoclaw2/groups/<g>`),
   // so a plain "inside any work tree" test would wrongly refuse the correct
@@ -6378,7 +6368,7 @@ export async function cmdSweepStart(
     if (ws === repoTop || ws.startsWith(repoTop + sep)) {
       const detail =
         `--workspace ${cli.workspace} is the --repo clone (${repoTop}) or a subdirectory of it — the pass would ` +
-        `land inside the clone, splitting it from the durable group-root ledger + rr-cache. Point --workspace at ` +
+        `land inside the clone, splitting it from the durable group-root rr-cache. Point --workspace at ` +
         `the GROUP ROOT (parent of the clone).`;
       console.error(`sweep start [ERR37_WORKSPACE_IN_CLONE]: ${detail}`);
       result(cli, { ok: false, issues: [{ id: 'ERR37_WORKSPACE_IN_CLONE', detail }] });
@@ -6496,7 +6486,7 @@ export async function cmdSweepStart(
   }
 
   // D-058 §2: reconstruct the blocked set from ORIGIN into the fresh journal
-  // BEFORE planning (plan/run read `origin-blocked` rows; the ledger's
+  // BEFORE planning (plan/run read `origin-blocked` rows; the retired ledger's
   // merge_status is dead). Blocking issues (token missing, API failure) leave
   // no plan-initial.json, so a re-run start clears + re-derives cleanly.
   progress('deriving merge status from origin');
@@ -6678,7 +6668,7 @@ function participatingBranches(dir: string): string[] {
  *
  * TYPECHECK ONLY, as the base gate did: tests are far slower and `finish`'s
  * verify still runs them. Results are memoised as `branch-check` journal rows
- * keyed by (branch, tip sha) — a PASS-LOCAL fact, not a ledger. `start` wipes
+ * keyed by (branch, tip sha) — a PASS-LOCAL fact, not durable state. `start` wipes
  * the journal, so it cannot go stale across passes, and a judged fix moves the
  * tip so the key changes and the branch is re-checked. (A stored green set is
  * the same mistake as the sha-keyed attempts file that D-058 §2 exists to rule

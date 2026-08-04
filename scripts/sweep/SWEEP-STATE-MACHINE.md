@@ -37,7 +37,7 @@ failure = ERR39), then reconstructs the blocked set from the origin `fix/sweep/*
 — merged into `origin/<target>` → resolved + delete the ref; unmerged WITH an open PR →
 blocked; unmerged WITHOUT a PR → orphan, delete it. It reads the GitHub token from the
 ENVIRONMENT (`GH_TOKEN`, fallback `GITHUB_TOKEN`) at each networked write — the agent
-manages no token file (D-060; `--token-file` survives as an internal/test override). The ledger `merge_status` authority (and the D-057
+manages no token file (D-060; `--token-file` survives as an internal/test override). The retired ledger's `merge_status` authority (and the D-057
 reconcile/settle machinery) is retired: the local pass dir is disposable, so `start`
 always re-derives a clean picture from origin.
 
@@ -209,7 +209,7 @@ silence.
   issue/inline comments never trigger; they only feed the reissue dialog. It takes
   the GH token from the environment (`GH_TOKEN`/`GITHUB_TOKEN`; missing while unmerged
   refs exist = `ERR11`), and every lookup/write is fail-closed (non-200 = `ERR13`). The
-  ledger's `merge_status` is no longer read — the pass dir is disposable and `start` is
+  `merge_status` is no longer read from local state — the pass dir is disposable and `start` is
   idempotent on origin; a pass that crashed before `finish` published nothing, so the
   re-derived picture is clean. **A reviewed GATE-FIX PR (D-061)** — its ref is
   `fix/sweep/<slug(branch)>--<caseId>`, recognized by the gate-fix id form — is ESCALATED
@@ -220,7 +220,7 @@ silence.
   `--workspace` is the GROUP ROOT (parent of the clone), defaulted from `--repo`;
   `start` REFUSES a workspace that IS `--repo`'s toplevel or a subdirectory of it
   (ERR37) so the pass never lands in the clone (which split per-pass state from
-  the durable group ledger + rr-cache and killed rerere) — a group root nested in
+  the durable group rr-cache and killed rerere) — a group root nested in
   an OUTER git repo (the real server, `~/nanoclaw2`) is accepted. After the
   open-pass refusal, `start` removes the
   WHOLE prior pass tree at the canonical location (worktrees + case dirs +

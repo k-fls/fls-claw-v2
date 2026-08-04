@@ -309,12 +309,14 @@ deviations from the letter of this spec and the feature-registry design:
      (`scripts/sweep/bootstrap/fork-registry@<tree-hash>/` + MANIFEST.md,
      moment of capture explicit) provides cheap re-bootstrap and is the
      default `--inventory`.
-   - Live state is DERIVED or GROUP-OWNED: `lastMergedUpstream` is never
-     stored (computed as `git merge-base <branch> upstream/main`);
-     freeze/exclude overrides, open PoIs and the last-sweep record live in a
-     plain JSON ledger in the group workspace (`--ledger`, default
-     `<workspace>/sweep-ledger.json`) with an append-only sweep-log.jsonl
-     journal; `record` writes workspace files only — no git commits.
+   - Live state is DERIVED: `lastMergedUpstream` is never stored (computed as
+     `git merge-base <branch> upstream/main`), and blockedness is re-read from
+     the origin `fix/sweep/*` refs at `start` (D-058). SUPERSEDED as written:
+     this paragraph originally put exclude overrides, open PoIs and the
+     last-sweep record in a group-owned `sweep-ledger.json`. That file was
+     deleted 2026-08-04 — a 12-day-old copy was read back by a fresh session
+     and reported as the current sweep state while an open pass sat beside it.
+     Exclusions are CONFIG (below); everything else is derived.
    - Exclusion policy is CONFIG, not state: `scripts/sweep/registry/scope.yaml`
      (include globs main_patched/fix/**/docs/notes; explicit exclusion of the
      telegram branch). Scope = inventory branches UNION include-glob matches,

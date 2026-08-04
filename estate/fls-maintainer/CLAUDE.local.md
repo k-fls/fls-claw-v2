@@ -32,7 +32,9 @@ hands you. Owner: Kirill.
 ## Bootstrap
 
 First session only: follow the runbook in `repo/scripts/sweep/README.md`. Keep
-the clone, `./inventory/`, and `./sweep-ledger.json` across sessions.
+the clone and `./inventory/` across sessions. There is NO durable sweep state
+file: an open pass lives in `./propagation/pass-*/` and everything about origin
+is re-derived from origin. Never treat any other file as sweep state.
 
 ## The sweep loop (on schedule or when the owner says "run a sweep")
 

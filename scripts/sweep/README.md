@@ -66,25 +66,25 @@ scripts/sweep/
 - **Derived state:** `lastMergedUpstream` is never stored — it is
   `git merge-base <branch> upstream/main`. Blockedness (`merge_status`) is
   derived from the origin `fix/sweep/*` refs at `start` plus the pass journal
-  (D-058); the ledger's `merge_status` field is a legacy cache the driver
-  never reads.
+  (D-058). There is NO durable local state file: a `sweep-ledger.json` existed
+  until 2026-08-04 and was deleted after a 12-day-old copy was read back by a
+  fresh session and reported as the current sweep state while an open pass sat
+  beside it. Anything about origin is re-read from origin.
 - **Group-owned state** (`--workspace <dir>`, default = the parent of
-  `--repo`): the ledger (`--ledger`, default `<workspace>/sweep-ledger.json` —
-  exclude overrides, open PoIs, last-sweep record), `propagation/pass-<wm12>/`
-  (plan + step + case files, `journal.jsonl`, machine state), `rr-cache/`
-  (shared rerere resolutions, local/ephemeral). The workspace MUST be outside
-  any git work tree (D-055).
+  `--repo`): `propagation/pass-<wm12>/` (plan + step + case files,
+  `journal.jsonl`, machine state) and `rr-cache/` (shared rerere resolutions,
+  local/ephemeral). The workspace MUST be outside any git work tree (D-055).
 
 ## Bootstrapping a group workspace
 
 From a clone where `origin` = k-fls/fls-claw-v2 and `upstream` =
 nanocoai/nanoclaw (never a human's checkout with WIP). The group root — the
-PARENT of the clone — is the workspace: the ledger, `propagation/` and
-`rr-cache/` live there, never inside the clone. Inventory: either take the
+PARENT of the clone — is the workspace: `propagation/` and `rr-cache/` live
+there, never inside the clone. Inventory: either take the
 default bootstrap snapshot or regenerate a live inventory into the group root
 with the `fork-registry-generate` skill and pass `--inventory <dir>`. Then run
-the loop in `SWEEP-STATE-MACHINE.md`; the clone, the inventory and
-`sweep-ledger.json` persist across sessions.
+the loop in `SWEEP-STATE-MACHINE.md`; the clone and the inventory persist
+across sessions.
 
 Registry-schema notes (verified against the live authored content):
 
@@ -107,8 +107,8 @@ computing without writing.
   throwaway temp worktree in `verify` — never committed to, never merged
   anywhere.
 - **No state branch** — all state writes are plain files in the group
-  workspace (ledger, pass dir, rr-cache); the toolkit never commits to any
-  branch except the merges a pass performs.
+  workspace (pass dir, rr-cache); the toolkit never commits to any branch
+  except the merges a pass performs.
 - **The driver pushes, verify-gated** — refs move via `git push` only, after a
   green `verify`, and any push failure is journaled and reported to the owner
   (D-046 case 2), never worked around.

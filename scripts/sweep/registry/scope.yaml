@@ -1,5 +1,5 @@
 # Sweep scope configuration — POLICY, not state (exclusions are config;
-# frozen/open-PoI state lives in the group-owned ledger).
+# blocked state is origin-derived; the driver keeps no durable local state).
 #
 # Scope rule (owner directive 2026-07-14): the sweep covers
 #   - main_patched (structural: the only upstream entry point besides main's ff),

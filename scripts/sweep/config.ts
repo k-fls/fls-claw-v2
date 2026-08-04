@@ -4,7 +4,7 @@
  * Durable tooling config (routing.yaml, scope.yaml, prompts, schema, test
  * cases, bootstrap inventory snapshot) lives in this directory and is read
  * from the LOCAL WORKING TREE. Live state is derived (merge-base) or
- * group-owned (the ledger file in the sweep workspace). There is no state
+ * group-owned (files in the sweep workspace). There is no state
  * branch (dissolved 2026-07-10 by owner decision).
  */
 import { existsSync, readdirSync } from 'node:fs';
@@ -51,7 +51,6 @@ export function defaultInventoryDir(): string | null {
 }
 
 /** Group-workspace file/dir names (all under --workspace, default cwd). */
-export const LEDGER_FILENAME = 'sweep-ledger.json';
 export const RR_CACHE_DIRNAME = 'rr-cache';
 
 export const DEFAULT_UPSTREAM_REF = 'upstream/main';

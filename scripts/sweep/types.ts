@@ -1,8 +1,11 @@
 /**
  * scripts/sweep/types.ts — shared types for the upstream-sweep toolkit.
  *
- * Mutable state is the group-owned Ledger file (no state branch — dissolved
- * 2026-07-10); everything else a pass produces lives in the pass dir.
+ * The driver keeps NO durable local state: everything a pass produces lives in
+ * the pass dir, and everything about origin is re-derived from origin. (A
+ * group-owned `sweep-ledger.json` existed until 2026-08-04; it was deleted after
+ * a 12-day-old copy was read back by a fresh session and reported as the current
+ * sweep state while an open pass sat beside it.)
  */
 
 /** PoI routing classes (feature-inventory design §4) plus pipeline extensions. */
@@ -74,7 +77,7 @@ export interface ScopeEntry {
  * within a pass from the journal (origin-blocked/held/defer rows); DEFERRED
  * is recomputed from the parents' PR_ID during derivation, never stored. The
  * three-state model and the invariant blocked(X) ⇔ merge_status(X) != NONE
- * (D-057) survive as the DERIVED view's semantics. This type + the ledger
+ * (D-057) survive as the DERIVED view's semantics. This type
  * field remain ONLY as a non-authoritative legacy cache read by the old sweep
  * merge stage (merge.ts) — the propagation driver never reads or writes it.
  */
@@ -95,41 +98,6 @@ export type MergeStatus =
       prNumber: number | null;
     }
   | { state: 'DEFERRED' };
-
-/**
- * Group-owned ledger branch override. Absence of an entry = active.
- * lastMergedUpstream is NOT stored — it is derived as
- * `git merge-base <branch> upstream/main`, never read from this record.
- * Blockedness is ORIGIN/JOURNAL-DERIVED (D-058); the pre-D-057 independent
- * freeze fields (status:'frozen', frozenBy, heldHead, heldPaths, fixBranch,
- * pendingBehindFreeze) are retired; readLedger up-converts legacy files.
- */
-export interface LedgerBranch {
-  status: 'active' | 'excluded';
-  /** Legacy non-authoritative cache (see MergeStatus) — dead to the propagation driver (D-058). */
-  merge_status?: MergeStatus | null;
-  notes: string;
-  /** Newest pending head the owner was last urged about (one POSTED urge per new head).
-   * Kept as a non-authoritative dedup cache (D-058 §3): losing it merely re-urges once. */
-  lastUrgedHead?: string | null;
-}
-
-/**
- * The group-owned ledger file (--ledger, default <workspace>/sweep-ledger.json):
- * freeze/exclude overrides, open PoIs, last-sweep record. Plain JSON in the
- * group workspace — no state branch exists (dissolved 2026-07-10).
- */
-export interface Ledger {
-  schemaVersion: 1;
-  lastSweep: { id: string; upstreamTip: string; result: 'clean' | 'partial' | 'blocked' } | null;
-  branches: Record<string, LedgerBranch>;
-  openPois: Array<
-    Pick<Poi, 'id' | 'class' | 'type' | 'paths' | 'branches' | 'upstreamCommits'> & {
-      state: 'open' | 'reported' | 'resolved';
-      pr: string | null;
-    }
-  >;
-}
 
 /** Inventory entry <id>.yaml (feature-inventory design §3; --inventory dir). */
 export interface FeatureEntry {
