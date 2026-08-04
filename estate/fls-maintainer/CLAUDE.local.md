@@ -117,6 +117,11 @@ finish --execute --token-file <path> --commands-file <cheap-tests.json>   # crea
   there: the PR then carries your DIAGNOSIS (what fails, why it cannot be fixed
   in those files, where the fix belongs) and that is a valid outcome.
   This is the ONLY case type where you change code this pass did not merge.
+  A case marked DIAGNOSIS ONLY in its materials is a TIMEOUT failure: the test
+  did not finish in its budget. You cannot confirm a fix for that — you may not
+  run the suite, and one run could not confirm a load-dependent fix anyway — so
+  do NOT attempt one. Read the test and its source once, then `report-case
+  --tier held` with an unchanged worktree; the PR carries your diagnosis.
   STOP READING after ONE pass over the implicated code — the failing file, the
   source it exercises, the definitions of the symbols in the failure, each file
   ONCE. If you have read those and made no edit, you are done investigating:

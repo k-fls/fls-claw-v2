@@ -23,6 +23,7 @@ import { countFailingFiles, parseFailingFiles } from './attribute.js';
 import { makeEnvAwareRunners } from './fixtures.js';
 import {
   classifyEnvironmentFault,
+  isTimeoutFailure,
   classifyFailure,
   findIntroducingCommit,
   locateOwner,
@@ -481,5 +482,31 @@ describe('breadth backstop — an experiment that distinguished nothing', () => 
     const { probe } = scriptedProbe([{ failing: baseline }]);
     const v = await classifyFailure(resolved, 'prefixsha0000', probe);
     expect(v.verdict).toBe('pre-existing');
+  });
+});
+
+describe('isTimeoutFailure — the class an agent cannot verify', () => {
+  it('recognises the live 2026-08-04 bun timeout', () => {
+    // Two runs, 300+ tool calls each, no edit and no attempt: the agent cannot
+    // become confident about a timing fix it may not run, so the driver stops
+    // asking and serves the case as a diagnosis.
+    expect(
+      isTimeoutFailure(
+        '(fail) task-run turn wiring > logs and conditionally nudges a second task run [5000.84ms]\n' +
+          '  ^ this test timed out after 5000ms.',
+      ),
+    ).toBe(true);
+  });
+
+  it('recognises the other runners’ phrasings', () => {
+    expect(isTimeoutFailure('Error: Exceeded timeout of 5000 ms for a test')).toBe(true);
+    expect(isTimeoutFailure('connect ETIMEDOUT 10.0.0.1:443')).toBe(true);
+  });
+
+  it('does NOT fire on an ordinary assertion — that IS fixable and verifiable', () => {
+    expect(isTimeoutFailure('AssertionError: expected 3 to be 4')).toBe(false);
+    expect(isTimeoutFailure("src/x.ts(3,1): error TS2345: wrong type")).toBe(false);
+    // A test merely NAMED "timeout" is not a timeout failure.
+    expect(isTimeoutFailure('(fail) handles the timeout config correctly')).toBe(false);
   });
 });

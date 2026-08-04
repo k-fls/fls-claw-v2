@@ -97,6 +97,7 @@ import { attributeFailure, countFailingFiles, parseFailingFiles } from './attrib
 import { ROOT_BRANCH, TRUNK_BRANCH } from './hierarchy.js';
 import {
   classifyEnvironmentFault,
+  isTimeoutFailure,
   classifyFailure,
   findIntroducingCommit,
   locateOwner,
@@ -8483,6 +8484,9 @@ function gateFixFailedOutput(dir: string, caseId: string): string {
 }
 
 function gateFixCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEntry): string {
+  // Set at mint time for a TIMEOUT-class failure — the case is a diagnosis, not
+  // a fix (see `isTimeoutFailure`). Read from the DRIVER's own journal row.
+  const diagnosisOnly = caseRow.diagnosisOnly === true;
   const gf = readJournal(dir).find((e) => e.action === 'gate-fix' && e.caseId === jc.caseId);
   const files = Array.isArray(gf?.files) ? (gf.files as string[]) : (caseRow.conflictedPaths as string[]) ?? [];
   const failedCommands = Array.isArray(gf?.failedCommands) ? (gf.failedCommands as string[]) : [];
@@ -8515,6 +8519,21 @@ function gateFixCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEn
     'failure. What is NOT valid is reporting the diagnosis in chat and stopping —',
     'the PR is how it reaches the owner.',
     '',
+    ...(diagnosisOnly
+      ? [
+          '## DIAGNOSIS ONLY — DO NOT ATTEMPT A FIX',
+          'This failure is a TIMEOUT: the test did not finish inside its budget.',
+          'A fix for that cannot be confirmed here — you may not run the suite, and',
+          'a single run could not confirm a load-dependent fix even if you could.',
+          'There is no path by which you become confident, so do not look for one.',
+          '',
+          'Read the failing test and the source it exercises ONCE, then:',
+          '  `report-case --tier held`  — with an UNCHANGED worktree.',
+          'The PR carries your DIAGNOSIS: what times out, what you believe causes',
+          'it, and where the fix belongs. That IS the deliverable for this case.',
+          '',
+        ]
+      : []),
     '## WHEN TO STOP READING',
     'ONE pass over the implicated code, then decide. "Implicated" is: the failing',
     'file, the source it exercises, and the definitions of the symbols in the',
@@ -8873,6 +8892,9 @@ async function materializeGateFixCases(
       files: g.files,
       failedCommands: commandNames,
       reason: g.reason,
+      // TIMEOUT-class: unverifiable by construction, so the case is served as
+      // DIAGNOSIS-ONLY rather than as something to fix (see `isTimeoutFailure`).
+      ...(isTimeoutFailure(failedOutput) ? { diagnosisOnly: true } : {}),
       // The ROOT the case's worktree was created at. Journaled because
       // `reverifyGateFixCase` re-derives the case from THIS row (never from the
       // agent-writable case.json) — without it, re-verification recomputes the
