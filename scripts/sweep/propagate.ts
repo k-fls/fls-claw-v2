@@ -81,6 +81,7 @@ import {
   gitPush,
   isAncestor,
   localBranchExists,
+  mergeTreeWithBase,
   newStyleMergeTree,
   resetBranchRef,
   revParse,
@@ -234,6 +235,13 @@ interface Cli {
    * does its work, journals, and prints its own SWEEP-STEP progress.
    */
   internal?: boolean;
+  /**
+   * Publish a HELD case as a RED-FINISH ESCALATION: the pass's target pushes did
+   * NOT run (tests are red), so the resolution is transplanted onto
+   * `origin/<branch>` instead of sitting on the local tip. Set only by
+   * `sweep-finish`'s red arm; never a user-facing flag.
+   */
+  escalateUnpushed?: boolean;
 }
 
 const USAGE =
@@ -3684,6 +3692,72 @@ function lastDisposition(journal: JournalEntry[], caseId: string): JournalEntry 
   return last;
 }
 
+/**
+ * Rebase a held resolution onto `origin/<branch>` for a RED-FINISH ESCALATION.
+ *
+ * Returns null when no transplant is needed or wanted (not escalating, no origin
+ * ref, origin already at/above the local tip — the ordinary case, where the head
+ * is already correct). Otherwise replays the resolution's own delta
+ * (`tip..localHead`) on top of origin's tip, so the escalation PR carries the fix
+ * and NOT the pass's unpushed merges.
+ *
+ * A conflicting transplant is NOT a refusal. The fix cannot be separated from the
+ * merges it sits on, so the case still reaches the owner — as a DRAFT, off the
+ * un-transplanted head, with the reason journaled. Dropping it silently is the
+ * failure this whole path exists to end; a fat diff the owner can still read is
+ * strictly better than no PR at all.
+ */
+async function transplantOntoOrigin(
+  cli: Cli,
+  dir: string,
+  jc: JournaledCase,
+  tip: string,
+  localHead: string,
+): Promise<{ headSha: string; draft: boolean; originBased: boolean } | null> {
+  if (!cli.escalateUnpushed) return null;
+  const originRef = `origin/${jc.branch}`;
+  if (!(await refExists(cli.repo, originRef))) return null;
+  const originTip = await revParse(cli.repo, originRef);
+  // Origin already contains the local tip → nothing was left unpushed for this
+  // branch; the ordinary head is right and ERR14 passes on its own terms.
+  if (await isAncestor(cli.repo, tip, originTip)) return null;
+  const replay = await mergeTreeWithBase(cli.repo, tip, originTip, localHead);
+  if (!replay.clean) {
+    if (cli.execute) {
+      appendJournal(dir, {
+        action: 'escalation-not-transplanted',
+        id: 'WARN16_ESCALATION_BASE_BEHIND',
+        branch: jc.branch,
+        caseId: jc.caseId,
+        conflictedPaths: replay.conflictFiles,
+        detail:
+          `the held resolution does not replay cleanly onto ${originRef} (${originTip.slice(0, 12)}) — ` +
+          `conflicts in [${replay.conflictFiles.join(', ')}]. Publishing a DRAFT off the local tip instead: its diff ` +
+          `also contains this pass's UNPUSHED merges, which were never verified green (the finish was red)`,
+      });
+    }
+    return { headSha: localHead, draft: true, originBased: false };
+  }
+  const headSha = await deterministicCommit(
+    cli.repo,
+    replay.treeOid,
+    [originTip],
+    `Escalated resolution of ${jc.caseId} on ${jc.branch} (rebased onto ${originRef} — the pass finished RED and pushed nothing)`,
+  );
+  if (cli.execute) {
+    appendJournal(dir, {
+      action: 'escalation-transplanted',
+      branch: jc.branch,
+      caseId: jc.caseId,
+      from: localHead,
+      to: headSha,
+      onto: originTip,
+      detail: `resolution replayed onto ${originRef} so the escalation PR shows the fix alone`,
+    });
+  }
+  return { headSha, draft: false, originBased: true };
+}
+
 function samePathSet(a: string[], b: string[]): boolean {
   return JSON.stringify([...a].sort()) === JSON.stringify([...b].sort());
 }
@@ -3768,6 +3842,8 @@ async function publishHead(
   mode?: 'held' | 'judged';
   draft?: boolean;
   escalation?: HeldEscalation | null;
+  /** Head was transplanted onto `origin/<branch>` (red-finish escalation). */
+  originBased?: boolean;
   issue?: Issue;
 }> {
   const disposition = lastDisposition(journal, jc.caseId);
@@ -3892,7 +3968,7 @@ async function publishHead(
         // `head.sha` IS the branch tip, so the ordinary two-parent form would
         // record the tip as both parents — a degenerate self-merge whose PR
         // diff reads as an empty merge rather than the fix.
-        const headSha = isGateFix
+        const localHead = isGateFix
           ? await deterministicCommit(cli.repo, shipTree, [tip], `Gate fix for ${jc.caseId} on ${jc.branch} (owner review)`)
           : await deterministicCommit(
               cli.repo,
@@ -3900,7 +3976,16 @@ async function publishHead(
               [tip, jc.head.sha],
               `Resolution of ${jc.caseId} for owner review (merges ${jc.head.sha.slice(0, 12)} into ${jc.branch})`,
             );
-        return { headSha, mode: 'held', draft: false, escalation };
+        // RED-FINISH ESCALATION. `localHead` sits on the local tip, which this
+        // pass advanced with merges that were deliberately NOT pushed (the tests
+        // are red). A PR of it against `origin/<branch>` would show every one of
+        // those unverified merges alongside the fix, and ERR14 refuses it
+        // outright — which is why three held escalations were silently dropped
+        // on 2026-08-05. Transplant the resolution onto origin's ACTUAL tip so
+        // the PR's diff is the case's own work and nothing else.
+        const transplant = await transplantOntoOrigin(cli, dir, jc, tip, localHead);
+        if (transplant) return { ...transplant, mode: 'held', draft: transplant.draft, escalation };
+        return { headSha: localHead, mode: 'held', draft: false, escalation };
       }
     }
     // A gate fix has no pristine conflict to fall back to — reaching here means
@@ -4149,7 +4234,7 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
   const push = (i: Issue | null): void => {
     if (i) issues.push(i);
   };
-  push(await checkBaseHeight(cli.repo, jc.branch, mode, headSha));
+  push(await checkBaseHeight(cli.repo, jc.branch, mode, headSha, src.originBased === true));
 
   // (4) "should this PR exist": recorded decisions (ERR05) + duplicates (ERR06)
   // + already-published (ERR07, journal side).
@@ -9300,7 +9385,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
           // unactionable shrug this whole change exists to remove.
           const pubOut = join(dir, `publish-${slug(jc.caseId)}.json`);
           const rcPub = await cmdPublish(
-            { ...cli, cmd: 'publish', caseId: jc.caseId, execute: true, internal: true, out: pubOut },
+            { ...cli, cmd: 'publish', caseId: jc.caseId, execute: true, internal: true, out: pubOut, escalateUnpushed: true },
             makeTransport,
           );
           if (rcPub === 0) {

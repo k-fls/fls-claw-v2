@@ -1187,3 +1187,44 @@ describe('propagate publish — fixBranchName is wall-clock independent', () => 
     }
   });
 });
+
+// --- red-finish escalation: origin is BEHIND by design (2026-08-05) ---------
+//
+// The pass finished RED, so `propagate push` never ran and origin/<branch> sits
+// at the pre-pass tip. Every held escalation was refused by ERR14 and the
+// agent's fixes were dropped with no PR — the failure this covers.
+describe('publish — held escalation off an unpushed base (ERR14, red finish)', () => {
+  it('an origin-based head passes the held height rule that the local-tip head fails', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: fork', { 'src/x.ts': 'fork\n' });
+    repo.setOrigin('main_patched'); // origin pinned at the PRE-PASS tip
+    repo.commit('mp: pass merge (never pushed — finish was red)', { 'src/util.ts': 'u\n' });
+    cleanups.push(() => repo.destroy());
+    const head = repo.sha('main_patched');
+
+    // Local-tip head: refused, exactly as it was live.
+    expect((await checkBaseHeight(repo.dir, 'main_patched', 'held', head))?.id).toBe('ERR14_BASE_BEHIND');
+    // Origin-based head (the transplant): allowed.
+    expect(await checkBaseHeight(repo.dir, 'main_patched', 'held', head, true)).toBeNull();
+  });
+
+  it('a DIVERGED origin still halts even for an origin-based head', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: fork', { 'src/x.ts': 'fork\n' });
+    repo.setOrigin('main_patched');
+    repo.commit('mp: local', { 'src/a.ts': 'a\n' });
+    // Move origin onto an unrelated commit so the two lines diverge.
+    repo.checkout('tmp_div', { create: true, at: 'main' });
+    repo.commit('div', { 'src/b.ts': 'b\n' });
+    repo.setOrigin('main_patched', 'tmp_div');
+    repo.checkout('main_patched');
+    cleanups.push(() => repo.destroy());
+    const issue = await checkBaseHeight(repo.dir, 'main_patched', 'held', repo.sha('main_patched'), true);
+    expect(issue?.id).toBe('ERR14_BASE_BEHIND');
+    expect(issue?.detail).toContain('DIVERGED');
+  });
+});

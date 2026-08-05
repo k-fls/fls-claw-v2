@@ -163,6 +163,56 @@ export async function newStyleMergeTree(repo: string, ours: string, theirs: stri
 }
 
 /**
+ * Merge-tree with an EXPLICIT merge base — i.e. "replay the delta `base..theirs`
+ * on top of `ours`", a cherry-pick preview that writes no worktree or index.
+ *
+ * `newStyleMergeTree` lets git pick the base, which is right for a merge and
+ * WRONG for transplanting one commit. When `ours` is an ancestor of `theirs`
+ * (origin's tip vs a local branch that this pass advanced), the computed base IS
+ * `ours`, so "theirs" wins wholesale and the result is `theirs`'s tree — every
+ * local commit included. Naming the base explicitly narrows the transplant to
+ * exactly the one delta wanted.
+ *
+ * The determinism measures of `newStyleMergeTree` apply here for the same
+ * reasons and are kept identical: full SHAs (conflict markers embed the labels
+ * verbatim) and a forced `merge.conflictStyle=merge`.
+ */
+export async function mergeTreeWithBase(
+  repo: string,
+  base: string,
+  ours: string,
+  theirs: string,
+): Promise<MergeTreeResult> {
+  const baseSha = await revParse(repo, base);
+  const oursSha = await revParse(repo, ours);
+  const theirsSha = await revParse(repo, theirs);
+  const res = await git(
+    repo,
+    [
+      '-c',
+      'merge.conflictStyle=merge',
+      'merge-tree',
+      '--write-tree',
+      '--name-only',
+      `--merge-base=${baseSha}`,
+      oursSha,
+      theirsSha,
+    ],
+    { allowCodes: [1] },
+  );
+  const lines = res.stdout.split('\n');
+  const treeOid = lines[0]?.trim() ?? '';
+  if (res.code === 0) return { clean: true, treeOid, conflictFiles: [] };
+  const conflictFiles: string[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (line === '') break;
+    conflictFiles.push(line.startsWith('"') ? JSON.parse(line) : line);
+  }
+  return { clean: false, treeOid, conflictFiles: [...new Set(conflictFiles)] };
+}
+
+/**
  * First-parent chain of `ref` excluding commits reachable from `not`, OLDEST first.
  *
  * ORDER IS LOAD-BEARING, AND IT IS A HISTORY ORDER — NOT A DATE ONE. Every

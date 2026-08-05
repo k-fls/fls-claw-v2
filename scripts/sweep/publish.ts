@@ -106,6 +106,20 @@ export async function checkBaseHeight(
   branch: string,
   mode: 'held' | 'judged',
   headSha: string,
+  /**
+   * The head was built ON TOP OF `origin/<branch>` rather than the local tip, so
+   * the held rule below does not apply to it.
+   *
+   * That rule enforces a PREMISE — "held PRs are published after the pass's
+   * target pushes" — and at a RED finish the premise is void by construction:
+   * the tests failed, so nothing is pushed, so origin is necessarily behind and
+   * every held escalation was refused (live 2026-08-05, three of three, which is
+   * how this parameter came to exist). The escalation instead transplants the
+   * resolution onto origin's actual tip, which satisfies what the rule protects
+   * — a PR whose diff is the case's own work and not the pass's unpushed,
+   * unverified merges — by a different route. Divergence is still a halt.
+   */
+  originBasedHead = false,
 ): Promise<Issue | null> {
   const originRef = `origin/${branch}`;
   if (!(await refExists(repo, originRef))) {
@@ -124,7 +138,7 @@ export async function checkBaseHeight(
       detail: `origin/${branch} (${originTip.slice(0, 12)}) has DIVERGED from the local branch (${localTip.slice(0, 12)}) — owner escalation, never force-resolve`,
     };
   }
-  if (mode === 'held' && !originAtOrAbove) {
+  if (mode === 'held' && !originAtOrAbove && !originBasedHead) {
     return {
       id: 'ERR14_BASE_BEHIND',
       detail:
