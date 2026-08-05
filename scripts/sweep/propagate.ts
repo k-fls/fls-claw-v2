@@ -9293,12 +9293,29 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
         );
         let escalated = 0;
         for (const jc of heldPending) {
+          // Capture WHY a publish refused. `cmdPublish` reports through `emit`,
+          // which `internal: true` suppresses, so a bare exit code told us
+          // nothing: three escalations failed instantly on 2026-08-05 and the
+          // journal recorded only "publish-failed", which is the same
+          // unactionable shrug this whole change exists to remove.
+          const pubOut = join(dir, `publish-${slug(jc.caseId)}.json`);
           const rcPub = await cmdPublish(
-            { ...cli, cmd: 'publish', caseId: jc.caseId, execute: true, internal: true },
+            { ...cli, cmd: 'publish', caseId: jc.caseId, execute: true, internal: true, out: pubOut },
             makeTransport,
           );
-          if (rcPub === 0) escalated++;
-          else appendJournal(dir, { action: 'publish-failed', caseId: jc.caseId, branch: jc.branch, phase: 'finish-tests-red' });
+          if (rcPub === 0) {
+            escalated++;
+            continue;
+          }
+          let why = 'unknown';
+          try {
+            const r = JSON.parse(readFileSync(pubOut, 'utf8')) as { issues?: Array<{ id?: string; detail?: string }> };
+            why = (r.issues ?? []).map((i) => `${i.id ?? '?'}: ${i.detail ?? ''}`).join('; ') || 'no issues reported';
+          } catch {
+            /* keep 'unknown' */
+          }
+          appendJournal(dir, { action: 'publish-failed', caseId: jc.caseId, branch: jc.branch, phase: 'finish-tests-red', reason: why });
+          console.error(`finish: held publish failed for ${jc.caseId} — ${why}`);
         }
         progress(
           `verify: RED — ${failedTests.join(', ')} — no branch lands; ${escalated}/${heldPending.length} held PR(s) published for the owner`,
