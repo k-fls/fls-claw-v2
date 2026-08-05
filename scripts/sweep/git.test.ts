@@ -6,7 +6,7 @@ import {
   firstParentChain,
   isAncestor,
   listTreePaths,
-  mergeTreeWithBase,
+  replayCommitOnto,
   newStyleMergeTree,
   revParse,
 } from './git.js';
@@ -60,7 +60,7 @@ describe('commitTreeMerge (July-sweep technique)', () => {
   });
 });
 
-describe('mergeTreeWithBase — transplanting one delta, not a whole branch', () => {
+describe('replayCommitOnto — transplanting one delta, not a whole branch', () => {
   // The red-finish escalation shape: origin sits at the pre-pass tip, the local
   // branch carries an unpushed pass merge, and the agent's fix sits on top of
   // that. Only the FIX may reach the escalation PR.
@@ -77,10 +77,10 @@ describe('mergeTreeWithBase — transplanting one delta, not a whole branch', ()
     return { r, originTip, tip, localHead };
   }
 
-  it('replays only base..theirs onto ours — the unpushed merge is left behind', async () => {
+  it("replays only the commit's own delta — the unpushed merge is left behind", async () => {
     const { r, originTip, tip, localHead } = transplantRepo();
     try {
-      const replay = await mergeTreeWithBase(r.dir, tip, originTip, localHead);
+      const replay = await replayCommitOnto(r.dir, localHead, originTip);
       expect(replay.clean).toBe(true);
       const paths = await listTreePaths(r.dir, replay.treeOid);
       // The fix is present...
@@ -92,7 +92,7 @@ describe('mergeTreeWithBase — transplanting one delta, not a whole branch', ()
     }
   });
 
-  it("git's own base choice would drag the unpushed merge in — which is why the base is explicit", async () => {
+  it("git's own base choice would drag the unpushed merge in — which is why a plain merge-tree is wrong", async () => {
     const { r, originTip, localHead } = transplantRepo();
     try {
       // originTip is an ancestor of localHead, so the inferred base IS originTip

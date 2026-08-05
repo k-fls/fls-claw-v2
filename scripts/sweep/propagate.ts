@@ -81,7 +81,7 @@ import {
   gitPush,
   isAncestor,
   localBranchExists,
-  mergeTreeWithBase,
+  replayCommitOnto,
   newStyleMergeTree,
   resetBranchRef,
   revParse,
@@ -3745,7 +3745,7 @@ async function transplantOntoOrigin(
   const originTip = await escalationBase(cli, jc.branch, tip);
   if (originTip === null) return null;
   const originRef = `origin/${jc.branch}`;
-  const replay = await mergeTreeWithBase(cli.repo, tip, originTip, localHead);
+  const replay = await replayCommitOnto(cli.repo, localHead, originTip);
   if (!replay.clean) {
     if (cli.execute) {
       appendJournal(dir, {

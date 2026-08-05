@@ -163,53 +163,50 @@ export async function newStyleMergeTree(repo: string, ours: string, theirs: stri
 }
 
 /**
- * Merge-tree with an EXPLICIT merge base — i.e. "replay the delta `base..theirs`
- * on top of `ours`", a cherry-pick preview that writes no worktree or index.
+ * Replay ONE commit's own delta on top of another commit — a cherry-pick preview
+ * that leaves the caller's worktree and index untouched.
  *
- * `newStyleMergeTree` lets git pick the base, which is right for a merge and
- * WRONG for transplanting one commit. When `ours` is an ancestor of `theirs`
- * (origin's tip vs a local branch that this pass advanced), the computed base IS
- * `ours`, so "theirs" wins wholesale and the result is `theirs`'s tree — every
- * local commit included. Naming the base explicitly narrows the transplant to
- * exactly the one delta wanted.
+ * WHY NOT `merge-tree --merge-base=`. That option arrived in git 2.40 and the
+ * agent container runs 2.39.5, so it exits 129 ("unknown option") and took
+ * `finish` down mid-publish with no SWEEP-RESULT (filed by the agent as #70).
+ * Local tests could never have caught it — this box is 2.43. A cherry-pick in a
+ * throwaway worktree needs nothing newer than git 2.x and expresses the intent
+ * directly: take what THIS commit changed, and only that, onto `onto`.
  *
- * The determinism measures of `newStyleMergeTree` apply here for the same
- * reasons and are kept identical: full SHAs (conflict markers embed the labels
- * verbatim) and a forced `merge.conflictStyle=merge`.
+ * Plain `merge-tree ours theirs` is not a substitute: it lets git pick the base,
+ * and when `onto` is an ancestor of `commit` the base IS `onto`, so "theirs"
+ * wins wholesale and the result is `commit`'s entire tree — every intervening
+ * commit dragged along, which is the bug this exists to avoid.
+ *
+ * A merge commit is replayed against its FIRST parent (`-m 1`), which is the
+ * branch tip for the two-parent resolution heads the publisher builds.
  */
-export async function mergeTreeWithBase(
-  repo: string,
-  base: string,
-  ours: string,
-  theirs: string,
-): Promise<MergeTreeResult> {
-  const baseSha = await revParse(repo, base);
-  const oursSha = await revParse(repo, ours);
-  const theirsSha = await revParse(repo, theirs);
-  const res = await git(
-    repo,
-    [
-      '-c',
-      'merge.conflictStyle=merge',
-      'merge-tree',
-      '--write-tree',
-      '--name-only',
-      `--merge-base=${baseSha}`,
-      oursSha,
-      theirsSha,
-    ],
-    { allowCodes: [1] },
-  );
-  const lines = res.stdout.split('\n');
-  const treeOid = lines[0]?.trim() ?? '';
-  if (res.code === 0) return { clean: true, treeOid, conflictFiles: [] };
-  const conflictFiles: string[] = [];
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i];
-    if (line === '') break;
-    conflictFiles.push(line.startsWith('"') ? JSON.parse(line) : line);
+export async function replayCommitOnto(repo: string, commit: string, onto: string): Promise<MergeTreeResult> {
+  const commitSha = await revParse(repo, commit);
+  const ontoSha = await revParse(repo, onto);
+  const parents = (await git(repo, ['rev-list', '--parents', '-n', '1', commitSha])).stdout.trim().split(/\s+/);
+  const isMerge = parents.length > 2; // self + 2 parents
+  const wt = await addTempWorktree(repo, ontoSha);
+  try {
+    const res = await git(
+      repo,
+      ['cherry-pick', '--no-commit', ...(isMerge ? ['-m', '1'] : []), commitSha],
+      { cwd: wt.path, allowCodes: [1, 128] },
+    );
+    if (res.code !== 0) {
+      const conflictFiles = (await git(repo, ['diff', '--name-only', '--diff-filter=U'], { cwd: wt.path })).stdout
+        .split('\n')
+        .filter(Boolean);
+      await git(repo, ['cherry-pick', '--abort'], { cwd: wt.path, allowCodes: [1, 128] });
+      // A non-zero exit with NO unmerged paths is a failure to run at all (bad
+      // object, unborn worktree) — never report it as a clean replay.
+      return { clean: false, treeOid: '', conflictFiles: [...new Set(conflictFiles)] };
+    }
+    const treeOid = (await git(repo, ['write-tree'], { cwd: wt.path })).stdout.trim();
+    return { clean: true, treeOid, conflictFiles: [] };
+  } finally {
+    await wt.remove();
   }
-  return { clean: false, treeOid, conflictFiles: [...new Set(conflictFiles)] };
 }
 
 /**
