@@ -3703,6 +3703,24 @@ function lastDisposition(journal: JournalEntry[], caseId: string): JournalEntry 
 }
 
 /**
+ * The commit a RED-FINISH ESCALATION should build its PR head on: `origin/<branch>`
+ * when the pass left local ahead of it, else null (no escalation, no origin ref,
+ * or origin already contains the local tip — the ordinary head is correct and
+ * ERR14 passes on its own terms).
+ *
+ * Every escalation head must go through this. The diagnosis-only report did not,
+ * and published a 305-commit PR for a case with no code change.
+ */
+async function escalationBase(cli: Cli, branch: string, tip: string): Promise<string | null> {
+  if (!cli.escalateUnpushed) return null;
+  const originRef = `origin/${branch}`;
+  if (!(await refExists(cli.repo, originRef))) return null;
+  const originTip = await revParse(cli.repo, originRef);
+  if (await isAncestor(cli.repo, tip, originTip)) return null;
+  return originTip;
+}
+
+/**
  * Rebase a held resolution onto `origin/<branch>` for a RED-FINISH ESCALATION.
  *
  * Returns null when no transplant is needed or wanted (not escalating, no origin
@@ -3724,13 +3742,9 @@ async function transplantOntoOrigin(
   tip: string,
   localHead: string,
 ): Promise<{ headSha: string; draft: boolean } | null> {
-  if (!cli.escalateUnpushed) return null;
+  const originTip = await escalationBase(cli, jc.branch, tip);
+  if (originTip === null) return null;
   const originRef = `origin/${jc.branch}`;
-  if (!(await refExists(cli.repo, originRef))) return null;
-  const originTip = await revParse(cli.repo, originRef);
-  // Origin already contains the local tip → nothing was left unpushed for this
-  // branch; the ordinary head is right and ERR14 passes on its own terms.
-  if (await isAncestor(cli.repo, tip, originTip)) return null;
   const replay = await mergeTreeWithBase(cli.repo, tip, originTip, localHead);
   if (!replay.clean) {
     if (cli.execute) {
@@ -4072,10 +4086,17 @@ async function publishHead(
     // the PR body, which the agent wrote. Draft, because there is nothing to
     // merge — it is a report, and the owner closes or acts on it.
     if (!probe && diagnosisOnlyCase(journal, jc.caseId)) {
+      // BUILD ON ORIGIN'S TIP WHEN ESCALATING. This returned early, before the
+      // transplant below, and parented the report on the LOCAL tip — which this
+      // pass had advanced. PR #72 (live 2026-08-05) came out at 305 commits and
+      // 362 files for a case with NO code change at all: unreviewable, and the
+      // exact fat diff the transplant exists to prevent. An empty commit makes
+      // this simple — no delta to replay, just the right parent.
+      const reportBase = (await escalationBase(cli, jc.branch, tip)) ?? tip;
       const headSha = await deterministicCommit(
         cli.repo,
-        `${tip}^{tree}`, // tree-ish: `commit-tree` resolves it; `revParse` normalizes to a COMMIT and cannot
-        [tip],
+        `${reportBase}^{tree}`, // tree-ish: `commit-tree` resolves it; `revParse` normalizes to a COMMIT and cannot
+        [reportBase],
         `Diagnosis for ${jc.caseId} on ${jc.branch} — no code change (owner review)`,
       );
       return { headSha, mode: 'held', draft: true, escalation };

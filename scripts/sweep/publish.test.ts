@@ -1384,6 +1384,27 @@ describe('publish — a diagnosis-only gate fix publishes a report PR (D-064)', 
     expect((post!.body as { draft?: boolean }).draft).toBe(true);
   });
 
+  it('as an ESCALATION it parents on origin, not the local tip (PR #72 was 305 commits)', async () => {
+    const { repo, ws, caseId, bareDir, tip, tokenFile, cli } = await diagnosisOnlyGateFix(true);
+    // The pass advanced the branch and — the finish being red — never pushed it.
+    repo.checkout('main_patched');
+    repo.commit('mp: unpushed pass merge', { 'src/unpushed.ts': 'nope\n' });
+    const gh = fakeGithub();
+    const out = join(ws, 'out.json');
+    expect(
+      await cmdPublish(
+        cli({ cmd: 'publish', caseId, execute: true, tokenFile, out, escalateUnpushed: true }),
+        gh.factory,
+      ),
+    ).toBe(0);
+    const ref = repo.git('-C', bareDir, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix').split('\n')[0];
+    const head = repo.git('-C', bareDir, 'rev-parse', ref);
+    // ONE commit against origin's tip — not the branch's whole history.
+    expect(repo.git('-C', bareDir, 'rev-parse', `${head}^`)).toBe(tip); // tip == what origin has
+    expect(repo.git('-C', bareDir, 'diff', '--name-only', `${head}^`, head)).toBe('');
+    expect(repo.git('-C', bareDir, 'rev-list', '--count', `${tip}..${head}`)).toBe('1');
+  });
+
   it('a NON-diagnosis-only gate fix with no resolution is still refused (the guard is not blanket)', async () => {
     const { ws, caseId, tokenFile, cli } = await diagnosisOnlyGateFix(false);
     const gh = fakeGithub();
