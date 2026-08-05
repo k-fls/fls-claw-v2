@@ -1230,3 +1230,66 @@ describe('publish — held escalation off an unpushed base (ERR14, red finish)',
     expect(issue?.detail).toContain('DIVERGED');
   });
 });
+
+// --- the red-finish escalation, end to end (D-064) ---------------------------
+//
+// `setupEscalatedHeldCase` ends with `git push origin main_patched` and
+// `setupHeldCase` labels that push "simulated target push -> ERR14 passes".
+// That push is EXACTLY what a red finish does not do: the tests failed, so
+// nothing is pushed, so origin is behind and the held escalation is refused.
+// This drives the real publish through that state.
+describe('publish — red-finish escalation, end to end (D-064)', () => {
+  async function redFinishState() {
+    const s = await setupEscalatedHeldCase();
+    // Another case merged earlier in this pass. The finish went RED, so it was
+    // NEVER pushed — origin still sits at the pre-merge tip.
+    s.repo.checkout('main_patched');
+    s.repo.commit('mp: an earlier case, merged this pass and NEVER pushed (finish was red)', {
+      'src/unpushed.ts': 'unverified\n',
+    });
+    writeText(s.prDir, GOOD_TITLE, GOOD_BODY);
+    const tokenFile = join(s.ws, 'token.txt');
+    writeFileSync(tokenFile, 'substitute-token\n');
+    return { ...s, tokenFile };
+  }
+
+  it('without the escalation the held case is refused (the live 2026-08-05 failure)', async () => {
+    const { ws, caseId, cli, tokenFile } = await redFinishState();
+    const gh = fakeGithub();
+    const out = join(ws, 'out.json');
+    expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, tokenFile, out }), gh.factory)).toBe(1);
+    const res = readOut(out);
+    expect((res.issues as Array<{ id: string }>).map((i) => i.id)).toContain('ERR14_BASE_BEHIND');
+    expect(gh.calls.some((c) => c.method === 'POST' && c.path.includes('/pulls'))).toBe(false); // no PR — dropped
+  });
+
+  it('as an escalation it publishes, and the PR carries the FIX ALONE — not the unpushed merge', async () => {
+    const { repo, ws, dir, caseId, bareDir, cli, tokenFile } = await redFinishState();
+    const gh = fakeGithub();
+    const out = join(ws, 'out.json');
+    expect(
+      await cmdPublish(
+        cli({ cmd: 'publish', caseId, execute: true, tokenFile, out, escalateUnpushed: true }),
+        gh.factory,
+      ),
+    ).toBe(0);
+    expect(readOut(out).ok).toBe(true);
+
+    // The pushed head, read off the BARE origin — what the owner would review.
+    const ref = repo.git('-C', bareDir, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix').split('\n')[0];
+    expect(ref).toMatch(/^refs\/heads\/fix\/sweep\//);
+    const head = repo.git('-C', bareDir, 'rev-parse', ref);
+
+    // It sits on ORIGIN's tip, so the PR diff is the case's own work...
+    expect(repo.git('-C', bareDir, 'rev-parse', `${head}^`)).toBe(repo.git('-C', bareDir, 'rev-parse', 'main_patched'));
+    // ...the resolution is in it...
+    expect(repo.git('-C', bareDir, 'show', `${head}:src/x.ts`)).toContain('RESOLVED');
+    // ...and this pass's unpushed, unverified merge is NOT.
+    expect(repo.git('-C', bareDir, 'ls-tree', '-r', '--name-only', head)).not.toContain('src/unpushed.ts');
+
+    // The transplant is journaled, so the owner can see the head was rebased.
+    const row = readJournal(dir).find((e) => e.action === 'escalation-transplanted' && e.caseId === caseId);
+    expect(row).toBeTruthy();
+    expect(row!.onto).toBe(repo.git('-C', bareDir, 'rev-parse', 'main_patched'));
+  });
+});
