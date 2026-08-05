@@ -3713,7 +3713,7 @@ async function transplantOntoOrigin(
   jc: JournaledCase,
   tip: string,
   localHead: string,
-): Promise<{ headSha: string; draft: boolean; originBased: boolean } | null> {
+): Promise<{ headSha: string; draft: boolean } | null> {
   if (!cli.escalateUnpushed) return null;
   const originRef = `origin/${jc.branch}`;
   if (!(await refExists(cli.repo, originRef))) return null;
@@ -3736,7 +3736,7 @@ async function transplantOntoOrigin(
           `also contains this pass's UNPUSHED merges, which were never verified green (the finish was red)`,
       });
     }
-    return { headSha: localHead, draft: true, originBased: false };
+    return { headSha: localHead, draft: true };
   }
   const headSha = await deterministicCommit(
     cli.repo,
@@ -3755,7 +3755,7 @@ async function transplantOntoOrigin(
       detail: `resolution replayed onto ${originRef} so the escalation PR shows the fix alone`,
     });
   }
-  return { headSha, draft: false, originBased: true };
+  return { headSha, draft: false };
 }
 
 function samePathSet(a: string[], b: string[]): boolean {
@@ -3842,8 +3842,6 @@ async function publishHead(
   mode?: 'held' | 'judged';
   draft?: boolean;
   escalation?: HeldEscalation | null;
-  /** Head was transplanted onto `origin/<branch>` (red-finish escalation). */
-  originBased?: boolean;
   issue?: Issue;
 }> {
   const disposition = lastDisposition(journal, jc.caseId);
@@ -4234,7 +4232,7 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
   const push = (i: Issue | null): void => {
     if (i) issues.push(i);
   };
-  push(await checkBaseHeight(cli.repo, jc.branch, mode, headSha, src.originBased === true));
+  push(await checkBaseHeight(cli.repo, jc.branch, mode, headSha, cli.escalateUnpushed === true));
 
   // (4) "should this PR exist": recorded decisions (ERR05) + duplicates (ERR06)
   // + already-published (ERR07, journal side).

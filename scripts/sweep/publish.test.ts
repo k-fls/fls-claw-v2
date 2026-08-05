@@ -1204,13 +1204,15 @@ describe('publish — held escalation off an unpushed base (ERR14, red finish)',
     cleanups.push(() => repo.destroy());
     const head = repo.sha('main_patched');
 
-    // Local-tip head: refused, exactly as it was live.
+    // Outside an escalation: refused, exactly as it was live.
     expect((await checkBaseHeight(repo.dir, 'main_patched', 'held', head))?.id).toBe('ERR14_BASE_BEHIND');
-    // Origin-based head (the transplant): allowed.
+    // As a red-finish escalation: allowed. This must hold for the CONFLICTING
+    // transplant too, which ships a draft off the local head — refusing there
+    // would restore the silent drop.
     expect(await checkBaseHeight(repo.dir, 'main_patched', 'held', head, true)).toBeNull();
   });
 
-  it('a DIVERGED origin still halts even for an origin-based head', async () => {
+  it('a DIVERGED origin still halts even for an escalation', async () => {
     const repo = initFixtureRepo();
     repo.commit('base: x', { 'src/x.ts': 'orig\n' });
     repo.checkout('main_patched', { create: true, at: 'main' });
