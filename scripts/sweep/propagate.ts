@@ -5054,6 +5054,14 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     action: 'verify',
     ok: false,
     offender: first.offender ?? null,
+    // What the base probe SAW, on every red. A verdict of "this branch did it"
+    // is a claim that the merged tree fails something the BASE does not, and
+    // that claim has to be auditable from the journal alone — otherwise a
+    // correct attribution and a missed base defect read exactly the same, which
+    // is how three branches got rolled back one per pass before anyone could
+    // tell whether that was right.
+    baseFailingFiles: first.baseFailingFiles ?? [],
+    mergedFailingFiles: first.mergedFailingFiles ?? [],
     ...(first.nonDeterministic ? { nonDeterministic: true, flakyCommands: first.flakyCommands ?? [] } : {}),
   });
   // A NON-DETERMINISTIC red belongs to no branch, so there is nothing to

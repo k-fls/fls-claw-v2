@@ -110,6 +110,16 @@ export interface VerifyResult {
   baseRed?: boolean;
   /** The base-alone failure output, for blame + the gate-fix case materials. */
   baseCommands?: CommandResult[];
+  /**
+   * What the base probe SAW, recorded on every red whether or not it fired.
+   *
+   * Without this, "the probe ran and the base was clean" and "the probe never
+   * ran" look identical from the journal, and the only way to tell an honest
+   * attribution from a missed base defect is to re-run the whole thing by hand.
+   * The verdict is a judgement about two file sets; both belong in the record.
+   */
+  baseFailingFiles?: string[];
+  mergedFailingFiles?: string[];
 }
 
 export interface VerifyOptions {
@@ -256,6 +266,8 @@ export async function verifyEverything(repo: string, opts: VerifyOptions): Promi
         flakyCommands: flaky,
       };
     }
+    let baseSeen: string[] = [];
+    let mergedSeen: string[] = [];
     // BASE PROBE, before attribution. Rebuild the base ALONE (no recipe) and
     // re-run: a failure that reproduces there belongs to the base, and blaming
     // any branch for it is wrong by construction. Costs one build; attribution
@@ -282,6 +294,8 @@ export async function verifyEverything(repo: string, opts: VerifyOptions): Promi
         mergedFiles.size === 0 && baseFiles.size === 0
           ? first.commands.some((c) => c.code !== 0 && baseCmds.has(c.cmd))
           : mergedFiles.size > 0 && [...mergedFiles].every((f) => baseFiles.has(f));
+      baseSeen = [...baseFiles];
+      mergedSeen = [...mergedFiles];
       if (subsumed) {
         return {
           ok: false,
@@ -289,8 +303,13 @@ export async function verifyEverything(repo: string, opts: VerifyOptions): Promi
           commands: first.commands,
           baseRed: true,
           baseCommands: baseOnly.commands,
+          baseFailingFiles: baseSeen,
+          mergedFailingFiles: mergedSeen,
         };
       }
+    } else {
+      baseSeen = [];
+      mergedSeen = [...new Set(first.commands.filter((c) => c.code !== 0).flatMap((c) => parseFailingFiles(c.output)))];
     }
 
     const maxTries = Math.min(opts.maxAttribution ?? opts.recipe.length, opts.recipe.length);
@@ -299,10 +318,24 @@ export async function verifyEverything(repo: string, opts: VerifyOptions): Promi
       const reduced = opts.recipe.filter((b) => b !== candidate);
       const attempt = await buildAndTest(repo, wt.path, baseRef, reduced, commands);
       if (attempt.green) {
-        return { ok: false, build: first.build, commands: first.commands, offender: candidate };
+        return {
+          ok: false,
+          build: first.build,
+          commands: first.commands,
+          offender: candidate,
+          baseFailingFiles: baseSeen,
+          mergedFailingFiles: mergedSeen,
+        };
       }
     }
-    return { ok: false, build: first.build, commands: first.commands, attributionFailed: true };
+    return {
+      ok: false,
+      build: first.build,
+      commands: first.commands,
+      attributionFailed: true,
+      baseFailingFiles: baseSeen,
+      mergedFailingFiles: mergedSeen,
+    };
   } finally {
     await wt.remove();
   }
