@@ -1325,15 +1325,15 @@ describe('emit — an internal caller with an explicit --out still gets the arti
   });
 });
 
-// --- a DIAGNOSIS-ONLY gate fix still reaches the owner (D-064 layer 6) -------
+// --- a held gate fix with NO resolution still reaches the owner -------------
 //
-// A timeout-class gate failure is one the agent must NOT try to reproduce: it
-// reads, diagnoses, and reports held WITHOUT editing, so the case freezes with
-// no resolution tree by design. publishHead refused exactly that shape, so the
-// diagnosis reached nobody — live 2026-08-05, two of two, the next door the
-// dropped-work failure walked through once ERR14 was shut.
-describe('publish — a diagnosis-only gate fix publishes a report PR (D-064)', () => {
-  async function diagnosisOnlyGateFix(diagnosisOnly: boolean) {
+// A gate fix never had a conflict, so freezing HELD with no resolution means the
+// agent tried and could not fix it. publishHead refused exactly that shape, so
+// the diagnosis reached nobody — live 2026-08-05, two of two. It was later
+// allowed only for cases flagged `diagnosisOnly`; that flag is gone, and the
+// rule applies to every held gate fix alike.
+describe('publish — a held gate fix with no resolution publishes a report PR', () => {
+  async function heldGateFixNoResolution() {
     const repo = initFixtureRepo();
     repo.commit('base', { 'src/x.ts': 'orig\n' });
     repo.checkout('main_patched', { create: true, at: 'main' });
@@ -1356,7 +1356,6 @@ describe('publish — a diagnosis-only gate fix publishes a report PR (D-064)', 
       parent: 'main',
       head: { sha: tip, height: 0 },
       conflictedPaths: [],
-      ...(diagnosisOnly ? { diagnosisOnly: true } : {}),
     });
     appendJournal(dir, { action: 'gate-fix', caseId, branch: 'main_patched' });
     appendJournal(dir, { action: 'held', caseId, branch: 'main_patched', tier: 'held' }); // NO resolution
@@ -1368,7 +1367,7 @@ describe('publish — a diagnosis-only gate fix publishes a report PR (D-064)', 
   }
 
   it('publishes a DRAFT report PR at an empty commit — the diagnosis is the deliverable', async () => {
-    const { repo, ws, caseId, bareDir, tip, tokenFile, cli } = await diagnosisOnlyGateFix(true);
+    const { repo, ws, caseId, bareDir, tip, tokenFile, cli } = await heldGateFixNoResolution();
     const gh = fakeGithub();
     const out = join(ws, 'out.json');
     expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, tokenFile, out }), gh.factory)).toBe(0);
@@ -1385,7 +1384,7 @@ describe('publish — a diagnosis-only gate fix publishes a report PR (D-064)', 
   });
 
   it('as an ESCALATION it parents on origin, not the local tip (PR #72 was 305 commits)', async () => {
-    const { repo, ws, caseId, bareDir, tip, tokenFile, cli } = await diagnosisOnlyGateFix(true);
+    const { repo, ws, caseId, bareDir, tip, tokenFile, cli } = await heldGateFixNoResolution();
     // The pass advanced the branch and — the finish being red — never pushed it.
     repo.checkout('main_patched');
     repo.commit('mp: unpushed pass merge', { 'src/unpushed.ts': 'nope\n' });
@@ -1405,11 +1404,12 @@ describe('publish — a diagnosis-only gate fix publishes a report PR (D-064)', 
     expect(repo.git('-C', bareDir, 'rev-list', '--count', `${tip}..${head}`)).toBe('1');
   });
 
-  it('a NON-diagnosis-only gate fix with no resolution is still refused (the guard is not blanket)', async () => {
-    const { ws, caseId, tokenFile, cli } = await diagnosisOnlyGateFix(false);
+  it('the report is a DRAFT — there is nothing to merge, it is a finding', async () => {
+    const { ws, caseId, tokenFile, cli } = await heldGateFixNoResolution();
     const gh = fakeGithub();
     const out = join(ws, 'out.json');
-    expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, tokenFile, out }), gh.factory)).toBe(1);
-    expect((readOut(out).issues as Array<{ id: string }>).map((i) => i.id)).toContain('ERR02_CASE_STALE');
+    expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, tokenFile, out }), gh.factory)).toBe(0);
+    const post = gh.calls.find((c) => c.method === 'POST' && c.path.includes('/pulls'));
+    expect((post!.body as { draft?: boolean }).draft).toBe(true);
   });
 });

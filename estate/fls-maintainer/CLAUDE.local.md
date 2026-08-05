@@ -117,11 +117,13 @@ finish --execute --token-file <path> --commands-file <cheap-tests.json>   # crea
   there: the PR then carries your DIAGNOSIS (what fails, why it cannot be fixed
   in those files, where the fix belongs) and that is a valid outcome.
   This is the ONLY case type where you change code this pass did not merge.
-  A case marked DIAGNOSIS ONLY in its materials is a TIMEOUT failure: the test
-  did not finish in its budget. You cannot confirm a fix for that — you may not
-  run the suite, and one run could not confirm a load-dependent fix anyway — so
-  do NOT attempt one. Read the test and its source once, then `report-case
-  --tier held` with an unchanged worktree; the PR carries your diagnosis.
+  A TIMEOUT in the failing output is not special. It used to mark a case DIAGNOSIS
+  ONLY — do not attempt a fix — on the argument that a timeout is load-dependent
+  and unconfirmable. That was withdrawn: the failure it was built for reproduced
+  3/3 in the full suite and passed 5/5 in isolation, so it was a deterministic
+  test-isolation defect, and `report-case` verifies a fix for that perfectly well.
+  Treat a timeout like any other failure — diagnose it, fix it if the fix belongs
+  in your files, escalate with `--tier held` if it does not.
   STOP READING after ONE pass over the implicated code — the failing file, the
   source it exercises, the definitions of the symbols in the failure, each file
   ONCE. If you have read those and made no edit, you are done investigating:

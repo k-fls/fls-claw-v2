@@ -98,7 +98,6 @@ import { attributeFailure, countFailingFiles, parseFailingFiles } from './attrib
 import { ROOT_BRANCH, TRUNK_BRANCH } from './hierarchy.js';
 import {
   classifyEnvironmentFault,
-  isTimeoutFailure,
   classifyFailure,
   findIntroducingCommit,
   locateOwner,
@@ -3782,16 +3781,6 @@ async function transplantOntoOrigin(
   return { headSha, draft: false };
 }
 
-/**
- * Was this case opened as DIAGNOSIS-ONLY? Recorded on the `case` row by
- * `next-case` when the gate failure is a timeout class (`isTimeoutFailure`),
- * which is the signal that the agent must diagnose from the code and never try
- * to reproduce. Such a case is EXPECTED to freeze with no resolution tree.
- */
-function diagnosisOnlyCase(journal: JournalEntry[], caseId: string): boolean {
-  const row = journal.find((e) => e.action === 'case' && e.caseId === caseId);
-  return row?.diagnosisOnly === true;
-}
 
 /**
  * Publish every HELD case that has not reached a PR yet, as a RED-FINISH
@@ -4069,29 +4058,27 @@ async function publishHead(
         return { headSha: localHead, mode: 'held', draft: false, escalation };
       }
     }
-    // A gate fix has no pristine conflict to fall back to. For a DIAGNOSIS-ONLY
-    // case that is not a defect — it is the designed outcome: the failure is a
-    // timeout class the agent must not try to reproduce, so it reads, diagnoses
-    // and reports held WITHOUT editing. There is no tree because there was never
-    // meant to be one.
+    // A GATE FIX HAS NO PRISTINE CONFLICT TO FALL BACK ON. It never had a
+    // conflict, so when it freezes HELD with no resolution the agent tried and
+    // could not fix it — which is a real outcome the owner has to see, not a
+    // reason to drop the case.
     //
-    // Refusing here dropped exactly that work. Live 2026-08-05, after the ERR14
-    // escalation was fixed, this became the NEXT door the same failure walked
-    // through: two diagnosis-only gate fixes refused with ERR02 and no PR, so
-    // the agent's diagnosis reached nobody. A reproducible-but-unfixable-in-scope
-    // finding MUST reach the owner as a held PR; there is no other channel.
+    // This used to refuse with ERR02 unless the case was flagged `diagnosisOnly`,
+    // and the work went nowhere: live 2026-08-05 two held gate fixes were refused
+    // and their diagnoses reached no one. The flag is gone now (it decided by
+    // grepping the output for "timed out" and forbade fixing defects that were
+    // perfectly fixable), and the rule it was standing in for applies to every
+    // held gate fix alike: reproducible-but-unfixable-in-scope reaches the owner
+    // as a held PR. There is no other channel.
     //
-    // A PR needs a commit, and there is no diff to make, so the head is an EMPTY
-    // commit on the tip whose message names the case. The finding itself lives in
-    // the PR body, which the agent wrote. Draft, because there is nothing to
-    // merge — it is a report, and the owner closes or acts on it.
-    if (!probe && diagnosisOnlyCase(journal, jc.caseId)) {
-      // BUILD ON ORIGIN'S TIP WHEN ESCALATING. This returned early, before the
-      // transplant below, and parented the report on the LOCAL tip — which this
-      // pass had advanced. PR #72 (live 2026-08-05) came out at 305 commits and
-      // 362 files for a case with NO code change at all: unreviewable, and the
-      // exact fat diff the transplant exists to prevent. An empty commit makes
-      // this simple — no delta to replay, just the right parent.
+    // A PR needs a commit and there is no diff to make, so the head is an EMPTY
+    // commit whose message names the case; the finding lives in the PR body the
+    // agent wrote. DRAFT, because there is nothing to merge — it is a report.
+    if (!probe) {
+      // ON ORIGIN'S TIP WHEN ESCALATING. Parenting this on the LOCAL tip — which
+      // the pass had advanced — is how PR #72 came out at 305 commits and 362
+      // files for a case with no code change at all. An empty commit needs only
+      // the right parent.
       const reportBase = (await escalationBase(cli, jc.branch, tip)) ?? tip;
       const headSha = await deterministicCommit(
         cli.repo,
@@ -4100,14 +4087,6 @@ async function publishHead(
         `Diagnosis for ${jc.caseId} on ${jc.branch} — no code change (owner review)`,
       );
       return { headSha, mode: 'held', draft: true, escalation };
-    }
-    if (!probe) {
-      return {
-        issue: {
-          id: 'ERR02_CASE_STALE',
-          detail: `held gate fix '${jc.caseId}' carries no marker-clean resolution and is not diagnosis-only — there is nothing to publish (a gate fix has no pristine conflict exhibit)`,
-        },
-      };
     }
     // DRAFT: the pristine conflict — clean prefix + the original
     // upstream-vs-ours conflict re-materialized, no agent edits.
@@ -8783,8 +8762,6 @@ function gateFixFailedOutput(dir: string, caseId: string): string {
 
 function gateFixCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEntry): string {
   // Set at mint time for a TIMEOUT-class failure — the case is a diagnosis, not
-  // a fix (see `isTimeoutFailure`). Read from the DRIVER's own journal row.
-  const diagnosisOnly = caseRow.diagnosisOnly === true;
   const gf = readJournal(dir).find((e) => e.action === 'gate-fix' && e.caseId === jc.caseId);
   const files = Array.isArray(gf?.files) ? (gf.files as string[]) : (caseRow.conflictedPaths as string[]) ?? [];
   const failedCommands = Array.isArray(gf?.failedCommands) ? (gf.failedCommands as string[]) : [];
@@ -8817,21 +8794,6 @@ function gateFixCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEn
     'failure. What is NOT valid is reporting the diagnosis in chat and stopping —',
     'the PR is how it reaches the owner.',
     '',
-    ...(diagnosisOnly
-      ? [
-          '## DIAGNOSIS ONLY — DO NOT ATTEMPT A FIX',
-          'This failure is a TIMEOUT: the test did not finish inside its budget.',
-          'A fix for that cannot be confirmed here — you may not run the suite, and',
-          'a single run could not confirm a load-dependent fix even if you could.',
-          'There is no path by which you become confident, so do not look for one.',
-          '',
-          'Read the failing test and the source it exercises ONCE, then:',
-          '  `report-case --tier held`  — with an UNCHANGED worktree.',
-          'The PR carries your DIAGNOSIS: what times out, what you believe causes',
-          'it, and where the fix belongs. That IS the deliverable for this case.',
-          '',
-        ]
-      : []),
     '## WHEN TO STOP READING',
     'ONE pass over the implicated code, then decide. "Implicated" is: the failing',
     'file, the source it exercises, and the definitions of the symbols in the',
@@ -9190,9 +9152,6 @@ async function materializeGateFixCases(
       files: g.files,
       failedCommands: commandNames,
       reason: g.reason,
-      // TIMEOUT-class: unverifiable by construction, so the case is served as
-      // DIAGNOSIS-ONLY rather than as something to fix (see `isTimeoutFailure`).
-      ...(isTimeoutFailure(failedOutput) ? { diagnosisOnly: true } : {}),
       // The ROOT the case's worktree was created at. Journaled because
       // `reverifyGateFixCase` re-derives the case from THIS row (never from the
       // agent-writable case.json) — without it, re-verification recomputes the
@@ -9209,12 +9168,6 @@ async function materializeGateFixCases(
       branch: g.branch,
       parent: GATE_FIX_PARENT,
       gateFix: true,
-      // ALSO on the `case` row: `gateFixCaseMaterials` is handed the `case` row,
-      // not the `gate-fix` row, so a flag written only to the latter never
-      // reaches the agent. Caught live 2026-08-05 — the journal said
-      // `diagnosisOnly: true` while the materials rendered the ordinary
-      // fix-it briefing and the agent investigated for the third run running.
-      ...(isTimeoutFailure(failedOutput) ? { diagnosisOnly: true } : {}),
       head,
       height: head.height,
       run: caseFile.run,

@@ -135,35 +135,6 @@ export function classifyEnvironmentFault(output: string): EnvFaultVerdict {
   };
 }
 
-/**
- * A TIMEOUT-class failure: the test did not finish inside its budget.
- *
- * This is structurally different from an assertion, and the difference decides
- * whether an agent can work the case at all. An assertion says "the code did the
- * wrong thing" and a fix can be checked by reading it. A timeout says "it did not
- * finish", whose causes are a hang, a deadlock, or a budget too tight for the
- * load — and NONE of those can be confirmed fixed without running the suite
- * repeatedly under load. The agent may not run tests, and the checks gate's
- * single run cannot confirm a load-dependent fix either. So there is no path by
- * which the agent becomes confident, and asking it to try produces exactly what
- * it produced twice on 2026-08-04/05: 300+ tool calls, no edit, no attempt, two
- * compactions, both spent re-reading what it had already read.
- *
- * The owner's rule settles it — "reproducible-but-unfixable-in-scope should lead
- * to a held PR, there is no other way" — so the driver stops asking. The case is
- * still minted (the defect is real and the branch owns it), but it is served as
- * DIAGNOSIS-ONLY: write what fails and where the fix belongs, claim held, done.
- */
-const TIMEOUT_PATTERNS: RegExp[] = [
-  /timed out after \d+\s*ms/i,
-  /\btest timed out\b/i,
-  /Exceeded timeout of \d+/i,
-  /\bETIMEDOUT\b/,
-];
-
-export function isTimeoutFailure(output: string): boolean {
-  return TIMEOUT_PATTERNS.some((re) => re.test(output));
-}
 
 /** Which tree a probe runs against. */
 export type ProbeTarget =

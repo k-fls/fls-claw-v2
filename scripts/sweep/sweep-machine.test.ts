@@ -1295,7 +1295,13 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     expect(openCases(journal).map((c) => c.caseId)).toEqual([gateFix!.caseId]);
   });
 
-  it('a TIMEOUT gate fix reaches the agent as DIAGNOSIS ONLY — in the MATERIALS, not just the journal', async () => {
+  it('a TIMEOUT gate fix is served as an ORDINARY fix case — no gag in the materials', async () => {
+    // `diagnosisOnly` used to fire here: `isTimeoutFailure` grepped the verify
+    // output for "timed out" and the briefing then said DO NOT ATTEMPT A FIX.
+    // It was deleted — the failure that motivated it reproduced 3/3 and was a
+    // deterministic test-isolation bug, so the checks gate could verify a fix
+    // perfectly well, and the gag only guaranteed the base stayed broken. The
+    // termination problem it was really covering belongs to the serve bound.
     // The flag was journaled on the `gate-fix` row while `gateFixCaseMaterials`
     // reads the `case` row, so it never reached the agent: the journal said
     // `diagnosisOnly: true` and the briefing still said "fix it". Caught live
@@ -1314,11 +1320,11 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
       JSON.stringify({
         ts: new Date().toISOString(), action: 'gate-fix', key: 'main_patched::src/x.test.ts', caseId,
         branch: 'main_patched', files: ['src/x.test.ts'], failedCommands: ['vitest run'], rootAt: tip,
-        reason: 'pre-existing', diagnosisOnly: true,
+        reason: 'pre-existing',
       }) + '\n' +
         JSON.stringify({
           ts: new Date().toISOString(), action: 'case', caseId, branch: 'main_patched', parent: '(gate-fix)',
-          gateFix: true, diagnosisOnly: true, head: { sha: tip, height: 1 }, conflictedPaths: ['src/x.test.ts'],
+          gateFix: true, head: { sha: tip, height: 1 }, conflictedPaths: ['src/x.test.ts'],
         }) + '\n',
     );
     mkdirSync(join(dir, caseId), { recursive: true });
@@ -1337,9 +1343,10 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     const out = join(ws, 'nc.json');
     await cmdSweepNextCase(baseCli(repo, ws, inv, { checksFile: checks, out }), greenPreMerge);
     const materials = readFileSync(join(dir, caseId, 'materials.md'), 'utf8');
-    expect(materials).toContain('DIAGNOSIS ONLY');
-    expect(materials).toContain('DO NOT ATTEMPT A FIX');
-    expect(materials).toContain('--tier held');
+    expect(materials).not.toContain('DIAGNOSIS ONLY');
+    expect(materials).not.toContain('DO NOT ATTEMPT A FIX');
+    expect(materials).toContain('--tier held'); // escalation is still offered
+    expect(materials).toContain('WHEN TO STOP READING'); // and the bounded look survives
   });
 
   it('a gate fix the agent cannot fix IN SCOPE becomes a HELD PR carrying the diagnosis', async () => {
