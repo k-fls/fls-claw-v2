@@ -18,6 +18,7 @@ import { execFile } from 'node:child_process';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
+import { parseFailingFiles } from './attribute.js';
 import { VERIFY_COMMANDS } from './config.js';
 import { addTempWorktree, git } from './git.js';
 import { installRrCache } from './merge.js';
@@ -94,6 +95,21 @@ export interface VerifyResult {
   nonDeterministic?: boolean;
   /** Which commands disagreed between the two identical runs. */
   flakyCommands?: string[];
+  /**
+   * The failure reproduces on the BASE ALONE, with no recipe branch merged.
+   *
+   * Then no branch caused it and none may be rolled back. Leave-one-out cannot
+   * see this: removing a branch never fixes a defect that is already in the
+   * base, so attribution either blames whoever happens to flip the matrix or
+   * reports "no clean attribution" — and the pass peels one branch per run
+   * before it ever reaches the real cause. Live 2026-08-05:
+   * module/credentials -> feat/ssh-auth -> module/runtime-updater -> (none),
+   * four finish runs and three frozen branches to arrive at a `main_patched`
+   * defect that was reproducible on the base from the first second.
+   */
+  baseRed?: boolean;
+  /** The base-alone failure output, for blame + the gate-fix case materials. */
+  baseCommands?: CommandResult[];
 }
 
 export interface VerifyOptions {
@@ -240,6 +256,43 @@ export async function verifyEverything(repo: string, opts: VerifyOptions): Promi
         flakyCommands: flaky,
       };
     }
+    // BASE PROBE, before attribution. Rebuild the base ALONE (no recipe) and
+    // re-run: a failure that reproduces there belongs to the base, and blaming
+    // any branch for it is wrong by construction. Costs one build; attribution
+    // costs one per recipe branch and would have been meaningless.
+    //
+    // It runs AFTER the determinism probe on purpose — that probe re-runs the
+    // tree standing in the worktree, and this rebuild replaces it with the base.
+    const baseOnly = await buildAndTest(repo, wt.path, baseRef, [], commands);
+    if (!baseOnly.green) {
+      // SUBSET RULE, by FILE — the same test `--not-my-bug` adjudication uses.
+      // Command granularity is useless here: `pnpm test` fails on both sides
+      // whenever anything at all is red, so matching on the command name calls
+      // every red base-caused, including one a branch really introduced. What
+      // makes a red base-caused is that it brings NO failing file the base does
+      // not already have.
+      const filesOf = (rs: CommandResult[]): Set<string> =>
+        new Set(rs.filter((c) => c.code !== 0).flatMap((c) => parseFailingFiles(c.output)));
+      const baseFiles = filesOf(baseOnly.commands);
+      const mergedFiles = filesOf(first.commands);
+      // No parseable file on either side (an opaque command): fall back to the
+      // command names, which is all the information there is.
+      const baseCmds = new Set(baseOnly.commands.filter((c) => c.code !== 0).map((c) => c.cmd));
+      const subsumed =
+        mergedFiles.size === 0 && baseFiles.size === 0
+          ? first.commands.some((c) => c.code !== 0 && baseCmds.has(c.cmd))
+          : mergedFiles.size > 0 && [...mergedFiles].every((f) => baseFiles.has(f));
+      if (subsumed) {
+        return {
+          ok: false,
+          build: first.build,
+          commands: first.commands,
+          baseRed: true,
+          baseCommands: baseOnly.commands,
+        };
+      }
+    }
+
     const maxTries = Math.min(opts.maxAttribution ?? opts.recipe.length, opts.recipe.length);
     const candidates = [...opts.recipe].reverse().slice(0, maxTries);
     for (const candidate of candidates) {

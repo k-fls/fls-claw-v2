@@ -5094,11 +5094,15 @@ describe('sweep finish — a gate-fix case is never served with NO files (defect
    *
    * Run 2 is the determinism probe (D-064): verify re-runs the SAME tree before
    * attributing, because attribution is meaningless under a flaky test. A
-   * DETERMINISTIC failure — which is what this fixture models — must therefore
-   * fail twice before the leave-one-out build gets its turn. The stub sequences
-   * by call count, so it says green on run 3, not run 2.
+   * DETERMINISTIC failure — which is what this fixture models — must fail twice
+   * before anything else happens.
+   *
+   * Run 3 is the base probe (D-065): the base alone must come back GREEN here,
+   * because this fixture models a failure a BRANCH introduced. Run 4 is the
+   * leave-one-out build that isolates it, also green. The stub sequences by call
+   * count, so both of those are green and everything else is red.
    */
-  function redRedGreenRed(ws: string): string {
+  function redRedGreenGreenRed(ws: string): string {
     const f = join(ws, 'cmds.json');
     const counter = join(ws, 'verify-runs');
     writeFileSync(
@@ -5107,7 +5111,7 @@ describe('sweep finish — a gate-fix case is never served with NO files (defect
         {
           cmd:
             `n=$(cat ${counter} 2>/dev/null || echo 0); n=$((n+1)); printf %s "$n" > ${counter}; ` +
-            `if [ "$n" -eq 3 ]; then exit 0; fi; echo boom; exit 1`,
+            `if [ "$n" -ge 3 ] && [ "$n" -le 4 ]; then exit 0; fi; echo boom; exit 1`,
         },
       ]),
     );
@@ -5121,7 +5125,7 @@ describe('sweep finish — a gate-fix case is never served with NO files (defect
     const dir = dirOf(repo, ws);
     repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched', 'feat/other');
-    const cmds = redRedGreenRed(ws);
+    const cmds = redRedGreenGreenRed(ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
     await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const out = join(ws, 'f1.json');

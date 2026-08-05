@@ -41,8 +41,19 @@ describe('verifyEverything', () => {
   });
 
   it('reports attribution failure when no single branch is to blame', async () => {
-    const res = await verifyEverything(repo.dir, { recipe: ['module/good'], commands: [{ cmd: 'false' }] });
+    // TWO branches each plant a tripwire and the base is clean, so removing
+    // either one leaves the other and nothing isolates an offender. (This used
+    // `cmd: 'false'`, which fails on the BASE as well — that is now reported as
+    // baseRed, a sharper verdict, and would no longer exercise attribution.)
+    repo.checkout('module/bad2', { create: true, at: 'main' });
+    repo.commit('bad2: plant second tripwire', { 'BROKEN2.marker': 'boom\n' });
+    repo.checkout('main');
+    const res = await verifyEverything(repo.dir, {
+      recipe: ['module/bad', 'module/bad2'],
+      commands: [{ cmd: 'test ! -f BROKEN.marker -a ! -f BROKEN2.marker' }],
+    });
     expect(res.ok).toBe(false);
+    expect(res.baseRed).toBeUndefined(); // base is clean
     expect(res.offender).toBeUndefined();
     expect(res.attributionFailed).toBe(true);
   });
@@ -150,5 +161,73 @@ describe('verifyEverything — a non-deterministic red is not attributed to a br
     expect(res.ok).toBe(false);
     expect(res.nonDeterministic).toBeUndefined(); // consistently red -> a real defect
     expect(res.offender).toBe('module/bad');
+  });
+});
+
+// --- base probe (D-065) -----------------------------------------------------
+//
+// Leave-one-out cannot see a defect that is already in the base: removing a
+// branch never fixes it, so attribution blames whoever happens to flip the
+// matrix, or gives up. Live 2026-08-05 the pass peeled
+// module/credentials -> feat/ssh-auth -> module/runtime-updater -> (none),
+// four finish runs and three frozen branches, to reach a `main_patched` defect
+// that reproduced on the base from the first second.
+describe('verifyEverything — a failure already in the BASE blames no branch', () => {
+  it('reports baseRed and rolls nothing back', async () => {
+    // The defect is planted on the BASE, not on a recipe branch, and the stub
+    // names the failing file the way vitest does.
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('base defect', { 'BROKEN.marker': 'boom\n' });
+    const NAMED_TRIP = [{ cmd: 'if [ -f BROKEN.marker ]; then echo " FAIL  src/x.test.ts"; exit 1; fi; exit 0' }];
+    try {
+      const res = await verifyEverything(repo.dir, {
+        baseRef: 'main_patched',
+        recipe: ['module/good'],
+        commands: NAMED_TRIP,
+      });
+      expect(res.ok).toBe(false);
+      expect(res.baseRed).toBe(true);
+      // No branch named, no attribution sweep run.
+      expect(res.offender).toBeUndefined();
+      expect(res.attributionFailed).toBeUndefined();
+      expect((res.baseCommands ?? []).some((c) => c.code !== 0)).toBe(true);
+    } finally {
+      repo.checkout('main');
+    }
+  });
+
+  it('a base failure the recipe FIXES does not mask a real offender', async () => {
+    // The base is red on file A. A branch introduces a DIFFERENT failure, on
+    // file B. The merged red therefore brings a file the base does not have, so
+    // it is branch-caused and must still be attributed — the subset rule is by
+    // FILE, not by command (`pnpm test` fails on both sides either way).
+    //
+    // The stub prints vitest-shaped FAIL lines so the same parser production
+    // uses can read them.
+    const NAMED = [
+      {
+        cmd:
+          'rc=0; if [ -f A.broken ]; then echo " FAIL  src/a.test.ts"; rc=1; fi; ' +
+          'if [ -f B.broken ]; then echo " FAIL  src/b.test.ts"; rc=1; fi; exit $rc',
+      },
+    ];
+    repo.checkout('main_patched');
+    repo.commit('base: A is broken', { 'A.broken': 'x\n' });
+    repo.checkout('module/heals-a', { create: true, at: 'main_patched' });
+    repo.git('rm', '-q', 'A.broken');
+    repo.git('commit', '-q', '-m', 'heal A (remove A.broken)');
+    repo.checkout('module/breaks-b', { create: true, at: 'main_patched' });
+    repo.commit('break B', { 'B.broken': 'x\n' });
+    repo.checkout('main');
+    const res = await verifyEverything(repo.dir, {
+      baseRef: 'main_patched',
+      recipe: ['module/heals-a', 'module/breaks-b'],
+      commands: NAMED,
+    });
+    expect(res.ok).toBe(false);
+    // src/b.test.ts is NOT among the base's failing files, so this is a real
+    // offender and not a base defect.
+    expect(res.baseRed).toBeUndefined();
+    expect(res.offender).toBe('module/breaks-b');
   });
 });

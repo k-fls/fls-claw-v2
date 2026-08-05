@@ -5072,6 +5072,46 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     emit(cli, { ok: false, nonDeterministic: true, flakyCommands: flaky, issues: [{ id: 'WARN17_VERIFY_FLAKY', detail }] });
     return 1;
   }
+  // BASE-RED: the failure reproduces on the base with no recipe branch merged,
+  // so no branch is responsible and none is rolled back. Reported in the SAME
+  // shape as an unattributable red — failing commands, cwds, full output — so
+  // finish's existing gate-fix path roots it on the base branch ON THE FIRST
+  // RED, which is a HELD PR that blocks every branch beneath it. That is what
+  // the peel-one-branch-per-pass cascade was doing the long way round.
+  if (first.baseRed) {
+    const baseFailed = (first.baseCommands ?? []).filter((c) => c.code !== 0);
+    const failedCommands = baseFailed.map((c) => c.cmd);
+    const failedCwds = baseFailed.map((c) => commands.find((v) => v.cmd === c.cmd)?.cwd ?? '');
+    const fullText = baseFailed.map((c) => `$ ${c.cmd}\n${c.output}`).join('\n');
+    const failedOutputFile = join(dir, 'verify-output.full.txt');
+    try {
+      writeFileSync(failedOutputFile, fullText);
+    } catch (e) {
+      console.error(`verify: could not write the full log: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    const summary = failureSummary(fullText, failedOutputFile);
+    const failedOutput = [summary, '', fullText].join('\n').slice(-VERIFY_OUTPUT_JOURNAL_CAP);
+    const detail =
+      `the failure reproduces on ${baseRef} with NO recipe branch merged — it is PRE-EXISTING in the base. ` +
+      `No branch caused it and none was rolled back; root it at ${baseRef} (gate fix + HELD PR), which blocks ` +
+      `every branch beneath it.`;
+    appendJournal(dir, {
+      action: 'verify',
+      ok: false,
+      attributionFailed: true,
+      baseRed: true,
+      baseRef,
+      failedCommands,
+      failedCwds,
+      failedOutput,
+      failedOutputFile,
+      ...(summary ? { failureSummary: summary } : {}),
+      detail,
+    });
+    console.error(`verify: BASE-RED — ${detail}`);
+    emit(cli, { ok: false, baseRed: true, baseRef, attributionFailed: true, commands: first.commands });
+    return 1;
+  }
   const offender = first.offender;
   if (!offender) {
     // D-060: expose the failed command names so finish can render a factual
