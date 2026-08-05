@@ -2235,8 +2235,18 @@ function emit(cli: Cli, artifact: unknown): void {
   // D-054: a flag command run INTERNALLY by a state-machine command
   // (next-case→run, finish→verify/publish/push) produces no output — only the
   // outer command emits its single SWEEP-RESULT line.
-  if (cli.internal) return;
+  //
+  // What D-054 protects is that ONE STDOUT LINE, not the artifact. An internal
+  // caller that passes an explicit `--out` is asking to READ the result itself,
+  // and returning early threw it away: `finish`'s held escalation passed `out`
+  // to capture WHY a publish refused and got `reason: unknown` on all three
+  // cases (live 2026-08-05), because this line ran first. The file is written
+  // silently — no `wrote ...` line — so the invariant is untouched.
   const json = JSON.stringify(artifact, null, 2);
+  if (cli.internal) {
+    if (cli.out) writeFileSync(cli.out, json + '\n');
+    return;
+  }
   if (cli.out) {
     writeFileSync(cli.out, json + '\n');
     console.log(`wrote ${cli.out}`);

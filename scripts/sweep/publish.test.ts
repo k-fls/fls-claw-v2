@@ -1293,3 +1293,33 @@ describe('publish — red-finish escalation, end to end (D-064)', () => {
     expect(row!.onto).toBe(repo.git('-C', bareDir, 'rev-parse', 'main_patched'));
   });
 });
+
+// --- internal + explicit --out (D-054 boundary, D-064 layer 5) --------------
+//
+// `finish`'s held escalation runs publish with `internal: true` (so only the
+// outer command prints a SWEEP-RESULT line) AND an explicit `--out` (so it can
+// read WHY a refusal happened). Before this, `internal` returned before the
+// file write and every refusal journaled `reason: unknown` — live 2026-08-05,
+// three of three, which is the whole point of having captured it.
+describe('emit — an internal caller with an explicit --out still gets the artifact (D-064)', () => {
+  it('writes the file, prints nothing', async () => {
+    const { ws, caseId, cli } = await setupHeldCase();
+    const out = join(ws, 'internal-out.json');
+    const logged: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => {
+      logged.push(a.join(' '));
+    });
+    try {
+      // No PR text -> ERR08. The exit code alone cannot say that; the file must.
+      expect(await cmdPublish(cli({ cmd: 'publish', caseId, internal: true, out }))).toBe(1);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(existsSync(out)).toBe(true);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { ok: boolean; issues: Array<{ id: string }> };
+    expect(res.ok).toBe(false);
+    expect(res.issues.map((i) => i.id)).toContain('ERR08_TEXT_MISSING');
+    // D-054 intact: the internal call still prints no result line.
+    expect(logged.some((l) => l.includes('wrote ') || l.trim().startsWith('{'))).toBe(false);
+  });
+});
