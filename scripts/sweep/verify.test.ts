@@ -122,3 +122,33 @@ describe('verifyEverything — worktree preparation (D-060 gap)', () => {
     expect(out).toContain('HEAD_MARKER'); // survives only because nothing is cropped
   });
 });
+
+// --- determinism probe (D-064) ----------------------------------------------
+//
+// Live 2026-08-05: three consecutive passes, three DIFFERENT branches blamed,
+// every one "no clean attribution". A flaky test makes leave-one-out blame
+// whichever branch was removed when it happened to pass — an innocent branch
+// rolled back and a gate fix minted against a defect that is not there.
+describe('verifyEverything — a non-deterministic red is not attributed to a branch', () => {
+  it('re-runs the same tree; a failure that does not repeat is reported flaky, not blamed', async () => {
+    const counter = join(repo.dir, 'flaky-runs');
+    // Fails the first time, passes the second — on the SAME tree.
+    const cmd =
+      `n=$(cat ${counter} 2>/dev/null || echo 0); n=$((n+1)); printf %s "$n" > ${counter}; ` +
+      `if [ "$n" -eq 1 ]; then echo boom; exit 1; fi; exit 0`;
+    const res = await verifyEverything(repo.dir, { recipe: ['module/good'], commands: [{ cmd }] });
+    expect(res.ok).toBe(false);
+    expect(res.nonDeterministic).toBe(true);
+    expect(res.flakyCommands).toEqual([cmd]);
+    // Crucially: NO branch was blamed, and no attribution sweep was run.
+    expect(res.offender).toBeUndefined();
+    expect(res.attributionFailed).toBeUndefined();
+  });
+
+  it('a failure that repeats on the same tree is still attributed normally', async () => {
+    const res = await verifyEverything(repo.dir, { recipe: ['module/good', 'module/bad'], commands: TRIPWIRE });
+    expect(res.ok).toBe(false);
+    expect(res.nonDeterministic).toBeUndefined(); // consistently red -> a real defect
+    expect(res.offender).toBe('module/bad');
+  });
+});

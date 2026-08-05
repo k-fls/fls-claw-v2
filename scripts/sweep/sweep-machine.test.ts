@@ -5088,7 +5088,17 @@ describe('sweep finish — a gate-fix case is never served with NO files (defect
    * and returns non-zero, having journaled NO attributionFailed row and NO
    * failing output.
    */
-  function redGreenRed(ws: string): string {
+  /**
+   * Red on the full recipe, red again on the identical re-run, GREEN once a
+   * branch is removed, red on the re-verify.
+   *
+   * Run 2 is the determinism probe (D-064): verify re-runs the SAME tree before
+   * attributing, because attribution is meaningless under a flaky test. A
+   * DETERMINISTIC failure — which is what this fixture models — must therefore
+   * fail twice before the leave-one-out build gets its turn. The stub sequences
+   * by call count, so it says green on run 3, not run 2.
+   */
+  function redRedGreenRed(ws: string): string {
     const f = join(ws, 'cmds.json');
     const counter = join(ws, 'verify-runs');
     writeFileSync(
@@ -5097,7 +5107,7 @@ describe('sweep finish — a gate-fix case is never served with NO files (defect
         {
           cmd:
             `n=$(cat ${counter} 2>/dev/null || echo 0); n=$((n+1)); printf %s "$n" > ${counter}; ` +
-            `if [ "$n" -eq 2 ]; then exit 0; fi; echo boom; exit 1`,
+            `if [ "$n" -eq 3 ]; then exit 0; fi; echo boom; exit 1`,
         },
       ]),
     );
@@ -5111,7 +5121,7 @@ describe('sweep finish — a gate-fix case is never served with NO files (defect
     const dir = dirOf(repo, ws);
     repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched', 'feat/other');
-    const cmds = redGreenRed(ws);
+    const cmds = redRedGreenRed(ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
     await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const out = join(ws, 'f1.json');

@@ -79,6 +79,21 @@ export interface VerifyResult {
   offender?: string;
   /** No single-branch removal fixed it. */
   attributionFailed?: boolean;
+  /**
+   * The SAME tree gave a different verdict on a second run — the failure is
+   * non-deterministic and belongs to no branch.
+   *
+   * Attribution assumes determinism: it removes one branch at a time and calls
+   * the one whose removal turns the matrix green the offender. Under a flaky
+   * test that logic blames whichever branch happened to be out when the test
+   * passed — an innocent branch rolled back and a gate fix minted against a
+   * defect that is not there. Live 2026-08-05: three consecutive passes, three
+   * DIFFERENT branches blamed, every one "no clean attribution"; the agent
+   * spotted the pattern before the driver had any way to express it.
+   */
+  nonDeterministic?: boolean;
+  /** Which commands disagreed between the two identical runs. */
+  flakyCommands?: string[];
 }
 
 export interface VerifyOptions {
@@ -204,6 +219,26 @@ export async function verifyEverything(repo: string, opts: VerifyOptions): Promi
     // A merge conflict in the recipe is directly attributable.
     if (!first.build.ok) {
       return { ok: false, build: first.build, commands: first.commands, offender: first.build.conflictBranch };
+    }
+    // DETERMINISM PROBE, before attribution. Re-run the failing commands on the
+    // very same tree: identical input, so a different verdict can only mean the
+    // failure is non-deterministic. Attribution below is meaningless in that
+    // case and actively harmful — it would blame whichever branch was removed
+    // when the test happened to pass. Cheaper than attribution too (one rerun
+    // versus one per recipe branch), so probing first also saves the wasted
+    // sweep when the answer is "no branch did this".
+    const failedFirst = first.commands.filter((c) => c.code !== 0).map((c) => c.cmd);
+    const rerun = await runCommands(wt.path, commands);
+    const failedAgain = new Set(rerun.filter((c) => c.code !== 0).map((c) => c.cmd));
+    const flaky = failedFirst.filter((c) => !failedAgain.has(c));
+    if (flaky.length > 0) {
+      return {
+        ok: false,
+        build: first.build,
+        commands: first.commands,
+        nonDeterministic: true,
+        flakyCommands: flaky,
+      };
     }
     const maxTries = Math.min(opts.maxAttribution ?? opts.recipe.length, opts.recipe.length);
     const candidates = [...opts.recipe].reverse().slice(0, maxTries);

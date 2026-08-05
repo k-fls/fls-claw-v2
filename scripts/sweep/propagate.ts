@@ -3779,6 +3779,54 @@ function diagnosisOnlyCase(journal: JournalEntry[], caseId: string): boolean {
   return row?.diagnosisOnly === true;
 }
 
+/**
+ * Publish every HELD case that has not reached a PR yet, as a RED-FINISH
+ * ESCALATION. Returns how many published, and how many were pending.
+ *
+ * Shared by BOTH red exits from `finish` (attributed ERR40 and the
+ * unattributed ERR18 halt). It lived inline in the first of those, which is
+ * precisely why the second kept dropping the agent's work: the rule "a held
+ * case reaches the owner" belongs to the OUTCOME, not to one code path.
+ *
+ * Records WHY each refusal happened. `cmdPublish` reports through `emit`, which
+ * `internal: true` silences, so a bare exit code said nothing — every refusal
+ * journaled an unactionable "publish-failed" until the `out` file was added.
+ */
+async function escalateHeldCases(
+  cli: Cli,
+  dir: string,
+  makeTransport: ((token: string) => GithubTransport) | undefined,
+  phase: string,
+): Promise<{ escalated: number; total: number }> {
+  const pending = [...journaledCases(readJournal(dir)).values()].filter(
+    (jc) =>
+      lastDisposition(readJournal(dir), jc.caseId)?.action === 'held' &&
+      !readJournal(dir).some((e) => e.action === 'pr-published' && e.caseId === jc.caseId),
+  );
+  let escalated = 0;
+  for (const jc of pending) {
+    const pubOut = join(dir, `publish-${slug(jc.caseId)}.json`);
+    const rcPub = await cmdPublish(
+      { ...cli, cmd: 'publish', caseId: jc.caseId, execute: true, internal: true, out: pubOut, escalateUnpushed: true },
+      makeTransport,
+    );
+    if (rcPub === 0) {
+      escalated++;
+      continue;
+    }
+    let why = 'unknown';
+    try {
+      const r = JSON.parse(readFileSync(pubOut, 'utf8')) as { issues?: Array<{ id?: string; detail?: string }> };
+      why = (r.issues ?? []).map((i) => `${i.id ?? '?'}: ${i.detail ?? ''}`).join('; ') || 'no issues reported';
+    } catch {
+      /* keep 'unknown' */
+    }
+    appendJournal(dir, { action: 'publish-failed', caseId: jc.caseId, branch: jc.branch, phase, reason: why });
+    console.error(`finish: held publish failed for ${jc.caseId} — ${why}`);
+  }
+  return { escalated, total: pending.length };
+}
+
 function samePathSet(a: string[], b: string[]): boolean {
   return JSON.stringify([...a].sort()) === JSON.stringify([...b].sort());
 }
@@ -4981,7 +5029,28 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     emit(cli, { ok: true, build: first.build });
     return 0;
   }
-  appendJournal(dir, { action: 'verify', ok: false, offender: first.offender ?? null });
+  appendJournal(dir, {
+    action: 'verify',
+    ok: false,
+    offender: first.offender ?? null,
+    ...(first.nonDeterministic ? { nonDeterministic: true, flakyCommands: first.flakyCommands ?? [] } : {}),
+  });
+  // A NON-DETERMINISTIC red belongs to no branch, so there is nothing to
+  // attribute, roll back or gate-fix. Say that plainly instead of the generic
+  // "investigate" — the agent's next move is completely different (report the
+  // flaky command to the owner, do not go hunting through a branch's diff), and
+  // without this it spent three passes discovering the pattern by hand.
+  if (first.nonDeterministic) {
+    const flaky = first.flakyCommands ?? [];
+    const detail =
+      `verify is NON-DETERMINISTIC: ${flaky.join(', ')} failed and then PASSED on a re-run of the same tree. ` +
+      `No branch caused this and none was rolled back — attribution would have blamed whichever branch was ` +
+      `removed when the test happened to pass. Report the flaky command(s) to the owner.`;
+    appendJournal(dir, { action: 'verify-non-deterministic', id: 'WARN17_VERIFY_FLAKY', flakyCommands: flaky, detail });
+    console.error(`verify: ${detail}`);
+    emit(cli, { ok: false, nonDeterministic: true, flakyCommands: flaky, issues: [{ id: 'WARN17_VERIFY_FLAKY', detail }] });
+    return 1;
+  }
   const offender = first.offender;
   if (!offender) {
     // D-060: expose the failed command names so finish can render a factual
@@ -9412,37 +9481,8 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
         // pushes a target branch — that is phase (3), which this arm still
         // refuses. So the red gate keeps doing its job (nothing lands) while the
         // escalation actually reaches a human.
-        const heldPending = [...journaledCases(readJournal(dir)).values()].filter(
-          (jc) =>
-            lastDisposition(readJournal(dir), jc.caseId)?.action === 'held' &&
-            !readJournal(dir).some((e) => e.action === 'pr-published' && e.caseId === jc.caseId),
-        );
-        let escalated = 0;
-        for (const jc of heldPending) {
-          // Capture WHY a publish refused. `cmdPublish` reports through `emit`,
-          // which `internal: true` suppresses, so a bare exit code told us
-          // nothing: three escalations failed instantly on 2026-08-05 and the
-          // journal recorded only "publish-failed", which is the same
-          // unactionable shrug this whole change exists to remove.
-          const pubOut = join(dir, `publish-${slug(jc.caseId)}.json`);
-          const rcPub = await cmdPublish(
-            { ...cli, cmd: 'publish', caseId: jc.caseId, execute: true, internal: true, out: pubOut, escalateUnpushed: true },
-            makeTransport,
-          );
-          if (rcPub === 0) {
-            escalated++;
-            continue;
-          }
-          let why = 'unknown';
-          try {
-            const r = JSON.parse(readFileSync(pubOut, 'utf8')) as { issues?: Array<{ id?: string; detail?: string }> };
-            why = (r.issues ?? []).map((i) => `${i.id ?? '?'}: ${i.detail ?? ''}`).join('; ') || 'no issues reported';
-          } catch {
-            /* keep 'unknown' */
-          }
-          appendJournal(dir, { action: 'publish-failed', caseId: jc.caseId, branch: jc.branch, phase: 'finish-tests-red', reason: why });
-          console.error(`finish: held publish failed for ${jc.caseId} — ${why}`);
-        }
+        const { escalated, total: heldTotal } = await escalateHeldCases(cli, dir, makeTransport, 'finish-tests-red');
+        const heldPending = { length: heldTotal };
         progress(
           `verify: RED — ${failedTests.join(', ')} — no branch lands; ${escalated}/${heldPending.length} held PR(s) published for the owner`,
         );
@@ -9462,13 +9502,32 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
         return 1;
       }
     }
+    // THE HELD WORK LEAVES BY THIS DOOR TOO. There are two red exits from
+    // finish: the attributed one above (ERR40) and this halt, and only the first
+    // published its held cases. So on 2026-08-05, with the ERR40 arm working,
+    // three consecutive passes still dropped every held PR — they all left
+    // through HERE, `verify RED (no clean attribution)`. A held case is the
+    // owner's to decide either way; which red path the pass took is the driver's
+    // bookkeeping, not a reason to throw the agent's work away.
+    const { escalated: haltEscalated, total: haltHeld } = await escalateHeldCases(
+      cli,
+      dir,
+      makeTransport,
+      'finish-verify-halt',
+    );
     const detail =
-      verifyRc !== 0
+      (verifyRc !== 0
         ? 'verify RED (no clean attribution) — investigate, fix, then re-run `finish` from the verify phase'
-        : 'verify RED — offender rolled back + HELD(gate); re-run `finish` (the frozen offender drops out of the publishable set)';
+        : 'verify RED — offender rolled back + HELD(gate); re-run `finish` (the frozen offender drops out of the publishable set)') +
+      (haltHeld > 0 ? ` — ${haltEscalated}/${haltHeld} held PR(s) published for the owner` : '');
     progress(`verify: RED ${offender ?? '(unattributed)'} — rolled back`);
     console.error(`finish: ${detail}`);
-    result(cli, { ok: false, issues: [{ id: 'ERR18_VERIFY_PENDING', detail }], halted: 'verify' });
+    result(cli, {
+      ok: false,
+      issues: [{ id: 'ERR18_VERIFY_PENDING', detail }],
+      halted: 'verify',
+      heldPublished: haltEscalated,
+    });
     return 1;
   }
   progress('verify: green');
