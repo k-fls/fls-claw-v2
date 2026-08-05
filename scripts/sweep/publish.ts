@@ -44,10 +44,9 @@
  * (GithubTransport) so tests never touch the network, and a dry-run
  * publish/push never constructs one at all.
  */
-import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
+import { connect as netConnect, type Socket } from 'node:net';
 import { connect as tlsConnect } from 'node:tls';
-import type { Socket } from 'node:net';
 
 import { isAncestor, refExists, revParse } from './git.js';
 import type { FeatureEntry } from './types.js';
@@ -320,22 +319,56 @@ export function parseGithubSlug(url: string): { owner: string; repo: string } | 
 
 const GITHUB_HOST = 'api.github.com';
 
-/** CONNECT tunnel through HTTPS_PROXY (the credential proxy swaps Authorization for api.github.com). */
+/**
+ * CONNECT tunnel through HTTPS_PROXY (the credential proxy swaps Authorization
+ * for api.github.com), written straight onto a raw socket.
+ *
+ * WHY NOT `node:http`'s request + 'connect' event. That is the idiomatic form
+ * and it works under node — but the agent runs `finish` under BUN as often as
+ * under tsx, and Bun's node:http shim cannot express CONNECT: it builds a fetch
+ * URL from `path`, `api.github.com:443` is not a path, and it fails with
+ * `fetch() URL is invalid`. That is verbatim what every held publish journaled
+ * on 2026-08-05 — six refusals across three finish runs, no PRs — while the
+ * same code had published fine the pass before, under tsx. The runtime the
+ * agent happens to type is not something the driver may depend on.
+ *
+ * CONNECT is a request line and a blank line; doing it by hand costs a few
+ * lines and works on any runtime with a TCP socket.
+ */
 function openTunnel(proxy: URL, host: string, port: number): Promise<Socket> {
   return new Promise((resolve, reject) => {
-    const req = httpRequest({
-      host: proxy.hostname,
-      port: Number(proxy.port || 80),
-      method: 'CONNECT',
-      path: `${host}:${port}`,
-      headers: { host: `${host}:${port}` },
+    const socket = netConnect(Number(proxy.port || 80), proxy.hostname);
+    const fail = (e: Error): void => {
+      socket.destroy();
+      reject(e);
+    };
+    socket.once('error', fail);
+    socket.once('connect', () => {
+      socket.write(`CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\n\r\n`);
     });
-    req.on('connect', (res, socket) => {
-      if (res.statusCode === 200) resolve(socket);
-      else reject(new Error(`proxy CONNECT ${host}:${port} failed: HTTP ${res.statusCode}`));
-    });
-    req.on('error', reject);
-    req.end();
+    let head = '';
+    const onData = (chunk: Buffer): void => {
+      head += chunk.toString('latin1');
+      const end = head.indexOf('\r\n\r\n');
+      if (end === -1) {
+        // A proxy that never completes the header would hang forever otherwise.
+        if (head.length > 64 * 1024) fail(new Error('proxy CONNECT response header too large'));
+        return;
+      }
+      socket.removeListener('data', onData);
+      socket.removeListener('error', fail);
+      const status = Number(/^HTTP\/1\.[01] (\d{3})/.exec(head)?.[1] ?? 0);
+      if (status !== 200) {
+        fail(new Error(`proxy CONNECT ${host}:${port} failed: HTTP ${status || head.split('\r\n')[0]}`));
+        return;
+      }
+      // Anything after the header belongs to the tunnelled stream — push it back
+      // so the TLS handshake does not lose its first bytes.
+      const rest = head.slice(end + 4);
+      if (rest.length > 0) socket.unshift(Buffer.from(rest, 'latin1'));
+      resolve(socket);
+    };
+    socket.on('data', onData);
   });
 }
 
