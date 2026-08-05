@@ -484,3 +484,41 @@ describe('breadth backstop — an experiment that distinguished nothing', () => 
   });
 });
 
+
+// --- an unresolved RELATIVE import is the agent's own defect ----------------
+//
+// The veto ("nothing that looks like an assertion") cannot catch this: typecheck
+// short-circuits before the tests, so the only output this function ever sees is
+// a typecheck log, which can never contain an assertion. A lone TS2307 also
+// carries no other TS error to veto with. So the doc comment's own
+// counterexample — "a resolution that deleted an import" — was classified as an
+// ENVIRONMENT fault, halting the sweep to tell the agent not to fix a broken
+// import it had just written.
+describe('classifyEnvironmentFault — which dependency tree the diagnostic is about', () => {
+  it("a relative specifier is the repo's own tree: code defect, the agent fixes it", () => {
+    const v = classifyEnvironmentFault(
+      "src/router.ts(12,24): error TS2307: Cannot find module './command-gate' or its corresponding type declarations.\n",
+    );
+    expect(v.isEnvironment).toBe(false);
+  });
+
+  it('a bare specifier is the dependency tree: still an environment fault', () => {
+    const v = classifyEnvironmentFault(
+      "src/config.ts(3,18): error TS2307: Cannot find module 'yaml' or its corresponding type declarations.\n",
+    );
+    expect(v.isEnvironment).toBe(true);
+    expect(v.signature).toContain('TS');
+  });
+
+  it('a MIX still reads as environment — one unresolvable package is enough to break the run', () => {
+    const v = classifyEnvironmentFault(
+      "src/a.ts(1,1): error TS2307: Cannot find module './local'.\n" +
+        "src/b.ts(2,1): error TS2307: Cannot find module 'yaml'.\n",
+    );
+    expect(v.isEnvironment).toBe(true);
+  });
+
+  it('the non-TS signatures are unaffected (no module specifier to read)', () => {
+    expect(classifyEnvironmentFault('Error: Could not locate the bindings file').isEnvironment).toBe(true);
+  });
+});

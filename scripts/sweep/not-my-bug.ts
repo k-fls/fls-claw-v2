@@ -97,13 +97,21 @@ export interface EnvFaultVerdict {
 /**
  * Does this failing output describe a broken ENVIRONMENT rather than broken code?
  *
- * Conservative by construction: it demands a named signature, and it demands
- * that NOTHING in the output looks like a genuine test assertion. A real defect
- * that merely happens to mention a missing module (a resolution that deleted an
- * import, say) still asserts somewhere, so it stays a code defect and keeps its
- * gate-fix case. The asymmetry is deliberate — mis-classifying an environment
- * fault as code produces confident branch-targeted nonsense, while
- * mis-classifying code as environment produces a stop case a human reads.
+ * Conservative by construction: it demands a named signature, it demands that
+ * NOTHING in the output looks like a genuine test assertion, and it demands that
+ * an unresolved module is not one of the repo's OWN files.
+ *
+ * That third demand replaces a claim this comment used to make and that the
+ * pipeline made false: "a real defect that merely happens to mention a missing
+ * module (a resolution that deleted an import, say) still asserts somewhere."
+ * It does not. Typecheck short-circuits before the tests, so an assertion is
+ * impossible in the only output this ever sees, and the named counterexample was
+ * classified ENVIRONMENT — halting the sweep to tell the agent not to fix a
+ * broken import it had just written.
+ *
+ * The asymmetry is still deliberate — mis-classifying an environment fault as
+ * code produces confident branch-targeted nonsense, while mis-classifying code
+ * as environment produces a stop case a human reads.
  */
 export function classifyEnvironmentFault(output: string): EnvFaultVerdict {
   const hit = ENV_FAULT_PATTERNS.find((re) => re.test(output));
@@ -123,6 +131,27 @@ export function classifyEnvironmentFault(output: string): EnvFaultVerdict {
   const asserts =
     /AssertionError|expected .* (?:to|but)\b|toBe\(|toEqual\(|Expected:.*Received:/is.test(output) || otherTsError;
   if (asserts) return { isEnvironment: false, signature: null, detail: '' };
+  // A RELATIVE specifier is the repo's own tree, so failing to resolve one is
+  // the agent's defect — not the environment's.
+  //
+  // The veto above cannot catch it. `checks.typecheck` runs before `checks.test`
+  // and short-circuits, so a typecheck failure is the ONLY thing this is ever
+  // asked about (the comment above says so) — its output can therefore never
+  // contain a test assertion, and a lone TS2307 carries no other TS error to
+  // veto with. So the doc's own counterexample, "a resolution that deleted an
+  // import", was classified ENVIRONMENT and the sweep halted telling the agent
+  // not to fix its own one-line mistake. Verified by calling this directly:
+  //
+  //   Cannot find module './command-gate'  -> ENVIRONMENT   (wrong)
+  //   Cannot find module 'yaml'            -> ENVIRONMENT   (right)
+  //
+  // What a diagnostic is ABOUT is the right discriminator; the specifier says
+  // which tree it is about. `'./x'` and `'../x'` are repo sources the agent
+  // edits; a bare `'yaml'` is the dependency tree it cannot.
+  const unresolvedSpecifiers = [...output.matchAll(/Cannot find module '([^']+)'/g)].map((m) => m[1]);
+  if (unresolvedSpecifiers.length > 0 && unresolvedSpecifiers.every((m) => m.startsWith('.'))) {
+    return { isEnvironment: false, signature: null, detail: '' };
+  }
   const framed = ENV_FAULT_FRAME.test(output);
   const signature = String(hit).replace(/^\/|\/[a-z]*$/g, '');
   return {

@@ -8761,7 +8761,6 @@ function gateFixFailedOutput(dir: string, caseId: string): string {
 }
 
 function gateFixCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEntry): string {
-  // Set at mint time for a TIMEOUT-class failure — the case is a diagnosis, not
   const gf = readJournal(dir).find((e) => e.action === 'gate-fix' && e.caseId === jc.caseId);
   const files = Array.isArray(gf?.files) ? (gf.files as string[]) : (caseRow.conflictedPaths as string[]) ?? [];
   const failedCommands = Array.isArray(gf?.failedCommands) ? (gf.failedCommands as string[]) : [];
