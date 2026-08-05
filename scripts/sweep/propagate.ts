@@ -5062,6 +5062,16 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     // tell whether that was right.
     baseFailingFiles: first.baseFailingFiles ?? [],
     mergedFailingFiles: first.mergedFailingFiles ?? [],
+    // Whether the BASE ALONE was green. An offender row said only "offender:
+    // module/credentials" — no commands, no output, no base verdict — so the
+    // accusation could not be checked without re-running the pass by hand.
+    // A branch is only credibly to blame if the base was green.
+    baseGreen: first.baseGreen ?? null,
+    ...(first.baseFailedCommands?.length ? { baseFailedCommands: first.baseFailedCommands } : {}),
+    // The failing commands on EVERY red, not only the unattributable ones. The
+    // attributed path journaled no diagnostics at all, which is precisely the
+    // path that accuses a branch and rolls it back.
+    failedCommands: first.commands.filter((c) => c.code !== 0).map((c) => c.cmd),
     ...(first.nonDeterministic ? { nonDeterministic: true, flakyCommands: first.flakyCommands ?? [] } : {}),
   });
   // A NON-DETERMINISTIC red belongs to no branch, so there is nothing to

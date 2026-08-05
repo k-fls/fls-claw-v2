@@ -120,6 +120,19 @@ export interface VerifyResult {
    */
   baseFailingFiles?: string[];
   mergedFailingFiles?: string[];
+  /**
+   * Did the BASE ALONE pass? The single fact that makes an attribution
+   * auditable: "this branch broke it" is only credible if the base was green.
+   *
+   * The file lists above are not enough on their own — both come back empty
+   * when the runner's output names no file the parser recognises, and an empty
+   * pair reads identically whether the base was clean or red-but-unparseable
+   * (live 2026-08-05, exactly the question that could not be answered about the
+   * module/credentials rollback).
+   */
+  baseGreen?: boolean;
+  /** Commands that failed on the base alone (empty when the base was green). */
+  baseFailedCommands?: string[];
 }
 
 export interface VerifyOptions {
@@ -268,6 +281,8 @@ export async function verifyEverything(repo: string, opts: VerifyOptions): Promi
     }
     let baseSeen: string[] = [];
     let mergedSeen: string[] = [];
+    let baseGreen = true;
+    let baseFailedCommands: string[] = [];
     // BASE PROBE, before attribution. Rebuild the base ALONE (no recipe) and
     // re-run: a failure that reproduces there belongs to the base, and blaming
     // any branch for it is wrong by construction. Costs one build; attribution
@@ -276,6 +291,8 @@ export async function verifyEverything(repo: string, opts: VerifyOptions): Promi
     // It runs AFTER the determinism probe on purpose — that probe re-runs the
     // tree standing in the worktree, and this rebuild replaces it with the base.
     const baseOnly = await buildAndTest(repo, wt.path, baseRef, [], commands);
+    baseGreen = baseOnly.green;
+    baseFailedCommands = baseOnly.commands.filter((c) => c.code !== 0).map((c) => c.cmd);
     if (!baseOnly.green) {
       // SUBSET RULE, by FILE — the same test `--not-my-bug` adjudication uses.
       // Command granularity is useless here: `pnpm test` fails on both sides
@@ -305,6 +322,8 @@ export async function verifyEverything(repo: string, opts: VerifyOptions): Promi
           baseCommands: baseOnly.commands,
           baseFailingFiles: baseSeen,
           mergedFailingFiles: mergedSeen,
+          baseGreen,
+          baseFailedCommands,
         };
       }
     } else {
@@ -325,6 +344,8 @@ export async function verifyEverything(repo: string, opts: VerifyOptions): Promi
           offender: candidate,
           baseFailingFiles: baseSeen,
           mergedFailingFiles: mergedSeen,
+          baseGreen,
+          baseFailedCommands,
         };
       }
     }
@@ -335,6 +356,8 @@ export async function verifyEverything(repo: string, opts: VerifyOptions): Promi
       attributionFailed: true,
       baseFailingFiles: baseSeen,
       mergedFailingFiles: mergedSeen,
+      baseGreen,
+      baseFailedCommands,
     };
   } finally {
     await wt.remove();
