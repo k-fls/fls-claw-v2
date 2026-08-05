@@ -43,6 +43,7 @@ import {
   duplicateCaseIssue,
   journaledCases,
   passDir,
+  appendJournal,
   readJournal,
   type Cli,
   type ColdReadInvoker,
@@ -1321,5 +1322,73 @@ describe('emit — an internal caller with an explicit --out still gets the arti
     expect(res.issues.map((i) => i.id)).toContain('ERR08_TEXT_MISSING');
     // D-054 intact: the internal call still prints no result line.
     expect(logged.some((l) => l.includes('wrote ') || l.trim().startsWith('{'))).toBe(false);
+  });
+});
+
+// --- a DIAGNOSIS-ONLY gate fix still reaches the owner (D-064 layer 6) -------
+//
+// A timeout-class gate failure is one the agent must NOT try to reproduce: it
+// reads, diagnoses, and reports held WITHOUT editing, so the case freezes with
+// no resolution tree by design. publishHead refused exactly that shape, so the
+// diagnosis reached nobody — live 2026-08-05, two of two, the next door the
+// dropped-work failure walked through once ERR14 was shut.
+describe('publish — a diagnosis-only gate fix publishes a report PR (D-064)', () => {
+  async function diagnosisOnlyGateFix(diagnosisOnly: boolean) {
+    const repo = initFixtureRepo();
+    repo.commit('base', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: fork', { 'src/x.ts': 'fork\n' });
+    const bareDir = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    cleanups.push(() => repo.destroy());
+
+    const ws = mkWorkspace();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, emptyInventory(), o);
+    await cmdPlan(cli({ cmd: 'plan' })); // open the pass the rows below belong to
+    const caseId = 'gate-fix-main_patched-deadbeef';
+    const tip = repo.sha('main_patched');
+    // The shape `finish` mints for a timeout-class gate failure.
+    appendJournal(dir, {
+      action: 'case',
+      caseId,
+      branch: 'main_patched',
+      parent: 'main',
+      head: { sha: tip, height: 0 },
+      conflictedPaths: [],
+      ...(diagnosisOnly ? { diagnosisOnly: true } : {}),
+    });
+    appendJournal(dir, { action: 'gate-fix', caseId, branch: 'main_patched' });
+    appendJournal(dir, { action: 'held', caseId, branch: 'main_patched', tier: 'held' }); // NO resolution
+    const prDir = join(dir, caseId, 'pr');
+    writeText(prDir, GOOD_TITLE, GOOD_BODY);
+    const tokenFile = join(ws, 'token.txt');
+    writeFileSync(tokenFile, 'substitute-token\n');
+    return { repo, ws, dir, caseId, bareDir, tip, tokenFile, cli };
+  }
+
+  it('publishes a DRAFT report PR at an empty commit — the diagnosis is the deliverable', async () => {
+    const { repo, ws, caseId, bareDir, tip, tokenFile, cli } = await diagnosisOnlyGateFix(true);
+    const gh = fakeGithub();
+    const out = join(ws, 'out.json');
+    expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, tokenFile, out }), gh.factory)).toBe(0);
+    expect(readOut(out).ok).toBe(true);
+
+    const ref = repo.git('-C', bareDir, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix').split('\n')[0];
+    const head = repo.git('-C', bareDir, 'rev-parse', ref);
+    // An EMPTY commit on the tip: a PR needs a commit, the case has no diff.
+    expect(repo.git('-C', bareDir, 'rev-parse', `${head}^`)).toBe(tip);
+    expect(repo.git('-C', bareDir, 'diff', '--name-only', `${head}^`, head)).toBe('');
+    // DRAFT — there is nothing to merge; it is a report.
+    const post = gh.calls.find((c) => c.method === 'POST' && c.path.includes('/pulls'));
+    expect((post!.body as { draft?: boolean }).draft).toBe(true);
+  });
+
+  it('a NON-diagnosis-only gate fix with no resolution is still refused (the guard is not blanket)', async () => {
+    const { ws, caseId, tokenFile, cli } = await diagnosisOnlyGateFix(false);
+    const gh = fakeGithub();
+    const out = join(ws, 'out.json');
+    expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, tokenFile, out }), gh.factory)).toBe(1);
+    expect((readOut(out).issues as Array<{ id: string }>).map((i) => i.id)).toContain('ERR02_CASE_STALE');
   });
 });

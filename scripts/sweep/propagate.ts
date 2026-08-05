@@ -3768,6 +3768,17 @@ async function transplantOntoOrigin(
   return { headSha, draft: false };
 }
 
+/**
+ * Was this case opened as DIAGNOSIS-ONLY? Recorded on the `case` row by
+ * `next-case` when the gate failure is a timeout class (`isTimeoutFailure`),
+ * which is the signal that the agent must diagnose from the code and never try
+ * to reproduce. Such a case is EXPECTED to freeze with no resolution tree.
+ */
+function diagnosisOnlyCase(journal: JournalEntry[], caseId: string): boolean {
+  const row = journal.find((e) => e.action === 'case' && e.caseId === caseId);
+  return row?.diagnosisOnly === true;
+}
+
 function samePathSet(a: string[], b: string[]): boolean {
   return JSON.stringify([...a].sort()) === JSON.stringify([...b].sort());
 }
@@ -3996,14 +4007,36 @@ async function publishHead(
         return { headSha: localHead, mode: 'held', draft: false, escalation };
       }
     }
-    // A gate fix has no pristine conflict to fall back to — reaching here means
-    // it was frozen with no shippable resolution, which report-case now refuses
-    // to do. Say so instead of manufacturing a conflict exhibit that never existed.
+    // A gate fix has no pristine conflict to fall back to. For a DIAGNOSIS-ONLY
+    // case that is not a defect — it is the designed outcome: the failure is a
+    // timeout class the agent must not try to reproduce, so it reads, diagnoses
+    // and reports held WITHOUT editing. There is no tree because there was never
+    // meant to be one.
+    //
+    // Refusing here dropped exactly that work. Live 2026-08-05, after the ERR14
+    // escalation was fixed, this became the NEXT door the same failure walked
+    // through: two diagnosis-only gate fixes refused with ERR02 and no PR, so
+    // the agent's diagnosis reached nobody. A reproducible-but-unfixable-in-scope
+    // finding MUST reach the owner as a held PR; there is no other channel.
+    //
+    // A PR needs a commit, and there is no diff to make, so the head is an EMPTY
+    // commit on the tip whose message names the case. The finding itself lives in
+    // the PR body, which the agent wrote. Draft, because there is nothing to
+    // merge — it is a report, and the owner closes or acts on it.
+    if (!probe && diagnosisOnlyCase(journal, jc.caseId)) {
+      const headSha = await deterministicCommit(
+        cli.repo,
+        `${tip}^{tree}`, // tree-ish: `commit-tree` resolves it; `revParse` normalizes to a COMMIT and cannot
+        [tip],
+        `Diagnosis for ${jc.caseId} on ${jc.branch} — no code change (owner review)`,
+      );
+      return { headSha, mode: 'held', draft: true, escalation };
+    }
     if (!probe) {
       return {
         issue: {
           id: 'ERR02_CASE_STALE',
-          detail: `held gate fix '${jc.caseId}' carries no marker-clean resolution — there is nothing to publish (a gate fix has no pristine conflict exhibit)`,
+          detail: `held gate fix '${jc.caseId}' carries no marker-clean resolution and is not diagnosis-only — there is nothing to publish (a gate fix has no pristine conflict exhibit)`,
         },
       };
     }
