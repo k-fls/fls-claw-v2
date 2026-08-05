@@ -233,12 +233,37 @@ function mergeCounts(a: Map<string, number>, b: Map<string, number>): Map<string
 }
 
 /**
- * How many simultaneously failing files stops looking like one defect and starts
- * looking like a broken environment. Deliberately well above anything a real
- * resolution-blocking defect produces (the live cases were 1 and 3 files) and at
- * the bottom of the observed environment-fault range (44).
+ * Did the runner report that ANYTHING passed?
+ *
+ * This replaces a file-count threshold (`IMPLAUSIBLE_BREADTH = 10`) that could
+ * not do the job asked of it. The guard below wants to know "is this a broken
+ * toolchain rather than a defect", and breadth is a proxy for that: the 08-03
+ * environment fault happened to touch 44 files. But a genuine pre-existing
+ * defect fails IDENTICALLY on both trees — the guard's own comment calls that
+ * "the NORMAL shape of a confirmed pre-existing defect" — so `hasControl` is
+ * false for every one of them, and any real defect touching >= 10 files became
+ * `undecidable` by construction, unconfirmable no matter how many probes ran.
+ * The observed real defects were 1 and 3 files; the threshold sat at 10 while
+ * its comment said "dozens".
+ *
+ * What was actually anomalous on 08-03 is what the guard's own message says:
+ * "nothing passed on either". A broken toolchain runs nothing; a code defect
+ * leaves the rest of the suite green. That is reported by the runner and can be
+ * read instead of guessed at.
+ *
+ * Returns null when NO count was reported at all (a clean `tsc` prints nothing).
+ * Absence of a pass count is not evidence that nothing passed, so the caller
+ * must not treat it as such.
  */
-const IMPLAUSIBLE_BREADTH = 10;
+function reportedPasses(output: string): number | null {
+  let total: number | null = null;
+  // vitest: `Tests  1 failed | 1175 passed | 21 skipped`
+  // bun:    `120 pass  5 fail`
+  for (const m of output.matchAll(/\b(\d+)\s+pass(?:ed)?\b/gi)) {
+    total = (total ?? 0) + Number(m[1]);
+  }
+  return total;
+}
 
 /**
  * Did anything DISTINGUISH the two runs? True when the baseline failed strictly
@@ -291,30 +316,32 @@ export async function classifyFailure(
   // Rule 2, confirming half: one red on a tree that does not contain the agent's
   // edits is proof enough. No repetition — repeating it cannot change the answer.
   if (uncovered(resolved, b1.counts).length === 0) {
-    // BREADTH BACKSTOP (owner, 2026-08-04). "Both sides fail identically" is the
+    // TOOLCHAIN BACKSTOP (owner, 2026-08-04). "Both sides fail identically" is the
     // NORMAL shape of a confirmed pre-existing defect — the 08-01 poll-loop case
     // is exactly one file failing the same way on both trees — so identity alone
     // proves nothing either way and must not be treated as suspicious.
     //
-    // What was anomalous on 2026-08-03 was BREADTH: 44 files at once, none of
-    // them passing anywhere. A pre-existing defect that blocks a resolution
-    // across dozens of unrelated files simultaneously is vanishingly rare; a
-    // broken toolchain or dependency tree looks exactly like that. So the guard
-    // fires only on implausible breadth WITH no discriminating observation
-    // anywhere — never on the ordinary one- or two-file case.
+    // What was anomalous on 2026-08-03 was that NOTHING PASSED: 44 files at
+    // once and not one green test anywhere. A broken toolchain or dependency
+    // tree runs nothing; a code defect, however broad, leaves the rest of the
+    // suite green. So the guard fires on a runner-reported zero WITH no
+    // discriminating observation — never on a defect that merely touches many
+    // files, and never when the runner reported no counts at all (a clean `tsc`
+    // prints nothing, and silence is not evidence).
     //
     // This sits BEHIND `classifyEnvironmentFault`, which catches the same class
     // by diagnostic shape and is the primary defence. It exists for the shapes
     // nobody has enumerated yet — which is precisely what a heuristic is for.
-    if (resolved.size >= IMPLAUSIBLE_BREADTH && !hasControl(b1.counts, resolved)) {
+    const passes = reportedPasses(b1.output);
+    if (passes === 0 && !hasControl(b1.counts, resolved)) {
       return {
         verdict: 'undecidable',
         files,
         probes: 1,
         detail:
-          `${files.length} files fail on BOTH trees and nothing passed on either — too broad to be one defect, and ` +
-          `the comparison distinguished nothing. This is what a broken toolchain or dependency tree looks like; ` +
-          `the environment must be checked before any code is blamed`,
+          `${files.length} files fail on BOTH trees, the runner reported ZERO passing tests, and the comparison ` +
+          `distinguished nothing. This is what a broken toolchain or dependency tree looks like; the environment ` +
+          `must be checked before any code is blamed`,
       };
     }
     return {

@@ -5237,6 +5237,55 @@ describe('report-case — a FAILED pristine reset is not reported as success (de
  * `SWEEP-RESULT` line, nothing for the agent to parse or act on at the exact
  * moment the driver refused to move a ref.
  */
+describe('next-case — the serve bound (a case handed out and never concluded)', () => {
+  it('warns on the 3rd serve, refuses the 5th, and journals every one', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+
+    // Serves 1-2: the agent is just working. Nothing said.
+    for (const n of [1, 2]) {
+      const out = join(ws, `n${n}.json`);
+      expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), greenPreMerge)).toBe(0);
+      expect(JSON.parse(readFileSync(out, 'utf8')).warning).toBeUndefined();
+    }
+    // Serve 3: WARN — name the loop, ask for the diagnosis, do not refuse yet.
+    const out3 = join(ws, 'n3.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: out3 }), greenPreMerge)).toBe(0);
+    const r3 = JSON.parse(readFileSync(out3, 'utf8')) as { warning?: string; serves?: number; materials?: string };
+    expect(r3.serves).toBe(3);
+    expect(r3.warning).toMatch(/served 3 times/);
+    expect(r3.warning).toMatch(/--tier held/);
+    expect(r3.materials).toContain('LOOP WARNING'); // the agent reads materials, not just the result
+    // Serve 4: still allowed (the warning gets one chance to work).
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: join(ws, 'n4.json') }), greenPreMerge)).toBe(0);
+    // Serve 5: refused.
+    const out5 = join(ws, 'n5.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: out5 }), greenPreMerge)).toBe(1);
+    const r5 = JSON.parse(readFileSync(out5, 'utf8')) as { issues?: Array<{ id: string }> };
+    expect(r5.issues!.map((i) => i.id)).toContain('ERR44_CASE_LOOPING');
+
+    // Every serve is on the record — `case` rows never showed this.
+    const journal = readJournal(dir);
+    expect(journal.filter((e) => e.action === 'case-served').length).toBe(5);
+    expect(journal.some((e) => e.action === 'case-serve-limit')).toBe(true);
+  });
+
+  it('an ordinary first serve carries no warning and no loop block', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    const out = join(ws, 'a.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), greenPreMerge)).toBe(0);
+    const r = JSON.parse(readFileSync(out, 'utf8')) as { warning?: string; materials?: string };
+    expect(r.warning).toBeUndefined();
+    expect(r.materials).not.toContain('LOOP WARNING');
+  });
+});
+
 describe('DriverHalt reporting', () => {
   const haltCli = (out: string): Cli => ({
     cmd: 'sweep-finish',

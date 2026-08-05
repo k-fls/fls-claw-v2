@@ -456,13 +456,44 @@ describe('environment faults never become code blame (2026-08-03/04)', () => {
 });
 
 describe('breadth backstop — an experiment that distinguished nothing', () => {
-  it('44 identical failures with nothing passing is UNDECIDABLE, not pre-existing', async () => {
+  it('identical failures with the runner reporting ZERO passes is UNDECIDABLE, not pre-existing', async () => {
+    // The 2026-08-03 environment fault. What made it anomalous was not the file
+    // COUNT — it was that not one test passed anywhere, which is what a broken
+    // toolchain looks like. The fixture has to SAY that now; it used to rely on
+    // a breadth threshold standing in for it.
     const files = Array.from({ length: 44 }, (_, i) => `src/f${i}.test.ts`);
     const resolved = new Map(files.map((f) => [f, 1]));
-    const { probe } = scriptedProbe([{ failing: Object.fromEntries(files.map((f) => [f, 1])) }]);
+    const { probe } = scriptedProbe([
+      { failing: Object.fromEntries(files.map((f) => [f, 1])), output: ' 0 pass  44 fail\n' },
+    ]);
     const v = await classifyFailure(resolved, 'prefixsha0000', probe);
     expect(v.verdict).toBe('undecidable');
-    expect(v.detail).toContain('too broad to be one defect');
+    expect(v.detail).toContain('ZERO passing tests');
+  });
+
+  it('a BROAD defect with the suite otherwise green is confirmed — breadth is not the signal', async () => {
+    // 12 files failing identically on both trees, but the runner reports plenty
+    // of passes: the toolchain works, so this is a real pre-existing defect and
+    // must be routed to its owner. Under the old `IMPLAUSIBLE_BREADTH = 10` this
+    // was `undecidable` FOREVER — identical counts mean `hasControl` is false,
+    // so no number of probes could ever confirm it.
+    const files = Array.from({ length: 12 }, (_, i) => `src/f${i}.test.ts`);
+    const resolved = new Map(files.map((f) => [f, 1]));
+    const { probe } = scriptedProbe([
+      { failing: Object.fromEntries(files.map((f) => [f, 1])), output: ' 1163 pass  12 fail\n' },
+    ]);
+    const v = await classifyFailure(resolved, 'prefixsha0000', probe);
+    expect(v.verdict).toBe('pre-existing');
+  });
+
+  it('NO reported counts is not evidence of a dead toolchain (a clean tsc prints nothing)', async () => {
+    const files = Array.from({ length: 20 }, (_, i) => `src/f${i}.ts`);
+    const resolved = new Map(files.map((f) => [f, 1]));
+    const { probe } = scriptedProbe([
+      { failing: Object.fromEntries(files.map((f) => [f, 1])), output: 'src/f0.ts(1,1): error TS2345: nope\n' },
+    ]);
+    const v = await classifyFailure(resolved, 'prefixsha0000', probe);
+    expect(v.verdict).toBe('pre-existing');
   });
 
   it('the ordinary one-file case is UNAFFECTED — identity is the normal confirming shape', async () => {
@@ -471,14 +502,14 @@ describe('breadth backstop — an experiment that distinguished nothing', () => 
     expect(v.verdict).toBe('pre-existing');
   });
 
-  it('breadth WITH a discriminating observation still confirms', async () => {
+  it('a discriminating observation confirms even with zero reported passes', async () => {
     // The baseline fails MORE than the case somewhere: the checks demonstrably
     // still distinguish trees, so breadth alone is not suspicious.
     const files = Array.from({ length: 44 }, (_, i) => `src/f${i}.test.ts`);
     const resolved = new Map(files.map((f) => [f, 1]));
     const baseline = Object.fromEntries(files.map((f) => [f, 1]));
     baseline['src/f0.test.ts'] = 3;
-    const { probe } = scriptedProbe([{ failing: baseline }]);
+    const { probe } = scriptedProbe([{ failing: baseline, output: ' 0 pass  44 fail\n' }]);
     const v = await classifyFailure(resolved, 'prefixsha0000', probe);
     expect(v.verdict).toBe('pre-existing');
   });

@@ -1391,6 +1391,26 @@ const ESCALATE_CHECKS = '[AUTO-ESCALATED: checks failing]';
 export const CHECKS_FAIL_LIMIT = 10;
 
 /**
+ * How many times `next-case` may hand the SAME case to the agent before it says
+ * so, and before it refuses.
+ *
+ * `CHECKS_FAIL_LIMIT` counts `report-case` failures, so it never fires on an
+ * agent that never submits — and that is the shape that actually happened:
+ * twice an agent read a dozen files, concluded nothing, and asked for the next
+ * case. `next-case` re-selected the same one (it refuses only `awaiting-pr`)
+ * and journaled nothing, so the pass looked idle while going nowhere. The
+ * previous answer was `diagnosisOnly`, which stopped the loop by deleting the
+ * work; the bound belongs here instead, where the looping actually happens.
+ *
+ * WARN first, then refuse. A silent forced HELD would throw away the agent's
+ * chance to write the diagnosis, which is the deliverable when it cannot fix
+ * something — so the warning names the loop and asks for `--tier held`, and only
+ * the next serve is an error.
+ */
+export const CASE_SERVE_WARN = 3;
+export const CASE_SERVE_LIMIT = 4;
+
+/**
  * D-060: the host+runner checks (typecheck + tests) that `report-case` runs as
  * its single quality gate (RESOLVED cases) and `finish` runs on the publishable
  * set. Shipped in the repo (`scripts/sweep/checks.json`); each list is command +
@@ -7252,13 +7272,40 @@ export async function cmdSweepNextCase(
     `case ready: ${jc.branch} — ${caseFile.conflictedPaths.join(', ')}${isReissue ? ' (REISSUE — revise the published resolution)' : ''}`,
   );
   // D-060: every case carries the fixed checks-contract line (typechecks now;
+  // SERVE BOUND. Every serve is journaled, so "handed out N times, concluded
+  // zero times" is answerable — it was not before: `case` rows come from `run`,
+  // `report` and the gate-fix reopen, never from here, so a re-serve left no
+  // trace at all.
+  const servedBefore = readJournal(dir).filter((e) => e.action === 'case-served' && e.caseId === jc.caseId).length;
+  const serves = servedBefore + 1;
+  appendJournal(dir, { action: 'case-served', caseId: jc.caseId, branch: jc.branch, serves });
+  if (serves > CASE_SERVE_LIMIT) {
+    const detail =
+      `case '${jc.caseId}' has been served ${serves} times and never concluded — no resolution, no ` +
+      `\`report-case\`, no escalation. Reading it again will not change that. Run ` +
+      `\`report-case --tier held\` and write what you found: an unfixable case with a diagnosis is a ` +
+      `valid outcome, an unanswered one is not.`;
+    appendJournal(dir, { action: 'case-serve-limit', id: 'ERR44_CASE_LOOPING', caseId: jc.caseId, branch: jc.branch, serves, detail });
+    console.error(`next-case [ERR44_CASE_LOOPING]: ${detail}`);
+    result(cli, { ok: false, status: 'looping', caseId: jc.caseId, serves, issues: [{ id: 'ERR44_CASE_LOOPING', detail }] });
+    return 1;
+  }
+  const loopWarning =
+    serves >= CASE_SERVE_WARN
+      ? `WARN46_CASE_LOOPING: this case has now been served ${serves} times with no conclusion. If you are ` +
+        `re-reading files you have already read, you are not going to fix it — run \`report-case --tier held\` ` +
+        `and write the diagnosis. The next serve is refused.`
+      : null;
+
   // tests are report-case's job) — served in both the materials and the result.
   const materials =
     (isGateFix
       ? gateFixCaseMaterials(dir, jc, caseRow!)
       : isReissue
         ? reissueCaseMaterials(dir, jc, caseRow!)
-        : await machineCaseMaterials(cli, jc)) + `\n\n${CHECKS_HANDOFF_LINE}`;
+        : await machineCaseMaterials(cli, jc)) +
+    (loopWarning ? `\n\n## LOOP WARNING\n${loopWarning}\n` : '') +
+    `\n\n${CHECKS_HANDOFF_LINE}`;
   writeFileSync(join(dir, jc.caseId, 'materials.md'), materials + '\n');
   st = { ...st, phase: 'case-ready', currentCase: { caseId: jc.caseId, branch: jc.branch } };
   writeMachineState(dir, st);
@@ -7272,6 +7319,7 @@ export async function cmdSweepNextCase(
     run: caseFile.run ?? [caseFile.head],
     ...(isReissue ? { reissue: true, prNumber: caseRow!.prNumber ?? null } : {}),
     ...(activeGates.length ? { activeGates } : {}),
+    ...(loopWarning ? { serves, warning: loopWarning } : {}),
     materials,
     materialsPath: join(dir, jc.caseId, 'materials.md'),
   });
@@ -8206,7 +8254,15 @@ export async function cmdSweepReportCase(
       // HELD work is not merged — it goes out as a PR for the owner, whose text
       // must say the checks still fail (the instruction below requires it). A
       // failing fix the owner can read beats a case nobody can close.
-      const heldByClaim = claimed === 'held' && n < CHECKS_FAIL_LIMIT;
+      // NOT `&& n < CHECKS_FAIL_LIMIT`. That composition made an explicit claim
+      // stop counting at exactly the try the agent worked hardest for: at n<=9
+      // the claim is honoured and the resolution kept — throwing it away "would
+      // lose the useful part and tell the owner to resolve a conflict that is
+      // already resolved" — while at n=10 the identical claim fell through to
+      // the limit path, reset the worktree to pristine and nulled `resolvedTree`.
+      // The limit path keeps its real purpose: an agent that kept failing and
+      // never conceded, where an empty exhibit is the honest thing to ship.
+      const heldByClaim = claimed === 'held';
       if (n >= CHECKS_FAIL_LIMIT || heldByClaim) {
         // Backstop: stop asking the agent to fix and escalate to the owner.
         // D-061 (B): a GATE-FIX case has NO pristine conflict to reset to — the
@@ -8621,7 +8677,13 @@ export async function cmdSweepReportPr(
   if (tier === 'held') {
     const heldDisp = lastDisposition(journal, caseId);
     const heldResolution = heldDisp?.resolution as { tree: string; markerClean: boolean } | null | undefined;
-    const draft = heldResolution?.markerClean !== true;
+    // A case that had to be WARNED for looping ships as a DRAFT even when its
+    // resolution is marker-clean. An active PR says "I resolved this, merge it";
+    // a case the agent circled without concluding has not earned that claim, and
+    // the owner should see the diagnosis before anything lands.
+    const looped =
+      journal.filter((e) => e.action === 'case-served' && e.caseId === caseId).length >= CASE_SERVE_WARN;
+    const draft = heldResolution?.markerClean !== true || looped;
     const jc = journaledCases(journal).get(caseId) ?? null;
     appendJournal(dir, {
       action: 'pr-intent',
@@ -9100,11 +9162,46 @@ async function materializeGateFixCases(
     // awaiting the owner. Minting a second one would hand the agent a case whose
     // fix is already written and under review. Skip the BRANCH and report it —
     // `next-case` has nothing to serve here until the PR merges.
+    //
+    // WHETHER IT IS THE SAME DEFECT IS A SEPARATE QUESTION, and the ref name
+    // answers it: every gate-fix case id ends in a digest of its FAILING FILE
+    // SET, so `fix/sweep/<branch>--gate-fix-<branch>-<digest>` says which defect
+    // is under review. The skip globbed `--gate-fix-*` and reported all of them
+    // as "the fix is written and awaiting the owner". For a SECOND, unrelated
+    // defect on the same branch that is false — no fix for it exists anywhere —
+    // and the owner merges the open PR expecting green, reds again on the other
+    // defect, and pays one round-trip per defect on a message the driver had the
+    // digest to falsify.
+    //
+    // The skip itself stays: the branch really is blocked, and a case minted
+    // here could never be served (`next-case` skips gated branches), so it would
+    // sit in `openCases` and block `finish` with ERR34. What changes is that the
+    // report says which defect is covered and which is not.
     const gateRef = await activeGateFixRef(cli.repo, g.branch);
     if (gateRef) {
+      const sameDefect = gateRef.endsWith(`--${gateFixCaseId(g.branch, g.files)}`);
       gated.push(g.branch);
-      appendJournal(dir, { action: 'gate-fix-skipped', branch: g.branch, ref: gateRef, files: g.files });
-      console.error(`gate-fix: ${g.branch} already has an ACTIVE gate '${gateRef}' — not minting a second case`);
+      appendJournal(dir, {
+        action: 'gate-fix-skipped',
+        branch: g.branch,
+        ref: gateRef,
+        files: g.files,
+        sameDefect,
+        ...(sameDefect
+          ? {}
+          : {
+              id: 'WARN19_GATE_COVERS_OTHER_DEFECT',
+              detail:
+                `${g.branch} is gated by '${gateRef}', which is a fix for a DIFFERENT failing file set — it does ` +
+                `NOT cover [${g.files.join(', ')}]. Merging it will not turn this branch green; a second gate fix ` +
+                `is needed once it lands. No case was minted: a gated branch cannot be served this pass.`,
+            }),
+      });
+      console.error(
+        sameDefect
+          ? `gate-fix: ${g.branch} already has an ACTIVE gate '${gateRef}' for these files — not minting a second case`
+          : `gate-fix: ${g.branch} is gated by '${gateRef}', which does NOT cover [${g.files.join(', ')}] — skipped, and the fix for these files is NOT yet written`,
+      );
       continue;
     }
     const key = gateFixKey(g.branch, g.files);
