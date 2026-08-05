@@ -5142,6 +5142,44 @@ describe('sweep finish — a gate-fix case is never served with NO files (defect
     const res = JSON.parse(readFileSync(out, 'utf8')) as { status?: string; gateFix?: { files: string[] } };
     expect(res.status).not.toBe('gate-fix-required');
   });
+
+  // --- finish must not verify a base that is under repair (D-065) -------------
+  describe('finish — a gated BASE is not re-verified', () => {
+    it('skips verify, rolls nothing back, and says the owner must merge the base gate fix', async () => {
+      const repo = rollbackFixture();
+      const ws = mkWorkspace();
+      const inv = writeInventory([{ id: 'other', branch: 'feat/other', parents: ['main_patched'] }]);
+      const dir = dirOf(repo, ws);
+      const bare = repo.attachBareOrigin();
+      repo.git('push', 'origin', 'main_patched', 'feat/other');
+      await cmdSweepStart(baseCli(repo, ws, inv));
+      await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
+      // An OPEN gate fix on the base: exactly what `next-case` already honours.
+      repo.git('push', 'origin', 'main_patched:refs/heads/fix/sweep/main_patched--gate-fix-main_patched-deadbeef');
+      repo.git('fetch', 'origin', '--prune', '+refs/heads/fix/sweep/*:refs/remotes/origin/fix/sweep/*');
+
+      // A command list that would be RED if it ever ran — it must not.
+      const cmds = join(ws, 'never.json');
+      writeFileSync(cmds, JSON.stringify([{ cmd: 'echo should-not-run; exit 1' }]));
+      const out = join(ws, 'f.json');
+      const before = readJournal(dir).filter((e) => e.action === 'held' && e.reason === 'gate').length;
+      expect(
+        await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out })),
+      ).toBe(1);
+
+      const journal = readJournal(dir);
+      const skipped = journal.find((e) => e.action === 'verify-skipped' && e.id === 'WARN18_BASE_GATED');
+      expect(skipped).toBeTruthy();
+      expect(skipped!.branch).toBe('main_patched');
+      // No verify ran, and NO branch was accused or frozen.
+      expect(journal.some((e) => e.action === 'verify')).toBe(false);
+      expect(journal.filter((e) => e.action === 'held' && e.reason === 'gate').length).toBe(before);
+      const res = JSON.parse(readFileSync(out, 'utf8')) as { stoppedAt?: string; instruction?: string };
+      expect(res.stoppedAt).toBe('base-gated');
+      expect(res.instruction).toMatch(/merge/i);
+      expect(bare).toBeTruthy();
+    });
+  });
 });
 
 /**

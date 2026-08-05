@@ -9440,6 +9440,43 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   // HELD(gate) — both HALT finish (report + resumable): re-running finish drops
   // the now-frozen offender from the publishable recipe and proceeds. Pushes
   // never redo; the rollback is not repeated (the offender is already frozen).
+  // THE BASE MAY ALREADY BE UNDER REPAIR. A gate fix on the base is an OPEN,
+  // unmerged HELD PR — the defect is still there by definition — so rebuilding
+  // on it and running the matrix is guaranteed red, and every red then gets
+  // attributed to a recipe branch. That is what made a pass roam
+  // module/credentials -> feat/ssh-auth -> module/runtime-updater: three
+  // innocent branches rolled back and frozen, one per finish run, for a
+  // `main_patched` defect that already had a gate fix waiting for the owner.
+  //
+  // `activeGateFixRefs` is how `next-case` skips a gated branch (D-063); finish
+  // never asked it. Verification cannot mean anything until the base is fixed,
+  // so don't pretend it can: publish the held work and report the blocker.
+  const verifyBase = await verifyBaseRef(cli);
+  const gatedRefs = await activeGateFixRefs(cli.repo);
+  const baseGate = gatedRefs.find((r) => r.startsWith(`fix/sweep/${slug(verifyBase)}--gate-fix-`));
+  if (baseGate) {
+    const { escalated, total } = await escalateHeldCases(cli, dir, makeTransport, 'finish-base-gated');
+    const detail =
+      `the base '${verifyBase}' has an OPEN gate-fix PR (${baseGate}) — its defect is still present, so a full ` +
+      `verify would be red no matter which branches are in the recipe, and any branch it accused would be ` +
+      `innocent. Nothing was merged, pushed or rolled back. The owner must merge the base gate fix first.`;
+    appendJournal(dir, { action: 'verify-skipped', id: 'WARN18_BASE_GATED', branch: verifyBase, gateRef: baseGate, detail });
+    progress(`verify: SKIPPED — base '${verifyBase}' is gated; ${escalated}/${total} held PR(s) published`);
+    console.error(`finish: ${detail}`);
+    result(cli, {
+      ok: false,
+      status: 'stopped',
+      stoppedAt: 'base-gated',
+      heldPublished: escalated,
+      issues: [{ id: 'WARN18_BASE_GATED', detail }],
+      instruction:
+        `REPORT to the owner: the base '${verifyBase}' is waiting on its own gate-fix PR (${baseGate}); nothing ` +
+        `can be verified or landed until that is merged. ${escalated} held PR(s) are published and named above. ` +
+        `Do NOT re-run finish until the owner merges it.`,
+    });
+    return 1;
+  }
+
   progress('verify: running');
   const gateBefore = readJournal(dir).filter((e) => e.action === 'held' && e.reason === 'gate').length;
   const verifyLenBefore = readJournal(dir).length;
