@@ -3643,6 +3643,41 @@ function prTemplateFor(rc: ResolvedCase, tier: Tier): string {
   return [...head, ...body, ''].join('\n');
 }
 
+/**
+ * The reading contract handed to the agent with every case.
+ *
+ * ONE COPY. It lived verbatim in both `prepareCaseMaterials` and
+ * `machineCaseMaterials`, and on 2026-08-06 an edit to it changed one and not
+ * the other — the dump still showed the old wording, which is how the
+ * duplication was noticed at all. Two copies of a rule are two rules.
+ */
+const CASE_DIRECTIVES: string[] = [
+  'EDIT: the pending files below, nothing else. `git status` shows exactly them.',
+  'READ: the hunk ranges below, then only what those hunks name — definitions,',
+  '  call sites and tests of the symbols IN them.',
+  'DO NOT: read whole files or trees, walk history, open unrelated branches.',
+  'CANNOT DECIDE: `report-case --tier held`. Never a wider search.',
+];
+
+/**
+ * The two sides' commit subjects over the conflicted paths. Also one copy: the
+ * two documents had drifted to different wordings ("since the merge base",
+ * "`<parent>` head") for the same two `git log` runs.
+ */
+function perSideBlocks(sides: { ours: string; theirs: string }, ours: string, theirs: string): string[] {
+  return [
+    `## ours (\`${ours}\`) — \`git log --oneline\` over the conflicted paths since the merge base`,
+    '```',
+    sides.ours,
+    '```',
+    '',
+    `## theirs (\`${theirs}\`) — same range on the other side`,
+    '```',
+    sides.theirs,
+    '```',
+  ];
+}
+
 async function prepareCaseMaterials(cli: Cli, dir: string, rc: ResolvedCase, tier: Tier): Promise<string> {
   const fixBranch = fixBranchName(rc.id, rc);
   const prDir = join(dir, rc.id, 'pr');
@@ -3656,11 +3691,7 @@ async function prepareCaseMaterials(cli: Cli, dir: string, rc: ResolvedCase, tie
   const materials = [
     `# Case materials — ${rc.id} (${tier})`,
     '',
-    'EDIT: the pending files below, nothing else. `git status` shows exactly them.',
-    'READ: the hunk ranges below, then only what those hunks name — definitions,',
-    '  call sites and tests of the symbols IN them.',
-    'DO NOT: read whole files or trees, walk history, open unrelated branches.',
-    'CANNOT DECIDE: `report-case --tier held`. Never a wider search.',
+    ...CASE_DIRECTIVES,
     '',
     '## Conflicted paths (the pending files — your edit scope)',
     ...rc.conflictedPaths.map((p) => `- ${p}`),
@@ -3674,15 +3705,7 @@ async function prepareCaseMaterials(cli: Cli, dir: string, rc: ResolvedCase, tie
     rc.reproduction.command,
     '```',
     '',
-    `## ours (\`${rc.branch}\`) — \`git log --oneline\` over the conflicted paths since the merge base`,
-    '```',
-    sides.ours,
-    '```',
-    '',
-    `## theirs (\`${rc.parent}\` head) — same range on the other side`,
-    '```',
-    sides.theirs,
-    '```',
+    ...perSideBlocks(sides, rc.branch, rc.parent),
     '',
     'Write pr/title.txt and pr/body.md YOURSELF from studying the case, then run',
     `\`propagate publish --case ${rc.id}\` (PROPAGATION.md §14, D-048).`,
@@ -5799,13 +5822,11 @@ async function machineCaseMaterials(cli: Cli, dir: string, jc: JournaledCase): P
   return [
     `# Case materials — ${jc.caseId}`,
     '',
-    'EDIT: the pending files below, nothing else. `git status` shows exactly them.',
-    'READ: the hunk ranges below, then only what those hunks name — definitions,',
-    '  call sites and tests of the symbols IN them.',
-    'DO NOT: read whole files or trees, walk history, open unrelated branches.',
-    'CANNOT DECIDE: `report-case --tier held`. Never a wider search.',
+    ...CASE_DIRECTIVES,
     '',
     '## Conflicted paths (the pending files — your edit scope)',
+    // Ranges only here: by `prepareCaseMaterials` the conflict is RESOLVED, so
+    // there are no markers left to point at.
     'Line numbers are where the markers ARE — read those windows, not the file.',
     ...(await conflictHunkRanges(cli.repo, caseWorktreePath(dir, jc.caseId), jc.conflictedPaths)),
     '',
@@ -5813,15 +5834,7 @@ async function machineCaseMaterials(cli: Cli, dir: string, jc: JournaledCase): P
     '',
     ...inventoryContextLines(registry.features, jc.branch, jc.parent, jc.conflictedPaths),
     '',
-    `## ours (\`${jc.branch}\`) — \`git log --oneline\` over the conflicted paths`,
-    '```',
-    sides.ours,
-    '```',
-    '',
-    `## theirs (\`${jc.parent}\`) — same range on the other side`,
-    '```',
-    sides.theirs,
-    '```',
+    ...perSideBlocks(sides, jc.branch, jc.parent),
     '',
     'Resolve the conflict in the worktree above, then run `report-case --tier mechanical|judged|held`.',
   ].join('\n');

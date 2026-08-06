@@ -466,6 +466,15 @@ describe('sweep report-case (D-053 §2)', () => {
     expect(st.phase).toBe('awaiting-pr');
     expect(st.currentCase?.tier).toBe('judged');
     expect(existsSync(join(dir, caseId, 'pr', 'materials.md'))).toBe(true);
+    // Its CONTENT was asserted nowhere, so the shared directives/per-side blocks
+    // could have rendered wrong here and only `tsc` would have noticed.
+    const prMaterials = readFileSync(join(dir, caseId, 'pr', 'materials.md'), 'utf8');
+    expect(prMaterials).toContain('EDIT: the pending files below, nothing else.');
+    expect(prMaterials).toContain('CANNOT DECIDE: `report-case --tier held`.');
+    expect(prMaterials).toMatch(/## ours \(`[^`]+`\) — `git log --oneline` over the conflicted paths since the merge base/);
+    expect(prMaterials).toMatch(/## theirs \(`[^`]+`\) — same range on the other side/);
+    // No hunk ranges here: the conflict is RESOLVED by this point.
+    expect(prMaterials).not.toContain('hunk(s) at lines');
   });
 
   it('ERR05 decided-already + JUDGED claim: NOT blocked — applying the recorded decision as judged IS the forward path (#65)', async () => {
