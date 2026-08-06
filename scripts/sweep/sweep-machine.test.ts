@@ -4313,8 +4313,14 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     const { cmds } = redUntilCleared(ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
     await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
-    // The trunk took a gate fix earlier in THIS pass and is red.
-    appendJournal(dir, { action: 'held', branch: 'main_patched', caseId: 'gate-main_patched', reason: 'gate' });
+    // The trunk took a gate fix earlier in THIS pass and is red. This is the
+    // AGENT-HELD shape — a held gate-FIX case, which carries no `reason` at all
+    // (only the §9 rollback hold does). The first version of the guard matched
+    // on `reason: 'gate'` and so never fired on the shape that actually occurs:
+    // live 2026-08-06 `main_patched` held like this at 09:15 and a descendant
+    // gate fix was minted anyway 53 minutes later.
+    appendJournal(dir, { action: 'gate-fix', branch: 'main_patched', caseId: 'gate-fix-main_patched-dead' });
+    appendJournal(dir, { action: 'held', branch: 'main_patched', caseId: 'gate-fix-main_patched-dead' });
 
     const out = join(ws, 'f1.json');
     await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out }));

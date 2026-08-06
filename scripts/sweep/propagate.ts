@@ -9227,8 +9227,28 @@ async function materializeGateFixCases(
   // produced PR #77, whose own title reads "fixes belong at main_patched" —
   // work downstream of a trunk the pass had already stopped on. One gate fix,
   // one HELD PR, everything beneath blocked, is the rule.
+  // TWO SHAPES OF GATE HOLD, and the first version of this checked only one.
+  //
+  //   `reason: 'gate'`        — the §9 rollback: verify blamed a branch and froze it.
+  //   a held GATE-FIX case    — the agent worked a gate fix and reported --tier held.
+  //                             That row carries NO `reason` at all.
+  //
+  // Live 2026-08-06: `main_patched` took the second shape at 09:15, and 53
+  // minutes later a gate fix was minted on its descendant anyway — PR #79, whose
+  // diagnosis points the fix at yet another branch. The guard added for exactly
+  // this had matched on `reason` and never fired.
+  const gateFixCaseIds = new Set(
+    journal.filter((e) => e.action === 'gate-fix' && typeof e.caseId === 'string').map((e) => e.caseId as string),
+  );
   const gateHeldThisPass = new Set(
-    journal.filter((e) => e.action === 'held' && e.reason === 'gate' && typeof e.branch === 'string').map((e) => e.branch as string),
+    journal
+      .filter(
+        (e) =>
+          e.action === 'held' &&
+          typeof e.branch === 'string' &&
+          (e.reason === 'gate' || (typeof e.caseId === 'string' && gateFixCaseIds.has(e.caseId))),
+      )
+      .map((e) => e.branch as string),
   );
   const ancestorsOfBranch = transitiveAncestors(Object.fromEntries(directParentEdges(cli)));
   for (const g of mintable) {
