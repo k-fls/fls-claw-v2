@@ -507,6 +507,12 @@ interface BlockedRow {
    * height); for a this-pass hold the case's conflict head. Null for gate holds.
    */
   headSha: string | null;
+  /**
+   * A GATE hold: the branch itself is RED, not blocked at some height by a
+   * conflict. Carried because the two block kinds have different SCOPE and the
+   * height machinery cannot express the difference.
+   */
+  gate?: boolean;
   /** fix/sweep head branch on origin (urge target); null until a PR exists. */
   fixBranch: string | null;
   prNumber: number | null;
@@ -554,6 +560,7 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
       put({
         branch: e.branch,
         caseId: typeof e.caseId === 'string' ? e.caseId : 'held',
+        gate: e.reason === 'gate',
         headSha: jc?.head.sha ?? null,
         fixBranch: null, // no PR until `finish` publishes (D-058)
         prNumber: null,
@@ -9157,7 +9164,42 @@ async function materializeGateFixCases(
   const cases: GateFixCaseSummary[] = [];
   const looping: string[] = [];
   const gated: string[] = [];
+  // A GATE HOLD ALREADY TAKEN THIS PASS BLOCKS EVERYTHING BENEATH IT.
+  //
+  // A gate fix means the branch is RED. Every descendant merges that branch, so
+  // every descendant inherits the redness — there is no height at which one is
+  // unaffected, and nothing beneath can be judged until the fix lands. The
+  // cross-pass skip below reads ORIGIN refs, which do not exist until `finish`
+  // publishes, so within a pass a trunk gate blocked nothing at all.
+  //
+  // Live 2026-08-06: `main_patched` froze with a gate fix at 23:20, and 57
+  // minutes later this loop minted a SECOND gate fix on its descendant
+  // `module/agent-group-contributions`. That case cost an hour of agent time and
+  // produced PR #77, whose own title reads "fixes belong at main_patched" —
+  // work downstream of a trunk the pass had already stopped on. One gate fix,
+  // one HELD PR, everything beneath blocked, is the rule.
+  const gateHeldThisPass = new Set(
+    journal.filter((e) => e.action === 'held' && e.reason === 'gate' && typeof e.branch === 'string').map((e) => e.branch as string),
+  );
+  const ancestorsOfBranch = transitiveAncestors(Object.fromEntries(directParentEdges(cli)));
   for (const g of mintable) {
+    const gatedAncestor = (ancestorsOfBranch[g.branch] ?? []).find((a) => gateHeldThisPass.has(a));
+    if (gatedAncestor && !gateHeldThisPass.has(g.branch)) {
+      gated.push(g.branch);
+      appendJournal(dir, {
+        action: 'gate-fix-skipped',
+        id: 'WARN20_ANCESTOR_GATED',
+        branch: g.branch,
+        ancestor: gatedAncestor,
+        files: g.files,
+        detail:
+          `${g.branch} descends from '${gatedAncestor}', which took a gate fix this pass and is RED — everything ` +
+          `beneath it inherits that. No case was minted for [${g.files.join(', ')}]: it cannot be judged until the ` +
+          `ancestor's fix lands, and it may well BE the ancestor's defect seen from below.`,
+      });
+      console.error(`gate-fix: ${g.branch} descends from gate-held '${gatedAncestor}' — not minting beneath a red ancestor`);
+      continue;
+    }
     // ACTIVE GATE (cross-pass): this branch already has a gate fix on origin
     // awaiting the owner. Minting a second one would hand the agent a case whose
     // fix is already written and under review. Skip the BRANCH and report it —

@@ -2832,3 +2832,4 @@ describe('dependencies are installed INTO the worktree, from ITS OWN manifests',
     expect(readJournal(dir).some((e) => e.action === 'branch-check')).toBe(false);
   });
 });
+

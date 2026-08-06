@@ -37,6 +37,7 @@ import {
   parseCli,
   parseMachineVerdict,
   passDir,
+  appendJournal,
   readJournal,
   reportDriverHalt,
   RESOLVE_COLDREAD_CAP,
@@ -4285,6 +4286,38 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     );
     return { cmds: f, clear: () => rmSync(flag, { force: true }) };
   }
+
+  it('NOT minted beneath an ancestor that already took a gate fix this pass', async () => {
+    // Live 2026-08-06: `main_patched` froze with a gate fix at 23:20 and 57
+    // minutes later the driver minted a SECOND gate fix on its descendant. That
+    // case produced PR #77, whose own title reads "fixes belong at
+    // main_patched" — work downstream of a trunk the pass had already stopped
+    // on. The cross-pass skip reads ORIGIN refs, which do not exist until finish
+    // publishes, so within a pass a trunk gate blocked nothing.
+    const repo = gateFixRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'], parents: ['main_patched'] }]);
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { cmds } = redUntilCleared(ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
+    // The trunk took a gate fix earlier in THIS pass and is red.
+    appendJournal(dir, { action: 'held', branch: 'main_patched', caseId: 'gate-main_patched', reason: 'gate' });
+
+    const out = join(ws, 'f1.json');
+    await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out }));
+
+    const journal = readJournal(dir);
+    // No second gate fix on the descendant...
+    expect(journal.some((e) => e.action === 'gate-fix' && e.branch === 'module/cg')).toBe(false);
+    // ...and the reason is on the record, naming the ancestor.
+    const skipped = journal.find((e) => e.action === 'gate-fix-skipped' && e.id === 'WARN20_ANCESTOR_GATED');
+    expect(skipped).toBeTruthy();
+    expect(skipped!.branch).toBe('module/cg');
+    expect(skipped!.ancestor).toBe('main_patched');
+  });
 
   it('red + no attribution -> gate-fix case on the OWNING branch, served with a no-merge briefing', async () => {
     const repo = gateFixRepo();
