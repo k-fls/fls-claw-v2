@@ -5286,6 +5286,94 @@ describe('report-case — a FAILED pristine reset is not reported as success (de
  * `SWEEP-RESULT` line, nothing for the agent to parse or act on at the exact
  * moment the driver refused to move a ref.
  */
+describe('report-case — a green that follows a red is confirmed', () => {
+  /** Checks that fail, then pass, then fail again — a flaky suite. */
+  function redGreenRedChecks(ws: string): string {
+    const f = join(ws, 'checks.json');
+    const counter = join(ws, 'gate-runs');
+    writeFileSync(
+      f,
+      JSON.stringify({
+        typecheck: [],
+        test: [
+          {
+            cmd:
+              `n=$(cat ${counter} 2>/dev/null || echo 0); n=$((n+1)); printf %s "$n" > ${counter}; ` +
+              `if [ "$n" -eq 2 ]; then exit 0; fi; echo boom; exit 1`,
+          },
+        ],
+      }),
+    );
+    return f;
+  }
+
+  it('a pass that does not reproduce is WARN21, not a resolved case', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    const checksFile = redGreenRedChecks(ws);
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile }));
+    await cmdSweepNextCase(baseCli(repo, ws, inv, { checksFile }), greenPreMerge);
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+
+    // Run 1: red — the ordinary failure path.
+    const o1 = join(ws, 'r1.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, checksFile, out: o1 }),
+        neverInvoked,
+      ),
+    ).toBe(1);
+    expect(readJournal(dir).some((e) => e.action === 'checks-fail' && e.caseId === caseId)).toBe(true);
+
+    // Run 2: the gate passes (run 2 of the stub) — but the CONFIRM run is run 3,
+    // which is red again. Without the confirm this case would have resolved on a
+    // coincidence and the flaky check would have gone unreported.
+    const o2 = join(ws, 'r2.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, checksFile, out: o2 }),
+        neverInvoked,
+      ),
+    ).toBe(1);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'checks-nondeterministic' && e.id === 'WARN21_CHECKS_FLAKY')).toBe(true);
+    expect(journal.some((e) => e.action === 'checks-pass' && e.caseId === caseId)).toBe(false);
+    expect(journal.some((e) => e.action === 'resolved' && e.caseId === caseId)).toBe(false);
+    const res = JSON.parse(readFileSync(o2, 'utf8')) as { instruction: string };
+    expect(res.instruction).toContain('NON-DETERMINISTIC');
+    expect(res.instruction).toContain('--tier held');
+  });
+
+  it('a FIRST-attempt green is believed as-is — no confirm run, no extra cost', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    const counter = join(ws, 'gate-runs2');
+    const checksFile = join(ws, 'checks2.json');
+    writeFileSync(
+      checksFile,
+      JSON.stringify({
+        typecheck: [],
+        test: [{ cmd: `n=$(cat ${counter} 2>/dev/null || echo 0); printf %s "$((n+1))" > ${counter}; exit 0` }],
+      }),
+    );
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile }));
+    await cmdSweepNextCase(baseCli(repo, ws, inv, { checksFile }), greenPreMerge);
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, checksFile }),
+      confirm,
+    );
+    expect(readJournal(dir).some((e) => e.action === 'checks-pass' && e.caseId === caseId)).toBe(true);
+    expect(readFileSync(counter, 'utf8')).toBe('1'); // ran ONCE — no confirm
+  });
+});
+
 describe('next-case — the materials say WHERE the markers are', () => {
   it('lists each pending file with its hunk line ranges', async () => {
     const repo = conflictFixture();

@@ -8212,7 +8212,46 @@ export async function cmdSweepReportCase(
       const list = checks[kind];
       if (list.length === 0) continue;
       const r = await runChecks(list, wtPath);
-      if (r.ok) continue;
+      if (r.ok) {
+        // CONFIRM A GREEN THAT FOLLOWS A RED. One run cannot tell "fixed" from
+        // "got lucky", and on a non-deterministic check the difference matters:
+        // the agent changes something plausible, the gate passes by coincidence,
+        // the case closes as resolved, and the defect stays in the tree with
+        // nobody looking for it any more — worse than never having tried.
+        //
+        // Only where luck is plausible. A first-attempt pass has no prior red to
+        // explain away, so it is believed as-is; re-running every green would
+        // double the gate's cost on every case to guard a question nobody asked.
+        // This costs one extra run, on cases that were already red once.
+        const failedBefore = journal.some((e) => e.action === 'checks-fail' && e.caseId === caseId && e.kind === kind);
+        if (!failedBefore) continue;
+        const confirm = await runChecks(list, wtPath);
+        if (confirm.ok) continue;
+        const flakyFile = join(caseDir, `${kind}-nondeterministic.txt`);
+        writeFileSync(flakyFile, confirm.output);
+        const detail =
+          `the ${kind} checks PASSED and then FAILED on an immediate re-run of the same tree ` +
+          `(${confirm.failedNames.join(', ')}). One green run cannot confirm a fix for a check that does not ` +
+          `reproduce — the pass would have closed this case on a coincidence. Output: ${flakyFile}`;
+        appendJournal(dir, {
+          action: 'checks-nondeterministic',
+          id: 'WARN21_CHECKS_FLAKY',
+          caseId,
+          kind,
+          failed: confirm.failedNames,
+          detail,
+        });
+        console.error(`report-case [WARN21_CHECKS_FLAKY]: ${detail}`);
+        result(cli, {
+          instruction:
+            `the ${kind} is NON-DETERMINISTIC on this tree — it passed once and failed once with no change ` +
+            `between. Do not re-run hoping for green: claim \`--tier held\` and say which check is unstable, ` +
+            `so the owner sees it. Output: ${flakyFile}`,
+          tier: claimed,
+          issues: [...issues, { id: 'WARN21_CHECKS_FLAKY', detail }],
+        });
+        return 1;
+      }
       const outFile = join(caseDir, `${kind}-output.txt`);
       const fullFile = join(caseDir, `${kind}-output.full.txt`);
       writeFileSync(fullFile, r.output);
