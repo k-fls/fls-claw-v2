@@ -22,11 +22,12 @@ hands you. Owner: Kirill.
 ## GitHub access
 
 - `gh` and `python3` are unavailable here.
-- Reads (PR/issue lookups, checks): `git fetch` or raw API GETs (curl/node)
-  with the token from `get_credential` pasted literally into the header. Never
-  use `$GITHUB_TOKEN`.
-- Once per session, write the `get_credential` output to a file and pass it as
-  `--token-file <path>` to `start` and `finish`.
+- Once per session, export the `get_credential` output as `GH_TOKEN`. The driver
+  reads it at every networked write; do not pass a token on the command line.
+- Your own reads (PR/issue lookups): raw API GETs with that same token in the
+  header, or `git fetch`. Never rely on an ambient `$GITHUB_TOKEN` — the driver
+  falls back to it when `GH_TOKEN` is unset, and a stale one belonging to
+  another identity fails exactly like a revoked one.
 - Auth failures that survive the above are a stop-case 2 report.
 
 ## Bootstrap
@@ -42,21 +43,22 @@ Your entire job per case: edit code in the worktree a command hands you, write
 a PR description at the fixed path when asked, and claim one `--tier` word. You
 pass NO case id, ref, or branch.
 
-Flags: pass `--inventory ../inventory` on EVERY invocation; mutating commands
-need `--execute`; `start` and `finish` take `--token-file <path>`;
-branch-scoped tests are opt-in via `--commands-file`.
+Flags: `--tier` on `report-case`, and nothing else. Executing IS the default
+(`--dry-run` opts out), the token comes from `GH_TOKEN`, and `start` pins the
+inventory and checks file into the machine state so later commands read them
+themselves. `--commands-file` on `start` remains, for branch-scoped tests.
 
 From the clone root (binary `scripts/sweep/sweep-machine.ts`):
 
 ```
-start --token-file <path>          # begin the pass (networked)
+start                              # begin the pass (networked)
 loop:
   next-case                        # -> {status:"case-ready", worktree, branch,
                                     #     conflictedPaths, materials} OR {status:"finalize"}
   <resolve the pending files (`git status`) in the returned worktree — commit not required>
-  report-case --tier mechanical|judged|held --execute
-  report-pr --execute              # ONLY when report-case says "provide PR description"
-finish --execute --token-file <path> --commands-file <cheap-tests.json>   # creates all PRs
+  report-case --tier mechanical|judged|held
+  report-pr                        # ONLY when report-case says "provide PR description"
+finish                             # creates all PRs
 ```
 
 - **Run the loop to `finish` in ONE CONTINUOUS TURN.** After `next-case` serves
@@ -150,7 +152,7 @@ finish --execute --token-file <path> --commands-file <cheap-tests.json>   # crea
   `done`). `status:"partial"` is normal: report the landed-vs-failed split
   factually and re-run `finish`. Only a global halt reported in the output, or
   a DIVERGED branch, is a stop-case 2 report.
-- `abort --execute` — the only way to drop an in-flight pass.
+- `abort` — the only way to drop an in-flight pass.
 - **NEVER tell the owner to edit code and push.** If a build is broken, the
   driver serves you a GATE-FIX case and your fix reaches the owner as a PR (or
   lands with the pass, on `--tier judged`). Reporting a diagnosis instead of
@@ -214,7 +216,7 @@ around a blocking id.
 | `ERR06_DUPLICATE_CASE` | resolve the named topmost case; this one inherits it |
 | `ERR07_PR_EXISTS` | work with the existing PR; never open a second |
 | `ERR08_TEXT_MISSING` | write `pr/title.txt` + `pr/body.md` from the case materials |
-| `ERR11_TOKEN_MISSING` | write the `get_credential` output to a file, pass `--token-file <path>` |
+| `ERR11_TOKEN_MISSING` | export the `get_credential` output as `GH_TOKEN` and re-run |
 | `ERR12_ORIGIN_UNRESOLVED` | point the clone's origin at a github.com URL; report if you cannot |
 | `ERR13_API_FAILED` | retry once; still failing → stop-case 2 report |
 | `ERR14_BASE_BEHIND` | unclear → report to the owner |
