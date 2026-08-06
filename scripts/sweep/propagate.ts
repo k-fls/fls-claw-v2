@@ -132,7 +132,6 @@ import {
   renderMachineBlock,
   renderSweepAddressed,
   renderSweepUrge,
-  reopenPullRequest,
   stripSweepAddressed,
   urgedHeads,
   withMachineBlock,
@@ -6600,20 +6599,47 @@ async function deriveOriginMergeStatus(
             `sweep start: PR #${mergedPr.number} on '${u.ref}' was MERGED (squash/rebase — head not an ancestor) — resolved${deleteFailed ? ' (cleanup delete failed)' : ', ref deleted'}; never reopened`,
           );
         } else if (prs.length > 0) {
-          // Case 4b: genuinely CLOSED and unmerged → REOPEN. The resolution +
-          // review thread stay owner-visible.
+          // Case 4b: genuinely CLOSED and unmerged. CLOSING IS THE OWNER SAYING
+          // "DROP THIS", and it is honoured as-is.
+          //
+          // The driver never closes a PR — there is no such call anywhere in it —
+          // so a closed one was closed by a person. This used to REOPEN it,
+          // which overrode that decision; and because the gate is keyed on the
+          // REF, closing by hand did not even lift it. The owner had to close a
+          // PR AND delete a ref to withdraw a case the driver should not have
+          // served (live 2026-08-06, PR #79: minted beneath an already-gated
+          // ancestor, asking for nothing).
+          //
+          // NO AGENT IS SERVED, and comments on the closed PR are not carried
+          // anywhere. A comment explains a decision; it is not a work item, and
+          // there is no artifact left to revise. Nor is the case id the right
+          // key to carry it on — `branch + failing-file digest` misses the same
+          // defect on another branch or with one more failing file, and matches
+          // a different defect on the same files. A decision that must bind
+          // future passes belongs in the inventory's `decided_paths`, which is
+          // keyed on the PATH, applies on any branch, and is already enforced
+          // (`decidedAlready` -> ERR05). That is the owner's call to record.
+          //
+          // Relevance needs no logic either: if the defect is still real the
+          // next verify re-derives it and mints a fresh case; if it is not,
+          // nothing comes back. The agent's resolution stays readable on the
+          // closed PR.
           const closed = prs[0];
-          await reopenPullRequest(transport!, slugParts!, closed.number);
+          const deleteFailed = await deleteOriginRef(u.ref);
           appendJournal(dir, {
-            action: 'origin-pr-reopened',
+            action: 'origin-ref-withdrawn',
             ref: u.ref,
             branch: u.branch,
             headSha: u.sha,
             prNumber: closed.number,
             prUrl: closed.url,
+            via: 'pr-closed-by-owner',
+            ...(deleteFailed ? { deleteFailed } : {}),
           });
-          journalBlocked(closed, null);
-          console.error(`sweep start: ${u.branch} blocked — closed PR #${closed.number} on '${u.ref}' REOPENED (D-059)`);
+          console.error(
+            `sweep start: PR #${closed.number} on '${u.ref}' was CLOSED by the owner — case withdrawn, ` +
+              `${u.branch} no longer gated${deleteFailed ? ' (ref delete failed)' : ', ref deleted'}`,
+          );
         } else {
           // Case 5: NO PR at all (crashed publish) → complete the publish from
           // the authoritative ref; never delete, never re-derive.

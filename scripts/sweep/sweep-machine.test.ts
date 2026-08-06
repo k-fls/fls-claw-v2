@@ -2521,13 +2521,17 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     expect((JSON.parse(readFileSync(nc, 'utf8')) as { status: string }).status).toBe('finalize');
   });
 
-  it('ref present + PR CLOSED (not merged) -> REOPENED via PATCH state=open -> PR_ID; nothing deleted (D-059 case 4)', async () => {
+  it('ref present + PR CLOSED (not merged) -> the case is WITHDRAWN: ref deleted, branch NOT gated, no reopen', async () => {
+    // The driver never closes a PR, so a closed one was closed by a person, and
+    // that is the owner saying "drop this". This used to REOPEN it — overriding
+    // the decision — and because the gate is keyed on the REF, closing by hand
+    // did not lift it either: the owner had to close a PR AND delete a ref.
     const repo = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
-    const { fixBranch, fixHead } = pushFixRef(repo);
+    const { fixBranch } = pushFixRef(repo);
     const tokenFile = join(ws, 'tok.txt');
     writeFileSync(tokenFile, 'tok\n');
     const gh = fakeGithub({
@@ -2539,20 +2543,19 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     expect(await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile }), gh.factory)).toBe(0);
     const dir = dirOf(repo, ws);
     const journal = readJournal(dir);
-    const reopened = journal.find((e) => e.action === 'origin-pr-reopened')!;
-    expect(reopened.ref).toBe(fixBranch);
-    expect(reopened.prNumber).toBe(12);
-    const patch = gh.calls.find((c) => c.method === 'PATCH' && c.path.endsWith('/pulls/12'))!;
-    expect((patch.body as { state: string }).state).toBe('open');
-    const row = journal.find((e) => e.action === 'origin-blocked')!;
-    expect(row.branch).toBe('main_patched');
-    expect(row.prNumber).toBe(12);
-    // Ref intact (the delete arm is gone) and the branch takes nothing.
-    expect(repo.git('-C', bare, 'rev-parse', `refs/heads/${fixBranch}`)).toBe(fixHead);
-    const nc = join(ws, 'nc.json');
-    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: nc }))).toBe(0);
-    expect((JSON.parse(readFileSync(nc, 'utf8')) as { status: string }).status).toBe('finalize');
+
+    const withdrawn = journal.find((e) => e.action === 'origin-ref-withdrawn')!;
+    expect(withdrawn.ref).toBe(fixBranch);
+    expect(withdrawn.prNumber).toBe(12);
+    expect(withdrawn.via).toBe('pr-closed-by-owner');
+    // The decision is honoured: no reopen attempted at all.
+    expect(journal.some((e) => e.action === 'origin-pr-reopened')).toBe(false);
+    expect(gh.calls.some((c) => c.method === 'PATCH' && c.path.endsWith('/pulls/12'))).toBe(false);
+    // The gate is withdrawn — ref gone, branch not blocked.
+    expect(repo.git('-C', bare, 'for-each-ref', `refs/heads/${fixBranch}`)).toBe('');
+    expect(journal.some((e) => e.action === 'origin-blocked' && e.branch === 'main_patched')).toBe(false);
   });
+
 
   it('REVIEW-only trigger: a NEW loose comment (and bot reviews, and a quote-reply embedding the marker) do NOT reissue; only a review above the marker would', async () => {
     const repo = conflictFixture();
@@ -2703,29 +2706,6 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     );
   });
 
-  it('a failing REOPEN is ERR13 (fail-closed): no wrongful mutation, ref intact, nothing journaled reopened', async () => {
-    const repo = conflictFixture();
-    const ws = mkWorkspace();
-    const inv = emptyInventory();
-    const bare = repo.attachBareOrigin();
-    repo.git('push', 'origin', 'main_patched');
-    const { fixBranch, fixHead } = pushFixRef(repo);
-    const tokenFile = join(ws, 'tok.txt');
-    writeFileSync(tokenFile, 'tok\n');
-    const gh = fakeGithub({
-      'GET /pulls?': {
-        status: 200,
-        body: [{ html_url: 'https://github.com/k-fls/fixture/pull/12', number: 12, state: 'closed' }],
-      },
-      'PATCH /pulls/12': { status: 500, body: { message: 'boom' } },
-    });
-    const out = join(ws, 'start.json');
-    expect(await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile, out }), gh.factory)).toBe(1);
-    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> };
-    expect(res.issues[0].id).toBe('ERR13_API_FAILED');
-    expect(readJournal(dirOf(repo, ws)).some((e) => e.action === 'origin-pr-reopened')).toBe(false);
-    expect(repo.git('-C', bare, 'rev-parse', `refs/heads/${fixBranch}`)).toBe(fixHead);
-  });
 
   it('ref ABSENT (crashed in flight, resolution lost) -> fresh re-derive: ordinary case, no origin rows, no token needed (D-059 case 6)', async () => {
     const repo = conflictFixture();
