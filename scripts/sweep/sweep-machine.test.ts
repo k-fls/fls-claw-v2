@@ -2489,7 +2489,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     const journal = readJournal(dir);
     // The crashed publish is COMPLETED, never discarded: PR created from the
     // authoritative ref (marker-clean resolution head -> ACTIVE, not draft),
-    // marker posted at 0, D-058's orphan-delete is retired.
+    // no marker comment (nothing addressed yet), D-058's orphan-delete is retired.
     const created = journal.find((e) => e.action === 'origin-pr-created')!;
     expect(created.ref).toBe(fixBranch);
     expect(created.prNumber).toBe(7);
@@ -2498,8 +2498,9 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     expect((prPost.body as { head: string }).head).toBe(fixBranch);
     expect((prPost.body as { base: string }).base).toBe('main_patched');
     expect((prPost.body as { draft: boolean }).draft).toBe(false);
-    const marker = gh.calls.find((c) => c.method === 'POST' && c.path.includes('/issues/7/comments'))!;
-    expect(String((marker.body as { body: string }).body)).toContain('<!-- sweep-addressed: 0 -->');
+    // NO marker comment: the recreated PR has no reviews, so there is nothing
+    // for the driver to record. `classifyComments` reads an absent marker as 0.
+    expect(gh.calls.some((c) => c.method === 'POST' && c.path.includes('/issues/7/comments'))).toBe(false);
     // The branch IS blocked (PR_ID on the recovered PR) and the ref is intact.
     const row = journal.find((e) => e.action === 'origin-blocked')!;
     expect(row.branch).toBe('main_patched');
@@ -5270,6 +5271,23 @@ describe('report-case — a FAILED pristine reset is not reported as success (de
  * `SWEEP-RESULT` line, nothing for the agent to parse or act on at the exact
  * moment the driver refused to move a ref.
  */
+describe('next-case — the materials say WHERE the markers are', () => {
+  it('lists each pending file with its hunk line ranges', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    const out = join(ws, 'nc.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), greenPreMerge)).toBe(0);
+    const materials = (JSON.parse(readFileSync(out, 'utf8')) as { materials: string }).materials;
+    // The driver computed the merge, so it knows the hunk positions. Handing over
+    // only file NAMES is what made the agent page a 2000-line file to find them:
+    // 99 of 136 reads carried offset/limit, 87 of 136 re-read a path already read.
+    expect(materials).toMatch(/hunk\(s\) at lines \d+-\d+/);
+    expect(materials).toContain('read those windows, not the file');
+  });
+});
+
 describe('next-case — the serve bound (a case handed out and never concluded)', () => {
   it('warns on the 3rd serve, refuses the 5th, and journals every one', async () => {
     const repo = conflictFixture();

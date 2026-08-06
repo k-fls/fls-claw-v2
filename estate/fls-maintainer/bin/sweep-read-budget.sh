@@ -52,7 +52,12 @@
 set -uo pipefail
 
 STATE=/tmp/sweep-read-counts.json
-LIMIT=${SWEEP_READ_LIMIT:-2} # allow this many, refuse the next
+# A BACKSTOP, not the mechanism. The re-reads were mostly the agent hunting for
+# conflict markers the driver knew the position of and did not say; the materials
+# now carry the hunk line ranges, so the search that caused them is gone. This
+# stays for the case where reading genuinely has stopped producing decisions, and
+# sits high enough that ordinary work never meets it.
+LIMIT=${SWEEP_READ_LIMIT:-4} # allow this many reads of one REGION, refuse the next
 
 payload=$(cat)
 

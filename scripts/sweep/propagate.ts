@@ -5752,8 +5752,49 @@ async function unresolvedMarkers(repo: string, tree: string, paths: string[]): P
   return bad;
 }
 
+/**
+ * WHERE the conflict markers are, per pending file, as line ranges.
+ *
+ * The driver computed the merge, so it knows every hunk's position exactly — and
+ * handed the agent only the file NAMES. To find the hunks in a 2000-line file
+ * the agent then PAGED it: a transcript audit of 2026-08-05 measured 99 of 136
+ * reads carrying offset/limit and 87 of 136 (64%) re-reading a path already
+ * read, 49% of all Read bytes, with `command-gate.ts` read 15 times. The
+ * materials meanwhile instructed "each file once, never re-reading" — an
+ * instruction the missing information made impossible to follow.
+ *
+ * Line ranges, not hunk CONTENT. The agent must read the real file anyway (Edit
+ * requires it), so shipping the text would be an extra read, not a substitute.
+ * Ranges turn "page the file to find the markers" into "read these two windows",
+ * which satisfies the same precondition and is what the re-reads were spent on.
+ */
+async function conflictHunkRanges(repo: string, wtPath: string, paths: string[]): Promise<string[]> {
+  const out: string[] = [];
+  for (const rel of paths) {
+    let text: string;
+    try {
+      text = readFileSync(join(wtPath, rel), 'utf8');
+    } catch {
+      continue; // deleted on one side — no markers to point at
+    }
+    const lines = text.split('\n');
+    const ranges: string[] = [];
+    let start: number | null = null;
+    lines.forEach((l, i) => {
+      if (l.startsWith('<<<<<<<')) start = i + 1;
+      else if (l.startsWith('>>>>>>>') && start !== null) {
+        ranges.push(`${start}-${i + 1}`);
+        start = null;
+      }
+    });
+    if (ranges.length > 0) out.push(`- ${rel} — ${ranges.length} hunk(s) at lines ${ranges.join(', ')}`);
+    else out.push(`- ${rel} — no markers (add/delete or already resolved)`);
+  }
+  return out;
+}
+
 /** Driver-authored case materials (D-048) for the case-ready hand-off. */
-async function machineCaseMaterials(cli: Cli, jc: JournaledCase): Promise<string> {
+async function machineCaseMaterials(cli: Cli, dir: string, jc: JournaledCase): Promise<string> {
   const tip = await revParse(cli.repo, jc.branch);
   const sides = await perSideLog(cli.repo, tip, jc.head.sha, jc.conflictedPaths);
   const registry = loadRegistry({
@@ -5777,7 +5818,8 @@ async function machineCaseMaterials(cli: Cli, jc: JournaledCase): Promise<string
     '`--tier held` (escalate) — never an ever-widening search.',
     '',
     '## Conflicted paths (the pending files — your edit scope)',
-    ...jc.conflictedPaths.map((p) => `- ${p}`),
+    'Line numbers are where the markers ARE — read those windows, not the file.',
+    ...(await conflictHunkRanges(cli.repo, caseWorktreePath(dir, jc.caseId), jc.conflictedPaths)),
     '',
     `Branch: ${jc.branch}   Parent: ${jc.parent}   Head: ${jc.head.sha.slice(0, 12)} (height ${jc.head.height})`,
     '',
@@ -7310,7 +7352,7 @@ export async function cmdSweepNextCase(
       ? gateFixCaseMaterials(dir, jc, caseRow!)
       : isReissue
         ? reissueCaseMaterials(dir, jc, caseRow!)
-        : await machineCaseMaterials(cli, jc)) +
+        : await machineCaseMaterials(cli, dir, jc)) +
     (loopWarning ? `\n\n## LOOP WARNING\n${loopWarning}\n` : '') +
     `\n\n${CHECKS_HANDOFF_LINE}`;
   writeFileSync(join(dir, jc.caseId, 'materials.md'), materials + '\n');

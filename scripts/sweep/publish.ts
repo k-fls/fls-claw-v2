@@ -829,11 +829,21 @@ export async function reopenPullRequest(
 
 /**
  * Post the sweep-addressed marker comment (D-059): the driver records the
- * highest SUBMITTED REVIEW id the just-published resolution addressed (0 for a
- * first publish — no review yet; otherwise always a review id actually present
- * on the PR at classification time). Append-only: a fresh comment is posted
- * each (re)publish and readers take the MAX (`classifyComments`), so no
- * review-id bookkeeping is needed. Throws on failure (ERR13 at the caller).
+ * highest SUBMITTED REVIEW id the just-published resolution addressed.
+ * Append-only — a fresh comment is posted each republish and readers take the
+ * MAX (`classifyComments`), so no review-id bookkeeping is needed. Throws on
+ * failure (ERR13 at the caller).
+ *
+ * NOTHING IS POSTED WHEN THERE IS NOTHING TO ADDRESS (`addressedId` 0 — a first
+ * publish, no review yet). The marker is bookkeeping between the driver and
+ * itself; a PR with no reviewer feedback has nothing for it to record, and the
+ * comment was landing on every freshly-opened PR saying the resolution
+ * "addresses PR reviews up to id 0" — driver internals printed into the owner's
+ * PR, meaning nothing to the person reading it. `classifyComments` already
+ * treats an absent marker as 0, so not posting is exactly equivalent.
+ *
+ * The prose line is gone with it. What the driver needs is the machine marker;
+ * the sentence was a human-readable gloss on a number that is not for humans.
  */
 export async function postSweepAddressed(
   transport: GithubTransport,
@@ -841,9 +851,8 @@ export async function postSweepAddressed(
   prNumber: number,
   addressedId: number,
 ): Promise<void> {
-  const body = [
-    `Sweep bookkeeping (driver-posted): the published resolution addresses PR reviews up to id ${addressedId}.`,
-    renderSweepAddressed(addressedId),
-  ].join('\n');
-  await ghExpect(transport, 'POST', `/repos/${slug.owner}/${slug.repo}/issues/${prNumber}/comments`, { body });
+  if (addressedId <= 0) return;
+  await ghExpect(transport, 'POST', `/repos/${slug.owner}/${slug.repo}/issues/${prNumber}/comments`, {
+    body: renderSweepAddressed(addressedId),
+  });
 }
