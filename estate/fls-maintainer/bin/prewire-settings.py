@@ -12,10 +12,7 @@ s = {
     },
     "hooks": {
         "PreCompact": [{"hooks": [{"type": "command", "command": "bun /app/src/compact-instructions.ts"}]}],
-        "PreToolUse": [
-            {"matcher": "Bash", "hooks": [{"type": "command", "command": "bash /workspace/agent/bin/sweep-no-tests.sh"}]},
-            {"matcher": "Read", "hooks": [{"type": "command", "command": "bash /workspace/agent/bin/sweep-read-budget.sh"}]},
-        ],
+        "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "bash /workspace/agent/bin/sweep-no-tests.sh"}]}],
     },
 }
 json.dump(s, open(p, 'w'), indent=2)
