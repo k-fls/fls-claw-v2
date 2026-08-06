@@ -230,7 +230,7 @@ around a blocking id.
 | `ERR23_PROTECTED_REF` | the driver REFUSED to move a protected ref — a refusal, not a crash: nothing ran and no ref moved. Stop-case 2 report; never move the ref by hand |
 | `ERR24_PLAN_DRIFT` | investigate what moved; report before continuing |
 | `ERR26_RESOLVE_NOT_CONVERGED` | auto-escalated to HELD → stop re-resolving, take the next case |
-| `ERR30_PASS_OPEN` | `finish` or `abort` first |
+| `ERR30_PASS_OPEN` | a previous sweep did not complete. REPORT it and ASK the owner: CONTINUE (resume — `next-case` while cases remain, then `finish`; merges and published PRs kept) or ABORT (branches rolled back to their pre-pass refs, local merges lost, PRs on origin remain). The result carries the counts — quote them. Do NOT choose, and do NOT run either command until the owner answers |
 | `ERR31_AWAITING_PR` | `report-pr` first |
 | `ERR32_UNRESOLVED` | resolve the remaining markers, re-run `report-case` |
 | `ERR33_BRANCH_TESTS_FAILED` | open the named log, fix the resolution, re-report |

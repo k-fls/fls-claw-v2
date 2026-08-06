@@ -263,15 +263,34 @@ function fakeGithub(overrides: Record<string, { status: number; body: unknown }>
 // ---------------------------------------------------------------------------
 
 describe('sweep start / abort (D-053 §2)', () => {
-  it('start refuses when a pass is already open (finish/abort first)', async () => {
+  it('start refuses when a pass is already open — and ASKS THE OWNER rather than choosing', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
     const inv = emptyInventory();
     expect(await cmdSweepStart(baseCli(repo, ws, inv))).toBe(0);
     const out = join(ws, 'start2.json');
     expect(await cmdSweepStart(baseCli(repo, ws, inv, { out }))).toBe(1);
-    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> };
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      issues: Array<{ id: string }>;
+      instruction: string;
+      openPass: { phase: string; mergedLocally: number; prsPublished: number; casesOpen: number };
+    };
     expect(res.issues[0].id).toBe('ERR30_PASS_OPEN');
+    // CONTINUE-or-ABORT is the OWNER's call. This used to say "run `finish` or
+    // `abort` first", which reads as a menu the agent picks from — and the two
+    // are not interchangeable: resuming keeps the pass's merges and PRs, while
+    // aborting rolls every touched branch back to its pre-ref. Which is right
+    // depends on WHY the pass stopped, which the agent cannot know.
+    expect(res.instruction).toContain('ASK THE OWNER');
+    expect(res.instruction).toMatch(/Do not choose/i);
+    expect(res.instruction).toContain('CONTINUE');
+    expect(res.instruction).toContain('ABORT');
+    // …and the facts it must quote come from the driver, not from the agent's
+    // own reading of the journal.
+    expect(res.openPass.phase).toBeTruthy();
+    expect(typeof res.openPass.mergedLocally).toBe('number');
+    expect(typeof res.openPass.prsPublished).toBe('number');
+    expect(typeof res.openPass.casesOpen).toBe('number');
   });
 
   it('abort rolls mutated branches back to pre-ref and allows a fresh start', async () => {

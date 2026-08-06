@@ -6806,9 +6806,54 @@ export async function cmdSweepStart(
   for (const d of openCandidates) {
     const st = readMachineState(d);
     if (st && st.phase !== 'complete') {
-      const detail = `a pass is already open (${d}, phase ${st.phase}) — run \`finish\` or \`abort\` first`;
+      // CONTINUE-OR-ABORT IS THE OWNER'S CALL, NOT THE AGENT'S.
+      //
+      // This used to say "run `finish` or `abort` first", which reads as a menu
+      // the agent picks from. The two are not interchangeable: `finish` resumes
+      // from the stopped step and keeps the pass's merges and published PRs,
+      // while `abort` rolls every touched branch back to its journaled pre-ref
+      // and throws the in-flight work away. Which is right depends on why the
+      // pass stopped — and on 2026-08-06 that was "the base gate PR is open and
+      // the owner has an unaddressed review on it", where resuming can only stop
+      // again and aborting is what lets `start` serve the review as a reissue.
+      // An agent cannot know that, so it must not choose.
+      //
+      // The facts the decision needs go in the result, so the report is not the
+      // agent's summary of a journal it half-read.
+      const j = readJournal(d);
+      const count = (a: string): number => j.filter((e) => e.action === a).length;
+      const merged = count('resolved');
+      const published = count('pr-published');
+      const heldCases = count('held');
+      const stillOpen = openCases(j).length;
+      const detail =
+        `a pass is already open (${d}, phase ${st.phase}${st.finishStep ? `, step ${st.finishStep}` : ''}) — ` +
+        `${merged} branch(es) merged locally, ${published} PR(s) published, ${heldCases} case(s) held, ` +
+        `${stillOpen} case(s) still open. CONTINUING and ABORTING are different outcomes and the choice is the ` +
+        `OWNER'S.`;
       console.error(`sweep start [ERR30_PASS_OPEN]: ${detail}`);
-      result(cli, { ok: false, issues: [{ id: 'ERR30_PASS_OPEN', detail }] });
+      result(cli, {
+        ok: false,
+        issues: [{ id: 'ERR30_PASS_OPEN', detail }],
+        openPass: {
+          dir: d,
+          phase: st.phase,
+          ...(st.finishStep ? { finishStep: st.finishStep } : {}),
+          mergedLocally: merged,
+          prsPublished: published,
+          casesHeld: heldCases,
+          casesOpen: stillOpen,
+        },
+        instruction:
+          `ASK THE OWNER, then STOP. Do not choose, and do not run \`finish\` or \`abort\` on your own. ` +
+          `Report: the previous sweep did not complete — it is at phase ${st.phase}` +
+          `${st.finishStep ? ` (step ${st.finishStep})` : ''} with ${merged} branch(es) merged locally but not ` +
+          `pushed, ${published} PR(s) already published, and ${stillOpen} case(s) still open. Offer exactly two ` +
+          `options and wait for the answer: (1) CONTINUE — resume the unfinished pass from where it stopped ` +
+          `(\`next-case\` while cases remain, then \`finish\`); the merges and published PRs are kept. ` +
+          `(2) ABORT — drop the pass; every touched branch is rolled back to its pre-pass ref and the local ` +
+          `merges are lost, though PRs already on origin remain. Say WHY it stopped if the journal shows it.`,
+      });
       return 1;
     }
   }
