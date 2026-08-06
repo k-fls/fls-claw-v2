@@ -456,3 +456,38 @@ export async function attributeFailure(
         : `${files.length} failing file(s) blamed by git history to ${groups.length} branch(es): ${summary}${refused}`,
   };
 }
+
+/**
+ * The `file:line` references the failing output already names — the gate-fix
+ * analogue of a conflict case's hunk ranges.
+ *
+ * A conflict case now says WHERE the markers are, so the agent reads two windows
+ * instead of paging the file. A gate fix had no equivalent: its materials give a
+ * file list and a 120-line output tail, and the agent locates the code itself.
+ * Measured on the pass of 2026-08-06 — a gate fix on `poll-loop.ts` — 50 reads,
+ * 42 with offset, 34 repeats of a path at DIFFERENT offsets, `poll-loop.ts`
+ * seventeen times. That is hunting, and the coordinates were sitting in the
+ * output the whole time: stack frames, `file(line,col): error`, `at fn (file:line)`.
+ *
+ * Deduped, first occurrence wins, capped — a stack trace repeats the same frame
+ * and the point is a short list of places to look, not the trace itself.
+ */
+export function failingLocations(output: string, limit = 12): string[] {
+  const seen = new Map<string, string>();
+  const patterns: RegExp[] = [
+    /(?:^|\s|\()([\w./@-]+\.[cm]?tsx?):(\d+)(?::(\d+))?/g, // vitest/node frames, `at x (f.ts:12:3)`
+    /(?:^|\s)([\w./@-]+\.[cm]?tsx?)\((\d+),(\d+)\)/g, // tsc `f.ts(12,3): error TS...`
+  ];
+  for (const re of patterns) {
+    for (const m of output.matchAll(re)) {
+      const file = m[1].replace(/^\.\//, '');
+      // node_modules frames are the runner's own stack, not the defect.
+      if (file.includes('node_modules/')) continue;
+      const key = `${file}:${m[2]}`;
+      if (!seen.has(key)) seen.set(key, key);
+      if (seen.size >= limit) break;
+    }
+    if (seen.size >= limit) break;
+  }
+  return [...seen.values()];
+}

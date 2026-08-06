@@ -19,7 +19,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { countFailingFiles, parseFailingFiles } from './attribute.js';
+import { countFailingFiles, failingLocations, parseFailingFiles } from './attribute.js';
 import { makeEnvAwareRunners } from './fixtures.js';
 import {
   classifyEnvironmentFault,
@@ -551,5 +551,36 @@ describe('classifyEnvironmentFault — which dependency tree the diagnostic is a
 
   it('the non-TS signatures are unaffected (no module specifier to read)', () => {
     expect(classifyEnvironmentFault('Error: Could not locate the bindings file').isEnvironment).toBe(true);
+  });
+});
+
+// --- failing locations in the gate-fix briefing ----------------------------
+describe('failingLocations — the coordinates the output already carries', () => {
+  it('pulls file:line out of vitest frames, tsc diagnostics and stack traces', () => {
+    const out = [
+      ' FAIL  src/cli/resources/groups.create.test.ts > errors when required fields are missing',
+      'AssertionError: expected true to be false',
+      ' ❯ src/cli/resources/groups.create.test.ts:85:21',
+      'container/agent-runner/src/poll-loop.ts(412,7): error TS2345: nope',
+      '    at drainSession (/repo/container/agent-runner/src/delivery.ts:204:37)',
+      '    at node_modules/vitest/dist/chunk.js:99:1',
+    ].join('\n');
+    const locs = failingLocations(out);
+    expect(locs).toContain('src/cli/resources/groups.create.test.ts:85');
+    expect(locs).toContain('container/agent-runner/src/poll-loop.ts:412');
+    expect(locs.some((l) => l.includes('delivery.ts:204'))).toBe(true);
+    // The runner's own frames are not the defect.
+    expect(locs.some((l) => l.includes('node_modules'))).toBe(false);
+  });
+
+  it('dedupes repeated frames and caps the list — a trace is not a to-do list', () => {
+    const frame = ' ❯ src/a.test.ts:10:2\n';
+    expect(failingLocations(frame.repeat(30))).toEqual(['src/a.test.ts:10']);
+    const many = Array.from({ length: 40 }, (_, i) => ` ❯ src/f${i}.test.ts:${i + 1}:1`).join('\n');
+    expect(failingLocations(many).length).toBe(12);
+  });
+
+  it('returns nothing when the output names no file (the caller then omits the section)', () => {
+    expect(failingLocations('boom\nexit status 1')).toEqual([]);
   });
 });

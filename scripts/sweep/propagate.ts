@@ -94,7 +94,7 @@ import {
   deriveCandidates,
   reconcileCandidates,
 } from './candidates.js';
-import { attributeFailure, countFailingFiles, parseFailingFiles } from './attribute.js';
+import { attributeFailure, countFailingFiles, failingLocations, parseFailingFiles } from './attribute.js';
 import { ROOT_BRANCH, TRUNK_BRANCH } from './hierarchy.js';
 import {
   classifyEnvironmentFault,
@@ -8893,6 +8893,12 @@ function gateFixCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEn
     '## Files to fix',
     ...files.map((f) => `- ${f}`),
     '',
+    ...(() => {
+      const locs = failingLocations(raw);
+      return locs.length > 0
+        ? ['## Failing locations (from the output — start here, do not hunt)', ...locs.map((l) => `- ${l}`), '']
+        : [];
+    })(),
     '## SCOPE',
     'The files above, plus what fixing them DIRECTLY forces. This is the ONLY case',
     'type where you change code this pass did not merge. Do NOT restructure.',
