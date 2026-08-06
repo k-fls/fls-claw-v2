@@ -2738,7 +2738,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     expect(served.status).toBe('case-ready');
     expect(served.reissue ?? false).toBe(false);
     // A FRESH conflict case: marker content in the worktree, fresh-case briefing.
-    expect(served.materials).toContain('RESOLVE ONLY THE PENDING FILES');
+    expect(served.materials).toContain('EDIT: the pending files below, nothing else.');
     const caseId = currentCaseId(dir);
     expect(readFileSync(join(dir, caseId, 'worktree', 'src/x.ts'), 'utf8')).toContain('<<<<<<<');
   });
