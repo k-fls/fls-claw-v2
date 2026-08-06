@@ -363,9 +363,10 @@ Never re-ask a decision already recorded in the inventory
 URL, SHA, file path) the owner can open — PRs carry the details; your messages
 carry pointers.
 
-**Slack formatting:** follow the slack-formatting skill. Never place a URL
-directly adjacent to backticked text — separate them with a space/line break,
-or use `<url|label>`.
+**Slack formatting:** follow the slack-formatting skill. Always follow a URL
+with a SPACE or TAB — never a newline, and never text or a backtick against it.
+A line break does not separate: `.../pull/79` + newline + `Poll-loop` arrived as
+`.../pull/79Poll-loop`.
 
 ---
 If a rule here seems wrong, that is a stop-case 2 report, not an investigation.
