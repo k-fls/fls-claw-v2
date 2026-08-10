@@ -38,6 +38,8 @@ import {
   parseMachineVerdict,
   passDir,
   appendJournal,
+  gateFixCaseMaterialsForTest,
+  journaledCases,
   readJournal,
   reportDriverHalt,
   RESOLVE_COLDREAD_CAP,
@@ -5397,6 +5399,99 @@ describe('report-case — a green that follows a red is confirmed', () => {
     );
     expect(readJournal(dir).some((e) => e.action === 'checks-pass' && e.caseId === caseId)).toBe(true);
     expect(readFileSync(counter, 'utf8')).toBe('1'); // ran ONCE — no confirm
+  });
+});
+
+describe('gate-fix — failing locations are rooted at the REPO, not the command cwd', () => {
+  it("a bun failure under cwd 'container/agent-runner' is emitted with the full repo path", async () => {
+    // `bun test` runs with `cwd: container/agent-runner` (checks.json), so it
+    // prints `src/poll-loop.test.ts` for a file at
+    // `container/agent-runner/src/poll-loop.test.ts`. Live 2026-08-10 the agent
+    // hit `ls: cannot access` on that path — in the very section whose purpose
+    // is "do not hunt". `rootChecksOutput` already solves this for blame; this
+    // section had bypassed it.
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    const checksFile = join(ws, 'checks.json');
+    writeFileSync(
+      checksFile,
+      JSON.stringify({ typecheck: [], test: [{ cmd: 'bun test', cwd: 'container/agent-runner' }] }),
+    );
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile }));
+    const caseId = 'gate-fix-main_patched-root';
+    const tip = repo.sha('main_patched');
+    mkdirSync(join(dir, caseId), { recursive: true });
+    writeFileSync(
+      join(dir, caseId, 'gate-fix-output.txt'),
+      ['src/poll-loop.test.ts:', '(fail) nudges a second task run [5000.54ms]'].join('\n'),
+    );
+    appendJournal(dir, { action: 'gate-fix', caseId, branch: 'main_patched', files: ['container/agent-runner/src/poll-loop.test.ts'], failedCommands: ['bun test'] });
+    appendJournal(dir, {
+      action: 'case', caseId, branch: 'main_patched', parent: 'gate-fix', gateFix: true,
+      head: { sha: tip, height: 0 }, conflictedPaths: ['container/agent-runner/src/poll-loop.test.ts'],
+    });
+    const journal = readJournal(dir);
+    const m = gateFixCaseMaterialsForTest(dir, journaledCases(journal).get(caseId)!, journal.find((e) => e.action === 'case' && e.caseId === caseId)!);
+    expect(m).toContain('container/agent-runner/src/poll-loop.test.ts — "nudges a second task run"');
+  });
+});
+
+describe('gate-fix — the briefing prices the exit and names the repro class', () => {
+  it('a full-suite-only failure says so at the TOP, and points at held', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    // The shape `--not-my-bug` mints when the bisect had to use the FULL command.
+    const caseId = 'gate-fix-main_patched-cafe';
+    const tip = repo.sha('main_patched');
+    appendJournal(dir, { action: 'gate-fix', caseId, branch: 'main_patched', files: ['src/x.test.ts'], failedCommands: ['bun test'] });
+    appendJournal(dir, {
+      action: 'case',
+      caseId,
+      branch: 'main_patched',
+      parent: 'gate-fix',
+      gateFix: true,
+      head: { sha: tip, height: 0 },
+      conflictedPaths: ['src/x.test.ts'],
+      fullSuiteOnly: true,
+    });
+    const journal = readJournal(dir);
+    const jc = journaledCases(journal).get(caseId)!;
+    const caseRow = journal.find((e) => e.action === 'case' && e.caseId === caseId)!;
+    const m = gateFixCaseMaterialsForTest(dir, jc, caseRow);
+    expect(m).toContain('REPRODUCTION: FULL SUITE ONLY');
+    expect(m).toContain('--tier held');
+    // …and it appears BEFORE the file list, not in a footer: the agent read the
+    // materials 23 minutes into the case on 2026-08-10 and immediately said "now
+    // I can see the full picture".
+    expect(m.indexOf('REPRODUCTION: FULL SUITE ONLY')).toBeLessThan(m.indexOf('## SCOPE'));
+  });
+
+  it('an ordinary gate fix carries no repro banner', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = emptyInventory();
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    const caseId = 'gate-fix-main_patched-beef';
+    const tip = repo.sha('main_patched');
+    appendJournal(dir, { action: 'gate-fix', caseId, branch: 'main_patched', files: ['src/x.ts'], failedCommands: ['tsc'] });
+    appendJournal(dir, {
+      action: 'case',
+      caseId,
+      branch: 'main_patched',
+      parent: 'gate-fix',
+      gateFix: true,
+      head: { sha: tip, height: 0 },
+      conflictedPaths: ['src/x.ts'],
+    });
+    const journal = readJournal(dir);
+    const m = gateFixCaseMaterialsForTest(dir, journaledCases(journal).get(caseId)!, journal.find((e) => e.action === 'case' && e.caseId === caseId)!);
+    expect(m).not.toContain('REPRODUCTION: FULL SUITE ONLY');
   });
 });
 

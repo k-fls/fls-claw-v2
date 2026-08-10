@@ -7883,6 +7883,16 @@ async function adjudicateNotMyBug(p: {
     const gate = await materializeGateFixCases(cli, dir, ctx.chain, gateOutput, failedCommands, null, {
       rootBranch: ownerBranch,
       ...(rootedBelowTip ? { rootAt } : {}),
+      // REPRODUCTION CHARACTER, carried to the briefing. The bisect had to fall
+      // back to the FULL failing command because the narrowed probe did not
+      // reproduce — i.e. the failure needs the whole suite running. The driver
+      // knew that and said it in a parenthetical at the bottom of the captured
+      // output; on 2026-08-10 the agent spent 70 minutes and two rejected fixes
+      // debugging a full-suite-only timeout it could never observe (it may not
+      // run tests), and both of its root causes were wrong by its own account.
+      // Whether a failure is observable at all decides what to DO with it, so it
+      // belongs at the top of the briefing rather than in a log footer.
+      ...(bisect.usedFullCommand ? { fullSuiteOnly: true } : {}),
     });
     if (!gate.served) {
       // Already gated on origin, or already attempted this pass. Both are real
@@ -8537,7 +8547,26 @@ export async function cmdSweepReportCase(
       // NO report-attempt is recorded on a checks failure (5b counts only trees
       // that reach the cold read). Phase stays case-ready.
       result(cli, {
-        instruction: `read ${outFile} and the named files, fix the pending files, re-run report-case.${yours}${hatch}`,
+        instruction:
+          `read ${outFile} and the named files, fix the pending files, re-run report-case.${yours}${hatch}` +
+          // PRICE THE EXIT, and say which attempt this is.
+          //
+          // This message was identical on every rejection: it prescribes the fix
+          // loop and never mentions `--tier held`. On 2026-08-10 the agent took
+          // two ~30-minute cycles on an unobservable failure and escaped only by
+          // MISAPPLYING the cold-read rule ("two rejections = auto-escalate"),
+          // which does not govern ERR40 — it invented a rule because none
+          // existed. The attempt count is the driver's to know, and naming the
+          // alternative costs one clause.
+          //
+          // A gate fix also has no `--not-my-bug` left to offer: the driver
+          // already proved the failure pre-existing, which is WHY the case
+          // exists, so that clause is dead weight there.
+          (isGateFixCase
+            ? ` This is attempt ${n} of ${CHECKS_FAIL_LIMIT}. If you cannot name the fix from the code, do not ` +
+              `spend another cycle guessing — \`report-case --tier held\` with what you found is a valid ` +
+              `outcome and the diagnosis is the deliverable.`
+            : ''),
         tier: claimed,
         ...(notMyBug.note ? { notMyBug: { verdict: 'refused', detail: notMyBug.note, files: notMyBug.yours ?? [] } } : {}),
         issues: [...issues, { id, detail }],
@@ -8982,6 +9011,10 @@ function gateFixFailedOutput(dir: string, caseId: string): string {
   return raw.split('\n').slice(-120).join('\n').slice(0, 60000);
 }
 
+export function gateFixCaseMaterialsForTest(dir: string, jc: JournaledCase, caseRow: JournalEntry): string {
+  return gateFixCaseMaterials(dir, jc, caseRow);
+}
+
 function gateFixCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEntry): string {
   const gf = readJournal(dir).find((e) => e.action === 'gate-fix' && e.caseId === jc.caseId);
   const files = Array.isArray(gf?.files) ? (gf.files as string[]) : (caseRow.conflictedPaths as string[]) ?? [];
@@ -8998,13 +9031,44 @@ function gateFixCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEn
     '',
     `Failing checks: ${failedCommands.join(', ') || '(see the output below)'}`,
     `Attributed to ${jc.branch} — ${String(gf?.reason ?? 'registry ownership')}.`,
+    ...(caseRow.fullSuiteOnly === true
+      ? [
+          '',
+          '## REPRODUCTION: FULL SUITE ONLY — you cannot observe this failure',
+          'The driver probed it: narrowed to these files it does NOT reproduce; it needs',
+          'the whole suite running. You may not run the suite, so you cannot see this',
+          'failure happen, cannot test a hypothesis, and cannot confirm a fix — only',
+          '`report-case` can, one attempt at a time.',
+          '',
+          'That is a REASON, not an obstacle to push through. A failure that appears only',
+          'under concurrency is usually about ORDER, SHARED STATE or TIMING between tests',
+          'rather than the logic in the named file — read it once with that in mind. If',
+          'you cannot name the interaction from the code, `report-case --tier held` and',
+          'write what you found: an unfixable-here finding with a diagnosis is the',
+          'DELIVERABLE for this shape, not a failure to fix it.',
+        ]
+      : []),
     ...(candidates.length > 1 ? [`Implicated: ${candidates.join(', ')} (earliest by hierarchy wins).`] : []),
     '',
     '## Files to fix',
     ...files.map((f) => `- ${f}`),
     '',
     ...(() => {
-      const locs = failingLocations(raw);
+      // ROOT THE PATHS FIRST. `bun test` runs with `cwd: container/agent-runner`
+      // (checks.json), so it prints `src/poll-loop.test.ts` for a file that lives
+      // at `container/agent-runner/src/poll-loop.test.ts`. Handing that to the
+      // agent sends it to a path that does not exist — live 2026-08-10 it hit
+      // `ls: cannot access` before finding the file, in the very section whose
+      // whole purpose is "do not hunt".
+      //
+      // `rootChecksOutput` already re-roots a command's output by its cwd and is
+      // what blame uses; this section bypassed it. The failing-command list comes
+      // from the gate-fix row, which records the command NAMES — resolve them
+      // back to their configured entries so the cwds are the real ones.
+      const cmdEntries = loadChecksConfig(readMachineState(dir)?.checksFile) ?? { typecheck: [], test: [] };
+      const all = [...cmdEntries.typecheck, ...cmdEntries.test];
+      const used = failedCommands.length > 0 ? all.filter((c) => failedCommands.includes(c.cmd)) : all;
+      const locs = failingLocations(used.length > 0 ? rootChecksOutput(raw, used) : raw);
       return locs.length > 0
         ? ['## Failing locations (from the output — start here, do not hunt)', ...locs.map((l) => `- ${l}`), '']
         : [];
@@ -9194,6 +9258,8 @@ async function materializeGateFixCases(
   accused: string | null,
   opts: {
     rootBranch?: string;
+    /** The failure reproduces only under the FULL command (see the call site). */
+    fullSuiteOnly?: boolean;
     /**
      * Root the case's worktree at THIS commit instead of the branch tip
      * (`--not-my-bug`, owner 2026-08-04). Used when the search could not name an
@@ -9512,6 +9578,10 @@ async function materializeGateFixCases(
       height: head.height,
       run: caseFile.run,
       conflictedPaths: g.files,
+      // On the `case` row because `gateFixCaseMaterials` is handed THAT row —
+      // a flag written only to the `gate-fix` row never reaches the agent
+      // (learned the hard way, 2026-08-05).
+      ...(opts.fullSuiteOnly ? { fullSuiteOnly: true } : {}),
     });
     writeFileSync(join(dir, caseId, 'gate-fix-output.txt'), failedOutput);
     cases.push({ caseId, branch: g.branch, files: g.files, reason: g.reason });
