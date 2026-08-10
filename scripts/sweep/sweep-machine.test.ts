@@ -4334,6 +4334,33 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     expect(skipped!.ancestor).toBe('main_patched');
   });
 
+  it('a LOCATED owner (--not-my-bug) is minted even beneath a gate-held ancestor', async () => {
+    // The ancestor gate is for the FINISH path, where blame is by elimination
+    // and therefore unreliable beneath a red ancestor. `--not-my-bug` proves the
+    // failure pre-existing and LOCATES the owner by probing, so refusing it
+    // discards evidence. Live 2026-08-06 it cost three ~20-minute rounds naming
+    // the same owner from three different case branches, recording nothing.
+    const repo = gateFixRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'], parents: ['main_patched'] }]);
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { cmds } = redUntilCleared(ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
+    // The trunk is gate-held this pass — the condition that refused the mint.
+    appendJournal(dir, { action: 'gate-fix', branch: 'main_patched', caseId: 'gate-fix-main_patched-dead' });
+    appendJournal(dir, { action: 'held', branch: 'main_patched', caseId: 'gate-fix-main_patched-dead' });
+
+    const before = readJournal(dir).filter((e) => e.action === 'gate-fix').length;
+    await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds }));
+    const j = readJournal(dir);
+    // The FINISH path still defers to the ancestor gate…
+    expect(j.some((e) => e.action === 'gate-fix-skipped' && e.id === 'WARN20_ANCESTOR_GATED')).toBe(true);
+    expect(j.filter((e) => e.action === 'gate-fix').length).toBe(before);
+  });
+
   it('red + no attribution -> gate-fix case on the OWNING branch, served with a no-merge briefing', async () => {
     const repo = gateFixRepo();
     const ws = mkWorkspace();

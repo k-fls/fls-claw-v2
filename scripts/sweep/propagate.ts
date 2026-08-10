@@ -9362,7 +9362,30 @@ async function materializeGateFixCases(
   );
   const ancestorsOfBranch = transitiveAncestors(Object.fromEntries(directParentEdges(cli)));
   for (const g of mintable) {
-    const gatedAncestor = (ancestorsOfBranch[g.branch] ?? []).find((a) => gateHeldThisPass.has(a));
+    // A LOCATED OWNER IS NOT A GUESS, so the ancestor gate does not apply to it.
+    //
+    // The guard exists for the FINISH path, where a red integration build is
+    // attributed by elimination: beneath a gate-held ancestor that attribution
+    // is unreliable, because the ancestor's own defect is in everything below
+    // it. `--not-my-bug` is the opposite — the failure was PROVEN pre-existing
+    // against the pre-conflict tree and the owner was located by probing the
+    // branch tip and the parent head. `opts.rootBranch` is set only on that
+    // path.
+    //
+    // Refusing those cost three rounds on 2026-08-06, ~20 minutes each, all
+    // naming the SAME owner from three different case branches:
+    //   10:17  module/host-rpc             -> parent -> skipped
+    //   10:51  module/host-rpc             -> parent -> skipped
+    //   11:37  module/interactions-helpers -> parent -> skipped
+    // `module/agent-group-contributions` owns a real defect; every descendant
+    // that merges it hits the same one, adjudicates correctly, and is refused
+    // because an UNRELATED ancestor (main_patched) happens to be gated. The
+    // defect is never recorded, so the next descendant repeats the whole
+    // adjudication. Refusing proven evidence is not caution.
+    const ownerLocated = typeof opts.rootBranch === 'string' && opts.rootBranch === g.branch;
+    const gatedAncestor = ownerLocated
+      ? undefined
+      : (ancestorsOfBranch[g.branch] ?? []).find((a) => gateHeldThisPass.has(a));
     if (gatedAncestor && !gateHeldThisPass.has(g.branch)) {
       gated.push(g.branch);
       appendJournal(dir, {
