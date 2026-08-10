@@ -598,6 +598,21 @@ describe('failingLocations — the coordinates the output already carries', () =
     expect(locs.some((l) => l.includes('node_modules'))).toBe(false);
   });
 
+  it('an absolute worktree frame is REPO-ROOTED — the agent must be able to open it', () => {
+    // Live 2026-08-10, first run with the section populated: every entry read
+    //   /workspace/agent/propagation/pass-743e32df4e6c/<case>/worktree/src/x.ts:153
+    // Unopenable twice over — it names a DIFFERENT pass (checks output is
+    // captured before the case is minted, carrying the tree it ran in) and that
+    // directory is gone after a clean-slate.
+    const out = [
+      '    at Object.<anonymous> (/workspace/agent/propagation/pass-743e/c/worktree/src/modules/a/route.ts:153:7)',
+      ' ❯ src/delivery.test.ts:88:3',
+      '/repo/node_modules/vitest/dist/chunk.js:99:1',
+      '    at /etc/somewhere/else.ts:12:1',
+    ].join('\n');
+    expect(failingLocations(out)).toEqual(['src/modules/a/route.ts:153', 'src/delivery.test.ts:88']);
+  });
+
   it('dedupes repeated frames and caps the list — a trace is not a to-do list', () => {
     const frame = ' ❯ src/a.test.ts:10:2\n';
     expect(failingLocations(frame.repeat(30))).toEqual(['src/a.test.ts:10']);

@@ -519,9 +519,29 @@ export function failingLocations(output: string, limit = 12): string[] {
       continue;
     }
     // vitest frames + node stack frames: `at fn (file:line:col)`, ` ❯ file:line:col`.
-    for (const f of line.matchAll(/(?:^|\s|\()([\w./@-]+\.[cm]?tsx?):(\d+)(?::\d+)?/g)) {
-      const file = f[1].replace(/^\.\//, '');
+    for (const f of line.matchAll(/(?:^|\s|\()(\/?[\w./@-]+\.[cm]?tsx?):(\d+)(?::\d+)?/g)) {
+      let file = f[1].replace(/^\.\//, '');
       if (file.includes('node_modules/')) continue; // the runner's own stack, not the defect
+      // ABSOLUTE FRAMES ARE REPO-ROOTED. Stack traces print the worktree's full
+      // path, so the first live run emitted
+      //   /workspace/agent/propagation/pass-743e32df4e6c/<case>/worktree/src/x.ts:153
+      // — a path the agent cannot open. It names a DIFFERENT pass (the checks
+      // output is captured before the case is minted and carries the tree it ran
+      // in), and that directory is gone after a clean-slate. Everything after the
+      // worktree root is the repo-relative path the agent works in, which is what
+      // the conflict-case hunk ranges give and what `parseFailingFiles` produces.
+      const cut = file.lastIndexOf('/worktree/');
+      if (cut >= 0) {
+        file = file.slice(cut + '/worktree/'.length);
+      } else if (file.startsWith('/')) {
+        // No worktree segment: a clone root, a temp verify worktree, wherever the
+        // runner happened to be. The repo-relative part still starts at the first
+        // source directory, and naming a `src/…`/`container/…` path the agent can
+        // actually open beats dropping a real location for want of a prefix.
+        const m = /\/((?:src|container|scripts|test|tests)\/.*)$/.exec(file);
+        if (!m) continue;
+        file = m[1];
+      }
       add(`${file}:${f[2]}`);
     }
   }
