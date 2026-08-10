@@ -458,36 +458,72 @@ export async function attributeFailure(
 }
 
 /**
- * The `file:line` references the failing output already names — the gate-fix
- * analogue of a conflict case's hunk ranges.
+ * WHERE the failure is, per failing test — the gate-fix analogue of a conflict
+ * case's hunk ranges.
  *
- * A conflict case now says WHERE the markers are, so the agent reads two windows
- * instead of paging the file. A gate fix had no equivalent: its materials give a
- * file list and a 120-line output tail, and the agent locates the code itself.
- * Measured on the pass of 2026-08-06 — a gate fix on `poll-loop.ts` — 50 reads,
- * 42 with offset, 34 repeats of a path at DIFFERENT offsets, `poll-loop.ts`
- * seventeen times. That is hunting, and the coordinates were sitting in the
- * output the whole time: stack frames, `file(line,col): error`, `at fn (file:line)`.
+ * A conflict case now says where the markers are, so the agent reads two windows
+ * instead of paging the file. A gate fix had no equivalent: file list plus a
+ * 120-line output tail, and the agent locates the code itself. Measured on the
+ * 2026-08-06 pass, a gate fix on `poll-loop.ts`: 50 reads, 42 with offset, 34
+ * repeats of a path at DIFFERENT offsets, `poll-loop.ts` seventeen times.
  *
- * Deduped, first occurrence wins, capped — a stack trace repeats the same frame
- * and the point is a short list of places to look, not the trace itself.
+ * THE RUNNERS DISAGREE ABOUT WHAT A LOCATION IS, and the first version of this
+ * only knew two of the three shapes — so on the run that motivated it, it
+ * emitted NOTHING and the section was silently omitted:
+ *
+ *   tsc      `src/x.ts(12,3): error TS2345`     file + line on the failing line
+ *   vitest   ` ❯ src/x.test.ts:85:21`            file + line on the failing line
+ *   bun      `src/x.test.ts:` … `(fail) <name>`  file is a HEADER; the failure
+ *                                                line carries NO file and NO
+ *                                                line number, only a test name
+ *
+ * Bun is the runner this driver's `checks.test` actually uses. Its file must be
+ * carried down from the header — the same statefulness `countFailingFiles`
+ * needs, and for the same reason — and since there is no line number, the
+ * TEST NAME is the coordinate: it is what the agent greps for.
+ *
+ * Deduped, first occurrence wins, capped — a stack trace repeats one frame
+ * dozens of times and the point is a short list of places to look.
  */
 export function failingLocations(output: string, limit = 12): string[] {
-  const seen = new Map<string, string>();
-  const patterns: RegExp[] = [
-    /(?:^|\s|\()([\w./@-]+\.[cm]?tsx?):(\d+)(?::(\d+))?/g, // vitest/node frames, `at x (f.ts:12:3)`
-    /(?:^|\s)([\w./@-]+\.[cm]?tsx?)\((\d+),(\d+)\)/g, // tsc `f.ts(12,3): error TS...`
-  ];
-  for (const re of patterns) {
-    for (const m of output.matchAll(re)) {
-      const file = m[1].replace(/^\.\//, '');
-      // node_modules frames are the runner's own stack, not the defect.
-      if (file.includes('node_modules/')) continue;
-      const key = `${file}:${m[2]}`;
-      if (!seen.has(key)) seen.set(key, key);
-      if (seen.size >= limit) break;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (loc: string): void => {
+    if (seen.has(loc) || out.length >= limit) return;
+    seen.add(loc);
+    out.push(loc);
+  };
+  let bunFile: string | null = null;
+  for (const line of output.split('\n')) {
+    if (out.length >= limit) break;
+    // `$ <cmd>` separates one command's output from the next; a header must not
+    // stay armed across that boundary (same hazard as countFailingFiles).
+    if (line.startsWith('$ ')) {
+      bunFile = null;
+      continue;
     }
-    if (seen.size >= limit) break;
+    const header = BUN_FILE_HEADER.exec(line);
+    if (header) {
+      bunFile = header[1].replace(/^\.\//, '');
+      continue;
+    }
+    if (BUN_FAIL.test(line) && bunFile) {
+      // `(fail) suite > case [1234.56ms]` — the timing is noise for a search.
+      const name = line.replace(/^\((?:fail|error)\)\s*/, '').replace(/\s*\[[\d.]+m?s\]\s*$/, '').trim();
+      add(name ? `${bunFile} — "${name}"` : bunFile);
+      continue;
+    }
+    const m = TSC_BRACKET.exec(line) ?? TSC_COLON.exec(line);
+    if (m) {
+      add(`${m[1].replace(/^\.\//, '')}:${m[2]}`);
+      continue;
+    }
+    // vitest frames + node stack frames: `at fn (file:line:col)`, ` ❯ file:line:col`.
+    for (const f of line.matchAll(/(?:^|\s|\()([\w./@-]+\.[cm]?tsx?):(\d+)(?::\d+)?/g)) {
+      const file = f[1].replace(/^\.\//, '');
+      if (file.includes('node_modules/')) continue; // the runner's own stack, not the defect
+      add(`${file}:${f[2]}`);
+    }
   }
-  return [...seen.values()];
+  return out;
 }

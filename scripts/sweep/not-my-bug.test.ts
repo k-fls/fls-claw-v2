@@ -556,6 +556,31 @@ describe('classifyEnvironmentFault — which dependency tree the diagnostic is a
 
 // --- failing locations in the gate-fix briefing ----------------------------
 describe('failingLocations — the coordinates the output already carries', () => {
+  it('BUN: carries the file down from the header and names the failing TEST (there is no line number)', () => {
+    // The shape that made the first version emit NOTHING on the live run of
+    // 2026-08-10: bun names the file ONCE as a header and the `(fail)` line
+    // carries neither a file nor a line — only a test name. `checks.test` is a
+    // bun command, so this is THE shape that matters, and the section was
+    // silently omitted from every gate-fix briefing.
+    const out = [
+      '[poll-loop] Duplicate result event — skipping',
+      'src/poll-loop.test.ts:',
+      '(fail) task-run turn wiring (real processQuery) > nudges a second task run [5000.54ms]',
+      '  ^ this test timed out after 5000ms.',
+      '',
+      'src/mcp-tools/core.test.ts:',
+      '(fail) core > rejects a bad tool name [12.00ms]',
+    ].join('\n');
+    const locs = failingLocations(out);
+    expect(locs[0]).toBe('src/poll-loop.test.ts — "task-run turn wiring (real processQuery) > nudges a second task run"');
+    expect(locs[1]).toBe('src/mcp-tools/core.test.ts — "core > rejects a bad tool name"');
+  });
+
+  it('a bun header does not stay armed across a `$ <cmd>` boundary', () => {
+    const out = ['src/a.test.ts:', '$ pnpm test', '(fail) belongs to the NEXT command'].join('\n');
+    expect(failingLocations(out)).toEqual([]);
+  });
+
   it('pulls file:line out of vitest frames, tsc diagnostics and stack traces', () => {
     const out = [
       ' FAIL  src/cli/resources/groups.create.test.ts > errors when required fields are missing',
