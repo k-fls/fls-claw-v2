@@ -257,7 +257,7 @@ export function makePropagationFixture(): {
  * The test file is the ONLY input, so any tree can be probed and the answer is
  * a property of that tree.
  */
-export function makeNotMyBugIncidentFixture(): {
+export function makeNotMyBugIncidentFixture(opts: { interaction?: boolean } = {}): {
   repo: FixtureRepo;
   /** The commit that broke the test — what the bisect must name. */
   introducer: string;
@@ -265,22 +265,45 @@ export function makeNotMyBugIncidentFixture(): {
   failingTest: string;
   /** Path of the conflicted file. */
   conflictedPath: string;
+  /**
+   * With `opts.interaction`: a second test, GREEN on each side alone and RED
+   * only in the merged tree (it fails iff BOTH sides' marker files exist).
+   * This is the live 5bfdf9af0869 remainder shape: a proven-pre-existing
+   * failure that no single branch owns, adjudicated alongside one a branch
+   * DOES own.
+   */
+  interactionTest: string;
 } {
   const failingTest = 'container/agent-runner/src/poll-loop.test.ts';
+  const interactionTest = 'container/agent-runner/src/interaction.test.ts';
   const conflictedPath = 'src/cli/resources/groups.ts';
   // Ignores any file arguments: the filtered form (`… {files}`) and the whole
   // form must answer identically, so a narrowed probe and a full run agree.
   const runTests = [
     '#!/bin/sh',
+    'code=0',
     'echo "src/poll-loop.test.ts:"',
     'if grep -q BROKEN src/poll-loop.test.ts 2>/dev/null; then',
     '  echo "(fail) task-run turn wiring (real processQuery) > logs and conditionally nudges a second task run [5000.64ms]"',
     '  echo "  ^ this test timed out after 5000ms."',
     '  echo " 1 fail"',
-    '  exit 1',
+    '  code=1',
+    'else',
+    '  echo " 1 pass"',
     'fi',
-    'echo " 1 pass"',
-    'exit 0',
+    ...(opts.interaction
+      ? [
+          'echo "src/interaction.test.ts:"',
+          'if [ -f ../../fork-marker.txt ] && [ -f ../../up-marker.txt ]; then',
+          '  echo "(fail) fork+upstream interaction [1.00ms]"',
+          '  echo " 1 fail"',
+          '  code=1',
+          'else',
+          '  echo " 1 pass"',
+          'fi',
+        ]
+      : []),
+    'exit $code',
     '',
   ].join('\n');
 
@@ -296,12 +319,14 @@ export function makeNotMyBugIncidentFixture(): {
     'tools/typecheck.sh': '#!/bin/sh\nexit 0\n',
     'container/agent-runner/run-tests.sh': runTests,
     [failingTest]: 'test("task-run turn wiring", () => ok);\n',
+    ...(opts.interaction ? { [interactionTest]: 'test("fork+upstream interaction", () => ok);\n' } : {}),
     [conflictedPath]: 'export const createGroup = () => "base";\n',
   });
 
   repo.checkout('main_patched', { create: true, at: 'main' });
   repo.commit('fix(ncl): groups create now provisions container_configs', {
     [conflictedPath]: 'export const createGroup = () => "fork";\n',
+    ...(opts.interaction ? { 'fork-marker.txt': 'fork side present\n' } : {}),
   });
   repo.commit('chore: unrelated', { 'docs/a.md': 'a\n' });
   const introducer = repo.commit('test(tasks): cover one-door task turns', {
@@ -313,9 +338,10 @@ export function makeNotMyBugIncidentFixture(): {
   repo.checkout('main');
   repo.commit('feat: support scheduled tasks in templates', {
     [conflictedPath]: 'export const createGroup = () => "upstream";\n',
+    ...(opts.interaction ? { 'up-marker.txt': 'upstream side present\n' } : {}),
   });
   repo.checkout('main_patched');
-  return { repo, introducer, failingTest, conflictedPath };
+  return { repo, introducer, failingTest, conflictedPath, interactionTest };
 }
 
 /**

@@ -26,6 +26,8 @@ import {
   classifyFailure,
   findIntroducingCommit,
   locateOwner,
+  partitionAcrossParents,
+  partitionOwners,
   type History,
   type ProbeResult,
   type ProbeTarget,
@@ -225,6 +227,118 @@ describe('locateOwner', () => {
     const { probe } = scriptedProbe([{ usable: false }]);
     const o = await locateOwner([POLL_LOOP], 'branchtip0000', 'parenthead000', probe);
     expect(o.owner).toBe('unknown');
+  });
+});
+
+describe('partitionOwners — the 5bfdf9af0869 shape: one bag of files, several owners', () => {
+  const A = 'src/a.test.ts';
+  const B = 'src/b.test.ts';
+
+  it('splits a two-owner set: red-at-tip files to the branch, then the remainder to the parent', async () => {
+    // Round 1 finds A red at the tip and stops there (locateOwner semantics);
+    // the fix is that B is NOT dropped or folded in — it is re-located.
+    const { probe } = scriptedProbe([
+      { failing: { [A]: 1 } }, // tip: A red -> branch owns A
+      { failing: {} }, // tip for B: green
+      { failing: {} }, // ...confirmed green
+      { failing: { [B]: 1 } }, // parent for B: red -> parent owns B
+    ]);
+    const p = await partitionOwners([A, B], 'branchtip0000', 'parenthead000', probe);
+    expect(p.groups).toHaveLength(2);
+    expect(p.groups[0]).toMatchObject({ owner: 'branch', ref: 'branchtip0000', files: [A] });
+    expect(p.groups[1]).toMatchObject({ owner: 'parent', ref: 'parenthead000', files: [B] });
+    expect(p.interaction).toEqual([]);
+    expect(p.unknown).toEqual([]);
+  });
+
+  it('a remainder nobody owns comes back as INTERACTION, never inside an owner group', async () => {
+    // The live third file: green at both tips, red only merged. It must not
+    // ride along in the branch-owned case (that mis-attribution is PR #81).
+    const { probe } = scriptedProbe([
+      { failing: { [A]: 1 } }, // tip: A red
+      { failing: {} }, // tip for B: green
+      { failing: {} }, // ...confirmed
+      { failing: {} }, // parent for B: green
+      { failing: {} }, // ...confirmed
+    ]);
+    const p = await partitionOwners([A, B], 'branchtip0000', 'parenthead000', probe);
+    expect(p.groups).toHaveLength(1);
+    expect(p.groups[0].files).toEqual([A]);
+    expect(p.interaction).toEqual([B]);
+  });
+
+  it('an unbuildable side leaves the remainder UNKNOWN — reported, not discarded', async () => {
+    const { probe } = scriptedProbe([{ failing: { [A]: 1 } }, { usable: false }]);
+    const p = await partitionOwners([A, B], 'branchtip0000', 'parenthead000', probe);
+    expect(p.groups).toHaveLength(1);
+    expect(p.groups[0].files).toEqual([A]);
+    expect(p.unknown).toEqual([B]);
+    expect(p.unknownDetail).toBeTruthy();
+  });
+
+  it('the common single-owner case costs exactly one locate round — one probe', async () => {
+    const { probe, calls } = scriptedProbe([{ failing: { [A]: 1, [B]: 1 } }]);
+    const p = await partitionOwners([A, B], 'branchtip0000', 'parenthead000', probe);
+    expect(p.groups).toHaveLength(1);
+    expect(p.groups[0].files).toEqual([A, B]);
+    expect(p.probes).toBe(1);
+    expect(calls).toHaveLength(1);
+  });
+});
+
+describe('partitionAcrossParents — a held gate fix claiming "this belongs upstream"', () => {
+  const A = 'src/a.test.ts';
+  const B = 'src/b.test.ts';
+  const P1 = { branch: 'main_patched', sha: 'p1sha00000000' };
+  const P2 = { branch: 'module/command-gate', sha: 'p2sha00000000' };
+
+  it('assigns each file to the first (shallowest) parent head it is red at', async () => {
+    const { probe } = scriptedProbe([
+      { failing: { [A]: 1 } }, // P1: A red
+      { failing: {} }, // P1: B confirmed green
+      { failing: { [B]: 1 } }, // P2: B red
+    ]);
+    const p = await partitionAcrossParents([A, B], [P1, P2], probe);
+    expect(p.groups).toEqual([
+      expect.objectContaining({ branch: 'main_patched', files: [A] }),
+      expect.objectContaining({ branch: 'module/command-gate', files: [B] }),
+    ]);
+    expect(p.selfOwned).toEqual([]);
+  });
+
+  it('green at every parent (seen twice) means the branch owns it — recursion stops', async () => {
+    const { probe } = scriptedProbe([{ failing: {} }]);
+    const p = await partitionAcrossParents([A], [P1, P2], probe);
+    expect(p.groups).toEqual([]);
+    expect(p.selfOwned).toEqual([A]);
+    expect(p.probes).toBe(4); // two runs per head: a lone flaky pass must not decide
+  });
+
+  it('a flaky green at a parent is caught by the confirming run', async () => {
+    const { probe } = scriptedProbe([
+      { failing: {} }, // P1: green by luck
+      { failing: { [A]: 1 } }, // P1 confirm: red — P1 owns it after all
+    ]);
+    const p = await partitionAcrossParents([A], [P1, P2], probe);
+    expect(p.groups).toEqual([expect.objectContaining({ branch: 'main_patched', files: [A] })]);
+  });
+
+  it('a file ABSENT at a head is not probed there — absence is the answer', async () => {
+    const { probe, calls } = scriptedProbe([{ failing: { [A]: 1 } }]);
+    const p = await partitionAcrossParents([A], [P1, P2], probe, {
+      hasFile: async (sha) => sha !== P1.sha,
+    });
+    expect(calls.every((c) => c.target !== P1.sha)).toBe(true);
+    expect(p.groups).toEqual([expect.objectContaining({ branch: 'module/command-gate', files: [A] })]);
+  });
+
+  it('an unbuildable head yields UNKNOWN, never a silent self-owned verdict', async () => {
+    const { probe } = scriptedProbe([{ usable: false }]);
+    const p = await partitionAcrossParents([A, B], [P1, P2], probe);
+    expect(p.groups).toEqual([]);
+    expect(p.selfOwned).toEqual([]);
+    expect(p.unknown).toEqual([A, B]);
+    expect(p.unknownDetail).toContain('main_patched');
   });
 });
 

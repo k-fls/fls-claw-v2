@@ -525,6 +525,182 @@ export async function locateOwner(
   };
 }
 
+/** One owner found by `partitionOwners` — a branch tip or parent head proven red. */
+export interface OwnerPartitionGroup {
+  owner: 'branch' | 'parent';
+  /** The commit the fix must be rooted on. */
+  ref: string;
+  /** The files proven red there. */
+  files: string[];
+  detail: string;
+}
+
+export interface OwnerPartition {
+  groups: OwnerPartitionGroup[];
+  /** Files green on BOTH sides in isolation — the merge's own defect. */
+  interaction: string[];
+  interactionDetail: string | null;
+  /** Files whose ownership could not be determined (a side would not build). */
+  unknown: string[];
+  unknownDetail: string | null;
+  probes: number;
+}
+
+/**
+ * Locate the owner of EVERY file, not just the first owner found.
+ *
+ * `locateOwner` answers with ONE owner and the subset of files failing there,
+ * and live that answer was treated as the whole story: pass 5bfdf9af0869
+ * (2026-08-10) sent three proven-pre-existing failures in, `locateOwner`
+ * returned `parent` covering two of them, and the third
+ * (`src/guard/conformance.test.ts` — green at BOTH tips, an interaction) was
+ * never located at all. It did not disappear: the mint re-parsed the failing
+ * output and folded it into the one gate-fix case, on a branch the probes had
+ * just shown does NOT own it. The agent on that case could only answer with a
+ * prose diagnosis (PR #81).
+ *
+ * So: locate on the full set; if the returned owner covers a SUBSET, re-locate
+ * on the remainder; repeat. Termination is structural — a `branch`/`parent`
+ * verdict always carries a non-empty failing subset (both return paths guard on
+ * `failing.length > 0`), so the remaining set strictly shrinks, and the two
+ * terminal verdicts (`interaction`, `unknown`) consume everything left. The
+ * common single-owner case is ONE `locateOwner` call, exactly as before; only a
+ * genuine split pays for further rounds.
+ */
+export async function partitionOwners(
+  files: string[],
+  branchTip: string,
+  parentHead: string,
+  probe: SubsetProbe,
+  opts: {
+    hasAnyFile?: (sha: string, files: string[]) => Promise<boolean>;
+  } = {},
+): Promise<OwnerPartition> {
+  const out: OwnerPartition = {
+    groups: [],
+    interaction: [],
+    interactionDetail: null,
+    unknown: [],
+    unknownDetail: null,
+    probes: 0,
+  };
+  let remaining = [...files];
+  while (remaining.length > 0) {
+    const o = await locateOwner(remaining, branchTip, parentHead, probe, opts);
+    out.probes += o.probes;
+    if (o.owner === 'unknown') {
+      out.unknown = remaining;
+      out.unknownDetail = o.detail;
+      return out;
+    }
+    if (o.owner === 'interaction') {
+      out.interaction = remaining;
+      out.interactionDetail = o.detail;
+      return out;
+    }
+    // A later round can re-return an owner already seen (a flaky red surfacing
+    // on the re-probe); merge rather than minting two cases on one ref.
+    const prior = out.groups.find((g) => g.owner === o.owner && g.ref === o.ref);
+    if (prior) prior.files = [...new Set([...prior.files, ...o.files])];
+    else out.groups.push({ owner: o.owner, ref: o.ref!, files: o.files, detail: o.detail });
+    remaining = remaining.filter((f) => !o.files.includes(f));
+  }
+  return out;
+}
+
+/** A parent head `partitionAcrossParents` may probe. */
+export interface ParentHead {
+  branch: string;
+  sha: string;
+}
+
+export interface ParentPartition {
+  /** Per parent proven red, in the caller's (shallowest-first) order. */
+  groups: Array<{ branch: string; ref: string; files: string[]; detail: string }>;
+  /** Green (seen twice) or absent at every parent head — this branch's own. */
+  selfOwned: string[];
+  /** A head would not build; ownership undetermined. NEVER silently dropped. */
+  unknown: string[];
+  unknownDetail: string | null;
+  probes: number;
+}
+
+/**
+ * For a GATE-FIX case claiming its defect belongs upstream: which parent heads
+ * are ALREADY red in these files?
+ *
+ * `locateOwner` cannot answer this — its first probe is the branch tip, and a
+ * gate fix's tip is red BY CONSTRUCTION (that is why the case exists), so it
+ * returns `branch` before ever looking up. The informative probe is the parent
+ * head alone: red there means the defect flowed down and the fix belongs above;
+ * green there (seen TWICE — rule 2, a single flaky pass must not strand the fix
+ * below its owner... nor, here, mint a case on an innocent parent) means this
+ * branch owns it and the held diagnosis stands. Live 2026-08-10 the gate fix on
+ * `module/agent-group-contributions` published PR #81 asserting its fixes
+ * belong in `main_patched` and `module/command-gate` — a claim this probe
+ * settles mechanically.
+ *
+ * Parents are probed in the CALLER's order (shallowest first), so a defect red
+ * at several heads roots at the shallowest — one fix that every descendant
+ * inherits, instead of one per branch. A file ABSENT at a head cannot be red
+ * there (same rule as `locateOwner`); one that is absent or confirmed-green at
+ * every head is `selfOwned`. Terminates trivially: the parent list is finite
+ * and each is visited once.
+ */
+export async function partitionAcrossParents(
+  files: string[],
+  parents: ParentHead[],
+  probe: SubsetProbe,
+  opts: {
+    hasFile?: (sha: string, file: string) => Promise<boolean>;
+  } = {},
+): Promise<ParentPartition> {
+  const out: ParentPartition = { groups: [], selfOwned: [], unknown: [], unknownDetail: null, probes: 0 };
+  let remaining = [...files];
+  for (const parent of parents) {
+    if (remaining.length === 0) break;
+    let present = remaining;
+    if (opts.hasFile) {
+      present = [];
+      for (const f of remaining) if (await opts.hasFile(parent.sha, f)) present.push(f);
+    }
+    if (present.length === 0) continue;
+    const r1 = await probe({ kind: 'commit', sha: parent.sha }, present);
+    out.probes++;
+    if (!r1.usable) {
+      // Undetermined, loudly: reading an unbuildable head as green would call a
+      // possibly-upstream defect `selfOwned` and freeze a prose PR for it.
+      out.unknown = [...new Set([...out.unknown, ...remaining])];
+      out.unknownDetail = `the ${parent.branch} head ${parent.sha.slice(0, 12)} could not be built — ownership undetermined`;
+      return out;
+    }
+    let red = present.filter((f) => (r1.counts.get(f) ?? 0) > 0);
+    const green = present.filter((f) => !red.includes(f));
+    if (green.length > 0) {
+      const r2 = await probe({ kind: 'commit', sha: parent.sha }, green);
+      out.probes++;
+      if (!r2.usable) {
+        out.unknown = [...new Set([...out.unknown, ...green])];
+        out.unknownDetail = `the ${parent.branch} head ${parent.sha.slice(0, 12)} became unbuildable on the confirming probe`;
+        remaining = remaining.filter((f) => !green.includes(f));
+      } else {
+        red = [...red, ...green.filter((f) => (r2.counts.get(f) ?? 0) > 0)];
+      }
+    }
+    if (red.length > 0) {
+      out.groups.push({
+        branch: parent.branch,
+        ref: parent.sha,
+        files: red,
+        detail: `already red at the ${parent.branch} head ${parent.sha.slice(0, 12)} — the defect flowed down from there`,
+      });
+      remaining = remaining.filter((f) => !red.includes(f));
+    }
+  }
+  out.selfOwned = remaining;
+  return out;
+}
+
 /**
  * How far back to look for a green anchor, in first-parent steps. Exponential
  * because there is no anchor to start from: `branch-check` only ever typechecks,

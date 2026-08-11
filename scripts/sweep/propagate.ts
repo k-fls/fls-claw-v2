@@ -95,12 +95,14 @@ import {
   reconcileCandidates,
 } from './candidates.js';
 import { attributeFailure, countFailingFiles, failingLocations, parseFailingFiles } from './attribute.js';
-import { ROOT_BRANCH, TRUNK_BRANCH } from './hierarchy.js';
+import { branchHierarchy, byHierarchy, ROOT_BRANCH, TRUNK_BRANCH } from './hierarchy.js';
 import {
   classifyEnvironmentFault,
   classifyFailure,
   findIntroducingCommit,
-  locateOwner,
+  partitionAcrossParents,
+  partitionOwners,
+  type BisectOutcome,
   type History,
   type SubsetProbe,
 } from './not-my-bug.js';
@@ -7467,6 +7469,155 @@ interface NotMyBugOutcome {
   yours?: string[];
 }
 
+/** What `investigateOwnedFailure` learned about one owner's proven-red files. */
+interface OwnedFailureInvestigation {
+  bisect: BisectOutcome;
+  introduced: { sha: string; subject: string; author: string } | null;
+  /** Where the fix must be rooted (the tip, or the deepest evidenced point). */
+  rootAt: string;
+  rootedBelowTip: boolean;
+  behind: number;
+  rebaseNote: string;
+  dupes: string[];
+  dupNote: string;
+}
+
+/**
+ * Everything between "this owner is proven red in these files" and "mint the
+ * case": name the introducing commit, root the fix as deep as the evidence
+ * supports (never below the trunk head), price the rebase, and flag cross-branch
+ * duplicates. Shared by the `--not-my-bug` partition loop and the held-gate-fix
+ * ownership router — the comments on each step live here, once.
+ */
+async function investigateOwnedFailure(p: {
+  cli: Cli;
+  dir: string;
+  caseId: string;
+  ownerBranch: string;
+  ownerRef: string;
+  files: string[];
+  narrowProbe: SubsetProbe;
+  fullProbe: SubsetProbe;
+  narrowRuns: ProbeRun[];
+  fullRuns: ProbeRun[];
+  trunkHead: string;
+}): Promise<OwnedFailureInvestigation> {
+  const { cli, dir, caseId, ownerBranch, ownerRef, files, trunkHead } = p;
+  progress(`not-my-bug: searching ${ownerBranch} for the commit that introduced ${files.join(', ')}`);
+  const bisect = await findIntroducingCommit(
+    ownerRef,
+    files,
+    p.narrowProbe,
+    repoHistory(cli.repo),
+    // The FULL-command fallback. A load-dependent failure exists only under
+    // whole-suite load, so a narrowed probe cannot see it and the determinism
+    // gate writes it off as a coin flip — live 2026-08-03, exactly that.
+    p.fullProbe,
+    // The FLOOR — bound the SEARCH, do not clamp its answer afterwards: it
+    // never spends probes on commits whose answer would be refused, and for a
+    // gate fix ON the trunk the window is empty so it returns at once.
+    trunkHead,
+  );
+  let introduced: { sha: string; subject: string; author: string } | null = null;
+  if (bisect.status === 'found' && bisect.sha) {
+    const info = await git(cli.repo, ['show', '-s', '--format=%s%n%an', bisect.sha], { allowCodes: [128] });
+    const [subject = '', author = ''] = info.stdout.split('\n');
+    introduced = { sha: bisect.sha, subject, author };
+    progress(`not-my-bug: introduced by ${bisect.sha.slice(0, 12)} "${subject}" (${author})`);
+  } else {
+    progress(`not-my-bug: bisect ${bisect.status} — ${bisect.detail}`);
+  }
+  appendJournal(dir, {
+    action: 'not-my-bug-bisect',
+    caseId,
+    branch: ownerBranch,
+    status: bisect.status,
+    sha: bisect.sha ?? null,
+    anchor: bisect.anchor ?? null,
+    lastFailed: bisect.lastFailed ?? null,
+    usedFullCommand: bisect.usedFullCommand === true,
+    probes: bisect.probes,
+    scanned: bisect.scanned ?? null,
+    detail: bisect.detail,
+    runs: bisect.usedFullCommand ? [...p.narrowRuns, ...p.fullRuns] : p.narrowRuns,
+  });
+
+  // THE BISECT NEVER GATES THE CASE (owner, 2026-08-04). Whether a gate fix is
+  // warranted was settled by the verdict (`pre-existing`) and the owner probe;
+  // naming the introducing commit only improves the BRIEFING. Suppressing the
+  // case because the optional step failed threw a proven defect away — and it
+  // was incoherent besides: `flaky` suppressed while `no-anchor` minted, two
+  // failure modes of one step with opposite consequences.
+  //
+  // ROOT AT THE LAST FAILED POINT. When the search cannot name an introducer it
+  // still knows the OLDEST commit it saw red, and that is the better root: the
+  // fix lands as deep as the evidence supports, so branches sharing that
+  // ancestor can take one fix instead of one each. The cost is that the fix is
+  // then BEHIND the branch tip, which is what the rebase note below is for.
+  //
+  // ROOT FLOOR: never deeper than the current trunk head (owner, 2026-08-04).
+  //
+  // Rooting a fix at the commit that INTRODUCED a failure is right in
+  // principle — branches sharing that ancestor take one fix instead of one
+  // each — and catastrophic without a floor. Live 2026-08-04 the bisect named
+  // `11d82a65`, which is 299 commits behind `main_patched`: the case worktree
+  // was a three-week-old tree, so the checks gate demanded THAT tree green,
+  // and it was red in a second, unrelated file whose fix simply had not been
+  // written yet. The agent could not win — its case scope was one test, and
+  // the gate wanted a suite from before half the branch's history existed.
+  //
+  // The floor is the trunk head: a root must CONTAIN it. Below that line the
+  // history is shared and already-integrated, so a fix rooted there carries
+  // every intervening divergence for no benefit. Above it, deep rooting still
+  // works — a feature branch can root back to where it left the current trunk,
+  // which is the case the shared-ancestor argument was actually about.
+  const bisectRoot = bisect.sha ?? bisect.lastFailed ?? ownerRef;
+  const trunkContained =
+    bisectRoot === ownerRef ||
+    !trunkHead ||
+    (await git(cli.repo, ['merge-base', '--is-ancestor', trunkHead, bisectRoot], { allowCodes: [1, 128] })).code === 0;
+  if (!trunkContained) {
+    appendJournal(dir, {
+      action: 'gate-fix-root-clamped',
+      caseId,
+      branch: ownerBranch,
+      wanted: bisectRoot,
+      usedTip: ownerRef,
+      reason: `root would predate the ${TRUNK_BRANCH} head — clamped to the branch tip`,
+    });
+    progress(`not-my-bug: root ${bisectRoot.slice(0, 12)} predates the ${TRUNK_BRANCH} head — rooting at the tip instead`);
+  }
+  const rootAt = trunkContained ? bisectRoot : ownerRef;
+  const rootedBelowTip = rootAt !== ownerRef;
+  const behind = rootedBelowTip
+    ? Number(
+        (
+          await git(cli.repo, ['rev-list', '--count', '--first-parent', `${rootAt}..${ownerRef}`], {
+            allowCodes: [128],
+          })
+        ).stdout.trim() || '0',
+      )
+    : 0;
+
+  // Does the fix, once made HERE, still apply and hold at the TIP? The checks
+  // gate will prove it at `rootAt`, which is not the same statement. Probing it
+  // costs one run and turns "rebase before merging" from advice into a fact the
+  // owner can act on — or a warning that it does not apply at all.
+  const rebaseNote = rootedBelowTip
+    ? `[ROOTED AT ${rootAt.slice(0, 12)}: ${behind} commit(s) behind the ${ownerBranch} tip — REBASE before merging` +
+      `${bisect.status === 'found' ? '' : `; this is the oldest point the search OBSERVED the failure, not a proven introducing commit`}]`
+    : '';
+
+  // DUPLICATE ACROSS BRANCHES. An unstable failure surfaces wherever luck puts
+  // it, so the same shared test can earn a gate fix on several branches — each
+  // genuinely needs it (separate lines of history), but the owner must be told
+  // they are one defect so they merge one and rebase or drop the rest.
+  const dupes = await duplicateGateFixes(cli, dir, ownerBranch, files);
+  const dupNote = dupes.length > 0 ? `[POSSIBLE DUPLICATE: ${dupes.join('; ')} — same failing files]` : '';
+
+  return { bisect, introduced, rootAt, rootedBelowTip, behind, rebaseNote, dupes, dupNote };
+}
+
 /**
  * Adjudicate `--not-my-bug` and route the outcome.
  *
@@ -7642,9 +7793,13 @@ async function adjudicateNotMyBug(p: {
     }
 
     // CONFIRMED pre-existing. The prefix proves it is not the agent's; it cannot
-    // say whose. Two probes settle that, and the third answer is not a gate fix.
-    progress('not-my-bug: confirmed — locating the owner (branch tip, then parent head)');
-    const owner = await locateOwner(verdict.files, branchTip, rc.head.sha, probe, {
+    // say whose — and the answer is PER FILE, not per bag: live pass
+    // 5bfdf9af0869 (2026-08-10) sent three files in, the single-owner probe
+    // covered two, and the third was folded into a case on a branch the probes
+    // had shown does not own it (see `partitionOwners`). Locate until every
+    // file has an owner, an interaction verdict, or a named unknown.
+    progress('not-my-bug: confirmed — locating the owner(s) (branch tip, then parent head)');
+    const partition = await partitionOwners(verdict.files, branchTip, rc.head.sha, probe, {
       // A file that does not EXIST at a tip cannot fail there, and a runner asked
       // for a path it cannot find exits non-zero with nothing parseable — which
       // the probe reports as unusable. The ordinary case is exactly this: the
@@ -7658,168 +7813,124 @@ async function adjudicateNotMyBug(p: {
         return false;
       },
     });
-    appendJournal(dir, {
-      action: 'not-my-bug-owner',
-      caseId,
-      branch,
-      owner: owner.owner,
-      ref: owner.ref,
-      files: owner.files,
-      probes: owner.probes,
-      detail: owner.detail,
-    });
-    progress(`not-my-bug: owner = ${owner.owner} — ${owner.detail}`);
-
-    if (owner.owner === 'unknown') {
-      return { handled: false, note: `${verdict.detail}; but ${owner.detail}` };
+    for (const g of partition.groups) {
+      appendJournal(dir, {
+        action: 'not-my-bug-owner',
+        caseId,
+        branch,
+        owner: g.owner,
+        ref: g.ref,
+        files: g.files,
+        probes: partition.probes,
+        detail: g.detail,
+      });
+      progress(`not-my-bug: owner = ${g.owner} for [${g.files.join(', ')}] — ${g.detail}`);
     }
 
-    if (owner.owner === 'interaction') {
-      // Neither side is red alone: this merge produced it, so it belongs to THIS
-      // case. Widen the edit scope to the failing files (the scope guard reads
-      // the widening from the journal) and hand the failure back — the one
-      // special case the owner sanctioned: let the agent edit files that are not
-      // conflicted, and let the cold read accept a change that resolves no markers.
-      appendJournal(dir, { action: 'scope-widened', caseId, branch, files: owner.files, reason: owner.detail });
-      progress(`not-my-bug: scope widened — you may now edit ${owner.files.join(', ')}`);
-      console.error(`report-case [WARN12_SCOPE_WIDENED]: ${caseId} may now edit ${owner.files.join(', ')}`);
+    if (partition.groups.length === 0 && partition.unknown.length > 0) {
+      appendJournal(dir, {
+        action: 'not-my-bug-owner',
+        caseId,
+        branch,
+        owner: 'unknown',
+        ref: null,
+        files: partition.unknown,
+        probes: partition.probes,
+        detail: partition.unknownDetail,
+      });
+      progress(`not-my-bug: owner = unknown — ${partition.unknownDetail}`);
+      return { handled: false, note: `${verdict.detail}; but ${partition.unknownDetail}` };
+    }
+
+    if (partition.groups.length === 0) {
+      // EVERY file is an interaction: neither side is red alone, this merge
+      // produced all of it, so it belongs to THIS case. Widen the edit scope to
+      // the failing files (the scope guard reads the widening from the journal)
+      // and hand the failure back — the one special case the owner sanctioned:
+      // let the agent edit files that are not conflicted, and let the cold read
+      // accept a change that resolves no markers.
+      const iDetail = partition.interactionDetail ?? 'green on both sides in isolation and red once merged';
+      appendJournal(dir, {
+        action: 'not-my-bug-owner',
+        caseId,
+        branch,
+        owner: 'interaction',
+        ref: null,
+        files: partition.interaction,
+        probes: partition.probes,
+        detail: iDetail,
+      });
+      progress(`not-my-bug: owner = interaction — ${iDetail}`);
+      appendJournal(dir, { action: 'scope-widened', caseId, branch, files: partition.interaction, reason: iDetail });
+      progress(`not-my-bug: scope widened — you may now edit ${partition.interaction.join(', ')}`);
+      console.error(`report-case [WARN12_SCOPE_WIDENED]: ${caseId} may now edit ${partition.interaction.join(', ')}`);
       result(cli, {
         status: 'scope-widened',
         instruction:
-          `${owner.detail}. Your EDIT SCOPE now also includes ${owner.files.join(', ')} — fix the failure there, ` +
+          `${iDetail}. Your EDIT SCOPE now also includes ${partition.interaction.join(', ')} — fix the failure there, ` +
           `then re-run report-case. The cold reader is told these files were added to the scope and why.`,
-        widenedPaths: owner.files,
-        notMyBug: { verdict: verdict.verdict, files: verdict.files, owner: owner.owner, probes: verdict.probes + owner.probes },
-        issues: [{ id: 'WARN12_SCOPE_WIDENED', detail: owner.detail }],
+        widenedPaths: partition.interaction,
+        notMyBug: { verdict: verdict.verdict, files: verdict.files, owner: 'interaction', probes: verdict.probes + partition.probes },
+        issues: [{ id: 'WARN12_SCOPE_WIDENED', detail: iDetail }],
       });
       return { handled: true, code: 1 };
     }
 
-    // The owner is a BRANCH (this one, or the parent it is merging from). Name
-    // the commit that introduced it before minting the case: a gate fix whose
+    // A remainder no branch owns, next to files a branch DOES own. It is never
+    // silently dropped and never folded into another owner's case (that fold is
+    // the 5bfdf9af0869 defect): it is journaled here and named in the result.
+    // An interaction remainder returns with the re-derived case once the owner
+    // fixes land — the case is being aborted below, so it cannot be widened into
+    // now — and an unknown remainder is the owner's to look at.
+    const remainder =
+      partition.interaction.length > 0
+        ? { files: partition.interaction, disposition: 'interaction', detail: partition.interactionDetail ?? '' }
+        : partition.unknown.length > 0
+          ? { files: partition.unknown, disposition: 'unknown', detail: partition.unknownDetail ?? '' }
+          : null;
+    if (remainder) {
+      appendJournal(dir, {
+        action: 'not-my-bug-remainder',
+        caseId,
+        branch,
+        files: remainder.files,
+        disposition: remainder.disposition,
+        detail: remainder.detail,
+      });
+      progress(`not-my-bug: remainder [${remainder.files.join(', ')}] (${remainder.disposition}) — not covered by any gate fix`);
+    }
+
+    // Each owner is a BRANCH (this one, or the parent it is merging from). Name
+    // the commit that introduced each defect before minting: a gate fix whose
     // briefing is "this branch is red, here is a log" costs the agent an
     // open-ended search, and the commit is also what tells the owner whether the
     // fix belongs on this branch at all.
-    const ownerBranch = owner.owner === 'branch' ? branch : rc.parent;
     const trunkHead = await revParse(cli.repo, TRUNK_BRANCH).catch(() => '');
-    progress(`not-my-bug: searching ${ownerBranch} for the commit that introduced ${owner.files.join(', ')}`);
-    const bisect = await findIntroducingCommit(
-      owner.ref!,
-      owner.files,
-      narrowProbe,
-      repoHistory(cli.repo),
-      // The FULL-command fallback. A load-dependent failure exists only under
-      // whole-suite load, so a narrowed probe cannot see it and the determinism
-      // gate writes it off as a coin flip — live 2026-08-03, exactly that.
-      probe,
-      // The FLOOR — bound the SEARCH, do not clamp its answer afterwards: it
-      // never spends probes on commits whose answer would be refused, and for a
-      // gate fix ON the trunk the window is empty so it returns at once.
-      trunkHead,
-    );
-    let introduced: { sha: string; subject: string; author: string } | null = null;
-    if (bisect.status === 'found' && bisect.sha) {
-      const info = await git(cli.repo, ['show', '-s', '--format=%s%n%an', bisect.sha], { allowCodes: [128] });
-      const [subject = '', author = ''] = info.stdout.split('\n');
-      introduced = { sha: bisect.sha, subject, author };
-      progress(`not-my-bug: introduced by ${bisect.sha.slice(0, 12)} "${subject}" (${author})`);
-    } else {
-      progress(`not-my-bug: bisect ${bisect.status} — ${bisect.detail}`);
-    }
-    appendJournal(dir, {
-      action: 'not-my-bug-bisect',
-      caseId,
-      branch: ownerBranch,
-      status: bisect.status,
-      sha: bisect.sha ?? null,
-      anchor: bisect.anchor ?? null,
-      lastFailed: bisect.lastFailed ?? null,
-      usedFullCommand: bisect.usedFullCommand === true,
-      probes: bisect.probes,
-      scanned: bisect.scanned ?? null,
-      detail: bisect.detail,
-      runs: bisect.usedFullCommand ? [...narrowRuns, ...runs] : narrowRuns,
-    });
-
-    // THE BISECT NEVER GATES THE CASE (owner, 2026-08-04). Whether a gate fix is
-    // warranted was settled by the verdict (`pre-existing`) and the owner probe;
-    // naming the introducing commit only improves the BRIEFING. Suppressing the
-    // case because the optional step failed threw a proven defect away — and it
-    // was incoherent besides: `flaky` suppressed while `no-anchor` minted, two
-    // failure modes of one step with opposite consequences.
-    //
-    // ROOT AT THE LAST FAILED POINT. When the search cannot name an introducer it
-    // still knows the OLDEST commit it saw red, and that is the better root: the
-    // fix lands as deep as the evidence supports, so branches sharing that
-    // ancestor can take one fix instead of one each. The cost is that the fix is
-    // then BEHIND the branch tip, which is what the rebase note below is for.
-    //
-    // ROOT FLOOR: never deeper than the current trunk head (owner, 2026-08-04).
-    //
-    // Rooting a fix at the commit that INTRODUCED a failure is right in
-    // principle — branches sharing that ancestor take one fix instead of one
-    // each — and catastrophic without a floor. Live 2026-08-04 the bisect named
-    // `11d82a65`, which is 299 commits behind `main_patched`: the case worktree
-    // was a three-week-old tree, so the checks gate demanded THAT tree green,
-    // and it was red in a second, unrelated file whose fix simply had not been
-    // written yet. The agent could not win — its case scope was one test, and
-    // the gate wanted a suite from before half the branch's history existed.
-    //
-    // The floor is the trunk head: a root must CONTAIN it. Below that line the
-    // history is shared and already-integrated, so a fix rooted there carries
-    // every intervening divergence for no benefit. Above it, deep rooting still
-    // works — a feature branch can root back to where it left the current trunk,
-    // which is the case the shared-ancestor argument was actually about.
-    const bisectRoot = bisect.sha ?? bisect.lastFailed ?? owner.ref!;
-    const trunkContained =
-      bisectRoot === owner.ref ||
-      !trunkHead ||
-      (await git(cli.repo, ['merge-base', '--is-ancestor', trunkHead, bisectRoot], { allowCodes: [1, 128] })).code === 0;
-    if (!trunkContained) {
-      appendJournal(dir, {
-        action: 'gate-fix-root-clamped',
+    const owned: Array<{
+      ownerKind: 'branch' | 'parent';
+      ownerBranch: string;
+      ref: string;
+      files: string[];
+      detail: string;
+      inv: OwnedFailureInvestigation;
+    }> = [];
+    for (const g of partition.groups) {
+      const ownerBranch = g.owner === 'branch' ? branch : rc.parent;
+      const inv = await investigateOwnedFailure({
+        cli,
+        dir,
         caseId,
-        branch: ownerBranch,
-        wanted: bisectRoot,
-        usedTip: owner.ref,
-        reason: `root would predate the ${TRUNK_BRANCH} head — clamped to the branch tip`,
+        ownerBranch,
+        ownerRef: g.ref,
+        files: g.files,
+        narrowProbe,
+        fullProbe: probe,
+        narrowRuns,
+        fullRuns: runs,
+        trunkHead,
       });
-      progress(`not-my-bug: root ${bisectRoot.slice(0, 12)} predates the ${TRUNK_BRANCH} head — rooting at the tip instead`);
+      owned.push({ ownerKind: g.owner, ownerBranch, ref: g.ref, files: g.files, detail: g.detail, inv });
     }
-    const rootAt = trunkContained ? bisectRoot : owner.ref!;
-    const rootedBelowTip = rootAt !== owner.ref;
-    const behind = rootedBelowTip
-      ? Number(
-          (
-            await git(cli.repo, ['rev-list', '--count', '--first-parent', `${rootAt}..${owner.ref!}`], {
-              allowCodes: [128],
-            })
-          ).stdout.trim() || '0',
-        )
-      : 0;
-
-    // Does the fix, once made HERE, still apply and hold at the TIP? The checks
-    // gate will prove it at `rootAt`, which is not the same statement. Probing it
-    // costs one run and turns "rebase before merging" from advice into a fact the
-    // owner can act on — or a warning that it does not apply at all.
-    const rebaseNote = rootedBelowTip
-      ? `[ROOTED AT ${rootAt.slice(0, 12)}: ${behind} commit(s) behind the ${ownerBranch} tip — REBASE before merging` +
-        `${bisect.status === 'found' ? '' : `; this is the oldest point the search OBSERVED the failure, not a proven introducing commit`}]`
-      : '';
-
-    // DUPLICATE ACROSS BRANCHES. An unstable failure surfaces wherever luck puts
-    // it, so the same shared test can earn a gate fix on several branches — each
-    // genuinely needs it (separate lines of history), but the owner must be told
-    // they are one defect so they merge one and rebase or drop the rest.
-    const dupes = await duplicateGateFixes(cli, dir, ownerBranch, owner.files);
-    const dupNote = dupes.length > 0 ? `[POSSIBLE DUPLICATE: ${dupes.join('; ')} — same failing files]` : '';
-
-    const gateOutput =
-      `${failingOutput}\n\n--- not-my-bug ---\n${verdict.detail}\n${owner.detail}\n${bisect.detail}\n` +
-      (introduced ? `introduced by ${introduced.sha} "${introduced.subject}" (${introduced.author})\n` : '') +
-      (bisect.usedFullCommand ? `(the search ran the FULL failing command: narrowed to these files it does not reproduce)\n` : '') +
-      (rebaseNote ? `${rebaseNote}\n` : '') +
-      (dupNote ? `${dupNote}\n` : '');
 
     // ABORT THE MERGE, **BEFORE** minting the gate fix. The case's merge was
     // never made — it lives only as the clean prefix in the worktree — so
@@ -7848,7 +7959,7 @@ async function adjudicateNotMyBug(p: {
     // re-derived against the blocked parent and the existing DEFERRED path holds
     // them until the fix lands. No priority rule is needed: with the descendants
     // superseded, the gate fix is the only case left to serve.
-    // THE OWNER'S SUBTREE, not just this case's. When ownership routes to the
+    // THE OWNERS' SUBTREES, not just this case's. When ownership routes to the
     // PARENT, the gate fix lands on a branch this case is not on — and its OTHER
     // children were never reopened, so they stayed open, sorted ahead of the fix,
     // and were served first. Live 2026-08-05: the fix went to
@@ -7857,10 +7968,10 @@ async function adjudicateNotMyBug(p: {
     // agent moved to them — the same "junk PRs queued ahead of the fix" bug this
     // reopen exists to prevent, one level up. Everything under the blocked branch
     // is blocked, wherever the case that found it happened to live.
-    const ownerSubtree =
-      ownerBranch === branch
-        ? []
-        : [ownerBranch, ...transitiveDescendants(planEdgesOf(dir), ownerBranch)];
+    const planEdges = planEdgesOf(dir);
+    const ownerSubtree = owned.flatMap((o) =>
+      o.ownerBranch === branch ? [] : [o.ownerBranch, ...transitiveDescendants(planEdges, o.ownerBranch)],
+    );
     reopen(dir, [...new Set([branch, ...rc.descendants, ...ownerSubtree])]);
 
     // PRESERVE THE AGENT'S WORK. Reopening re-derives the branch, and the next
@@ -7880,34 +7991,79 @@ async function adjudicateNotMyBug(p: {
       /* best-effort: losing the pin costs the agent a re-resolve, not correctness */
     }
 
-    const gate = await materializeGateFixCases(cli, dir, ctx.chain, gateOutput, failedCommands, null, {
-      rootBranch: ownerBranch,
-      ...(rootedBelowTip ? { rootAt } : {}),
-      // REPRODUCTION CHARACTER, carried to the briefing. The bisect had to fall
-      // back to the FULL failing command because the narrowed probe did not
-      // reproduce — i.e. the failure needs the whole suite running. The driver
-      // knew that and said it in a parenthetical at the bottom of the captured
-      // output; on 2026-08-10 the agent spent 70 minutes and two rejected fixes
-      // debugging a full-suite-only timeout it could never observe (it may not
-      // run tests), and both of its root causes were wrong by its own account.
-      // Whether a failure is observable at all decides what to DO with it, so it
-      // belongs at the top of the briefing rather than in a log footer.
-      ...(bisect.usedFullCommand ? { fullSuiteOnly: true } : {}),
-    });
-    if (!gate.served) {
+    // ONE MINT PER PROVEN OWNER — the same one-case-per-owner shape the finish
+    // path's blame grouping already has, which this path used to collapse into
+    // a single `rootBranch` carrying every parsed file (pass 5bfdf9af0869).
+    // `ownedFiles` restricts each case to the files that owner was proven red
+    // in; nothing else may ride along.
+    const minted: GateFixCaseSummary[] = [];
+    const unserved: string[] = [];
+    let totalBisectProbes = 0;
+    for (const o of owned) {
+      totalBisectProbes += o.inv.bisect.probes;
+      const gateOutput =
+        `${failingOutput}\n\n--- not-my-bug ---\n${verdict.detail}\n${o.detail}\n${o.inv.bisect.detail}\n` +
+        (o.inv.introduced
+          ? `introduced by ${o.inv.introduced.sha} "${o.inv.introduced.subject}" (${o.inv.introduced.author})\n`
+          : '') +
+        (o.inv.bisect.usedFullCommand
+          ? `(the search ran the FULL failing command: narrowed to these files it does not reproduce)\n`
+          : '') +
+        (o.inv.rebaseNote ? `${o.inv.rebaseNote}\n` : '') +
+        (o.inv.dupNote ? `${o.inv.dupNote}\n` : '');
+      const gate = await materializeGateFixCases(cli, dir, ctx.chain, gateOutput, failedCommands, null, {
+        rootBranch: o.ownerBranch,
+        ownedFiles: o.files,
+        ...(o.inv.rootedBelowTip ? { rootAt: o.inv.rootAt } : {}),
+        // REPRODUCTION CHARACTER, carried to the briefing. The bisect had to fall
+        // back to the FULL failing command because the narrowed probe did not
+        // reproduce — i.e. the failure needs the whole suite running. The driver
+        // knew that and said it in a parenthetical at the bottom of the captured
+        // output; on 2026-08-10 the agent spent 70 minutes and two rejected fixes
+        // debugging a full-suite-only timeout it could never observe (it may not
+        // run tests), and both of its root causes were wrong by its own account.
+        // Whether a failure is observable at all decides what to DO with it, so it
+        // belongs at the top of the briefing rather than in a log footer.
+        ...(o.inv.bisect.usedFullCommand ? { fullSuiteOnly: true } : {}),
+      });
+      if (gate.served) minted.push(...gate.cases);
+      else unserved.push(`${o.ownerBranch} [${o.files.join(', ')}]: ${gate.reason}`);
+    }
+
+    // The remainder and any unserved owner go into the agent's mouth verbatim —
+    // the agent is the only channel to the owner, and a file that reaches
+    // neither a case nor the report is a silently lost defect.
+    const remainderNote = remainder
+      ? remainder.disposition === 'interaction'
+        ? ` NOT covered by any gate fix: ${remainder.files.join(', ')} — green on BOTH sides in isolation and red only ` +
+          `merged, so it is this merge's own defect; it will come back with the re-derived case. Report it to the owner.`
+        : ` NOT covered by any gate fix: ownership of ${remainder.files.join(', ')} could not be determined ` +
+          `(${remainder.detail}). Report it to the owner.`
+      : '';
+    const unservedNote = unserved.length ? ` No case could be prepared for: ${unserved.join('; ')}.` : '';
+
+    if (minted.length === 0) {
       // Already gated on origin, or already attempted this pass. Both are real
       // answers the agent must relay rather than retry. The reopen above already
       // superseded this case, so say so plainly instead of implying a retry: the
       // agent's next move is `next-case`, which re-derives the branch.
-      progress(`not-my-bug: no gate-fix case served — ${gate.reason}`);
+      progress(`not-my-bug: no gate-fix case served — ${unserved.join('; ')}`);
       const stNow = readMachineState(dir);
       writeMachineState(dir, { ...stNow!, phase: 'open', currentCase: null });
       result(cli, {
         status: 'stopped',
-        issues: [{ id: 'WARN09_GATE_FIX_SERVED', detail: gate.detail }],
-        notMyBug: { verdict: verdict.verdict, files: verdict.files, owner: owner.owner, ownerBranch, detail: verdict.detail },
+        issues: [{ id: 'WARN09_GATE_FIX_SERVED', detail: unserved.join('; ') }],
+        notMyBug: {
+          verdict: verdict.verdict,
+          files: verdict.files,
+          owner: owned[0].ownerKind,
+          ownerBranch: owned[0].ownerBranch,
+          owners: owned.map((o) => ({ owner: o.ownerKind, ownerBranch: o.ownerBranch, files: o.files })),
+          detail: verdict.detail,
+        },
         instruction:
-          `REPORT to the owner: ${verdict.detail}. ${owner.detail}. But ${gate.reason} — no new case could be prepared. ` +
+          `REPORT to the owner: ${verdict.detail}. ${owned.map((o) => o.detail).join(' ')} But ${unserved.join('; ')} — ` +
+          `no new case could be prepared.${remainderNote} ` +
           (preserved ? `Your resolution is preserved at ${keepRef}. ` : '') +
           `Run \`next-case\` to continue with the rest of the pass.`,
       });
@@ -7916,35 +8072,371 @@ async function adjudicateNotMyBug(p: {
 
     const st = readMachineState(dir);
     writeMachineState(dir, { ...st!, phase: 'open', currentCase: null });
-    const first = gate.cases[0];
-    progress(`not-my-bug: merge aborted; gate-fix case prepared on ${first.branch} — run next-case`);
-    console.error(`report-case: gate-fix ${first.caseId} prepared on ${first.branch}; case ${caseId} superseded`);
+    const first = minted[0];
+    const where = minted.map((c) => `${c.caseId} on ${c.branch} [${c.files.join(', ')}]`).join('; ');
+    progress(`not-my-bug: merge aborted; ${minted.length} gate-fix case(s) prepared (${where}) — run next-case`);
+    console.error(`report-case: gate-fix ${where} prepared; case ${caseId} superseded`);
+    const perOwner = owned
+      .map(
+        (o) =>
+          `${o.detail}. ` +
+          (o.inv.introduced
+            ? `Introduced by ${o.inv.introduced.sha.slice(0, 12)} "${o.inv.introduced.subject}" (${o.inv.introduced.author}). `
+            : `${o.inv.bisect.detail}. `) +
+          (o.inv.rebaseNote ? `${o.inv.rebaseNote} Put that line in the PR body. ` : '') +
+          (o.inv.dupNote ? `${o.inv.dupNote} Say so in the PR body. ` : ''),
+      )
+      .join(' ');
     result(cli, {
       status: 'gate-fix-required',
       // A PROCEED arm must never carry an ERR id — the agent obeys the id's
       // doctrine row, and an ERR row says "stop and report". WARN advises.
-      issues: [{ id: 'WARN09_GATE_FIX_SERVED', detail: gate.detail }],
+      issues: [{ id: 'WARN09_GATE_FIX_SERVED', detail: where }],
       notMyBug: {
         verdict: verdict.verdict,
         files: verdict.files,
-        owner: owner.owner,
-        ownerBranch,
-        probes: verdict.probes + owner.probes + bisect.probes,
+        owner: owned[0].ownerKind,
+        ownerBranch: owned[0].ownerBranch,
+        owners: owned.map((o) => ({ owner: o.ownerKind, ownerBranch: o.ownerBranch, files: o.files })),
+        probes: verdict.probes + partition.probes + totalBisectProbes,
         detail: verdict.detail,
       },
-      introducedBy: introduced,
-      ...(rebaseNote ? { rebaseNote } : {}),
-      ...(dupes.length ? { duplicates: dupes } : {}),
-      gateFix: { caseId: first.caseId, branch: first.branch, files: first.files, reason: gate.reason },
+      introducedBy: owned[0].inv.introduced,
+      ...(owned[0].inv.rebaseNote ? { rebaseNote: owned[0].inv.rebaseNote } : {}),
+      ...(owned[0].inv.dupes.length ? { duplicates: owned[0].inv.dupes } : {}),
+      gateFix: { caseId: first.caseId, branch: first.branch, files: first.files, reason: first.reason },
+      ...(minted.length > 1 ? { gateFixes: minted.map((c) => ({ caseId: c.caseId, branch: c.branch, files: c.files })) } : {}),
       instruction:
-        `Your resolution was not the problem: ${verdict.detail}. ${owner.detail}. ` +
-        (introduced
-          ? `Introduced by ${introduced.sha.slice(0, 12)} "${introduced.subject}" (${introduced.author}). `
-          : `${bisect.detail}. `) +
-        (rebaseNote ? `${rebaseNote} Put that line in the PR body. ` : '') +
-        (dupNote ? `${dupNote} Say so in the PR body. ` : '') +
-        `This case's merge is ABORTED and a gate-fix case is prepared on ${first.branch} — run \`next-case\`.` +
+        `Your resolution was not the problem: ${verdict.detail}. ${perOwner}` +
+        `This case's merge is ABORTED and ${minted.length === 1 ? `a gate-fix case is prepared on ${first.branch}` : `${minted.length} gate-fix cases are prepared (${where})`} — run \`next-case\`.` +
+        `${remainderNote}${unservedNote}` +
         (preserved ? ` Your resolution is preserved at ${keepRef} if this case comes back.` : ''),
+    });
+    return { handled: true, code: 1 };
+  } finally {
+    await dispose();
+    await disposeNarrow();
+  }
+}
+
+/** What `routeHeldGateFix` decided about a gate fix's `--tier held` claim. */
+interface HeldGateFixRoute {
+  /** True: the route emitted the result; the command is over. */
+  handled: boolean;
+  code?: number;
+  /** For the fall-through freeze: what the probe established, or why it could not run. */
+  note?: string;
+}
+
+/**
+ * `--tier held` on a GATE-FIX case: before freezing a prose diagnosis, ask the
+ * one question a probe can answer — is this defect ALREADY red at the head of
+ * the branch(es) ABOVE this one?
+ *
+ * The `--not-my-bug` exemption that used to cover this block is right for
+ * `classifyFailure` (a gate fix has no resolution and no pre-conflict tree, so
+ * "does it fail without your resolution" is trivially yes and adjudicating it
+ * would recurse) but wrong for OWNERSHIP, which needs only a tip and a parent
+ * head. Live 2026-08-10 (pass 5bfdf9af0869): the gate fix on
+ * `module/agent-group-contributions` froze into PR #81 asserting its fixes
+ * belong in `main_patched` and `module/command-gate` — claims a probe could
+ * have proven, and one of them verified true by hand (`/help` sits in
+ * FILTERED_COMMANDS while the branch's own merged test expects
+ * `gateCommand('/help') -> handle`). A proven claim becomes a CASE on the
+ * owning branch; prose is reserved for what cannot be proven.
+ *
+ * `locateOwner`'s tip-first shape is useless here — a gate fix's tip is red BY
+ * CONSTRUCTION — so the probe is `partitionAcrossParents`: parent heads only,
+ * red on sight, green believed only when seen twice. TERMINATION comes from
+ * machinery that already exists, verified per claim:
+ *   - each routed mint targets a DIRECT registry parent, so recursion moves
+ *     strictly up the DAG and the chain is finite;
+ *   - upstream `main` is never probed here (see below) and
+ *     `materializeGateFixCases` refuses to mint on it (WARN15);
+ *   - the bisect is floored at the trunk head (`findIntroducingCommit`);
+ *   - a repeat of the same (branch, files) defect is blocked in-pass by
+ *     `gateFixKey` and cross-pass by the open gate ref (`activeGateFixRef`);
+ *   - green-at-every-parent (the gate-fix reading of `interaction`: nobody
+ *     upstream owns it) STOPS the recursion and leaves the case here.
+ */
+async function routeHeldGateFix(p: {
+  cli: Cli;
+  ctx: PassCtx;
+  dir: string;
+  caseId: string;
+  rc: ResolvedCase;
+  journal: JournalEntry[];
+  checksFile: string | undefined;
+  wtPath: string;
+  resolvedTree: string;
+  emptyResolution: boolean;
+  issues: Issue[];
+  runChecks: ChecksRunner;
+  runInstall?: InstallRunner;
+}): Promise<HeldGateFixRoute> {
+  const { cli, ctx, dir, caseId, rc } = p;
+  const files = rc.conflictedPaths;
+  if (files.length === 0) return { handled: false };
+
+  // The branches ABOVE this one, from the registry — the same authority
+  // `reverifyGateFixCase` trusts. Upstream `main` is excluded twice over:
+  // minting there is refused (outside the mandate) and PROBING it is the
+  // 2026-08-04 hazard — upstream's head run with the fork's dependencies came
+  // back red for a module upstream declares, and a fully substantiated case
+  // was built for a defect that did not exist.
+  const parentsOf = directParentEdges(cli);
+  const declared = [...new Set(parentsOf.get(rc.branch) ?? (rc.branch === TRUNK_BRANCH ? [ROOT_BRANCH] : []))];
+  const candidates: string[] = [];
+  for (const b of declared) {
+    if (b === ROOT_BRANCH) continue;
+    if (await refExists(cli.repo, b)) candidates.push(b);
+  }
+  if (candidates.length === 0) {
+    return {
+      handled: false,
+      note: declared.includes(ROOT_BRANCH)
+        ? `ownership probe skipped: the only branch above ${rc.branch} is upstream ${ROOT_BRANCH}, outside the sweep's mandate`
+        : `ownership probe skipped: no parent branch of ${rc.branch} is resolvable`,
+    };
+  }
+  // Shallowest first: a defect red at several heads then roots at the
+  // shallowest — one fix every descendant inherits, not one per branch.
+  const { features } = loadRegistry({ inventoryDir: cli.inventory, scopeFile: cli.scopeFile, routingFile: cli.routingFile });
+  candidates.sort(byHierarchy(branchHierarchy(features)));
+
+  // Re-run EXACTLY what failed, from the driver's own journal row. Older rows
+  // carry names only; fall back to matching the checks config, then to the
+  // bare command string — a probe that then cannot run reports itself unusable
+  // rather than deciding anything.
+  const gateRow = p.journal.find((e) => e.action === 'gate-fix' && e.caseId === caseId);
+  let commands: VerifyCommand[] = Array.isArray(gateRow?.failedCommandSpecs)
+    ? (gateRow!.failedCommandSpecs as VerifyCommand[])
+    : [];
+  if (commands.length === 0) {
+    const names = Array.isArray(gateRow?.failedCommands) ? (gateRow!.failedCommands as string[]) : [];
+    const checks = loadChecksConfig(p.checksFile);
+    commands = checks ? [...checks.typecheck, ...checks.test].filter((c) => names.includes(c.cmd)) : [];
+    if (commands.length === 0) commands = names.map((cmd) => ({ cmd }));
+  }
+  if (commands.length === 0) {
+    return { handled: false, note: 'ownership probe skipped: the failing command could not be reconstructed from the journal' };
+  }
+
+  const heads: Array<{ branch: string; sha: string }> = [];
+  for (const b of candidates) heads.push({ branch: b, sha: await revParse(cli.repo, b) });
+
+  const { probe, runs, dispose } = makeSubsetProbe(cli, commands, p.runChecks, p.wtPath, p.runInstall);
+  const { probe: narrowProbe, runs: narrowRuns, dispose: disposeNarrow } = makeSubsetProbe(
+    cli,
+    commands,
+    p.runChecks,
+    p.wtPath,
+    p.runInstall,
+    { narrow: true },
+  );
+  try {
+    progress(`gate-fix held: probing ${heads.map((h) => h.branch).join(', ')} — is this defect already red above ${rc.branch}?`);
+    const part = await partitionAcrossParents(files, heads, probe, {
+      hasFile: async (sha, f) => (await git(cli.repo, ['cat-file', '-e', `${sha}:${f}`], { allowCodes: [1, 128] })).code === 0,
+    });
+    for (const g of part.groups) {
+      appendJournal(dir, {
+        action: 'gate-fix-owner',
+        caseId,
+        branch: rc.branch,
+        owner: g.branch,
+        ref: g.ref,
+        files: g.files,
+        probes: part.probes,
+        detail: g.detail,
+        runs,
+      });
+      progress(`gate-fix held: owner = ${g.branch} for [${g.files.join(', ')}] — ${g.detail}`);
+    }
+    if (part.selfOwned.length > 0 || part.unknown.length > 0) {
+      appendJournal(dir, {
+        action: 'gate-fix-owner',
+        caseId,
+        branch: rc.branch,
+        owner: 'self',
+        files: part.selfOwned,
+        unknown: part.unknown,
+        probes: part.probes,
+        detail:
+          part.selfOwned.length > 0
+            ? `green (twice) or absent at ${heads.map((h) => h.branch).join(', ')} — ${rc.branch}'s own`
+            : part.unknownDetail,
+      });
+    }
+    if (part.groups.length === 0) {
+      // Nobody upstream owns it, or nothing could be proven. The recursion
+      // STOPS and the held diagnosis stands — now carrying the probe's answer
+      // instead of only the agent's belief.
+      const note = part.unknown.length
+        ? `ownership probe inconclusive: ${part.unknownDetail}`
+        : `ownership probe: ${files.join(', ')} is green (confirmed twice) or absent at ` +
+          `${heads.map((h) => h.branch).join(', ')} — nobody upstream owns this; the fix belongs on ${rc.branch}`;
+      progress(`gate-fix held: ${note}`);
+      return { handled: false, note };
+    }
+
+    // PROVEN upstream: the claim becomes a case at the owner, not prose.
+    const trunkHead = await revParse(cli.repo, TRUNK_BRANCH).catch(() => '');
+    const failedOutput = gateFixFailedOutput(dir, caseId);
+    const owned: Array<{ ownerBranch: string; ref: string; files: string[]; detail: string; inv: OwnedFailureInvestigation }> =
+      [];
+    for (const g of part.groups) {
+      const inv = await investigateOwnedFailure({
+        cli,
+        dir,
+        caseId,
+        ownerBranch: g.branch,
+        ownerRef: g.ref,
+        files: g.files,
+        narrowProbe,
+        fullProbe: probe,
+        narrowRuns,
+        fullRuns: runs,
+        trunkHead,
+      });
+      owned.push({ ownerBranch: g.branch, ref: g.ref, files: g.files, detail: g.detail, inv });
+    }
+    const stays = [...part.selfOwned, ...part.unknown];
+
+    // A remainder the parents do NOT own keeps THIS case alive as a held PR
+    // scoped to it — frozen BEFORE the reopen so the disposition row precedes
+    // the `reopened` rows, same as every freeze path in this command.
+    if (stays.length > 0) {
+      await freezeHeld(
+        cli,
+        dir,
+        rc,
+        [
+          'gate fix: agent declared cannot-fix-in-scope (--tier held)',
+          `ownership probe: ${owned.map((o) => `[${o.files.join(', ')}] -> ${o.ownerBranch}`).join('; ')} routed to new case(s); ` +
+            `[${stays.join(', ')}] stays here${part.unknown.length ? ` (${part.unknownDetail})` : ''}`,
+        ],
+        {
+          resolvedTree: p.emptyResolution ? null : p.resolvedTree,
+          escalation: {
+            tag: ESCALATE_CHECKS,
+            feedback: `cannot be fixed within the case's named files; remaining here: ${stays.join(', ')}`.slice(
+              0,
+              COLDREAD_FEEDBACK_CAP,
+            ),
+          },
+        },
+      );
+    }
+
+    // Reopen FIRST, mint SECOND (supersession order, same as adjudicateNotMyBug:
+    // the minted case's rows must land AFTER the owner branch's `reopened` row
+    // or the mint is superseded the instant it is created). The owners' whole
+    // subtrees reopen — this branch is inside them, being a descendant of every
+    // proven owner — plus this case's own branch and descendants.
+    const planEdges = planEdgesOf(dir);
+    const subtrees = owned.flatMap((o) => [o.ownerBranch, ...transitiveDescendants(planEdges, o.ownerBranch)]);
+    reopen(dir, [...new Set([rc.branch, ...rc.descendants, ...subtrees])]);
+
+    // With the case routed away whole, an edited worktree would otherwise be
+    // lost to gc when the branch re-derives — pin it, as adjudicateNotMyBug
+    // does for an abandoned resolution. (The mixed arm ships the edits in the
+    // held PR instead, so no pin is needed there.)
+    const keepRef = `refs/sweep/abandoned/${caseId}`;
+    let preserved = false;
+    if (stays.length === 0 && !p.emptyResolution) {
+      try {
+        const commit = await deterministicCommit(cli.repo, p.resolvedTree, [rc.head.sha], `abandoned gate-fix attempt for ${caseId}`);
+        preserved = (await git(cli.repo, ['update-ref', keepRef, commit], { allowCodes: [1, 128] })).code === 0;
+        if (preserved) appendJournal(dir, { action: 'not-my-bug-preserved', caseId, ref: keepRef, tree: p.resolvedTree });
+      } catch {
+        /* best-effort: losing the pin costs a re-fix, not correctness */
+      }
+    }
+
+    const minted: GateFixCaseSummary[] = [];
+    const unserved: string[] = [];
+    for (const o of owned) {
+      const gateOutput =
+        `${failedOutput}\n\n--- gate-fix ownership ---\n${o.detail}\n${o.inv.bisect.detail}\n` +
+        (o.inv.introduced
+          ? `introduced by ${o.inv.introduced.sha} "${o.inv.introduced.subject}" (${o.inv.introduced.author})\n`
+          : '') +
+        (o.inv.rebaseNote ? `${o.inv.rebaseNote}\n` : '') +
+        (o.inv.dupNote ? `${o.inv.dupNote}\n` : '');
+      const gate = await materializeGateFixCases(cli, dir, ctx.chain, gateOutput, commands, null, {
+        rootBranch: o.ownerBranch,
+        ownedFiles: o.files,
+        ...(o.inv.rootedBelowTip ? { rootAt: o.inv.rootAt } : {}),
+        ...(o.inv.bisect.usedFullCommand ? { fullSuiteOnly: true } : {}),
+      });
+      if (gate.served) minted.push(...gate.cases);
+      else unserved.push(`${o.ownerBranch} [${o.files.join(', ')}]: ${gate.reason}`);
+    }
+
+    const st = readMachineState(dir);
+    if (stays.length > 0) {
+      writeMachineState(dir, { ...st!, phase: 'awaiting-pr', currentCase: { caseId, branch: rc.branch, tier: 'held' } });
+      progress(`gate-fix held (mixed): [${stays.join(', ')}] stays; routed ${owned.map((o) => o.ownerBranch).join(', ')}`);
+      console.error(`report-case: held ${caseId} for [${stays.join(', ')}]; rest routed to ${owned.map((o) => o.ownerBranch).join(', ')}`);
+      result(cli, {
+        instruction: prHandoff(
+          dir,
+          caseId,
+          `provide PR description — LIMIT it to ${stays.join(', ')}: the ownership probe proved the other failing ` +
+            `files belong upstream and ${
+              minted.length
+                ? `new case(s) were prepared (${minted.map((c) => `${c.caseId} on ${c.branch}`).join('; ')})`
+                : `yet no case could be prepared (${unserved.join('; ')}) — relay that to the owner`
+            }. State WHAT still fails here, WHY it cannot be fixed in the named files, and WHERE you believe the fix belongs`,
+        ),
+        tier: 'held',
+        gateFixOwnership: {
+          routed: owned.map((o) => ({ ownerBranch: o.ownerBranch, files: o.files })),
+          stays: part.selfOwned,
+          unknown: part.unknown,
+        },
+        ...(minted.length ? { gateFixes: minted.map((c) => ({ caseId: c.caseId, branch: c.branch, files: c.files })) } : {}),
+        issues: p.issues,
+      });
+      return { handled: true, code: 0 };
+    }
+
+    writeMachineState(dir, { ...st!, phase: 'open', currentCase: null });
+    if (minted.length === 0) {
+      // Gated or already attempted — real answers the agent relays, not retries.
+      progress(`gate-fix held: routed upstream but no case served — ${unserved.join('; ')}`);
+      result(cli, {
+        status: 'stopped',
+        issues: [{ id: 'WARN09_GATE_FIX_SERVED', detail: unserved.join('; ') }],
+        gateFixOwnership: { routed: owned.map((o) => ({ ownerBranch: o.ownerBranch, files: o.files })), stays: [], unknown: [] },
+        instruction:
+          `REPORT to the owner: ${owned.map((o) => o.detail).join(' ')} But ${unserved.join('; ')} — no new case could ` +
+          `be prepared.` +
+          (preserved ? ` Your attempt is preserved at ${keepRef}.` : '') +
+          ` Run \`next-case\` to continue with the rest of the pass.`,
+      });
+      return { handled: true, code: 1 };
+    }
+
+    const where = minted.map((c) => `${c.caseId} on ${c.branch} [${c.files.join(', ')}]`).join('; ');
+    progress(`gate-fix held: claim VERIFIED — case superseded; ${where} — run next-case`);
+    console.error(`report-case: held gate fix ${caseId} routed upstream (${where}); case superseded`);
+    result(cli, {
+      status: 'gate-fix-required',
+      // A PROCEED arm must never carry an ERR id — WARN advises (ERR42 lesson).
+      issues: [{ id: 'WARN09_GATE_FIX_SERVED', detail: where }],
+      gateFixOwnership: { routed: owned.map((o) => ({ ownerBranch: o.ownerBranch, files: o.files })), stays: [], unknown: [] },
+      introducedBy: owned[0].inv.introduced,
+      ...(owned[0].inv.rebaseNote ? { rebaseNote: owned[0].inv.rebaseNote } : {}),
+      ...(owned[0].inv.dupes.length ? { duplicates: owned[0].inv.dupes } : {}),
+      gateFix: { caseId: minted[0].caseId, branch: minted[0].branch, files: minted[0].files, reason: minted[0].reason },
+      ...(minted.length > 1 ? { gateFixes: minted.map((c) => ({ caseId: c.caseId, branch: c.branch, files: c.files })) } : {}),
+      instruction:
+        `Your held claim was VERIFIED, not just recorded: ${owned.map((o) => o.detail).join(' ')} ` +
+        `This case is superseded and the fix is re-minted at the proven owner — run \`next-case\`.` +
+        (unserved.length ? ` No case could be prepared for: ${unserved.join('; ')}.` : '') +
+        (preserved ? ` Your attempt is preserved at ${keepRef} if this defect comes back to you.` : ''),
     });
     return { handled: true, code: 1 };
   } finally {
@@ -8193,19 +8685,45 @@ export async function cmdSweepReportCase(
   // IS the outcome: the owner gets a PR carrying the diagnosis, which is exactly
   // what a fix nobody can make in scope should produce.
   if (isGateFixCase && claimed === 'held') {
-    await freezeHeld(cli, dir, rc, ['gate fix: agent declared cannot-fix-in-scope (--tier held)'], {
-      // An unchanged tree publishes no diff — the PR is the DIAGNOSIS. A tree
-      // with edits keeps them: a partial or wrong attempt the owner can read
-      // beats an empty exhibit (the D-061 B rule, same reasoning).
-      resolvedTree: emptyResolution ? null : resolvedTree,
-      escalation: {
-        tag: ESCALATE_CHECKS,
-        feedback: `cannot be fixed within the case's named files (${rc.conflictedPaths.join(', ')})`.slice(
-          0,
-          COLDREAD_FEEDBACK_CAP,
-        ),
-      },
+    // ADJUDICATE the claim before writing it down (2026-08-10, PR #81): "the
+    // fix belongs elsewhere" is provable with a parent-head probe, and a proven
+    // claim becomes a case at the owner. Only what the probe cannot route falls
+    // through to the prose freeze below — now carrying the probe's answer.
+    const routed = await routeHeldGateFix({
+      cli,
+      ctx,
+      dir,
+      caseId,
+      rc,
+      journal,
+      checksFile,
+      wtPath,
+      resolvedTree,
+      emptyResolution,
+      issues,
+      runChecks,
+      runInstall,
     });
+    if (routed.handled) return routed.code ?? 0;
+    await freezeHeld(
+      cli,
+      dir,
+      rc,
+      ['gate fix: agent declared cannot-fix-in-scope (--tier held)', ...(routed.note ? [routed.note] : [])],
+      {
+        // An unchanged tree publishes no diff — the PR is the DIAGNOSIS. A tree
+        // with edits keeps them: a partial or wrong attempt the owner can read
+        // beats an empty exhibit (the D-061 B rule, same reasoning).
+        resolvedTree: emptyResolution ? null : resolvedTree,
+        escalation: {
+          tag: ESCALATE_CHECKS,
+          feedback: `cannot be fixed within the case's named files (${rc.conflictedPaths.join(', ')})`.slice(
+            0,
+            COLDREAD_FEEDBACK_CAP,
+          ),
+        },
+      },
+    );
     reopen(dir, reopenTargets);
     writeMachineState(dir, { ...st, phase: 'awaiting-pr', currentCase: { caseId, branch: rc.branch, tier: 'held' } });
     progress(`gate fix held (cannot fix in scope): ${rc.branch}`);
@@ -8215,7 +8733,8 @@ export async function cmdSweepReportCase(
         dir,
         caseId,
         `provide PR description — you could not fix this within ${rc.conflictedPaths.join(', ')}. State WHAT fails, ` +
-          `WHY it cannot be fixed in those files, and WHERE you believe the fix belongs. That diagnosis IS the deliverable`,
+          `WHY it cannot be fixed in those files, and WHERE you believe the fix belongs. That diagnosis IS the deliverable` +
+          (routed.note ? `. Include the driver's finding: ${routed.note}` : ''),
       ),
       tier: 'held',
       issues,
@@ -9269,6 +9788,17 @@ async function materializeGateFixCases(
      * fix is then BEHIND the tip — the PR text carries the rebase note.
      */
     rootAt?: string;
+    /**
+     * With `rootBranch`: the exact files this owner was PROVEN to own. Without
+     * this, the rooted group re-parsed `failedOutput` and carried EVERY failing
+     * file in it: live pass 5bfdf9af0869 (2026-08-10), the ownership probe
+     * attributed 2 of 3 adjudicated files to the parent, yet the minted case's
+     * conflictedPaths came out as 4 — the unlocated remainder AND a conflicted
+     * path of the aborted case (which adjudication had explicitly dropped as
+     * the agent's own work) folded back in. The agent on that case could only
+     * answer "these belong to three different branches" in prose (PR #81).
+     */
+    ownedFiles?: string[];
   } = {},
 ): Promise<{ served: boolean; cases: GateFixCaseSummary[]; reason: string; detail: string; gated: string[] }> {
   const journal = readJournal(dir);
@@ -9312,7 +9842,7 @@ async function materializeGateFixCases(
     accused,
     cutPoints.duplicates,
   );
-  const files = a.files;
+  const files = opts.rootBranch && opts.ownedFiles?.length ? opts.ownedFiles : a.files;
   const commandNames = failedCommands.map((c) => c.cmd);
   // NO FILES, NO CASE. `cmdVerify`'s ROLLBACK arm (an offender isolated, rolled
   // back, HELD(gate), and the re-verify STILL red) journals no attributionFailed
@@ -9565,6 +10095,11 @@ async function materializeGateFixCases(
       // the scope guard then sees every commit in between as an agent edit and
       // demotes an in-scope fix to HELD for "scope exceeded".
       rootAt: tip,
+      // The full command SPECS (cmd/cwd/filter), not just names: the held-claim
+      // ownership probe (`routeHeldGateFix`) must re-run exactly what failed on
+      // the parent heads, and a name alone loses the cwd that decides where the
+      // command runs and how its output re-roots.
+      failedCommandSpecs: failedCommands,
       // Git evidence, not declarations: `<branch>@<depth>/<own commits>`.
       candidates: a.candidates.map((c) => `${c.branch}@${c.depth}/${c.commits}`),
     });
