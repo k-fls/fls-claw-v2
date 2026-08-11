@@ -147,12 +147,8 @@ function removeLegacyOnecliContainers(): string {
   return out.join('\n');
 }
 
-// The installer binds its own Postgres container to this port. When a local
-// Postgres already owns it, the installer fails fast with "Port <n> is
-// already in use" and names the exact port to reroute (its own error message
-// tells the user to `export POSTGRES_PORT=<n>` and retry). We parse that port
-// out of stderr and retry once with an auto-picked free port rather than
-// making the user do it by hand.
+// The installer's own failure message names the busy port and suggests
+// exporting POSTGRES_PORT manually; parsing it lets us automate that fix.
 export function extractPortConflict(stderr: string | undefined): number | null {
   if (!stderr) return null;
   const match = stderr.match(/Port (\d+) is already in use/i);
@@ -202,10 +198,8 @@ export async function installOnecli(
       });
       gw = runInstallFn(gatewayInstallCmd(freePort));
     } catch (err) {
-      // No free port near the busy one -- keep the original (pre-retry)
-      // failure so the caller still gets this module's structured
-      // 'install_failed' error and the real installer stderr, instead of an
-      // unrelated exception bubbling past this function entirely.
+      // No free port nearby -- fall through to the original conflict
+      // failure instead of letting this escape the structured error path.
       log.error('No free port found for OneCLI Postgres; keeping the original install failure', {
         busyPort: conflictPort,
         err: (err as Error).message,
