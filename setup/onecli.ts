@@ -13,6 +13,7 @@
  */
 import { execFileSync, execSync } from 'child_process';
 import fs from 'fs';
+import net from 'net';
 import os from 'os';
 import path from 'path';
 
@@ -146,14 +147,56 @@ function removeLegacyOnecliContainers(): string {
   return out.join('\n');
 }
 
-function installOnecli(): { stdout: string; ok: boolean } {
+// The installer binds its own Postgres container to this port. When a local
+// Postgres already owns it, the installer fails fast with "Port <n> is
+// already in use" and names the exact port to reroute (its own error message
+// tells the user to `export POSTGRES_PORT=<n>` and retry). We parse that port
+// out of stderr and retry once with an auto-picked free port rather than
+// making the user do it by hand.
+export function extractPortConflict(stderr: string | undefined): number | null {
+  if (!stderr) return null;
+  const match = stderr.match(/Port (\d+) is already in use/i);
+  return match ? Number(match[1]) : null;
+}
+
+function isPortFree(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.once('error', () => resolve(false));
+    srv.once('listening', () => srv.close(() => resolve(true)));
+    srv.listen(port, '127.0.0.1');
+  });
+}
+
+export async function findFreePort(start: number, range = 20): Promise<number> {
+  for (let port = start; port < start + range; port++) {
+    if (await isPortFree(port)) return port;
+  }
+  throw new Error(`No free port found near ${start} for OneCLI Postgres`);
+}
+
+function gatewayInstallCmd(postgresPort?: number): string {
+  const portExport = postgresPort ? `export POSTGRES_PORT=${postgresPort} && ` : '';
+  return `${portExport}export ONECLI_VERSION=${ONECLI_GATEWAY_VERSION} && curl -fsSL onecli.sh/install | sh`;
+}
+
+async function installOnecli(): Promise<{ stdout: string; ok: boolean }> {
   let stdout = '';
 
   const cleanup = removeLegacyOnecliContainers();
   if (cleanup) stdout += cleanup + '\n';
 
   // Gateway install (docker-compose based, no rate-limit concerns).
-  const gw = runInstall(`export ONECLI_VERSION=${ONECLI_GATEWAY_VERSION} && curl -fsSL onecli.sh/install | sh`);
+  let gw = runInstall(gatewayInstallCmd());
+  const conflictPort = !gw.ok ? extractPortConflict(gw.stderr) : null;
+  if (conflictPort) {
+    const freePort = await findFreePort(conflictPort + 1);
+    log.warn('OneCLI Postgres port already in use; retrying install on a free port', {
+      busyPort: conflictPort,
+      port: freePort,
+    });
+    gw = runInstall(gatewayInstallCmd(freePort));
+  }
   stdout += gw.stdout;
   if (!gw.ok) {
     log.error('OneCLI gateway install failed', { stderr: gw.stderr });
@@ -395,7 +438,7 @@ export async function run(args: string[]): Promise<void> {
   }
 
   log.info('Installing OneCLI gateway and CLI');
-  const res = installOnecli();
+  const res = await installOnecli();
   if (!res.ok) {
     emitStatus('ONECLI', {
       INSTALLED: false,
