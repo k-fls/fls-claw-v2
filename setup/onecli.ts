@@ -180,22 +180,37 @@ function gatewayInstallCmd(postgresPort?: number): string {
   return `${portExport}export ONECLI_VERSION=${ONECLI_GATEWAY_VERSION} && curl -fsSL onecli.sh/install | sh`;
 }
 
-async function installOnecli(): Promise<{ stdout: string; ok: boolean }> {
+export async function installOnecli(
+  runInstallFn: typeof runInstall = runInstall,
+  findFreePortFn: typeof findFreePort = findFreePort,
+  installCliFn: typeof installOnecliCliDirect = installOnecliCliDirect,
+): Promise<{ stdout: string; ok: boolean }> {
   let stdout = '';
 
   const cleanup = removeLegacyOnecliContainers();
   if (cleanup) stdout += cleanup + '\n';
 
   // Gateway install (docker-compose based, no rate-limit concerns).
-  let gw = runInstall(gatewayInstallCmd());
+  let gw = runInstallFn(gatewayInstallCmd());
   const conflictPort = !gw.ok ? extractPortConflict(gw.stderr) : null;
   if (conflictPort) {
-    const freePort = await findFreePort(conflictPort + 1);
-    log.warn('OneCLI Postgres port already in use; retrying install on a free port', {
-      busyPort: conflictPort,
-      port: freePort,
-    });
-    gw = runInstall(gatewayInstallCmd(freePort));
+    try {
+      const freePort = await findFreePortFn(conflictPort + 1);
+      log.warn('OneCLI Postgres port already in use; retrying install on a free port', {
+        busyPort: conflictPort,
+        port: freePort,
+      });
+      gw = runInstallFn(gatewayInstallCmd(freePort));
+    } catch (err) {
+      // No free port near the busy one -- keep the original (pre-retry)
+      // failure so the caller still gets this module's structured
+      // 'install_failed' error and the real installer stderr, instead of an
+      // unrelated exception bubbling past this function entirely.
+      log.error('No free port found for OneCLI Postgres; keeping the original install failure', {
+        busyPort: conflictPort,
+        err: (err as Error).message,
+      });
+    }
   }
   stdout += gw.stdout;
   if (!gw.ok) {
@@ -203,7 +218,7 @@ async function installOnecli(): Promise<{ stdout: string; ok: boolean }> {
     return { stdout: stdout + (gw.stderr ?? ''), ok: false };
   }
 
-  const cli = installOnecliCliDirect();
+  const cli = installCliFn();
   stdout += cli.stdout;
   if (!cli.ok) {
     log.error('OneCLI CLI install failed');

@@ -7,9 +7,9 @@
  */
 import net from 'net';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import { extractPortConflict, findFreePort, verifyGatewayV1 } from './onecli.js';
+import { extractPortConflict, findFreePort, installOnecli, verifyGatewayV1 } from './onecli.js';
 
 function fakeFetch(behavior: 'ok' | '404' | 'down'): typeof fetch {
   return (async () => {
@@ -59,5 +59,59 @@ describe('findFreePort', () => {
     } finally {
       busy.close();
     }
+  });
+});
+
+describe('installOnecli', () => {
+  const conflictStderr = 'Error: Port 5432 is already in use (probably a local PostgreSQL).';
+
+  it('retries once with POSTGRES_PORT after a port-conflict failure, then succeeds', async () => {
+    const runInstallFn = vi
+      .fn()
+      .mockReturnValueOnce({ stdout: '', stderr: conflictStderr, ok: false })
+      .mockReturnValueOnce({ stdout: 'https://example.local installed', ok: true });
+    const findFreePortFn = vi.fn().mockResolvedValue(5433);
+    const installCliFn = vi.fn().mockReturnValue({ stdout: 'cli installed', ok: true });
+
+    const result = await installOnecli(runInstallFn, findFreePortFn, installCliFn);
+
+    expect(result.ok).toBe(true);
+    expect(runInstallFn).toHaveBeenCalledTimes(2);
+    expect(findFreePortFn).toHaveBeenCalledWith(5433);
+    expect(runInstallFn.mock.calls[1][0]).toContain('export POSTGRES_PORT=5433 && ');
+  });
+
+  it('fails without a second retry when the retried install also fails', async () => {
+    const runInstallFn = vi
+      .fn()
+      .mockReturnValueOnce({ stdout: '', stderr: conflictStderr, ok: false })
+      .mockReturnValueOnce({ stdout: '', stderr: 'still broken', ok: false });
+    const findFreePortFn = vi.fn().mockResolvedValue(5433);
+
+    const result = await installOnecli(runInstallFn, findFreePortFn);
+
+    expect(result.ok).toBe(false);
+    expect(runInstallFn).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry when the failure is not a port conflict', async () => {
+    const runInstallFn = vi.fn().mockReturnValueOnce({ stdout: '', stderr: 'docker: command not found', ok: false });
+    const findFreePortFn = vi.fn();
+
+    const result = await installOnecli(runInstallFn, findFreePortFn);
+
+    expect(result.ok).toBe(false);
+    expect(runInstallFn).toHaveBeenCalledTimes(1);
+    expect(findFreePortFn).not.toHaveBeenCalled();
+  });
+
+  it('keeps the original failure (does not throw) when no free port can be found', async () => {
+    const runInstallFn = vi.fn().mockReturnValueOnce({ stdout: '', stderr: conflictStderr, ok: false });
+    const findFreePortFn = vi.fn().mockRejectedValue(new Error('No free port found near 5433 for OneCLI Postgres'));
+
+    const result = await installOnecli(runInstallFn, findFreePortFn);
+
+    expect(result.ok).toBe(false);
+    expect(runInstallFn).toHaveBeenCalledTimes(1);
   });
 });
