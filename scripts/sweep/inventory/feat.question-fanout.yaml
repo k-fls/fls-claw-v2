@@ -1,0 +1,43 @@
+id: feat.question-fanout
+name: Question fan-out coordinator (design 08 WS-C)
+kind: feat
+status: in-progress
+branch: feat/question-fanout
+parents:
+- main_patched
+dependents: []
+summary: 'Q&A fan-out coordinator with quiet-hours gate: routes owner-directed questions to configured
+  surfaces (migration 021 question-surfaces), tracks answers, respects quiet hours (design 08 §3.3, §4.2,
+  §6).'
+owned_paths:
+- src/modules/question-fanout/**
+- src/db/migrations/021-question-surfaces.ts
+touch_paths:
+- src/host-sweep.ts
+- src/modules/index.ts
+- src/db/migrations/index.ts
+key_symbols: []
+symbol_watch: []
+invariants: []
+design_docs:
+- docs/design/08-implementation-plan.md@design/flsclaw
+test_anchors:
+- src/modules/question-fanout/coordinator.test.ts
+overlap_hints: Upstream adding ask-the-user routing, notification digests, or do-not-disturb/quiet-hours
+  handling is OVERLAP-HIGH.
+routing:
+  keywords:
+  - question
+  - fanout
+  - quiet-hours
+  - notify
+  - surface
+  always_check_on: []
+prompt:
+  template: prompts/overlap-check.md
+maintenance:
+  owner: sweep-agent-group
+  last_verified: '2026-07-10'
+  verified_against: ab965f57727d0e68129cb013299408aa48e8c177
+  notes: skeleton — needs enrichment. WS-C; consumes the frozen OpsRegistry contract (feat.ops-registry)
+    for surface lookup; merges after WS-K (shared delivery.ts).

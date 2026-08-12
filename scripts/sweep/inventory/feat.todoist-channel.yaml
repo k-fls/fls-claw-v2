@@ -1,0 +1,51 @@
+id: feat.todoist-channel
+name: Todoist channel adapter (design 08 WS-A)
+kind: feat
+status: in-progress
+branch: feat/todoist-channel
+parents:
+- main_patched
+dependents: []
+summary: 'Todoist as a chat channel: polling ingest (item = thread) with a webhook path scaffolded, REST
+  writes, echo suppression via a ledger, idempotent traces, and channel registration.'
+owned_paths:
+- src/channels/todoist.ts
+- src/channels/todoist.test.ts
+- src/channels/todoist-client.ts
+- src/channels/todoist-ledger.ts
+- src/channels/todoist-ledger.test.ts
+- src/channels/todoist-webhook.ts
+- src/channels/todoist-webhook.test.ts
+- src/channels/todoist-registration.test.ts
+touch_paths:
+- src/channels/index.ts
+- src/channels/channel-registry.ts
+key_symbols: []
+symbol_watch: []
+invariants: []
+design_docs:
+- docs/design/08-implementation-plan.md@design/flsclaw
+test_anchors:
+- src/channels/todoist.test.ts
+- src/channels/todoist-ledger.test.ts
+- src/channels/todoist-webhook.test.ts
+- src/channels/todoist-registration.test.ts
+overlap_hints: Upstream shipping a Todoist (or generic task-manager) channel/integration is OVERLAP-HIGH;
+  channel-registry or adapter-interface changes are OVERLAP-TOUCH.
+routing:
+  keywords:
+  - todoist
+  - channel
+  - webhook
+  - polling
+  - task
+  always_check_on: []
+prompt:
+  template: prompts/overlap-check.md
+maintenance:
+  owner: sweep-agent-group
+  last_verified: '2026-07-10'
+  verified_against: 9d20c363ee532aaa20d7f8bb61e5100105e97aa1
+  notes: 'skeleton — needs enrichment. WS-A done+reviewed. F1 (deferred): attribution-as-owner assumes
+    single-user Todoist projects; loud warn on foreign posted_uid; full posted_uid routing is the follow-up
+    before any shared project.'

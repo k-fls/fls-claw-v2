@@ -1,0 +1,40 @@
+id: planned.estate-config
+name: Estate config + doctrine seeds (design 08 WS-J)
+kind: planned
+status: planned
+parents: []
+dependents: []
+summary: 'Planned: the estate/ configuration content — ops registry YAML content, doctrine seeds estate/ops/{cos,tenant-parent}/CLAUDE.md
+  (design 08 §4.3), and a bring-up script. No code branch; lands with integration (J1 after A+B, J2 after
+  D).'
+owned_paths:
+- estate/**
+touch_paths: []
+key_symbols: []
+symbol_watch:
+- estate|doctrine
+invariants: []
+design_docs:
+- docs/design/08-implementation-plan.md@design/flsclaw
+- docs/design/08-personal-ops-setup.md@design/flsclaw
+test_anchors: []
+overlap_hints: Upstream introducing an estate/, fleet-config, or seeded-CLAUDE.md convention, or reserving
+  the estate/ path, would collide.
+routing:
+  keywords:
+  - estate
+  - doctrine
+  - registry
+  - seed
+  always_check_on:
+  - new-top-level-dir
+prompt:
+  template: prompts/overlap-check.md
+  extra_context: Planned-only configuration content (no code). The runtime reader of estate/registry.yaml
+    is feat.ops-registry.
+maintenance:
+  owner: sweep-agent-group
+  last_verified: '2026-07-10'
+  verified_against: null
+  notes: planned — content workstream WS-J; no branch will exist (lands with integration); retire when
+    estate/ content ships.

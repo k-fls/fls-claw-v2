@@ -1,0 +1,46 @@
+id: module.runtime-updater
+name: Agent runtime version tracking + auto-update
+kind: module
+status: shipped
+branch: module/runtime-updater
+parents:
+- module/interactions-helpers
+dependents: []
+summary: 'Tracks the managed agent-runtime version per group and auto-updates it: runtime-version migration
+  (16-fls-01), runtime-auto-update DB helpers, updater/manager module, and the `ncl agent-runtime` command.'
+owned_paths:
+- src/modules/runtime-updater/**
+- src/commands/agent-runtime.ts
+- src/commands/agent-runtime.test.ts
+- src/db/runtime-auto-update.ts
+- src/db/migrations/16-fls-01-runtime-version.ts
+- docs/agent-runtime.md
+touch_paths:
+- src/db/migrations/index.ts
+- src/container-config.ts
+- src/container-runner.ts
+- src/index.ts
+key_symbols: []
+symbol_watch: []
+invariants: []
+design_docs:
+- docs/agent-runtime.md@module/runtime-updater
+test_anchors:
+- src/modules/runtime-updater/manager.test.ts
+- src/modules/runtime-updater/updater.test.ts
+overlap_hints: Upstream adding runtime/SDK version pinning, auto-upgrade of the agent runner, or migration-driven
+  version tracking.
+routing:
+  keywords:
+  - runtime
+  - update
+  - upgrade
+  - version
+  always_check_on: []
+prompt:
+  template: prompts/overlap-check.md
+maintenance:
+  owner: sweep-agent-group
+  last_verified: '2026-07-10'
+  verified_against: 677714a9b0c08bd880ebe43bfb0d3ebef94a372e
+  notes: skeleton — needs enrichment

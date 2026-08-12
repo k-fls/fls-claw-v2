@@ -1,0 +1,65 @@
+id: feat.maintenance-sweep
+name: Upstream-sweep tooling (design 02 §5 mechanics, M0 operator CLI)
+kind: feat
+status: in-progress
+branch: feat/maintenance-sweep
+parents:
+- main_patched
+dependents: []
+summary: 'The scripted core of the self-maintenance pipeline: sweep.ts CLI (scan, stop-points,
+  DAG-ordered merge with rerere, everything-rebuild verify, state journaling, registry
+  validation/routing, test-case replay). Consumes this registry branch via git show; dry-run
+  by default, mutations gated behind --execute.'
+owned_paths:
+- scripts/sweep/**
+touch_paths:
+- package.json
+- pnpm-lock.yaml
+key_symbols:
+- "sweep.ts subcommands: fetch|ff-main|scan|stop-points|merge|verify|record|status|validate-registry|route|replay — scripts/sweep/sweep.ts"
+symbol_watch:
+- "upstream[_ -]?(sync|sweep|merge)|fork[_ -]?maint"
+- "merge-tree|rerere"
+invariants:
+- "New-style git merge-tree only (never --merge-base single-base preview); merge unit is the
+  upstream first-parent commit; everything branch is verification-only."
+- "sweep-state.json and fork-registry/** live on maint/fork-registry and are mutated only via
+  script subcommands (journaled)."
+design_docs:
+- docs/design/02-self-maintaining-flsclaw.md@design/flsclaw
+test_anchors:
+- scripts/sweep/sweep.test.ts
+- scripts/sweep/scan.test.ts
+- scripts/sweep/merge.test.ts
+- scripts/sweep/replay.test.ts
+overlap_hints: Upstream adding its own fork-maintenance/upstream-sync automation, a merge-queue,
+  or update-nanoclaw skill rework is OVERLAP-HIGH; changes to scripts/ conventions, vitest
+  scripts glob, or the yaml dependency are OVERLAP-TOUCH.
+routing:
+  keywords:
+  - sweep
+  - upstream
+  - fork
+  - merge
+  - update-nanoclaw
+  always_check_on: []
+prompt:
+  template: prompts/overlap-check.md
+  extra_context: >
+    DECIDED 2026-07-21 (owner, from freeze-PR forensics, ex-PR #55): for
+    src/cli/resources/wirings.ts conflicts vs main_patched — main_patched
+    ensureAgentDestinationForWiring (src/db/messaging-groups.ts:213) VERIFIED to
+    replace the fork customOperations.create + createMessagingGroupAgent call
+    (creates the agent_destinations row, guarded). Take main_patched side;
+    fork-only threads/priority fields must survive. Resolve as judged; do NOT
+    freeze or re-ask.
+    RECORDED 2026-07-21 (G1): (1) container/agent-runner/src/current-batch.ts
+    modify/delete vs upstream — KEEP the fork file (intentional divergence, PR #4).
+    (2) src/db/migrations/** numbering collisions — fork side-numbering convention
+    NN-fls-MM / flsMigrationNNN; renumber the fork migration, never upstreams.
+maintenance:
+  owner: sweep-agent-group
+  last_verified: '2026-07-10'
+  verified_against: 4d24f6c83b4c6d2530fe7d8c61767d19c7f6a8d8
+  notes: 'skeleton — created by the orchestrator to close the validator rule-5 ALERT; scope-gap
+    fix and DESIGN.md commits will advance the tip past verified_against.'
