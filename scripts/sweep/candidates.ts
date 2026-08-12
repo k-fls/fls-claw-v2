@@ -1,6 +1,6 @@
 /**
  * scripts/sweep/candidates.ts — inventory-candidate discovery with mechanical
- * inheritance derivation (PROPAGATION.md §13, D-045).
+ * inheritance derivation (DRIVER.md §3.7, D-045).
  *
  * DETECTION: branches (local or origin/*) matching the sweepable namespaces
  * (config REGISTRY_REQUIRED_GLOBS, minus scope exclusions) — plus branches the

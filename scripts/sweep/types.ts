@@ -62,7 +62,7 @@ export interface ScopeEntry {
   /** DAG parents (merge sources) for mergeModel 'parents'; empty otherwise. */
   parents: string[];
   /**
-   * D-045 (PROPAGATION.md §13): the branch has no local ref but exists as
+   * D-045 (DRIVER.md §4.7): the branch has no local ref but exists as
    * `origin/<branch>` — in scope, planned from the origin commit; `run
    * --execute` creates the local branch at the origin tip before its first
    * mutation. Absent/false for locally-present branches.
@@ -127,7 +127,7 @@ export interface FeatureEntry {
    * `decided_paths` (D-048) optionally pins the paths a recorded decision
    * governs — `propagate publish` blocks (ERR05_DECIDED_ALREADY) a PR whose
    * conflicted paths hit either the explicit list or a path mentioned in the
-   * `extra_context` text (PROPAGATION.md §14).
+   * `extra_context` text (DRIVER.md §3.1).
    */
   prompt?: { template?: string; extra_context?: string; decided_paths?: string[] };
   maintenance?: { owner?: string; last_verified?: string; verified_against?: string; notes?: string };
@@ -179,7 +179,7 @@ export interface ValidationResult {
 }
 
 // ---------------------------------------------------------------------------
-// Mechanical propagation driver (PROPAGATION.md, D-035..D-040). New flat
+// Mechanical propagation driver (DRIVER.md §12.1, D-035..D-040). New flat
 // modules: heights / interval / tiers / plan / deferred / scope-guard / steps /
 // propagate. These are the shared data-model + JSON artifact schemas; the
 // per-module computational result types stay local to their modules.

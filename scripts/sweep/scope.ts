@@ -183,7 +183,7 @@ export function buildScope(
   const exclude = [...EXCLUDED_BRANCH_GLOBS, ...(scope.exclude ?? [])];
   const excluded = (b: string) => globMatchAny(exclude, b);
   const repoSet = new Set(repoBranches);
-  // D-045 (PROPAGATION.md §13): branches present ONLY as origin/* remote-tracking
+  // D-045 (DRIVER.md §4.7): branches present ONLY as origin/* remote-tracking
   // refs. An inventory branch found here (and not locally) is IN scope, flagged
   // `materialize` — planned from the origin commit, local ref created by
   // `run --execute` before its first mutation. A branch in NEITHER place stays

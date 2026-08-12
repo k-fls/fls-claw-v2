@@ -1,5 +1,5 @@
 id: p5-noop-skip-mitm-interactions-helpers
-class: 5 (no-op skip, PROPAGATION.md section 6)
+class: 5 (no-op skip, DRIVER.md section 4.5)
 status: verified
 title: >-
   Merging inventory parent module/interactions-helpers into

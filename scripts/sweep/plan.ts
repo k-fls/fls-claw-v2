@@ -1,7 +1,7 @@
 /**
  * scripts/sweep/plan.ts — DAG validation + breadth-wise whole-pass plan
  * derivation, including no-op/skip detection and the leaf/always_merge un-skip
- * logic (PROPAGATION.md §2/§6, D-036/D-039).
+ * logic (DRIVER.md §4.1/§4.5, D-036/D-039).
  *
  * The plan is a PURE derivation from git state + inventory: regenerating it must
  * be a no-op (idempotent, resumable — §7). Branches are processed strictly

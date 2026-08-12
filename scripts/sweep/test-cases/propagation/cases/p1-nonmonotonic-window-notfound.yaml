@@ -1,5 +1,5 @@
 id: p1-nonmonotonic-window-notfound
-class: 1 (non-monotonic conflict window, PROPAGATION.md section 3)
+class: 1 (non-monotonic conflict window, DRIVER.md section 4.3)
 status: not-found-closest-shape
 title: >-
   No branch in this repo has a conflict-at-k / clean-at-k+m window over the

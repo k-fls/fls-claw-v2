@@ -167,7 +167,7 @@ export interface BranchCandidate {
 
 /**
  * Resolve a branch NAME to something git can read: the local ref, else the
- * remote-tracking one (PROPAGATION.md §13 — an inventory branch may legitimately
+ * remote-tracking one (DRIVER.md §4.7 — an inventory branch may legitimately
  * exist only as `origin/<branch>`). Null when neither exists, which is not an
  * error: a planned entry simply has no history to blame. Cached — the same
  * branches would otherwise be re-resolved once per failing file.

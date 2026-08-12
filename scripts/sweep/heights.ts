@@ -1,6 +1,6 @@
 /**
  * scripts/sweep/heights.ts — watermark pinning, trunk-chain enumeration,
- * height<->sha, and coverage derivation (PROPAGATION.md §2).
+ * height<->sha, and coverage derivation (DRIVER.md §2.2).
  *
  * A PASS pins `upstream/main`'s tip once (the watermark); the trunk
  * first-parent chain is enumerated ONCE from the fork point and each commit

@@ -1,11 +1,11 @@
 /**
  * scripts/sweep/propagate.ts — mechanical propagation driver
- * (PROPAGATION.md §8, D-035..D-040).
+ * (DRIVER.md §4/§6, D-035..D-040).
  *
  * Usage:
  *   pnpm exec tsx scripts/sweep/propagate.ts <sweep-start|next-case|report-case|report-pr|sweep-finish|sweep-abort> [flags]
  *
- * The D-053 state machine (SWEEP-STATE-MACHINE.md) is the ONLY command surface —
+ * The D-053 state machine (DRIVER.md §1) is the ONLY command surface —
  * the same six commands `sweep-machine.ts` wraps under their agent-facing names.
  * The deterministic stages (plan, run, publish, push, verify, report) are
  * INTERNAL steps of those six and have no standalone entry point: `sweep-start`
@@ -2243,7 +2243,7 @@ async function removeCaseWorktree(cli: Cli, dir: string, caseId: string): Promis
 
 /**
  * D-054: the single machine-readable guidance line for a state-machine command
- * (SWEEP-STATE-MACHINE.md §2), written to STDOUT with the exact prefix
+ * (DRIVER.md §6), written to STDOUT with the exact prefix
  * `SWEEP-RESULT: ` (compact one-line JSON) — mirrors `progress`. The five
  * commands (+ abort) call this DIRECTLY, so exactly ONE line is produced per
  * command; the two-prefix contract is then unambiguous for a backgrounded
@@ -3707,7 +3707,7 @@ async function prepareCaseMaterials(cli: Cli, dir: string, rc: ResolvedCase, tie
     ...perSideBlocks(sides, rc.branch, rc.parent),
     '',
     'Write pr/title.txt and pr/body.md YOURSELF from studying the case, then run',
-    `\`propagate publish --case ${rc.id}\` (PROPAGATION.md §14, D-048).`,
+    `\`propagate publish --case ${rc.id}\` (D-048).`,
   ].join('\n');
   writeFileSync(join(prDir, 'materials.md'), materials + '\n');
   return fixBranch;
@@ -5386,13 +5386,13 @@ export async function cmdReport(cli: Cli): Promise<number> {
 }
 
 // ==========================================================================
-// D-053 — sweep state machine (SWEEP-STATE-MACHINE.md). The canonical
+// D-053 — sweep state machine (DRIVER.md §6). The canonical
 // AGENT-FACING surface: five commands (start / next-case / report-case /
 // report-pr / finish) plus `abort`, driven by a resumable machine-state record
 // in the pass dir. The agent has ZERO identifying params — the driver holds the
 // watermark, the current case, the phase and the journal — which structurally
 // removes the wrong-case / wrong-ref / stale-verdict / forged-plan bug classes
-// (SWEEP-STATE-MACHINE.md §1/§5). These functions WRAP the deterministic
+// (DRIVER.md §1/§6.7). These functions WRAP the deterministic
 // internals above (plan/run/reverify/merge/publish/verify/push) — they never
 // re-implement them. The ONLY LLM call in the loop is the cold read, run here
 // via an INJECTABLE invoker that shells `claude -p` (default) — there is NO
@@ -5403,7 +5403,7 @@ export async function cmdReport(cli: Cli): Promise<number> {
 // is superseded as the AGENT surface by these commands.
 // ==========================================================================
 
-/** Machine phases (SWEEP-STATE-MACHINE.md §5): a dead container resumes here. */
+/** Machine phases (DRIVER.md §6.7): a dead container resumes here. */
 type MachinePhase = 'open' | 'case-ready' | 'awaiting-pr' | 'finishing' | 'complete';
 
 interface MachineState {
@@ -6016,7 +6016,7 @@ function branchTestCommands(cli: Cli): VerifyCommand[] {
 }
 
 // --------------------------------------------------------------------------
-// `sweep start` / `sweep abort` (SWEEP-STATE-MACHINE.md §2).
+// `sweep start` / `sweep abort` (DRIVER.md §6.1/§6.6).
 // --------------------------------------------------------------------------
 
 /**
@@ -7018,7 +7018,7 @@ export async function cmdSweepAbort(cli: Cli): Promise<number> {
 }
 
 // --------------------------------------------------------------------------
-// `sweep next-case` (SWEEP-STATE-MACHINE.md §2).
+// `sweep next-case` (DRIVER.md §6.2).
 // --------------------------------------------------------------------------
 
 /**
@@ -7406,9 +7406,9 @@ export async function cmdSweepNextCase(
       `\`report-case\`, no escalation. Reading it again will not change that. Run ` +
       `\`report-case --tier held\` and write what you found: an unfixable case with a diagnosis is a ` +
       `valid outcome, an unanswered one is not.`;
-    appendJournal(dir, { action: 'case-serve-limit', id: 'ERR44_CASE_LOOPING', caseId: jc.caseId, branch: jc.branch, serves, detail });
-    console.error(`next-case [ERR44_CASE_LOOPING]: ${detail}`);
-    result(cli, { ok: false, status: 'looping', caseId: jc.caseId, serves, issues: [{ id: 'ERR44_CASE_LOOPING', detail }] });
+    appendJournal(dir, { action: 'case-serve-limit', id: 'ERR48_CASE_LOOPING', caseId: jc.caseId, branch: jc.branch, serves, detail });
+    console.error(`next-case [ERR48_CASE_LOOPING]: ${detail}`);
+    result(cli, { ok: false, status: 'looping', caseId: jc.caseId, serves, issues: [{ id: 'ERR48_CASE_LOOPING', detail }] });
     return 1;
   }
   const loopWarning =
@@ -7954,13 +7954,13 @@ async function adjudicateNotMyBug(p: {
 }
 
 // --------------------------------------------------------------------------
-// `report-case --tier mechanical|judged|held` (SWEEP-STATE-MACHINE.md §2).
+// `report-case --tier mechanical|judged|held` (DRIVER.md §6.4).
 // --------------------------------------------------------------------------
 
 /**
  * `report-case --tier <t>` (D-060) — the ONLY agent param is `--tier` (a claim;
  * the driver is demote-only) and it is the SINGLE quality gate. Branch order
- * (first match wins, SWEEP-STATE-MACHINE.md §report-case):
+ * (first match wins, DRIVER.md §6.4):
  *   1. held-duplicate → consolidate into the topmost held twin.
  *   2. adequacy block (ERR05 first-attempt steer / ERR06 duplicate).
  *   3. conflicts present + claim ≠ held → ERR32 (resolve first).
@@ -8042,7 +8042,7 @@ export async function cmdSweepReportCase(
   }
   const resolvedTree = await snapshotWorktreeTree(cli.repo, wtPath);
 
-  // --- deterministic checks (SWEEP-STATE-MACHINE.md §report-case) ------------
+  // --- deterministic checks (DRIVER.md §6.4) ------------
   const issues: Issue[] = [];
   const emptyResolution = resolvedTree === rc.automergeTree;
   const markers = await unresolvedMarkers(cli.repo, resolvedTree, rc.conflictedPaths);
@@ -8767,7 +8767,7 @@ export async function cmdSweepReportCase(
 }
 
 // --------------------------------------------------------------------------
-// `report-pr` (judged and held only) (SWEEP-STATE-MACHINE.md §2).
+// `report-pr` (judged and held only) (DRIVER.md §6.5).
 // --------------------------------------------------------------------------
 
 /**
@@ -8978,7 +8978,7 @@ export async function cmdSweepReportPr(
 }
 
 // --------------------------------------------------------------------------
-// `sweep finish` (SWEEP-STATE-MACHINE.md §2) — multi-step, resumable.
+// `sweep finish` (DRIVER.md §10.2) — multi-step, resumable.
 // --------------------------------------------------------------------------
 
 /**
@@ -10356,7 +10356,7 @@ export function reportDriverHalt(cli: Cli, err: DriverHalt): number {
   return 1;
 }
 
-// D-053 state machine (SWEEP-STATE-MACHINE.md) — the ONLY command surface. The
+// D-053 state machine (DRIVER.md §1) — the ONLY command surface. The
 // deterministic stages (plan/run/publish/push/verify/report) are internal steps
 // of these six; they have no standalone entry point.
 const HANDLERS: Record<string, (cli: Cli) => Promise<number>> = {

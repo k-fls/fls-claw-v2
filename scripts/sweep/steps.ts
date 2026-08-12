@@ -1,6 +1,6 @@
 /**
  * scripts/sweep/steps.ts — step/case JSON artifacts and their FIRST-PRINCIPLES
- * re-verification (PROPAGATION.md §7).
+ * re-verification (DRIVER.md §4.6).
  *
  * The driver is the only author of merge parameters, but the merge executor
  * NEVER trusts the file author: for every step it independently recomputes,

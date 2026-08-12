@@ -1,10 +1,10 @@
 /**
  * scripts/sweep/publish.ts — mechanics for `propagate publish --case <id>`
  * (the ONLY sanctioned PR-creation path) and the `propagate push` publication
- * stage (PROPAGATION.md §14, D-048/D-049).
+ * stage (DRIVER.md §10, D-048/D-049).
  *
  * Born from the 2026-07-21 forensic reviews of the freeze PRs, corrected the
- * same day by D-049 (MERGE-POLICY.md):
+ * same day by D-049 (DRIVER.md §10):
  *  - PR heads are REAL commits pushed by the driver via `git push` (D-049 §5;
  *    unified per D-057): HELD with a marker-clean resolution = the resolved
  *    merge commit (ACTIVE PR — the owner reviews & merges); HELD without one
@@ -33,7 +33,7 @@
  * Every check returns a machine-readable Issue {id, detail}; ERR* ids block,
  * WARN* ids are advisory. HALT_IDS maps the existing DriverHalt reasons onto
  * the same scheme for run/resolve CLI output. The registry of ids is
- * PROPAGATION.md §14 (single source of truth). ERR03/ERR04 (D-049, the exhibit
+ * DRIVER.md §11 (single source of truth). ERR03/ERR04 (D-049, the exhibit
  * mechanism) and ERR09/ERR10/WARN04 (D-050, the PR-text cold read) are retired
  * permanently and their numbers are never reused.
  *
@@ -53,7 +53,7 @@ import type { FeatureEntry } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Result ids (§14, D-048). ERR* blocks, WARN* is advisory. The full registry
-// with meanings + prescribed agent actions lives in PROPAGATION.md §14 and the
+// with meanings + prescribed agent actions lives in DRIVER.md §11 and the
 // doctrine's "Tool result IDs" table.
 // ---------------------------------------------------------------------------
 
@@ -178,7 +178,7 @@ export function renderMachineBlock(pendingCount: number, watermark12: string): s
     MACHINE_BLOCK_BEGIN,
     '## Sweep status (driver-maintained — do not edit)',
     `Pending upstream commits beyond this freeze: **${pendingCount}** (as of pass ${watermark12}).`,
-    'Kept current by posted urge comments (D-004, PROPAGATION.md §14.4).',
+    'Kept current by posted urge comments (D-004, DRIVER.md §5.5).',
     MACHINE_BLOCK_END,
   ].join('\n');
 }

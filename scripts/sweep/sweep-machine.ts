@@ -1,6 +1,6 @@
 /**
  * scripts/sweep/sweep-machine.ts — the AGENT-FACING sweep CLI
- * (SWEEP-STATE-MACHINE.md). Six commands, driven by a resumable machine-state
+ * (DRIVER.md §6). Six commands, driven by a resumable machine-state
  * record in the pass dir; the agent passes ZERO identifying params (no --case,
  * no --resolved-ref, no --branch) — the driver holds the watermark, the current
  * case, the phase and the journal.

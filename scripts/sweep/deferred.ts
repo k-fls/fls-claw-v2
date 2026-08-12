@@ -1,9 +1,9 @@
 /**
- * scripts/sweep/deferred.ts — the DEFERRED rule (MERGE-POLICY.md §1):
+ * scripts/sweep/deferred.ts — the DEFERRED rule (DRIVER.md §5.2):
  * pure height-MIN over the branch's BLOCKED DIRECT PARENTS.
  *
  * When branch X hits its OWN conflict at height `conflictHeight` (the run TOP,
- * MERGE-POLICY.md §2), it is DEFERRED — clean prefix committed, STOP, NO PR — iff any
+ * DRIVER.md §4.4), it is DEFERRED — clean prefix committed, STOP, NO PR — iff any
  * DIRECT parent is currently blocked (merge_status != NONE) AND the conflict is
  * at or above the LOWEST blocked parent's height:
  *
@@ -37,7 +37,7 @@ export interface DeferDecision {
 /**
  * Decide whether X's own conflict at `conflictHeight` is DEFERRED.
  *
- * @param conflictHeight  the TOP height of X's conflicting run (MERGE-POLICY.md §2).
+ * @param conflictHeight  the TOP height of X's conflicting run (DRIVER.md §4.4).
  * @param blockedParents  X's DIRECT parents that are blocked, with their heights.
  */
 export function checkDeferred(conflictHeight: number, blockedParents: BlockedParent[]): DeferDecision {

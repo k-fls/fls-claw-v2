@@ -1,5 +1,5 @@
 id: p7-conflict-profile-role-grant
-class: 7 (largest-clean-height / full linear conflict profile, PROPAGATION.md section 3)
+class: 7 (largest-clean-height / full linear conflict profile, DRIVER.md section 4.3)
 status: verified
 title: >-
   Full 98-height linear conflict profile of fix/main/role-grant-scope-clarity;

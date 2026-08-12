@@ -1,5 +1,5 @@
 id: p2-deferred-positive-hostrpc-egress
-class: 2 (deferred-positive, PROPAGATION.md section 5)
+class: 2 (deferred-positive, DRIVER.md section 5.2)
 status: verified
 title: >-
   module/host-rpc and its inventory child module/egress-lockdown both

@@ -2,8 +2,8 @@
  * scripts/sweep/verify.ts — everything-rebuild + test-matrix runner.
  *
  * Rebuilds the throwaway integration target from the recipe (ordered branch
- * list) in a TEMPORARY worktree: seed the recorded rerere cache (PROPAGATION.md
- * §9), reset
+ * list) in a TEMPORARY worktree: seed the recorded rerere cache (DRIVER.md
+ * §10.2), reset
  * --hard to the base ref, then sequential merges with rerere. Then runs the CI
  * command list (injectable — fixture tests use `true`/`false` stubs instead of
  * the real matrix). The recipe + base are the caller's (cmdVerify passes THIS
@@ -136,7 +136,7 @@ export interface VerifyOptions {
   /** Attribution rebuild attempts cap (default: recipe length). */
   maxAttribution?: number;
   /**
-   * Workspace rr-cache directory (PROPAGATION.md §9): installed into `.git/rr-cache` BEFORE
+   * Workspace rr-cache directory (DRIVER.md §12.3): installed into `.git/rr-cache` BEFORE
    * the recipe build so the rebuild replays the sweep's RECORDED resolutions
    * (the same install the driver's own merges do), not merely whatever preimages
    * happen to already live in the shared cache. Null/omitted → no seeding (fixtures).
@@ -233,7 +233,7 @@ async function buildAndTest(
 export async function verifyEverything(repo: string, opts: VerifyOptions): Promise<VerifyResult> {
   const baseRef = opts.baseRef ?? 'main';
   const commands = opts.commands ?? VERIFY_COMMANDS;
-  // Defense in depth (PROPAGATION.md §9): seed the shared rerere cache (common git dir, so the
+  // Defense in depth (DRIVER.md §10.2): seed the shared rerere cache (common git dir, so the
   // temp worktree's merges see it) with the sweep's recorded resolutions before
   // the rebuild — otherwise a would-be conflict that WAS resolved this pass
   // could reappear in the recipe build and mis-attribute a false offender.

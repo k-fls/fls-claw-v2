@@ -1,6 +1,6 @@
 /**
  * scripts/sweep/tiers.ts — tier types, floors, and the ONLY legal tier
- * transitions (PROPAGATION.md §1, D-035/D-015/D-012).
+ * transitions (DRIVER.md §8.1, D-035/D-015/D-012).
  *
  * Tier decisions are demote-only in the driver:
  *  - CLEAN vs conflict is computed mechanically (new-style merge-tree).

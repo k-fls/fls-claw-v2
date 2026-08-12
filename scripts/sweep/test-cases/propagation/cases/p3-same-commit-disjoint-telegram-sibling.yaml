@@ -1,5 +1,5 @@
 id: p3-same-commit-disjoint-telegram-sibling
-class: 3 (same-commit-disjoint, PROPAGATION.md section 5 negative rule)
+class: 3 (same-commit-disjoint, DRIVER.md section 5.2 negative rule)
 status: not-found-closest-shape
 title: >-
   Same-commit-DISJOINT with a true inventory ANCESTOR does not exist in this

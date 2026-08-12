@@ -101,8 +101,12 @@ history of both sides, the standing records in your case materials.
   and update every call site. `judged`.
   (c) Fields: both sides add fields to the same class, struct, interface or type —
   union them and update constructors, initializers and serializers. `judged`.
-  For (b) and (c) your allowed files extend to the files that reference the unioned
-  symbol; the driver computes that extension, and anything beyond it is out of scope.
+  For (b) and (c) the call sites usually live OUTSIDE the files you were given.
+  Updating them is correct and expected — but it takes the case out of scope, and the
+  driver treats that as an escalation rather than a mistake: the reviewer judges your
+  resolution, and if it agrees, the case goes to the owner as a pull request carrying
+  your work instead of merging in place. That is the intended ending for a union that
+  reaches call sites, so make the pull-request text explain the reach.
 - **A4 — verifiable subsumption.** One side's commits on the conflicted paths are
   ancestors of the other side's line, or are a verified textual superset of it. Take the
   superset. `mechanical`. An unverified claim of subsumption fails review even when it
@@ -181,10 +185,12 @@ plainly.
 If you believe the failure is NOT caused by your resolution — it was already broken —
 re-run `report-case` with `--not-my-bug` IN ADDITION to your `--tier`, never instead of
 it. The tier describes your edit; the flag describes the driver's test report; they are
-independent. It has no effect on your first `report-case` for a case: before the gate
-has run you cannot know a check failed, so a claim there is premature. You do not decide
-this — the driver proves or disproves it by running the same checks without your edits,
-and tells you the verdict:
+independent. It is IGNORED on the first failure reported to you — before the gate has
+told you a check failed you cannot have an informed opinion about it — and adjudicated
+from the second report of that failing check onward. It is also ignored on a gate-fix
+case and on a reissue, where the premise does not apply. You do not decide this — the
+driver proves or disproves it by running the same checks without your edits, and tells
+you the verdict:
 
 - **it was already broken** — the driver takes over: it either serves the fix as a
   gate-fix case on the branch that owns it, or widens your allowed files to include the

@@ -1,5 +1,5 @@
 id: p4-multi-parent-mitm
-class: 4 (multi-parent barrier / differing parent coverage, PROPAGATION.md sections 2 and 4)
+class: 4 (multi-parent barrier / differing parent coverage, DRIVER.md sections 4.1 and 4.2)
 status: verified
 title: >-
   feat/mitm-credential-proxy has six inventory parents whose merges bring

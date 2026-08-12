@@ -9,7 +9,7 @@
  * conflict, a linear oldest->newest sweep, merging at the LARGEST clean height
  * (which may lie beyond intermediate conflicting heights).
  *
- * Case stacking (MERGE-POLICY.md §2): the reported case STARTS at the smallest
+ * Case stacking (DRIVER.md §4.4): the reported case STARTS at the smallest
  * conflicting height above the merge point and is the MAXIMAL RUN of
  * consecutive conflicting heights whose conflicted path sets intersect (one
  * logical decision), capped (`stack_cap`, default 5). The run breaks at a
@@ -118,7 +118,7 @@ export interface MergePointResult {
   /** Largest clean head (§3 step 3); null when even the oldest head conflicts. */
   mergePoint: Head | null;
   /**
-   * The stacked conflict run ABOVE the merge point (§3 step 4; MERGE-POLICY.md §2):
+   * The stacked conflict run ABOVE the merge point (DRIVER.md §4.3 step 4 / §4.4):
    * starts at the smallest conflicting height, extends over consecutive
    * path-intersecting conflicting heights, capped. `head` is the run's TOP;
    * paths/tree are the top probe's.
@@ -141,7 +141,7 @@ function reproCommand(branch: string, headSha: string): { command: string } {
 /**
  * Linear merge-point sweep over an eligible line (§3). One full-range probe;
  * on conflict a linear oldest->newest sweep. Returns the largest clean head as
- * the merge point and the stacked conflict run above it as the case (MERGE-POLICY.md §2):
+ * the merge point and the stacked conflict run above it as the case (DRIVER.md §4.4):
  * the run starts at the smallest conflicting height and extends over
  * consecutive path-intersecting conflicting heights up to `stackCap`.
  */
@@ -199,7 +199,7 @@ export async function mergePointSweep(
   for (const p of probes)
     if (p.clean && (mergePoint === null || p.head.height > mergePoint.height)) mergePoint = p.head;
 
-  // Step 4 (MERGE-POLICY.md §2): the case run. It STARTS at the smallest conflicting
+  // Step 4 (DRIVER.md §4.4): the case run. It STARTS at the smallest conflicting
   // height above the merge point (when there is no clean head the floor is
   // below EVERY head — heights can be -1 (fork-only), so -Infinity, not -1, or
   // a fork-only conflict at height -1 would be missed) and STACKS consecutive

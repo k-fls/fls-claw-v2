@@ -96,7 +96,7 @@ export async function localBranches(repo: string): Promise<string[]> {
 /**
  * Branch names present on a remote (refs/remotes/<remote>/*, HEAD excluded),
  * WITHOUT the remote prefix. Input to the remote-branch scope rule
- * (PROPAGATION.md §13): an inventory branch with no local ref but an existing
+ * (DRIVER.md §4.7): an inventory branch with no local ref but an existing
  * origin/<branch> is still in scope.
  */
 export async function remoteBranches(repo: string, remote = 'origin'): Promise<string[]> {
@@ -309,7 +309,7 @@ export async function commitTreeMerge(
 }
 
 /**
- * Driver push (MERGE-POLICY.md §5): move a ref on origin via `git push` — the
+ * Driver push (DRIVER.md §10.3): move a ref on origin via `git push` — the
  * ONLY way refs move to the remote (the API is never used to fabricate
  * refs/commits as a push workaround). `src` is a committish (branch name or
  * sha); `dstBranch` the remote branch name. Never force — with ONE
@@ -318,7 +318,7 @@ export async function commitTreeMerge(
  * the caller passes the EXPECTED old sha as `forceWithLease` and the push
  * succeeds only if the remote ref is still exactly there (no blind force,
  * ever). Throws GitError on failure — callers journal the halt and surface
- * ERR15_PUSH_FAILED (an owner report per MERGE-POLICY.md §5, no fallback of
+ * ERR15_PUSH_FAILED (an owner report per DRIVER.md §10.3, no fallback of
  * any kind).
  */
 export async function gitPush(

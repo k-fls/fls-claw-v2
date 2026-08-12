@@ -81,7 +81,7 @@ export class FixtureRepo {
    * Fake an `origin` remote-tracking ref (refs/remotes/origin/<branch>) at
    * `at` (default: the branch itself). Lets tests simulate remote-only /
    * behind / ahead / diverged branch states without a second repo
-   * (PROPAGATION.md §13).
+   * (DRIVER.md §4.7).
    */
   setOrigin(branch: string, at?: string): string {
     const sha = this.sha(at ?? branch);
@@ -193,7 +193,7 @@ export function makeSweepFixture(): {
 }
 
 /**
- * Propagation fixture with a NON-MONOTONIC conflict window (PROPAGATION.md §3):
+ * Propagation fixture with a NON-MONOTONIC conflict window (DRIVER.md §4.3):
  *
  *   main / base       src/x.ts = "orig"
  *   fork              src/x.ts = "fork"                       (cut from base)

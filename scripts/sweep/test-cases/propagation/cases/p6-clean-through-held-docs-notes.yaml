@@ -1,5 +1,5 @@
 id: p6-clean-through-held-docs-notes
-class: 6 (clean-through-held / annotate-not-gate, PROPAGATION.md section 1 D-002)
+class: 6 (clean-through-held / annotate-not-gate, DRIVER.md section 8.1 D-002)
 status: verified
 title: >-
   docs/notes and fix/main/last-owner-guard merge the ENTIRE pending range

@@ -1,7 +1,7 @@
 # Mined propagation-driver test cases (2026-07-18)
 
 Real-DAG regression cases for the mechanical propagation driver
-(`scripts/sweep/PROPAGATION.md` §3–§6), mined from
+(`scripts/sweep/DRIVER.md` §4.3–§4.5), mined from
 `/home/user/workspace/fls/fls-claw-v2-clean` (fork k-fls/fls-claw-v2 of
 nanocoai/nanoclaw). Follows the conventions of
 `/home/user/workspace/fls/wt/feat-maintenance-sweep/scripts/sweep/test-cases/`

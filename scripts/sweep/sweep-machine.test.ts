@@ -5540,7 +5540,7 @@ describe('next-case — the serve bound (a case handed out and never concluded)'
     const out5 = join(ws, 'n5.json');
     expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: out5 }), greenPreMerge)).toBe(1);
     const r5 = JSON.parse(readFileSync(out5, 'utf8')) as { issues?: Array<{ id: string }> };
-    expect(r5.issues!.map((i) => i.id)).toContain('ERR44_CASE_LOOPING');
+    expect(r5.issues!.map((i) => i.id)).toContain('ERR48_CASE_LOOPING');
 
     // Every serve is on the record — `case` rows never showed this.
     const journal = readJournal(dir);
