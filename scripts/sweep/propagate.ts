@@ -7399,20 +7399,46 @@ export async function cmdSweepNextCase(
   // zero times" is answerable — it was not before: `case` rows come from `run`,
   // `report` and the gate-fix reopen, never from here, so a re-serve left no
   // trace at all.
+  // A REFUSED serve is not a serve. Journaling it as one inflated the counter
+  // (the live journal read "serves: 6" for four real hand-outs) and made the
+  // record claim the case had been given to the agent when it had not.
   const servedBefore = readJournal(dir).filter((e) => e.action === 'case-served' && e.caseId === jc.caseId).length;
   const serves = servedBefore + 1;
-  appendJournal(dir, { action: 'case-served', caseId: jc.caseId, branch: jc.branch, serves });
   if (serves > CASE_SERVE_LIMIT) {
+    // THE REFUSAL MUST LEAVE THE CASE CONCLUDABLE.
+    //
+    // This returned before `writeMachineState`, so the phase stayed `open` while
+    // the instruction said "run `report-case --tier held`" — and report-case
+    // answers "no case is ready — run next-case first". The driver told the
+    // agent to do the one thing this code path had just made impossible, and the
+    // agent (correctly) stopped and filed a stop-case rather than guess
+    // (2026-08-12, k-fls/fls-claw-v2#85: "the driver contradicts its own
+    // output"). The pass then could not complete: the case stays in `openCases`,
+    // so `finish` halts on ERR34_CASES_REMAIN with no way to drain it.
+    //
+    // So the case IS made ready — the refusal withdraws further investigation,
+    // not the ability to conclude. `report-case --tier held` is the only move
+    // the instruction offers and now the only one that works.
+    st = { ...st, phase: 'case-ready', currentCase: { caseId: jc.caseId, branch: jc.branch } };
+    writeMachineState(dir, st);
     const detail =
-      `case '${jc.caseId}' has been served ${serves} times and never concluded — no resolution, no ` +
-      `\`report-case\`, no escalation. Reading it again will not change that. Run ` +
-      `\`report-case --tier held\` and write what you found: an unfixable case with a diagnosis is a ` +
-      `valid outcome, an unanswered one is not.`;
+      `case '${jc.caseId}' has been handed out ${CASE_SERVE_LIMIT} times and never concluded — no resolution, ` +
+      `no \`report-case\`, no escalation. Reading it again will not change that. The case is READY: run ` +
+      `\`report-case --tier held\` and write what you found. An unfixable case with a diagnosis is a valid ` +
+      `outcome; an unanswered one is not, and nothing else will be served until this one concludes.`;
     appendJournal(dir, { action: 'case-serve-limit', id: 'ERR44_CASE_LOOPING', caseId: jc.caseId, branch: jc.branch, serves, detail });
     console.error(`next-case [ERR44_CASE_LOOPING]: ${detail}`);
-    result(cli, { ok: false, status: 'looping', caseId: jc.caseId, serves, issues: [{ id: 'ERR44_CASE_LOOPING', detail }] });
+    result(cli, {
+      ok: false,
+      status: 'looping',
+      caseId: jc.caseId,
+      serves,
+      issues: [{ id: 'ERR44_CASE_LOOPING', detail }],
+      instruction: `run \`report-case --tier held\` for ${jc.caseId} and write the diagnosis — that is the only action that advances this pass`,
+    });
     return 1;
   }
+  appendJournal(dir, { action: 'case-served', caseId: jc.caseId, branch: jc.branch, serves });
   const loopWarning =
     serves >= CASE_SERVE_WARN
       ? `WARN46_CASE_LOOPING: this case has now been served ${serves} times with no conclusion. If you are ` +

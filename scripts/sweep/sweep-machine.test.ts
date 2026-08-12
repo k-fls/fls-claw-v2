@@ -5536,15 +5536,25 @@ describe('next-case — the serve bound (a case handed out and never concluded)'
     expect(r3.materials).toContain('LOOP WARNING'); // the agent reads materials, not just the result
     // Serve 4: still allowed (the warning gets one chance to work).
     expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: join(ws, 'n4.json') }), greenPreMerge)).toBe(0);
-    // Serve 5: refused.
+    // Serve 5: refused — but the case must stay CONCLUDABLE. The refusal used to
+    // return before `writeMachineState`, so the phase stayed `open` while the
+    // instruction said "run report-case --tier held" — which then answered "no
+    // case is ready". The agent filed a stop-case for the contradiction and the
+    // pass could not drain the case (2026-08-12, #85).
     const out5 = join(ws, 'n5.json');
     expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: out5 }), greenPreMerge)).toBe(1);
-    const r5 = JSON.parse(readFileSync(out5, 'utf8')) as { issues?: Array<{ id: string }> };
+    const r5 = JSON.parse(readFileSync(out5, 'utf8')) as { issues?: Array<{ id: string }>; instruction?: string };
     expect(r5.issues!.map((i) => i.id)).toContain('ERR44_CASE_LOOPING');
+    expect(r5.instruction).toContain('--tier held');
+    const stAfter = machineState(dir);
+    expect(stAfter.phase).toBe('case-ready');
+    expect(stAfter.currentCase?.caseId).toBeTruthy();
+    // …and a refused serve is NOT counted as a serve.
+    expect(readJournal(dir).filter((e) => e.action === 'case-served').length).toBe(4);
 
     // Every serve is on the record — `case` rows never showed this.
     const journal = readJournal(dir);
-    expect(journal.filter((e) => e.action === 'case-served').length).toBe(5);
+    expect(journal.filter((e) => e.action === 'case-served').length).toBe(4); // refusals are not serves
     expect(journal.some((e) => e.action === 'case-serve-limit')).toBe(true);
   });
 
