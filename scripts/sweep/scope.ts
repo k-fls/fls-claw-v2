@@ -300,7 +300,7 @@ export function buildScope(
   for (const b of [...inventory].sort()) visit(b, []);
   if (cycle)
     throw new Error(
-      `scope DAG contains a cycle: ${cycle} — the inventory may only contain branches with proper/valid inheritance (PROPAGATION.md §13); fix the entries' parents before planning`,
+      `scope DAG contains a cycle: ${cycle} — the inventory may only contain branches with proper/valid inheritance; fix the entries' parents before planning`,
     );
 
   return {

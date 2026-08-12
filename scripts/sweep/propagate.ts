@@ -3612,7 +3612,7 @@ async function prepareCaseMaterials(cli: Cli, dir: string, rc: ResolvedCase, tie
     ...rc.conflictedPaths.map((p) => `- ${p}`),
     '',
     `Branch: ${rc.branch}   Parent: ${rc.parent}   Head: ${rc.head.sha.slice(0, 12)} (height ${rc.head.height})`,
-    `Case run (MERGE-POLICY.md §2, ${rc.run.length} height(s)): ${rc.run.map((h) => `h${h.height} ${h.sha.slice(0, 12)}`).join(', ')}`,
+    `Case run (${rc.run.length} height(s)): ${rc.run.map((h) => `h${h.height} ${h.sha.slice(0, 12)}`).join(', ')}`,
     `Pending upstream commits above this point: ${rc.pendingAbove}`,
     '',
     `## Reproduction`,
@@ -3623,7 +3623,7 @@ async function prepareCaseMaterials(cli: Cli, dir: string, rc: ResolvedCase, tie
     ...perSideBlocks(sides, rc.branch, rc.parent),
     '',
     'Write pr/title.txt and pr/body.md YOURSELF from studying the case, then run',
-    `\`propagate publish --case ${rc.id}\` (PROPAGATION.md §14).`,
+    `\`report-pr\`.`,
   ].join('\n');
   writeFileSync(join(prDir, 'materials.md'), materials + '\n');
   return fixBranch;

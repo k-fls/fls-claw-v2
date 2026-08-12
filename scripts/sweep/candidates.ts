@@ -495,7 +495,7 @@ export function candidatePlacementLine(r: CandidateRecord): string {
 /** The CANDIDATES section lines for plan/status output (§13). */
 export function candidateSectionLines(reported: CandidateRecord[]): string[] {
   if (reported.length === 0) return [];
-  const lines = ['CANDIDATES (PROPAGATION.md §13):'];
+  const lines = ['CANDIDATES:'];
   for (const r of reported) lines.push(`  ${r.branch} [${r.confidence}] ${candidatePlacementLine(r)}`);
   lines.push(`  ${CANDIDATE_STANDING_INSTRUCTION}`);
   return lines;

@@ -118,7 +118,7 @@ export async function checkBaseHeight(
   if (!(await refExists(repo, originRef))) {
     return {
       id: 'ERR14_BASE_BEHIND',
-      detail: `no origin ref for base '${branch}' — the target branch must exist on origin before a PR can be based on it (MERGE-POLICY.md §5)`,
+      detail: `no origin ref for base '${branch}' — the target branch must exist on origin before a PR can be based on it`,
     };
   }
   const originTip = await revParse(repo, originRef);
@@ -136,7 +136,7 @@ export async function checkBaseHeight(
       id: 'ERR14_BASE_BEHIND',
       detail:
         `origin/${branch} (${originTip.slice(0, 12)}) is BEHIND the expected pass height (local ${localTip.slice(0, 12)}) — ` +
-        `HELD PRs are published after the pass's target pushes: run \`propagate push --execute\` first (MERGE-POLICY.md §5, PROPAGATION.md §14.4)`,
+        `HELD PRs are published after the pass's target pushes, which happen at \`finish\``,
     };
   }
   if (mode === 'judged' && (await isAncestor(repo, headSha, originTip))) {
@@ -144,7 +144,7 @@ export async function checkBaseHeight(
       id: 'ERR14_BASE_BEHIND',
       detail:
         `origin/${branch} already contains the judged merge commit ${headSha.slice(0, 12)} — ` +
-        `JUDGED PRs are created BEFORE the target push (MERGE-POLICY.md §5 order); nothing to publish against this base`,
+        `JUDGED PRs are created BEFORE the target push; nothing to publish against this base`,
     };
   }
   return null;
@@ -166,7 +166,7 @@ export function renderMachineBlock(pendingCount: number, watermark12: string): s
     MACHINE_BLOCK_BEGIN,
     '## Sweep status (driver-maintained — do not edit)',
     `Pending upstream commits beyond this freeze: **${pendingCount}** (as of pass ${watermark12}).`,
-    'Kept current by posted urge comments (PROPAGATION.md §14.4).',
+    'Kept current by posted urge comments.',
     MACHINE_BLOCK_END,
   ].join('\n');
 }

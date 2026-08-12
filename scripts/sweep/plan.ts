@@ -411,7 +411,7 @@ export function validateInventoryInheritance(
     for (const p of e.parents ?? []) {
       if (excluded(p) || inventorySet.has(p) || structuralSet.has(p)) continue;
       throw new Error(
-        `inventory inheritance invalid (PROPAGATION.md §13): entry '${e.id}' (branch '${e.branch}') declares parent '${p}', ` +
+        `inventory inheritance invalid: entry '${e.id}' (branch '${e.branch}') declares parent '${p}', ` +
           `which is not in the inventory/structural set — the inventory may only contain branches with ` +
           `proper/valid inheritance; fix the entry (or add/restore the parent) before planning`,
       );
