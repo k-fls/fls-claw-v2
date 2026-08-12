@@ -1,13 +1,17 @@
 /**
  * scripts/sweep/candidates.ts — inventory-candidate discovery with mechanical
- * inheritance derivation (DRIVER.md §3.7, D-045).
+ * inheritance derivation (DRIVER.md §3.7).
+ *
+ * Candidates are derived FRESH from git every pass, journaled and written to
+ * the pass dir's candidates.json, and reported every pass until the owner
+ * acts in config.
  *
  * DETECTION: branches (local or origin/*) matching the sweepable namespaces
  * (config REGISTRY_REQUIRED_GLOBS, minus scope exclusions) — plus branches the
- * D-033 edition-composition closure qualifies — that have NO inventory entry.
- * For each, a CANDIDATE record is derived. Candidates are NEVER merged or
- * planned for propagation — discovery and reporting only; the owner approves
- * the placement before an entry is created (agent duty, doctrine).
+ * transitive edition-composition closure qualifies — that have NO inventory
+ * entry. For each, a CANDIDATE record is derived. Candidates are NEVER merged
+ * or planned for propagation — discovery and reporting only; the owner
+ * approves the placement before an entry is created (agent duty, doctrine).
  *
  * INHERITANCE DERIVATION — mechanical, evidence-backed, both directions:
  *  - Ownership model: an established branch X (inventory + main_patched) OWNS
@@ -23,8 +27,8 @@
  *  - Parent evidence, strongest first: (1) `cut-from` — the fork point is owned
  *    by exactly one branch; owned by several → ambiguous cut point (open
  *    question); (2) `merged-from` — P-own commits reachable from the candidate
- *    tip off its first-parent line and above the fork point (the D-033
- *    fork-era-reachability approach; upstream never qualifies); (3) `merge-base`
+ *    tip off its first-parent line and above the fork point (fork-era
+ *    reachability, as in the composition closure; upstream never qualifies); (3) `merge-base`
  *    — deepest merge-base among inventory branches, ALWAYS thin evidence
  *    (open question), never `clear` on its own.
  *  - Descendant evidence: `merged-into` — candidate-own commits reachable from
@@ -46,24 +50,18 @@
  * owner reviews every candidate before an entry exists, so a wrong prior is
  * caught at approval time.
  *
- * ARTIFACTS: per-candidate `<workspace>/inventory-candidates/<slug>.yaml`
- * (throttle field `lastReportedTip` — re-report only when the tip moved, like
- * urging; a candidate whose branch gains an inventory entry is marked
- * `resolved` and reported once). Writing these + the pass `candidates.json` is
- * derived-REPORT state: the documented exception to plan purity (§13) —
- * reports, never git refs.
+ * ARTIFACTS: the pass dir's `candidates.json` plus journal rows, rewritten
+ * every pass from the fresh derivation. There is no per-candidate store and
+ * no report throttle — a candidate is reported every pass until the owner
+ * acts in config (an inventory entry or a scope exclusion). Writing the
+ * report is derived-REPORT state: the documented exception to plan purity
+ * (§13) — reports, never git refs.
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-
-import { parse, stringify } from 'yaml';
-
 import { EXCLUDED_BRANCH_GLOBS, REGISTRY_REQUIRED_GLOBS } from './config.js';
 import { commitInfo, diffNameStatus, git, localBranches, remoteBranches, revParse } from './git.js';
 import { globMatchAny } from './globs.js';
 import { deriveCoverage, type Chain } from './heights.js';
 import { editionCompositionBranches } from './scope.js';
-import { slug } from './steps.js';
 import type { FeatureEntry, SweepScope } from './types.js';
 
 /** Standing instruction printed verbatim with every CANDIDATES section (§13). */
@@ -89,7 +87,7 @@ export interface ProposedParent {
 export interface ProposedDescendant {
   branch: string;
   evidence: CandidateEvidence[];
-  /** D has an inventory entry whose `parents` needs amending (owner-approved). */
+  /** D has an inventory entry whose `parents` needs amending (the amendment requires owner approval). */
   requiresEntryEdit: boolean;
 }
 
@@ -98,8 +96,6 @@ export interface CandidateRecord {
   tip: string;
   /** The branch exists only as origin/<branch> (no local ref). */
   remoteOnly: boolean;
-  /** Watermark12 of the pass that first discovered the candidate. */
-  discovered: string;
   /** First-parent divergence point from the fork ancestry + its trunk height (-1 = below the chain). */
   forkPoint: { sha: string; height: number } | null;
   /** Candidate tip's derived trunk coverage height (heights.ts, -1 = none). */
@@ -113,13 +109,9 @@ export interface CandidateRecord {
   changedFiles: string[];
   /** Total changed files; > changedFiles.length when capped at CHANGED_FILES_CAP. */
   changedFilesTotal: number;
-  /** Throttle: tip the candidate was last reported at (re-report only on movement). */
-  lastReportedTip: string;
-  resolved?: boolean;
-  resolvedReason?: string;
 }
 
-const SWEEPABLE_STATUS = new Set(['in-progress', 'shipped', 'experimental']);
+// Sweepability is derived: an entry with a `branch` is an established member.
 
 export interface DeriveCandidatesOptions {
   repo: string;
@@ -145,7 +137,7 @@ export async function deriveCandidates(opts: DeriveCandidatesOptions): Promise<C
     .filter((b) => b !== 'main' && b !== 'main_patched' && !excluded(b))
     .sort();
   const entryBranches = new Set(features.filter((f) => f.branch).map((f) => f.branch!));
-  // D-033 machinery: composition members without an entry are candidates too
+  // Edition-composition closure: composition members without an entry are candidates too
   // (they already draw the "add one" scope warning). Local-only: the closure
   // walks branches by name.
   const composition = new Set(await editionCompositionBranches(repo, local, { forkPoint: chain.base }));
@@ -161,7 +153,7 @@ export async function deriveCandidates(opts: DeriveCandidatesOptions): Promise<C
   const entryByBranch = new Map<string, FeatureEntry>();
   const inventory: string[] = [];
   for (const f of features) {
-    if (!f.branch || !SWEEPABLE_STATUS.has(f.status) || excluded(f.branch)) continue;
+    if (!f.branch || excluded(f.branch)) continue;
     if (!localSet.has(f.branch) && !origin.includes(f.branch)) continue;
     if (entryByBranch.has(f.branch)) continue;
     inventory.push(f.branch);
@@ -474,7 +466,6 @@ export async function deriveCandidates(opts: DeriveCandidatesOptions): Promise<C
       branch: cand,
       tip,
       remoteOnly: !localSet.has(cand),
-      discovered: '', // stamped by reconcileCandidates (pass watermark)
       forkPoint: forkPoint ? { sha: forkPoint, height: forkHeight } : null,
       coverage,
       proposedParents: parentNames.sort().map((b) => ({ branch: b, evidence: parents.get(b)! })),
@@ -484,89 +475,9 @@ export async function deriveCandidates(opts: DeriveCandidatesOptions): Promise<C
       changedFilesVs: strongest ?? (diffBase ? 'main' : null),
       changedFiles: changed.slice(0, CHANGED_FILES_CAP),
       changedFilesTotal: changed.length,
-      lastReportedTip: tip,
     });
   }
   return records;
-}
-
-// ---------------------------------------------------------------------------
-// Report reconciliation (YAML store + throttle) — derived-report state (§13).
-// ---------------------------------------------------------------------------
-
-export function candidatesDir(workspace: string): string {
-  return join(workspace, 'inventory-candidates');
-}
-
-export function candidateYamlPath(workspace: string, branch: string): string {
-  return join(candidatesDir(workspace), `${slug(branch)}.yaml`);
-}
-
-/** Read all stored candidate records (tolerates unparsable files: skipped). */
-export function readCandidateFiles(workspace: string): CandidateRecord[] {
-  const dir = candidatesDir(workspace);
-  if (!existsSync(dir)) return [];
-  const out: CandidateRecord[] = [];
-  for (const f of readdirSync(dir).filter((n) => n.endsWith('.yaml')).sort()) {
-    try {
-      const doc = parse(readFileSync(join(dir, f), 'utf8')) as CandidateRecord | null;
-      if (doc && typeof doc === 'object' && typeof doc.branch === 'string') out.push(doc);
-    } catch {
-      /* unreadable candidate file: skip (regenerated on next movement) */
-    }
-  }
-  return out;
-}
-
-export interface CandidateEvent {
-  record: CandidateRecord;
-  event: 'discovered' | 'moved';
-}
-
-export interface CandidateReconcile {
-  /** Candidates newly reported this pass (new, or tip moved past lastReportedTip). */
-  events: CandidateEvent[];
-  /** Stale candidate files marked resolved this pass (reported once). */
-  resolved: Array<{ branch: string; reason: string }>;
-  /** Every currently-detected candidate (throttled ones included). */
-  all: CandidateRecord[];
-}
-
-/**
- * Apply the urging-style throttle (§13): write/refresh the per-candidate YAML
- * only for NEW candidates or ones whose tip moved past `lastReportedTip`;
- * quiet passes stay quiet. A stored candidate whose branch gained an inventory
- * entry (or vanished entirely) is marked `resolved` and reported once.
- */
-export function reconcileCandidates(
-  workspace: string,
-  records: CandidateRecord[],
-  entryBranches: Set<string>,
-  watermark12: string,
-): CandidateReconcile {
-  const dir = candidatesDir(workspace);
-  const existing = new Map(readCandidateFiles(workspace).map((r) => [r.branch, r]));
-  const events: CandidateEvent[] = [];
-  const writeRecord = (r: CandidateRecord): void => {
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(candidateYamlPath(workspace, r.branch), stringify(r));
-  };
-  for (const r of records) {
-    const prev = existing.get(r.branch);
-    if (prev && !prev.resolved && prev.lastReportedTip === r.tip) continue; // throttled
-    const record: CandidateRecord = { ...r, discovered: prev?.discovered || watermark12, lastReportedTip: r.tip };
-    writeRecord(record);
-    events.push({ record, event: prev && !prev.resolved ? 'moved' : 'discovered' });
-  }
-  const current = new Set(records.map((r) => r.branch));
-  const resolved: Array<{ branch: string; reason: string }> = [];
-  for (const [branch, prev] of existing) {
-    if (current.has(branch) || prev.resolved) continue;
-    const reason = entryBranches.has(branch) ? 'inventory-entry-added' : 'branch-gone';
-    writeRecord({ ...prev, resolved: true, resolvedReason: reason });
-    resolved.push({ branch, reason });
-  }
-  return { events, resolved, all: records };
 }
 
 /** One-line placement (clear) or first open question (unclear) for a record. */
@@ -582,14 +493,10 @@ export function candidatePlacementLine(r: CandidateRecord): string {
 }
 
 /** The CANDIDATES section lines for plan/status output (§13). */
-export function candidateSectionLines(
-  reported: CandidateRecord[],
-  resolved: Array<{ branch: string; reason: string }> = [],
-): string[] {
-  if (reported.length === 0 && resolved.length === 0) return [];
-  const lines = ['CANDIDATES (D-045):'];
+export function candidateSectionLines(reported: CandidateRecord[]): string[] {
+  if (reported.length === 0) return [];
+  const lines = ['CANDIDATES (PROPAGATION.md §13):'];
   for (const r of reported) lines.push(`  ${r.branch} [${r.confidence}] ${candidatePlacementLine(r)}`);
-  for (const s of resolved) lines.push(`  ${s.branch} resolved (${s.reason})`);
   lines.push(`  ${CANDIDATE_STANDING_INSTRUCTION}`);
   return lines;
 }

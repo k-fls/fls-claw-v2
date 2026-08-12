@@ -9,24 +9,57 @@ import { loadFeatures, loadRegistry, loadRoutingConfig, parseFeatureEntry } from
 const scratch = mkdtempSync(join(tmpdir(), 'sweep-registry-'));
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
-describe('parseFeatureEntry (fail closed)', () => {
+describe('parseFeatureEntry (strict config schema)', () => {
   it('accepts a minimal valid entry', () => {
-    const { entry, error } = parseFeatureEntry(
-      'id: feat.x\nname: X\nkind: feat\nstatus: shipped\nbranch: feat/x\n',
-      'f.yaml',
-    );
+    const { entry, error } = parseFeatureEntry('id: feat.x\nname: X\nkind: feat\nbranch: feat/x\n', 'f.yaml');
     expect(error).toBeUndefined();
     expect(entry).toMatchObject({ id: 'feat.x', branch: 'feat/x' });
   });
 
-  it('rejects missing fields, bad enums, and branchless non-planned entries', () => {
-    expect(parseFeatureEntry('name: X\nkind: feat\nstatus: shipped\n', 'f').error).toMatch(/missing required/);
-    expect(parseFeatureEntry('id: a\nname: X\nkind: nope\nstatus: shipped\n', 'f').error).toMatch(/bad kind/);
-    expect(parseFeatureEntry('id: a\nname: X\nkind: feat\nstatus: later\n', 'f').error).toMatch(/bad status/);
-    expect(parseFeatureEntry('id: a\nname: X\nkind: feat\nstatus: shipped\n', 'f').error).toMatch(/branch required/);
-    expect(parseFeatureEntry('id: a\nname: X\nkind: planned\nstatus: planned\n', 'f').error).toBeUndefined();
+  it('accepts an entry without a branch (planned/observational config)', () => {
+    const { entry, error } = parseFeatureEntry('id: planned.x\nname: X\nkind: planned\n', 'f.yaml');
+    expect(error).toBeUndefined();
+    expect(entry).toMatchObject({ id: 'planned.x' });
+    expect(entry!.branch).toBeUndefined();
+  });
+
+  it('accepts the declared levers: tier_floor judged and always_merge', () => {
+    const { entry, error } = parseFeatureEntry(
+      'id: feat.x\nname: X\nkind: feat\nbranch: feat/x\ntier_floor: judged\nalways_merge: true\n',
+      'f.yaml',
+    );
+    expect(error).toBeUndefined();
+    expect(entry).toMatchObject({ tier_floor: 'judged', always_merge: true });
+  });
+
+  it('rejects missing required fields and malformed documents', () => {
+    expect(parseFeatureEntry('name: X\nkind: feat\n', 'f').error).toMatch(/missing required/);
     expect(parseFeatureEntry('- just\n- a list\n', 'f').error).toMatch(/not a mapping/);
     expect(parseFeatureEntry('{{{{', 'f').error).toMatch(/YAML parse error/);
+  });
+
+  it('rejects any unknown key: the inventory is strict config only', () => {
+    expect(parseFeatureEntry('id: a\nname: X\nkind: feat\nbranch: feat/a\nstatus: shipped\n', 'f').error).toMatch(
+      /unknown key 'status'/,
+    );
+    expect(parseFeatureEntry('id: a\nname: X\nkind: feat\nmaintenance:\n  last_verified: x\n', 'f').error).toMatch(
+      /unknown key 'maintenance'/,
+    );
+  });
+
+  it('rejects bad-shaped values for declared keys', () => {
+    expect(parseFeatureEntry('id: a\nname: X\nkind: nope\n', 'f').error).toMatch(/bad value for 'kind'/);
+    expect(parseFeatureEntry('id: a\nname: X\nkind: feat\ntier_floor: held\n', 'f').error).toMatch(
+      /bad value for 'tier_floor'/,
+    );
+    expect(parseFeatureEntry('id: a\nname: X\nkind: feat\nbranch: 7\n', 'f').error).toMatch(/bad value for 'branch'/);
+  });
+
+  it('rejects prose fields: the inventory carries no guidance addressed to the agent', () => {
+    for (const key of ['prompt', 'invariants', 'overlap_hints', 'touch_paths', 'symbol_watch']) {
+      const yaml = `id: a\nname: X\nkind: feat\n${key}: whatever\n`;
+      expect(parseFeatureEntry(yaml, 'f').error).toMatch(new RegExp(`unknown key '${key}'`));
+    }
   });
 });
 
@@ -35,20 +68,20 @@ describe('local-tree loaders', () => {
   mkdirSync(inventory, { recursive: true });
   writeFileSync(
     join(inventory, 'feat.good.yaml'),
-    'id: feat.good\nname: Good\nkind: feat\nstatus: shipped\nbranch: feat/good\nowned_paths:\n  - src/good/**\n',
+    'id: feat.good\nname: Good\nkind: feat\nbranch: feat/good\nowned_paths:\n  - src/good/**\n',
   );
-  writeFileSync(join(inventory, 'feat.broken.yaml'), 'id: feat.broken\nname: no kind or status\n');
+  writeFileSync(join(inventory, 'feat.broken.yaml'), 'id: feat.broken\nname: no kind\n');
   const routingFile = join(scratch, 'routing.yaml');
   writeFileSync(routingFile, 'schemaVersion: 1\nscope_guard_mode: conflict-hunks\nstack_cap: 3\n');
   const scopeFile = join(scratch, 'scope.yaml');
-  writeFileSync(scopeFile, 'include: [main_patched, "fix/**"]\nrecipe: [module/a, feat/b]\n');
+  writeFileSync(scopeFile, 'exclude: ["wip/**"]\nrecipe: [module/a, feat/b]\n');
 
   it('loads features/routing/scope from local files; bad entries become warnings', () => {
     const reg = loadRegistry({ inventoryDir: inventory, routingFile, scopeFile });
     expect(reg.features.map((f) => f.id)).toEqual(['feat.good']);
     expect(reg.warnings.some((w) => w.includes('feat.broken'))).toBe(true);
     expect(reg.routing).toEqual({ scopeGuardMode: 'conflict-hunks', stackCap: 3 });
-    expect(reg.scope).toEqual({ include: ['main_patched', 'fix/**'], recipe: ['module/a', 'feat/b'] });
+    expect(reg.scope).toEqual({ exclude: ['wip/**'], recipe: ['module/a', 'feat/b'] });
   });
 
   it('warns on a missing inventory dir and returns defaults for missing config files', () => {
@@ -59,10 +92,10 @@ describe('local-tree loaders', () => {
     expect(routing).toEqual({}); // both levers unset -> consumers apply their own defaults
   });
 
-  it('the committed bootstrap snapshot is the default inventory and parses clean', () => {
+  it('the committed scripts/sweep/inventory is the default inventory and loads with zero warnings', () => {
     const dir = defaultInventoryDir();
     expect(dir).toBeTruthy();
-    expect(dir).toContain('bootstrap/fork-registry@');
+    expect(dir).toContain(join('scripts', 'sweep', 'inventory'));
     const { features, warnings } = loadFeatures(dir);
     expect(features.length).toBe(27);
     expect(warnings).toEqual([]);

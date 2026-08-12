@@ -125,21 +125,24 @@ Every materials file ends with the same contract line: after editing, run the
 typechecks yourself and fix what they report; never run the tests — `report-case` runs
 them itself.
 
-## 5. Standing records
+## 5. What governs a resolution
 
-A standing record is a rule the owner has recorded for specific files. You see standing
-records in exactly one place: in a conflict case's materials, inside the inventory
-entries, on indented lines beginning `extra_context (path-relevant):` and
-`decided_paths:`. Only what is printed there applies to this case. A comment in the
-code, a decision you saw on an old pull request, or something you remember from an
-earlier case is not a standing record; never cite one. Never contradict a printed
-record — the reviewer in section 9 is shown the same records and rejects a resolution
-that drops, inverts, or re-decides what one settles.
+Nobody hands you a rule for the conflict in front of you. What constrains the answer is
+the repository, and you read it: the code that calls the symbols in the conflict, the
+naming and numbering of the files around them, the tests that assert their behavior, and
+the commit history of each side over the conflicted paths, which the materials give you.
+When one side deletes something the other side's code still uses, the code saying so is
+the constraint. When a file's neighbours follow a visible convention, that convention is
+the constraint.
 
-One command answer also carries a record: if `report-case` returns
-`ERR05_DECIDED_ALREADY`, its detail quotes a recorded decision that covers a conflicted
-path. Apply the quoted decision exactly as written and re-run
-`report-case --tier judged`; do not put the question to the owner again.
+The inventory entries printed in your materials carry identity, not instruction: which
+feature owns a branch, what it owns, and what it summarises. Read them to know whose
+code you are in. They will never tell you how to resolve anything.
+
+Nothing you remember from another case, and nothing you find on an old pull request,
+governs this one. If you cannot establish what constrains the answer, that is exactly
+the situation section 7 calls `held`: resolve it as best the code supports, and name the
+premise you could not establish.
 
 ## 6. What you may edit
 
@@ -172,14 +175,14 @@ The `--tier` you pass to `report-case` classifies your edit and decides how the 
 lands.
 
 `mechanical` means anyone applying the materials would produce the same bytes — a union
-of disjoint additions, a recorded decision re-applied unchanged, a verified superset
-taken whole. A confirmed mechanical resolution merges immediately, with no pull request
+of disjoint additions, a replay of a resolution the repository already records, a
+verified superset taken whole. A confirmed mechanical resolution merges immediately, with no pull request
 and no text to write. Claim it only when nothing in the resolution needed a judgment
 call; a mechanical claim on a gate-fix case, or on a branch the driver floors at
 `judged`, is simply treated as `judged`.
 
-`judged` means you made a defensible choice within the two sides, their base, and the
-printed records. A confirmed judged resolution merges, and `finish` leaves a
+`judged` means you made a defensible choice within the two sides, their base, and what
+the surrounding code establishes. A confirmed judged resolution merges, and `finish` leaves a
 pull request behind as its record. You write the text.
 
 `held` means the owner, not you, approves the result. It has two shapes. If you
@@ -189,9 +192,9 @@ request for the owner to approve and merge. If you could not resolve it and clai
 clean, unmangled conflict to resolve themselves. Either way you write the text.
 
 Claim `held` when the case turns on a decision the materials do not settle: one side
-removed or reshaped something the other side depends on and no replacement or record
-covers it; you cannot establish what a side was trying to do; the merge forces a choice
-no printed record answers. In those situations still resolve the case as best you can —
+removed or reshaped something the other side depends on and no replacement exists; you
+cannot establish what a side was trying to do; the merge forces a choice the code does
+not settle. In those situations still resolve the case as best you can —
 a held pull request carrying a finished resolution and a precise question is worth far
 more than an untouched conflict — and leave it untouched only when you genuinely
 cannot resolve it, naming in the text the premise you could not establish.
@@ -249,11 +252,11 @@ without your resolution, and the result names the outcome:
 
 Every resolution that passes the checks is judged by an independent reviewer. It sees
 only driver-assembled material — the conflict regions, your resolution diff, the same
-standing records and per-side histories you were given — never your reasoning and never
+inventory entries and per-side histories you were given — never your reasoning and never
 your pull-request text. It answers three questions: is each side's behavior preserved,
 or its loss explicitly justified; is every change explained by the conflict, with
-nothing from outside the two sides and their base; does the resolution contradict a
-printed record. Resolve so those three answers are yes, yes, no. For a gate fix the
+nothing from outside the two sides and their base; does the resolution break something
+the surrounding code depends on. Resolve so those three answers are yes, yes, no. For a gate fix the
 questions become: does the change plausibly make the named check pass, and is every
 hunk explained by that failure alone — a gate-fix case is the one place an unrelated
 "improvement" is most tempting and most reliably rejected.

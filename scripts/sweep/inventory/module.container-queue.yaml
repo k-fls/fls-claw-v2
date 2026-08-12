@@ -1,62 +1,31 @@
 id: module.container-queue
 name: Container concurrency queue + graceful shutdown
 kind: module
-status: shipped
 branch: module/container-queue
 parents:
-- main_patched
+  - main_patched
 dependents:
-- feat/mitm-credential-proxy
-summary: 'Bounded container-spawn concurrency queue plus graceful shutdown/drain: `ncl shutdown` drains
-  running containers instead of killing them (the sanctioned way to restart the daemon).'
+  - feat/mitm-credential-proxy
+summary: "Bounded container-spawn concurrency queue plus graceful shutdown/drain: `ncl shutdown`
+  drains running containers instead of killing them (the sanctioned way to restart the daemon)."
 owned_paths:
-- src/container-queue.ts
-- src/container-queue.test.ts
-- src/shutdown.ts
-- src/cli/commands/shutdown.ts
-- src/cli/commands/shutdown.test.ts
-- docs/container-queue.md
-touch_paths:
-- src/host-sweep.ts
-- src/container-runner.ts
-- src/container-runtime.ts
-- src/index.ts
-- src/config.ts
-- src/cli/commands/index.ts
-- container/agent-runner/src/poll-loop.ts
+  - src/container-queue.ts
+  - src/container-queue.test.ts
+  - src/shutdown.ts
+  - src/cli/commands/shutdown.ts
+  - src/cli/commands/shutdown.test.ts
+  - docs/container-queue.md
 key_symbols: []
-symbol_watch: []
-invariants: []
 design_docs:
-- docs/container-queue.md@module/container-queue
+  - docs/container-queue.md@module/container-queue
 test_anchors:
-- src/container-queue.test.ts
-- src/cli/commands/shutdown.test.ts
-overlap_hints: Upstream adding spawn throttling/concurrency limits, queueing, or any graceful-shutdown/drain
-  mechanism. Poll-loop stop semantics changes are merge risk.
+  - src/container-queue.test.ts
+  - src/cli/commands/shutdown.test.ts
 routing:
   keywords:
-  - queue
-  - concurrency
-  - shutdown
-  - drain
-  - graceful
+    - queue
+    - concurrency
+    - shutdown
+    - drain
+    - graceful
   always_check_on: []
-prompt:
-  template: prompts/overlap-check.md
-  extra_context: >
-    DECIDED 2026-07-13 (owner, Option A — coexistence, implemented in PR #7, merged):
-    upstream tasks-core removed MAX_CONCURRENT_CONTAINERS ("isolation replaces
-    throttling"); the fork KEEPS the global admission queue and its fork-only config
-    constants (MAX_CONCURRENT_CONTAINERS, IDLE_BEFORE_EVICT, EVICTION_TIMEOUT)
-    coexisting with upstream per-series task isolation. Do NOT re-raise this overlap;
-    the standing consequence is maintenance: re-apply the fork-only config.ts
-    constants and keep reconcileContainerCapacity() coexisting with upstream
-    task-session GC at every future upstream change to config.ts / host-sweep.ts.
-    Only escalate again if upstream REINTRODUCES its own concurrency cap or removes
-    the seams the queue hooks into.
-maintenance:
-  owner: sweep-agent-group
-  last_verified: '2026-07-10'
-  verified_against: 09169ade7b414a8c2927327734e2decda14d2127
-  notes: skeleton — needs enrichment

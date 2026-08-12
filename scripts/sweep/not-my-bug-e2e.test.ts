@@ -1,9 +1,9 @@
 /**
- * scripts/sweep/not-my-bug-e2e.test.ts — the 2026-08-01 deadlock, end to end.
+ * scripts/sweep/not-my-bug-e2e.test.ts — the not-my-bug deadlock, end to end.
  *
- * This is the incident as a repo, walked through the REAL command surface with
- * the REAL checks runner: `makeNotMyBugIncidentFixture` builds the same shape
- * that stalled pass `87175bdb89ad` for three days — a conflict on
+ * This is the deadlock as a repo, walked through the REAL command surface with
+ * the REAL checks runner: `makeNotMyBugIncidentFixture` builds the shape that
+ * can stall a pass indefinitely — a conflict on
  * `src/cli/resources/groups.ts` blocked by a bun test the case never touched,
  * already red three commits below the branch tip — and the test drives
  * `start → next-case → report-case → report-case --not-my-bug → next-case → …`
@@ -17,10 +17,10 @@
  * network `pnpm install`) are stubbed. The unit tests script probe outcomes;
  * this one is the check that the pieces agree with each other and with git.
  *
- * It also pins the defect that made the first cut of this mechanism useless:
+ * It also pins the ordering that makes the mechanism useful at all:
  * `next-case` MUST serve the gate-fix case. Journaling it before the abort's
- * `reopened` row superseded it the instant it was created — every assertion in
- * the unit tests passed and the pass still could not move.
+ * `reopened` row would supersede it the instant it was created — every
+ * assertion in the unit tests could pass and the pass still could not move.
  */
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -61,6 +61,17 @@ function tmp(prefix: string): string {
   return d;
 }
 
+/**
+ * Inventory with a single branchless entry: `sweep start` requires a
+ * non-empty, warning-free inventory, and a branchless entry satisfies that
+ * while contributing nothing to scope (structural-only fixture).
+ */
+function branchlessInventory(): string {
+  const dir = tmp('nmb-inv-');
+  writeFileSync(join(dir, 'planned.seed.yaml'), 'id: planned.seed\nname: planned.seed\nkind: feat\n');
+  return dir;
+}
+
 /** The real checks contract: a typecheck that passes and the bun-shaped runner. */
 function incidentChecksFile(ws: string): string {
   const f = join(ws, 'checks.json');
@@ -74,12 +85,12 @@ function incidentChecksFile(ws: string): string {
   return f;
 }
 
-describe('the 2026-08-01 deadlock, end to end (real checks, real commits)', () => {
+describe('the not-my-bug deadlock, end to end (real checks, real commits)', () => {
   it('walks conflict -> blocked by someone else’s red -> gate fix -> both cases resolve', async () => {
     const { repo, introducer, failingTest, conflictedPath } = makeNotMyBugIncidentFixture();
     cleanups.push(() => repo.destroy());
     const ws = tmp('nmb-ws-');
-    const inv = tmp('nmb-inv-');
+    const inv = branchlessInventory();
     const cli = (over: Partial<Cli> = {}): Cli => ({
       cmd: 'plan',
       repo: repo.dir,
@@ -140,19 +151,19 @@ describe('the 2026-08-01 deadlock, end to end (real checks, real commits)', () =
     expect(adjudicated.status).toBe('gate-fix-required');
     expect(adjudicated.notMyBug.verdict).toBe('pre-existing');
     expect(adjudicated.notMyBug.owner).toBe('branch');
-    // A PROCEED arm must never carry an ERR id (the ERR42 defect, 52 idle minutes).
+    // A PROCEED arm must never carry an ERR id — an ERR id parks the case.
     expect(adjudicated.issues.every((i) => i.id.startsWith('WARN'))).toBe(true);
-    // THE SEARCH FLOOR (owner, 2026-08-04). This gate fix is on `main_patched`
+    // THE SEARCH FLOOR (owner directive). This gate fix is on `main_patched`
     // ITSELF, so the floor — the current trunk head — IS the branch tip and the
     // window is empty: no commit below it may be named or rooted on, and the
     // search returns without probing rather than paying for an answer that would
     // be refused. `introducer` is P3, below the tip, so it is deliberately NOT
     // reported here.
     //
-    // Live 2026-08-04 the unfloored version rooted a case 299 commits behind the
-    // tip: the worktree became a three-week-old tree, the checks gate demanded
-    // THAT whole suite green, and it was red in a second unrelated file whose fix
-    // had not been written yet — one test in scope, a pre-history demanded green.
+    // Unfloored, the search can root a case hundreds of commits behind the
+    // tip: the worktree becomes a weeks-old tree, the checks gate demands
+    // THAT whole suite green, and it may be red in a second unrelated file whose
+    // fix has not been written yet — one test in scope, a pre-history demanded green.
     expect(adjudicated.introducedBy).toBeNull();
     expect(adjudicated.gateFix.branch).toBe('main_patched');
     expect(adjudicated.gateFix.files).toEqual([failingTest]);
@@ -220,8 +231,7 @@ describe('the 2026-08-01 deadlock, end to end (real checks, real commits)', () =
     expect(await cmdSweepReportPr(cli({ cmd: 'report-pr', out }))).toBe(0);
     expect(repo.git('show', `main_patched:${conflictedPath}`)).toContain('fork+upstream');
     // Nothing left open: the red that blocked the pass is fixed on the branch,
-    // and the conflict it was blocking is resolved. This is the run that stalled
-    // for three days on 2026-08-01.
+    // and the conflict it was blocking is resolved.
     expect(openCases(readJournal(dir))).toEqual([]);
   });
 
@@ -235,7 +245,7 @@ describe('the 2026-08-01 deadlock, end to end (real checks, real commits)', () =
       [failingTest]: 'test("task-run turn wiring", () => ok);\n',
     });
     const ws = tmp('nmb-ws-');
-    const inv = tmp('nmb-inv-');
+    const inv = branchlessInventory();
     const cli = (over: Partial<Cli> = {}): Cli => ({
       cmd: 'plan',
       repo: repo.dir,

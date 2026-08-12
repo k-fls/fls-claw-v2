@@ -1,8 +1,8 @@
 /**
- * scripts/sweep/publish.test.ts — `propagate publish` (PROPAGATION.md §14,
- * D-048/D-049/D-050): the pre-PR height check + D-004 machine block, the
- * blocking/advisory check battery (text checks MECHANICAL only — the PR-text
- * cold read is retired, D-050), and the networked execute path — real
+ * scripts/sweep/publish.test.ts — `propagate publish` (DRIVER.md §10):
+ * the pre-PR height check + the PR machine block, the
+ * blocking/advisory check battery (text checks MECHANICAL only — there is no
+ * PR-text cold read), and the networked execute path — real
  * `git push` into a bare fixture origin, PR creation against an injected fake
  * transport (dry-run must make ZERO network calls and ZERO pushes).
  */
@@ -18,7 +18,6 @@ import {
   checkBaseHeight,
   classifyComments,
   classifyReviewTrigger,
-  decidedAlready,
   extractSweepAddressed,
   ghPaginated,
   haltIdFor,
@@ -49,7 +48,6 @@ import {
   type ColdReadInvoker,
   type JournalEntry,
 } from './propagate.js';
-import type { FeatureEntry } from './types.js';
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -64,10 +62,8 @@ function mkWorkspace(): string {
 
 interface InvEntry {
   id: string;
-  branch: string;
+  branch?: string;
   parents?: string[];
-  extra_context?: string;
-  decided_paths?: string[];
 }
 
 function writeInventory(entries: InvEntry[]): string {
@@ -78,24 +74,21 @@ function writeInventory(entries: InvEntry[]): string {
       `id: ${e.id}`,
       `name: ${e.id}`,
       'kind: feat',
-      'status: shipped',
-      `branch: ${e.branch}`,
+      ...(e.branch ? [`branch: ${e.branch}`] : []),
       ...(e.parents ? ['parents:', ...e.parents.map((p) => `  - ${p}`)] : []),
-      ...(e.extra_context || e.decided_paths
-        ? [
-            'prompt:',
-            ...(e.extra_context ? [`  extra_context: ${JSON.stringify(e.extra_context)}`] : []),
-            ...(e.decided_paths ? ['  decided_paths:', ...e.decided_paths.map((p) => `    - ${JSON.stringify(p)}`)] : []),
-          ]
-        : []),
     ].join('\n');
     writeFileSync(join(dir, `${e.id}.yaml`), yaml + '\n');
   }
   return dir;
 }
 
-function emptyInventory(): string {
-  return writeInventory([]);
+/**
+ * Inventory with a single branchless entry: `sweep start` requires a
+ * non-empty, warning-free inventory, and a branchless entry satisfies that
+ * while contributing nothing to scope (structural-only fixtures).
+ */
+function branchlessInventory(): string {
+  return writeInventory([{ id: 'planned.seed' }]);
 }
 
 function baseCli(repo: FixtureRepo, ws: string, inv: string, over: Partial<Cli> = {}): Cli {
@@ -157,7 +150,7 @@ function fakeGithub(responses: Record<string, { status: number; body: unknown }>
           if (method === 'GET' && path.includes('/pulls?')) return { status: 200, body: [] };
           if (path.endsWith('/pulls') && method === 'POST')
             return { status: 201, body: { html_url: 'https://github.com/k-fls/fixture/pull/58', number: 58 } };
-          // D-059: held publishes post the sweep-addressed marker comment.
+          // Held publishes post the sweep-addressed marker comment.
           if (method === 'POST' && path.includes('/comments')) return { status: 201, body: {} };
           return { status: 404, body: null };
         },
@@ -167,13 +160,11 @@ function fakeGithub(responses: Record<string, { status: number; body: unknown }>
   return state;
 }
 
-// --- Reaching a HELD case through the SURVIVING path (D-053) -----------------
-// The flag-based `resolve` these fixtures used to call is gone (it was a second
-// resolution implementation the state machine never invoked). The freeze now
-// happens the only way it can: `report-case --tier held`. Everything downstream
-// of the freeze — the journal rows publish reads, the pass heights, the case
-// worktree lifecycle — is identical, so the batteries below still exercise
-// `cmdPublish` exactly as before.
+// --- Reaching a HELD case through the state-machine path ---------------------
+// The freeze happens the only way it can: `report-case --tier held`, the state
+// machine's single resolution surface. Everything downstream of the freeze —
+// the journal rows publish reads, the pass heights, the case worktree
+// lifecycle — is what the batteries below exercise through `cmdPublish`.
 
 const confirm: ColdReadInvoker = async () => ({
   verdict: 'confirm',
@@ -222,14 +213,9 @@ function heldCaseRepo(): FixtureRepo {
  * the cold read are skipped — nothing was resolved). A REAL pushable origin (bare
  * repo behind a github-shaped URL) is always attached: `start` fetches origin, and
  * `publish --execute` really pushes. The target push that HELD publishing requires
- * (D-049 §14.4 order: targets first, then HELD PRs) is simulated so ERR14 passes.
- *
- * `entries` is the inventory the RETURNED cli publishes against. The freeze itself
- * always runs on an EMPTY inventory: `report-case` has its own first-attempt ERR05
- * steer (D-060) which would block the freeze before publish's gate could be
- * reached, and the subject here is publish's gate.
+ * (§14.4 order: targets first, then HELD PRs) is simulated so ERR14 passes.
  */
-async function setupHeldCase(entries: InvEntry[] = []): Promise<{
+async function setupHeldCase(): Promise<{
   repo: FixtureRepo;
   ws: string;
   dir: string;
@@ -243,27 +229,25 @@ async function setupHeldCase(entries: InvEntry[] = []): Promise<{
   repo.git('push', 'origin', 'main_patched'); // pre-pass tip on origin
 
   const ws = mkWorkspace();
-  const passInv = emptyInventory();
-  const publishInv = entries.length ? writeInventory(entries) : passInv;
+  const inv = branchlessInventory();
   const dir = passDir(ws, repo.sha('main').slice(0, 12));
-  const passCli = (o: Partial<Cli>): Cli => baseCli(repo, ws, passInv, o);
-  expect(await cmdSweepStart(passCli({ cmd: 'sweep-start' }))).toBe(0);
-  expect(await cmdSweepNextCase(passCli({ cmd: 'next-case' }))).toBe(0);
+  const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, o);
+  expect(await cmdSweepStart(cli({ cmd: 'sweep-start' }))).toBe(0);
+  expect(await cmdSweepNextCase(cli({ cmd: 'next-case' }))).toBe(0);
   const caseId = currentCaseId(dir);
   expect(
-    await cmdSweepReportCase(passCli({ cmd: 'report-case', tier: 'held', execute: true }), neverInvoked),
+    await cmdSweepReportCase(cli({ cmd: 'report-case', tier: 'held', execute: true }), neverInvoked),
   ).toBe(0);
   const held = readJournal(dir).find((e) => e.action === 'held' && e.caseId === caseId)!;
   expect(held.resolution ?? null).toBeNull(); // pristine: publish must build the DRAFT head
   repo.git('push', 'origin', 'main_patched'); // simulated target push -> ERR14 passes
-  const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, publishInv, o);
   return { repo, ws, dir, caseId, prDir: join(dir, caseId, 'pr'), bareDir, cli };
 }
 
 /**
  * The ESCALATED held case: a MARKER-CLEAN resolution that also edits a file
  * outside the conflict, with the cold read AGREEING — scope exceeded + confirm
- * (D-057 #3) freezes HELD carrying the resolution, so publish must build an
+ * freezes HELD carrying the resolution, so publish must build an
  * ACTIVE (non-draft) PR at the resolved merge commit with the escalation prefix.
  */
 async function setupEscalatedHeldCase(): Promise<{
@@ -281,7 +265,7 @@ async function setupEscalatedHeldCase(): Promise<{
   repo.git('push', 'origin', 'main_patched');
 
   const ws = mkWorkspace();
-  const inv = emptyInventory();
+  const inv = branchlessInventory();
   const dir = passDir(ws, repo.sha('main').slice(0, 12));
   const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, o);
   expect(await cmdSweepStart(cli({ cmd: 'sweep-start' }))).toBe(0);
@@ -301,9 +285,9 @@ async function setupEscalatedHeldCase(): Promise<{
   return { repo, ws, dir, caseId, prDir: join(dir, caseId, 'pr'), bareDir, resolvedTree: resolution.tree, cli };
 }
 
-// --- Pre-PR height check (D-049 §5) + D-004 machine block --------------------
+// --- Pre-PR height check (DRIVER.md §10.4) + the PR machine block (§5.5) ---------
 
-describe('publish — pre-PR height check (ERR14, D-049 §5)', () => {
+describe('publish — pre-PR height check (ERR14, MERGE-POLICY.md §5)', () => {
   function heightFixture(): { repo: FixtureRepo } {
     const repo = initFixtureRepo();
     repo.commit('base: x', { 'src/x.ts': 'orig\n' });
@@ -365,7 +349,7 @@ describe('publish — pre-PR height check (ERR14, D-049 §5)', () => {
   });
 });
 
-describe('publish — D-004 machine block (D-049 decision 8)', () => {
+describe('publish — the PR machine block', () => {
   it('appends below the agent body, replaces idempotently, never touches the prose', () => {
     const block1 = renderMachineBlock(3, 'abcdef123456');
     const withBlock = withMachineBlock('Decision needed: keep fork?\n\nDetails.', block1);
@@ -383,35 +367,9 @@ describe('publish — D-004 machine block (D-049 decision 8)', () => {
   });
 });
 
-// --- Unit: decidedAlready, slug parsing, halt-id mapping ---------------------
+// --- Unit: slug parsing, halt-id mapping -------------------------------------
 
-describe('publish — decidedAlready (ERR05) + helpers', () => {
-  it('fires on an extra_context record naming a conflicted path, quoting the record', () => {
-    const features = [
-      {
-        id: 'creds',
-        name: 'creds',
-        kind: 'module',
-        status: 'shipped',
-        branch: 'module/credentials',
-        prompt: { extra_context: 'Owner decision 2026-07-15: src/x.ts keeps the fork variant (PR #40).' },
-      },
-    ] as unknown as FeatureEntry[];
-    const issue = decidedAlready(features, 'main_patched', ['src/x.ts']);
-    expect(issue?.id).toBe('ERR05_DECIDED_ALREADY');
-    expect(issue?.detail).toContain("entry 'creds'");
-    expect(issue?.detail).toContain('keeps the fork variant');
-    expect(issue?.detail).toContain('do not re-ask the owner');
-    expect(decidedAlready(features, 'main_patched', ['src/other.ts'])).toBeNull();
-  });
-
-  it('fires on an explicit decided_paths hit even without extra_context text', () => {
-    const features = [
-      { id: 'e', name: 'e', kind: 'feat', status: 'shipped', prompt: { decided_paths: ['src/x.ts'] } },
-    ] as unknown as FeatureEntry[];
-    expect(decidedAlready(features, 'b', ['src/x.ts'])?.id).toBe('ERR05_DECIDED_ALREADY');
-  });
-
+describe('publish — slug parsing + halt-id mapping', () => {
   it('parses github slugs and maps DriverHalt reasons to ERR2x ids', () => {
     expect(parseGithubSlug('https://github.com/k-fls/fls-claw-v2.git')).toEqual({ owner: 'k-fls', repo: 'fls-claw-v2' });
     expect(parseGithubSlug('git@github.com:k-fls/fls-claw-v2.git')).toEqual({ owner: 'k-fls', repo: 'fls-claw-v2' });
@@ -430,7 +388,7 @@ describe('publish — decidedAlready (ERR05) + helpers', () => {
 
 // --- cmdPublish: blocking battery end-to-end ---------------------------------
 
-describe('D-059 FINAL — review-loop primitives (hardened tag, review trigger, pagination)', () => {
+describe('review-loop primitives (hardened tag, review trigger, pagination)', () => {
   it('the sweep-addressed tag is recognized ONLY as its own marker line — a quote-reply/inline embedding stays human', () => {
     expect(extractSweepAddressed('<!-- sweep-addressed: 7 -->')).toBe(7);
     expect(extractSweepAddressed('   <!-- sweep-addressed: 7 -->  ')).toBe(7); // whitespace-tolerant
@@ -551,7 +509,7 @@ describe('propagate publish — check battery (blocking ids reachable)', () => {
     repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' });
     cleanups.push(() => repo.destroy());
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
     const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, o);
     await cmdPlan(cli({ cmd: 'plan' }));
@@ -627,22 +585,6 @@ describe('propagate publish — check battery (blocking ids reachable)', () => {
     expect(issue!.detail).toContain('resolution landed');
   });
 
-  it('ERR05: a recorded inventory decision naming a conflicted path blocks the publish', async () => {
-    const { ws, caseId, prDir, cli } = await setupHeldCase([
-      {
-        id: 'x-decision',
-        branch: 'feat/none',
-        extra_context: 'Owner decision 2026-07-15: src/x.ts keeps the fork variant; never re-raise.',
-      },
-    ]);
-    writeText(prDir, GOOD_TITLE, GOOD_BODY);
-    const out = join(ws, 'out.json');
-    expect(await cmdPublish(cli({ cmd: 'publish', caseId, out }))).toBe(1);
-    const issue = readOut(out).issues.find((i) => i.id === 'ERR05_DECIDED_ALREADY');
-    expect(issue).toBeTruthy();
-    expect(issue!.detail).toContain('never re-raise');
-  });
-
   it('ERR06: two cases sharing a conflict signature — only the topmost (DAG order) may publish', async () => {
     // feat/a and feat/b carry the SAME fork edit and conflict identically
     // against the same main_patched tip: same paths + same head sha.
@@ -688,7 +630,7 @@ describe('propagate publish — check battery (blocking ids reachable)', () => {
     expect(duplicate).not.toBe(topmost);
 
     // The twin IS a duplicate, asserted on the very checker publish's battery
-    // calls — same id, and it names the topmost case. (Publish can no longer
+    // calls — same id, and it names the topmost case. (Publish cannot
     // SURFACE this itself: report-case consolidates the twin before it can hold
     // a publishable disposition — see the assertions below.)
     const jnow = readJournal(dir);
@@ -710,7 +652,7 @@ describe('propagate publish — check battery (blocking ids reachable)', () => {
     expect(await cmdPublish(cli({ cmd: 'publish', caseId: duplicate, out }))).toBe(1); // no PR of its own
   });
 
-  it('ERR06 subset (D-050): a 6-path case whose set is a subset of a 7-path sibling with matching blobs is a duplicate', async () => {
+  it('ERR06 subset: a 6-path case whose set is a subset of a 7-path sibling with matching blobs is a duplicate', async () => {
     // The missed #60 shape: feat/a carries the fork edit on SEVEN files,
     // feat/b the SAME edit on six of them — b's conflicted set is a strict
     // subset of a's and the shared conflict blobs are byte-identical.
@@ -801,14 +743,14 @@ describe('propagate publish — check battery (blocking ids reachable)', () => {
     expect(issue!.detail).toContain('#7');
   });
 
-  it('ERR08 (text missing); with text present the checks are MECHANICAL only — no reader loop, no prtext artifacts (D-050)', async () => {
+  it('ERR08 (text missing); with text present the checks are MECHANICAL only — no reader loop, no prtext artifacts', async () => {
     const { ws, caseId, prDir, cli } = await setupHeldCase();
     const out = join(ws, 'out.json');
     expect(await cmdPublish(cli({ cmd: 'publish', caseId, out }))).toBe(1);
     expect(readOut(out).issues.some((i) => i.id === 'ERR08_TEXT_MISSING')).toBe(true);
 
-    // Text present -> straight to green (dry-run): the retired PR-text cold
-    // read never fires and no prtext request/verdict artifact is written.
+    // Text present -> straight to green (dry-run): no PR-text cold
+    // read fires and no prtext request/verdict artifact is written.
     writeText(prDir, GOOD_TITLE, GOOD_BODY);
     expect(await cmdPublish(cli({ cmd: 'publish', caseId, out }))).toBe(0);
     const res = readOut(out);
@@ -877,7 +819,7 @@ describe('propagate publish — check battery (blocking ids reachable)', () => {
 
 // --- cmdPublish: dry-run purity + execute happy path -------------------------
 
-describe('propagate publish — dry-run makes no pushes/network; execute pushes the ref + creates the PR (D-049)', () => {
+describe('propagate publish — dry-run makes no pushes/network; execute pushes the ref + creates the PR', () => {
   it('dry-run: full battery green, pristine-conflict draft head reported, transport never constructed, nothing pushed', async () => {
     const { repo, ws, dir, caseId, prDir, bareDir, cli } = await setupHeldCase();
     writeText(prDir, GOOD_TITLE, GOOD_BODY);
@@ -889,7 +831,7 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
     expect(res.dryRun).toBe(true);
     expect(res.issues).toEqual([]);
     // No marker-clean resolution exists (--tier held on an untouched worktree) →
-    // the DRAFT head is the PRISTINE CONFLICT (D-057): clean-prefix commit on the
+    // the DRAFT head is the PRISTINE CONFLICT: clean-prefix commit on the
     // branch tip + a conflict commit whose tree is the automerge tree (markers, no
     // agent edits), parented on the case head so the owner's merge completes PR_ID.
     const caseHead = (readJournal(dir).find((e) => e.action === 'case')!.head as { sha: string }).sha;
@@ -906,7 +848,7 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
     expect(repo.git('-C', bareDir, 'for-each-ref', 'refs/heads/fix')).toBe('');
   });
 
-  it('execute: git push of the fix/sweep ref at the pristine-conflict head, then POST /pulls (draft, machine block); journaled (no durable local state, D-058)', async () => {
+  it('execute: git push of the fix/sweep ref at the pristine-conflict head, then POST /pulls (draft, machine block); journaled (no durable local state)', async () => {
     const { repo, ws, dir, caseId, prDir, bareDir, cli } = await setupHeldCase();
     writeText(prDir, GOOD_TITLE, GOOD_BODY);
     const tokenFile = join(ws, 'token.txt');
@@ -919,11 +861,11 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
     expect(res.pr).toEqual({ url: 'https://github.com/k-fls/fixture/pull/58', number: 58 });
 
     // API sequence: ERR07 probe + POST /pulls — no ref/commit fabrication
-    // (D-049 §5), and NO marker comment: this is a first publish with no review
-    // to address, so there is nothing for the driver to record. It used to post
-    // one saying the resolution "addresses PR reviews up to id 0" — internals
-    // printed into the owner's PR. `classifyComments` reads an absent marker as
-    // 0, so not posting is exactly equivalent.
+    // (DRIVER.md §2.5), and NO marker comment: this is a first publish with
+    // no review to address, so there is nothing for the driver to record — a
+    // marker saying the resolution "addresses PR reviews up to id 0" would be
+    // internals printed into the owner's PR. `classifyComments` reads an absent
+    // marker as 0, so not posting is exactly equivalent.
     const paths = gh.calls.map((c) => c.path);
     expect(paths[0]).toContain('/repos/k-fls/fixture/pulls?head=k-fls%3Afix%2Fsweep%2F'); // ERR07 API probe
     expect(paths.some((p) => p.includes('/git/'))).toBe(false);
@@ -933,14 +875,14 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
     expect((prCall.body as { draft: boolean }).draft).toBe(true); // HELD = draft
     expect((prCall.body as { base: string }).base).toBe('main_patched');
     expect((prCall.body as { title: string }).title).toBe(GOOD_TITLE);
-    // D-004 machine block appended below the agent's body.
+    // The machine block appended below the agent's body.
     const sentBody = (prCall.body as { body: string }).body;
     expect(sentBody).toContain(GOOD_BODY.split('\n')[0]);
     expect(sentBody).toContain(MACHINE_BLOCK_BEGIN);
     expect(sentBody.indexOf(MACHINE_BLOCK_BEGIN)).toBeGreaterThan(sentBody.indexOf('Decision needed'));
 
     // The ref was REALLY pushed (git push into the bare origin) at the DRAFT
-    // pristine-conflict head (D-057: clean prefix + re-materialized conflict,
+    // pristine-conflict head (clean prefix + re-materialized conflict,
     // 2nd parent = the case head so the owner's merge completes PR_ID).
     const published = readJournal(dir).find((e) => e.action === 'pr-published')!;
     expect(published.caseId).toBe(caseId);
@@ -957,11 +899,11 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
     expect(readJournal(dir).some((e) => e.action === 'push' && e.branch === fixBranch && e.kind === 'pr-head')).toBe(
       true,
     );
-    // Local anchor; the pr-published journal row (D-058)
+    // Local anchor; the pr-published journal row
     // carries the fix branch + PR number the pass's blocked view enriches
     // urge targets from — no local state file is written.
     expect(repo.sha(fixBranch)).toBe(pushedHead);
-    expect(existsSync(join(ws, 'sweep-ledger.json'))).toBe(false); // no durable local state (2026-08-04)
+    expect(existsSync(join(ws, 'sweep-ledger.json'))).toBe(false); // no durable local state
 
     // A second publish of the same case is ERR07 (journal side), no network needed.
     const gh2 = fakeGithub();
@@ -1007,7 +949,7 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
     expect(gh2.factories).toBe(0);
   });
 
-  it('execute: a failing git push is ERR15 (journaled halt, D-046 case-2 report) and no PR is created', async () => {
+  it('execute: a failing git push is ERR15 (journaled halt, an owner report) and no PR is created', async () => {
     const { repo, ws, dir, caseId, prDir, bareDir, cli } = await setupHeldCase();
     writeText(prDir, GOOD_TITLE, GOOD_BODY);
     const tokenFile = join(ws, 'token.txt');
@@ -1020,16 +962,16 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
     expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, tokenFile, out }), gh.factory)).toBe(1);
     const issue = readOut(out).issues.find((i) => i.id === 'ERR15_PUSH_FAILED');
     expect(issue).toBeTruthy();
-    expect(issue!.detail).toContain('D-046 case 2');
+    expect(issue!.detail).toContain('report to the owner and STOP');
     expect(readJournal(dir).some((e) => e.action === 'halt' && e.id === 'ERR15_PUSH_FAILED')).toBe(true);
     expect(gh.calls.filter((c) => c.method === 'POST').length).toBe(0); // no PR created
   });
 });
 
-// --- D-057: unified HELD publish — ACTIVE (non-draft) PR for a marker-clean
+// --- unified HELD publish — ACTIVE (non-draft) PR for a marker-clean
 // resolution, with the escalation prefix + reviewer feedback in the body ------
 
-describe('propagate publish — unified HELD publish (D-057): marker-clean resolution -> ACTIVE PR', () => {
+describe('propagate publish — unified HELD publish: marker-clean resolution -> ACTIVE PR', () => {
   it('execute: pushes the RESOLVED MERGE COMMIT and opens a NON-draft PR with the escalation prefix + feedback', async () => {
     const { repo, ws, dir, caseId, prDir, bareDir, resolvedTree, cli } = await setupEscalatedHeldCase();
     writeText(prDir, GOOD_TITLE, GOOD_BODY);
@@ -1054,7 +996,7 @@ describe('propagate publish — unified HELD publish (D-057): marker-clean resol
     expect(repo.git('-C', bareDir, 'rev-parse', `refs/heads/${published.fixBranch as string}`)).toBe(head);
 
     // Escalation prefix + the cold reviewer's feedback ride ABOVE the agent prose;
-    // the D-004 machine block still trails it.
+    // the machine block still trails it.
     const sentBody = (prCall.body as { body: string }).body;
     expect(sentBody.startsWith('[AUTO-ESCALATED: scope exceeded]')).toBe(true);
     expect(sentBody).toContain('src/extra.ts');
@@ -1146,7 +1088,7 @@ describe('propagate publish — unified HELD publish (D-057): marker-clean resol
   });
 });
 
-// --- D-057 review fix: deterministic fix-branch naming ------------------------
+// --- deterministic fix-branch naming ------------------------------------------
 
 describe('propagate publish — fixBranchName is wall-clock independent', () => {
   it('a JUDGED publish retried days later computes the SAME fix branch (no orphan ref)', async () => {
@@ -1162,7 +1104,7 @@ describe('propagate publish — fixBranchName is wall-clock independent', () => 
     repo.git('push', 'origin', 'main_patched');
     cleanups.push(() => repo.destroy());
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
     const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, o);
     expect(await cmdSweepStart(cli({ cmd: 'sweep-start' }))).toBe(0);
@@ -1172,7 +1114,7 @@ describe('propagate publish — fixBranchName is wall-clock independent', () => 
     expect(
       await cmdSweepReportCase(cli({ cmd: 'report-case', tier: 'judged', execute: true }), confirm),
     ).toBe(0);
-    // JUDGED merges at report-pr (D-060), which is where the merge commit publish
+    // JUDGED merges at report-pr, which is where the merge commit publish
     // uses as the PR head comes from.
     writeText(join(dir, caseId, 'pr'), GOOD_TITLE, GOOD_BODY);
     expect(await cmdSweepReportPr(cli({ cmd: 'report-pr', execute: true }), neverInvoked)).toBe(0);
@@ -1192,11 +1134,11 @@ describe('propagate publish — fixBranchName is wall-clock independent', () => 
   });
 });
 
-// --- red-finish escalation: origin is BEHIND by design (2026-08-05) ---------
+// --- red-finish escalation: origin is BEHIND by design -----------------------
 //
 // The pass finished RED, so `propagate push` never ran and origin/<branch> sits
-// at the pre-pass tip. Every held escalation was refused by ERR14 and the
-// agent's fixes were dropped with no PR — the failure this covers.
+// at the pre-pass tip. Without the escalation, every held escalation is refused
+// by ERR14 and the agent's fixes are dropped with no PR — the failure this covers.
 describe('publish — held escalation off an unpushed base (ERR14, red finish)', () => {
   it('an origin-based head passes the held height rule that the local-tip head fails', async () => {
     const repo = initFixtureRepo();
@@ -1235,14 +1177,14 @@ describe('publish — held escalation off an unpushed base (ERR14, red finish)',
   });
 });
 
-// --- the red-finish escalation, end to end (D-064) ---------------------------
+// --- the red-finish escalation, end to end -----------------------------------
 //
 // `setupEscalatedHeldCase` ends with `git push origin main_patched` and
 // `setupHeldCase` labels that push "simulated target push -> ERR14 passes".
 // That push is EXACTLY what a red finish does not do: the tests failed, so
 // nothing is pushed, so origin is behind and the held escalation is refused.
 // This drives the real publish through that state.
-describe('publish — red-finish escalation, end to end (D-064)', () => {
+describe('publish — red-finish escalation, end to end', () => {
   async function redFinishState() {
     const s = await setupEscalatedHeldCase();
     // Another case merged earlier in this pass. The finish went RED, so it was
@@ -1257,7 +1199,7 @@ describe('publish — red-finish escalation, end to end (D-064)', () => {
     return { ...s, tokenFile };
   }
 
-  it('without the escalation the held case is refused (the live 2026-08-05 failure)', async () => {
+  it('without the escalation the held case is refused (ERR14_BASE_BEHIND)', async () => {
     const { ws, caseId, cli, tokenFile } = await redFinishState();
     const gh = fakeGithub();
     const out = join(ws, 'out.json');
@@ -1298,14 +1240,14 @@ describe('publish — red-finish escalation, end to end (D-064)', () => {
   });
 });
 
-// --- internal + explicit --out (D-054 boundary, D-064 layer 5) --------------
+// --- internal + explicit --out ----------------------------------------------
 //
 // `finish`'s held escalation runs publish with `internal: true` (so only the
 // outer command prints a SWEEP-RESULT line) AND an explicit `--out` (so it can
-// read WHY a refusal happened). Before this, `internal` returned before the
-// file write and every refusal journaled `reason: unknown` — live 2026-08-05,
-// three of three, which is the whole point of having captured it.
-describe('emit — an internal caller with an explicit --out still gets the artifact (D-064)', () => {
+// read WHY a refusal happened). If `internal` returned before the file write,
+// every refusal would journal `reason: unknown` — and capturing the reason is
+// the whole point.
+describe('emit — an internal caller with an explicit --out still gets the artifact', () => {
   it('writes the file, prints nothing', async () => {
     const { ws, caseId, cli } = await setupHeldCase();
     const out = join(ws, 'internal-out.json');
@@ -1323,7 +1265,7 @@ describe('emit — an internal caller with an explicit --out still gets the arti
     const res = JSON.parse(readFileSync(out, 'utf8')) as { ok: boolean; issues: Array<{ id: string }> };
     expect(res.ok).toBe(false);
     expect(res.issues.map((i) => i.id)).toContain('ERR08_TEXT_MISSING');
-    // D-054 intact: the internal call still prints no result line.
+    // The internal-caller boundary holds: the internal call prints no result line.
     expect(logged.some((l) => l.includes('wrote ') || l.trim().startsWith('{'))).toBe(false);
   });
 });
@@ -1331,9 +1273,8 @@ describe('emit — an internal caller with an explicit --out still gets the arti
 // --- a held gate fix with NO resolution still reaches the owner -------------
 //
 // A gate fix never had a conflict, so freezing HELD with no resolution means the
-// agent tried and could not fix it. publishHead refused exactly that shape, so
-// the diagnosis reached nobody — live 2026-08-05, two of two. It was later
-// allowed only for cases flagged `diagnosisOnly`; that flag is gone, and the
+// agent tried and could not fix it. If publishHead refused that shape, the
+// diagnosis would reach nobody. There is no `diagnosisOnly` gate: the
 // rule applies to every held gate fix alike.
 describe('publish — a held gate fix with no resolution publishes a report PR', () => {
   async function heldGateFixNoResolution() {
@@ -1347,7 +1288,7 @@ describe('publish — a held gate fix with no resolution publishes a report PR',
 
     const ws = mkWorkspace();
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
-    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, emptyInventory(), o);
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, branchlessInventory(), o);
     await cmdPlan(cli({ cmd: 'plan' })); // open the pass the rows below belong to
     const caseId = 'gate-fix-main_patched-deadbeef';
     const tip = repo.sha('main_patched');

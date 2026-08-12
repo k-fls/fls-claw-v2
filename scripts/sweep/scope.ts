@@ -1,6 +1,5 @@
 /**
- * scripts/sweep/scope.ts — scope partition + DAG ordering
- * (2026-07-14 merge-source correction; owner directive).
+ * scripts/sweep/scope.ts — scope partition + DAG ordering.
  *
  * Partition of `git branch --list` (after explicit + namespace exclusions):
  *  - structural:       main_patched — the ONLY upstream entry point besides
@@ -11,14 +10,14 @@
  *                      NEVER upstream/main directly. Conflicts resolve once
  *                      at the topmost affected branch; descendants inherit.
  *  - edition-ancestor: non-inventory branches in the TRANSITIVE edition
- *                      composition (D-033): tip-ancestor of an edition/*
+ *                      composition: tip-ancestor of an edition/*
  *                      branch OR ever merged into any branch whose merge
  *                      history reaches an edition (fork-era merge-edge
  *                      closure — upstream-PR candidates cut from main);
  *                      mergeModel upstream-chain (merge main ONLY — never
  *                      polluted with main_patched/fork content). Flagged:
  *                      "in edition composition but no inventory entry".
- *  - ignored:          every other non-inventory branch (owner rule: "agent
+ *  - ignored:          every other non-inventory branch (the standing scope rule: "agent
  *                      ignores non-inventory branches, unless they are
  *                      present in any edition branch"). At most a digest
  *                      drift line.
@@ -41,10 +40,11 @@ export interface ScopeResult {
   warnings: string[];
 }
 
-const SWEEPABLE_STATUS = new Set(['in-progress', 'shipped', 'experimental']);
+// Sweepability is derived: an entry with a `branch` is swept. An entry whose
+// branch resolves nowhere is dropped with a scope-drift warning below.
 
 /**
- * D-033: the edition-composition test is TRANSITIVE and HISTORICAL. A branch
+ * The edition-composition test is TRANSITIVE and HISTORICAL. A branch
  * qualifies if it was ever merged into any branch whose merge history
  * (transitively) reaches an edition/* branch. Tip-ancestry into a member is
  * the cheap first check; the general test is fork-era reachability of the
@@ -183,7 +183,7 @@ export function buildScope(
   const exclude = [...EXCLUDED_BRANCH_GLOBS, ...(scope.exclude ?? [])];
   const excluded = (b: string) => globMatchAny(exclude, b);
   const repoSet = new Set(repoBranches);
-  // D-045 (DRIVER.md §4.7): branches present ONLY as origin/* remote-tracking
+  // DRIVER.md §4.7: branches present ONLY as origin/* remote-tracking
   // refs. An inventory branch found here (and not locally) is IN scope, flagged
   // `materialize` — planned from the origin commit, local ref created by
   // `run --execute` before its first mutation. A branch in NEITHER place stays
@@ -199,7 +199,7 @@ export function buildScope(
   };
   const byBranch = new Map<string, FeatureEntry>();
   for (const e of features) {
-    if (!e.branch || !SWEEPABLE_STATUS.has(e.status)) continue;
+    if (!e.branch) continue;
     byBranch.set(e.branch, e);
   }
   for (const [branch, e] of byBranch) {
@@ -290,7 +290,7 @@ export function buildScope(
     ordered.push({
       branch: b,
       kind: 'inventory',
-      // No parents at all (no main_patched in the repo, e.g. bootstrap
+      // No parents at all (no main_patched in the repo, e.g. test
       // fixtures): fall back to the upstream chain.
       mergeModel: parentOf[b].length > 0 ? 'parents' : 'upstream-chain',
       parents: parentOf[b],
@@ -300,7 +300,7 @@ export function buildScope(
   for (const b of [...inventory].sort()) visit(b, []);
   if (cycle)
     throw new Error(
-      `scope DAG contains a cycle: ${cycle} — the inventory may only contain branches with proper/valid inheritance (D-045); fix the entries' parents before planning`,
+      `scope DAG contains a cycle: ${cycle} — the inventory may only contain branches with proper/valid inheritance (PROPAGATION.md §13); fix the entries' parents before planning`,
     );
 
   return {
@@ -317,7 +317,7 @@ export async function resolveScope(
   scope: SweepScope,
   opts: {
     /**
-     * D-045 (§13): also consider origin/* remote-tracking refs so remote-only
+     * §13: also consider origin/* remote-tracking refs so remote-only
      * inventory branches enter scope (flagged `materialize`). The propagation
      * driver passes true; the scan flow stays local-only (it probes by branch
      * name and never materializes refs).

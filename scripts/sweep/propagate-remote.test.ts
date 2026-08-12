@@ -1,5 +1,5 @@
 /**
- * D-045 Feature A (PROPAGATION.md §13) — remote-branch materialization + sync,
+ * DRIVER.md §4.7 — remote-branch materialization + sync,
  * end-to-end at the cmdRun level. Fixtures fake `origin` via
  * refs/remotes/origin/* (FixtureRepo.setOrigin); the driver never operates on
  * refs/remotes directly — it materializes/syncs LOCAL branches from origin at
@@ -34,7 +34,6 @@ function writeInventory(entries: Array<{ id: string; branch: string; parents?: s
       `id: ${e.id}`,
       `name: ${e.id}`,
       'kind: feat',
-      'status: shipped',
       `branch: ${e.branch}`,
       ...(e.parents ? ['parents:', ...e.parents.map((p) => `  - ${p}`)] : []),
     ].join('\n');
@@ -198,7 +197,7 @@ describe('propagate — §13 sync states: behind / ahead / diverged in one pass'
       issues: Array<{ id: string; detail: string }>;
     };
     expect(out.diverged).toEqual(['feat/d']);
-    // §14 (D-048): the sync-diverged DriverHalt surfaces under the ERR2x id
+    // §14: the sync-diverged DriverHalt surfaces under the ERR2x id
     // scheme in run output; the human text stays in `detail`.
     const err20 = out.issues.find((i) => i.id === 'ERR20_BRANCH_DIVERGED');
     expect(err20).toBeTruthy();

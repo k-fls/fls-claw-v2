@@ -1,7 +1,7 @@
 /**
  * scripts/sweep/cut-points.test.ts — owner-approved cut-point exceptions.
  *
- * The two shapes under test are MEASURED, not invented (live fork 2026-07-29):
+ * The two shapes under test are MEASURED on the live fork, not invented:
  *
  *   DUPLICATE  `3b8c5896` and `dc3cb7f6` are the same patch twice — identical
  *              patch-id `25c7b6481c3a`. `dc3cb7f6` is on module/host-rpc;
@@ -55,7 +55,7 @@ function absentFile(): string {
 }
 
 function feat(over: Partial<FeatureEntry> & { id: string }): FeatureEntry {
-  return { name: over.id, kind: 'module', status: 'shipped', ...over } as FeatureEntry;
+  return { name: over.id, kind: 'module', ...over } as FeatureEntry;
 }
 
 const SERVER = 'src/modules/host-rpc/server.ts';
@@ -246,16 +246,17 @@ describe('verifyCutPointExceptions — re-verified against git, never trusted fo
     expect(v.applied[0]).toContain('is a copy of');
   });
 
-  it('STALE DUPLICATE: the two commits are no longer the same patch — WARN, do NOT apply', async () => {
+  it('STALE DUPLICATE: the two commits are not the same patch — WARN, do NOT apply', async () => {
     const f = duplicateRepo();
-    // `twin` points at a commit with a different diff: the claim git used to
-    // support is now false. Applying anyway would erase a commit from
+    // `twin` points at a commit with a different diff: the repo contradicts the
+    // recorded claim. Applying anyway would erase a commit from
     // module/credentials that it really did write — suppressing a real answer.
     const ex = loadCutPointExceptions(tmpFile('cut-point-exceptions.yaml', dupYaml(f, { twin: f.ownWork })))!;
     const v = await verifyCutPointExceptions(f.repo.dir, ex);
     expect(v.duplicates.size).toBe(0);
     expect(staleWarnings(v)).toHaveLength(1);
-    expect(staleWarnings(v)[0].detail).toContain('no longer the same patch');
+    expect(staleWarnings(v)[0].detail).toContain('not the same patch');
+    expect(staleWarnings(v)[0].detail).toContain('the patches have diverged');
   });
 
   it('STALE DUPLICATE: the RECORDED patch_id no longer matches the recomputed one — WARN, do NOT apply', async () => {
@@ -308,13 +309,13 @@ describe('verifyCutPointExceptions — re-verified against git, never trusted fo
     expect(v.applied[0]).toContain('is contained in main_patched');
   });
 
-  it('STALE ABSORBED: `as_of` no longer contains the branch (it moved on) — WARN, do NOT apply', async () => {
+  it('STALE ABSORBED: `as_of` does not contain the branch (it moved past it) — WARN, do NOT apply', async () => {
     const f = duplicateRepo();
     f.repo.checkout('main_patched');
     f.repo.merge('module/host-rpc', 'verify: merge module/host-rpc');
     const asOf = f.repo.sha('main_patched');
-    // The branch commits again AFTER the absorption: its remainder is no longer
-    // empty, so the recorded fact is now false.
+    // The branch commits again AFTER the absorption: its remainder is
+    // non-empty, so the repo contradicts the recorded fact.
     f.repo.checkout('module/host-rpc');
     f.repo.commit('host-rpc: more work', { [SERVER]: 'server v2\n' });
     f.repo.checkout('main');
@@ -335,7 +336,8 @@ describe('verifyCutPointExceptions — re-verified against git, never trusted fo
     const v = await verifyCutPointExceptions(f.repo.dir, ex);
     expect(v.absorbed.size).toBe(0);
     expect(staleWarnings(v)).toHaveLength(1);
-    expect(staleWarnings(v)[0].detail).toContain('no longer contains module/host-rpc');
+    expect(staleWarnings(v)[0].detail).toContain('does not contain module/host-rpc');
+    expect(staleWarnings(v)[0].detail).toContain('moved past it');
   });
 
   it('a NULL config (absent file) verifies to an empty, warning-free result', async () => {

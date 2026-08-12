@@ -1,16 +1,15 @@
 /**
- * D-045 Feature B (PROPAGATION.md §13) — candidate discovery with inheritance
+ * DRIVER.md §3.7 — candidate discovery with inheritance
  * derivation: fixture DAGs for the evidence kinds, the confidence rule, the
- * urging-style report throttle, and the "inventory only with valid
+ * every-pass derivation + reporting, and the "inventory only with valid
  * inheritance" plan-time hard halt.
  */
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parse } from 'yaml';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { candidateYamlPath, deriveCandidates, type CandidateRecord } from './candidates.js';
+import { deriveCandidates, type CandidateRecord } from './candidates.js';
 import { initFixtureRepo, type FixtureRepo } from './fixtures.js';
 import { enumerateChain } from './heights.js';
 import { cmdPlan, cmdRun, passDir, readJournal, type Cli } from './propagate.js';
@@ -34,7 +33,7 @@ function mkWorkspace(): string {
 }
 
 function entry(id: string, branch: string, parents?: string[]): FeatureEntry {
-  return { id, name: id, kind: 'feat', status: 'shipped', branch, parents } as FeatureEntry;
+  return { id, name: id, kind: 'feat', branch, parents };
 }
 
 async function derive(repo: FixtureRepo, base: string, features: FeatureEntry[]): Promise<CandidateRecord[]> {
@@ -42,7 +41,7 @@ async function derive(repo: FixtureRepo, base: string, features: FeatureEntry[])
   return deriveCandidates({ repo: repo.dir, chain, features, scope: {} });
 }
 
-describe('deriveCandidates — inheritance derivation (D-045)', () => {
+describe('deriveCandidates — inheritance derivation (§13.2)', () => {
   it('(i) clear: a candidate cut from an inventory branch derives that parent (cut-from evidence)', async () => {
     const repo = fixtureRepo();
     repo.commit('base: x', { 'src/x.ts': 'orig\n' });
@@ -176,7 +175,7 @@ describe('deriveCandidates — inheritance derivation (D-045)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// e2e through the driver: reporting, throttle, plan exclusion, validator.
+// e2e through the driver: per-pass reporting, plan exclusion, validator.
 // ---------------------------------------------------------------------------
 
 function writeInventoryDir(entries: Array<{ id: string; branch: string; parents?: string[] }>): string {
@@ -191,7 +190,6 @@ function addInventoryEntry(dir: string, e: { id: string; branch: string; parents
     `id: ${e.id}`,
     `name: ${e.id}`,
     'kind: feat',
-    'status: shipped',
     `branch: ${e.branch}`,
     ...(e.parents ? ['parents:', ...e.parents.map((p) => `  - ${p}`)] : []),
   ].join('\n');
@@ -232,55 +230,41 @@ function candidateEvents(dir: string): Array<{ event: string; branch: string }> 
     .map((e) => ({ event: e.event as string, branch: e.branch as string }));
 }
 
-describe('propagate plan — candidate reporting + throttle (§13)', () => {
-  it('(v) reports on discovery, stays quiet on an unmoved tip, re-reports on movement, resolves once on entry gain', async () => {
+describe('propagate plan — candidates derived fresh and reported every pass (§13)', () => {
+  it('(v) journals + writes candidates.json on every pass until an inventory entry ends the reporting', async () => {
     const { repo } = candidateFixture();
     const ws = mkWorkspace();
     const inv = writeInventoryDir([{ id: 'a', branch: 'feat/a', parents: ['main_patched'] }]);
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
     const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, o);
 
-    // Discovery: journaled, YAML written, candidates.json lists it as newly reported.
+    // First pass: journaled, candidates.json carries the full derived record.
     expect(await cmdPlan(cli({ cmd: 'plan' }))).toBe(0);
     expect(candidateEvents(dir)).toEqual([{ event: 'discovered', branch: 'feat/cand' }]);
-    const yamlPath = candidateYamlPath(ws, 'feat/cand');
-    expect(existsSync(yamlPath)).toBe(true);
-    const stored = parse(readFileSync(yamlPath, 'utf8')) as CandidateRecord;
-    expect(stored.lastReportedTip).toBe(repo.sha('feat/cand'));
-    expect(stored.confidence).toBe('clear');
     const summary = JSON.parse(readFileSync(join(dir, 'candidates.json'), 'utf8')) as {
-      newlyReported: string[];
+      candidates: CandidateRecord[];
       standingInstruction: string;
     };
-    expect(summary.newlyReported).toEqual(['feat/cand']);
+    expect(summary.candidates.map((c) => c.branch)).toEqual(['feat/cand']);
+    expect(summary.candidates[0].confidence).toBe('clear');
+    expect(summary.candidates[0].tip).toBe(repo.sha('feat/cand'));
     expect(summary.standingInstruction).toContain('inventory may only contain branches with proper/valid inheritance');
 
-    // Unmoved tip: quiet pass — no new candidate journal entries.
-    expect(await cmdPlan(cli({ cmd: 'plan' }))).toBe(0);
-    expect(candidateEvents(dir).length).toBe(1);
-
-    // Moved tip: re-reported, YAML throttle field updated.
-    repo.checkout('feat/cand');
-    const c2 = repo.commit('c2: more work', { 'src/c2.ts': 'c2\n' });
-    repo.checkout('main');
+    // Unchanged tip, next pass: reported AGAIN — no cross-pass throttle.
     expect(await cmdPlan(cli({ cmd: 'plan' }))).toBe(0);
     expect(candidateEvents(dir)).toEqual([
       { event: 'discovered', branch: 'feat/cand' },
-      { event: 'moved', branch: 'feat/cand' },
+      { event: 'discovered', branch: 'feat/cand' },
     ]);
-    expect((parse(readFileSync(yamlPath, 'utf8')) as CandidateRecord).lastReportedTip).toBe(c2);
 
-    // Entry gained: stops being a candidate — marked resolved, reported once.
+    // Entry gained: no longer a candidate — no new rows, candidates.json empties.
     addInventoryEntry(inv, { id: 'cand', branch: 'feat/cand', parents: ['feat/a'] });
     expect(await cmdPlan(cli({ cmd: 'plan' }))).toBe(0);
-    const events3 = candidateEvents(dir);
-    expect(events3[events3.length - 1]).toEqual({ event: 'resolved', branch: 'feat/cand' });
-    const resolvedYaml = parse(readFileSync(yamlPath, 'utf8')) as CandidateRecord;
-    expect(resolvedYaml.resolved).toBe(true);
-    expect(resolvedYaml.resolvedReason).toBe('inventory-entry-added');
-    // ...and only once: a further plan stays quiet.
-    expect(await cmdPlan(cli({ cmd: 'plan' }))).toBe(0);
-    expect(candidateEvents(dir).length).toBe(events3.length);
+    expect(candidateEvents(dir).length).toBe(2);
+    const after = JSON.parse(readFileSync(join(dir, 'candidates.json'), 'utf8')) as {
+      candidates: CandidateRecord[];
+    };
+    expect(after.candidates).toEqual([]);
   });
 
   it('(vii) a candidate never appears in the merge plan and is never merged by run', async () => {
@@ -307,7 +291,7 @@ describe('propagate plan — candidate reporting + throttle (§13)', () => {
   });
 });
 
-describe('propagate plan — inventory-inheritance hard halt (§13, D-045)', () => {
+describe('propagate plan — inventory-inheritance hard halt (§13)', () => {
   it('(vi) an inventory entry whose parent is missing from the inventory/structural set halts, naming the entry', async () => {
     const repo = fixtureRepo();
     repo.commit('base: x', { 'src/x.ts': 'orig\n' });
@@ -322,6 +306,8 @@ describe('propagate plan — inventory-inheritance hard halt (§13, D-045)', () 
     await expect(cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }))).rejects.toThrow(
       /entry 'a' \(branch 'feat\/a'\) declares parent 'feat\/ghost'/,
     );
-    await expect(cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }))).rejects.toThrow(/D-045/);
+    await expect(cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }))).rejects.toThrow(
+      /inventory may only contain branches with proper\/valid inheritance/,
+    );
   });
 });

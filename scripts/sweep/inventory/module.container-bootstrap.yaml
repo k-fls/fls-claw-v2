@@ -1,56 +1,35 @@
 id: module.container-bootstrap
 name: Container bootstrap (launch shape, network, privilege)
 kind: module
-status: shipped
 branch: module/container-bootstrap
 parents:
-- module/agent-group-contributions
+  - module/agent-group-contributions
 dependents:
-- feat/ssh-auth
-- edition/fls-ai-bot
-summary: 'Structured container launch pipeline: launch-shape assembly, network setup, privilege handling,
-  IP registry/observer, reserved env names, snapshotting, container-env module, and mount-security checks.
-  Registered via the agent-group-contributions seam.'
+  - feat/ssh-auth
+  - edition/fls-ai-bot
+summary: "Structured container launch pipeline: launch-shape assembly, network setup, privilege
+  handling, IP registry/observer, reserved env names, snapshotting, container-env module, and
+  mount-security checks. Registered via the agent-group-contributions seam."
 owned_paths:
-- src/modules/container-bootstrap/**
-- src/modules/container-env/**
-- src/modules/mount-security/index.test.ts
-- docs/container-bootstrap.md
-touch_paths:
-- src/container-runner.ts
-- src/container-runtime.ts
-- container/entrypoint.sh
-- src/modules/index.ts
-- src/index.ts
-- src/config.ts
+  - src/modules/container-bootstrap/**
+  - src/modules/container-env/**
+  - src/modules/mount-security/index.test.ts
+  - docs/container-bootstrap.md
 key_symbols: []
-symbol_watch: []
-invariants: []
 design_docs:
-- docs/container-bootstrap.md@module/container-bootstrap
+  - docs/container-bootstrap.md@module/container-bootstrap
 test_anchors:
-- src/modules/container-bootstrap/e2e.test.ts
-- src/modules/container-bootstrap/launch-shape.test.ts
-- src/modules/container-bootstrap/network.test.ts
-- src/modules/container-bootstrap/privilege.test.ts
-overlap_hints: Upstream changes to how containers are launched (docker run args, networking, mounts, env
-  injection) overlap directly; any new sandbox-hardening feature is a candidate duplicate.
+  - src/modules/container-bootstrap/e2e.test.ts
+  - src/modules/container-bootstrap/launch-shape.test.ts
+  - src/modules/container-bootstrap/network.test.ts
+  - src/modules/container-bootstrap/privilege.test.ts
 routing:
   keywords:
-  - bootstrap
-  - network
-  - privilege
-  - mount
-  - launch
-  - sandbox
+    - bootstrap
+    - network
+    - privilege
+    - mount
+    - launch
+    - sandbox
   always_check_on:
-  - dockerfile-change
-prompt:
-  template: prompts/overlap-check.md
-maintenance:
-  owner: sweep-agent-group
-  last_verified: '2026-07-10'
-  verified_against: 703d047e5f708f15910e058a0693fce53f3068b7
-  notes: skeleton — needs enrichment. Branch content shows sibling root modules (crypto, interaction-status,
-    container-queue, command-gate) merged in — DAG edge list may be incomplete; confirm during enrichment.
-    src/modules/container-bootstrap/egress-observer.ts is owned by module/egress-lockdown, not here.
+    - dockerfile-change

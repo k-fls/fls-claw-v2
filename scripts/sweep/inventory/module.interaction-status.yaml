@@ -1,37 +1,25 @@
 id: module.interaction-status
 name: Interaction status registry
 kind: module
-status: shipped
 branch: module/interaction-status
 parents:
-- main_patched
+  - main_patched
 dependents:
-- module/interactions-helpers
-summary: Registry tracking the lifecycle/status of interactive prompts sent to users, so other modules
-  can await or inspect pending interactions. Standalone root module.
+  - module/interactions-helpers
+summary: Registry tracking the lifecycle/status of interactive prompts sent to users, so other
+  modules can await or inspect pending interactions. Standalone root module.
 owned_paths:
-- src/modules/interaction-status/**
-- docs/interaction-status.md
-touch_paths: []
+  - src/modules/interaction-status/**
+  - docs/interaction-status.md
 key_symbols: []
-symbol_watch: []
-invariants: []
 design_docs:
-- docs/interaction-status.md@module/interaction-status
+  - docs/interaction-status.md@module/interaction-status
 test_anchors:
-- src/modules/interaction-status/registry.test.ts
-overlap_hints: Upstream adding any pending-interaction/awaiting-user-input tracking mechanism.
+  - src/modules/interaction-status/registry.test.ts
 routing:
   keywords:
-  - interaction
-  - status
-  - pending
-  - prompt
+    - interaction
+    - status
+    - pending
+    - prompt
   always_check_on: []
-prompt:
-  template: prompts/overlap-check.md
-maintenance:
-  owner: sweep-agent-group
-  last_verified: '2026-07-10'
-  verified_against: de0427e4aea1d955787ea73244264bc28df78701
-  notes: skeleton — needs enrichment

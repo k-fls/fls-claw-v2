@@ -1,45 +1,30 @@
 id: feat.memory-substrate
 name: Memory substrate P0 (design 06, WS-H)
 kind: feat
-status: in-progress
 branch: feat/memory-substrate
 parents:
-- main_patched
+  - main_patched
 dependents: []
-summary: 'Memory architecture P0: LogAdapter over session logs including rotated files, NormalizedEvent
-  (frozen contract §3.5), L0 salience scanning, leads store, degradation handling, and a memory-scan script
-  (design 06 §2-3, §9-P0).'
+summary: "Memory architecture P0: LogAdapter over session logs including rotated files,
+  NormalizedEvent (frozen contract §3.5), L0 salience scanning, leads store, degradation handling,
+  and a memory-scan script (design 06 §2-3, §9-P0)."
 owned_paths:
-- src/modules/memory-substrate/**
-- scripts/memory-scan.ts
-touch_paths:
-- src/group-init.ts
+  - src/modules/memory-substrate/**
+  - scripts/memory-scan.ts
 key_symbols: []
-symbol_watch: []
-invariants: []
 design_docs:
-- docs/design/06-memory-architecture.md@design/flsclaw
-- docs/design/08-implementation-plan.md@design/flsclaw
+  - docs/design/06-memory-architecture.md@design/flsclaw
+  - docs/design/08-implementation-plan.md@design/flsclaw
 test_anchors:
-- src/modules/memory-substrate/log-adapter.test.ts
-- src/modules/memory-substrate/salience-l0.test.ts
-- src/modules/memory-substrate/leads-store.test.ts
-- src/modules/memory-substrate/scan.test.ts
-overlap_hints: Upstream adding conversation-log mining, memory extraction, salience scoring, or any episodic-log-to-findings
-  pipeline is OVERLAP-HIGH; session log format changes are OVERLAP-TOUCH (LogAdapter parses them).
+  - src/modules/memory-substrate/log-adapter.test.ts
+  - src/modules/memory-substrate/salience-l0.test.ts
+  - src/modules/memory-substrate/leads-store.test.ts
+  - src/modules/memory-substrate/scan.test.ts
 routing:
   keywords:
-  - memory
-  - salience
-  - log
-  - leads
-  - mining
+    - memory
+    - salience
+    - log
+    - leads
+    - mining
   always_check_on: []
-prompt:
-  template: prompts/overlap-check.md
-maintenance:
-  owner: sweep-agent-group
-  last_verified: '2026-07-10'
-  verified_against: ea94786081db7700f4280513f3a84db4794daccd
-  notes: skeleton — needs enrichment. WS-H; NormalizedEvent is a frozen contract consumed by WS-I (planned.ops-kb).
-    Log-mining opt-in + retention defaults are unratified owner decisions.

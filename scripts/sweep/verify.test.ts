@@ -42,9 +42,9 @@ describe('verifyEverything', () => {
 
   it('reports attribution failure when no single branch is to blame', async () => {
     // TWO branches each plant a tripwire and the base is clean, so removing
-    // either one leaves the other and nothing isolates an offender. (This used
-    // `cmd: 'false'`, which fails on the BASE as well — that is now reported as
-    // baseRed, a sharper verdict, and would no longer exercise attribution.)
+    // either one leaves the other and nothing isolates an offender. (A plain
+    // `cmd: 'false'` would fail on the BASE as well — reported as baseRed, a
+    // sharper verdict — and would not exercise attribution at all.)
     repo.checkout('module/bad2', { create: true, at: 'main' });
     repo.commit('bad2: plant second tripwire', { 'BROKEN2.marker': 'boom\n' });
     repo.checkout('main');
@@ -83,14 +83,14 @@ describe('verifyEverything', () => {
   });
 });
 
-describe('verifyEverything — worktree preparation (D-060 gap)', () => {
+describe('verifyEverything — worktree preparation (dependency install hook)', () => {
   /**
-   * ROOT CAUSE, live 2026-07-31: a `git worktree add` checkout holds TRACKED
-   * FILES ONLY, so `node_modules` is absent. The case and gate-fix worktrees
-   * have symlinked the clone's dependency trees in since D-060; this one never
-   * did, so `finish`'s verify ran `tsc` with no `@types/node` and no `vitest`
-   * and was red on EVERY pass regardless of content. pnpm said so outright:
-   * "Local package.json exists, but node_modules missing".
+   * A `git worktree add` checkout holds TRACKED FILES ONLY, so `node_modules`
+   * is absent. The verify worktree needs the same dependency preparation the
+   * case and gate-fix worktrees get; without it, `finish`'s verify runs `tsc`
+   * with no `@types/node` and no `vitest` and is red on EVERY pass regardless
+   * of content — pnpm says so outright: "Local package.json exists, but
+   * node_modules missing".
    */
   it('prepares the temp worktree, and the deps SURVIVE runRecipe\'s clean', async () => {
     const seen: string[] = [];
@@ -134,12 +134,12 @@ describe('verifyEverything — worktree preparation (D-060 gap)', () => {
   });
 });
 
-// --- determinism probe (D-064) ----------------------------------------------
+// --- determinism probe ------------------------------------------------------
 //
-// Live 2026-08-05: three consecutive passes, three DIFFERENT branches blamed,
-// every one "no clean attribution". A flaky test makes leave-one-out blame
-// whichever branch was removed when it happened to pass — an innocent branch
-// rolled back and a gate fix minted against a defect that is not there.
+// A flaky test makes leave-one-out blame whichever branch was removed when it
+// happened to pass — an innocent branch rolled back and a gate fix minted
+// against a defect that is not there. So a red that does not repeat on the
+// same tree is reported flaky, never attributed.
 describe('verifyEverything — a non-deterministic red is not attributed to a branch', () => {
   it('re-runs the same tree; a failure that does not repeat is reported flaky, not blamed', async () => {
     const counter = join(repo.dir, 'flaky-runs');
@@ -164,14 +164,13 @@ describe('verifyEverything — a non-deterministic red is not attributed to a br
   });
 });
 
-// --- base probe (D-065) -----------------------------------------------------
+// --- base probe -------------------------------------------------------------
 //
 // Leave-one-out cannot see a defect that is already in the base: removing a
 // branch never fixes it, so attribution blames whoever happens to flip the
-// matrix, or gives up. Live 2026-08-05 the pass peeled
-// module/credentials -> feat/ssh-auth -> module/runtime-updater -> (none),
-// four finish runs and three frozen branches, to reach a `main_patched` defect
-// that reproduced on the base from the first second.
+// matrix, or gives up — peeling innocent branches one by one to reach a base
+// defect it could have probed for from the first second. The base probe runs
+// the commands on the bare base first.
 describe('verifyEverything — a failure already in the BASE blames no branch', () => {
   it('reports baseRed and rolls nothing back', async () => {
     // The defect is planted on the BASE, not on a recipe branch, and the stub

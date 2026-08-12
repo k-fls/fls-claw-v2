@@ -5,7 +5,7 @@ import { buildScope, editionCompositionBranches } from './scope.js';
 import type { FeatureEntry, ScopeEntry } from './types.js';
 
 function entry(partial: Partial<FeatureEntry> & { id: string }): FeatureEntry {
-  return { name: partial.id, kind: 'feat', status: 'shipped', ...partial } as FeatureEntry;
+  return { name: partial.id, kind: 'feat', ...partial } as FeatureEntry;
 }
 
 const FEATURES: FeatureEntry[] = [
@@ -13,9 +13,8 @@ const FEATURES: FeatureEntry[] = [
   entry({ id: 'module.host-rpc', kind: 'module', branch: 'module/host-rpc', parents: ['module/agc'] }),
   entry({ id: 'feat.mitm', branch: 'feat/mitm', parents: ['module/host-rpc', 'module/agc'] }),
   entry({ id: 'edition.bot', kind: 'edition', branch: 'edition/bot', parents: ['feat/mitm'] }),
-  entry({ id: 'planned.x', kind: 'planned', status: 'planned' }),
-  entry({ id: 'feat.retired', status: 'retired', branch: 'feat/retired' }),
-  entry({ id: 'feat.exp', status: 'experimental', branch: 'experimental/feat/policies' }),
+  entry({ id: 'planned.x', kind: 'planned' }), // no branch -> not swept
+  entry({ id: 'feat.exp', branch: 'experimental/feat/policies' }),
 ];
 
 const REPO_BRANCHES = [
@@ -34,7 +33,7 @@ const REPO_BRANCHES = [
 const names = (ordered: ScopeEntry[]) => ordered.map((e) => e.branch);
 const byBranch = (ordered: ScopeEntry[]) => new Map(ordered.map((e) => [e.branch, e]));
 
-describe('buildScope (2026-07-14 partition)', () => {
+describe('buildScope — scope partition', () => {
   it('orders parents before children (DAG), main_patched first', () => {
     const order = names(buildScope(FEATURES, {}, REPO_BRANCHES).ordered);
     expect(order[0]).toBe('main_patched');
@@ -64,11 +63,15 @@ describe('buildScope (2026-07-14 partition)', () => {
     expect(scope.get('module/host-rpc')).toMatchObject({ mergeModel: 'parents', parents: ['module/agc'] });
   });
 
-  it('excludes retired/planned entries and excluded namespaces', () => {
+  it('excludes branchless entries and excluded namespaces: only branch-carrying entries enter scope', () => {
     const order = names(buildScope(FEATURES, {}, REPO_BRANCHES).ordered);
-    expect(order).not.toContain('feat/retired');
     expect(order).not.toContain('experimental/feat/policies');
     expect(order).not.toContain('everything');
+    // The branchless entry contributes nothing: scope is exactly the structural
+    // branch plus the four branch-carrying inventory entries.
+    expect([...order].sort()).toEqual(
+      ['main_patched', 'module/agc', 'module/host-rpc', 'feat/mitm', 'edition/bot'].sort(),
+    );
   });
 
   it('partitions non-inventory branches: edition-ancestors in scope (main-only source, flagged), the rest ignored', () => {
@@ -123,7 +126,7 @@ describe('buildScope (2026-07-14 partition)', () => {
   });
 });
 
-describe('editionCompositionBranches (D-033: transitive + historical)', () => {
+describe('editionCompositionBranches (transitive + historical)', () => {
   const repo = initFixtureRepo();
   afterAll(() => repo.destroy());
 

@@ -309,7 +309,7 @@ export async function commitTreeMerge(
 }
 
 /**
- * Driver push (DRIVER.md §10.3): move a ref on origin via `git push` — the
+ * Driver push (DRIVER.md §2.5): move a ref on origin via `git push` — the
  * ONLY way refs move to the remote (the API is never used to fabricate
  * refs/commits as a push workaround). `src` is a committish (branch name or
  * sha); `dstBranch` the remote branch name. Never force — with ONE

@@ -4,8 +4,8 @@ import { checkDeferred, type BlockedParent } from './deferred.js';
 
 // checkDeferred(conflictHeight, blockedParents): X's own conflict DEFERS iff a
 // blocked DIRECT parent exists AND conflictHeight >= MIN(blockedParents.height).
-// Pure height-MIN — no path/window/ancestor-set test (D-057).
-describe('checkDeferred — pure height-MIN over blocked direct parents (D-057)', () => {
+// Pure height-MIN — no path/window/ancestor-set test.
+describe('checkDeferred — pure height-MIN over blocked direct parents', () => {
   const A: BlockedParent = { branch: 'feat/a', height: 5 };
   const B: BlockedParent = { branch: 'feat/b', height: 10 };
 
@@ -37,8 +37,8 @@ describe('checkDeferred — pure height-MIN over blocked direct parents (D-057)'
     expect(d.blockedBy).toBeNull();
   });
 
-  it('paths no longer matter: any conflict at/above MIN defers regardless of what changed', () => {
-    // The retired rule required conflicted-path intersection; D-057 dropped it.
+  it('paths do not matter: any conflict at/above MIN defers regardless of what changed', () => {
+    // No conflicted-path-intersection test: disjoint paths still defer.
     expect(checkDeferred(10, [B]).deferred).toBe(true);
   });
 });

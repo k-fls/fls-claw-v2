@@ -26,7 +26,7 @@ describe('buildEligibleLine (entry model, §4)', () => {
   });
 });
 
-describe('mergePointSweep — linear, non-monotonic window (§3, D-037)', () => {
+describe('mergePointSweep — linear, non-monotonic window (§3)', () => {
   it('merges past an intermediate conflict at the largest clean height', async () => {
     const tip = await revParse(repo.dir, 'fork');
     const line = await buildEligibleLine({
@@ -42,7 +42,7 @@ describe('mergePointSweep — linear, non-monotonic window (§3, D-037)', () => 
     expect(res.cleanFullRange).toBe(false);
     expect(res.mergePoint).toEqual({ sha: chain[2], height: 2 });
     // The case run starts at the smallest conflicting height ABOVE the merge
-    // point = 3 (a single-height run here — nothing above it, D-049 §2).
+    // point = 3 (a single-height run here — nothing above it, DRIVER.md §4.4).
     expect(res.firstConflict?.head.height).toBe(3);
     expect(res.firstConflict?.run.map((h) => h.height)).toEqual([3]);
     expect(res.firstConflict?.conflictedPaths).toEqual(['src/x.ts']);
@@ -96,7 +96,7 @@ describe('mergePointSweep — linear, non-monotonic window (§3, D-037)', () => 
   });
 });
 
-describe('mergePointSweep — case stacking (D-049 §2)', () => {
+describe('mergePointSweep — case stacking (MERGE-POLICY.md §2)', () => {
   /**
    * Trunk with a clean height 0 then consecutive conflicting heights 1..3 on
    * src/x.ts, plus a DISJOINT conflicting height 4 on src/y.ts. The fork edits

@@ -1,57 +1,35 @@
 id: feat.ssh-auth
 name: SSH auth for agent containers
 kind: feat
-status: in-progress
 branch: feat/ssh-auth
 parents:
-- module/container-bootstrap
-- module/credentials
-- module/host-rpc
-- module/interactions-helpers
-- module/agent-group-contributions
+  - module/container-bootstrap
+  - module/credentials
+  - module/host-rpc
+  - module/interactions-helpers
+  - module/agent-group-contributions
 dependents:
-- edition/fls-ai-bot
-summary: 'SSH key/auth management for agent containers: pending-auth flow with user notification through
-  chat, host-RPC handlers, an ssh MCP tool in the agent runner, an ssh skill, and the `ncl ssh` command.'
+  - edition/fls-ai-bot
+summary: "SSH key/auth management for agent containers: pending-auth flow with user notification
+  through chat, host-RPC handlers, an ssh MCP tool in the agent runner, an ssh skill, and the `ncl
+  ssh` command."
 owned_paths:
-- src/modules/ssh-auth/**
-- container/agent-runner/src/mcp-tools/ssh.ts
-- container/skills/ssh/SKILL.md
-- docs/ssh-auth.md
-touch_paths:
-- container/Dockerfile
-- container/entrypoint.sh
-- container/agent-runner/src/mcp-tools/index.ts
-- src/modules/host-rpc/server.ts
-- src/modules/container-bootstrap/network.ts
-- src/modules/credentials/index.ts
-- src/container-runtime.ts
-- src/modules/index.ts
+  - src/modules/ssh-auth/**
+  - container/agent-runner/src/mcp-tools/ssh.ts
+  - container/skills/ssh/SKILL.md
+  - docs/ssh-auth.md
 key_symbols: []
-symbol_watch: []
-invariants: []
 design_docs:
-- docs/ssh-auth.md@feat/ssh-auth
+  - docs/ssh-auth.md@feat/ssh-auth
 test_anchors:
-- src/modules/ssh-auth/e2e.test.ts
-- src/modules/ssh-auth/manager.test.ts
-- src/modules/ssh-auth/rpc.test.ts
-- src/modules/ssh-auth/pending.test.ts
-overlap_hints: Upstream adding SSH agent forwarding, key injection into sandboxes, or git-over-ssh credential
-  handling.
+  - src/modules/ssh-auth/e2e.test.ts
+  - src/modules/ssh-auth/manager.test.ts
+  - src/modules/ssh-auth/rpc.test.ts
+  - src/modules/ssh-auth/pending.test.ts
 routing:
   keywords:
-  - ssh
-  - key
-  - known-hosts
-  - agent-forwarding
+    - ssh
+    - key
+    - known-hosts
+    - agent-forwarding
   always_check_on: []
-prompt:
-  template: prompts/overlap-check.md
-maintenance:
-  owner: sweep-agent-group
-  last_verified: '2026-07-10'
-  verified_against: d7a2fa6eb957bfe3da2e230ae14fcdab0fcd065d
-  notes: 'skeleton — needs enrichment. STATUS AMBIGUITY: edition/fls-ai-bot carries the ssh-auth module
-    files but this branch tip is NOT an ancestor of edition (parallel/earlier merge); local branches broken-ssh-auth
-    and everything-ssh-l3 suggest unfinished L3 work. Reconcile which version shipped during enrichment.'

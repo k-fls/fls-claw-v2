@@ -1,38 +1,26 @@
 id: module.crypto
 name: Crypto primitives (AES + GPG)
 kind: module
-status: shipped
 branch: module/crypto
 parents:
-- main_patched
+  - main_patched
 dependents:
-- module/credentials
-summary: 'Shared crypto primitives module: AES encryption helpers and GPG wrappers used by the credentials
-  stack. Standalone root module.'
+  - module/credentials
+summary: "Shared crypto primitives module: AES encryption helpers and GPG wrappers used by the
+  credentials stack. Standalone root module."
 owned_paths:
-- src/modules/crypto/**
-- docs/crypto.md
-touch_paths: []
+  - src/modules/crypto/**
+  - docs/crypto.md
 key_symbols: []
-symbol_watch: []
-invariants: []
 design_docs:
-- docs/crypto.md@module/crypto
+  - docs/crypto.md@module/crypto
 test_anchors:
-- src/modules/crypto/aes.test.ts
-- src/modules/crypto/gpg.test.ts
-overlap_hints: Upstream adding encryption-at-rest, GPG integration, or crypto utility modules.
+  - src/modules/crypto/aes.test.ts
+  - src/modules/crypto/gpg.test.ts
 routing:
   keywords:
-  - crypto
-  - aes
-  - gpg
-  - encrypt
+    - crypto
+    - aes
+    - gpg
+    - encrypt
   always_check_on: []
-prompt:
-  template: prompts/overlap-check.md
-maintenance:
-  owner: sweep-agent-group
-  last_verified: '2026-07-10'
-  verified_against: ac901a4603730c9b994334631924269e4093a16f
-  notes: skeleton — needs enrichment

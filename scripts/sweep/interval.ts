@@ -118,7 +118,7 @@ export interface MergePointResult {
   /** Largest clean head (§3 step 3); null when even the oldest head conflicts. */
   mergePoint: Head | null;
   /**
-   * The stacked conflict run ABOVE the merge point (DRIVER.md §4.3 step 4 / §4.4):
+   * The stacked conflict run ABOVE the merge point (§3 step 4; DRIVER.md §4.4):
    * starts at the smallest conflicting height, extends over consecutive
    * path-intersecting conflicting heights, capped. `head` is the run's TOP;
    * paths/tree are the top probe's.

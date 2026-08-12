@@ -136,7 +136,7 @@ export interface VerifyOptions {
   /** Attribution rebuild attempts cap (default: recipe length). */
   maxAttribution?: number;
   /**
-   * Workspace rr-cache directory (DRIVER.md §12.3): installed into `.git/rr-cache` BEFORE
+   * Workspace rr-cache directory (DRIVER.md §10.2): installed into `.git/rr-cache` BEFORE
    * the recipe build so the rebuild replays the sweep's RECORDED resolutions
    * (the same install the driver's own merges do), not merely whatever preimages
    * happen to already live in the shared cache. Null/omitted → no seeding (fixtures).

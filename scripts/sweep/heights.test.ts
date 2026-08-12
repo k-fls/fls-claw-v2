@@ -19,7 +19,7 @@ describe('enumerateChain / height<->sha', () => {
   });
 });
 
-describe('pinWatermark + coverage derivation (binary ancestry search, D-029)', () => {
+describe('pinWatermark + coverage derivation (binary ancestry search)', () => {
   it('pins the watermark to a concrete sha', async () => {
     expect(await pinWatermark(repo.dir, 'upstream-main')).toBe(chain[3]);
   });

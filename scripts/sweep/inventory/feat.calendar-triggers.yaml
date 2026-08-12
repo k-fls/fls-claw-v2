@@ -1,49 +1,30 @@
 id: feat.calendar-triggers
 name: Calendar triggers sweep (design 08 WS-G)
 kind: feat
-status: in-progress
 branch: feat/calendar-triggers
 parents:
-- feat/ops-registry
+  - feat/ops-registry
 dependents: []
-summary: 'Sweep that reads per-tenant calendars and materializes kind=''task'' jobs from matching events:
-  rules engine, YAML config with fixtures, trigger latches (migration 024), and `ncl calendar-triggers`
-  CLI resource.'
+summary: "Sweep that reads per-tenant calendars and materializes kind='task' jobs from matching
+  events: rules engine, YAML config with fixtures, trigger latches (migration 024), and `ncl
+  calendar-triggers` CLI resource."
 owned_paths:
-- src/modules/calendar-triggers/**
-- src/cli/resources/calendar-triggers.ts
-- src/db/migrations/024-calendar-trigger-latches.ts
-touch_paths:
-- src/config.ts
-- src/index.ts
-- src/modules/index.ts
-- src/cli/resources/index.ts
-- src/db/migrations/index.ts
+  - src/modules/calendar-triggers/**
+  - src/cli/resources/calendar-triggers.ts
+  - src/db/migrations/024-calendar-trigger-latches.ts
 key_symbols: []
-symbol_watch: []
-invariants: []
 design_docs:
-- docs/design/08-implementation-plan.md@design/flsclaw
+  - docs/design/08-implementation-plan.md@design/flsclaw
 test_anchors:
-- src/modules/calendar-triggers/rules.test.ts
-- src/modules/calendar-triggers/process.test.ts
-- src/modules/calendar-triggers/actions.test.ts
-- src/modules/calendar-triggers/index.test.ts
-overlap_hints: Upstream adding calendar integrations, event-driven task creation, or scheduled-trigger
-  config is OVERLAP-HIGH; scheduling-module changes are OVERLAP-TOUCH.
+  - src/modules/calendar-triggers/rules.test.ts
+  - src/modules/calendar-triggers/process.test.ts
+  - src/modules/calendar-triggers/actions.test.ts
+  - src/modules/calendar-triggers/index.test.ts
 routing:
   keywords:
-  - calendar
-  - trigger
-  - schedule
-  - event
-  - gcal
+    - calendar
+    - trigger
+    - schedule
+    - event
+    - gcal
   always_check_on: []
-prompt:
-  template: prompts/overlap-check.md
-maintenance:
-  owner: sweep-agent-group
-  last_verified: '2026-07-10'
-  verified_against: 26c3aaee16e626a50a694543b8ad4f46aa8becaf
-  notes: skeleton — needs enrichment. WS-G done+reviewed; stacked on feat/ops-registry. F10 (calendar
-    re-ensure from sweep) is a tracked follow-up.

@@ -14,15 +14,15 @@
  * `module/runtime-updater` (which was cut from credentials). So excluding
  * `module/host-rpc` from a traversal does NOT remove `3b8c5896` — it is on
  * credentials' OWN first-parent line, and every count that reads that line
- * credits credentials with host-rpc's work. Measured on the live fork
- * (2026-07-29): 23 of 458 non-merge commits (5%) are duplicates of this shape.
+ * credits credentials with host-rpc's work. Measured on the live fork:
+ * 23 of 458 non-merge commits (5%) are duplicates of this shape.
  * No topological rule can see this: patch identity is not an edge.
  *
  * ABSORBED — the parent has already merged the branch down, remainder empty.
  * -------------------------------------------------------------------------
  * `module/crypto` is an ANCESTOR of `main_patched` (tip e4c82f34): its
  * `rev-list --count module/crypto ^main_patched` is 0. Measured on the live
- * server clone 2026-07-29: 5 of the 25 branches — `module/crypto`,
+ * server clone: 5 of the 25 branches — `module/crypto`,
  * `module/command-gate`, `module/container-queue`, `module/interaction-status`,
  * `module/agent-group-contributions` — have an empty remainder.
  *
@@ -105,7 +105,7 @@ export interface CutPointExceptions {
 
 /**
  * One entry that could not be applied. `stale: true` = the repo CONTRADICTS the
- * claim (patch-ids diverged, `as_of` no longer contains the branch) and the
+ * claim (patch-ids diverged, the branch has moved past `as_of`) and the
  * operator must be told. `stale: false` = the entry simply does not apply to
  * this repo (the refs are absent), which suppresses nothing and stays quiet.
  */
@@ -295,7 +295,7 @@ async function patchId(repo: string, ref: string): Promise<string | null> {
  * misattribution the exception was for.
  *
  * absorbed: `as_of` must still CONTAIN the branch (`merge-base --is-ancestor`).
- * A branch that has since moved on is no longer absorbed, and the entry is
+ * A branch that has moved past `as_of` is not absorbed, and the entry is
  * stale by definition.
  */
 export async function verifyCutPointExceptions(
@@ -333,7 +333,7 @@ export async function verifyCutPointExceptions(
           branch,
           kind: 'duplicate',
           detail:
-            `STALE: ${e.sha} and ${e.twin} are no longer the same patch ` +
+            `STALE: ${e.sha} and ${e.twin} are not the same patch — the patches have diverged ` +
             `(${pidSha ?? 'no patch-id'} vs ${pidTwin ?? 'no patch-id'}) — exception NOT applied, ` +
             `${e.sha} counts as ${branch}'s own work again`,
           stale: true,
@@ -381,7 +381,7 @@ export async function verifyCutPointExceptions(
           branch,
           kind: 'absorbed',
           detail:
-            `STALE: ${e.as_of} (${e.into}) no longer contains ${branch} — the branch has moved on and its ` +
+            `STALE: ${e.as_of} (${e.into}) does not contain ${branch} — the branch has moved past it and its ` +
             `remainder is not empty; exception NOT applied`,
           stale: true,
         });

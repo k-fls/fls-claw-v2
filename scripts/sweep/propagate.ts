@@ -1,11 +1,11 @@
 /**
  * scripts/sweep/propagate.ts — mechanical propagation driver
- * (DRIVER.md §4/§6, D-035..D-040).
+ * (DRIVER.md §4).
  *
  * Usage:
  *   pnpm exec tsx scripts/sweep/propagate.ts <sweep-start|next-case|report-case|report-pr|sweep-finish|sweep-abort> [flags]
  *
- * The D-053 state machine (DRIVER.md §1) is the ONLY command surface —
+ * The state machine (DRIVER.md §1) is the ONLY command surface —
  * the same six commands `sweep-machine.ts` wraps under their agent-facing names.
  * The deterministic stages (plan, run, publish, push, verify, report) are
  * INTERNAL steps of those six and have no standalone entry point: `sweep-start`
@@ -14,14 +14,14 @@
  *
  * Flags:
  *   --repo <path>            repo to operate on                (default: cwd)
- *   --workspace <dir>        artifacts root = GROUP ROOT       (default: parent of --repo; MUST be outside any git work tree, D-055)
+ *   --workspace <dir>        artifacts root = GROUP ROOT       (default: parent of --repo; never the --repo clone or a subdirectory of it)
  *   --pass <watermark12>     attach to a specific pass         (default: latest OPEN pass)
- *   --inventory <dir>        live feature inventory            (default: latest bootstrap snapshot)
+ *   --inventory <dir>        feature inventory (tests/fixtures) (default: scripts/sweep/inventory in the clone)
  *   --scope-config <file>    scope policy                      (default: registry/scope.yaml)
  *   --routing-config <file>  router/scan tuning                (default: registry/routing.yaml)
  *   --upstream <ref>         upstream ref (sweep-start only)   (default: upstream/main)
  *   --base <ref>             trunk-chain fork point            (default: FORK_POINT else merge-base)
- *   --dry-run                compute without writing (execute is the default, D-060)
+ *   --dry-run                compute without writing (execute is the default)
  *   --tier <mechanical|judged|held>  report-case: the agent's claimed tier
  *   --token-file <path>      sweep-start/sweep-finish: file holding the substitute
  *                            GitHub token (the agent writes the get_credential output there
@@ -35,13 +35,13 @@
  *   plan-initial.json (immutable opening snapshot), plan.json (working), step files,
  *   case-<id>/case.json (+ coldread-request.md, pr/materials.md), journal.jsonl
  *   (append-only). case.json is a POINTER only — report-case re-derives everything from
- *   git+registry (§7 trust boundary). The driver NEVER generates PR prose (D-048): the
+ *   git+registry (§7 trust boundary). The driver NEVER generates PR prose (§14): the
  *   agent writes pr/title.txt + pr/body.md from studying the case. `sweep-start` and
  *   `sweep-finish` are the only commands that touch the network (git push/fetch +
- *   GitHub REST — §14/§14.4, D-049/D-058); refs move via git push ONLY, and any push
- *   failure is a hard halt reported to the owner (D-046 case 2), never worked around.
+ *   GitHub REST — §14/§14.4); refs move via git push ONLY, and any push
+ *   failure is a hard halt reported to the owner, never worked around.
  *
- *   D-058: NOTHING is published before `finish` — report-pr records intent only, and
+ *   NOTHING is published before `finish` — report-pr records intent only, and
  *   finish's single post-verify publish phase creates every PR (judged + held). The
  *   blocked (merge_status) picture is derived from ORIGIN at `sweep start`, never from
  */
@@ -71,6 +71,7 @@ import {
   FORK_POINT,
   RR_CACHE_DIRNAME,
   VERIFY_COMMANDS,
+  defaultInventoryDir,
 } from './config.js';
 import {
   addTempWorktree,
@@ -88,12 +89,7 @@ import {
   refExists,
   worktreeBranches,
 } from './git.js';
-import {
-  CANDIDATE_STANDING_INSTRUCTION,
-  candidateSectionLines,
-  deriveCandidates,
-  reconcileCandidates,
-} from './candidates.js';
+import { CANDIDATE_STANDING_INSTRUCTION, candidateSectionLines, deriveCandidates } from './candidates.js';
 import { attributeFailure, countFailingFiles, failingLocations, parseFailingFiles } from './attribute.js';
 import { ROOT_BRANCH, TRUNK_BRANCH } from './hierarchy.js';
 import {
@@ -106,7 +102,8 @@ import {
 } from './not-my-bug.js';
 import { malformedCutPointExceptionsIssue, resolveCutPointExceptions, staleWarnings } from './cut-points.js';
 import { installRrCache } from './merge.js';
-import { loadRegistry } from './registry.js';
+import { appendObservation } from './observations.js';
+import { loadFeatures, loadRegistry } from './registry.js';
 import { resolveScope } from './scope.js';
 import { scopeGuard } from './scope-guard.js';
 import {
@@ -115,7 +112,6 @@ import {
   classifyComments,
   classifyReviewTrigger,
   createPullRequest,
-  decidedAlready,
   getOpenPrByHead,
   getPrsByHead,
   getPullRequest,
@@ -172,10 +168,10 @@ interface Cli {
   workspace: string;
   pass?: string;
   /**
-   * Live inventory dir. Omitted (undefined) falls back to the committed
-   * bootstrap snapshot via loadRegistry — NEVER to an empty inventory: the
-   * old `null` default meant "explicitly no inventory", silently collapsing
-   * the scope to main_patched alone (2026-07-20 test-drive finding #2).
+   * Inventory dir. Omitted (undefined) falls back to the committed
+   * scripts/sweep/inventory/ in the clone via loadRegistry — NEVER to an
+   * empty inventory, which would silently collapse the scope to
+   * main_patched alone.
    */
   inventory?: string;
   scopeFile?: string;
@@ -205,17 +201,21 @@ interface Cli {
   installRunner?: InstallRunner;
   resolvedRef?: string;
   /**
-   * publish: file holding the substitute GitHub token (§14, D-048). The agent
-   * writes the get_credential output there once per session; the credential
-   * proxy swaps the Authorization header for api.github.com on the wire.
-   * $GITHUB_TOKEN is deliberately NOT read (untrustworthy in the container).
+   * Internal override: file holding the substitute GitHub token (§14) — wins
+   * over the environment when present, so the flag CLI and tests can pin a
+   * token explicitly. The default source is the ENVIRONMENT, read fresh at
+   * each networked write: `GH_TOKEN`, then `GITHUB_TOKEN` as fallback (see
+   * `resolveGithubTokenSourced`); the credential proxy swaps the Authorization
+   * header for api.github.com on the wire. Absent everywhere →
+   * ERR11_TOKEN_MISSING; a 401/403 on use → ERR41_TOKEN_REJECTED, whose detail
+   * names the token's source.
    */
   tokenFile?: string;
   branch?: string;
   recipe?: string[];
   commandsFile?: string;
   /**
-   * checks-file (D-060): host+runner typecheck/test command lists shipped in the
+   * checks-file: host+runner typecheck/test command lists shipped in the
    * repo (`scripts/sweep/checks.json`). `sweep start` resolves this to
    * flag-or-default, persists the absolute path into machine state, and the later
    * commands read it FROM STATE (never a flag). JSON `{typecheck:[{cmd,cwd}],
@@ -226,7 +226,7 @@ interface Cli {
   commands?: VerifyCommand[];
   out?: string;
   /**
-   * D-054: set on a nested invocation (a state-machine command driving a flag
+   * Set on a nested invocation (a state-machine command driving a flag
    * command internally — next-case→run, finish→verify/publish/push/report). When
    * true, `emit` is a no-op and cmdReport skips its `--out` write, so ONLY the
    * outer state-machine command produces a result line. The nested call still
@@ -256,7 +256,7 @@ function parseCli(argv: string[]): Cli {
     repo: process.cwd(),
     workspace: process.cwd(),
     upstream: DEFAULT_UPSTREAM_REF,
-    // D-060: EXECUTE IS THE DEFAULT for the agent surface — `--dry-run` opts into
+    // EXECUTE IS THE DEFAULT for the agent surface — `--dry-run` opts into
     // no-write. (`--execute` is still accepted as an idempotent no-op.)
     execute: true,
   };
@@ -298,7 +298,7 @@ function parseCli(argv: string[]): Cli {
         cli.base = need();
         break;
       case '--execute':
-        cli.execute = true; // idempotent — execute is already the default (D-060)
+        cli.execute = true; // idempotent — execute is already the default
         break;
       case '--dry-run':
         cli.execute = false;
@@ -326,11 +326,11 @@ function parseCli(argv: string[]): Cli {
         process.exit(2);
     }
   }
-  // D-055 (C-1): the canonical workspace is the GROUP ROOT — the parent of the
+  // The canonical workspace is the GROUP ROOT — the parent of the
   // git clone (`repo/`), where the DURABLE `rr-cache` lives. When `--workspace`
   // is not given, derive it from `--repo` so the pass and rr-cache never land
-  // INSIDE the clone (the 2026-07-22 split that killed rerere). An explicit
-  // `--workspace` is honored
+  // INSIDE the clone (a clone-local rr-cache is wiped with the clone, losing
+  // rerere's learned resolutions). An explicit `--workspace` is honored
   // but `sweep start` refuses one inside a git working tree (see cmdSweepStart).
   if (!workspaceExplicit) cli.workspace = dirname(pathResolve(cli.repo));
   return cli;
@@ -389,31 +389,17 @@ export function arrivedSet(journal: JournalEntry[]): Set<string> {
 // --------------------------------------------------------------------------
 
 /**
- * D-061's BASE GATE and its anti-loop record are GONE (owner decision,
- * 2026-07-30).
+ * There is NO start-time base gate: `start` does not typecheck the base, and a
+ * red base never refuses a pass.
  *
- * `start` used to typecheck the base and, when it was red, either refuse the
- * pass or mint a gate-fix case on the spot — with a group-root JSON
- * (`sweep-base-gate-attempts.json`, keyed `<anchor>@<sha>`) as the cross-pass
- * anti-loop, because `start` wipes the journal the finish-time guard lives in.
- *
- * Three things were wrong with it. It was BASE-ONLY, while a gate fix is
- * per-branch and `finish` can mint one anywhere — so the base over-blocked
- * while every other branch had no cross-pass guard at all. Its SHA key wedged
- * by construction: a HELD fix means the base never goes green, so the sha never
- * moves, so the key never changes and the case is refused forever (live
- * 2026-07-30: a case that had never even been published was refused). And it
- * was LOCAL STATE, which D-058 §2 exists to abolish — the blocked picture is
- * derived from ORIGIN at start, never from a side-car file.
- *
- * A red base is now discovered where every other red is: `finish`'s verify,
- * which blames the failing files and mints a gate-fix case on the branch that
- * owns them — the base included, since `main_patched` is a scope entry and the
- * default parent of every root (scope.ts). The start-time gate only existed
- * because a REFUSING start never reached `finish`; with the refusal gone,
- * `finish` subsumes it. The anti-loop is the fix's own PR: an active gate-fix
- * ref on origin blocks its branch through the machinery that already blocks
- * every other fix PR, and self-clears when the owner merges it.
+ * A red base is discovered where every other red is: `finish`'s verify, which
+ * blames the failing files and mints a gate-fix case on the branch that owns
+ * them — the base included, since `main_patched` is a scope entry and the
+ * default parent of every root (scope.ts). The cross-pass anti-loop is the
+ * fix's own PR: an active gate-fix ref on origin blocks its branch through the
+ * machinery that already blocks every other fix PR, and self-clears when the
+ * owner merges it. No local side-car state is kept for this — the blocked
+ * picture is derived from ORIGIN at start, never from a local file.
  */
 
 async function resolveBase(cli: Cli): Promise<string> {
@@ -485,16 +471,14 @@ async function passContext(cli: Cli): Promise<PassCtx> {
 }
 
 /**
- * Blocked state (D-058): merge_status is NO LONGER stored anywhere local — it
- * is DERIVED. Cross-pass authority is ORIGIN: `sweep start` reconstructs the
+ * Blocked state: merge_status is not stored anywhere local — it is DERIVED.
+ * Cross-pass authority is ORIGIN: `sweep start` reconstructs the
  * PR_ID set from the origin `fix/sweep/*` refs (an unmerged ref WITH an open
  * PR ⇔ blocked) and journals one `origin-blocked` row per blocked branch into
  * the fresh pass dir. Within a pass the journal is the working view:
  * `origin-blocked` rows + this-pass `held` dispositions are PR_ID; `defer`
  * rows are DEFERRED while a direct parent is still blocked; a manual
- * `unfrozen` row clears a branch for the rest of the pass. The retired ledger's
- * `merge_status` field survives only as a non-authoritative legacy cache for
- * the old sweep merge stage — the propagation driver never reads or writes it.
+ * `unfrozen` row clears a branch for the rest of the pass.
  */
 interface BlockedRow {
   branch: string;
@@ -516,7 +500,7 @@ interface BlockedRow {
   fixBranch: string | null;
   prNumber: number | null;
   /**
-   * The PR's effective sweep-addressed id at classification time (D-059; null
+   * The PR's effective sweep-addressed id at classification time (null
    * when unknown/no marker). Urge comments re-assert it so every driver
    * comment carries the marker (the content-based bot exclusion).
    */
@@ -527,8 +511,8 @@ interface BlockedRow {
  * PR_ID rows derived from the pass journal, keyed branch → ALL of its rows
  * (last-writer-wins per branch+caseId): a multi-parent branch can carry
  * SEVERAL concurrent blocks (one per held case / origin fix ref), and every
- * one matters — collapsing to one row weakened the descendants' DEFER
- * height-MIN when the survivor was the HIGHER block (finding #4).
+ * one matters — collapsing to one row weakens the descendants' DEFER
+ * height-MIN whenever the survivor is the HIGHER block.
  * `origin-blocked` (start) and `held` (this pass) add a row, a later manual
  * `unfrozen` clears the branch's rows, and a `pr-published` (mode held)
  * enriches its case's row with the fix branch + PR number.
@@ -561,7 +545,7 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
         caseId: typeof e.caseId === 'string' ? e.caseId : 'held',
         gate: e.reason === 'gate',
         headSha: jc?.head.sha ?? null,
-        fixBranch: null, // no PR until `finish` publishes (D-058)
+        fixBranch: null, // no PR until `finish` publishes
         prNumber: null,
         markerId: null,
       });
@@ -580,10 +564,10 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
 
 /**
  * The pass's merge_status view (branch → PR_ID | DEFERRED; absence = NONE),
- * derived from the journal alone (D-058):
+ * derived from the journal alone:
  *  - PR_ID: `blockedRows` (origin-derived rows + this-pass holds).
  *  - DEFERRED: branches with a journaled `defer` this pass, kept only while a
- *    DIRECT parent (registry edges) is still blocked — the D-057 STAY rule as
+ *    DIRECT parent (registry edges) is still blocked — the STAY rule as
  *    a fixpoint over the journal instead of a stored flag, so a cleared
  *    parent releases its whole deferred chain on the next derivation. Across
  *    passes nothing is stored: DEFERRED is simply recomputed from the
@@ -633,8 +617,8 @@ function prBlockedBranches(journal: JournalEntry[]): Set<string> {
 }
 
 /**
- * LIVE block-height records for the PR_ID branches (D-057 heights, D-058
- * source): no height is stored anywhere — heights are pass-relative (the
+ * LIVE block-height records for the PR_ID branches:
+ * no height is stored anywhere — heights are pass-relative (the
  * chain's fork point moves as branches absorb upstream), so each blocked
  * branch's height is RE-DERIVED against THIS pass's pinned chain from the
  * row's sha: an origin row's fix/sweep ref head CONTAINS the conflict head
@@ -648,7 +632,7 @@ function prBlockedBranches(journal: JournalEntry[]): Set<string> {
 async function prBlockedRecords(cli: Cli, journal: JournalEntry[], chain: Chain): Promise<HeldRecord[]> {
   const out: HeldRecord[] = [];
   for (const [branch, rows] of blockedRows(journal)) {
-    // Multiple concurrent blocks per branch (finding #4): contribute the
+    // Multiple concurrent blocks per branch: contribute the
     // MINIMUM height-matched block — the safest DEFER for descendants (a
     // higher survivor would let a child below it wrongly take its own case).
     let best: HeldRecord | null = null;
@@ -667,7 +651,7 @@ async function prBlockedRecords(cli: Cli, journal: JournalEntry[], chain: Chain)
 /**
  * Direct-parent edges from the registry (features + scope extra_edges): the
  * DEFERRED stay-condition is a function of the DIRECT parents, never a stored
- * flag or a journaled defer pointer (D-057).
+ * flag or a journaled defer pointer.
  */
 function directParentEdges(cli: Cli): Map<string, string[]> {
   const registry = loadRegistry({ inventoryDir: cli.inventory, scopeFile: cli.scopeFile, routingFile: cli.routingFile });
@@ -679,7 +663,7 @@ function directParentEdges(cli: Cli): Map<string, string[]> {
   return parentsOf;
 }
 
-/** A pending urge for a still-PR_ID-blocked branch (§8; posted by `push`, D-049). */
+/** A pending urge for a still-PR_ID-blocked branch (§8; posted by `push`, §14.4). */
 interface PendingUrge {
   branch: string;
   /** The pending run's top = the newest pending trunk head (a blocked branch lands no merges). */
@@ -687,9 +671,9 @@ interface PendingUrge {
   pending: Head[];
   fixBranch: string;
   prNumber: number | null;
-  /** The blocking case id (merge_status PR_ID caseId, D-057). */
+  /** The blocking case id (merge_status PR_ID caseId). */
   caseId: string;
-  /** Current sweep-addressed id re-asserted by the urge comment (D-059). */
+  /** Current sweep-addressed id re-asserted by the urge comment. */
   markerId: number | null;
 }
 
@@ -697,19 +681,18 @@ interface PendingUrge {
  * URGING detection (§8, pure): for each PR_ID-blocked branch, if the newest
  * pending trunk head beyond its coverage on the PINNED chain differs from
  * `lastUrgedHead`, an urge is DUE. One urge per NEW head, not per pass.
- * `plan`/`run` only report these; POSTING (PR comment + D-004 machine-block
+ * `plan`/`run` only report these; POSTING (PR comment + machine-block
  * refresh + `lastUrgedHead` advance) lives exclusively in the networked
- * `push` stage (D-049 — the driver posts, never prepares gh commands).
- * Blocked rows come from the journal (D-058: origin-derived at start). DEDUP is
+ * `push` stage (§14.4 — the driver posts, never prepares gh commands).
+ * Blocked rows come from the journal (origin-derived at start). DEDUP is
  * done at POST time against the PR's own comments (`urgedHeads`), not from a
- * local cache: "have I already urged about this head" is a fact about origin,
- * and the ledger that used to hold it is gone (2026-08-04).
+ * local cache: "have I already urged about this head" is a fact about origin.
  */
 async function detectUrges(cli: Cli, ctx: PassCtx, journal: JournalEntry[]): Promise<PendingUrge[]> {
   const due: PendingUrge[] = [];
   for (const row of [...blockedRows(journal).values()].flat()) {
     // Rows without a fix branch have no owner-facing PR to nudge: gate holds,
-    // and this-pass holds whose PR is only created at `finish` (D-058) — those
+    // and this-pass holds whose PR is only created at `finish` — those
     // become origin-derived rows (with a PR) by the next pass.
     if (!row.fixBranch) continue;
     if (!(await refExists(cli.repo, row.branch))) continue;
@@ -748,12 +731,12 @@ async function urgeCommentBody(cli: Cli, urge: PendingUrge): Promise<string> {
     '',
     `Resolving this PR unblocks \`${urge.branch}\` and everything downstream.`,
     '',
-    // D-059: every driver comment carries the sweep-addressed marker (the
+    // Every driver comment carries the sweep-addressed marker (the
     // content-based bot exclusion — same PAT as the human). The urge RE-ASSERTS
     // the current value; classification takes the MAX, so this never regresses.
     renderSweepAddressed(urge.markerId ?? 0),
-    // The record that this head WAS urged — read back by `urgedHeads` instead of
-    // a local ledger field (2026-08-04).
+    // The record that this head WAS urged — read back by `urgedHeads`, never
+    // from a local cache.
     renderSweepUrge(urge.head),
   ].join('\n');
 }
@@ -779,7 +762,7 @@ async function derive(
     scope: registry.scope,
     held,
     mergeStatusOf: statusView,
-    stackCap: registry.routing.stackCap, // D-049 §2 lever (per-feature override in derivePlan)
+    stackCap: registry.routing.stackCap, // stacked-run cap lever (per-feature override in derivePlan)
   });
 }
 
@@ -822,13 +805,13 @@ function openCaseBranches(journal: JournalEntry[]): Set<string> {
 }
 
 /**
- * D-051 — the verify recipe = THIS PASS'S PUBLISHABLE RESULT: the branches that
+ * The verify recipe (§9) = THIS PASS'S PUBLISHABLE RESULT: the branches that
  * ADVANCED this pass (a `pre-ref` was journaled, i.e. they were mutated),
  * ordered by the plan's DAG order (parents before children), MINUS any branch
  * that is held/frozen (`held`) or carries an OPEN case. Held/frozen branches are
  * frozen-by-design and UNPUBLISHED — they carry unresolved conflicts that, when
  * merged onto a bare base, recreate historical stack conflicts and wrongly abort
- * the build (the root bug: a permanently-held module branch could never let the
+ * the build (otherwise a permanently-held module branch could never let the
  * gate go green). They are validated by their own fix/case flow, never here.
  * Branches missing from `order` (should not happen for a real plan) trail in
  * pre-ref order so nothing publishable is silently dropped.
@@ -903,7 +886,7 @@ function passScope(dir: string): Set<string> {
   return new Set(plan.branches.map((b) => b.branch));
 }
 
-/** The pass plan's DAG order (parents before children) — verify recipe order (D-051). */
+/** The pass plan's DAG order (parents before children) — verify recipe order (§9). */
 function passOrder(dir: string): string[] {
   const p = join(dir, 'plan.json');
   const src = existsSync(p) ? p : join(dir, 'plan-initial.json');
@@ -913,7 +896,7 @@ function passOrder(dir: string): string[] {
 }
 
 /**
- * D-051 — the verify rebuild base per the §3 merge-source model: module & feat
+ * The verify rebuild base per the §3 merge-source model: module & feat
  * branches root at `main_patched` (the fork trunk), NOT bare `main` — merging
  * them onto `main` recreates the fork-content conflicts they were merged past
  * and aborts the build. `main_patched` ⊇ `main`, so upstream-chain-from-main
@@ -967,12 +950,12 @@ async function journaledMerge(
   try {
     return await commitTreeMerge(repo, branch, headSha, message);
   } catch (e) {
-    // D-047/B11 backstop: cmdRun re-probes cleanliness against the LIVE tip
+    // Backstop: cmdRun re-probes cleanliness against the LIVE tip
     // immediately before every parent merge (§3 execution re-probe), so a
     // conflicted tree is unreachable here in normal operation. Anything that
     // still throws (racing ref movement, update-ref CAS refusal) must surface
     // as a journaled per-branch halt — never escape as a bare Error and abort
-    // the whole run (the 2026-07-21 crash mode).
+    // the whole run.
     throw new DriverHalt(
       'merge-failed',
       `merge into '${branch}' failed: ${e instanceof Error ? e.message : String(e)}`,
@@ -981,7 +964,7 @@ async function journaledMerge(
 }
 
 /**
- * D-045 Feature A (§13) — one journaled origin-sync step per in-scope branch,
+ * Origin sync (§13) — one journaled origin-sync step per in-scope branch,
  * run by `run --execute` BEFORE the branch's first mutation this pass. The
  * driver never operates on refs/remotes directly: it reconciles the LOCAL
  * branch with `origin/<branch>` through the guardRef choke point, then all
@@ -1058,7 +1041,7 @@ async function journaledResolvedMerge(
 }
 
 /**
- * D-061 (B): commit a GATE FIX onto a branch — a SINGLE-parent commit, unlike
+ * Commit a GATE FIX onto a branch — a SINGLE-parent commit, unlike
  * `journaledResolvedMerge`. A gate fix is new code, not a propagation merge:
  * there is no `theirs` side to record, and recording the branch tip as a second
  * parent would fabricate a self-merge. Same ref-scope guard and same
@@ -1085,9 +1068,9 @@ async function journaledFixCommit(
 // --------------------------------------------------------------------------
 
 /**
- * The three BOUNDED cold-reader questions (D-050 — the owner: "make this cold
- * read very focused. It should not go researching the universe"). The old
- * open-ended Q4 ("follow-on invariants — tests, types, call sites") is deleted:
+ * The three BOUNDED cold-reader questions. The cold read is deliberately
+ * focused — it must not go researching the universe. There is no open-ended
+ * question about follow-on invariants (tests, types, call sites):
  * typecheck/tests are the verify gate's job (§9), not the reader's.
  */
 const COLD_READ_QUESTIONS = [
@@ -1103,9 +1086,7 @@ const COLD_READ_QUESTIONS = [
  * gate fix has neither: its `automergeTree` IS the branch tip, so the conflict
  * section of its request is EMPTY. Q1 is then unanswerable and Q2 is worse —
  * with no conflict to explain anything, EVERY hunk reads as "content from
- * outside the two sides". The reader has coped in practice (live 2026-07-30 it
- * confirmed the fix and rejected only a smuggled unrelated edit), but it was
- * coping despite the questions, not because of them.
+ * outside the two sides".
  *
  * What actually needs judging is: does this change fix the named failure, and
  * ONLY that. Q2 is deliberately the sharp one — a gate-fix case is the place an
@@ -1139,7 +1120,7 @@ function gateFixEvidenceLines(failedOutput: string): string[] {
   ];
 }
 
-/** D-050 preamble: the reader judges from the request ONLY — never researches. */
+/** Cold-read preamble: the reader judges from the request ONLY — never researches. */
 const COLD_READ_PREAMBLE = [
   'Judge ONLY from the materials in this request. Do NOT explore the repository or search',
   'beyond them. If something cannot be judged from the request, answer',
@@ -1147,38 +1128,10 @@ const COLD_READ_PREAMBLE = [
   'it as a reject reason only if it concerns questions 1-3.',
 ];
 
-/** Cap for embedded inventory extra_context excerpts (cold-read case context). */
-const CONTEXT_EXCERPT_CAP = 2000;
-
-/**
- * The PATH-RELEVANT slice of an `extra_context` blob (token-opt): only the
- * lines that mention a conflicted path, each with ±2 lines of surrounding
- * context, gaps elided with `…`. Returns null when nothing in the blob mentions
- * a conflicted path — so an entry's full recorded-decision prose is embedded
- * only for the parts that bear on THIS case, not the whole blob truncated.
- */
-export function relevantExcerpt(ctx: string, paths: string[], around = 2): string | null {
-  const lines = ctx.split('\n');
-  const keep = new Set<number>();
-  lines.forEach((l, i) => {
-    if (paths.some((p) => l.includes(p)))
-      for (let j = Math.max(0, i - around); j <= Math.min(lines.length - 1, i + around); j++) keep.add(j);
-  });
-  if (keep.size === 0) return null;
-  const out: string[] = [];
-  let prev = -2;
-  for (const i of [...keep].sort((a, b) => a - b)) {
-    if (i > prev + 1) out.push('…');
-    out.push(lines[i]);
-    prev = i;
-  }
-  return out.join('\n').slice(0, CONTEXT_EXCERPT_CAP);
-}
-
 /**
  * Per-side one-line histories over the conflicted paths: what each side did to
  * the disputed files since their merge base (`git log --oneline`, capped).
- * Driver-derived facts used by the case context block (§7, D-048) and
+ * Driver-derived facts used by the case context block (§7) and
  * pr/materials.md.
  */
 async function perSideLog(
@@ -1230,43 +1183,35 @@ export async function conflictHunks(repo: string, tree: string, paths: string[],
 }
 
 /**
- * Relevant inventory context for a case (D-048; used by BOTH cold reads): the
- * branch's and parent's entries plus any entry whose owned_paths or
- * extra_context mention a conflicted path — summary, owned_paths and the
- * recorded-decision excerpts, capped. Driver-authored from the registry, so
- * the resolving agent still cannot frame the question.
+ * Relevant inventory context for a case (used by BOTH cold reads): the
+ * branch's and parent's entries plus any entry whose owned_paths cover a
+ * conflicted path, reduced to summary + owned_paths. The inventory says WHOSE
+ * code a case is in; it never says how to resolve one, so there is no prose
+ * here to embed. Driver-authored from the registry, so the resolving agent
+ * still cannot frame the question.
  */
 function inventoryContextLines(features: FeatureEntry[], branch: string, parent: string, paths: string[]): string[] {
   const relevant = features.filter(
     (f) =>
       f.branch === branch ||
       f.branch === parent ||
-      (f.owned_paths ?? []).some((glob) => paths.some((p) => p.startsWith(glob.replace(/\*.*$/, '')))) ||
-      (f.prompt?.extra_context ? paths.some((p) => f.prompt!.extra_context!.includes(p)) : false),
+      (f.owned_paths ?? []).some((glob) => paths.some((p) => p.startsWith(glob.replace(/\*.*$/, '')))),
   );
   if (relevant.length === 0) return ['(no matching inventory entries)'];
   const lines: string[] = [];
   for (const f of relevant) {
     lines.push(`- entry '${f.id}'${f.branch ? ` (branch ${f.branch})` : ''}: ${f.summary ?? f.name}`);
     if (f.owned_paths?.length) lines.push(`  owned_paths: ${f.owned_paths.join(', ')}`);
-    const ctx = f.prompt?.extra_context?.trim();
-    // Only the path-relevant slice of extra_context (token-opt) — an entry
-    // matched by branch/parent whose prose does not bear on a conflicted path
-    // contributes just its summary/owned_paths/decided_paths, not the blob.
-    const ex = ctx ? relevantExcerpt(ctx, paths) : null;
-    if (ex) lines.push(`  extra_context (path-relevant): ${ex}`);
-    if (f.prompt?.decided_paths?.length) lines.push(`  decided_paths: ${f.prompt.decided_paths.join(', ')}`);
   }
   return lines;
 }
 
 /**
- * The driver-derived case context block (D-048 fix for the 2026-07-21
- * context-starvation reject): the branch's inventory entry summary +
- * owned_paths + relevant extra_context excerpts, and per-side `git log
+ * The driver-derived case context block: the branch's inventory entry summary +
+ * owned_paths, and per-side `git log
  * --oneline` over the conflicted paths, so the cold reader can answer
- * ownership questions instead of defaulting to reject. Driver-authored inputs
- * only — the resolving agent still cannot frame the question.
+ * ownership questions instead of rejecting for lack of context. Driver-authored
+ * inputs only — the resolving agent still cannot frame the question.
  */
 async function caseContextLines(
   cli: Cli,
@@ -1280,7 +1225,7 @@ async function caseContextLines(
   const tip = await revParse(cli.repo, c.branch);
   const sides = await perSideLog(cli.repo, tip, c.head.sha, c.conflictedPaths);
   return [
-    '## Case context (driver-derived — D-048)',
+    '## Case context (driver-derived)',
     '',
     '### Inventory',
     ...inventoryContextLines(registry.features, c.branch, c.parent, c.conflictedPaths),
@@ -1298,8 +1243,8 @@ async function caseContextLines(
 }
 
 /**
- * The cold-read request (§7, D-031/D-050): conflict hunks + resolution diff +
- * the driver-derived case context (D-048 — inventory summary/owned_paths/
+ * The cold-read request (§7): conflict hunks + resolution diff +
+ * the driver-derived case context (inventory summary/owned_paths/
  * recorded decisions + per-side histories, so the reader can answer ownership
  * questions instead of defaulting to reject) + the judge-from-the-request-only
  * preamble + the three bounded cold-reader questions — NOTHING
@@ -1357,12 +1302,12 @@ function coldReadRequest(
     ' "feedback": "1-2 lines for the resolving agent: why the reject / what is off (omit when nothing is)",',
     ' "resolvedTree": "<tree OID of the resolution this verdict attests to>"}',
     '```',
-    'An `UNVERIFIABLE-FROM-REQUEST` answer on any of q1-q3 is treated as a reject (fail-closed, D-050).',
+    'An `UNVERIFIABLE-FROM-REQUEST` answer on any of q1-q3 is treated as a reject (fail-closed).',
   ].join('\n');
 }
 
 /**
- * D-052 FIX 3: anti-thrash cap (defense in depth, mirroring the kind-2 repro
+ * Anti-thrash cap (defense in depth, mirroring the kind-2 repro
  * cap). A resolution whose tree keeps CHANGING between attempts never
  * converges under cold read; beyond this many DISTINCT resolution trees the
  * driver stops retrying the case and force-freezes it HELD for the owner
@@ -1371,25 +1316,25 @@ function coldReadRequest(
 export const RESOLVE_COLDREAD_CAP = 2;
 
 /**
- * D-057: cold-read REJECTIONS per case before the driver stops retrying and
+ * Cold-read REJECTIONS per case before the driver stops retrying and
  * escalates to HELD (published via the unified active/draft path with the
  * warning prefix below). Tightens the distinct-tree cap above: two content
  * rejections mean the owner should look, not the agent loop.
  */
 const COLDREAD_REJECT_LIMIT = 2;
 
-/** Bound on the cold reviewer's 1-2 line `feedback` (D-057). */
+/** Bound on the cold reviewer's 1-2 line `feedback`. */
 const COLDREAD_FEEDBACK_CAP = 400;
 
 /** PR-description warning prefixes for HELD escalations (owner-facing). */
 const ESCALATE_REJECTED_2X = '[AUTO-ESCALATED: cold read rejected 2x]';
 const ESCALATE_SCOPE = '[AUTO-ESCALATED: scope exceeded]';
 const ESCALATE_CAP = '[AUTO-ESCALATED: resolution did not converge]';
-/** D-060: the checks gate (typecheck/tests) kept failing CHECKS_FAIL_LIMIT times. */
+/** The checks gate (typecheck/tests) kept failing CHECKS_FAIL_LIMIT times. */
 const ESCALATE_CHECKS = '[AUTO-ESCALATED: checks failing]';
 
 /**
- * D-060: how many times a case's checks gate (typecheck OR tests) may fail before
+ * How many times a case's checks gate (typecheck OR tests) may fail before
  * the driver stops asking the agent to fix and force-freezes it HELD (draft,
  * pristine conflict — the agent's failing resolution is NOT published) for the
  * owner. Counted per case, reset on a passing checks run (`checksFailCount`).
@@ -1401,12 +1346,11 @@ export const CHECKS_FAIL_LIMIT = 10;
  * so, and before it refuses.
  *
  * `CHECKS_FAIL_LIMIT` counts `report-case` failures, so it never fires on an
- * agent that never submits — and that is the shape that actually happened:
- * twice an agent read a dozen files, concluded nothing, and asked for the next
- * case. `next-case` re-selected the same one (it refuses only `awaiting-pr`)
- * and journaled nothing, so the pass looked idle while going nowhere. The
- * previous answer was `diagnosisOnly`, which stopped the loop by deleting the
- * work; the bound belongs here instead, where the looping actually happens.
+ * agent that never submits — the shape to foreclose: an agent reads a dozen
+ * files, concludes nothing, and asks for the next case; `next-case` re-selects
+ * the same one (it refuses only `awaiting-pr`) and journals nothing, so the
+ * pass looks idle while going nowhere. The bound belongs here, where the
+ * looping actually happens.
  *
  * WARN first, then refuse. A silent forced HELD would throw away the agent's
  * chance to write the diagnosis, which is the deliverable when it cannot fix
@@ -1417,7 +1361,7 @@ export const CASE_SERVE_WARN = 3;
 export const CASE_SERVE_LIMIT = 4;
 
 /**
- * D-060: the host+runner checks (typecheck + tests) that `report-case` runs as
+ * The host+runner checks (typecheck + tests) that `report-case` runs as
  * its single quality gate (RESOLVED cases) and `finish` runs on the publishable
  * set. Shipped in the repo (`scripts/sweep/checks.json`); each list is command +
  * clone-root-relative cwd. A missing/empty list → that gate is skipped.
@@ -1450,12 +1394,12 @@ function loadChecksConfig(checksFile: string | undefined): ChecksConfig | null {
  * A MALFORMED checks file, told apart from an ABSENT one.
  *
  * `loadChecksConfig` returns null for both and null means "skip the gate", so a
- * single JSON typo silently disabled BOTH gates — the per-case checks gate and
- * the finish verify command list — with no issue, no journal row and no warning:
- * the pass then ran to completion reporting everything green while nothing was
- * ever typechecked or tested. An ABSENT file stays a deliberate skip (a repo
- * without checks behaves exactly as before); a BROKEN one is a broken gate and
- * must stop the command that found it.
+ * single JSON typo would silently disable BOTH gates — the per-case checks gate
+ * and the finish verify command list — with no issue, no journal row and no
+ * warning: the pass would run to completion reporting everything green while
+ * nothing was ever typechecked or tested. An ABSENT file stays a deliberate
+ * skip (a repo without checks simply skips both gates); a BROKEN one is a
+ * broken gate and must stop the command that found it.
  */
 function malformedChecksIssue(checksFile: string | undefined): Issue | null {
   if (!checksFile || !existsSync(checksFile)) return null;
@@ -1476,14 +1420,14 @@ function malformedChecksIssue(checksFile: string | undefined): Issue | null {
 /**
  * How much of a failing checks run the agent is handed. The FULL log goes to
  * `<kind>-output.full.txt`; the file the driver TELLS the agent to read is capped
- * to this many trailing lines. Live evidence (2026-07-28): an uncapped vitest run
- * of 1860 tests wrote 973 KB and the driver said "read <output-file>" — a context
- * bomb for 11 failing names. The tail is where failures and summaries live.
+ * to this many trailing lines. An uncapped run of a large test suite can write
+ * hundreds of KB, and "read <output-file>" then becomes a context bomb for a
+ * handful of failing names. The tail is where failures and summaries live.
  */
 const CHECKS_OUTPUT_TAIL_LINES = 250;
 
 /**
- * Cap on the failing verify output carried in a journal row (D-061 B). Enough
+ * Cap on the failing verify output carried in a journal row. Enough
  * for the compiler diagnostics `attributeFailure` parses; small enough that a
  * chatty test runner cannot bloat the journal the whole pass reads repeatedly.
  */
@@ -1495,7 +1439,7 @@ const VERIFY_OUTPUT_JOURNAL_CAP = 20000;
  * string, so it carries this self-describing label rather than a branch name.
  * It is WRITE-ONLY: nothing reads it (case KIND comes from the `gateFix: true`
  * journal flag, and the ref name from `isGateFixCaseId`), so it cannot mislead
- * a code path the way it once did — it only has to be legible in the journal.
+ * a code path — it only has to be legible in the journal.
  * Deleting it would mean making `parent` optional across CaseFile/ResolvedCase
  * and every reader, which is churn for no behavioural gain.
  */
@@ -1515,19 +1459,19 @@ function gateFixKey(branch: string, files: string[]): string {
  * A GATE-FIX case id. N5 SHAPE, gate-fix form: `gate-fix-<slug(branch)>-<id8>`.
  *
  * A gate fix has NO conflict and therefore NO height, so it cannot honestly
- * wear the conflict form (`<branch>--<parent>-h<n>`). It was given a FAKE
- * height of `-1` purely to slip past the id validator — a lie that then had to
- * be taught to the validator's regex (`-h-?\d+`), to the fix-ref parser, and to
- * every height reader downstream. The id now carries the case's real identity:
+ * wear the conflict form (`<branch>--<parent>-h<n>`) — a fake placeholder
+ * height would be a lie that the id validator's regex, the fix-ref parser, and
+ * every height reader downstream would all have to be taught. The id instead
+ * carries the case's real identity:
  * the branch, plus a digest of the FAILING FILE SET — which is also what keeps
  * two DIFFERENT gate fixes on ONE branch (same pass, different failing files)
  * from colliding on an id. A collision there is fatal, not cosmetic: the second
  * case inherits the first's `resolved` disposition, drops straight out of
  * `openCases`, and `next-case` can never serve it.
  *
- * THE DIGEST COVERS THE FILES ONLY, not `gateFixKey` (owner, 2026-08-04). With
- * the branch mixed in, the same failing test on two branches produced two
- * unrelated digests and a cross-branch duplicate was invisible BY CONSTRUCTION —
+ * THE DIGEST COVERS THE FILES ONLY, not `gateFixKey`. With
+ * the branch mixed in, the same failing test on two branches would produce two
+ * unrelated digests and a cross-branch duplicate would be invisible BY CONSTRUCTION —
  * and duplicates are the normal case for an unstable shared test, which surfaces
  * wherever luck puts it. Files-only means the same defect wears the same digest
  * everywhere, so `refs/remotes/origin/fix/sweep/*--gate-fix-*` can be matched on
@@ -1587,9 +1531,9 @@ function isGateFixCaseId(id: string): boolean {
  * the pass's pinned chain — the highest trunk head the branch already contains.
  * That is the same quantity a conflict head's height denotes (a trunk index),
  * which is what keeps every height reader honest for a gate fix: notably the
- * D-004 machine block, whose `pendingAbove = heads.length - 1 - head.height`
- * reported `heads.length` — one MORE than the chain even holds — on every held
- * gate-fix PR while the placeholder `-1` sat in this field.
+ * PR-body machine block, whose `pendingAbove = heads.length - 1 - head.height`
+ * would report `heads.length` — one MORE than the chain even holds — on every
+ * held gate-fix PR if a placeholder `-1` sat in this field.
  *
  * `deriveCoverage` may itself return -1, and that is not a placeholder: it means
  * the branch contains NO head of this chain, for which "every trunk head is
@@ -1609,9 +1553,9 @@ async function gateFixHeadHeight(cli: Cli, chain: Chain, tip: string): Promise<n
  * The agent gets regions to open instead of a window someone else chose, and
  * the SHAPE of a failure becomes legible: 38 files all reporting TS2580
  * "Cannot find name 'process'" reads instantly as a broken toolchain, where the
- * last 4000 characters of the same run looked like four files with type errors
- * (live 2026-07-31 — that misreading is what minted a gate-fix case against a
- * defect that did not exist).
+ * last 4000 characters of the same run can look like four files with type
+ * errors — a misreading that mints a gate-fix case against a defect that does
+ * not exist.
  *
  * Pure text in, pure text out — no git, no fs.
  */
@@ -1697,7 +1641,7 @@ function boundedChecksOutput(r: ChecksRunResult, fullFile: string): string {
   ].join('\n');
 }
 
-/** The outcome of running one checks command list in a directory (D-060). */
+/** The outcome of running one checks command list in a directory. */
 export interface ChecksRunResult {
   ok: boolean;
   /** The commands that exited non-zero (their `cmd` strings). */
@@ -1707,7 +1651,7 @@ export interface ChecksRunResult {
 }
 
 /**
- * D-060: run a checks command list under `baseDir` (each command's `cwd` is
+ * Run a checks command list under `baseDir` (each command's `cwd` is
  * joined onto it) and report which commands failed + their output. Injectable
  * (mirrors the cold-read invoker) so tests never spawn a real pnpm/bun.
  */
@@ -1808,10 +1752,9 @@ function makeSubsetProbe(
      * the ADJUDICATION and ownership probes: the gate's own counts come from the
      * FULL command, and comparing a full-suite count against a narrowed one
      * compares two different populations — the difference decides the verdict.
-     * The 2026-08-01 test is the proof: it fails only under whole-suite load
-     * (5000 ms internal deadline, 5000 ms runner timeout) and passes in ~250 ms
-     * on its own, so a narrowed baseline would have called the very failure this
-     * exists for `flaky` and never `pre-existing`.
+     * A deadline-bound test can fail only under whole-suite load and pass in
+     * milliseconds on its own, so a narrowed baseline would call exactly the
+     * failure this exists for `flaky` and never `pre-existing`.
      *
      * ON for the BISECT, where every probe is narrowed on BOTH sides of the
      * comparison and the tip-determinism gate rejects anything that does not
@@ -1908,7 +1851,7 @@ function repoHistory(repo: string): History {
 }
 
 /**
- * D-060: how many `checks-fail` rows a case has accumulated since its most recent
+ * How many `checks-fail` rows a case has accumulated since its most recent
  * `checks-pass` (a pass resets the count) — else from the case's start. Shared by
  * typecheck AND test failures; drives the CHECKS_FAIL_LIMIT force-HELD backstop.
  * Independent of the cold-read reject/cap counters.
@@ -1923,14 +1866,14 @@ function checksFailCount(journal: JournalEntry[], caseId: string): number {
   return count;
 }
 
-/** A HELD escalation carried from freeze to publish (D-057): prefix tag + the
+/** A HELD escalation carried from freeze to publish: prefix tag + the
  * cold reviewer's short feedback, prepended to the PR description. */
 interface HeldEscalation {
   tag: string;
   feedback: string | null;
 }
 
-/** Bounded reviewer feedback out of a verdict-ish object (D-057). */
+/** Bounded reviewer feedback out of a verdict-ish object. */
 function boundedFeedback(v: { feedback?: unknown }): string | null {
   return typeof v.feedback === 'string' && v.feedback.trim() !== ''
     ? v.feedback.trim().slice(0, COLDREAD_FEEDBACK_CAP)
@@ -1941,10 +1884,10 @@ function boundedFeedback(v: { feedback?: unknown }): string | null {
  * Cold-read REJECTIONS of the RESOLUTION journaled for a case (fail-closed
  * UNVERIFIABLE counts). EVERY reject counts toward COLDREAD_REJECT_LIMIT.
  *
- * D-060: the pre-D-060 `defect: 'description'` exclusion is GONE. The cold read
- * is now the single gate at `report-case`, where no PR prose exists yet — the
- * reader is never shown a description and never asked to classify one. Keeping
- * the exclusion would mean a stray `"defect":"description"` in the reader's JSON
+ * There is NO `defect: 'description'` exclusion. The cold read
+ * is the single gate at `report-case`, where no PR prose exists yet — the
+ * reader is never shown a description and never asked to classify one. Such an
+ * exclusion would mean a stray `"defect":"description"` in the reader's JSON
  * silently un-counts a real resolution reject: the case would never reach the
  * 2× HELD escalation, and re-reporting an UNCHANGED tree records no new
  * report-attempt either, so the convergence cap would not catch it — an
@@ -1955,13 +1898,13 @@ function coldReadRejectionCount(journal: JournalEntry[], caseId: string): number
 }
 
 /**
- * The CLEAN-PREFIX tree (owner directive 2026-07-22, D-057): the automerge tree
+ * The CLEAN-PREFIX tree: the automerge tree
  * with every conflicted path reset to its `baseTip` (ours) blob — i.e. all of
  * the merge that landed cleanly, and NONE of the conflict. Committing THIS as
  * the case worktree's HEAD (see `createCaseWorktree`) makes the conflicted paths
  * the ONLY pending change in the worktree: `git status` = exactly the conflict,
- * so the agent reviews only the conflicting delta, never the ~750-file
- * accumulated merge (the per-case context blowup, handover §3.1).
+ * so the agent reviews only the conflicting delta, never a many-hundred-file
+ * accumulated merge (the per-case context blowup).
  *
  * Built in a throwaway index (never the repo index): read the automerge tree,
  * then for each conflicted path splice in the baseTip version — its blob when
@@ -2000,15 +1943,15 @@ async function cleanPrefixTree(
 }
 
 /**
- * Driver-created resolution worktree (SPEC 1; D-057 pending-diff shape): a
+ * Driver-created resolution worktree (pending-diff shape): a
  * detached worktree at <passdir>/<caseid>/worktree whose HEAD is the CLEAN
  * PREFIX commit (all of the merge that landed cleanly — `cleanPrefixTree`),
  * parented on the branch tip; the conflicted paths are then written into the
  * WORKING TREE (unstaged) with their automerge (conflict-marker) content. The
  * result: `git status` shows ONLY the conflicted paths as pending, so the agent
- * resolves just that delta — not the whole accumulated merge (handover §3.1,
- * owner directive: "commit all before the conflict; the agent reviews ONLY the
- * pending files"). The on-disk bytes and the `add -A; write-tree` snapshot are
+ * resolves just that delta — not the whole accumulated merge (commit all before
+ * the conflict; the agent reviews ONLY the
+ * pending files). The on-disk bytes and the `add -A; write-tree` snapshot are
  * IDENTICAL to a full automerge-tree checkout (prefix == automerge outside the
  * conflict; the conflicted files are overwritten back to automerge content), so
  * the empty-resolution check, scope guard and cold-read diff (all vs
@@ -2016,7 +1959,7 @@ async function cleanPrefixTree(
  * Best-effort — on failure journal a warning and continue (the case is still
  * resolvable via an agent-made worktree).
  *
- * D-059 (reissue): `contentSource` overrides WHERE the pending files' on-disk
+ * Reissue: `contentSource` overrides WHERE the pending files' on-disk
  * content comes from (default: the automerge tree — the fresh conflict with
  * markers). A REISSUE case passes the origin fix/sweep ref head so the agent
  * edits the PRIOR RESOLUTION (revises it per the owner's PR comments) instead
@@ -2024,7 +1967,7 @@ async function cleanPrefixTree(
  * status, snapshot/scope-guard vs automergeTree) is identical.
  */
 /**
- * The dependency trees a case worktree needs for the D-060 checks gate. Relative
+ * The dependency trees a case worktree needs for the checks gate. Relative
  * to the clone root; each is linked only when the clone actually has it.
  */
 const WORKTREE_DEP_LINKS = ['node_modules', 'container/agent-runner/node_modules'];
@@ -2035,17 +1978,16 @@ const WORKTREE_DEP_LINKS = ['node_modules', 'container/agent-runner/node_modules
  * `info/exclude` is repo-local and never committed.
  *
  * Must be the COMMON dir: git reads `info/exclude` from the shared `.git`, NOT
- * from a linked worktree's private `.git/worktrees/<id>/` (verified — writing
- * there had no effect and `git status` still listed the links as untracked).
+ * from a linked worktree's private `.git/worktrees/<id>/` (writing there has no
+ * effect and `git status` still lists the links as untracked).
  * Patterns are anchored (`/path`), so they apply at the top level of the clone
  * and of every worktree alike.
  *
- * This exists because `.gitignore` DOES NOT COVER THE DEP LINKS (live bug,
- * 2026-07-28): the repo ignores `node_modules/` — with a trailing slash, which
+ * This exists because `.gitignore` DOES NOT COVER THE DEP LINKS: the repo
+ * ignores `node_modules/` — with a trailing slash, which
  * matches DIRECTORIES ONLY — while git records a symlink as mode 120000, a FILE.
- * So `git add -A` staged both links into every resolved tree of the first live
- * pass (confirmed: `120000 blob … node_modules`). Slash-free patterns here match
- * a path of ANY type.
+ * `git add -A` would therefore stage the links into every resolved tree.
+ * Slash-free patterns here match a path of ANY type.
  */
 async function excludeInWorktree(repo: string, wtPath: string, patterns: string[]): Promise<void> {
   const gitDir = (await git(repo, ['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd: wtPath })).stdout.trim();
@@ -2064,29 +2006,25 @@ async function excludeInWorktree(repo: string, wtPath: string, patterns: string[
  * Install the tree's dependencies INTO THE WORKTREE, from the manifests that are
  * in that worktree. Returns false when no valid environment could be produced.
  *
- * THIS REPLACES DEPENDENCY POOLS (2026-08-04), and the reason is worth keeping.
- * Pools were introduced three days earlier (bc92eed8) against a real bug: every
- * worktree symlinked the CLONE's `node_modules`, so a branch declaring its own
- * package was typechecked against the wrong dependency tree and reported
- * `TS2307 Cannot find module` — an environment gap read as a code defect, which
- * minted a gate-fix case blaming the branch. The clone's tree is mutable too: an
- * install run mid-pass made the SAME sha go red at 05:09 and green at 05:30 with
- * no commit between.
- *
- * The diagnosis was right and the cure was worse. A pool is a SHARED, CACHED,
- * KEYED artifact, and each of those three properties produced a production
- * incident inside three days:
- *   - installed with `--ignore-scripts`, so native addons never compiled and
- *     every DB-touching suite died at require time — in every tree linked to it;
- *   - keyed on the PRE-MERGE branch tip while the worktree held the MERGED tree,
- *     so a dependency the merge introduced was simply absent;
- *   - keyed on manifests alone, so no fix could ever invalidate an existing pool
- *     — the poisoned ones had to be deleted by hand, and a node upgrade would
- *     have silently reproduced the first incident with no code change at all.
- * Each was reported to the sweep as a code failure and turned into branch-
- * targeted work. A pool is also exactly the LOCAL STATE that D-058 §2 abolishes:
- * it survived clean-slate by design, keyed by a value that could not change in
- * response to the bug, and never self-healed.
+ * NO shared dependency pool, and no symlink to the clone's `node_modules`.
+ * Linking the clone's tree typechecks a branch that declares its own package
+ * against the wrong dependency tree — `TS2307 Cannot find module`, an
+ * environment gap read as a code defect that mints a gate-fix case blaming the
+ * branch; and the clone's tree is mutable, so an install run mid-pass can flip
+ * the SAME sha between red and green with no commit between. A pool is a
+ * SHARED, CACHED, KEYED artifact, and each of those three properties is its own
+ * failure class:
+ *   - shared: one bad install (e.g. `--ignore-scripts` skipping native addon
+ *     builds) breaks every tree linked to it at once;
+ *   - keyed on the PRE-MERGE branch tip while the worktree holds the MERGED
+ *     tree: a dependency the merge introduces is simply absent;
+ *   - keyed on manifests alone: no fix can ever invalidate an existing pool —
+ *     a poisoned one must be deleted by hand, and a node upgrade silently
+ *     poisons it again with no code change at all.
+ * Each such failure is reported to the sweep as a code failure and turns into
+ * branch-targeted work. A pool is also exactly the LOCAL STATE this driver
+ * forbids: it survives clean-slate by design, keyed by a value that cannot
+ * change in response to the bug, and never self-heals.
  *
  * Installing into the worktree is correct BY CONSTRUCTION: the environment is a
  * function of the tree under test and nothing else, there is no cache to poison,
@@ -2111,9 +2049,9 @@ async function installDeps(cli: Cli, wtPath: string, runInstall?: InstallRunner)
  *
  * Returns FALSE for any failure. There is no fallback: a tree whose dependencies
  * could not be installed has NO valid environment, and a check run in it is an
- * inadmissible observation — not evidence about the code. The previous fallback
- * (link the clone's `node_modules` instead) is precisely how an environment gap
- * became a `TS2307` blamed on a branch.
+ * inadmissible observation — not evidence about the code. Falling back to the
+ * clone's `node_modules` is exactly how an environment gap becomes a `TS2307`
+ * blamed on a branch.
  */
 export type InstallRunner = (worktree: string) => Promise<boolean>;
 
@@ -2148,11 +2086,11 @@ const defaultInstallRunner: InstallRunner = async (dir) => {
 /**
  * Prepare a case's resolution worktree. Returns FALSE when it could not be
  * built: the whole body is best-effort (a container-uid-owned tree is not
- * removable from the host), but "best-effort" used to mean a journaled warning
- * and a NORMAL return, so callers that reset a worktree to the pristine conflict
- * went on to tell the agent "the worktree is now pristine" and froze a draft PR
- * over a tree that still held the agent's discarded edits. The claim has to
- * follow the outcome.
+ * removable from the host), but a failure must never be reported as a normal
+ * return — a caller that resets a worktree to the pristine conflict would then
+ * tell the agent "the worktree is now pristine" and freeze a draft PR over a
+ * tree that still holds the agent's discarded edits. The claim has to follow
+ * the outcome.
  */
 export async function createCaseWorktree(
   cli: Cli,
@@ -2176,7 +2114,7 @@ export async function createCaseWorktree(
         `clean prefix for ${caseFile.id} — conflict pending in: ${caseFile.conflictedPaths.join(', ')}`,
       ])
     ).stdout.trim();
-    // Idempotent (D-057): a case RE-EMITTED after a reopen may leave a stale
+    // Idempotent: a case RE-EMITTED after a reopen may leave a stale
     // worktree registration and/or dir at this path — `worktree add` then fails
     // with "missing but already registered" or "already exists", stranding the
     // case with no worktree. Clear both (registration via remove+prune, dir via
@@ -2200,13 +2138,13 @@ export async function createCaseWorktree(
         rmSync(abs, { force: true });
       }
     }
-    // Shared rerere (D-006, D-049 §4): install the workspace rr-cache into the
+    // Shared rerere: install the workspace rr-cache into the
     // shared .git so rerere-enabled operations in the case worktree see the
     // recorded resolutions. Best-effort, like the worktree itself.
     const seeded = await installRrCache(cli.repo, join(cli.workspace, RR_CACHE_DIRNAME));
     // Installed from the WORKTREE's own manifests — which are the MERGED ones.
-    // Keying this on the pre-merge branch tip is what made a dependency the merge
-    // introduced (`yaml`, live 2026-08-04) look like `TS2307` in the agent's code.
+    // Keying this on the pre-merge branch tip would make a dependency the merge
+    // introduced look like `TS2307` in the agent's code.
     const depsOk = await installDeps(cli, wtPath, runInstall);
     const linkedDeps = depsOk ? WORKTREE_DEP_LINKS : [];
     appendJournal(dir, {
@@ -2242,8 +2180,8 @@ async function removeCaseWorktree(cli: Cli, dir: string, caseId: string): Promis
 // --------------------------------------------------------------------------
 
 /**
- * D-054: the single machine-readable guidance line for a state-machine command
- * (DRIVER.md §6), written to STDOUT with the exact prefix
+ * The single machine-readable guidance line for a state-machine command
+ * (DRIVER.md §10.7), written to STDOUT with the exact prefix
  * `SWEEP-RESULT: ` (compact one-line JSON) — mirrors `progress`. The five
  * commands (+ abort) call this DIRECTLY, so exactly ONE line is produced per
  * command; the two-prefix contract is then unambiguous for a backgrounded
@@ -2257,15 +2195,15 @@ function result(cli: Cli, artifact: unknown): void {
 }
 
 function emit(cli: Cli, artifact: unknown): void {
-  // D-054: a flag command run INTERNALLY by a state-machine command
+  // A flag command run INTERNALLY by a state-machine command
   // (next-case→run, finish→verify/publish/push) produces no output — only the
   // outer command emits its single SWEEP-RESULT line.
   //
-  // What D-054 protects is that ONE STDOUT LINE, not the artifact. An internal
-  // caller that passes an explicit `--out` is asking to READ the result itself,
-  // and returning early threw it away: `finish`'s held escalation passed `out`
-  // to capture WHY a publish refused and got `reason: unknown` on all three
-  // cases (live 2026-08-05), because this line ran first. The file is written
+  // What the contract protects is that ONE STDOUT LINE, not the artifact. An
+  // internal caller that passes an explicit `--out` is asking to READ the
+  // result itself, and returning early would throw it away — `finish`'s held
+  // escalation passes `out` to capture WHY a publish refused, and would read
+  // `reason: unknown` if this line returned first. The file is written
   // silently — no `wrote ...` line — so the invariant is untouched.
   const json = JSON.stringify(artifact, null, 2);
   if (cli.internal) {
@@ -2281,7 +2219,7 @@ function emit(cli: Cli, artifact: unknown): void {
 }
 
 /**
- * D-054 observability: a MAJOR-STEP progress line for a running sweep, written to
+ * Observability: a MAJOR-STEP progress line for a running sweep, written to
  * STDOUT with the exact prefix `SWEEP-STEP: ` and flushed immediately (never
  * buffered to exit — `process.stdout.write` emits at the call site so the owner
  * sees the sweep advance live while a long next-case/finish runs in the
@@ -2296,11 +2234,11 @@ function progress(msg: string): void {
 }
 
 /**
- * D-060: the substitute GitHub token for a networked write. The agent NO LONGER
- * manages a token file — the driver reads it from the environment (`GH_TOKEN`,
+ * The substitute GitHub token for a networked write. The agent does not
+ * manage a token file — the driver reads it from the environment (`GH_TOKEN`,
  * fallback `GITHUB_TOKEN`) at each networked write and never persists it. The
- * internal `--token-file` override is kept (a file wins when present) so the flag
- * CLI and tests can still pin a token explicitly, but the default is the env.
+ * internal `--token-file` override (a file wins when present) lets the flag
+ * CLI and tests pin a token explicitly, but the default is the env.
  * Absent from both → null (the caller returns `ERR11_TOKEN_MISSING`).
  */
 function resolveGithubToken(cli: Cli): string | null {
@@ -2308,7 +2246,7 @@ function resolveGithubToken(cli: Cli): string | null {
 }
 
 /**
- * The token PLUS where it came from. Since D-060 the driver picks a token up off
+ * The token PLUS where it came from. The driver picks a token up off
  * the ENVIRONMENT silently, so a rejected token is ambiguous: a revoked `GH_TOKEN`
  * and a stale ambient `GITHUB_TOKEN` that was never meant for this pass fail
  * identically. Every auth failure report names this source so the two are
@@ -2360,11 +2298,11 @@ export async function cmdPlan(cli: Cli): Promise<number> {
   // a pass with journal activity legitimately derives differently now (§8).
   const ctx = await openPass(cli);
   const dir = ctx.dir;
-  // Blocked state is journal-derived (D-058): `sweep start` reconstructs the
+  // Blocked state is journal-derived: `sweep start` reconstructs the
   // PR_ID set from origin and journals `origin-blocked` rows BEFORE plan runs;
-  // there is no local reconcile step anymore — origin is the authority.
+  // there is no local reconcile step — origin is the authority.
   const journal = readJournal(dir);
-  // Urges are only DETECTED here; posting is `push`'s job (D-049, §14.4).
+  // Urges are only DETECTED here; posting is `push`'s job (§14.4).
   const dueUrges = await detectUrges(cli, ctx, journal);
   if (dueUrges.length) {
     console.error(`urges due (post via \`propagate push --execute\`): ${dueUrges.map((u) => u.branch).join(', ')}`);
@@ -2390,11 +2328,12 @@ export async function cmdPlan(cli: Cli): Promise<number> {
   }
   writeJsonFile(join(dir, 'plan.json'), plan);
 
-  // D-045 Feature B (§13): candidate discovery. Writing the per-candidate YAML
-  // + candidates.json + journal `candidate` entries from `plan` is the
-  // documented exception to plan purity — derived REPORT state, never git refs.
-  // Candidates are never planned or merged; the printed section is the agent's
-  // relay duty to the owner (doctrine).
+  // Candidate discovery (§13): candidates are DERIVED FRESH
+  // from git every pass — no cross-pass store, no report throttle; a candidate
+  // is reported every pass until the owner acts in config (an inventory entry
+  // or a scope exclusion). candidates.json + the journal `candidate` rows are
+  // pass-dir artifacts. Candidates are never planned or merged; the printed
+  // section is the agent's relay duty to the owner (doctrine).
   const registry = loadRegistry({
     inventoryDir: cli.inventory,
     scopeFile: cli.scopeFile,
@@ -2406,33 +2345,22 @@ export async function cmdPlan(cli: Cli): Promise<number> {
     features: registry.features,
     scope: registry.scope,
   });
-  const entryBranches = new Set(registry.features.filter((f) => f.branch).map((f) => f.branch!));
-  const rec = reconcileCandidates(cli.workspace, candidateRecords, entryBranches, ctx.watermark12);
-  for (const { record, event } of rec.events) {
+  for (const record of candidateRecords) {
     appendJournal(dir, {
       action: 'candidate',
-      event,
+      event: 'discovered',
       branch: record.branch,
       tip: record.tip,
       confidence: record.confidence,
     });
   }
-  for (const r of rec.resolved) {
-    appendJournal(dir, { action: 'candidate', event: 'resolved', branch: r.branch, reason: r.reason });
-  }
   writeJsonFile(join(dir, 'candidates.json'), {
     schemaVersion: 1,
     watermark12: ctx.watermark12,
-    candidates: rec.all,
-    newlyReported: rec.events.map((e) => e.record.branch),
-    resolved: rec.resolved,
+    candidates: candidateRecords,
     standingInstruction: CANDIDATE_STANDING_INSTRUCTION,
   });
-  for (const line of candidateSectionLines(
-    rec.events.map((e) => e.record),
-    rec.resolved,
-  ))
-    console.error(line);
+  for (const line of candidateSectionLines(candidateRecords)) console.error(line);
 
   emit(cli, plan);
   return 0;
@@ -2454,7 +2382,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
     return 0;
   }
 
-  // EXECUTE. Repo-wide rerere first (D-050, owner (b) 2026-07-22): BEFORE the
+  // EXECUTE. Repo-wide rerere first: BEFORE the
   // first mutation, idempotently enable rerere in the agent clone so every
   // merge — driver or case worktree — records/replays resolutions. Journaled
   // once, only when the value actually changes.
@@ -2463,9 +2391,9 @@ export async function cmdRun(cli: Cli): Promise<number> {
     await git(cli.repo, ['config', 'rerere.enabled', 'true']);
     appendJournal(dir, { action: 'rerere-enabled', repo: cli.repo });
   }
-  // Blocked state is journal-derived (D-058): the origin-derived PR_ID rows
+  // Blocked state is journal-derived: the origin-derived PR_ID rows
   // were journaled by `sweep start`; there is no local reconcile step. Urges
-  // are only DETECTED (posting is `push`'s job — D-049, §14.4).
+  // are only DETECTED (posting is `push`'s job — §14.4).
   {
     const due = await detectUrges(cli, ctx, readJournal(dir));
     if (due.length) {
@@ -2479,7 +2407,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
   const journal = readJournal(dir);
   const statusView = passStatusView(cli, journal);
   const blockedSet = new Set(statusView.keys()); // merge_status != NONE (PR_ID ∪ DEFERRED)
-  const held = await prBlockedRecords(cli, journal, ctx.chain); // PR_ID block heights, live-derived (§5/N3 → D-058)
+  const held = await prBlockedRecords(cli, journal, ctx.chain); // PR_ID block heights, live-derived (§5/N3)
   const plan = await derive(cli, held, ctx, statusView);
   const passHasProgress = plan.chainLength > 0;
   const scope = new Set(plan.branches.map((b) => b.branch));
@@ -2497,7 +2425,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
       .filter((e) => e.action === 'branch-materialized' || e.action === 'branch-synced')
       .map((e) => e.branch as string),
   );
-  // D-047/B11: branches the DRIVER itself already mutated or demoted this pass
+  // Branches the DRIVER itself already mutated or demoted this pass
   // (a journaled `merge` or `case`) legitimately derive differently from the
   // last written plan — the §3 execution re-probe's merge→case/skip demotion
   // is a sanctioned transition, and a crash between the journal entry and the
@@ -2511,7 +2439,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
   const planPath = join(dir, 'plan.json');
   if (existsSync(planPath)) {
     const prev = JSON.parse(readFileSync(planPath, 'utf8')) as PropagationPlan;
-    // merge_status transitions are sanctioned derivation changes (D-058): a
+    // merge_status transitions are sanctioned derivation changes: a
     // branch manually unfrozen this pass legitimately derives differently
     // from the last written plan.
     const statusCleared = new Set(
@@ -2522,7 +2450,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
     const exclude = new Set([...arrived, ...reopened, ...blockedSet, ...statusCleared, ...syncedBranches, ...driverTouched]);
     const drift = plansDiffer(prev, plan, exclude);
     if (drift.length) {
-      // §14 (D-048): DriverHalt reasons surface under the machine-readable id
+      // §14: DriverHalt reasons surface under the machine-readable id
       // scheme in CLI output; the human text stays in `detail`/the journal.
       const detail = `git moved under us — plan drift for not-yet-processed branch(es): ${drift.join(', ')}`;
       appendJournal(dir, { action: 'halt', reason: 'plan-drift', id: 'ERR24_PLAN_DRIFT', branches: drift });
@@ -2545,7 +2473,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
   const heldSet = new Set([...statusView.entries()].filter(([, s]) => s === 'PR_ID').map(([b]) => b));
   const preReffed = preReffedSet(journal);
 
-  // D-057 block-height map for the LIVE execution path (mirrors derivePlan): every
+  // Block-height map for the LIVE execution path (mirrors derivePlan): every
   // blocked branch (merge_status != NONE) with its block-height, seeded from the
   // blocked set and GROWN as branches defer in DAG order — deriveLive and the §3
   // re-probe use it for the height-MIN DEFER over blocked DIRECT parents. Without
@@ -2567,14 +2495,14 @@ export async function cmdRun(cli: Cli): Promise<number> {
   let gated = false;
   const diverged: string[] = [];
   const mergeFailed: string[] = [];
-  /** §14 (D-048): this run's per-branch halts under the ERR2x id scheme (CLI output). */
+  /** §14: this run's per-branch halts under the ERR2x id scheme (CLI output). */
   const issues: Issue[] = [];
 
   try {
     for (const snap of plan.branches) {
       if (arrived.has(snap.branch)) continue; // already processed this pass (resume)
 
-      // D-045 Feature A (§13): reconcile the local branch with origin BEFORE its
+      // Origin sync (§13): reconcile the local branch with origin BEFORE its
       // first mutation this pass. DIVERGED hard-halts THIS branch only (journaled,
       // skipped, reported) — siblings keep processing; any other DriverHalt
       // (dirty worktree, protected ref) still halts the whole run below.
@@ -2600,7 +2528,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
         throw e;
       }
 
-      // Live merge_status dispatch (D-058; the JOURNAL is re-read per branch so
+      // Live merge_status dispatch (the JOURNAL is re-read per branch so
       // a mid-loop hold/defer of an earlier sibling is visible).
       const viewNow = passStatusView(cli, readJournal(dir));
       const stNow = viewNow.get(snap.branch) ?? null;
@@ -2619,7 +2547,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
       // Re-derive THIS branch against LIVE tips so a child sees its parents'
       // just-merged tips (breadth-wise cascade, like merge.ts probes live sources).
       // The same derivation is reused by the §3 execution re-probe below when a
-      // per-parent verdict goes stale mid-branch (D-047/B11).
+      // per-parent verdict goes stale mid-branch.
       const model: 'entry' | 'parents' = snap.parents[0]?.model ?? 'entry';
       const deriveLive = (mergeBlocked?: { state: 'DEFERRED'; behind: string }): Promise<BranchPlan> =>
         deriveBranch({
@@ -2635,11 +2563,11 @@ export async function cmdRun(cli: Cli): Promise<number> {
           alwaysMerge: snap.alwaysMerge,
           held,
           blockHeightOf,
-          stackCap: snap.stackCap, // effective cap resolved at plan derivation (D-049 §2)
+          stackCap: snap.stackCap, // effective cap resolved at plan derivation
           mergeBlocked,
         });
 
-      // DEFERRED (D-057 STAY, D-058 source): sticky while ANY direct parent is
+      // DEFERRED (STAY rule, journal-derived): sticky while ANY direct parent is
       // still blocked — the branch takes nothing this pass; its own conflict
       // height is re-probed live so its children's height-MIN keeps working.
       // The journal-fixpoint view (`passStatusView`) already dropped branches
@@ -2671,7 +2599,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
 
       // Leaf / always_merge un-skip (§6): if every parent no-op'd in a pass that
       // carries progress, force (empty) merges along the cheapest parent chain.
-      // D-057: the chain must not merge into/through a branch whose merge_status
+      // The chain must not merge into/through a branch whose merge_status
       // != NONE (PR_ID | DEFERRED) — blocked branches are excluded from the
       // LIVE search here (statuses may have changed mid-pass), so a blocked
       // intermediate aborts the un-skip instead of being force-merged past its
@@ -2687,7 +2615,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
             if (pp.verdict === 'skip' || pp.verdict === 'up-to-date') pp.skipReason = 'unskip-blocked';
           }
         }
-        // §6 conflict pre-probe (2026-07-23 live halt): the un-skip premise
+        // §6 conflict pre-probe: the un-skip premise
         // ("every parent no-op'd, so forcing produces empty merges") breaks
         // once a prior forced hop moves a tip and a later hop then genuinely
         // conflicts — journaledMerge -> clean-only commitTreeMerge would throw
@@ -2735,23 +2663,19 @@ export async function cmdRun(cli: Cli): Promise<number> {
       const step = buildStepFile(bp, plan.watermark);
       writeJsonFile(join(dir, `step-${bp.branch.replace(/\//g, '__')}.json`), step);
 
-      // VERIFY AGAINST THE TIP THE PLAN WAS DERIVED AT (2026-08-04).
+      // VERIFY AGAINST THE TIP THE PLAN WAS DERIVED AT.
       //
       // `deriveBranch` pins ONE `branchTip` for all of a branch's per-parent
-      // probes (D-047/B11) — verdicts are statements about THAT tip. Verification
-      // used a FRESH `revParse` instead, so any ref movement between derivation
-      // and this line put the two on different trees and they disagreed about the
-      // same merge: the plan said `merge`, the re-probe said "no-op (should be
-      // skip)", and the run HALTED. Live 2026-08-04 on
-      // `module/agent-group-contributions`: planned merge, executed (f3e947ff →
-      // e22b9606), then halted on its own result. It self-healed on the next
-      // `next-case` — the re-derivation saw the landed merge and said
-      // `up-to-date` — but the halt still cost a stop and a spurious driver
-      // issue, because a self-healing halt is indistinguishable from a real one.
+      // probes — verdicts are statements about THAT tip. A fresh `revParse`
+      // here instead would let any ref movement between derivation and this
+      // line put the two on different trees, disagreeing about the same merge:
+      // the plan says `merge`, the re-probe says "no-op (should be skip)", and
+      // the run halts on its own result — a self-healing halt that is
+      // indistinguishable from a real one.
       //
-      // Judging a plan against a tree the plan never saw is the bug; the fix is
-      // to hold the tip fixed across both, which is what makes the two agree by
-      // construction rather than by luck of timing.
+      // Judging a plan against a tree the plan never saw is the bug; holding
+      // the tip fixed across both makes the two agree by construction rather
+      // than by luck of timing.
       const verdict = await verifyStepFile(cli.repo, step, {
         chain,
         branchTip: tipAtDerive,
@@ -2789,7 +2713,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
           id: caseId(bp.branch, pp.parent, pp.case!.head.height), // B8: branch+PARENT+height (run TOP)
           branch: bp.branch,
           parent: pp.parent,
-          head: pp.case!.head, // the run's TOP commit (D-049 §2)
+          head: pp.case!.head, // the run's TOP commit (stacked-run model)
           run: pp.case!.run,
           tierFloor: bp.tierFloor,
           conflictedPaths: probe.conflictFiles,
@@ -2802,7 +2726,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
         const diffText = await conflictHunks(cli.repo, caseFile.automergeTree, caseFile.conflictedPaths);
         writeFileSync(
           join(caseDir, 'coldread-request.md'),
-          // Resolution diff added at resolve (§7); D-048 context block included
+          // Resolution diff added at resolve (§7); the context block is included
           // from emission so the reader is never context-starved.
           coldReadRequest(caseFile, diffText.slice(0, 60000), null, await caseContextLines(cli, caseFile)),
         );
@@ -2813,10 +2737,10 @@ export async function cmdRun(cli: Cli): Promise<number> {
           caseId: caseFile.id,
           head: caseFile.head, // sha recorded for the B5i crash-heal ancestry check
           height: caseFile.head.height,
-          run: caseFile.run, // the stacked run (D-049 §2)
+          run: caseFile.run, // the stacked run
           conflictedPaths: caseFile.conflictedPaths,
         });
-        await createCaseWorktree(cli, dir, caseFile, nowTip); // SPEC 1: agent resolves here
+        await createCaseWorktree(cli, dir, caseFile, nowTip); // agent resolves here
         return true;
       };
 
@@ -2825,11 +2749,11 @@ export async function cmdRun(cli: Cli): Promise<number> {
         for (let pi = 0; pi < bp.parents.length; pi++) {
           let pp = bp.parents[pi];
           if (branchGated) break; // halt at first case needing judgment per branch
-          // Execution re-probe (§3/§8, D-047/B11): each per-parent verdict above
+          // Execution re-probe (§3/§8): each per-parent verdict above
           // was probed against the branch tip AT DERIVATION, but parents merge
           // SEQUENTIALLY — once an earlier parent's merge advances the tip, a
-          // later parent's clean `merge` verdict is stale (executing it blind is
-          // what crashed the 2026-07-21 sweep). Re-probe against the CURRENT tip
+          // later parent's clean `merge` verdict is stale (executing it blind
+          // crashes the run mid-merge). Re-probe against the CURRENT tip
           // (pinned SHAs, §3 determinism); on staleness re-derive the parent row
           // live and demote as found: conflicted → case (conflict set + automerge
           // tree recomputed from the current tip), tree-equal → skip (§6 no-op).
@@ -2868,7 +2792,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
               forced: pp.forced ?? false,
               newRef,
             });
-            // Annotate-class (§1, D-002): a CLEAN merge passing THROUGH a height a
+            // Annotate-class (§1): a CLEAN merge passing THROUGH a height a
             // transitive ancestor is HELD on — never gates, surfaced in the report.
             if (pp.annotate) {
               appendJournal(dir, {
@@ -2881,7 +2805,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
             }
             // A clean prefix can merge while the conflict ABOVE it is DEFERRED to a
             // blocked DIRECT parent (§5): record the defer pointer — the journaled
-            // `defer` row IS the DEFERRED state (D-058), so blocked(X) holds in the
+            // `defer` row IS the DEFERRED state, so blocked(X) holds in the
             // derived view from this moment.
             if (pp.deferredTo) {
               appendJournal(dir, { action: 'defer', branch: bp.branch, parent: pp.parent, deferredTo: pp.deferredTo });
@@ -2894,8 +2818,8 @@ export async function cmdRun(cli: Cli): Promise<number> {
               gated = true;
             }
           } else if (pp.verdict === 'defer') {
-            // BECOME DEFERRED (D-057): the journaled `defer` row is the state
-            // (D-058) — the branch is blocked in the derived view from now on.
+            // BECOME DEFERRED: the journaled `defer` row is the state
+            // — the branch is blocked in the derived view from now on.
             appendJournal(dir, { action: 'defer', branch: bp.branch, parent: pp.parent, deferredTo: pp.deferredTo });
             recordDefer(bp.branch, pp.deferHeight);
           } else if (pp.verdict === 'case') {
@@ -2913,7 +2837,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
           }
         }
       } catch (e) {
-        // D-047/B11: a merge write that STILL fails (journaledMerge's backstop —
+        // A merge write that STILL fails (journaledMerge's backstop —
         // racing ref movement, CAS refusal; a conflicted tree is unreachable
         // after the re-probe above) halts THIS branch only, journaled, like
         // sync-diverged — siblings keep processing and the branch arrives for the
@@ -2947,7 +2871,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
 
   // pass-complete only when no open cases AND the §9 gate is green for the
   // current set of merges (a green `verify` journal entry after the last merge).
-  // "Open cases" covers MORE than this run's own gating (D-059): a REISSUE case
+  // "Open cases" covers MORE than this run's own gating: a REISSUE case
   // journaled at `start` (undispositioned, never emitted by run — its branch is
   // PR_ID) must keep the pass open, or run would seal a pass with a case still
   // to serve and report-*/finish could no longer attach.
@@ -2966,7 +2890,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
   }
   if (diverged.length) console.error(`diverged branches skipped this pass (owner escalation): ${diverged.join(', ')}`);
   if (mergeFailed.length)
-    console.error(`merge-failed branches halted this pass (journaled, D-047/B11): ${mergeFailed.join(', ')}`);
+    console.error(`merge-failed branches halted this pass (journaled): ${mergeFailed.join(', ')}`);
   console.error(sealed ? 'run complete — pass sealed (pass-complete)' : `run complete — ${missing}`);
   emit(cli, { watermark12: plan.watermark12, gated, sealed, missing, passDir: dir, diverged, mergeFailed, issues });
   return 0;
@@ -3060,12 +2984,12 @@ async function crashHeal(cli: Cli, dir: string, journal: JournalEntry[]): Promis
   const healed: string[] = [];
   for (const e of journal) {
     if (e.action !== 'case' || closed.has(e.caseId as string)) continue;
-    // D-061 (B): NEVER crash-heal a GATE-FIX case. The heuristic below reads
+    // NEVER crash-heal a GATE-FIX case. The heuristic below reads
     // "the ref already contains the case head, so it was resolved before a
     // crash" — but a gate-fix case's head IS the branch tip by construction, and
-    // a commit is always its own ancestor, so it matched instantly and every
-    // gate-fix case was journaled `resolved` on the next command. `openCases`
-    // then dropped it and `next-case` answered `finalize` with the case unserved.
+    // a commit is always its own ancestor, so it would match instantly and the
+    // case would be journaled `resolved` on the next command; `openCases` would
+    // drop it and `next-case` would answer `finalize` with the case unserved.
     if (e.gateFix === true) continue;
     const head = e.head as { sha?: string } | undefined;
     if (!head?.sha || typeof e.branch !== 'string') continue; // pre-head-journaling entries: not healable
@@ -3096,7 +3020,7 @@ interface ResolvedCase {
   branch: string;
   parent: string;
   model: 'entry' | 'parents';
-  /** The case run's TOP head (D-049 §2). */
+  /** The case run's TOP head (stacked-run model). */
   head: { sha: string; height: number };
   /** The stacked run (ascending); run[run.length - 1] === head. */
   run: Head[];
@@ -3115,11 +3039,11 @@ interface ResolvedCase {
 }
 
 /**
- * D-061 (B): re-derive a GATE-FIX case. `reverifyCase` cannot be used — it
+ * Re-derive a GATE-FIX case. `reverifyCase` cannot be used — it
  * re-derives a CONFLICT (live first-conflict head against a named parent, an
  * automerge tree, a plan snapshot entry), and a gate fix has none of those. Left
- * on that path every gate-fix case dies with ERR02_CASE_STALE and the agent
- * loops: next-case serves it, report-case rejects it, forever.
+ * on that path every gate-fix case would die with ERR02_CASE_STALE and the agent
+ * would loop: next-case serves it, report-case rejects it, forever.
  *
  * The trust boundary still holds: branch, files and the failing commands come
  * from the DRIVER'S OWN journal row, never from the agent-writable case.json.
@@ -3221,12 +3145,10 @@ async function reverifyCase(
     scopeFile: cli.scopeFile,
     routingFile: cli.routingFile,
   });
-  const feat = registry.features.find((f) => f.branch === caseFile.branch) as
-    | (FeatureEntry & { tier_floor?: string; always_merge?: boolean })
-    | undefined;
+  const feat = registry.features.find((f) => f.branch === caseFile.branch);
   const floor = tierFloor(caseFile.branch, feat);
   const scopeGuardMode: ScopeGuardMode = feat?.scope_guard ?? registry.routing.scopeGuardMode ?? 'same-files';
-  // D-049 §2 lever, re-derived from config exactly like the tier floor above.
+  // Stacked-run cap lever, re-derived from config exactly like the tier floor above.
   const stackCap = feat?.stack_cap ?? registry.routing.stackCap ?? DEFAULT_STACK_CAP;
 
   // (N2) AUTHORITY for parent legality + pass scope: the branch's kind/model/
@@ -3357,7 +3279,7 @@ async function reverifyCase(
 }
 
 /**
- * D-059 — re-verification for a REISSUE case (a revision of a published-and-
+ * Re-verification for a REISSUE case (a revision of a published-and-
  * commented resolution). `reverifyCase` cannot apply: it re-derives the case
  * from the live plan sweep, but a reissue branch is PR_ID-blocked (empty
  * interval — the sweep never probes it) and the recorded head may sit below a
@@ -3394,9 +3316,7 @@ async function reverifyReissueCase(
     scopeFile: cli.scopeFile,
     routingFile: cli.routingFile,
   });
-  const feat = registry.features.find((f) => f.branch === caseFile.branch) as
-    | (FeatureEntry & { tier_floor?: string })
-    | undefined;
+  const feat = registry.features.find((f) => f.branch === caseFile.branch);
   const floor = tierFloor(caseFile.branch, feat);
   const scopeGuardMode: ScopeGuardMode = feat?.scope_guard ?? registry.routing.scopeGuardMode ?? 'same-files';
   const scopeResult = await resolveScope(cli.repo, registry.features, registry.scope, { includeRemote: true });
@@ -3459,12 +3379,12 @@ async function reverifyReissueCase(
 }
 
 /**
- * Freeze a branch HELD: prepare the PR materials (D-048) and journal `held` —
+ * Freeze a branch HELD: prepare the PR materials (§14) and journal `held` —
  * the journaled disposition IS the blocked state for the rest of the pass
- * (D-058: blockedRows/passStatusView read it; nothing is written to the
+ * (blockedRows/passStatusView read it; nothing is written to the
  * journal, and NOTHING is pushed or published here — the PR is created at
  * `finish`, after verify). The journal entry records what the UNIFIED publish
- * needs (D-057):
+ * needs:
  *  - `resolution`: the agent's last resolution tree + whether it is
  *    MARKER-CLEAN — the publish decision key (marker-clean → ACTIVE PR at the
  *    resolved merge commit; otherwise → DRAFT PR from the pristine conflict).
@@ -3503,7 +3423,7 @@ async function freezeHeld(
     branch: rc.branch,
     caseId: rc.id,
     height: rc.head.height,
-    headSha: rc.head.sha, // conflict head — the derived block height's anchor (D-058)
+    headSha: rc.head.sha, // conflict head — the derived block height's anchor
     conflictedPaths: rc.conflictedPaths,
     notes,
     resolution,
@@ -3515,8 +3435,8 @@ async function freezeHeld(
  * N5: the CONFLICT case-id shape (`slug(branch)--slug(parent)-h<n>`, steps.ts).
  * `<n>` may be NEGATIVE and that is not a sentinel: `deriveCoverage` returns -1
  * for a head that sits BELOW this pass's pinned chain, which parents-model
- * cases hit routinely — which is also exactly why a gate fix wearing `-h-1`
- * was indistinguishable from a real case id.
+ * cases hit routinely — which is also exactly why a gate fix wearing a fake
+ * `-h-1` would be indistinguishable from a real case id.
  */
 const CONFLICT_CASE_ID_RE = /^[A-Za-z0-9_-]+-h-?\d+$/;
 
@@ -3528,11 +3448,8 @@ const CONFLICT_CASE_ID_RE = /^[A-Za-z0-9_-]+-h-?\d+$/;
  *
  * There are TWO generated shapes, because there are two kinds of case: the
  * CONFLICT form above, and the GATE-FIX form (`gateFixCaseId`), which has no
- * height because a gate fix has no merge. The gate-fix form used to be forced
- * through the conflict regex by appending a fake height of `-h-1`; before that
- * it was refused outright with ERR25_BAD_CASE_ID, so no HELD gate fix could
- * ever publish however green the rest of the pipeline was. Both shapes are
- * stated as themselves now, so the charset guarantee is unchanged and no case
+ * height because a gate fix has no merge. Both shapes are
+ * stated as themselves, so the charset guarantee is unchanged and no case
  * has to lie about having a height to be publishable.
  */
 function isGeneratedCaseId(id: string): boolean {
@@ -3552,10 +3469,10 @@ function isGeneratedCaseId(id: string): boolean {
  * A GATE FIX has no parent and no height, so it names itself with its own
  * identity (the case id) after the `<slug(branch)>--` prefix every fix ref
  * needs — that prefix is what `deriveOriginMergeStatus` maps back to the target
- * branch. It used to be spelled through the conflict form, which put the
- * `(gate-fix)` parent LABEL and a `-h-1` height into a ref name that the next
- * pass's origin reader then tried to parse a real scope branch and a real trunk
- * height back out of.
+ * branch. Spelling it through the conflict form would put the `(gate-fix)`
+ * parent LABEL and a fake height into a ref name that the next pass's origin
+ * reader then tries to parse a real scope branch and a real trunk height back
+ * out of.
  */
 function fixBranchName(id: string, rc: Pick<ResolvedCase, 'branch' | 'parent' | 'head'>): string {
   if (isGateFixCaseId(id)) return `fix/sweep/${slug(rc.branch)}--${id}`;
@@ -3563,15 +3480,15 @@ function fixBranchName(id: string, rc: Pick<ResolvedCase, 'branch' | 'parent' | 
 }
 
 /**
- * Prepare the case's PR MATERIALS (§14, D-048) — structured driver facts ONLY:
+ * Prepare the case's PR MATERIALS (§14) — structured driver facts ONLY:
  * conflicted paths, the case run, per-side one-line histories over those
- * paths, the reproduction command. The driver NEVER generates PR prose (the
- * retired template body/title could not pass the agent's own text gate —
- * 2026-07-21 forensic finding): the agent studies the case (worktree + these
+ * paths, the reproduction command. The driver NEVER generates PR prose
+ * (driver-generated boilerplate cannot pass the agent's own text gate): the
+ * agent studies the case (worktree + these
  * materials) and writes pr/title.txt + pr/body.md itself, then runs
  * `propagate publish --case <id>` — the ONLY sanctioned PR-creation path.
  * No fix/sweep ref is created here either: publish pushes the ref at the REAL
- * head (D-049 — HELD: the run's top commit; JUDGED: the merge commit). Returns
+ * head (HELD: the run's top commit; JUDGED: the merge commit). Returns
  * the deterministic fix branch NAME for urge bookkeeping.
  */
 /** Where the case's PR template is written — the ONE template the agent may use. */
@@ -3581,8 +3498,8 @@ function prTemplatePath(dir: string, caseId: string): string {
 
 /**
  * The PR-description handoff, appended to every result that asks for PR text.
- * With no template named, the agent used the repo's contribution template
- * instead (live: PR #61). Name the one to use; say nothing about the rest.
+ * With no template named, an agent reaches for the repo's contribution
+ * template instead. Name the one to use; say nothing about the rest.
  */
 function prHandoff(dir: string, caseId: string, base: string): string {
   return `${base}. Write \`pr/body.md\` from ${prTemplatePath(dir, caseId)} — use only this template.`;
@@ -3645,10 +3562,9 @@ function prTemplateFor(rc: ResolvedCase, tier: Tier): string {
 /**
  * The reading contract handed to the agent with every case.
  *
- * ONE COPY. It lived verbatim in both `prepareCaseMaterials` and
- * `machineCaseMaterials`, and on 2026-08-06 an edit to it changed one and not
- * the other — the dump still showed the old wording, which is how the
- * duplication was noticed at all. Two copies of a rule are two rules.
+ * ONE COPY, shared by `prepareCaseMaterials` and `machineCaseMaterials` — an
+ * edit that changes one and not the other leaves two divergent contracts in
+ * play. Two copies of a rule are two rules.
  */
 const CASE_DIRECTIVES: string[] = [
   'EDIT: the pending files below, nothing else. `git status` shows exactly them.',
@@ -3659,9 +3575,9 @@ const CASE_DIRECTIVES: string[] = [
 ];
 
 /**
- * The two sides' commit subjects over the conflicted paths. Also one copy: the
- * two documents had drifted to different wordings ("since the merge base",
- * "`<parent>` head") for the same two `git log` runs.
+ * The two sides' commit subjects over the conflicted paths. Also one copy, so
+ * the two documents cannot drift to different wordings for the same two
+ * `git log` runs.
  */
 function perSideBlocks(sides: { ours: string; theirs: string }, ours: string, theirs: string): string[] {
   return [
@@ -3696,7 +3612,7 @@ async function prepareCaseMaterials(cli: Cli, dir: string, rc: ResolvedCase, tie
     ...rc.conflictedPaths.map((p) => `- ${p}`),
     '',
     `Branch: ${rc.branch}   Parent: ${rc.parent}   Head: ${rc.head.sha.slice(0, 12)} (height ${rc.head.height})`,
-    `Case run (D-049 §2, ${rc.run.length} height(s)): ${rc.run.map((h) => `h${h.height} ${h.sha.slice(0, 12)}`).join(', ')}`,
+    `Case run (MERGE-POLICY.md §2, ${rc.run.length} height(s)): ${rc.run.map((h) => `h${h.height} ${h.sha.slice(0, 12)}`).join(', ')}`,
     `Pending upstream commits above this point: ${rc.pendingAbove}`,
     '',
     `## Reproduction`,
@@ -3707,14 +3623,14 @@ async function prepareCaseMaterials(cli: Cli, dir: string, rc: ResolvedCase, tie
     ...perSideBlocks(sides, rc.branch, rc.parent),
     '',
     'Write pr/title.txt and pr/body.md YOURSELF from studying the case, then run',
-    `\`propagate publish --case ${rc.id}\` (D-048).`,
+    `\`propagate publish --case ${rc.id}\` (PROPAGATION.md §14).`,
   ].join('\n');
   writeFileSync(join(prDir, 'materials.md'), materials + '\n');
   return fixBranch;
 }
 
 // --------------------------------------------------------------------------
-// publish — the ONLY sanctioned PR-creation path (§14, D-048).
+// publish — the ONLY sanctioned PR-creation path (§14).
 // --------------------------------------------------------------------------
 
 /**
@@ -3733,7 +3649,7 @@ async function originSlug(cli: Cli): Promise<{ owner: string; repo: string } | n
 function lastDisposition(journal: JournalEntry[], caseId: string): JournalEntry | null {
   let last: JournalEntry | null = null;
   for (const e of journal) {
-    // `held-duplicate` (finding B) IS a terminal disposition: the case folded
+    // `held-duplicate` IS a terminal disposition: the case folded
     // into a HELD topmost sibling and inherits its PR — it must drain from
     // openCases (so `finish` completes) and never publish a PR of its own. It is
     // NOT `held`, so the finish held-publish phase (which filters action==='held')
@@ -3750,8 +3666,9 @@ function lastDisposition(journal: JournalEntry[], caseId: string): JournalEntry 
  * or origin already contains the local tip — the ordinary head is correct and
  * ERR14 passes on its own terms).
  *
- * Every escalation head must go through this. The diagnosis-only report did not,
- * and published a 305-commit PR for a case with no code change.
+ * Every escalation head must go through this — an escalation built on the
+ * local tip instead publishes a PR carrying hundreds of the pass's unpushed
+ * merge commits for a case with no code change.
  */
 async function escalationBase(cli: Cli, branch: string, tip: string): Promise<string | null> {
   if (!cli.escalateUnpushed) return null;
@@ -3830,13 +3747,13 @@ async function transplantOntoOrigin(
  * ESCALATION. Returns how many published, and how many were pending.
  *
  * Shared by BOTH red exits from `finish` (attributed ERR40 and the
- * unattributed ERR18 halt). It lived inline in the first of those, which is
- * precisely why the second kept dropping the agent's work: the rule "a held
- * case reaches the owner" belongs to the OUTCOME, not to one code path.
+ * unattributed ERR18 halt) — the rule "a held case reaches the owner" belongs
+ * to the OUTCOME, not to one code path, so neither exit may drop the agent's
+ * work.
  *
  * Records WHY each refusal happened. `cmdPublish` reports through `emit`, which
- * `internal: true` silences, so a bare exit code said nothing — every refusal
- * journaled an unactionable "publish-failed" until the `out` file was added.
+ * `internal: true` silences, so a bare exit code says nothing — the `out` file
+ * is what keeps a refusal from journaling an unactionable "publish-failed".
  */
 async function escalateHeldCases(
   cli: Cli,
@@ -3908,7 +3825,7 @@ export function journaledCases(journal: JournalEntry[]): Map<string, JournaledCa
 }
 
 /**
- * Deterministic driver-built commit (D-057 publish heads): fixed identity and
+ * Deterministic driver-built commit (publish heads): fixed identity and
  * dates so re-running publish rebuilds the SAME sha for the same tree/parents
  * — a retried push stays a no-op instead of a non-fast-forward.
  */
@@ -3927,8 +3844,8 @@ async function deterministicCommit(repo: string, tree: string, parents: string[]
 }
 
 /**
- * The REAL commit a case's PR head is pushed at — the UNIFIED publish (§14,
- * D-049 → D-057). Decision key for a HELD case: does a MARKER-CLEAN resolution
+ * The REAL commit a case's PR head is pushed at — the UNIFIED publish (§14).
+ * Decision key for a HELD case: does a MARKER-CLEAN resolution
  * exist (recorded on the `held` journal entry)?
  *
  *  - MARKER-CLEAN resolution → ACTIVE (non-draft) PR at the RESOLVED MERGE
@@ -3973,13 +3890,13 @@ async function publishHead(
   }
   const tip = await revParse(cli.repo, jc.branch);
   if (disposition.action === 'held') {
-    // D-061 (B): a GATE FIX has no conflict and never had one — its `head.sha`
+    // A GATE FIX has no conflict and never had one — its `head.sha`
     // IS the branch tip by construction, and `freezeHeld` only journals (it never
-    // advances the ref). All three staleness probes below therefore fired
-    // unconditionally on every held gate fix: the first read "the resolution
-    // landed", finish journaled `publish-failed`, and the agent's fix was thrown
-    // away — no fix/sweep ref, no PR, nothing for the owner. (`crashHeal` already
-    // carries the analogous guard; this site was missed.) A held gate fix
+    // advances the ref). Without this guard all three staleness probes below
+    // would fire unconditionally on every held gate fix: the first would read
+    // "the resolution landed", finish would journal `publish-failed`, and the
+    // agent's fix would be thrown away — no fix/sweep ref, no PR, nothing for
+    // the owner. (`crashHeal` carries the analogous guard.) A held gate fix
     // publishes like any other held case, off its recorded resolution.
     const isGateFix = journal.some((e) => e.action === 'gate-fix' && e.caseId === jc.caseId);
     if (!isGateFix && (await isAncestor(cli.repo, jc.head.sha, tip))) {
@@ -4077,7 +3994,7 @@ async function publishHead(
         }
       }
       if (shipTree) {
-        // D-061 (B): a HELD GATE FIX ships as a SINGLE-parent commit. Its
+        // A HELD GATE FIX ships as a SINGLE-parent commit. Its
         // `head.sha` IS the branch tip, so the ordinary two-parent form would
         // record the tip as both parents — a degenerate self-merge whose PR
         // diff reads as an empty merge rather than the fix.
@@ -4093,8 +4010,8 @@ async function publishHead(
         // pass advanced with merges that were deliberately NOT pushed (the tests
         // are red). A PR of it against `origin/<branch>` would show every one of
         // those unverified merges alongside the fix, and ERR14 refuses it
-        // outright — which is why three held escalations were silently dropped
-        // on 2026-08-05. Transplant the resolution onto origin's ACTUAL tip so
+        // outright — silently dropping the escalation. Transplant the
+        // resolution onto origin's ACTUAL tip so
         // the PR's diff is the case's own work and nothing else.
         const transplant = await transplantOntoOrigin(cli, dir, jc, tip, localHead);
         if (transplant) return { ...transplant, mode: 'held', draft: transplant.draft, escalation };
@@ -4104,24 +4021,18 @@ async function publishHead(
     // A GATE FIX HAS NO PRISTINE CONFLICT TO FALL BACK ON. It never had a
     // conflict, so when it freezes HELD with no resolution the agent tried and
     // could not fix it — which is a real outcome the owner has to see, not a
-    // reason to drop the case.
-    //
-    // This used to refuse with ERR02 unless the case was flagged `diagnosisOnly`,
-    // and the work went nowhere: live 2026-08-05 two held gate fixes were refused
-    // and their diagnoses reached no one. The flag is gone now (it decided by
-    // grepping the output for "timed out" and forbade fixing defects that were
-    // perfectly fixable), and the rule it was standing in for applies to every
-    // held gate fix alike: reproducible-but-unfixable-in-scope reaches the owner
-    // as a held PR. There is no other channel.
+    // reason to drop the case. The rule applies to every held gate fix alike:
+    // reproducible-but-unfixable-in-scope reaches the owner as a held PR.
+    // There is no other channel.
     //
     // A PR needs a commit and there is no diff to make, so the head is an EMPTY
     // commit whose message names the case; the finding lives in the PR body the
     // agent wrote. DRAFT, because there is nothing to merge — it is a report.
     if (!probe) {
-      // ON ORIGIN'S TIP WHEN ESCALATING. Parenting this on the LOCAL tip — which
-      // the pass had advanced — is how PR #72 came out at 305 commits and 362
-      // files for a case with no code change at all. An empty commit needs only
-      // the right parent.
+      // ON ORIGIN'S TIP WHEN ESCALATING. Parenting this on the LOCAL tip —
+      // which the pass advanced — would publish a PR of hundreds of commits
+      // and files for a case with no code change at all. An empty commit needs
+      // only the right parent.
       const reportBase = (await escalationBase(cli, jc.branch, tip)) ?? tip;
       const headSha = await deterministicCommit(
         cli.repo,
@@ -4171,25 +4082,24 @@ async function publishHead(
  * path SET plus the same head sha, or byte-identical conflict blobs (the
  * automerge-side content at every conflicted path — two branches carrying the
  * same fork edit against the same upstream rewrite produce identical marker
- * blobs). D-050 loosening (the missed #60 near-duplicate — a 6-path subset of
- * a 7-path sibling): a case whose path set is a SUBSET of a sibling's (either
- * direction) is also a duplicate when the conflict blobs on the SHARED paths
- * match. Duplicates consolidate into the TOPMOST case by DAG order (run
+ * blobs). Subset loosening: a case whose path set is a SUBSET of a sibling's
+ * (either direction) is also a duplicate when the conflict blobs on the SHARED
+ * paths match — a near-duplicate differing only by a missing path is still the
+ * same conflict. Duplicates consolidate into the TOPMOST case by DAG order (run
  * journals cases in DAG order, so first-journaled = topmost); the topmost case
- * itself publishes. Three of the six 2026-07-21 freeze PRs were byte-identical
- * duplicates.
+ * itself publishes.
  */
 /**
  * ERR06 with a machine-readable pointer when the matched sibling's PR is
  * ALREADY PUBLISHED — `finish`'s held phase skips such a case (journaled
- * `held-duplicate`) instead of wedging on an unpublishable duplicate
- * (finding #3); absent for the still-open topmost-sibling arm, which remains
+ * `held-duplicate`) instead of wedging on an unpublishable duplicate;
+ * absent for the still-open topmost-sibling arm, which remains
  * a consolidate-first error.
  */
 interface DuplicateIssue extends Issue {
   duplicateOf?: { caseId: string; url: string; number: number };
   /**
-   * Set (finding B) when the matching topmost sibling is itself HELD (frozen for
+   * Set when the matching topmost sibling is itself HELD (frozen for
    * the owner, no PR yet). "Resolve THAT case" is impossible — it is frozen — so
    * report-case CONSOLIDATES this case into it (a `held-duplicate` disposition)
    * rather than blocking, and it inherits the topmost's held PR at finish.
@@ -4211,7 +4121,7 @@ export async function duplicateCaseIssue(
    * a path absent there). merge-tree stamps the side commit OIDs into the
    * conflict markers (`<<<<<<< <sha>` / `>>>>>>> <sha>`), so raw blob oids
    * differ across sibling branches even when the conflict is byte-identical —
-   * strip the marker labels before comparing (D-050).
+   * strip the marker labels before comparing.
    */
   const conflictBlobs = async (tree: string, paths: string[]): Promise<Array<string | null>> => {
     const out: Array<string | null> = [];
@@ -4233,7 +4143,7 @@ export async function duplicateCaseIssue(
   })();
 
   const signatureMatches = async (other: JournaledCase): Promise<boolean> => {
-    // Path-set relation: equal, or one a SUBSET of the other (D-050). The
+    // Path-set relation: equal, or one a SUBSET of the other. The
     // shared set is the smaller one; blob comparison runs over it.
     const otherSet = new Set(other.conflictedPaths);
     const selfSet = new Set(self.conflictedPaths);
@@ -4262,11 +4172,11 @@ export async function duplicateCaseIssue(
   const superseded = supersededCaseIds(journal);
   for (const other of cases.values()) {
     if (other.caseId === self.caseId) continue;
-    // A case SUPERSEDED by a reopen (bug #64) is dead — never a duplicate. Its
+    // A case SUPERSEDED by a reopen is dead — never a duplicate. Its
     // undispositioned `case` row would otherwise read as an open sibling and,
     // since a reopen re-emits a superset case (same conflict + new paths), match
     // this case's signature and fire ERR06 pointing at a case next-case will
-    // never serve → the same wedge #63 fixed in the open-case readers.
+    // never serve — the same wedge the open-case readers guard against.
     if (superseded.has(other.caseId)) continue;
     const disposition = lastDisposition(journal, other.caseId);
     const isOpen = disposition === null || disposition.action === 'held';
@@ -4282,7 +4192,7 @@ export async function duplicateCaseIssue(
       };
     }
     if (other.firstIndex < self.firstIndex) {
-      // Finding B: a HELD topmost cannot be "resolved" — it is frozen for the
+      // A HELD topmost cannot be "resolved" — it is frozen for the
       // owner. Flag it for consolidation (report-case journals a held-duplicate)
       // instead of an unsatisfiable "resolve THAT case" block that would loop
       // and then wedge `finish` (ERR34). An UNDISPOSED topmost keeps the plain
@@ -4304,7 +4214,7 @@ export async function duplicateCaseIssue(
 }
 
 /**
- * `propagate publish --case <id>` (§14, D-048/D-049; unified per D-057) — the
+ * `propagate publish --case <id>` (§14; unified for held + judged) — the
  * ONLY sanctioned PR-creation path. The agent writes pr/title.txt + pr/body.md
  * itself from studying the case; this subcommand re-verifies the case,
  * determines the REAL PR head via `publishHead` (HELD with a marker-clean
@@ -4314,12 +4224,11 @@ export async function duplicateCaseIssue(
  * machine-readable JSON object {ok, issues:[{id, detail}], pr?} on stdout.
  * Blocking ERR* ids stop the publish; WARN* ids ship as advisories. With
  * --execute (and all-clear) it PUSHES the fix/sweep ref via `git push`
- * (ERR15 on failure — a D-046 case-2 owner report, never worked around) and
- * creates the PR via the GitHub API (HELD PRs carry the D-004 machine block,
+ * (ERR15 on failure — an owner report, never worked around) and
+ * creates the PR via the GitHub API (HELD PRs carry the machine block,
  * escalated holds the warning prefix + reviewer feedback); without --execute
  * it is a dry-run — full battery, but NO pushes and NO network calls of any
- * kind. Text checks are MECHANICAL only (ERR08 + lint WARNs + ERR05/ERR06);
- * the PR-text cold read is retired (D-050).
+ * kind. Text checks are MECHANICAL only (ERR08 + lint WARNs + ERR06).
  */
 export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => GithubTransport): Promise<number> {
   if (!cli.caseId) {
@@ -4354,7 +4263,7 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
   }
 
   // (1)+(2) disposition + live-state re-verification (ERR01/ERR02), then the
-  // REAL head (D-049) + the pre-PR height check (ERR14).
+  // REAL head + the pre-PR height check (ERR14).
   const src = await publishHead(cli, dir, journal, jc);
   if (src.issue) {
     emit(cli, { ok: false, issues: [src.issue] });
@@ -4368,18 +4277,8 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
   };
   push(await checkBaseHeight(cli.repo, jc.branch, mode, headSha, cli.escalateUnpushed === true));
 
-  // (4) "should this PR exist": recorded decisions (ERR05) + duplicates (ERR06)
-  // + already-published (ERR07, journal side).
-  const registry = loadRegistry({
-    inventoryDir: cli.inventory,
-    scopeFile: cli.scopeFile,
-    routingFile: cli.routingFile,
-  });
-  // ERR05 (decided-already) is SATISFIED by a judged resolution — applying the
-  // recorded decision as judged IS the prescribed action (#65), so it must not
-  // block the judged publish (that would dead-end a case with no forward path).
-  // It still applies to a held publish (re-asking the owner on a decided matter).
-  if (mode !== 'judged') push(decidedAlready(registry.features, jc.branch, jc.conflictedPaths));
+  // (4) "should this PR exist": duplicates (ERR06) + already-published (ERR07,
+  // journal side).
   push(await duplicateCaseIssue(cli, journal, cases, jc));
   const priorPr = journal.filter((e) => e.action === 'pr-published' && e.caseId === jc.caseId).pop();
   if (priorPr) {
@@ -4390,10 +4289,7 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
   }
 
   // (5) agent-written text (ERR08) + MECHANICAL text checks only — the lint
-  // WARNs below and the ERR05/ERR06 adequacy gates above. The two-round
-  // PR-text cold read (ERR09/ERR10/WARN04) is RETIRED (D-050: zero unique
-  // catches ever; ~300k tokens/~19 min burned in one batch); the D-031
-  // catch-list survives as WRITING RULES the agent follows (doctrine).
+  // WARNs below and the ERR06 adequacy gate above.
   const prDir = join(dir, jc.caseId, 'pr');
   const titlePath = join(prDir, 'title.txt');
   const bodyPath = join(prDir, 'body.md');
@@ -4402,7 +4298,7 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
   if (title === '' || body === '') {
     push({
       id: 'ERR08_TEXT_MISSING',
-      detail: `write ${titlePath} and ${bodyPath} YOURSELF from studying the case (worktree + pr/materials.md) — the driver never generates PR prose (D-048)`,
+      detail: `write ${titlePath} and ${bodyPath} YOURSELF from studying the case (worktree + pr/materials.md) — the driver never generates PR prose`,
     });
   } else {
     issues.push(...advisoryTextIssues(title, body, jc.conflictedPaths));
@@ -4424,7 +4320,7 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
       push({
         id: 'ERR11_TOKEN_MISSING',
         detail:
-          'publish needs the substitute GitHub token in the environment: export GH_TOKEN (or GITHUB_TOKEN) — the credential proxy swaps the Authorization header for api.github.com on the wire (D-060)',
+          'publish needs the substitute GitHub token in the environment: export GH_TOKEN (or GITHUB_TOKEN) — the credential proxy swaps the Authorization header for api.github.com on the wire',
       });
     }
     slugParts = await originSlug(cli);
@@ -4436,9 +4332,9 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
     }
   }
 
-  // Deterministic fix branch (D-057 naming, D-058: no pinned copy anywhere —
+  // Deterministic fix branch (no pinned copy anywhere —
   // the name derives from the case identity alone, so a retried publish and
-  // the next pass's origin scan agree on it). A REISSUE case (D-059) prefers
+  // the next pass's origin scan agree on it). A REISSUE case prefers
   // the ORIGIN ref name the driver recorded at start (it IS the existing PR's
   // head branch — the identity-derived name must and does match it).
   const caseRow = journal.find((e) => e.action === 'case' && e.caseId === jc.caseId) ?? null;
@@ -4451,7 +4347,7 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
     return 1;
   }
 
-  // Active-vs-draft is the unified publish decision (D-057): a HELD case with
+  // Active-vs-draft is the unified publish decision: a HELD case with
   // a MARKER-CLEAN resolution ships an ACTIVE (non-draft) PR at the resolved
   // merge commit — the owner reviews & merges (never the driver); only the
   // pristine-conflict exhibit is a draft. JUDGED stays non-draft history.
@@ -4469,7 +4365,7 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
   }
 
   // EXECUTE: ERR07 (API side) first — an open PR by head branch name means an
-  // earlier publish already landed. For a REISSUE (D-059) the KNOWN PR's LIVE
+  // earlier publish already landed. For a REISSUE the KNOWN PR's LIVE
   // state is re-checked first: the owner may have merged/closed it MID-PASS —
   // then the republish is SKIPPED (journaled), never a clobber of the owner's
   // action and never a second PR (the next start re-derives the truth).
@@ -4506,7 +4402,7 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
     }
     const existing = reissue ? null : await getOpenPrByHead(transport, slugParts!, fixBranch);
     if (existing) {
-      // RECONCILE, never a livelock (finding #1): reaching here means the
+      // RECONCILE, never a livelock: reaching here means the
       // journal carries NO `pr-published` row for this case (a journal-side row
       // is blocking ERR07 above), yet the PR exists on the API side — the
       // crash window between the prior run's PR create and its journal append.
@@ -4517,7 +4413,7 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
       if (!(await refExists(cli.repo, fixBranch))) {
         await git(cli.repo, ['update-ref', `refs/heads/${fixBranch}`, headSha, '']);
       }
-      // D-059: the crashed run may have died between PR create and the marker
+      // The crashed run may have died between PR create and the marker
       // post — re-assert the sweep-addressed marker (0: first publish; readers
       // take the MAX, so a duplicate is harmless).
       if (mode === 'held') await postSweepAddressed(transport, slugParts!, existing.number, 0);
@@ -4550,9 +4446,9 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
     return 1;
   }
 
-  // The DRIVER pushes the PR head — `git push` is the only way refs move
-  // (D-049 §5). A failure is ERR15: hard halt, journaled, D-046 case-2 owner
-  // report; NO fallback of any kind. A REISSUE replaces the prior resolution
+  // The DRIVER pushes the PR head — `git push` is the only way refs move.
+  // A failure is ERR15: hard halt, journaled, reported to the owner;
+  // NO fallback of any kind. A REISSUE replaces the prior resolution
   // head on the SAME ref (non-fast-forward by construction), so it pushes with
   // a compare-and-swap lease on the start-classified old head — never blind.
   const priorHead = reissue && typeof caseRow!.priorHead === 'string' ? (caseRow!.priorHead as string) : null;
@@ -4568,7 +4464,7 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
   } catch (e) {
     const detail =
       `git push of '${fixBranch}' at ${headSha.slice(0, 12)} failed: ${e instanceof Error ? e.message : String(e)} — ` +
-      `report to the owner (D-046 case 2) and STOP; publication is blocked until the infrastructure is fixed`;
+      `report to the owner and STOP; publication is blocked until the infrastructure is fixed`;
     appendJournal(dir, {
       action: 'halt',
       reason: 'push-failed',
@@ -4582,21 +4478,21 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
 
   try {
     let finalBody = body;
-    // Escalated hold (D-057): the warning prefix + the cold reviewer's short
+    // Escalated hold: the warning prefix + the cold reviewer's short
     // feedback go ABOVE the agent's prose so the owner sees why this landed
     // on their desk (scope exceeded / rejected twice / did not converge).
     if (escalation) {
       finalBody = `${escalation.tag}${escalation.feedback ? ` — ${escalation.feedback}` : ''}\n\n${finalBody}`;
     }
     if (mode === 'held') {
-      // D-004 machine block (D-049 decision 8): driver-maintained, delimited,
+      // The PR-body machine block: driver-maintained, delimited,
       // appended BELOW the agent's prose; posted urges keep it current.
       const pendingAbove = Math.max(0, ctx.chain.heads.length - 1 - jc.head.height);
       finalBody = withMachineBlock(finalBody, renderMachineBlock(pendingAbove, ctx.watermark12));
     }
     let result: { url: string; number: number };
     if (reissueTarget) {
-      // D-059 REISSUE: the revision replaces the EXISTING PR's head (the ref
+      // REISSUE: the revision replaces the EXISTING PR's head (the ref
       // push above); refresh the PR's title/body from the agent's revised
       // prose — never a second PR for the same review.
       await ghExpect(transport, 'PATCH', `/repos/${slugParts!.owner}/${slugParts!.repo}/pulls/${reissueTarget.number}`, {
@@ -4613,7 +4509,7 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
         draft,
       });
     }
-    // D-059: record the review-loop state on the PR — the sweep-addressed
+    // Record the review-loop state on the PR — the sweep-addressed
     // marker names the highest SUBMITTED REVIEW id this publish addressed
     // (0 on a first publish — no review yet; a reissue posts the triggering
     // review id classified at start — always a review id actually present on
@@ -4642,7 +4538,7 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
       head: headSha,
       ...(reissue ? { reissued: true, addressedReviewId } : {}),
     });
-    // No stored pointer to update (D-058): the `pr-published` journal row
+    // No stored pointer to update: the `pr-published` journal row
     // above enriches the pass's blocked view (urge target), and the next
     // pass rediscovers the PR from origin at `start`.
     console.error(
@@ -4663,15 +4559,15 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
 }
 
 /**
- * `propagate push` — the pass publication stage (§14.4, D-049). The DRIVER
- * pushes; the agent never hand-pushes anything (rule 3 as amended by D-049:
- * driver-journaled pass pushes are the only pushes). Per-pass order: verify
+ * `propagate push` — the pass publication stage (§14.4). The DRIVER
+ * pushes; the agent never hand-pushes anything —
+ * driver-journaled pass pushes are the only pushes. Per-pass order: verify
  * green → JUDGED PRs created (`publish`, non-draft) → THIS command pushes the
  * target branches — ONE push per branch, clean prefix + judged merge commits
- * together; GitHub auto-flips the JUDGED PRs to merged (D-040) → HELD PRs
- * created (`publish`, active/draft — D-058: bases now current, ERR14 enforces
+ * together; GitHub auto-flips the JUDGED PRs to merged → HELD PRs
+ * created (`publish`, active/draft — bases now current, ERR14 enforces
  * it) → urge comments posted (also this command). Verify-gated (ERR18): nothing is
- * pushed before `verify` is green (§9, D-012). PUSH RESILIENCE (D-059 FINAL):
+ * pushed before `verify` is green (§9). PUSH RESILIENCE:
  * each target pushes INDEPENDENTLY — a failed push is journaled per branch
  * (`push-failed` with a diverged/transient/auth category; ERR15 stays the
  * per-branch LABEL) and the remaining targets still land; landed branches are
@@ -4716,7 +4612,7 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
     const originTip = await revParse(cli.repo, originRef);
     if (originTip === localTip) intents.push({ branch, state: 'up-to-date', localTip });
     else if (await isAncestor(cli.repo, originTip, localTip)) intents.push({ branch, state: 'push', localTip });
-    // Origin strictly ahead: someone else committed — higher is fine (D-049 §5).
+    // Origin strictly ahead: someone else committed — higher is fine.
     else if (await isAncestor(cli.repo, localTip, originTip)) intents.push({ branch, state: 'remote-ahead', localTip });
     else intents.push({ branch, state: 'diverged', localTip });
   }
@@ -4725,7 +4621,7 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
   const judgedPrs = journal.filter((e) => e.action === 'pr-published' && e.mode === 'judged');
   const dueUrges = await detectUrges(cli, ctx, journal);
 
-  // Verify gate (§9, D-012): nothing is pushed before verify is green.
+  // Verify gate (§9): nothing is pushed before verify is green.
   const gateOk = canComplete(journal);
 
   if (!cli.execute) {
@@ -4744,14 +4640,14 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
 
   if (!gateOk) {
     const detail =
-      "no green `verify` journal entry after the pass's last mutation — run `propagate verify --execute` first (§9, D-012)";
+      "no green `verify` journal entry after the pass's last mutation — run `propagate verify --execute` first (§9)";
     console.error(`push [ERR18_VERIFY_PENDING]: ${detail}`);
     emit(cli, { ok: false, issues: [{ id: 'ERR18_VERIFY_PENDING', detail }] });
     return 1;
   }
 
-  // (1) Target pushes — ONE push per branch, plan order (D-049 decision 2).
-  // PUSH RESILIENCE (D-059 FINAL): each target pushes INDEPENDENTLY — a
+  // (1) Target pushes — ONE push per branch, plan order.
+  // PUSH RESILIENCE: each target pushes INDEPENDENTLY — a
   // failure is journaled per branch (`push-failed`, categorized) and the loop
   // FINISHES THE REST; ERR15 stays the per-branch failure LABEL but is no
   // longer a stop. Verify already validated each publishable branch
@@ -4761,7 +4657,7 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
   type PushFailCategory = 'diverged' | 'transient' | 'auth' | 'rejected';
   const pushFailed: Array<{ branch: string; category: PushFailCategory; detail: string }> = [];
   const categorize = (msg: string): PushFailCategory => {
-    // A pre-receive-hook / permission rejection is NOT divergence (finding 3):
+    // A pre-receive-hook / permission rejection is NOT divergence:
     // its git output also says "[remote rejected] … failed to push some refs",
     // but no history diverged — re-pushing can never succeed until the owner
     // changes the hook/branch protection. Checked FIRST so the diverged
@@ -4772,7 +4668,7 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
       return 'auth';
     return 'transient';
   };
-  // Categories that can NEVER self-heal by retrying (finding 3): the owner must
+  // Categories that can NEVER self-heal by retrying: the owner must
   // act. Journaled as a DISTINCT escalation row so `finish` can surface them as
   // needs-owner (not merely a category) and an autonomous re-run loop can stop
   // re-trying the branch.
@@ -4795,7 +4691,7 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
       failBranch(
         intent.branch,
         'diverged',
-        `push target '${intent.branch}' has DIVERGED from origin — owner escalation (D-046 case 2), never force-resolve; the other targets proceed`,
+        `push target '${intent.branch}' has DIVERGED from origin — owner escalation, never force-resolve; the other targets proceed`,
       );
       continue;
     }
@@ -4811,15 +4707,15 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
         category,
         `git push of target '${intent.branch}' failed (${category}): ${msg} — ` +
           (category === 'diverged'
-            ? 'owner escalation (D-046 case 2), never force-resolve; the other targets proceed'
+            ? 'owner escalation, never force-resolve; the other targets proceed'
             : category === 'rejected'
-              ? 'owner escalation (D-046 case 2): a hook/branch-protection rejection cannot heal by retrying; the other targets proceed'
-              : 'report to the owner (D-046 case 2); the other targets proceed and this branch retries on the next finish'),
+              ? 'owner escalation: a hook/branch-protection rejection cannot heal by retrying; the other targets proceed'
+              : 'report to the owner; the other targets proceed and this branch retries on the next finish'),
       );
     }
   }
 
-  // APPROVED-landing rollback escalations pending a post (finding 2): the
+  // APPROVED-landing rollback escalations pending a post: the
   // verify stage journals `approved-rollback` offline; THIS stage owns the
   // networked comment. One post per rollback — an `approved-escalated` row
   // marks it done, so re-runs never re-post.
@@ -4834,7 +4730,7 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
 
   // Networked steps (closure checks + urge posting + approved-rollback
   // escalations). Only constructed when there is work; same --token-file
-  // contract as publish (D-049 decision 7).
+  // contract as publish.
   const needsNetwork = judgedPrs.length > 0 || dueUrges.length > 0 || pendingApprovedEscalations.length > 0;
   let transport: GithubTransport | null = null;
   let slugParts: { owner: string; repo: string } | null = null;
@@ -4845,7 +4741,7 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
       issues.push({
         id: 'ERR11_TOKEN_MISSING',
         detail:
-          'closure checks / urge posting need the substitute GitHub token in the environment: export GH_TOKEN (or GITHUB_TOKEN) (D-060)',
+          'closure checks / urge posting need the substitute GitHub token in the environment: export GH_TOKEN (or GITHUB_TOKEN)',
       });
     } else {
       slugParts = await originSlug(cli);
@@ -4860,7 +4756,7 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
     }
   }
 
-  // (2) JUDGED closure check (D-040): every judged PR must have auto-flipped.
+  // (2) JUDGED closure check: every judged PR must have auto-flipped.
   // PRs whose target push FAILED this run are skipped (their flip is pending
   // the retried push — an ERR16 for them would be noise, not signal).
   const failedBranches = new Set(pushFailed.map((f) => f.branch));
@@ -4888,7 +4784,7 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
     }
   }
 
-  // (2b) APPROVED-landing rollback escalations (finding 2): tell the owner
+  // (2b) APPROVED-landing rollback escalations: tell the owner
   // their approved resolution fails the integration build, WITH the marker
   // advanced to the approving review id — the next `start` then reads the
   // review as addressed and neither re-lands nor re-serves it (a NEW review
@@ -4927,7 +4823,7 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
     }
   }
 
-  // (3) Urge posting (§8, D-004): post FIRST — the journal row and the comment's
+  // (3) Urge posting (§8): post FIRST — the journal row and the comment's
   // own `sweep-urge` marker land only after a successful post, so a failed urge
   // retries on the next push.
   const urged: Array<{ branch: string; head: string; prNumber: number }> = [];
@@ -4946,13 +4842,13 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
         }
         // ORIGIN-DERIVED DEDUP: the PR's own comments say whether this head was
         // already urged. Cheap (one paginated read per due urge, and urges are
-        // rare), and it cannot go stale the way the ledger field did.
+        // rare), and it cannot go stale the way a local cache field can.
         if ((await urgedHeads(transport, slugParts, prNumber)).has(urge.head)) {
           appendJournal(dir, { action: 'urge-skip', branch: urge.branch, head: urge.head, reason: 'already urged for this head' });
           continue;
         }
         const commentBody = await urgeCommentBody(cli, urge);
-        // D-004: refresh the machine block on the PR body, then post the comment.
+        // Refresh the machine block on the PR body, then post the comment.
         const pr = await ghExpect(transport, 'GET', `${api}/pulls/${prNumber}`);
         const newBody = withMachineBlock(
           String(pr.body ?? ''),
@@ -4981,9 +4877,9 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
   }
 
   // Blocking NON-push issues (ERR16/ERR17/token/API) are journaled as
-  // `push-issue` rows (finding 3): `finish` reads only the journal delta, so
-  // without these rows a partial finish silently DROPPED them from the
-  // SWEEP-RESULT whenever per-branch push failures also occurred.
+  // `push-issue` rows: `finish` reads only the journal delta, so
+  // without these rows a partial finish would silently drop them from the
+  // SWEEP-RESULT whenever per-branch push failures also occur.
   for (const i of issues) {
     if (isBlocking(i.id) && i.id !== 'ERR15_PUSH_FAILED') {
       appendJournal(dir, { action: 'push-issue', id: i.id, detail: i.detail });
@@ -5007,39 +4903,39 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     scopeFile: cli.scopeFile,
     routingFile: cli.routingFile,
   });
-  // D-051 fix 1: the recipe = THIS PASS'S publishable set (advanced branches, in
+  // The recipe = THIS PASS'S publishable set (advanced branches, in
   // the plan's DAG order, minus held/frozen/open-case), built on the fork-trunk
-  // base. An explicit `--recipe` still overrides (manual re-verify / debugging,
-  // §12). The static scope.yaml `recipe` is now only a PLANLESS fallback (no
-  // pass plan on disk): validating publishable branches replaces validating a
+  // base. An explicit `--recipe` overrides (manual re-verify / debugging,
+  // §12). The static scope.yaml `recipe` is only a PLANLESS fallback (no
+  // pass plan on disk): the gate validates publishable branches, never a
   // fixed config stack that could pin a permanently-held branch at its head.
   // PR_ID-blocked branches are unpublished-by-design (their unresolved conflicts
   // would recreate stack conflicts in the rebuild); DEFERRED branches carry only
-  // their clean prefix and stay publishable (D-057).
+  // their clean prefix and stay publishable.
   const held = prBlockedBranches(journal);
   const order = passOrder(dir);
   const derived = order.length > 0 ? publishableRecipe(journal, order, held) : (registry.scope.recipe ?? []);
   const recipe = cli.recipe ?? derived;
   const baseRef = await verifyBaseRef(cli);
   const rrCacheDir = join(cli.workspace, RR_CACHE_DIRNAME);
-  // D-060: an in-memory command list (finish threads checks.test here) wins,
+  // An in-memory command list (finish threads checks.test here) wins,
   // then `--commands-file`, then the static VERIFY_COMMANDS default.
   const commands: VerifyCommand[] = cli.commands
     ? cli.commands
     : cli.commandsFile
       ? (JSON.parse(readFileSync(cli.commandsFile, 'utf8')) as VerifyCommand[])
       : VERIFY_COMMANDS;
-  // D-060's dependency links, applied to the VERIFY worktree too. The case and
-  // gate-fix worktrees have always had them; this one never did, so every
-  // finish-time verify typechecked without `@types/node` or `vitest` and was
+  // The dependency links, applied to the VERIFY worktree too — the same as the
+  // case and gate-fix worktrees. Without them the finish-time verify typechecks
+  // without `@types/node` or `vitest` and is
   // red on every pass regardless of content (see VerifyOptions.prepareWorktree).
   const verifyOpts = {
     commands,
     baseRef,
     rrCacheDir,
     // The verify worktree is base + every publishable branch merged, so its
-    // manifests are the MERGED ones and nothing else can describe them. (It
-    // previously linked the clone's trees, which is the same environment gap.)
+    // manifests are the MERGED ones and nothing else can describe them.
+    // (Linking the clone's trees instead would be the same environment gap.)
     prepareWorktree: async (wtPath: string) => {
       const ok = await installDeps(cli, wtPath);
       return ok ? WORKTREE_DEP_LINKS : [];
@@ -5053,7 +4949,7 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     }
     // A plan exists but nothing publishable advanced this pass — vacuously green
     // (nothing to integrate, nothing to push). Everything held is reported, not
-    // gated (D-051): a pass where every branch froze must still complete.
+    // gated: a pass where every branch froze must still complete.
     appendJournal(dir, { action: 'verify', ok: true, note: 'empty publishable recipe (nothing advanced this pass)' });
     console.error('verify: green (no publishable branches advanced this pass — nothing to rebuild)');
     emit(cli, { ok: true, recipe: [], baseRef });
@@ -5079,28 +4975,26 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     // What the base probe SAW, on every red. A verdict of "this branch did it"
     // is a claim that the merged tree fails something the BASE does not, and
     // that claim has to be auditable from the journal alone — otherwise a
-    // correct attribution and a missed base defect read exactly the same, which
-    // is how three branches got rolled back one per pass before anyone could
-    // tell whether that was right.
+    // correct attribution and a missed base defect read exactly the same, and
+    // branches get rolled back for a defect that was never theirs.
     baseFailingFiles: first.baseFailingFiles ?? [],
     mergedFailingFiles: first.mergedFailingFiles ?? [],
-    // Whether the BASE ALONE was green. An offender row said only "offender:
-    // module/credentials" — no commands, no output, no base verdict — so the
-    // accusation could not be checked without re-running the pass by hand.
+    // Whether the BASE ALONE was green. A bare offender row —
+    // no commands, no output, no base verdict — is an
+    // accusation that cannot be checked without re-running the pass by hand.
     // A branch is only credibly to blame if the base was green.
     baseGreen: first.baseGreen ?? null,
     ...(first.baseFailedCommands?.length ? { baseFailedCommands: first.baseFailedCommands } : {}),
-    // The failing commands on EVERY red, not only the unattributable ones. The
-    // attributed path journaled no diagnostics at all, which is precisely the
-    // path that accuses a branch and rolls it back.
+    // The failing commands on EVERY red, not only the unattributable ones — the
+    // attributed path is precisely the one that accuses a branch and rolls it
+    // back, so it must carry its diagnostics too.
     failedCommands: first.commands.filter((c) => c.code !== 0).map((c) => c.cmd),
     ...(first.nonDeterministic ? { nonDeterministic: true, flakyCommands: first.flakyCommands ?? [] } : {}),
   });
   // A NON-DETERMINISTIC red belongs to no branch, so there is nothing to
   // attribute, roll back or gate-fix. Say that plainly instead of the generic
   // "investigate" — the agent's next move is completely different (report the
-  // flaky command to the owner, do not go hunting through a branch's diff), and
-  // without this it spent three passes discovering the pattern by hand.
+  // flaky command to the owner, do not go hunting through a branch's diff).
   if (first.nonDeterministic) {
     const flaky = first.flakyCommands ?? [];
     const detail =
@@ -5116,8 +5010,8 @@ export async function cmdVerify(cli: Cli): Promise<number> {
   // so no branch is responsible and none is rolled back. Reported in the SAME
   // shape as an unattributable red — failing commands, cwds, full output — so
   // finish's existing gate-fix path roots it on the base branch ON THE FIRST
-  // RED, which is a HELD PR that blocks every branch beneath it. That is what
-  // the peel-one-branch-per-pass cascade was doing the long way round.
+  // RED, which is a HELD PR that blocks every branch beneath it — instead of
+  // peeling one branch per pass the long way round.
   if (first.baseRed) {
     const baseFailed = (first.baseCommands ?? []).filter((c) => c.code !== 0);
     const failedCommands = baseFailed.map((c) => c.cmd);
@@ -5154,9 +5048,9 @@ export async function cmdVerify(cli: Cli): Promise<number> {
   }
   const offender = first.offender;
   if (!offender) {
-    // D-060: expose the failed command names so finish can render a factual
+    // Expose the failed command names so finish can render a factual
     // "tests failed at finish — <list>" STOP result.
-    // D-061 (B): ALSO journal the failing OUTPUT. finish cannot attribute an
+    // ALSO journal the failing OUTPUT. finish cannot attribute an
     // unattributable red to a branch without the diagnostics — file paths live
     // in the compiler output, not in a command name — and the VerifyResult
     // itself never reaches finish; only this journal row does. Bounded so a
@@ -5170,9 +5064,9 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     const fullText = failedCmds.map((c) => `$ ${c.cmd}\n${c.output}`).join('\n');
     // The FULL log goes to disk; the journal keeps a bounded view plus the path.
     // Blame reads the FILE (see `attributionOutput`), so a long failure is
-    // attributed completely instead of being scoped to whatever fitted in the
-    // journal cap — the defect that scoped a gate-fix case to the four files
-    // that happened to land in the last 4000 characters (live 2026-07-31).
+    // attributed completely instead of being scoped to whatever fits in the
+    // journal cap — which would scope a gate-fix case to only the files that
+    // happen to land in the tail.
     const failedOutputFile = join(dir, 'verify-output.full.txt');
     try {
       writeFileSync(failedOutputFile, fullText);
@@ -5196,10 +5090,10 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     return 1;
   }
   const preRef = lastPreRef(journal, offender);
-  // D-051 fix 2: a HELD/FROZEN offender (or any branch with no this-pass pre-ref)
+  // A HELD/FROZEN offender (or any branch with no this-pass pre-ref)
   // is NOT a publishable failure — it is already frozen and unpublished, so it
-  // must NEVER hard-block (ERR18). fix 1 already excludes held/frozen branches
-  // from the recipe, so this is defense in depth for an explicit `--recipe` (or a
+  // must NEVER hard-block (ERR18). The recipe already excludes held/frozen
+  // branches, so this is defense in depth for an explicit `--recipe` (or a
   // branch frozen after its pre-ref): journal a non-blocking gate OBSERVATION,
   // re-verify the publishable set WITHOUT it, and let the rest proceed. ERR18
   // fires ONLY when a branch that WOULD be pushed this pass fails verify.
@@ -5246,14 +5140,13 @@ export async function cmdVerify(cli: Cli): Promise<number> {
   }
   appendJournal(dir, { action: 'pre-ref-rollback', branch: offender, to: preRef });
   // A GATE hold is not a case: the branch was rolled back and dropped from the
-  // publishable set, with no conflict, no head and no merge behind it. It used
-  // to carry `height: -1` and `conflictedPaths: []` — placeholders claiming a
-  // measurement nobody took. Nothing read them (no `case` row is ever journaled
-  // for a `gate-*` id, so the head lookup in `deriveLive` correctly misses and
-  // records a null headSha), but a fake height in a typed-looking field is the
-  // exact shape D-061 spent a decision removing from gate-fix cases, where it
-  // WAS load-bearing: `pendingAbove = heads.length - 1 - head.height` reported
-  // one more than the chain held on every held gate-fix PR. Omit them instead:
+  // publishable set, with no conflict, no head and no merge behind it. It
+  // deliberately carries NO `height` or `conflictedPaths` — those would be
+  // placeholders claiming a measurement nobody took. Nothing reads them (no
+  // `case` row is ever journaled for a `gate-*` id, so the head lookup in
+  // `deriveLive` correctly misses and records a null headSha), but a fake
+  // height in a typed-looking field is exactly the shape that corrupts height
+  // readers like `pendingAbove = heads.length - 1 - head.height`. Omit them:
   // absent says "not applicable", `-1` says "measured, and the answer is -1".
   appendJournal(dir, {
     action: 'held',
@@ -5261,7 +5154,7 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     caseId: `gate-${offender.replace(/\//g, '__')}`,
     reason: 'gate',
   });
-  // APPROVED-LANDING offender (D-059 FINAL finding 2): the rolled-back merge
+  // APPROVED-LANDING offender: the rolled-back merge
   // was an owner-APPROVED resolution landed at `start`. Without a signal the
   // loop is silent and infinite — every later pass re-derives the still-open
   // approved PR, re-lands it, re-fails verify, re-rolls back, and the owner
@@ -5284,13 +5177,13 @@ export async function cmdVerify(cli: Cli): Promise<number> {
       `verify: offender ${offender} was an APPROVED landing — escalation journaled (the owner is notified at push; the marker advance stops the re-land loop)`,
     );
   }
-  // Gate hold (D-057/D-058): the journaled `held` row above IS the PR_ID state
+  // Gate hold: the journaled `held` row above IS the PR_ID state
   // for the rest of the pass — no conflicting head / PR (blockedRows keeps
   // headSha null), so it cannot auto-complete; the owner clears it manually.
   // Cross-pass a gate hold leaves nothing on origin, so the next `start`
   // re-derives the branch unblocked and the offending merge is simply retried.
   // Re-verify on the publishable set with the offender now rolled back + held —
-  // it drops out of the recipe (fix 1) so its bad merge is gone (D-051).
+  // it drops out of the recipe so its bad merge is excluded.
   const reRecipe = recipe.filter((b) => b !== offender);
   const re = await verifyEverything(cli.repo, { recipe: reRecipe, ...verifyOpts });
   appendJournal(dir, { action: 'verify', ok: re.ok, offender, rolledBack: offender });
@@ -5302,9 +5195,9 @@ export async function cmdVerify(cli: Cli): Promise<number> {
 }
 
 /**
- * D-052 FIX 4: the end-of-sweep owner summary, derived PURELY from the journal
+ * The end-of-sweep owner summary, derived PURELY from the journal
  * (no git, no GitHub) so a dead or abnormally-terminated session still leaves a
- * readable status. The D-046 owner message the agent sends at end-of-sweep is a
+ * readable status. The owner message the agent sends at end-of-sweep is a
  * thin wrapper over this — the harness can always emit it, and "no pass dies
  * silently" holds even when the agent never composed a message. Prints
  * merged / resolved / held / open-cases / pushed plus the escalation lines
@@ -5356,7 +5249,7 @@ export async function cmdReport(cli: Cli): Promise<number> {
   console.log(`open:     ${open.length}${open.length ? ` — ${open.map((o) => o.caseId).join(', ')}` : ''}`);
   console.log(`pushed:   ${pushes.length}${pushedBranches.length ? ` (${pushedBranches.join(', ')})` : ''}`);
   if (diverged.length) console.log(`diverged (owner escalation): ${diverged.join(', ')}`);
-  if (mergeFailed.length) console.log(`merge-failed (D-047/B11): ${mergeFailed.join(', ')}`);
+  if (mergeFailed.length) console.log(`merge-failed: ${mergeFailed.join(', ')}`);
   if (notConverged.length) console.log(`resolve-not-converged (force-HELD, ERR26): ${notConverged.join(', ')}`);
   if (staleCleared) console.log(`stale verdicts cleared (WARN05): ${staleCleared}`);
 
@@ -5375,7 +5268,7 @@ export async function cmdReport(cli: Cli): Promise<number> {
     staleVerdictsCleared: staleCleared,
     urges,
   };
-  // D-054: when driven internally by `finish`, do NOT write --out — that file is
+  // When driven internally by `finish`, do NOT write --out — that file is
   // the outer command's result; the human summary above still prints (ignored by
   // the SWEEP-RESULT/SWEEP-STEP monitor contract, but useful in a foreground run).
   if (cli.out && !cli.internal) {
@@ -5386,21 +5279,21 @@ export async function cmdReport(cli: Cli): Promise<number> {
 }
 
 // ==========================================================================
-// D-053 — sweep state machine (DRIVER.md §6). The canonical
+// Sweep state machine (DRIVER.md §1). The canonical
 // AGENT-FACING surface: five commands (start / next-case / report-case /
 // report-pr / finish) plus `abort`, driven by a resumable machine-state record
 // in the pass dir. The agent has ZERO identifying params — the driver holds the
 // watermark, the current case, the phase and the journal — which structurally
 // removes the wrong-case / wrong-ref / stale-verdict / forged-plan bug classes
-// (DRIVER.md §1/§6.7). These functions WRAP the deterministic
+// (DRIVER.md §1). These functions WRAP the deterministic
 // internals above (plan/run/reverify/merge/publish/verify/push) — they never
 // re-implement them. The ONLY LLM call in the loop is the cold read, run here
 // via an INJECTABLE invoker that shells `claude -p` (default) — there is NO
 // verdict file and NO freshness binding on this path (the driver holds the
 // resolved tree and pipes the request straight to `claude -p`). The flag-based
-// `resolve`/`publish` agent path (verdict file + freshness binding) is KEPT
-// working (still the driver's tested implementation + reused sub-helpers), but
-// is superseded as the AGENT surface by these commands.
+// `resolve`/`publish` path (verdict file + freshness binding) remains the
+// driver's tested implementation + reused sub-helpers, but these commands are
+// the AGENT surface — the flag path is never handed to the agent.
 // ==========================================================================
 
 /** Machine phases (DRIVER.md §6.7): a dead container resumes here. */
@@ -5411,14 +5304,14 @@ interface MachineState {
   phase: MachinePhase;
   watermark: string;
   watermark12: string;
-  /** The case the agent is currently editing/reporting (driver-held, D-053). */
+  /** The case the agent is currently editing/reporting (driver-held). */
   currentCase: { caseId: string; branch: string; tier?: 'mechanical' | 'judged' | 'held' } | null;
   /** Resumable `finish` sub-phase (finishing only). */
   finishStep?: 'verify' | 'judged-prs' | 'push' | 'held-prs' | 'report' | 'done';
   /**
-   * D-060: the pass's resolved config paths, pinned at `start` and read from
+   * The pass's resolved config paths, pinned at `start` and read from
    * state by every later command (the agent passes no such flag mid-pass).
-   * `inventory` — absolute live-inventory dir (undefined → bootstrap snapshot);
+   * `inventory` — absolute inventory dir (undefined → the committed scripts/sweep/inventory);
    * `checksFile` — absolute path to the host+runner typecheck/test command JSON.
    */
   inventory?: string;
@@ -5426,7 +5319,7 @@ interface MachineState {
 }
 
 /**
- * D-060: apply the pass's PINNED config paths (resolved + persisted at `start`)
+ * Apply the pass's PINNED config paths (resolved + persisted at `start`)
  * onto the CLI so the deterministic internals (loadRegistry via cli.inventory,
  * the checks gate via the returned path) see the pass's config, not whatever the
  * later invocation happened to pass. Returns the persisted checks-file path.
@@ -5459,8 +5352,9 @@ function writeMachineState(dir: string, st: MachineState): void {
 }
 
 // --------------------------------------------------------------------------
-// Cold read — injectable `claude -p` invoker (D-053; the ONLY LLM call in the
-// loop). The driver composes a FOCUSED request (D-050 preamble + three bounded
+// Cold read — injectable `claude -p` invoker (the ONLY LLM call in the
+// loop). The driver composes a FOCUSED request (the judge-from-the-request-only
+// preamble + three bounded
 // questions + driver-derived context, NOTHING agent-authored), pipes it to
 // `claude -p` as a synchronous, context-free subprocess, and parses the verdict
 // from stdout. Tests inject a fake invoker returning a canned verdict.
@@ -5472,7 +5366,7 @@ export interface MachineVerdict {
    * `confirm`/`reject` are CONTENT decisions from a cold read that actually RAN.
    * `error` is an INFRA failure of the tooling (spawn error, non-zero exit,
    * unparseable stdout, or a recognizable auth/login failure) — NOT a content
-   * decision (D-054). It must NOT collapse to reject/HELD: a broken tool marking
+   * decision. It must NOT collapse to reject/HELD: a broken tool marking
    * resolutions as content-rejected is the bug this distinguishes. `error` maps
    * to a hard blocking halt (ERR35_COLDREAD_UNAVAILABLE) at the call sites.
    */
@@ -5480,7 +5374,7 @@ export interface MachineVerdict {
   answers?: Partial<Record<'q1' | 'q2' | 'q3', string>>;
   notes: string;
   /**
-   * Short (1-2 line) reviewer feedback for the RESOLVING AGENT (D-057): why
+   * Short (1-2 line) reviewer feedback for the RESOLVING AGENT: why
    * the rejection / what is off. Surfaced on a reject so the agent can act;
    * reused as the PR-description prefix on a HELD escalation. Bounded
    * (COLDREAD_FEEDBACK_CAP) at parse.
@@ -5489,9 +5383,9 @@ export interface MachineVerdict {
   /** verdict:'error' only — the infra reason (surfaced in the ERR35 halt detail). */
   reason?: string;
   /**
-   * LEGACY (pre-D-060), parsed but no longer acted on. It classified a reject as
-   * a PR-prose defect vs a resolution defect back when `report-pr` cold-read the
-   * description. The gate now runs at `report-case` with no prose in sight, so
+   * Parsed but not acted on: a reader may still emit it to classify a reject
+   * as a PR-prose defect vs a resolution defect, but the gate runs at
+   * `report-case` with no prose in sight, so
    * every reject is a resolution reject — see `coldReadRejectionCount`.
    */
   defect?: 'code' | 'description' | null;
@@ -5505,7 +5399,7 @@ export type ColdReadInvoker = (prompt: string) => Promise<MachineVerdict>;
 
 /**
  * Parse the last JSON object printed by `claude -p`. A valid confirm/reject is a
- * content decision. Otherwise → `error` (D-054): recognizable auth/login failure
+ * content decision. Otherwise → `error`: recognizable auth/login failure
  * text (which `claude -p` often prints AT EXIT 0) is an infra error, and so is a
  * total absence of a parseable verdict — NEITHER is a content reject.
  */
@@ -5533,11 +5427,11 @@ export function parseMachineVerdict(stdout: string): MachineVerdict {
   if (COLDREAD_AUTH_FAILURE.test(stdout)) {
     return { verdict: 'error', notes: '', reason: `cold read auth/login failure: ${stdout.trim().slice(0, 300)}` };
   }
-  return { verdict: 'error', notes: '', reason: 'cold read produced no parseable verdict (tooling error, D-054)' };
+  return { verdict: 'error', notes: '', reason: 'cold read produced no parseable verdict (tooling error)' };
 }
 
 /**
- * Default invoker: a synchronous `claude -p` subprocess, request on stdin. D-054:
+ * Default invoker: a synchronous `claude -p` subprocess, request on stdin.
  * `claude` scrubs env for its own Bash subprocesses, so the spawned `claude -p`
  * loses CLAUDE_CODE_OAUTH_TOKEN — read it from the credentials file and inject it
  * (silent if the file is unreadable: fall through to the infra-error path, never
@@ -5551,7 +5445,7 @@ const COLDREAD_BACKOFF_MS = [0, 5000, 15000, 30000];
  * Retry wrapper for a single-shot cold read. Auth is refreshed AUTOMATICALLY
  * into the credentials file, but not instantly — a cold-started container or a
  * mid-run token rotation can make `claude -p` print "Not logged in" for a few
- * seconds. A `verdict:'error'` is an INFRA/auth failure (D-054), so we wait and
+ * seconds. A `verdict:'error'` is an INFRA/auth failure, so we wait and
  * retry (the `attempt` re-reads the token fresh each call, so a retry picks up
  * the just-refreshed token). A real confirm/reject is a content decision and
  * returns immediately — never retried. Only after the whole backoff is spent
@@ -5598,7 +5492,7 @@ export const defaultColdReadInvoker: ColdReadInvoker = (prompt) =>
   });
 
 /**
- * Fail-closed reduction shared by both cold reads (the D-050 gate): an overall
+ * Fail-closed reduction shared by both cold reads: an overall
  * `reject`, OR an `UNVERIFIABLE-FROM-REQUEST` answer on any of Q1-Q3, is a
  * reject. Returns the unverifiable question list for the notes.
  */
@@ -5610,11 +5504,11 @@ function coldReadRejected(v: MachineVerdict): { rejected: boolean; unverifiable:
 }
 
 /**
- * The FOCUSED cold-read prompt for the state-machine path — same D-050 preamble,
+ * The FOCUSED cold-read prompt for the state-machine path — same preamble,
  * three bounded questions and driver-derived context as `coldReadRequest`, but
  * asking `claude -p` to PRINT a JSON verdict (no verdict file).
  *
- * D-060: the reader judges the RESOLUTION only. It runs at `report-case`, before
+ * The reader judges the RESOLUTION only. It runs at `report-case`, before
  * any PR text exists, so there is no description to review and no defect to
  * classify — a reject is always a resolution reject.
  */
@@ -5639,7 +5533,7 @@ function machineColdReadPrompt(opts: {
 }): string {
   const gf = opts.gateFix ?? null;
   const lines: string[] = [
-    `# Cold-read request — ${opts.id} (state-machine path, D-053)`,
+    `# Cold-read request — ${opts.id} (state-machine path)`,
     '',
     ...COLD_READ_PREAMBLE,
     '',
@@ -5692,8 +5586,8 @@ function machineColdReadPrompt(opts: {
 }
 
 // --------------------------------------------------------------------------
-// Branch-scoped tests (D-053) — a CHEAP per-case gate, NOT the finish-time
-// everything-rebuild (D-051). Injectable so tests never spawn a real matrix;
+// Branch-scoped tests — a CHEAP per-case gate, NOT the finish-time
+// everything-rebuild (§9). Injectable so tests never spawn a real matrix;
 // the default builds an ephemeral merge of the resolved tree in a temp worktree
 // and runs the caller's command list (--commands-file), skipping (green) when
 // none is configured — the authoritative full battery still runs at `finish`.
@@ -5747,7 +5641,7 @@ export const defaultBranchTestRunner: BranchTestRunner = async (args) => {
 // Shared machine helpers.
 // --------------------------------------------------------------------------
 
-/** The driver-prepared case worktree path (createCaseWorktree, SPEC 1). */
+/** The driver-prepared case worktree path (createCaseWorktree). */
 function caseWorktreePath(dir: string, caseId: string): string {
   return join(dir, caseId, 'worktree');
 }
@@ -5771,18 +5665,17 @@ async function unresolvedMarkers(repo: string, tree: string, paths: string[]): P
 /**
  * WHERE the conflict markers are, per pending file, as line ranges.
  *
- * The driver computed the merge, so it knows every hunk's position exactly — and
- * handed the agent only the file NAMES. To find the hunks in a 2000-line file
- * the agent then PAGED it: a transcript audit of 2026-08-05 measured 99 of 136
- * reads carrying offset/limit and 87 of 136 (64%) re-reading a path already
- * read, 49% of all Read bytes, with `command-gate.ts` read 15 times. The
- * materials meanwhile instructed "each file once, never re-reading" — an
- * instruction the missing information made impossible to follow.
+ * The driver computed the merge, so it knows every hunk's position exactly.
+ * Handing the agent only the file NAMES makes it PAGE a 2000-line file to find
+ * the hunks — re-reading the same paths over and over — while the materials
+ * instruct "each file once, never re-reading": an instruction the missing
+ * information would make impossible to follow.
  *
  * Line ranges, not hunk CONTENT. The agent must read the real file anyway (Edit
  * requires it), so shipping the text would be an extra read, not a substitute.
  * Ranges turn "page the file to find the markers" into "read these two windows",
- * which satisfies the same precondition and is what the re-reads were spent on.
+ * which satisfies the same precondition and is what the re-reads would be
+ * spent on.
  */
 async function conflictHunkRanges(repo: string, wtPath: string, paths: string[]): Promise<string[]> {
   const out: string[] = [];
@@ -5809,7 +5702,7 @@ async function conflictHunkRanges(repo: string, wtPath: string, paths: string[])
   return out;
 }
 
-/** Driver-authored case materials (D-048) for the case-ready hand-off. */
+/** Driver-authored case materials for the case-ready hand-off. */
 async function machineCaseMaterials(cli: Cli, dir: string, jc: JournaledCase): Promise<string> {
   const tip = await revParse(cli.repo, jc.branch);
   const sides = await perSideLog(cli.repo, tip, jc.head.sha, jc.conflictedPaths);
@@ -5840,7 +5733,7 @@ async function machineCaseMaterials(cli: Cli, dir: string, jc: JournaledCase): P
 }
 
 /**
- * One turn of the reissue DIALOG (D-059 FINAL): the FULL review conversation —
+ * One turn of the reissue DIALOG: the FULL review conversation —
  * issue comments + inline review comments + review bodies + the PR description
  * — merged time-ordered. The agent's OWN prior messages (driver-posted,
  * marker-bearing; plus the PR description it wrote) are served back
@@ -5875,7 +5768,7 @@ function buildReviewDialog(args: {
   if (description) {
     items.push({ role: 'agent', author: '', kind: 'pr-description', id: null, at: args.pr.createdAt, body: description });
   }
-  // Finding 4: same reality bound as the trigger — a human comment pasting an
+  // Same reality bound as the trigger — a human comment pasting an
   // out-of-range marker stays a REVIEWER turn, never `you (prior)`.
   const { humans, driver } = classifyComments(args.issueComments, maxRealReviewId(args.reviews));
   for (const c of driver) {
@@ -5968,7 +5861,7 @@ function reissueCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEn
 
 /** Undispositioned cases this pass, topmost-first (DAG order = journal order). */
 /**
- * Cases SUPERSEDED by a later reopen (bug #63). Resolving a case reopens its
+ * Cases SUPERSEDED by a later reopen. Resolving a case reopens its
  * branch + descendants (§8); the next `run` re-derives each reopened branch
  * against its now-ADVANCED parent and re-emits a FRESH case — new conflict
  * head, new height (so a new caseId), new conflict set. The pre-reopen case is
@@ -6016,11 +5909,11 @@ function branchTestCommands(cli: Cli): VerifyCommand[] {
 }
 
 // --------------------------------------------------------------------------
-// `sweep start` / `sweep abort` (DRIVER.md §6.1/§6.6).
+// `sweep start` / `sweep abort` (DRIVER.md §6.1, §6.6).
 // --------------------------------------------------------------------------
 
 /**
- * D-059 (REISSUE case-serving mechanics, FINAL review-trigger model): an open
+ * REISSUE case-serving mechanics (review-trigger model): an open
  * PR with a SUBMITTED review beyond the sweep-addressed marker gets its case
  * served THIS pass as a REVISION of the published resolution, not a fresh
  * resolve. The case is driver-manufactured here at `start` (run skips the
@@ -6062,7 +5955,7 @@ async function materializeReissueCase(
     features: FeatureEntry[];
   },
 ): Promise<void> {
-  // ESCALATE ONCE (D-059 FINAL): post the problem to the PR WITH the marker at
+  // ESCALATE ONCE: post the problem to the PR WITH the marker at
   // the triggering review id — the owner is notified exactly once and the next
   // pass reads the marker as current (no re-trigger, no warn-loop). Throws on
   // API failure (the caller maps it to ERR13 — fail-closed).
@@ -6094,10 +5987,9 @@ async function materializeReissueCase(
   // A GATE-FIX ref names a case with NO parent and NO conflict head, so there is
   // nothing here to parse and nothing to REVISE: a reissue re-probes a live
   // conflict, and this PR never had one. Say that, rather than reporting the
-  // driver's own ref name as unparseable — which is what happened while the ref
-  // spelled the `(gate-fix)` parent label and a `-h-1` height in the conflict
-  // form (the parent lookup below searches SCOPE BRANCHES; no branch is or can
-  // be named that, so every reviewed gate-fix PR escalated with a bogus reason).
+  // driver's own ref name as unparseable (the parent lookup below searches
+  // SCOPE BRANCHES, and no branch is or can be named `(gate-fix)`, so falling
+  // through would escalate every reviewed gate-fix PR with a bogus reason).
   if (isGateFixCaseId(rest)) {
     return escalateOnce(
       `'${args.ref}' is a GATE-FIX PR (case ${rest}): it carries a fix, not a conflict resolution, so there is no revision case to serve — merge or close it`,
@@ -6153,9 +6045,7 @@ async function materializeReissueCase(
   }
   const cid = caseId(args.branch, parent, height);
   const head = { sha: conflictHead, height };
-  const feat = args.features.find((f) => f.branch === args.branch) as
-    | (FeatureEntry & { tier_floor?: string })
-    | undefined;
+  const feat = args.features.find((f) => f.branch === args.branch);
   const caseFile: CaseFile = {
     schemaVersion: 1,
     id: cid,
@@ -6196,13 +6086,13 @@ async function materializeReissueCase(
 }
 
 /**
- * D-059 case 5 — crashed publish (ref pushed, PR never created): the ref's
+ * Crashed publish (ref pushed, PR never created): the ref's
  * resolution is AUTHORITATIVE, so `start` COMPLETES the publish by creating
  * the missing PR on the existing head — nothing is re-derived and the ref is
  * never deleted. Draft-vs-active re-derives from the ref content itself
  * (conflict markers anywhere in its own diff → the pristine-conflict DRAFT;
  * marker-clean → the ACTIVE review PR). The title is the ref head's commit
- * subject; the body is driver BOOKKEEPING prose only (like the D-004 block —
+ * subject; the body is driver BOOKKEEPING prose only (like the machine block —
  * the agent prose of the crashed pass is gone with its pass dir), and the
  * sweep-addressed marker is posted at 0 (nothing addressed yet). Throws on any
  * API failure — the caller maps it to ERR13 (fail-closed).
@@ -6221,7 +6111,7 @@ async function createRecoveryPr(
   const draft = markers.length > 0;
   const title = info.subject || `Sweep resolution for ${u.branch} (recovered publish)`;
   const body = [
-    `Recovered publish (D-059): the resolution ref \`${u.ref}\` was pushed by an earlier pass, but its PR was`,
+    `Recovered publish: the resolution ref \`${u.ref}\` was pushed by an earlier pass, but its PR was`,
     'never created (crashed publish). The resolution on the ref is authoritative — this PR completes that',
     'publish; nothing was re-derived.',
     '',
@@ -6235,12 +6125,11 @@ async function createRecoveryPr(
 }
 
 /**
- * D-058 §2 → D-059 FINAL — reconstruct the blocked (PR_ID) set from ORIGIN
+ * Reconstruct the blocked (PR_ID) set from ORIGIN
  * alone. For every `origin/fix/sweep/*` ref (post-fetch), parse the TARGET
  * branch out of the ref name (fix/sweep/<slug(branch)>--<slug(parent)>-h<n>-
  * <sha8>; matched against the registry scope's branch slugs, longest match
- * wins) and classify (`start` deletes a ref ONLY when its PR/head MERGED; the
- * D-058 orphan-delete is retired):
+ * wins) and classify (`start` deletes a ref ONLY when its PR/head MERGED):
  *  1. ref IS an ancestor of origin/<target> → RESOLVED (the owner merged the
  *     PR / it landed): not blocked; delete the origin ref (cleanup).
  *  2. unmerged + OPEN PR + NO submitted non-bot review above the
@@ -6254,7 +6143,7 @@ async function createRecoveryPr(
  *         target → LAND: merge it into the local target now (journaled
  *         `origin-approved` + `resolved` tier 'approved'; pre-ref recorded),
  *         NOT blocked — finish verifies and pushes the target, the push
- *         auto-flips the PR to merged (D-040); no reissue.
+ *         auto-flips the PR to merged; no reissue.
  *       - APPROVED but the target advanced so it no longer merges cleanly →
  *         REISSUE (the agent re-resolves against the new base): PR_ID row +
  *         a revision case (`materializeReissueCase`).
@@ -6263,9 +6152,9 @@ async function createRecoveryPr(
  *  4. unmerged + PR CLOSED:
  *       - merged_at set (squash/rebase-merged — head not an ancestor) →
  *         RESOLVED: delete the ref; NEVER attempt a reopen on a merged PR
- *         (GitHub 422s it — the retired ERR13 halt).
+ *         (GitHub 422s it).
  *       - genuinely closed unmerged → REOPEN the PR (driver PATCH state=open)
- *         → PR_ID. Replaces the D-058 delete.
+ *         → PR_ID.
  *  5. unmerged + NO PR at all (crashed publish) → (re)create the PR from the
  *     ref (`createRecoveryPr`) → PR_ID. The ref's resolution is authoritative;
  *     never re-derived, never deleted.
@@ -6276,11 +6165,11 @@ async function createRecoveryPr(
  * and left alone (unknown provenance: never deleted, never blocking).
  *
  * Every GitHub list is PAGINATED to exhaustion (GitHub returns oldest-first —
- * page-1-only truncated the newest reviews) and FAIL-CLOSED: any non-200 on a
+ * a page-1-only read would truncate the newest reviews) and FAIL-CLOSED: any non-200 on a
  * needed lookup/write is an ERR13 halt — never a wrongful mutation. Start's
  * origin WRITES (merged-ref delete, reopen, recovery PR create, escalation
  * comment) all run AFTER the token/slug gate. Ref deletions go through
- * `git push origin --delete` (refs move via git only, D-049); a failed delete
+ * `git push origin --delete` (refs move via git only); a failed delete
  * is journaled and non-fatal (the ref is re-examined at the next start).
  */
 async function deriveOriginMergeStatus(
@@ -6340,14 +6229,14 @@ async function deriveOriginMergeStatus(
   };
 
   const blocked: string[] = [];
-  // TOKEN/TRANSPORT GATE FIRST (finding #6, fail-closed): when unmerged refs
+  // TOKEN/TRANSPORT GATE FIRST (fail-closed): when unmerged refs
   // need PR lookups, a missing token/slug must abort start BEFORE any origin
   // mutation — the merged-ref cleanup below runs only once the gate passes
   // (or is not needed: merged-only starts stay token-free).
   let transport: GithubTransport | null = null;
   let slugParts: { owner: string; repo: string } | null = null;
   if (unmerged.length > 0) {
-    // Networked part (D-058 §4): start takes --token-file like publish/push.
+    // Networked part: start takes --token-file like publish/push.
     let token: string | null = null;
     token = resolveGithubToken(cli);
     if (!token) {
@@ -6356,7 +6245,7 @@ async function deriveOriginMergeStatus(
         issues: [
           {
             id: 'ERR11_TOKEN_MISSING',
-            detail: `origin carries ${unmerged.length} unmerged fix/sweep ref(s) — start must check their PRs: export GH_TOKEN (or GITHUB_TOKEN) with the substitute GitHub token (D-060)`,
+            detail: `origin carries ${unmerged.length} unmerged fix/sweep ref(s) — start must check their PRs: export GH_TOKEN (or GITHUB_TOKEN) with the substitute GitHub token`,
           },
         ],
         blocked,
@@ -6398,12 +6287,12 @@ async function deriveOriginMergeStatus(
     const preReffed = preReffedSet(readJournal(dir));
 
     /**
-     * APPROVED landing (D-059 FINAL): the ref head still merges CLEANLY into
+     * APPROVED landing: the ref head still merges CLEANLY into
      * the current target → merge it into the LOCAL branch now (pre-ref
      * recorded — abort can roll back), journal `origin-approved` + `resolved`
      * (tier 'approved'), leave the branch UNBLOCKED. Finish verifies the merge
      * (the `resolved` row re-arms the §9 gate) and its target push lands it —
-     * GitHub auto-flips the review PR to merged/closed (D-040). Returns false
+     * GitHub auto-flips the review PR to merged/closed. Returns false
      * when it cannot land (target advanced / diverged local) — the caller
      * falls through to the reissue arm.
      */
@@ -6511,17 +6400,17 @@ async function deriveOriginMergeStatus(
         blocked.push(u.branch);
       };
       try {
-        // FAIL-CLOSED lookup across ALL states (D-059): only an authoritative
+        // FAIL-CLOSED lookup across ALL states: only an authoritative
         // 200 may classify — an API failure must never read as "no PR".
         const prs = await getPrsByHead(transport!, slugParts!, u.ref);
         const open = prs.find((p) => p.state === 'open');
         if (open) {
-          // Cases 2/3: REVIEWS are the only trigger (D-059 FINAL). Issue
+          // Cases 2/3: REVIEWS are the only trigger. Issue
           // comments are fetched for the marker watermark (+ dialog); loose
           // comments/inline comments never trigger. All lists paginated.
           const comments = await listIssueComments(transport!, slugParts!, open.number);
           const reviews = await listReviews(transport!, slugParts!, open.number);
-          // Finding 4: the marker is bounded TO REALITY — a pasted
+          // The marker is bounded TO REALITY — a pasted
           // sweep-addressed id above the max real review id is ignored, so a
           // human comment can never silence the review loop.
           const { markerId } = classifyComments(comments, maxRealReviewId(reviews));
@@ -6583,7 +6472,7 @@ async function deriveOriginMergeStatus(
           // Case 4a: the PR was MERGED (squash/rebase — the head is not an
           // ancestor of the target, which is why the ref classified unmerged).
           // The owner's decision LANDED: resolved + ref cleanup. NEVER attempt
-          // a reopen on a merged PR (GitHub 422 — the retired ERR13 halt).
+          // a reopen on a merged PR (GitHub 422s it).
           const mergedPr = prs.find((p) => p.mergedAt !== null)!;
           const deleteFailed = await deleteOriginRef(u.ref);
           appendJournal(dir, {
@@ -6603,22 +6492,18 @@ async function deriveOriginMergeStatus(
           // "DROP THIS", and it is honoured as-is.
           //
           // The driver never closes a PR — there is no such call anywhere in it —
-          // so a closed one was closed by a person. This used to REOPEN it,
-          // which overrode that decision; and because the gate is keyed on the
-          // REF, closing by hand did not even lift it. The owner had to close a
-          // PR AND delete a ref to withdraw a case the driver should not have
-          // served (live 2026-08-06, PR #79: minted beneath an already-gated
-          // ancestor, asking for nothing).
+          // so a closed one was closed by a person. Reopening it would override
+          // that decision; and because the gate is keyed on the
+          // REF, closing by hand would not even lift the gate — the owner
+          // would have to close a PR AND delete a ref to withdraw a case.
           //
           // NO AGENT IS SERVED, and comments on the closed PR are not carried
           // anywhere. A comment explains a decision; it is not a work item, and
-          // there is no artifact left to revise. Nor is the case id the right
-          // key to carry it on — `branch + failing-file digest` misses the same
-          // defect on another branch or with one more failing file, and matches
-          // a different defect on the same files. A decision that must bind
-          // future passes belongs in the inventory's `decided_paths`, which is
-          // keyed on the PATH, applies on any branch, and is already enforced
-          // (`decidedAlready` -> ERR05). That is the owner's call to record.
+          // there is no artifact left to revise. The decision is scoped to the
+          // ref the owner closed: while that PR/ref stands it speaks for
+          // itself; once the refs are cleaned the question is legitimately
+          // open again. A decision that must bind future passes belongs in
+          // code or configuration — never in driver memory.
           //
           // Relevance needs no logic either: if the defect is still real the
           // next verify re-derives it and mints a fresh case; if it is not,
@@ -6635,6 +6520,13 @@ async function deriveOriginMergeStatus(
             prUrl: closed.url,
             via: 'pr-closed-by-owner',
             ...(deleteFailed ? { deleteFailed } : {}),
+          });
+          appendObservation(cli.workspace, {
+            kind: 'origin-ref-withdrawn',
+            ref: u.ref,
+            branch: u.branch,
+            prNumber: closed.number,
+            prUrl: closed.url,
           });
           console.error(
             `sweep start: PR #${closed.number} on '${u.ref}' was CLOSED by the owner — case withdrawn, ` +
@@ -6669,75 +6561,52 @@ async function deriveOriginMergeStatus(
 /**
  * `sweep start` — open a pass and pin its watermark. Refuses if a pass is
  * already open (a machine state that is not `complete`): the agent must
- * `finish` or `abort` first — never blind-wipe an in-flight pass (that stranded
- * resolved-but-unpushed merges before, §2). Pins the watermark = upstream top
+ * `finish` or `abort` first — never blind-wipe an in-flight pass (that strands
+ * resolved-but-unpushed merges, §2). Pins the watermark = upstream top
  * commit (via cmdPlan), initializes the journal, and writes the machine state.
  *
- * D-058: start is NETWORKED — it fetches origin (+ upstream) and reconstructs
+ * start is NETWORKED — it fetches origin (+ upstream) and reconstructs
  * the blocked set from the origin fix/sweep refs (`deriveOriginMergeStatus`)
  * BEFORE planning; merge_status is origin-derived, so the local
  * pass dir is disposable and `start` is idempotent on origin. A pass that
  * crashed before `finish` published NOTHING, so the re-derived picture is
  * clean and the pass is simply redone.
  *
- * D-055 clean-slate boundary: the pass directory lives at ONE canonical location
+ * Clean-slate boundary: the pass directory lives at ONE canonical location
  * — `<--workspace>/propagation/pass-<watermark12>` — logged on every `start` and
  * `status` so no operator guesses it. `start` REMOVES the WHOLE prior pass tree
  * (worktrees + case dirs + `coldread-*.json`/`.md` + `pr/`) of any COMPLETE or
  * STALE prior pass at that location before opening (a still-OPEN pass still
- * refuses). This closes the 2026-07-22 contamination: a new run at the same
- * watermark inherited a prior pass's journal (a D-053 HELD leaked into a D-054
- * run) AND a poisoned `coldread-verdict.json` (an infra failure recorded as a
- * reject) because `plan` re-attached to the leftover files. The driver OWNS the
- * pass-dir lifecycle — never rely on an external hand-rm (host `rm` fails on
- * container-uid-owned files, so teardown MUST run IN-CONTAINER, which `start`
- * does). C-1: it also refuses a `--workspace` that IS the `--repo` clone or a
- * subdirectory of it, so the pass never lands inside the clone (splitting it
- * from the durable group-root rr-cache, which killed rerere). A group root
- * inside an OUTER git repo is accepted.
+ * refuses). Without the wipe a new run at the same
+ * watermark inherits a prior pass's journal (a leftover HELD leaks into the
+ * new run) AND a poisoned `coldread-verdict.json` (an infra failure recorded as
+ * a reject), because `plan` re-attaches to the leftover files. The driver OWNS
+ * the pass-dir lifecycle — never rely on an external hand-rm (host `rm` fails
+ * on container-uid-owned files, so teardown MUST run IN-CONTAINER, which
+ * `start` does). C-1: it also refuses a `--workspace` that IS the `--repo`
+ * clone or a subdirectory of it, so the pass never lands inside the clone
+ * (splitting it from the durable group-root rr-cache loses rerere's learned
+ * resolutions). A group root inside an OUTER git repo is accepted.
  */
-/**
- * Seal a pass that `start` OPENED and then REFUSED (the two D-061 base-red arms).
- * Since the red base is carried forward, both refusals fire AFTER `openPass` has
- * written machine state with phase `open` — so the pass was left in flight and the
- * NEXT `sweep start` hit the "a pass is already open" guard and returned
- * ERR30_PASS_OPEN, wedging the agent on the exact path a broken base takes (and
- * nothing in the ERR42 result told it to `abort`). Sealing writes the same
- * `pass-complete` row + machine phase `complete` that `abort`/`finish` write, so
- * the next `start` is allowed through. Nothing is rolled back and nothing is
- * deleted: `start` refuses before any merge, and every file (journal, machine
- * state, the base checks output) stays on disk for whoever investigates until the
- * next `start` clean-slates the dir anyway.
- */
-function sealRefusedPass(dir: string, st: MachineState): void {
-  if (!readJournal(dir).some((e) => e.action === 'pass-complete')) {
-    appendJournal(dir, { action: 'pass-complete', watermark: st.watermark });
-  }
-  writeMachineState(dir, { ...st, phase: 'complete', currentCase: null });
-}
-
 export async function cmdSweepStart(
   cli: Cli,
   makeTransport?: (token: string) => GithubTransport,
 ): Promise<number> {
-  // D-060: RESOLVE the pass config to flag-or-default up front, then persist the
+  // RESOLVE the pass config to flag-or-default up front, then persist the
   // absolute paths into machine state (below) so every later command reads them
   // FROM STATE and the agent passes no such flag mid-pass.
-  //  - inventory: `--inventory` or the group-root default `../inventory` (sibling
-  //    of the clone) when it exists; otherwise left undefined so loadRegistry
-  //    falls back to the committed bootstrap snapshot (NEVER an empty inventory).
+  //  - inventory: `--inventory` (tests/fixtures) or the committed
+  //    `scripts/sweep/inventory/` in the clone — config tracked in the repo,
+  //    never a workspace dir.
   //  - checks-file: `--checks-file` or the in-repo default
   //    `scripts/sweep/checks.json`; a non-existent path → the gate is skipped.
-  if (cli.inventory === undefined) {
-    const defaultInv = pathResolve(cli.repo, '..', 'inventory');
-    if (existsSync(defaultInv)) cli.inventory = defaultInv;
-  }
   const resolvedChecksFile = cli.checksFile ?? pathResolve(cli.repo, 'scripts', 'sweep', 'checks.json');
 
-  // C-1 (D-055): the workspace is the GROUP ROOT and MUST NOT be the FORK CLONE
-  // (`--repo`) or a subdirectory of it — the run set --workspace to the clone, so
-  // the pass + a missing rr-cache landed inside the clone, splitting per-pass
-  // state from the durable group rr-cache and killing rerere. The check is scoped to the CLONE ONLY:
+  // C-1: the workspace is the GROUP ROOT and MUST NOT be the FORK CLONE
+  // (`--repo`) or a subdirectory of it — a --workspace pointed at the clone
+  // lands the pass + rr-cache inside the clone, splitting per-pass
+  // state from the durable group rr-cache and losing rerere's learned
+  // resolutions. The check is scoped to the CLONE ONLY:
   // the group root legitimately sits inside an OUTER git work tree (the real
   // server — `~/nanoclaw2` is a git repo, group root `~/nanoclaw2/groups/<g>`),
   // so a plain "inside any work tree" test would wrongly refuse the correct
@@ -6758,7 +6627,7 @@ export async function cmdSweepStart(
     }
   }
 
-  // D-058: FETCH FIRST — the pass derives everything from origin, so the
+  // FETCH FIRST — the pass derives everything from origin, so the
   // remote-tracking view (and the upstream watermark) must be current before
   // anything is pinned. Only remotes that exist are fetched (fixtures often
   // have none — their refs/remotes/origin/* are read as-is). The fix/sweep
@@ -6775,7 +6644,7 @@ export async function cmdSweepStart(
       } catch (e) {
         const detail =
           `git fetch ${remote} failed: ${e instanceof Error ? e.message : String(e)} — ` +
-          `start derives the blocked set from origin (D-058) and must not open a pass on a stale view`;
+          `start derives the blocked set from origin and must not open a pass on a stale view`;
         console.error(`sweep start [ERR39_FETCH_FAILED]: ${detail}`);
         result(cli, { ok: false, issues: [{ id: 'ERR39_FETCH_FAILED', detail }] });
         return 1;
@@ -6783,14 +6652,14 @@ export async function cmdSweepStart(
     }
   }
 
-  // D-055: resolve the ONE canonical pass location for this watermark up front.
+  // Resolve the ONE canonical pass location for this watermark up front.
   // `--workspace` is the single artifacts root (default: the group root = parent
   // of --repo); passDir() is the sole path builder, so where the driver WRITES
   // and what the doctrine names are identical — there is exactly one location.
   const watermark12 = (await revParse(cli.repo, cli.upstream)).slice(0, 12);
   const canonicalDir = passDir(cli.workspace, watermark12);
 
-  // Refuse a still-OPEN pass (D-053): a machine state whose phase is not
+  // Refuse a still-OPEN pass: a machine state whose phase is not
   // `complete` is in flight — require `finish`/`abort` first, never blind-wipe.
   // Check BOTH the canonical dir for THIS watermark AND the latest pass
   // attachPass would attach to (an in-flight pass at a DIFFERENT watermark
@@ -6808,15 +6677,12 @@ export async function cmdSweepStart(
     if (st && st.phase !== 'complete') {
       // CONTINUE-OR-ABORT IS THE OWNER'S CALL, NOT THE AGENT'S.
       //
-      // This used to say "run `finish` or `abort` first", which reads as a menu
-      // the agent picks from. The two are not interchangeable: `finish` resumes
+      // The two are not interchangeable: `finish` resumes
       // from the stopped step and keeps the pass's merges and published PRs,
       // while `abort` rolls every touched branch back to its journaled pre-ref
       // and throws the in-flight work away. Which is right depends on why the
-      // pass stopped — and on 2026-08-06 that was "the base gate PR is open and
-      // the owner has an unaddressed review on it", where resuming can only stop
-      // again and aborting is what lets `start` serve the review as a reissue.
-      // An agent cannot know that, so it must not choose.
+      // pass stopped. An agent cannot know that, so it must not choose — and
+      // the refusal must never read as a menu the agent picks from.
       //
       // The facts the decision needs go in the result, so the report is not the
       // agent's summary of a journal it half-read.
@@ -6858,9 +6724,29 @@ export async function cmdSweepStart(
     }
   }
 
-  // A checks file that does not PARSE disables every gate this pass has (base,
-  // per-case, finish) and used to do it silently — the pass would open, merge,
-  // publish and report green having typechecked and tested nothing. Refuse here,
+  // Start guard: the inventory is strict config — a missing or empty
+  // inventory, or any entry error (unknown key, bad value), is fatal here.
+  // Mid-pass commands re-read the pinned path from machine state and stay
+  // fail-open: start already guaranteed its validity for the pass.
+  {
+    const inventoryDir = cli.inventory ?? defaultInventoryDir();
+    const { features, warnings } = loadFeatures(inventoryDir);
+    if (!inventoryDir || warnings.length > 0 || features.length === 0) {
+      const detail = !inventoryDir
+        ? 'no inventory: scripts/sweep/inventory/ is missing and no --inventory was given'
+        : warnings.length > 0
+          ? `inventory '${inventoryDir}' is not valid config: ${warnings.join('; ')}`
+          : `inventory '${inventoryDir}' is empty`;
+      console.error(`sweep start [ERR46_INVENTORY_INVALID]: ${detail}`);
+      result(cli, { ok: false, issues: [{ id: 'ERR46_INVENTORY_INVALID', detail }] });
+      return 1;
+    }
+    cli.inventory = inventoryDir; // pinned into machine state below
+  }
+
+  // A checks file that does not PARSE disables every gate this pass has (the
+  // per-case checks gate and the finish verify) — silently: the pass would open,
+  // merge, publish and report green having typechecked and tested nothing. Refuse here,
   // before the clean-slate wipe, so nothing is destroyed and the operator is told
   // exactly which file to fix.
   const badChecks = malformedChecksIssue(resolvedChecksFile);
@@ -6879,12 +6765,12 @@ export async function cmdSweepStart(
   // it does not judge the build. A red base surfaces at `finish`'s verify like
   // any other red, and its fix is served as an ordinary gate-fix case.
   //
-  // Clean-slate boundary (D-055): the refusal above cleared any in-flight pass,
+  // Clean-slate boundary: the refusal above cleared any in-flight pass,
   // so anything still at the canonical location is a COMPLETE or STALE prior
   // pass (or a pre-machine-state leftover with no machine-state.json). Remove the
   // WHOLE tree — journal + machine-state + every case dir with its
   // `coldread-*.json`/`.md` + `pr/` — so NOTHING is inherited: not the leaked
-  // HELD journal, and not a poisoned `coldread-verdict.json` (the D-055 poison:
+  // HELD journal, and not a poisoned `coldread-verdict.json` (the poison:
   // an infra failure recorded on disk as a reject, which a later read of that
   // file would take for an authentic content decision).
   // `start` is the ONLY place this happens; the driver owns the lifecycle.
@@ -6909,12 +6795,12 @@ export async function cmdSweepStart(
     // Stale git worktree admin entries (repo/.git/worktrees/*) now point at a
     // removed tree — prune them so a fresh case can re-register its worktree.
     await git(cli.repo, ['worktree', 'prune'], { allowCodes: [1, 128] });
-    console.error(`sweep start: cleared prior pass dir ${canonicalDir} (whole tree; clean-slate, D-055)`);
+    console.error(`sweep start: cleared prior pass dir ${canonicalDir} (whole tree; clean-slate)`);
   }
 
-  // D-058 §2: reconstruct the blocked set from ORIGIN into the fresh journal
-  // BEFORE planning (plan/run read `origin-blocked` rows; the retired ledger's
-  // merge_status is dead). Blocking issues (token missing, API failure) leave
+  // Reconstruct the blocked set from ORIGIN into the fresh journal
+  // BEFORE planning (plan/run read `origin-blocked` rows).
+  // Blocking issues (token missing, API failure) leave
   // no plan-initial.json, so a re-run start clears + re-derives cleanly.
   progress('deriving merge status from origin');
   const originDerive = await deriveOriginMergeStatus(cli, canonicalDir, makeTransport);
@@ -6937,7 +6823,7 @@ export async function cmdSweepStart(
     watermark: ctx.watermark,
     watermark12: ctx.watermark12,
     currentCase: null,
-    // D-060: pin the resolved config paths for the rest of the pass.
+    // Pin the resolved config paths for the rest of the pass.
     ...(cli.inventory !== undefined ? { inventory: cli.inventory } : {}),
     checksFile: resolvedChecksFile,
   };
@@ -6984,9 +6870,8 @@ export async function cmdSweepAbort(cli: Cli): Promise<number> {
     } catch (err) {
       if (err instanceof DriverHalt) {
         // The journal keeps the BRANCH (the result line is command-level); the
-        // shared reporter emits the one SWEEP-RESULT. Previously this arm
-        // journaled and returned 1 with no result line at all, so even the one
-        // command that DID catch a halt told the agent nothing.
+        // shared reporter emits the one SWEEP-RESULT — journaling and
+        // returning 1 with no result line would tell the agent nothing.
         appendJournal(dir, { action: 'halt', branch, reason: err.reason, message: err.message });
         return reportDriverHalt(cli, err);
       }
@@ -6995,7 +6880,7 @@ export async function cmdSweepAbort(cli: Cli): Promise<number> {
   }
   for (const c of journaledCases(journal).keys()) await removeCaseWorktree(cli, dir, c);
   appendJournal(dir, { action: 'pass-aborted', rolledBack });
-  // C-4 (D-055): seal the pass with `pass-complete` too — `attachPass` defines
+  // C-4: seal the pass with `pass-complete` too — `attachPass` defines
   // "open" as (has plan-initial.json AND no pass-complete), so WITHOUT this row an
   // aborted pass stays the latest "open" pass and next-case/report-*/finish
   // re-attach to it (the machine-state `complete` alone is invisible to
@@ -7030,7 +6915,7 @@ export async function cmdSweepAbort(cli: Cli): Promise<number> {
  * `currentCase` in the machine state.
  */
 /**
- * D-060: the fixed hand-off line served with every case — the checks contract.
+ * The fixed hand-off line served with every case — the checks contract.
  * The agent runs the typechecks itself while editing; report-case runs BOTH the
  * typecheck and the tests as its single gate, so the agent must NOT run the
  * (slow) tests beforehand.
@@ -7083,23 +6968,20 @@ function participatingBranches(dir: string): string[] {
  * moves catches it at the one branch that can actually fix it, and no
  * descendant ever inherits an unfixable failure.
  *
- * This replaces D-061's base gate, which had the right instinct and three wrong
- * parts: it looked only at the trunk (so any other red branch went unseen until
- * `finish`), it lived at `start` (which has no pass to put a case in, so it
- * could only REFUSE), and its anti-loop was a sha-keyed file that wedged the
- * moment a held fix left the trunk red. Removing it (84e60cd7) left nothing
- * looking: there is exactly ONE `runChecks` call in this driver and it is the
- * per-case gate, so a CLEAN merge is never typechecked and a red propagates in
- * silence — live 2026-07-31, a trunk defect from 2026-07-04 surfaced only when
- * an unrelated conflict case tripped over it and could not fix it in scope.
+ * This check deliberately covers EVERY participating branch, not only the
+ * trunk (a red on any source branch reaches its descendants the same way), and
+ * lives inside the pass (which can put a case somewhere) rather than at
+ * `start` (which could only refuse). Without it, the per-case gate is the only
+ * `runChecks` call in this driver, so a CLEAN merge is never typechecked and a
+ * red propagates in silence until an unrelated conflict case trips over it and
+ * cannot fix it in scope.
  *
- * TYPECHECK ONLY, as the base gate did: tests are far slower and `finish`'s
+ * TYPECHECK ONLY: tests are far slower and `finish`'s
  * verify still runs them. Results are memoised as `branch-check` journal rows
  * keyed by (branch, tip sha) — a PASS-LOCAL fact, not durable state. `start` wipes
  * the journal, so it cannot go stale across passes, and a judged fix moves the
- * tip so the key changes and the branch is re-checked. (A stored green set is
- * the same mistake as the sha-keyed attempts file that D-058 §2 exists to rule
- * out.)
+ * tip so the key changes and the branch is re-checked. (A stored green set
+ * would be exactly the local cross-pass state this driver forbids.)
  */
 export async function firstRedParticipant(
   cli: Cli,
@@ -7108,9 +6990,9 @@ export async function firstRedParticipant(
   runChecks: ChecksRunner,
   runInstall?: InstallRunner,
 ): Promise<{ branch: string; sha: string; output: string; failed: VerifyCommand[]; failedNames: string[] } | null> {
-  // An ABSENT checks file is a deliberate skip (a repo without one behaves as
-  // before). A CONFIGURED one that will not load is a silently disabled gate —
-  // the ERR43 lesson — so say so instead of returning null indistinguishably.
+  // An ABSENT checks file is a deliberate skip (a repo without one skips the
+  // gate). A CONFIGURED one that will not load is a silently disabled gate —
+  // the ERR43 failure shape — so say so instead of returning null indistinguishably.
   const checks = loadChecksConfig(checksFile);
   if (!checks || checks.typecheck.length === 0) {
     if (checksFile && (!checks || checks.typecheck.length === 0)) {
@@ -7143,10 +7025,9 @@ export async function firstRedParticipant(
         if (checked.get(key) === true) continue;
       }
       // Dependencies for THIS branch's manifests, not the clone's. Without
-      // this a branch declaring its own package (node-forge on
-      // feat/mitm-credential-proxy) reports TS2307 and is blamed for an
-      // environment gap — and worse, an unchanged sha flips red->green the
-      // moment anything installs into the shared clone (live 2026-08-01).
+      // this a branch declaring its own package reports TS2307 and is blamed
+      // for an environment gap — and worse, an unchanged sha flips red->green
+      // the moment anything installs into the shared clone.
 
       if (!wt) {
         wt = await addTempWorktree(cli.repo, sha);
@@ -7185,10 +7066,10 @@ export async function cmdSweepNextCase(
   const dir = ctx.dir;
   let st = readMachineState(dir);
   // applyPassConfig RETURNS the pass's checks file; it does not assign it onto
-  // `cli` (it only does that for `inventory`). Dropping the return value left
-  // `checksFile` undefined here, so the pre-merge check below loaded no config
-  // and silently did nothing — live 2026-07-31, zero `branch-check` rows while
-  // the merges ran on regardless. `report-case` and `finish` both capture it.
+  // `cli` (it only does that for `inventory`). Dropping the return value would
+  // leave `checksFile` undefined here, so the pre-merge check below would load
+  // no config and silently do nothing — zero `branch-check` rows while
+  // the merges run on regardless. `report-case` and `finish` both capture it.
   const passChecksFile = applyPassConfig(cli, st);
   if (!st) {
     console.error('next-case: no machine state — run `sweep start` first');
@@ -7216,7 +7097,7 @@ export async function cmdSweepNextCase(
   // the descendant is then handed a failure it cannot fix inside its own case
   // scope. Serve the fix as a case on the branch that owns it instead; the
   // branch is thereby blocked, and the existing DEFERRED path holds its
-  // descendants back (D-057/D-058) with no extra machinery.
+  // descendants back with no extra machinery.
   //
   // AN OPEN GATE FIX IS THE SAME STATEMENT, already proven. The pre-merge check
   // is TYPECHECK ONLY (tests are far slower and `finish` runs them), so a branch
@@ -7225,8 +7106,7 @@ export async function cmdSweepNextCase(
   // `cmdRun` merges into it anyway and RE-EMITS the very conflict case that was
   // aborted; the re-emission gives that case a newer `case` row, so it is no
   // longer superseded, it sorts ahead of the gate fix by first-seen order, and
-  // `next-case` serves it instead of the fix. Caught by the end-to-end walk of
-  // the 2026-08-01 incident, which is what that test exists for.
+  // `next-case` serves it instead of the fix.
   const openGateFixCase = ((): boolean => {
     const j = readJournal(dir);
     const gateFixIds = new Set(j.filter((e) => e.action === 'case' && e.gateFix === true).map((e) => e.caseId as string));
@@ -7242,10 +7122,10 @@ export async function cmdSweepNextCase(
     // materializeGateFixCases dedups on its own key — and then FALL THROUGH to
     // the ordinary case-serving path below.
     //
-    // Returning here instead told the agent to "run `next-case`", but the very
-    // next call re-ran this check, hit that dedup, and could never hand the case
-    // over: it was minted and then STRANDED (live 2026-07-31 — phase stayed
-    // `open` with currentCase null while the agent improvised its own diagnosis).
+    // Returning here instead would tell the agent to "run `next-case`", but the
+    // very next call would re-run this check, hit that dedup, and never hand
+    // the case over: minted and then STRANDED (phase stuck at `open` with
+    // currentCase null while the agent improvises its own diagnosis).
     // Serving it on THIS call also means the tree is typechecked once, not once
     // per round-trip.
     const gate = await materializeGateFixCases(cli, dir, ctx.chain, redBranch.output, redBranch.failed, null, {
@@ -7257,7 +7137,7 @@ export async function cmdSweepNextCase(
   } else {
 
   // Advance the deterministic machinery (idempotent; continues reopened branches
-  // above resolved heights and lands new clean prefixes/skips/defers). D-054: the
+  // above resolved heights and lands new clean prefixes/skips/defers). The
   // MAJOR transitions cmdRun runs internally, announced as progress; the batched
   // merge/skip/defer summary comes from the journal delta below.
   progress('scanning upstream');
@@ -7275,16 +7155,14 @@ export async function cmdSweepNextCase(
   if (runRc !== 0) {
     // A per-branch/whole-run halt (ERR2x) — surface it; the agent reports it.
     // cmdRun's own emit is suppressed (internal), so next-case emits the single
-    // result itself: the halt is journaled — point the agent at it (D-054).
+    // result itself: the halt is journaled — point the agent at it.
     console.error('next-case: `run` halted — see the journal');
     // RESUMABLE BY CONSTRUCTION — say so, because the agent cannot tell a
     // self-healing halt from a terminal one and will otherwise stop on both.
     // `cmdRun` is idempotent: it re-derives from git every call, so a halt whose
-    // cause was a mid-run ref movement clears on the next attempt. Live
-    // 2026-08-04 exactly that happened — the run halted on
-    // `module/agent-group-contributions`, the retry drove the pass all the way to
-    // a servable case, and the agent nonetheless filed a driver issue and stopped
-    // while a case sat ready for an hour.
+    // cause was a mid-run ref movement clears on the next attempt — and an
+    // agent that stops and files a driver issue on the first halt leaves a
+    // servable case sitting ready.
     result(cli, {
       status: 'run-halted',
       instruction:
@@ -7323,10 +7201,8 @@ export async function cmdSweepNextCase(
     //  (a) a fix for it is already written and HELD but not yet PUBLISHED —
     //      `finish` is what pushes the fix/sweep ref and opens the PR, so the
     //      pass is not over and saying "report to the owner" strands the fix in
-    //      the pass dir. Live 2026-07-31: the agent wrote the trunk fix, was told
-    //      the pass had stopped, reported that faithfully, and never ran
-    //      `finish` — pr-intent journaled, zero refs pushed, zero PRs. The work
-    //      existed and the owner could not see it.
+    //      the pass dir: pr-intent journaled, zero refs pushed, zero PRs — the
+    //      work exists and the owner cannot see it.
     //  (b) nothing to publish either (already gated on origin, or nothing
     //      blameable) — then it really is a stop.
     //
@@ -7381,22 +7257,22 @@ export async function cmdSweepNextCase(
   const jc = open[0];
   const caseFile = readCaseFile(join(dir, jc.caseId, 'case.json'));
   const worktree = caseWorktreePath(dir, jc.caseId);
-  // D-059: a REISSUE case (driver-journaled at start) is served as a REVISION —
+  // A REISSUE case (driver-journaled at start) is served as a REVISION —
   // the worktree carries the prior published resolution and the materials carry
   // the FULL time-ordered review dialog, never the fresh-conflict briefing.
   const caseRow = journal.find((e) => e.action === 'case' && e.caseId === jc.caseId) ?? null;
   const isReissue = caseRow?.reissue === true;
-  // D-061 (B): a GATE-FIX case has no merge and no markers — the briefing is the
+  // A GATE-FIX case has no merge and no markers — the briefing is the
   // failing build, not a conflict.
   const isGateFix = caseRow?.gateFix === true;
   progress(
     `case ready: ${jc.branch} — ${caseFile.conflictedPaths.join(', ')}${isReissue ? ' (REISSUE — revise the published resolution)' : ''}`,
   );
-  // D-060: every case carries the fixed checks-contract line (typechecks now;
+  // Every case carries the fixed checks-contract line (typechecks now;
   // SERVE BOUND. Every serve is journaled, so "handed out N times, concluded
-  // zero times" is answerable — it was not before: `case` rows come from `run`,
-  // `report` and the gate-fix reopen, never from here, so a re-serve left no
-  // trace at all.
+  // zero times" is answerable: `case` rows come from `run`,
+  // `report` and the gate-fix reopen, never from here, so without this row a
+  // re-serve would leave no trace at all.
   const servedBefore = readJournal(dir).filter((e) => e.action === 'case-served' && e.caseId === jc.caseId).length;
   const serves = servedBefore + 1;
   appendJournal(dir, { action: 'case-served', caseId: jc.caseId, branch: jc.branch, serves });
@@ -7406,9 +7282,9 @@ export async function cmdSweepNextCase(
       `\`report-case\`, no escalation. Reading it again will not change that. Run ` +
       `\`report-case --tier held\` and write what you found: an unfixable case with a diagnosis is a ` +
       `valid outcome, an unanswered one is not.`;
-    appendJournal(dir, { action: 'case-serve-limit', id: 'ERR48_CASE_LOOPING', caseId: jc.caseId, branch: jc.branch, serves, detail });
-    console.error(`next-case [ERR48_CASE_LOOPING]: ${detail}`);
-    result(cli, { ok: false, status: 'looping', caseId: jc.caseId, serves, issues: [{ id: 'ERR48_CASE_LOOPING', detail }] });
+    appendJournal(dir, { action: 'case-serve-limit', id: 'ERR44_CASE_LOOPING', caseId: jc.caseId, branch: jc.branch, serves, detail });
+    console.error(`next-case [ERR44_CASE_LOOPING]: ${detail}`);
+    result(cli, { ok: false, status: 'looping', caseId: jc.caseId, serves, issues: [{ id: 'ERR44_CASE_LOOPING', detail }] });
     return 1;
   }
   const loopWarning =
@@ -7542,13 +7418,12 @@ async function adjudicateNotMyBug(p: {
   // the bisect narrows to the failing files, since it compares a commit against
   // its own history and full-suite cost is not affordable across a dozen probes.
   //
-  // NEITHER forces an environment. An earlier cut pinned the CASE's pool onto
-  // every probe so a lockfile difference could not decide a verdict — but the
-  // clean prefix was the side that was already RIGHT (it carries the merged
-  // manifests), and the case worktree was the broken one. Forcing bought
-  // comparability by corrupting the correct observation, and that is what
-  // produced a false `pre-existing`, a converged bisect and a PR against
-  // upstream `main` on 2026-08-04. Each tree gets its own dependencies.
+  // NEITHER forces an environment. Pinning the CASE's dependency tree onto
+  // every probe (so a lockfile difference could not decide a verdict) would
+  // corrupt the side that is already RIGHT — the clean prefix carries the
+  // merged manifests — buying comparability by corrupting the correct
+  // observation, which yields a false `pre-existing`, a converged bisect and a
+  // PR against the wrong branch. Each tree gets its own dependencies.
   const { probe, runs, dispose } = makeSubsetProbe(cli, failedCommands, p.runChecks, wtPath, p.runInstall);
   const { probe: narrowProbe, runs: narrowRuns, dispose: disposeNarrow } = makeSubsetProbe(
     cli,
@@ -7574,12 +7449,12 @@ async function adjudicateNotMyBug(p: {
     progress(`not-my-bug: ${verdict.verdict.toUpperCase()} — ${verdict.detail}`);
     console.error(`report-case [not-my-bug]: ${verdict.verdict} — ${verdict.detail}`);
 
-    // ENVIRONMENT FAULT (2026-08-03). Both trees share one dependency pool, so a
-    // broken pool reproduces identically on both and the verdict is a perfectly
+    // ENVIRONMENT FAULT. A broken environment reproduces identically on both
+    // trees, so the verdict is a perfectly
     // correct "not caused by your resolution" — about a failure no code change
-    // can fix. Left unchecked the driver blames a branch and mints a case: live,
-    // a 44-file gate fix on `module/container-queue` whose log held 76 missing
-    // bindings and zero assertions. Checked here, before any routing decision.
+    // can fix. Left unchecked the driver blames a branch and mints a
+    // many-file gate fix whose log holds missing bindings and zero
+    // assertions. Checked here, before any routing decision.
     const envFault = classifyEnvironmentFault(failingOutput);
     if (envFault.isEnvironment) {
       appendJournal(dir, {
@@ -7679,7 +7554,8 @@ async function adjudicateNotMyBug(p: {
       // case. Widen the edit scope to the failing files (the scope guard reads
       // the widening from the journal) and hand the failure back — the one
       // special case the owner sanctioned: let the agent edit files that are not
-      // conflicted, and let the cold read accept a change that resolves no markers.
+      // conflicted, and let the cold read accept a change that resolves no
+      // markers.
       appendJournal(dir, { action: 'scope-widened', caseId, branch, files: owner.files, reason: owner.detail });
       progress(`not-my-bug: scope widened — you may now edit ${owner.files.join(', ')}`);
       console.error(`report-case [WARN12_SCOPE_WIDENED]: ${caseId} may now edit ${owner.files.join(', ')}`);
@@ -7710,7 +7586,7 @@ async function adjudicateNotMyBug(p: {
       repoHistory(cli.repo),
       // The FULL-command fallback. A load-dependent failure exists only under
       // whole-suite load, so a narrowed probe cannot see it and the determinism
-      // gate writes it off as a coin flip — live 2026-08-03, exactly that.
+      // gate writes it off as a coin flip.
       probe,
       // The FLOOR — bound the SEARCH, do not clamp its answer afterwards: it
       // never spends probes on commits whose answer would be refused, and for a
@@ -7741,12 +7617,12 @@ async function adjudicateNotMyBug(p: {
       runs: bisect.usedFullCommand ? [...narrowRuns, ...runs] : narrowRuns,
     });
 
-    // THE BISECT NEVER GATES THE CASE (owner, 2026-08-04). Whether a gate fix is
+    // THE BISECT NEVER GATES THE CASE. Whether a gate fix is
     // warranted was settled by the verdict (`pre-existing`) and the owner probe;
     // naming the introducing commit only improves the BRIEFING. Suppressing the
-    // case because the optional step failed threw a proven defect away — and it
-    // was incoherent besides: `flaky` suppressed while `no-anchor` minted, two
-    // failure modes of one step with opposite consequences.
+    // case because the optional step failed would throw a proven defect away —
+    // and incoherently so: two failure modes of one optional step must not have
+    // opposite consequences.
     //
     // ROOT AT THE LAST FAILED POINT. When the search cannot name an introducer it
     // still knows the OLDEST commit it saw red, and that is the better root: the
@@ -7754,16 +7630,16 @@ async function adjudicateNotMyBug(p: {
     // ancestor can take one fix instead of one each. The cost is that the fix is
     // then BEHIND the branch tip, which is what the rebase note below is for.
     //
-    // ROOT FLOOR: never deeper than the current trunk head (owner, 2026-08-04).
+    // ROOT FLOOR: never deeper than the current trunk head.
     //
     // Rooting a fix at the commit that INTRODUCED a failure is right in
     // principle — branches sharing that ancestor take one fix instead of one
-    // each — and catastrophic without a floor. Live 2026-08-04 the bisect named
-    // `11d82a65`, which is 299 commits behind `main_patched`: the case worktree
-    // was a three-week-old tree, so the checks gate demanded THAT tree green,
-    // and it was red in a second, unrelated file whose fix simply had not been
-    // written yet. The agent could not win — its case scope was one test, and
-    // the gate wanted a suite from before half the branch's history existed.
+    // each — and catastrophic without a floor: a bisect can name a commit
+    // hundreds of commits behind the trunk, making the case worktree a
+    // weeks-old tree; the checks gate then demands THAT tree green, and it is
+    // red in unrelated files whose fixes simply have not been written yet. The
+    // agent cannot win — its case scope is one test, and the gate wants a
+    // suite from before half the branch's history existed.
     //
     // The floor is the trunk head: a root must CONTAIN it. Below that line the
     // history is shared and already-integrated, so a fix rooted there carries
@@ -7830,32 +7706,29 @@ async function adjudicateNotMyBug(p: {
     // ORDER IS LOAD-BEARING. `supersededCaseIds` supersedes every undispositioned
     // case whose `case` row PRECEDES its branch's last `reopened`. When the owner
     // is this branch, the gate fix is journaled on the SAME branch — so minting
-    // it first and reopening second superseded the gate fix TOO, the instant it
-    // was created: `next-case` would never serve it, the conflict case would be
-    // re-emitted, and the pass would loop through a full re-adjudication (bisect
-    // included) until the ten-strike backstop. Reopen first and the gate fix's
-    // rows land after it, untouched.
+    // it first and reopening second would supersede the gate fix TOO, the
+    // instant it is created: `next-case` would never serve it, the conflict case
+    // would be re-emitted, and the pass would loop through a full
+    // re-adjudication (bisect included) until the ten-strike backstop. Reopen
+    // first and the gate fix's rows land after it, untouched.
     //
     // DESCENDANTS TOO — every other path that blocks a branch does this
-    // (`freezeHeld`'s callers, the crash-heal, the resolve path) and reopening
-    // only the branch itself was a bug. A branch that has just been proven RED is
+    // (`freezeHeld`'s callers, the crash-heal, the resolve path), and reopening
+    // only the branch itself is a bug. A branch that has just been proven RED is
     // blocked, and its descendants' OPEN cases were derived against it: they
     // cannot pass, because the red commit is in the very content they are merging.
     // Left open they are served one by one, each failing the same checks, each
     // paying a full adjudication, each hitting the `gateFixKey` anti-loop and
-    // falling back to `--tier held` — eleven junk HELD PRs for one defect (live
-    // 2026-08-04, stopped at the second). Reopening supersedes them, so they are
+    // falling back to `--tier held` — a queue of junk HELD PRs for one defect.
+    // Reopening supersedes them, so they are
     // re-derived against the blocked parent and the existing DEFERRED path holds
     // them until the fix lands. No priority rule is needed: with the descendants
     // superseded, the gate fix is the only case left to serve.
     // THE OWNER'S SUBTREE, not just this case's. When ownership routes to the
-    // PARENT, the gate fix lands on a branch this case is not on — and its OTHER
-    // children were never reopened, so they stayed open, sorted ahead of the fix,
-    // and were served first. Live 2026-08-05: the fix went to
-    // `module/agent-group-contributions` while `module/interactions-helpers` and
-    // `module/container-bootstrap` (its other children) kept their cases and the
-    // agent moved to them — the same "junk PRs queued ahead of the fix" bug this
-    // reopen exists to prevent, one level up. Everything under the blocked branch
+    // PARENT, the gate fix lands on a branch this case is not on — and without
+    // this its OTHER children are never reopened, so they stay open, sort ahead
+    // of the fix, and are served first: the same "junk PRs queued ahead of the
+    // fix" bug, one level up. Everything under the blocked branch
     // is blocked, wherever the case that found it happened to live.
     const ownerSubtree =
       ownerBranch === branch
@@ -7875,7 +7748,10 @@ async function adjudicateNotMyBug(p: {
       const commit = await deterministicCommit(cli.repo, p.resolvedTree, [headSha], `abandoned resolution for ${caseId}`);
       const pinned = await git(cli.repo, ['update-ref', keepRef, commit], { allowCodes: [1, 128] });
       preserved = pinned.code === 0;
-      if (preserved) appendJournal(dir, { action: 'not-my-bug-preserved', caseId, ref: keepRef, tree: p.resolvedTree });
+      if (preserved) {
+        appendJournal(dir, { action: 'not-my-bug-preserved', caseId, ref: keepRef, tree: p.resolvedTree });
+        appendObservation(cli.workspace, { kind: 'abandoned-resolution-preserved', caseId, ref: keepRef });
+      }
     } catch {
       /* best-effort: losing the pin costs the agent a re-resolve, not correctness */
     }
@@ -7885,12 +7761,11 @@ async function adjudicateNotMyBug(p: {
       ...(rootedBelowTip ? { rootAt } : {}),
       // REPRODUCTION CHARACTER, carried to the briefing. The bisect had to fall
       // back to the FULL failing command because the narrowed probe did not
-      // reproduce — i.e. the failure needs the whole suite running. The driver
-      // knew that and said it in a parenthetical at the bottom of the captured
-      // output; on 2026-08-10 the agent spent 70 minutes and two rejected fixes
-      // debugging a full-suite-only timeout it could never observe (it may not
-      // run tests), and both of its root causes were wrong by its own account.
-      // Whether a failure is observable at all decides what to DO with it, so it
+      // reproduce — i.e. the failure needs the whole suite running. Burying that
+      // in a parenthetical at the bottom of the captured output leaves the agent
+      // debugging a full-suite-only failure it can never observe (it may not
+      // run tests). Whether a failure is observable at all decides what to DO
+      // with it, so it
       // belongs at the top of the briefing rather than in a log footer.
       ...(bisect.usedFullCommand ? { fullSuiteOnly: true } : {}),
     });
@@ -7958,11 +7833,11 @@ async function adjudicateNotMyBug(p: {
 // --------------------------------------------------------------------------
 
 /**
- * `report-case --tier <t>` (D-060) — the ONLY agent param is `--tier` (a claim;
+ * `report-case --tier <t>` — the ONLY agent param is `--tier` (a claim;
  * the driver is demote-only) and it is the SINGLE quality gate. Branch order
  * (first match wins, DRIVER.md §6.4):
  *   1. held-duplicate → consolidate into the topmost held twin.
- *   2. adequacy block (ERR05 first-attempt steer / ERR06 duplicate).
+ *   2. adequacy block (ERR06 duplicate).
  *   3. conflicts present + claim ≠ held → ERR32 (resolve first).
  *   4. claim == held + conflicts present (PRISTINE) → reset the worktree to the
  *      pristine conflict, freeze HELD DRAFT, "provide PR description (pristine)";
@@ -8004,7 +7879,7 @@ export async function cmdSweepReportCase(
   const caseFile = readCaseFile(join(caseDir, 'case.json'));
   const journal = readJournal(dir);
 
-  // D-059: a REISSUE case (driver-journaled at start with `reissue: true`) is a
+  // A REISSUE case (driver-journaled at start with `reissue: true`) is a
   // revision of a published resolution — verified against the journal-anchored
   // conflict head + a direct live probe, and ALWAYS routed through HELD (the
   // revision republishes to the EXISTING PR at finish; it never merges here).
@@ -8053,8 +7928,8 @@ export async function cmdSweepReportCase(
   // merge are green in isolation and only the merged tree is red, no upstream
   // branch owns the failure — it is this merge's own, and the fix lives in files
   // that are not conflicted. The driver journals the widening; the guard reads it
-  // back so those edits pass instead of reading as a scope violation. This is the
-  // one special case the owner sanctioned (2026-07-29 §1): let the agent edit
+  // back so those edits pass instead of reading as a scope violation. This is
+  // the one owner-sanctioned special case: let the agent edit
   // non-conflicted files, and let the cold read accept it.
   const widenRows = journal.filter(
     (e) => e.action === 'scope-widened' && e.caseId === caseId && Array.isArray(e.files),
@@ -8070,24 +7945,17 @@ export async function cmdSweepReportCase(
     hunkExempt: widenedPaths,
   });
 
-  // Adequacy: recorded-decision (ERR05) + duplicate (ERR06) — mechanical.
-  const registry = loadRegistry({
-    inventoryDir: cli.inventory,
-    scopeFile: cli.scopeFile,
-    routingFile: cli.routingFile,
-  });
+  // Adequacy: duplicate detection (ERR06) — mechanical.
   // (Skipped for a REISSUE: its PR already exists — adequacy was settled at the
-  // original publish; ERR05/ERR06 would wrongly re-litigate the open review.)
-  let decidedIssue: Issue | null = null;
+  // original publish; ERR06 would wrongly re-litigate the open review.)
   let dupIssue: DuplicateIssue | null = null;
   if (!isReissue) {
-    decidedIssue = decidedAlready(registry.features, rc.branch, rc.conflictedPaths);
     dupIssue = await duplicateCaseIssue(cli, journal, journaledCases(journal), journaledCases(journal).get(caseId)!);
     if (dupIssue) issues.push(dupIssue);
   }
 
-  // Scope + resolution-state snapshot. A scope violation is NOT an instant hold
-  // (D-057 #3): it is carried as `scopeExceeded` past the cold read — cold read
+  // Scope + resolution-state snapshot. A scope violation is NOT an instant
+  // hold: it is carried as `scopeExceeded` past the cold read — cold read
   // agrees + scope exceeded → HELD ACTIVE (resolution published, escalated); a
   // reject follows the 2-strike rejection path.
   const conflictsPresent = emptyResolution || markers.length > 0;
@@ -8111,7 +7979,7 @@ export async function cmdSweepReportCase(
           COLDREAD_FEEDBACK_CAP,
         )
     : null;
-  // Effective tier: a claim of `held`, a reissue revision (D-059: never merges
+  // Effective tier: a claim of `held`, a reissue revision (never merges
   // in place — republished to the existing review PR at finish), or a checks/cap
   // demotion (5a/5b) all force HELD; otherwise the claim under its floor.
   let effectiveTier: Tier = applyFloor(
@@ -8155,48 +8023,37 @@ export async function cmdSweepReportCase(
     return 0;
   }
 
-  // ---- 2. adequacy block (ERR05 first-attempt steer / ERR06 duplicate) ------
-  // ERR05 (decided-already) is a FIRST-ATTEMPT steer, not a standing gate: it
-  // fires ONCE (tracked by a `decided-steer` journal row, D-060 — report-attempt
-  // is no longer recorded before the checks gate) and only for a non-judged
-  // claim, to say "this file is already decided; apply it as a JUDGED resolution".
-  // Once steered, the case disposes on the next attempt (judged proceeds; a
-  // held/mechanical retry is no longer blocked and reaches its freeze/merge).
-  const alreadySteered = journal.some((e) => e.action === 'decided-steer' && e.caseId === caseId);
-  if (decidedIssue && effectiveTier !== 'judged' && !alreadySteered) {
-    issues.push(decidedIssue);
-    if (cli.execute) appendJournal(dir, { action: 'decided-steer', caseId, branch: rc.branch });
-  }
-  if (issues.some((i) => i.id === 'ERR05_DECIDED_ALREADY' || i.id === 'ERR06_DUPLICATE_CASE')) {
-    const first = issues.find((i) => i.id === 'ERR05_DECIDED_ALREADY' || i.id === 'ERR06_DUPLICATE_CASE')!;
+  // ---- 2. adequacy block (ERR06 duplicate) -----------------------------------
+  const dup = issues.find((i) => i.id === 'ERR06_DUPLICATE_CASE');
+  if (dup) {
     result(cli, {
-      instruction: `${first.id === 'ERR05_DECIDED_ALREADY' ? 'apply the recorded decision (judged)' : 'consolidate into the topmost case'}: ${first.detail}`,
+      instruction: `consolidate into the topmost case: ${dup.detail}`,
       tier: effectiveTier,
       issues,
     });
     return 1;
   }
 
-  // A GATE FIX the agent cannot fix IN SCOPE escalates to a HELD PR (owner,
-  // 2026-08-04: "reproducible-but-unfixable-in-scope should lead to held PR —
-  // there is no other way"). It is a real and common category, and the model had
-  // nowhere to put it: the failure REPRODUCES (so it is not `flaky`), it is
+  // A GATE FIX the agent cannot fix IN SCOPE escalates to a HELD PR —
+  // reproducible-but-unfixable-in-scope leads to a held PR;
+  // there is no other way. It is a real and common category and needs
+  // somewhere to go: the failure REPRODUCES (so it is not `flaky`), it is
   // genuinely pre-existing (so it is not the agent's), and yet no edit inside the
   // named files can fix it — because the driver scopes a gate fix to the files
   // the failure was REPORTED in, which is not where the fix belongs. `tsc` names
   // the call site, not the edit; a failing test names the test, not the source.
   //
-  // Before this, `--tier held` with an unchanged worktree fell into ERR32 below
-  // and was told "edit the files named in the briefing, or report the diagnosis
-  // to the owner" — but reporting is not a driver action, so the case dead-ended
-  // and the agent burned attempts until the container was reaped. The escalation
-  // IS the outcome: the owner gets a PR carrying the diagnosis, which is exactly
-  // what a fix nobody can make in scope should produce.
+  // Without this arm, `--tier held` with an unchanged worktree falls into ERR32
+  // below and is told "edit the files named in the briefing, or report the
+  // diagnosis to the owner" — but reporting is not a driver action, so the case
+  // dead-ends and the agent burns attempts until the container is reaped. The
+  // escalation IS the outcome: the owner gets a PR carrying the diagnosis,
+  // which is exactly what a fix nobody can make in scope should produce.
   if (isGateFixCase && claimed === 'held') {
     await freezeHeld(cli, dir, rc, ['gate fix: agent declared cannot-fix-in-scope (--tier held)'], {
       // An unchanged tree publishes no diff — the PR is the DIAGNOSIS. A tree
       // with edits keeps them: a partial or wrong attempt the owner can read
-      // beats an empty exhibit (the D-061 B rule, same reasoning).
+      // beats an empty exhibit.
       resolvedTree: emptyResolution ? null : resolvedTree,
       escalation: {
         tag: ESCALATE_CHECKS,
@@ -8338,10 +8195,10 @@ export async function cmdSweepReportCase(
       writeFileSync(fullFile, r.output);
       writeFileSync(outFile, boundedChecksOutput(r, fullFile));
       // ENVIRONMENT FAULT — checked HERE, on the ORDINARY path, before anything
-      // is counted against the agent. It used to be reachable only inside
-      // `adjudicateNotMyBug`, which needs the flag AND a second failure, so an
-      // agent that never raised the flag marched a broken toolchain all the way
-      // to CHECKS_FAIL_LIMIT and froze a HELD PR for it (10 wasted attempts).
+      // is counted against the agent. Checking it only inside
+      // `adjudicateNotMyBug` (which needs the flag AND a second failure) would
+      // let an agent that never raises the flag march a broken toolchain all
+      // the way to CHECKS_FAIL_LIMIT and freeze a HELD PR for it.
       const envFaultGate = classifyEnvironmentFault(r.output);
       if (envFaultGate.isEnvironment) {
         appendJournal(dir, {
@@ -8414,28 +8271,28 @@ export async function cmdSweepReportCase(
       // above needs `conflictsPresent` (markers, or no resolution at all), so an
       // agent that HAS resolved the conflict falls through to this gate, and the
       // gate answers ERR36/ERR40 — "fix the pending files" — which is impossible
-      // when the failing file is not one of them. Live 2026-08-01: the conflict
-      // was `src/cli/resources/groups.ts`, the failing test was
-      // `container/agent-runner/src/poll-loop.test.ts` from upstream 3d4b349b,
-      // the agent claimed held twice, was refused twice, and filed a stop-case
-      // reporting the deadlock. It was right. Doctrine's own ERR36 row tells it
+      // when the failing file is not one of them (e.g. an upstream test far from
+      // the conflicted paths). The agent claims held, is refused, and is
+      // deadlocked. Doctrine's own ERR36 row tells it
       // to claim held here, so refusing that is the driver contradicting itself.
       //
       // HELD work is not merged — it goes out as a PR for the owner, whose text
       // must say the checks still fail (the instruction below requires it). A
       // failing fix the owner can read beats a case nobody can close.
-      // NOT `&& n < CHECKS_FAIL_LIMIT`. That composition made an explicit claim
-      // stop counting at exactly the try the agent worked hardest for: at n<=9
-      // the claim is honoured and the resolution kept — throwing it away "would
+      // NOT `&& n < CHECKS_FAIL_LIMIT`. That composition would make an explicit
+      // claim stop counting at exactly the try the agent worked hardest for:
+      // below the limit the claim is honoured and the resolution kept —
+      // throwing it away would
       // lose the useful part and tell the owner to resolve a conflict that is
-      // already resolved" — while at n=10 the identical claim fell through to
-      // the limit path, reset the worktree to pristine and nulled `resolvedTree`.
+      // already resolved — while at the limit the identical claim would fall
+      // through to the limit path, reset the worktree to pristine and null
+      // `resolvedTree`.
       // The limit path keeps its real purpose: an agent that kept failing and
       // never conceded, where an empty exhibit is the honest thing to ship.
       const heldByClaim = claimed === 'held';
       if (n >= CHECKS_FAIL_LIMIT || heldByClaim) {
         // Backstop: stop asking the agent to fix and escalate to the owner.
-        // D-061 (B): a GATE-FIX case has NO pristine conflict to reset to — the
+        // A GATE-FIX case has NO pristine conflict to reset to — the
         // "pristine" reset would rebuild a merge that never happened and the
         // briefing would tell the owner to resolve a conflict that does not
         // exist. Keep the attempted fix instead and ship it as the held
@@ -8535,8 +8392,7 @@ export async function cmdSweepReportCase(
       // The escape hatch is ADVERTISED HERE, in the same message that reports the
       // failure. This is the only moment the agent learns a check failed at all,
       // so an escape it has to remember from a doctrine row is one it will not
-      // find — the same failure mode as the ERR42 proceed-arm that idled a pass
-      // for 52 minutes. A refused claim names the agent's own failures instead,
+      // find. A refused claim names the agent's own failures instead,
       // which beats "read the output and work out which half is yours".
       const yours = notMyBug.yours?.length
         ? ` These failures are YOURS — they pass without your resolution: ${notMyBug.yours.join(', ')}.`
@@ -8551,13 +8407,10 @@ export async function cmdSweepReportCase(
           `read ${outFile} and the named files, fix the pending files, re-run report-case.${yours}${hatch}` +
           // PRICE THE EXIT, and say which attempt this is.
           //
-          // This message was identical on every rejection: it prescribes the fix
-          // loop and never mentions `--tier held`. On 2026-08-10 the agent took
-          // two ~30-minute cycles on an unobservable failure and escaped only by
-          // MISAPPLYING the cold-read rule ("two rejections = auto-escalate"),
-          // which does not govern ERR40 — it invented a rule because none
-          // existed. The attempt count is the driver's to know, and naming the
-          // alternative costs one clause.
+          // A message that only prescribes the fix loop and never mentions
+          // `--tier held` leaves an agent stuck on an unobservable failure to
+          // invent an escape rule of its own. The attempt count is the
+          // driver's to know, and naming the alternative costs one clause.
           //
           // A gate fix also has no `--not-my-bug` left to offer: the driver
           // already proved the failure pre-existing, which is WHY the case
@@ -8621,12 +8474,12 @@ export async function cmdSweepReportCase(
   progress(`cold-read: ${rc.branch}`);
   const verdict = await invoke(prompt);
   writeFileSync(join(caseDir, 'coldread-verdict.json'), JSON.stringify(verdict, null, 2) + '\n');
-  // D-054: infra failure of the cold read (spawn/exit/unparseable/auth) is NOT a
+  // Infra failure of the cold read (spawn/exit/unparseable/auth) is NOT a
   // content reject — HARD BLOCKING HALT (ERR35), do NOT freeze the case. The
   // machine state stays `case-ready` so the agent re-runs report-case once the
   // tooling is fixed; only a cold read that RAN and rejected → HELD (below).
   if (verdict.verdict === 'error') {
-    const detail = `cold-read tooling unavailable: ${verdict.reason ?? 'unknown'} — report to owner (D-046 case 2) and stop; NOT a content decision`;
+    const detail = `cold-read tooling unavailable: ${verdict.reason ?? 'unknown'} — report to owner and stop; NOT a content decision`;
     appendJournal(dir, {
       action: 'halt',
       reason: 'coldread-unavailable',
@@ -8655,7 +8508,7 @@ export async function cmdSweepReportCase(
   // Rejection (incl. fail-closed UNVERIFIABLE): FIRST → no freeze, surface the
   // reviewer's feedback so the agent revises in the worktree and re-reports;
   // SECOND → stop retrying, HELD via the unified publish with the escalation
-  // prefix (D-057 #4). The machine state stays case-ready on the first strike.
+  // prefix. The machine state stays case-ready on the first strike.
   if (rejected) {
     const rejections = coldReadRejectionCount(readJournal(dir), caseId);
     if (rejections >= COLDREAD_REJECT_LIMIT) {
@@ -8771,13 +8624,13 @@ export async function cmdSweepReportCase(
 // --------------------------------------------------------------------------
 
 /**
- * `report-pr` — PR AUTHORING ONLY (D-060). The single quality gate (checks + the
+ * `report-pr` — PR AUTHORING ONLY. The single quality gate (checks + the
  * cold read) already ran at `report-case`; this stage reads the agent's PR text
  * and RECORDS INTENT — no cold read, no typecheck, no tests, no network.
  *
  * PR content: either a `pr/body.md` whose FIRST line is the H1 title (`# <title>`,
- * canonical), with the rest the body; or a legacy `pr/title.txt` + `pr/body.md`
- * pair (accepted for back-compat, the H1 wins when both are present). The
+ * canonical), with the rest the body; or a `pr/title.txt` + `pr/body.md`
+ * pair (both accepted; the H1 wins when both are present). The
  * resolved title/body are normalized back to `pr/title.txt` + `pr/body.md` so
  * the finish-time publish reads them unchanged. Missing title or body → ERR08;
  * deterministic text checks add WARN01/WARN02 (advisory, non-blocking).
@@ -8814,7 +8667,7 @@ export async function cmdSweepReportPr(
   const journal = readJournal(dir);
 
   // PR content: `pr/body.md` (H1 title on the first line, canonical) or the
-  // legacy `pr/title.txt` + `pr/body.md` pair. Resolve title + body, then
+  // `pr/title.txt` + `pr/body.md` pair. Resolve title + body, then
   // normalize both files so the finish-time publish reads them verbatim.
   const titlePath = join(caseDir, 'pr', 'title.txt');
   const bodyPath = join(caseDir, 'pr', 'body.md');
@@ -8834,7 +8687,7 @@ export async function cmdSweepReportPr(
   if (!title || !body) {
     const detail =
       `write ${bodyPath} with the H1 title on the first line (\`# <title>\`) and the body below, ` +
-      `FROM ${prTemplatePath(dir, caseId)} — the driver never generates PR prose (D-048)`;
+      `FROM ${prTemplatePath(dir, caseId)} — the driver never generates PR prose`;
     result(cli, {
       instruction: prHandoff(dir, caseId, 'provide PR description'),
       prTemplate: prTemplatePath(dir, caseId),
@@ -8897,7 +8750,7 @@ export async function cmdSweepReportPr(
   // already confirmed it at report-case; re-verify + re-snapshot (fail-closed to
   // HELD only if it no longer resolves), then merge (the history PR flips to
   // merged when pushed at finish).
-  // D-061 (B): a JUDGED GATE FIX is new code on the branch, not a propagation
+  // A JUDGED GATE FIX is new code on the branch, not a propagation
   // merge — there is no parent to merge and no conflict to re-verify. Commit the
   // fixed tree as a SINGLE-parent commit, then REOPEN every descendant so the
   // fix is pulled through the DAG; the next `finish` sees cases outstanding
@@ -8934,9 +8787,9 @@ export async function cmdSweepReportPr(
       mergeCommit: fixCommit,
       reopened: descendants,
       // NO `prIntent`. The arm above deliberately journals no pr-intent row and
-      // finish excludes gate fixes from the judged PRs, so claiming one made the
-      // agent promise the owner a PR that is never created. The commit IS the
-      // record here.
+      // finish excludes gate fixes from the judged PRs, so claiming one would
+      // make the agent promise the owner a PR that is never created. The commit
+      // IS the record here.
       prIntent: false,
       issues: warnings,
     });
@@ -8982,8 +8835,8 @@ export async function cmdSweepReportPr(
 // --------------------------------------------------------------------------
 
 /**
- * `sweep finish` — the ONLY stage that publishes ANYTHING (D-058: all PRs are
- * created here, after the full-integration verify, D-012). Steps, in order:
+ * `sweep finish` — the ONLY stage that publishes ANYTHING (all PRs are
+ * created here, after the full-integration verify, §9). Steps, in order:
  * verify the publishable set (full rebuild) → create JUDGED history PRs
  * (publish, non-draft) → push target branches (flips JUDGED PRs to merged) +
  * closure checks + urges → create the HELD PRs (unified active/draft — push
@@ -8997,7 +8850,7 @@ export async function cmdSweepReportPr(
  * `start` sees a clean origin picture and redoes the pass.
  */
 /**
- * The GATE-FIX briefing (D-061 B). Deliberately unlike a conflict briefing: it
+ * The GATE-FIX briefing. Deliberately unlike a conflict briefing: it
  * says up front that there is no merge and nothing pending, so the agent does
  * not hunt for markers, and it states the scope explicitly because the standard
  * "your scope is what this merge causes" rule does not apply here.
@@ -9057,12 +8910,12 @@ function gateFixCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEn
       // ROOT THE PATHS FIRST. `bun test` runs with `cwd: container/agent-runner`
       // (checks.json), so it prints `src/poll-loop.test.ts` for a file that lives
       // at `container/agent-runner/src/poll-loop.test.ts`. Handing that to the
-      // agent sends it to a path that does not exist — live 2026-08-10 it hit
-      // `ls: cannot access` before finding the file, in the very section whose
+      // agent sends it to a path that does not exist — `ls: cannot access`
+      // before it finds the file, in the very section whose
       // whole purpose is "do not hunt".
       //
-      // `rootChecksOutput` already re-roots a command's output by its cwd and is
-      // what blame uses; this section bypassed it. The failing-command list comes
+      // `rootChecksOutput` re-roots a command's output by its cwd and is
+      // what blame uses; this section must not bypass it. The failing-command list comes
       // from the gate-fix row, which records the command NAMES — resolve them
       // back to their configured entries so the cwds are the real ones.
       const cmdEntries = loadChecksConfig(readMachineState(dir)?.checksFile) ?? { typecheck: [], test: [] };
@@ -9093,9 +8946,9 @@ function gateFixCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEn
     'If you have read those and have NOT made an edit, you are done investigating:',
     'claim `--tier held` and write the diagnosis. Re-reading a file you have',
     'already read is the signal that reading is no longer producing decisions —',
-    'stop there. Live 2026-08-04 an agent read poll-loop.ts twelve times over 35',
-    'minutes, compacted twice, and never attempted a fix or an escalation; both',
-    'compactions were spent re-reading what it had already seen.',
+    'stop there. Re-reading in a loop burns the whole session without ever',
+    'producing a fix or an escalation; the diagnosis you already have IS the',
+    'deliverable.',
     '',
     '## REPORT AS YOU GO',
     'Send a one-line message when you TAKE this case, and again on every',
@@ -9186,16 +9039,17 @@ interface GateFixCaseSummary {
 }
 
 /**
- * D-061 (B): turn an unattributable red into GATE-FIX case(s).
+ * Turn an unattributable red into GATE-FIX case(s).
  *
  * Blame the failing files to their branches by GIT HISTORY (`attributeFailure`,
  * owner rule: shallowest by hierarchy), then prepare a worktree at each blamed
  * branch's tip. Unlike a conflict case there is nothing pending and no markers —
  * the agent edits the named files so the checks pass.
  *
- * BATCHED, ONE CASE PER BRANCH (owner-approved 2026-07-28). A red build routinely
- * names files that belong to DIFFERENT branches; a single case forced all of them
- * onto one branch's worktree, where the fix for someone else's file either cannot
+ * BATCHED, ONE CASE PER BRANCH. A red build routinely
+ * names files that belong to DIFFERENT branches; a single case would force all
+ * of them onto one branch's worktree, where the fix for someone else's file
+ * either cannot
  * be made or lands where it reaches nobody. Cases come back SHALLOWEST BRANCH
  * FIRST: a judged trunk fix plus the `reopen()` it triggers can moot a
  * descendant's case entirely, so the trunk must be workable before its children.
@@ -9206,23 +9060,21 @@ interface GateFixCaseSummary {
  * never suppresses another branch's first attempt. When nothing at all is
  * servable the caller falls back to the STOP path.
  *
- * `rootBranch` (the BASE GATE at `start`): the case is rooted THERE rather than
+ * `rootBranch`: the case is rooted THERE rather than
  * on the blamed branch — see the rooting comment below.
  */
 /**
  * The ACTIVE GATE on a branch: an unmerged gate-fix ref on ORIGIN.
  *
- * This is the cross-pass anti-loop, and it replaces the group-root JSON the base
- * gate used to keep. Three properties that file did not have:
+ * This is the cross-pass anti-loop, and three properties make it the right one:
  *
- *  - PER-BRANCH, so it covers every gate fix `finish` can mint rather than the
- *    base alone — the file guarded the base and nothing else, which left every
- *    other branch re-mintable on every pass;
- *  - DERIVED FROM ORIGIN (D-058 §2), not local state a pass wipe or a fresh
+ *  - PER-BRANCH, so it covers every gate fix `finish` can mint — no branch is
+ *    re-mintable on every pass;
+ *  - DERIVED FROM ORIGIN, not local state a pass wipe or a fresh
  *    clone silently loses;
- *  - SELF-CLEARING. The file was keyed by base SHA, so a HELD fix — which by
- *    definition leaves the branch red until the owner merges it — pinned the key
- *    forever and refused the case for good. A ref disappears when its PR merges.
+ *  - SELF-CLEARING: a ref disappears when its PR merges. (A sha-keyed local
+ *    record would wedge on a HELD fix — which by definition leaves the branch
+ *    red until the owner merges it — pinning the key forever.)
  *
  * Keyed on the BRANCH, not the case id: a gate fix IS per-branch (blame groups
  * the failing files by owner and mints one case per owner), so "does this branch
@@ -9262,7 +9114,7 @@ async function materializeGateFixCases(
     fullSuiteOnly?: boolean;
     /**
      * Root the case's worktree at THIS commit instead of the branch tip
-     * (`--not-my-bug`, owner 2026-08-04). Used when the search could not name an
+     * (`--not-my-bug`). Used when the search could not name an
      * introducing commit but did observe the failure at an older point: rooting
      * there puts the fix as deep as the evidence supports, so branches sharing
      * that ancestor can take one fix rather than one each. The trade is that the
@@ -9317,9 +9169,9 @@ async function materializeGateFixCases(
   // NO FILES, NO CASE. `cmdVerify`'s ROLLBACK arm (an offender isolated, rolled
   // back, HELD(gate), and the re-verify STILL red) journals no attributionFailed
   // row, so `failedOutput` arrives empty: attribution parses nothing, falls back
-  // to the ACCUSED branch, and a case was minted with empty conflictedPaths and
-  // an empty output file — the agent handed something to fix with nothing in it,
-  // pre-empting the honest STOP. A case needs at least one named file.
+  // to the ACCUSED branch, and a case would be minted with empty conflictedPaths
+  // and an empty output file — the agent handed something to fix with nothing in
+  // it, pre-empting the honest STOP. A case needs at least one named file.
   if (files.length === 0) {
     return {
       ...none,
@@ -9347,12 +9199,12 @@ async function materializeGateFixCases(
     return { ...none, reason: 'no branch could be blamed for the failing files', detail: `verify RED (no clean attribution); ${a.reason}` };
   }
 
-  // MANDATE BOUNDARY (owner, 2026-08-04). `main` is UPSTREAM — never ours to fix,
+  // MANDATE BOUNDARY. `main` is UPSTREAM — never ours to fix,
   // and a fix committed there could not be pushed anywhere the fork controls.
-  // Live 2026-08-04 the driver minted `gate-fix-main-c1e3ddc6` on it: a probe of
-  // upstream's head ran with the wrong dependencies, came back red for a module
-  // upstream actually declares, ownership moved to the parent, and a bisect
-  // converged — a fully substantiated case for a defect that did not exist.
+  // The failure shape this forecloses: a probe of
+  // upstream's head runs with the wrong dependencies, comes back red for a
+  // module upstream actually declares, ownership moves to the parent, a bisect
+  // converges — a fully substantiated case for a defect that does not exist.
   //
   // Enforced HERE because this is the one place a case is created, and the
   // `rootBranch` override bypasses attribution entirely (which already excludes
@@ -9395,24 +9247,19 @@ async function materializeGateFixCases(
   // every descendant inherits the redness — there is no height at which one is
   // unaffected, and nothing beneath can be judged until the fix lands. The
   // cross-pass skip below reads ORIGIN refs, which do not exist until `finish`
-  // publishes, so within a pass a trunk gate blocked nothing at all.
-  //
-  // Live 2026-08-06: `main_patched` froze with a gate fix at 23:20, and 57
-  // minutes later this loop minted a SECOND gate fix on its descendant
-  // `module/agent-group-contributions`. That case cost an hour of agent time and
-  // produced PR #77, whose own title reads "fixes belong at main_patched" —
-  // work downstream of a trunk the pass had already stopped on. One gate fix,
+  // publishes, so within a pass this check is what blocks beneath a trunk gate.
+  // Without it the loop mints a SECOND gate fix on a descendant — work
+  // downstream of a trunk the pass has already stopped on. One gate fix,
   // one HELD PR, everything beneath blocked, is the rule.
-  // TWO SHAPES OF GATE HOLD, and the first version of this checked only one.
+  //
+  // TWO SHAPES OF GATE HOLD, and this check must cover BOTH:
   //
   //   `reason: 'gate'`        — the §9 rollback: verify blamed a branch and froze it.
   //   a held GATE-FIX case    — the agent worked a gate fix and reported --tier held.
   //                             That row carries NO `reason` at all.
   //
-  // Live 2026-08-06: `main_patched` took the second shape at 09:15, and 53
-  // minutes later a gate fix was minted on its descendant anyway — PR #79, whose
-  // diagnosis points the fix at yet another branch. The guard added for exactly
-  // this had matched on `reason` and never fired.
+  // Matching on `reason` alone misses the second shape, and a gate fix gets
+  // minted on a descendant of a gate-held trunk anyway.
   const gateFixCaseIds = new Set(
     journal.filter((e) => e.action === 'gate-fix' && typeof e.caseId === 'string').map((e) => e.caseId as string),
   );
@@ -9438,14 +9285,10 @@ async function materializeGateFixCases(
     // branch tip and the parent head. `opts.rootBranch` is set only on that
     // path.
     //
-    // Refusing those cost three rounds on 2026-08-06, ~20 minutes each, all
-    // naming the SAME owner from three different case branches:
-    //   10:17  module/host-rpc             -> parent -> skipped
-    //   10:51  module/host-rpc             -> parent -> skipped
-    //   11:37  module/interactions-helpers -> parent -> skipped
-    // `module/agent-group-contributions` owns a real defect; every descendant
+    // Refusing a located owner burns a full adjudication round per descendant,
+    // each naming the SAME owner: a branch owns a real defect, every descendant
     // that merges it hits the same one, adjudicates correctly, and is refused
-    // because an UNRELATED ancestor (main_patched) happens to be gated. The
+    // because an UNRELATED ancestor happens to be gated. The
     // defect is never recorded, so the next descendant repeats the whole
     // adjudication. Refusing proven evidence is not caution.
     const ownerLocated = typeof opts.rootBranch === 'string' && opts.rootBranch === g.branch;
@@ -9476,11 +9319,11 @@ async function materializeGateFixCases(
     // WHETHER IT IS THE SAME DEFECT IS A SEPARATE QUESTION, and the ref name
     // answers it: every gate-fix case id ends in a digest of its FAILING FILE
     // SET, so `fix/sweep/<branch>--gate-fix-<branch>-<digest>` says which defect
-    // is under review. The skip globbed `--gate-fix-*` and reported all of them
-    // as "the fix is written and awaiting the owner". For a SECOND, unrelated
-    // defect on the same branch that is false — no fix for it exists anywhere —
+    // is under review. Reporting every glob match as "the fix is written and
+    // awaiting the owner" is false for a SECOND, unrelated
+    // defect on the same branch — no fix for it exists anywhere —
     // and the owner merges the open PR expecting green, reds again on the other
-    // defect, and pays one round-trip per defect on a message the driver had the
+    // defect, and pays one round-trip per defect on a message the driver has the
     // digest to falsify.
     //
     // The skip itself stays: the branch really is blocked, and a case minted
@@ -9526,7 +9369,7 @@ async function materializeGateFixCases(
     // commit when the caller has evidence the failure lives further down.
     const tip = opts.rootAt ? await revParse(cli.repo, opts.rootAt) : await revParse(cli.repo, g.branch);
     // The head's HEIGHT (see `gateFixHeadHeight`): the tip's coverage on this
-    // pass's pinned chain, not the `-1` placeholder that used to stand here.
+    // pass's pinned chain — never a `-1` placeholder.
     const head = { sha: tip, height: await gateFixHeadHeight(cli, chain, tip) };
     await createGateFixWorktree(cli, dir, caseId, tip);
     const caseFile: CaseFile = {
@@ -9579,8 +9422,7 @@ async function materializeGateFixCases(
       run: caseFile.run,
       conflictedPaths: g.files,
       // On the `case` row because `gateFixCaseMaterials` is handed THAT row —
-      // a flag written only to the `gate-fix` row never reaches the agent
-      // (learned the hard way, 2026-08-05).
+      // a flag written only to the `gate-fix` row never reaches the agent.
       ...(opts.fullSuiteOnly ? { fullSuiteOnly: true } : {}),
     });
     writeFileSync(join(dir, caseId, 'gate-fix-output.txt'), failedOutput);
@@ -9634,7 +9476,7 @@ async function createGateFixWorktree(cli: Cli, dir: string, caseId: string, tip:
   await installDeps(cli, wtPath);
 }
 
-/** One related PR in a finished pass's owner-facing summary (D-059 owner request). */
+/** One related PR in a finished pass's owner-facing summary. */
 interface PassPrSummary {
   number: number;
   url: string;
@@ -9644,7 +9486,7 @@ interface PassPrSummary {
 }
 
 /**
- * EVERY PR this pass touched, journal-derived (D-059 owner request): the open
+ * EVERY PR this pass touched, journal-derived: the open
  * review PRs `start` found (origin-blocked rows), PRs reopened/recovered at
  * start, and the JUDGED/HELD PRs created (or reissued) at finish. Titles come
  * from the recorded intent (pr/title.txt); where a transport is available each
@@ -9750,21 +9592,20 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   const dir = ctx.dir;
   let st = readMachineState(dir);
   const checksFile = applyPassConfig(cli, st);
-  // D-060: the finish verify gate runs the checks from the pass's pinned
+  // The finish verify gate runs the checks from the pass's pinned
   // checks-file on the publishable set; a persisted checks-file wins over any
-  // legacy --commands-file. When it is absent the gate is skipped (cli.commands
-  // undefined → cmdVerify falls back to --commands-file / VERIFY_COMMANDS, the
-  // pre-D-060 behavior).
+  // --commands-file. When it is absent the gate is skipped (cli.commands
+  // undefined → cmdVerify falls back to --commands-file / VERIFY_COMMANDS).
   //
-  // D-061 (B): TYPECHECK FIRST, then tests. Pre-D-061 finish ran `test` ONLY, so
-  // a type error surfaced indirectly (a suite failing to import) or not at all,
-  // and the verify log held no compiler diagnostics — leaving `attributeFailure`
+  // TYPECHECK FIRST, then tests. Running `test` only would let
+  // a type error surface indirectly (a suite failing to import) or not at all,
+  // with no compiler diagnostics in the verify log — leaving `attributeFailure`
   // nothing to parse and every unattributable red falling back to the branch
   // verify accused. Typecheck output is what makes blame possible, and it is the
   // cheap check besides.
   //
-  // An unparseable checks file silently emptied that list and finish then
-  // published on a verify that ran nothing. Halt instead — this is the last gate
+  // An unparseable checks file would silently empty that list and finish would
+  // publish on a verify that ran nothing. Halt instead — this is the last gate
   // before anything reaches origin.
   const badChecks = malformedChecksIssue(checksFile);
   if (badChecks) {
@@ -9780,7 +9621,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     return 2;
   }
   if (st.phase === 'awaiting-pr' || openCases(readJournal(dir)).length > 0) {
-    // D-061 (B): say WHY cases reappeared when a judged gate fix reopened the
+    // Say WHY cases reappeared when a judged gate fix reopened the
     // DAG — otherwise "cases remain" right after a finish reads like a driver
     // bug, and the agent is liable to report it as one instead of looping.
     const gfResolved = readJournal(dir).find((e) => e.action === 'resolved' && e.gateFix === true);
@@ -9801,7 +9642,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
       !journal.some((e) => e.action === 'pr-published' && e.caseId === jc.caseId);
     const judged = [...journaledCases(journal).values()].filter((jc) => {
       const d = lastDisposition(journal, jc.caseId);
-      // D-061 (B): a gate fix is never a JUDGED history PR — see below.
+      // A gate fix is never a JUDGED history PR — see below.
       return d?.action === 'resolved' && d.tier === 'judged' && d.gateFix !== true && unpublished(jc);
     });
     const held = [...journaledCases(journal).values()].filter(
@@ -9816,7 +9657,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     return 0;
   }
 
-  // (1) verify the publishable set (full rebuild, D-051). A red verify either
+  // (1) verify the publishable set (full rebuild, §9). A red verify either
   // fails attribution (verifyRc != 0) or rolls a publishable offender back to
   // HELD(gate) — both HALT finish (report + resumable): re-running finish drops
   // the now-frozen offender from the publishable recipe and proceeds. Pushes
@@ -9824,13 +9665,12 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   // THE BASE MAY ALREADY BE UNDER REPAIR. A gate fix on the base is an OPEN,
   // unmerged HELD PR — the defect is still there by definition — so rebuilding
   // on it and running the matrix is guaranteed red, and every red then gets
-  // attributed to a recipe branch. That is what made a pass roam
-  // module/credentials -> feat/ssh-auth -> module/runtime-updater: three
-  // innocent branches rolled back and frozen, one per finish run, for a
-  // `main_patched` defect that already had a gate fix waiting for the owner.
+  // attributed to a recipe branch — innocent branches rolled back and frozen,
+  // one per finish run, for a
+  // base defect that already has a gate fix waiting for the owner.
   //
-  // `activeGateFixRefs` is how `next-case` skips a gated branch (D-063); finish
-  // never asked it. Verification cannot mean anything until the base is fixed,
+  // `activeGateFixRefs` is how `next-case` skips a gated branch; finish
+  // must ask it too. Verification cannot mean anything until the base is fixed,
   // so don't pretend it can: publish the held work and report the blocker.
   const verifyBase = await verifyBaseRef(cli);
   const gatedRefs = await activeGateFixRefs(cli.repo);
@@ -9871,20 +9711,20 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   const gatesNow = readJournal(dir).filter((e) => e.action === 'held' && e.reason === 'gate');
   const gateAfter = gatesNow.length;
   if (verifyRc !== 0 || gateAfter > gateBefore) {
-    // D-060: an UNATTRIBUTABLE red where the checks TESTS failed (build clean, no
+    // An UNATTRIBUTABLE red where the checks TESTS failed (build clean, no
     // single-branch offender) is a STOP, not a resumable rollback: journal the
     // failed test names and report "publish nothing; report to the owner" —
-    // fixing red tests is code work / an owner decision, never a re-run.
+    // fixing red tests is code work / the owner's call, never a re-run.
     const attrib = readJournal(dir)
       .slice(verifyLenBefore)
       .find((e) => e.action === 'verify' && e.attributionFailed === true && Array.isArray(e.failedCommands));
     const failedTests = attrib ? (attrib.failedCommands as string[]) : [];
     const offender = gateAfter > gateBefore ? (gatesNow[gatesNow.length - 1].branch as string | undefined) : undefined;
 
-    // D-061 (B): an UNATTRIBUTABLE red is a build defect nobody in this pass
-    // caused — pre-D-061 it dead-ended in an ERR18/ERR40 whose message asked a
+    // An UNATTRIBUTABLE red is a build defect nobody in this pass
+    // caused — dead-ending it in an ERR18/ERR40 whose message asks a
     // HUMAN to fix something the agent is forbidden to deliver (it may not push
-    // or open a PR). Turn it into a CASE instead, so the fix flows through the
+    // or open a PR) goes nowhere. Turn it into a CASE instead, so the fix flows through the
     // machinery that already exists: agent edits → checks gate PROVES it green →
     // cold read → judged (merge in place + re-propagate) or held (fix/sweep ref +
     // PR that blocks the next pass until the owner merges).
@@ -9940,20 +9780,20 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
         return 1;
       }
       // Not servable (already attempted for these files, or nothing to blame):
-      // fall through to the pre-D-061 STOP so a bad fix cannot cycle forever.
+      // fall through to the STOP so a bad fix cannot cycle forever.
       if (failedTests.length > 0) {
         appendJournal(dir, { action: 'finish-tests-failed', failed: failedTests });
         // PUBLISH THE HELD ESCALATIONS ANYWAY — the red is very often the thing
-        // they are ABOUT (2026-08-05).
+        // they are ABOUT.
         //
-        // The catch-22 this fixes, observed end to end: a gate fix was served for
-        // `groups.create.test.ts`; the agent correctly found the fix lived in
-        // `groups.ts`, OUTSIDE the case's named files, and claimed `--tier held`
-        // exactly as doctrine says. Held means NOT merged, so the failure
-        // persisted, so `finish`'s verify stayed RED, so this arm published
-        // NOTHING — including the held PR that was the entire escalation. The
-        // sweep swallowed its own request for help and reported "nothing
-        // published" while holding the two-line diff that would have fixed it.
+        // The catch-22 this forecloses: a gate fix is served, the agent
+        // correctly finds the fix lives OUTSIDE the case's named files and
+        // claims `--tier held` exactly as doctrine says. Held means NOT merged,
+        // so the failure persists, so `finish`'s verify stays RED — and an arm
+        // that publishes NOTHING on red swallows the held PR that was the
+        // entire escalation: the sweep suppresses its own request for help and
+        // reports "nothing published" while holding the small diff that would
+        // fix it.
         //
         // Publishing held cases here is safe: a held publish pushes a
         // `fix/sweep/*` ref and opens a REVIEW PR the owner merges. It never
@@ -9982,10 +9822,10 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
       }
     }
     // THE HELD WORK LEAVES BY THIS DOOR TOO. There are two red exits from
-    // finish: the attributed one above (ERR40) and this halt, and only the first
-    // published its held cases. So on 2026-08-05, with the ERR40 arm working,
-    // three consecutive passes still dropped every held PR — they all left
-    // through HERE, `verify RED (no clean attribution)`. A held case is the
+    // finish: the attributed one above (ERR40) and this halt, and BOTH must
+    // publish their held cases — a pass that leaves through
+    // `verify RED (no clean attribution)` must not drop every held PR. A held
+    // case is the
     // owner's to decide either way; which red path the pass took is the driver's
     // bookkeeping, not a reason to throw the agent's work away.
     const { escalated: haltEscalated, total: haltHeld } = await escalateHeldCases(
@@ -10018,11 +9858,11 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     const journal = readJournal(dir);
     const judged = [...journaledCases(journal).values()].filter((jc) => {
       const d = lastDisposition(journal, jc.caseId);
-      // D-061 (B): EXCLUDE gate fixes. The JUDGED history PR is auto-flipped to
+      // EXCLUDE gate fixes. The JUDGED history PR is auto-flipped to
       // merged by the target push landing the SAME merge commit — machinery for a
       // propagation merge. A gate fix is a single-parent commit with no conflict
-      // head, so cmdPublish cannot build it and finish halted at `judged-prs`.
-      // Selection is by DISPOSITION, so dropping its pr-intent was not enough.
+      // head, so cmdPublish cannot build it and finish would halt at `judged-prs`.
+      // Selection is by DISPOSITION, so dropping its pr-intent is not enough.
       return d?.action === 'resolved' && d.tier === 'judged' && d.gateFix !== true;
     });
     let closuresN = 0;
@@ -10044,7 +9884,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   writeMachineState(dir, { ...st, finishStep: 'push' });
 
   // (3) push target branches (flips JUDGED PRs to merged) + closure checks +
-  // urges. PUSH RESILIENCE (D-059 FINAL): per-branch failures (`push-failed`
+  // urges. PUSH RESILIENCE: per-branch failures (`push-failed`
   // journal rows, categorized) do NOT halt finish — the rest of the pass
   // completes and the SWEEP-RESULT reports landed vs failed factually. Only a
   // GLOBAL failure with no per-branch rows (verify gate, token, closure check)
@@ -10073,7 +9913,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   progress(`urge comments (${pushDelta.filter((e) => e.action === 'urge').length})`);
   writeMachineState(dir, { ...st, finishStep: 'held-prs' });
 
-  // SYSTEMIC OUTAGE short-circuit (D-059 FINAL finding 3): when EVERY push
+  // SYSTEMIC OUTAGE short-circuit: when EVERY push
   // this run failed `transient` and nothing landed, the network itself is
   // down — attempting every held publish (each of which starts with a `git
   // push` of its fix ref) over the same dead transport would just burn a
@@ -10084,7 +9924,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     !pushDelta.some((e) => e.action === 'push') &&
     pushFailures.every((f) => f.category === 'transient');
 
-  // (4) create the HELD PRs (D-058: the ONE publish phase for held cases —
+  // (4) create the HELD PRs (the ONE publish phase for held cases —
   // push the fix/sweep ref + review PR, active for a marker-clean resolution,
   // draft for the pristine conflict; NEVER merged by the driver). After the
   // target pushes so cmdPublish's ERR14 held ordering holds (origin bases are
@@ -10114,7 +9954,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     let heldN = 0;
     for (const jc of held) {
       if (journal.some((e) => e.action === 'pr-published' && e.caseId === jc.caseId)) continue;
-      // Cross-tier duplicate (finding #3): a held case whose conflict signature
+      // Cross-tier duplicate: a held case whose conflict signature
       // matches an ALREADY-PUBLISHED sibling (e.g. a JUDGED PR created in
       // phase 2, or an earlier held PR from this loop) can never publish —
       // ERR06 would wedge finish forever. The published PR already carries the
@@ -10141,8 +9981,8 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
         makeTransport,
       );
       if (rcPub !== 0) {
-        // PUSH RESILIENCE (D-059 FINAL): a failed held publish (e.g. its base
-        // push failed → ERR14, or a transient API error) no longer halts the
+        // PUSH RESILIENCE: a failed held publish (e.g. its base
+        // push failed → ERR14, or a transient API error) does not halt the
         // whole finish — journal it, finish the rest, report factually; the
         // case retries on the next finish (no pr-published row exists).
         appendJournal(dir, {
@@ -10174,7 +10014,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     /* upstream ref unavailable (e.g. fixtures) — report done */
   }
 
-  // PUSH RESILIENCE (D-059 FINAL): with per-branch failures the pass is NOT
+  // PUSH RESILIENCE: with per-branch failures the pass is NOT
   // sealed — the machine state stays `finishing` so a re-run finish retries
   // exactly the failed pushes/publishes (landed branches skip as up-to-date;
   // verify re-gates). Only a fully-landed finish completes the pass.
@@ -10196,8 +10036,8 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   }
   const next = anyFailures ? 're-run finish' : upstreamAdvanced ? 'start again' : 'done';
 
-  // Owner-facing pass summary on the ONE SWEEP-RESULT (success or partial,
-  // D-059 owner request): every related PR (found-open at start / reopened /
+  // Owner-facing pass summary on the ONE SWEEP-RESULT (success or
+  // partial): every related PR (found-open at start / reopened /
   // recovered / created / reissued / approved-landed) + per-branch landed vs
   // failed outcomes + journal-derived stats, with an explicit cue to REPORT
   // them — the agent relays numbers/titles/status/failures to the owner.
@@ -10238,7 +10078,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     failedByCategory[(f.category as keyof typeof failedByCategory) ?? 'transient'] =
       (failedByCategory[(f.category as keyof typeof failedByCategory) ?? 'transient'] ?? 0) + 1;
   }
-  // Finding 3: owner-action-required failures (diverged / hook-rejected) and
+  // Owner-action-required failures (diverged / hook-rejected) and
   // blocking non-push issues (ERR16/ERR17/token/API) from THIS run's push
   // phase — surfaced as their own SWEEP-RESULT fields, not merely categories,
   // so an autonomous re-run loop can stop re-trying what only the owner can fix.
@@ -10290,7 +10130,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
       branches,
       failedPushes: pushFailures,
       failedPublishes: publishFailures,
-      // Finding 3: needs-owner failures are a FIRST-CLASS field — a re-run
+      // Needs-owner failures are a FIRST-CLASS field — a re-run
       // loop must stop re-trying these branches and hand them to the owner.
       needsOwner,
       blockingIssues: pushBlockingIssues,
@@ -10328,12 +10168,12 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
  * return the exit code.
  *
  * A DriverHalt is an EXPECTED, journaled refusal — a protected or out-of-scope
- * ref, a dirty worktree, a diverged branch, a surprise merge conflict. Only
- * `sweep-abort` caught it, so the other five commands let it reach the
- * top-level rejection handler, which printed a raw stack and NO `SWEEP-RESULT`
- * line at all: the two-prefix contract (SWEEP-STEP relays, SWEEP-RESULT is
- * parsed and acted on) broke, and the agent was left with nothing actionable
- * at the exact moment the driver refused to proceed.
+ * ref, a dirty worktree, a diverged branch, a surprise merge conflict. Every
+ * command must route it here: letting it reach the
+ * top-level rejection handler prints a raw stack and NO `SWEEP-RESULT`
+ * line at all, breaking the two-prefix contract (SWEEP-STEP relays,
+ * SWEEP-RESULT is parsed and acted on) and leaving the agent nothing actionable
+ * at the exact moment the driver refuses to proceed.
  *
  * No new id is minted. `haltIdFor` supplies the mapped ERR when one exists —
  * `out-of-scope` has none, and inventing an id would need a doctrine row to be
@@ -10356,11 +10196,11 @@ export function reportDriverHalt(cli: Cli, err: DriverHalt): number {
   return 1;
 }
 
-// D-053 state machine (DRIVER.md §1) — the ONLY command surface. The
+// The state machine (DRIVER.md §1) — the ONLY command surface. The
 // deterministic stages (plan/run/publish/push/verify/report) are internal steps
 // of these six; they have no standalone entry point.
 const HANDLERS: Record<string, (cli: Cli) => Promise<number>> = {
-  'sweep-start': (cli) => cmdSweepStart(cli), // real transport unless a test injects one (D-058)
+  'sweep-start': (cli) => cmdSweepStart(cli), // real transport unless a test injects one
   'sweep-abort': cmdSweepAbort,
   'next-case': cmdSweepNextCase,
   'report-case': (cli) => cmdSweepReportCase(cli),

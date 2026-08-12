@@ -1,6 +1,6 @@
 /**
- * scripts/sweep/sweep-machine.test.ts — the D-053 state machine
- * (SWEEP-STATE-MACHINE.md). Every mutating stage runs against throwaway git
+ * scripts/sweep/sweep-machine.test.ts — the sweep state machine
+ * (DRIVER.md §6). Every mutating stage runs against throwaway git
  * fixtures; the cold read (`claude -p`) and the GitHub transport are injected so
  * nothing spawns a real subprocess or touches the network.
  */
@@ -61,31 +61,9 @@ function mkWorkspace(): string {
   cleanups.push(() => rmSync(ws, { recursive: true, force: true }));
   return ws;
 }
-function emptyInventory(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'sm-inv-'));
-  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-  return dir;
-}
-/** Inventory with one feature carrying a recorded decision (prompt.decided_paths). */
-function decidedInventory(paths: string[]): string {
-  const dir = mkdtempSync(join(tmpdir(), 'sm-inv-'));
-  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-  const yaml = [
-    'id: prior-decision',
-    'name: prior-decision',
-    'kind: feat',
-    'status: shipped',
-    'branch: feat/none',
-    'prompt:',
-    '  decided_paths:',
-    ...paths.map((p) => `    - ${JSON.stringify(p)}`),
-  ].join('\n');
-  writeFileSync(join(dir, 'prior-decision.yaml'), yaml + '\n');
-  return dir;
-}
 /** Minimal inventory writer (id/branch/parents) — mirrors propagate.test.ts. */
 function writeInventory(
-  entries: Array<{ id: string; branch: string; parents?: string[]; owned?: string[] }>,
+  entries: Array<{ id: string; branch?: string; parents?: string[]; owned?: string[] }>,
 ): string {
   const dir = mkdtempSync(join(tmpdir(), 'sm-inv-'));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
@@ -94,14 +72,21 @@ function writeInventory(
       `id: ${e.id}`,
       `name: ${e.id}`,
       'kind: feat',
-      'status: shipped',
-      `branch: ${e.branch}`,
+      ...(e.branch ? [`branch: ${e.branch}`] : []),
       ...(e.parents ? ['parents:', ...e.parents.map((p) => `  - ${p}`)] : []),
       ...(e.owned ? ['owned_paths:', ...e.owned.map((p) => `  - ${JSON.stringify(p)}`)] : []),
     ].join('\n');
     writeFileSync(join(dir, `${e.id}.yaml`), yaml + '\n');
   }
   return dir;
+}
+/**
+ * Inventory with a single branchless entry: `sweep start` requires a
+ * non-empty, warning-free inventory (ERR46), and a branchless entry satisfies
+ * that while contributing nothing to scope (structural-only fixtures).
+ */
+function branchlessInventory(): string {
+  return writeInventory([{ id: 'planned.seed' }]);
 }
 function baseCli(repo: FixtureRepo, ws: string, inv: string, over: Partial<Cli> = {}): Cli {
   return {
@@ -112,7 +97,7 @@ function baseCli(repo: FixtureRepo, ws: string, inv: string, over: Partial<Cli> 
     scopeFile: join(inv, 'no-scope.yaml'), // non-existent -> empty scope (structural only)
     upstream: 'main',
     execute: false,
-    // Deps are installed INTO each worktree now (pools deleted 2026-08-04), and
+    // Deps are installed INTO each worktree, and
     // `createCaseWorktree` sits deep inside `cmdRun` — without this seam every
     // fixture case worktree would spawn a real `pnpm install`.
     installRunner: fakeInstall,
@@ -188,9 +173,9 @@ function currentCaseId(dir: string): string {
 const greenPreMerge: ChecksRunner = async () => ({ ok: true, failedNames: [], output: '' });
 
 /**
- * Dependency install stub. Pools were deleted 2026-08-04: deps are installed
+ * Dependency install stub. Deps are installed
  * INTO the worktree from its own manifests, so the stub creates the two trees
- * there. Tests must inject it — there is no fallback to the clone any more, and
+ * there. Tests must inject it — there is no fallback to the clone, and
  * a tree with no valid environment yields no verdict at all.
  */
 const fakeInstall: InstallRunner = async (wt) => {
@@ -211,11 +196,11 @@ const rejectCode: ColdReadInvoker = async () => ({
   feedback: 'restore the fork-side guard before re-reporting',
   defect: 'code',
 });
-// D-060: the cold read is the SINGLE quality gate and it lives at `report-case`.
+// The cold read is the SINGLE quality gate and it lives at `report-case`.
 // Any stage that must not cold-read gets this invoker — it fails the test loudly
 // instead of silently passing a second `claude -p` through.
 /**
- * A green checks runner for `start`'s BASE GATE (D-061 A). Tests that exercise
+ * A green checks runner for `start`. Tests that exercise
  * the PER-CASE gate need the base to pass, or `start` refuses with ERR42 and no
  * pass ever opens. Injected at start only; report-case gets its own runner.
  */
@@ -223,7 +208,7 @@ const rejectCode: ColdReadInvoker = async () => ({
 const neverInvoked: ColdReadInvoker = async () => {
   throw new Error('cold read invoked where D-060 forbids one');
 };
-// D-054: the cold-read TOOLING is broken (spawn/exit/unparseable/auth) — an infra
+// The cold-read TOOLING is broken (spawn/exit/unparseable/auth) — an infra
 // error, distinct from a content reject. Must halt (ERR35), never freeze HELD.
 const infraError: ColdReadInvoker = async () => ({
   verdict: 'error',
@@ -248,12 +233,12 @@ function fakeGithub(overrides: Record<string, { status: number; body: unknown }>
         if (method === 'GET' && path.includes('/pulls?')) return { status: 200, body: [] }; // no existing PR
         if (method === 'POST' && path.endsWith('/pulls'))
           return { status: 201, body: { html_url: 'https://github.com/k-fls/fixture/pull/7', number: 7 } };
-        if (method === 'GET' && /\/pulls\/\d+\/reviews/.test(path)) return { status: 200, body: [] }; // D-059 review trigger
-        if (method === 'GET' && /\/pulls\/\d+\/comments/.test(path)) return { status: 200, body: [] }; // D-059 inline dialog
+        if (method === 'GET' && /\/pulls\/\d+\/reviews/.test(path)) return { status: 200, body: [] }; // review trigger
+        if (method === 'GET' && /\/pulls\/\d+\/comments/.test(path)) return { status: 200, body: [] }; // inline dialog
         if (method === 'GET' && /\/pulls\/\d+$/.test(path))
           return { status: 200, body: { number: 7, merged: true, body: 'x' } };
         if (method === 'PATCH' && /\/pulls\/\d+$/.test(path)) return { status: 200, body: {} };
-        if (method === 'GET' && /\/issues\/\d+\/comments/.test(path)) return { status: 200, body: [] }; // D-059
+        if (method === 'GET' && /\/issues\/\d+\/comments/.test(path)) return { status: 200, body: [] }; // review-loop comments
         if (method === 'POST' && path.includes('/comments')) return { status: 201, body: {} };
         return { status: 404, body: null };
       },
@@ -264,11 +249,11 @@ function fakeGithub(overrides: Record<string, { status: number; body: unknown }>
 
 // ---------------------------------------------------------------------------
 
-describe('sweep start / abort (D-053 §2)', () => {
+describe('sweep start / abort (SWEEP-STATE-MACHINE.md §2)', () => {
   it('start refuses when a pass is already open — and ASKS THE OWNER rather than choosing', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     expect(await cmdSweepStart(baseCli(repo, ws, inv))).toBe(0);
     const out = join(ws, 'start2.json');
     expect(await cmdSweepStart(baseCli(repo, ws, inv, { out }))).toBe(1);
@@ -278,8 +263,8 @@ describe('sweep start / abort (D-053 §2)', () => {
       openPass: { phase: string; mergedLocally: number; prsPublished: number; casesOpen: number };
     };
     expect(res.issues[0].id).toBe('ERR30_PASS_OPEN');
-    // CONTINUE-or-ABORT is the OWNER's call. This used to say "run `finish` or
-    // `abort` first", which reads as a menu the agent picks from — and the two
+    // CONTINUE-or-ABORT is the OWNER's call. The instruction must not read as
+    // a menu the agent picks from ("run `finish` or `abort` first") — the two
     // are not interchangeable: resuming keeps the pass's merges and PRs, while
     // aborting rolls every touched branch back to its pre-ref. Which is right
     // depends on WHY the pass stopped, which the agent cannot know.
@@ -298,7 +283,7 @@ describe('sweep start / abort (D-053 §2)', () => {
   it('abort rolls mutated branches back to pre-ref and allows a fresh start', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const preRef = repo.sha('main_patched');
     await cmdSweepStart(baseCli(repo, ws, inv));
     await cmdSweepNextCase(baseCli(repo, ws, inv)); // merges the U0 prefix into main_patched
@@ -312,28 +297,60 @@ describe('sweep start / abort (D-053 §2)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// D-061 (A): the BASE GATE at `start`. Live 2026-07-28: the fork trunk had been
-// type-broken since fcee39ea (2026-07-04); the pass merged it into 11 branches
-// and only found out at finish, where verify went red with NO clean attribution
-// — an hour of work, no usable output, and a report asking a human to go fix it.
+// Start guard: the resolved inventory must be present, non-empty and
+// warning-free before a pass opens (ERR46).
+// ---------------------------------------------------------------------------
+
+describe('sweep start — inventory guard (ERR46)', () => {
+  it('refuses with ERR46 when the --inventory dir holds an entry with an unknown key', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = mkdtempSync(join(tmpdir(), 'sm-inv-'));
+    cleanups.push(() => rmSync(inv, { recursive: true, force: true }));
+    writeFileSync(join(inv, 'bad.yaml'), 'id: bad\nname: bad\nkind: feat\nbranch: feat/none\nstatus: shipped\n');
+    const out = join(ws, 'start.json');
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { out }))).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string; detail: string }> };
+    const issue = res.issues.find((i) => i.id === 'ERR46_INVENTORY_INVALID');
+    expect(issue).toBeTruthy();
+    expect(issue!.detail).toContain("unknown key 'status'");
+    expect(existsSync(join(ws, 'propagation'))).toBe(false);
+  });
+
+  it('proceeds when no residue exists and the inventory is valid, pinning the resolved path into machine state', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    expect(await cmdSweepStart(baseCli(repo, ws, inv))).toBe(0);
+    const st = JSON.parse(readFileSync(join(dirOf(repo, ws), 'machine-state.json'), 'utf8')) as {
+      phase: string;
+      inventory?: string;
+    };
+    expect(st.phase).toBe('open');
+    expect(st.inventory).toBe(inv);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `start` and a red base.
 // ---------------------------------------------------------------------------
 
 /**
- * The D-061 BASE GATE IS GONE (owner decision, 2026-07-30). `start` no longer
- * typechecks the base, no longer refuses or gates a red one, and keeps no
- * `sweep-base-gate-attempts.json`. A red base is found at `finish`'s verify and
- * served as an ordinary gate-fix case on the branch that owns the failing files
+ * `start` has NO base gate: it does not typecheck the base, does not refuse or
+ * gate a red one, and keeps no `sweep-base-gate-attempts.json`. A red base is
+ * found at `finish`'s verify and served as an ordinary gate-fix case on the
+ * branch that owns the failing files
  * — see 'sweep finish — gate-fix on an unattributable red', which also covers
- * the sub-cwd path normalisation this block used to test through the base gate.
+ * sub-cwd path normalisation.
  *
- * What remains at `start` is the MALFORMED-checks refusal, which never depended
- * on the gate: it READS the file, it does not run it.
+ * What `start` does keep is the MALFORMED-checks refusal, which never depended
+ * on a gate: it READS the file, it does not run it.
  */
 describe('sweep start — no base gate; malformed checks still LOUD', () => {
-  it('a RED base no longer refuses, gates, or writes a side-car record', async () => {
+  it('a RED base does not refuse, gate, or write a side-car record', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const checks = join(ws, 'checks.json');
     // A typecheck that would FAIL if start still ran it.
     writeFileSync(checks, JSON.stringify({ typecheck: [{ cmd: 'exit 1' }], test: [] }));
@@ -357,7 +374,7 @@ describe('sweep start — no base gate; malformed checks still LOUD', () => {
   it('DEFECT 7 — a MALFORMED checks file is LOUD, never a silent skip', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const bad = join(ws, 'checks.json');
     writeFileSync(bad, '{ "typecheck": [ {"cmd": "tsc --noEmit"} ,,, ]\n'); // truncated/invalid JSON
     const out = join(ws, 'start.json');
@@ -372,11 +389,11 @@ describe('sweep start — no base gate; malformed checks still LOUD', () => {
 });
 
 
-describe('sweep next-case (D-053 §2)', () => {
+describe('sweep next-case (SWEEP-STATE-MACHINE.md §2)', () => {
   it('advances the clean prefix and serves the conflict case with materials', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
     const out = join(ws, 'nc.json');
@@ -403,7 +420,7 @@ describe('sweep next-case (D-053 §2)', () => {
   it('a clean pass with no conflict returns finalize', async () => {
     const repo = cleanFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     await cmdSweepStart(baseCli(repo, ws, inv));
     const out = join(ws, 'nc.json');
     expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out }))).toBe(0);
@@ -411,7 +428,7 @@ describe('sweep next-case (D-053 §2)', () => {
   });
 });
 
-describe('sweep report-case (D-053 §2)', () => {
+describe('sweep report-case (SWEEP-STATE-MACHINE.md §2)', () => {
   async function toCase(repo: FixtureRepo, ws: string, inv: string): Promise<string> {
     await cmdSweepStart(baseCli(repo, ws, inv));
     await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
@@ -421,7 +438,7 @@ describe('sweep report-case (D-053 §2)', () => {
   it('mechanical: injected cold read confirm -> merge in place', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     const caseId = await toCase(repo, ws, inv);
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
@@ -443,7 +460,7 @@ describe('sweep report-case (D-053 §2)', () => {
   it('mechanical with an untouched worktree -> ERR32 (resolve first, no freeze)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const caseId = await toCase(repo, ws, inv);
     const out = join(ws, 'rc.json');
     expect(
@@ -457,10 +474,10 @@ describe('sweep report-case (D-053 §2)', () => {
     expect(readJournal(dirOf(repo, ws)).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
   });
 
-  it('judged: cold read HERE (D-060) confirms -> provide PR description, NOT merged yet (merge lands at report-pr)', async () => {
+  it('judged: cold read HERE confirms -> provide PR description, NOT merged yet (merge lands at report-pr)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     const caseId = await toCase(repo, ws, inv);
     const beforeTip = repo.sha('main_patched');
@@ -480,8 +497,8 @@ describe('sweep report-case (D-053 §2)', () => {
     expect(res.instruction).toContain('use only this template');
     expect(res.tier).toBe('judged');
     expect(repo.sha('main_patched')).toBe(beforeTip); // NOT merged yet (report-pr merges)
-    // D-060: the single quality gate (cold read) now runs at report-case for
-    // judged too — the coldread row exists here (no longer deferred to report-pr).
+    // The single quality gate (cold read) runs at report-case for
+    // judged too — the coldread row exists here, not at report-pr.
     expect(readJournal(dir).some((e) => e.action === 'coldread' && e.caseId === caseId)).toBe(true);
     const st = machineState(dir);
     expect(st.phase).toBe('awaiting-pr');
@@ -496,78 +513,6 @@ describe('sweep report-case (D-053 §2)', () => {
     expect(prMaterials).toMatch(/## theirs \(`[^`]+`\) — same range on the other side/);
     // No hunk ranges here: the conflict is RESOLVED by this point.
     expect(prMaterials).not.toContain('hunk(s) at lines');
-  });
-
-  it('ERR05 decided-already + JUDGED claim: NOT blocked — applying the recorded decision as judged IS the forward path (#65)', async () => {
-    const repo = conflictFixture();
-    const ws = mkWorkspace();
-    const inv = decidedInventory(['src/x.ts']); // a recorded decision covers the conflicted path
-    const dir = dirOf(repo, ws);
-    const caseId = await toCase(repo, ws, inv);
-    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED per recorded decision\n' });
-    const out = join(ws, 'rc.json');
-    // Before #65 this looped: report-case fired ERR05 regardless of tier, and
-    // --tier judged (the prescribed action) re-hit it with no exit.
-    expect(
-      await cmdSweepReportCase(
-        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true, out }),
-        confirm,
-      ),
-    ).toBe(0);
-    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; tier: string; issues?: Array<{ id: string }> };
-    expect(res.tier).toBe('judged');
-    // The instruction now carries the case's own PR template path — the agent is
-    // given ONE template rather than left to find the repo's (live: PR #61).
-    expect(res.instruction).toContain('provide PR description');
-    expect(res.instruction).toContain('pr/TEMPLATE.md');
-    expect(res.instruction).toContain('use only this template');
-    expect((res.issues ?? []).some((i) => i.id === 'ERR05_DECIDED_ALREADY')).toBe(false);
-    expect(machineState(dir).phase).toBe('awaiting-pr');
-  });
-
-  it('ERR05 decided-already + MECHANICAL claim: STILL blocked -> steered to judged (#65 must not over-open the gate)', async () => {
-    const repo = conflictFixture();
-    const ws = mkWorkspace();
-    const inv = decidedInventory(['src/x.ts']);
-    const dir = dirOf(repo, ws);
-    const caseId = await toCase(repo, ws, inv);
-    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
-    const out = join(ws, 'rc.json');
-    expect(
-      await cmdSweepReportCase(
-        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
-        confirm,
-      ),
-    ).toBe(1);
-    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; issues: Array<{ id: string }> };
-    expect(res.issues.some((i) => i.id === 'ERR05_DECIDED_ALREADY')).toBe(true);
-    expect(res.instruction).toContain('apply the recorded decision (judged)');
-    expect(readJournal(dir).some((e) => e.action === 'resolved' && e.caseId === caseId)).toBe(false); // blocked before merge
-  });
-
-  it('ERR05 decided-already is FIRST-ATTEMPT-ONLY: 1st held report steers, 2nd disposes — no loop (#65 finding A)', async () => {
-    const repo = conflictFixture();
-    const ws = mkWorkspace();
-    const inv = decidedInventory(['src/x.ts']);
-    const dir = dirOf(repo, ws);
-    const caseId = await toCase(repo, ws, inv);
-    const out = join(ws, 'rc.json');
-    // Attempt 1 (held, decided path): ERR05 fires ONCE — the steer.
-    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED variant 1\n' });
-    expect(
-      await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true, out }), confirm),
-    ).toBe(1);
-    expect((JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> }).issues.some((i) => i.id === 'ERR05_DECIDED_ALREADY')).toBe(true);
-    // Attempt 2 (distinct tree): ERR05 is quiet now (not the first attempt), so
-    // the case reaches its HELD freeze instead of looping forever.
-    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED variant 2\n' });
-    expect(
-      await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true, out }), confirm),
-    ).toBe(0);
-    const res2 = JSON.parse(readFileSync(out, 'utf8')) as { tier: string; issues?: Array<{ id: string }> };
-    expect(res2.tier).toBe('held');
-    expect((res2.issues ?? []).some((i) => i.id === 'ERR05_DECIDED_ALREADY')).toBe(false);
-    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
   });
 
   it('ERR06 finding B: a duplicate of a HELD topmost CONSOLIDATES (held-duplicate), never wedges finish', async () => {
@@ -611,10 +556,10 @@ describe('sweep report-case (D-053 §2)', () => {
     expect((JSON.parse(readFileSync(out, 'utf8')) as { status: string }).status).toBe('finalize');
   });
 
-  it('scope exceeded + cold read AGREES -> HELD publishing the RESOLUTION (escalated, no merge) — D-057 #3', async () => {
+  it('scope exceeded + cold read AGREES -> HELD publishing the RESOLUTION (escalated, no merge)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     const caseId = await toCase(repo, ws, inv);
     const postRun = repo.sha('main_patched');
@@ -635,9 +580,9 @@ describe('sweep report-case (D-053 §2)', () => {
     expect(res.instruction).toContain('use only this template');
     expect(repo.sha('main_patched')).toBe(postRun); // no merge
     // Blocked ⇔ the journaled held disposition; nothing is published here and
-    // no durable local state is written (D-058).
+    // no durable local state is written.
     expect(readJournal(dir).some((e) => e.action === 'pr-published')).toBe(false);
-    expect(existsSync(join(ws, 'sweep-ledger.json'))).toBe(false); // no durable local state (2026-08-04)
+    expect(existsSync(join(ws, 'sweep-ledger.json'))).toBe(false); // no durable local state
     // The cold read RAN (not demoted before it) and the held entry carries the
     // marker-clean resolution + the scope escalation for the unified publish.
     expect(readJournal(dir).some((e) => e.action === 'coldread' && e.caseId === caseId)).toBe(true);
@@ -650,7 +595,7 @@ describe('sweep report-case (D-053 §2)', () => {
   it('markerClean covers EXTRA changed files: a marker left in a scope-exceeded file is NOT marker-clean (draft, not active)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     const caseId = await toCase(repo, ws, inv);
     // The conflicted path is resolved clean, but the scope-exceeded EXTRA file
@@ -669,10 +614,10 @@ describe('sweep report-case (D-053 §2)', () => {
     expect((held.resolution as { markerClean: boolean }).markerClean).toBe(false);
   });
 
-  it('mechanical cold-read reject: 1st -> revise with feedback (still case-ready); 2nd -> HELD escalated (D-057 #4)', async () => {
+  it('mechanical cold-read reject: 1st -> revise with feedback (still case-ready); 2nd -> HELD escalated', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     const caseId = await toCase(repo, ws, inv);
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
@@ -704,10 +649,10 @@ describe('sweep report-case (D-053 §2)', () => {
     expect(machineState(dir).currentCase?.tier).toBe('held');
   });
 
-  it('judged cold-read reject (D-060: the gate is HERE, not at report-pr): 1st -> revise, 2nd -> HELD escalated, never merged', async () => {
+  it('judged cold-read reject (the gate is HERE, not at report-pr): 1st -> revise, 2nd -> HELD escalated, never merged', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     const caseId = await toCase(repo, ws, inv);
     const beforeTip = repo.sha('main_patched');
@@ -740,13 +685,13 @@ describe('sweep report-case (D-053 §2)', () => {
     expect(machineState(dir).currentCase?.tier).toBe('held');
   });
 
-  it('per-case attempt cap force-HELD after RESOLVE_COLDREAD_CAP distinct cold-read-reaching trees (D-060 5b)', async () => {
+  it('per-case attempt cap force-HELD after RESOLVE_COLDREAD_CAP distinct cold-read-reaching trees', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     const caseId = await toCase(repo, ws, inv);
-    // D-060: report-attempt is recorded POST-CHECKS (5b), so the cap counts only
+    // report-attempt is recorded POST-CHECKS, so the cap counts only
     // cold-read-reaching (RESOLVED, checks-passing) trees. Seed CAP prior
     // report-attempt rows with distinct trees, then report ONE more distinct
     // RESOLVED tree: 5b sees >CAP distinct and force-freezes HELD ACTIVE with the
@@ -777,12 +722,12 @@ describe('sweep report-case (D-053 §2)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// D-060 §5a: the CHECKS GATE (typecheck THEN tests) at report-case. The runner
+// The CHECKS GATE (typecheck THEN tests) at report-case. The runner
 // is injected (3rd param) so nothing spawns a real pnpm/bun; the checks-file is
 // resolved + pinned by `start`, so these fixtures pass it there and never again.
 // ---------------------------------------------------------------------------
 
-describe('sweep report-case — the checks gate (D-060 §5a)', () => {
+describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
   /** A checks-file the fake runner keys off (the cmd strings are just labels). */
   function checksFile(ws: string, over: Partial<{ typecheck: string[]; test: string[] }> = {}): string {
     const f = join(ws, 'checks.json');
@@ -823,7 +768,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
   it('typecheck RED -> ERR36 (fix + re-run), tests never run, NO cold read, NO report-attempt, still case-ready', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const checks = checksFile(ws);
     const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
     const r = runner(['tsc --noEmit']);
@@ -854,7 +799,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
   it('tests RED -> ERR40_TESTS_FAILED; a fixed re-report passes both, journals checks-pass, and reaches the cold read', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const checks = checksFile(ws);
     const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
     const red = runner(['vitest run']);
@@ -889,7 +834,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
   it('CHECKS_FAIL_LIMIT consecutive failures -> HELD DRAFT at the PRISTINE conflict (the failing resolution is never published)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const checks = checksFile(ws);
     const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
     // Seed LIMIT-1 prior failures, then fail once more to reach the backstop.
@@ -931,7 +876,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
   it('a passing run RESETS the counter: LIMIT-1 failures, then a pass, then a failure is strike 1 again (no premature HELD)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const checks = checksFile(ws);
     const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
     const jp = join(dir, 'journal.jsonl');
@@ -963,19 +908,19 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
   });
 
   /**
-   * DEADLOCK (live 2026-08-01). `--tier held` is the documented escape when the
+   * DEADLOCK SHAPE. `--tier held` is the documented escape when the
    * agent cannot make a case green, and doctrine's ERR36 row explicitly sends it
    * here when the failing file is out of scope. But the pristine-held branch
-   * requires `conflictsPresent`, so an agent that HAS resolved the conflict fell
-   * through to the checks gate and got ERR40 "fix the pending files" — which was
-   * impossible: the conflict was `src/cli/resources/groups.ts`, the failing test
-   * `container/agent-runner/src/poll-loop.test.ts` from upstream. It claimed held
-   * twice, was refused twice, and filed a stop-case. It was right.
+   * requires `conflictsPresent`, so an agent that HAS resolved the conflict falls
+   * through to the checks gate and gets ERR40 "fix the pending files" — which can
+   * be impossible: the conflict is `src/cli/resources/groups.ts`, the failing test
+   * `container/agent-runner/src/poll-loop.test.ts` from upstream. An agent that
+   * claims held, is refused, and files a stop-case is right.
    */
   it('an explicit --tier held with FAILING checks is honoured now, not after 10 tries', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const checks = checksFile(ws, { typecheck: ['true'], test: ['false'] }); // tests fail
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }), undefined);
@@ -1007,7 +952,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
   it('a HELD claim on a pristine conflict SKIPS the gate entirely (nothing to typecheck)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const checks = checksFile(ws);
     await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
     await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
@@ -1030,12 +975,11 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
   it('the case worktree gets its deps INSTALLED (not the clone linked), so the gate can run', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     // A `git worktree add` checkout has no `node_modules`, so without this the
     // gate dies `tsc: not found` on EVERY case — a failure no agent edit can fix,
-    // marching every case to the CHECKS_FAIL_LIMIT force-HELD. Pools used to
-    // supply it and were deleted (2026-08-04); the install now runs IN the
-    // worktree, from the manifests that worktree carries.
+    // marching every case to the CHECKS_FAIL_LIMIT force-HELD. The install runs
+    // IN the worktree, from the manifests that worktree carries.
     await cmdSweepStart(baseCli(repo, ws, inv));
     await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const dir = dirOf(repo, ws);
@@ -1048,7 +992,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
       expect(lstatSync(join(wt, rel)).isSymbolicLink()).toBe(false);
     }
     expect(existsSync(join(wt, 'node_modules', '.bin', 'tsc'))).toBe(true);
-    // REGRESSION (live bug, 2026-07-28): `.gitignore` has `node_modules/` — a
+    // REGRESSION GUARD: `.gitignore` has `node_modules/` — a
     // trailing slash matches DIRECTORIES ONLY. The per-worktree info/exclude is
     // what actually keeps the installed trees out of the resolved tree, the merge
     // and the PR. Assert on TREE MODES, not on a name: the original name-only
@@ -1065,7 +1009,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
   it('the per-worktree info/exclude is what hides the links (anchored, slash-free, uncommitted)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     for (const rel of ['node_modules', 'container/agent-runner/node_modules']) {
       mkdirSync(join(repo.dir, rel), { recursive: true });
       writeFileSync(join(repo.dir, rel, 'marker.txt'), 'x\n');
@@ -1088,7 +1032,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
   it('no checks-file in the repo -> the gate is SKIPPED (no checks rows), the cold read still gates', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     // start with NO --checks-file: the default <repo>/scripts/sweep/checks.json
     // does not exist in the fixture, so loadChecksConfig yields null.
     await cmdSweepStart(baseCli(repo, ws, inv));
@@ -1111,9 +1055,9 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
     expect(repo.git('show', 'main_patched:src/x.ts')).toBe('RESOLVED');
   });
 
-  // ---- `--not-my-bug` (2026-08-03) ---------------------------------------
+  // ---- `--not-my-bug` ------------------------------------------------------
   //
-  // The 08-01 deadlock end to end: a failure the case did not cause, which the
+  // The not-my-bug deadlock end to end: a failure the case did not cause, which the
   // agent may not fix in scope and could not escape. `runner` above emits output
   // that names no file, so these use a variant that does — the comparison is
   // file-identity based and there is nothing to compare without it.
@@ -1143,7 +1087,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
   it('--not-my-bug on the FIRST failure is ignored, and says why (the agent may not run tests)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const checks = checksFile(ws);
     const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
     const r = namingRunner(['tsc --noEmit'], 'src/util.ts');
@@ -1166,7 +1110,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
   it('the ERR payload ADVERTISES the hatch — the only message that tells the agent a check failed', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const checks = checksFile(ws);
     const { dir } = await toResolvedCase(repo, ws, inv, checks);
     expect(dir).toBeTruthy();
@@ -1184,7 +1128,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
   it('CONFIRMED pre-existing -> merge aborted, gate-fix case minted, case superseded', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const checks = checksFile(ws);
     const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
     seedPriorFailure(dir, caseId, 'typecheck', ['tsc --noEmit']);
@@ -1237,7 +1181,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
   it('REFUSED -> the gate names which failures are the agent’s own', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const checks = checksFile(ws);
     const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
     seedPriorFailure(dir, caseId, 'typecheck', ['tsc --noEmit']);
@@ -1273,13 +1217,13 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
   });
 
   it('minting a gate fix SUPERSEDES the descendants’ open cases, so only the fix is left to serve', async () => {
-    // Live 2026-08-04: eleven open cases sat ahead of the gate fix, every one of
-    // them merging from a branch that carried the red commit. Each would fail the
+    // Open cases ahead of the gate fix, each merging from a branch that carries
+    // the red commit, would each fail the
     // same checks, pay a full adjudication, hit the `gateFixKey` anti-loop and
-    // fall back to `--tier held` — eleven junk PRs for one defect.
+    // fall back to `--tier held` — a queue of junk PRs for one defect.
     //
-    // Every other blocking path reopens `[branch, ...descendants]`; this one
-    // reopened the branch alone. Reopening the subtree supersedes their cases,
+    // Every blocking path reopens `[branch, ...descendants]`, this one
+    // included. Reopening the subtree supersedes their cases,
     // and the open-gate-fix guard stops `cmdRun` re-deriving them, so no priority
     // rule is needed — the gate fix is simply the only case left.
     const repo = conflictFixture();
@@ -1327,20 +1271,15 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
   });
 
   it('a TIMEOUT gate fix is served as an ORDINARY fix case — no gag in the materials', async () => {
-    // `diagnosisOnly` used to fire here: `isTimeoutFailure` grepped the verify
-    // output for "timed out" and the briefing then said DO NOT ATTEMPT A FIX.
-    // It was deleted — the failure that motivated it reproduced 3/3 and was a
-    // deterministic test-isolation bug, so the checks gate could verify a fix
-    // perfectly well, and the gag only guaranteed the base stayed broken. The
-    // termination problem it was really covering belongs to the serve bound.
-    // The flag was journaled on the `gate-fix` row while `gateFixCaseMaterials`
-    // reads the `case` row, so it never reached the agent: the journal said
-    // `diagnosisOnly: true` and the briefing still said "fix it". Caught live
-    // 2026-08-05 only because the agent kept investigating. Assert the MATERIALS
-    // — the thing the agent actually reads — not the flag.
+    // There is no `diagnosisOnly` gag for timeouts: a reproducible timeout is
+    // usually a deterministic test-isolation bug the checks gate can verify a
+    // fix for perfectly well, and a "DO NOT ATTEMPT A FIX" briefing would only
+    // guarantee the base stays broken. The termination problem such a gag
+    // would cover belongs to the serve bound. Assert the MATERIALS
+    // — the thing the agent actually reads — not a flag.
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const checks = checksFile(ws);
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
@@ -1381,19 +1320,20 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
   });
 
   it('a gate fix the agent cannot fix IN SCOPE becomes a HELD PR carrying the diagnosis', async () => {
-    // Owner, 2026-08-04: "reproducible-but-unfixable-in-scope should lead to held
-    // PR — there is no other way." The category is real and had nowhere to go:
+    // Owner rule: "reproducible-but-unfixable-in-scope should lead to held
+    // PR — there is no other way." The category is real:
     // the failure REPRODUCES (not `flaky`), it is genuinely pre-existing (not the
     // agent's), and no edit inside the NAMED files can fix it — because a gate
     // fix is scoped to where the failure was REPORTED, which is not where the fix
     // belongs (a failing test names the test, not the source).
     //
-    // Before: `--tier held` on an unchanged tree hit ERR32 and was told to "edit
-    // the files or report to the owner" — but reporting is not a driver action,
-    // so the case dead-ended and the agent burned attempts until it was reaped.
+    // Without this path, `--tier held` on an unchanged tree hits ERR32 and is
+    // told to "edit the files or report to the owner" — but reporting is not a
+    // driver action, so the case dead-ends and the agent burns attempts until
+    // it is reaped.
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const checks = checksFile(ws);
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
@@ -1473,10 +1413,10 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
   });
 
   it('a PARENT-owned gate fix supersedes the PARENT’s other children too', async () => {
-    // Live 2026-08-05: ownership routed to `module/agent-group-contributions`,
-    // the fix was minted there, but only the CASE branch's subtree was reopened —
-    // so the parent's OTHER children kept their cases, sorted ahead of the fix,
-    // and were served first. The same junk-PR queue this reopen prevents, one
+    // When ownership routes to a PARENT branch, the fix is minted there;
+    // reopening only the CASE branch's subtree would leave the parent's OTHER
+    // children with their cases, sorted ahead of the fix,
+    // and served first. The same junk-PR queue this reopen prevents, one
     // level up: everything under a blocked branch is blocked, wherever the case
     // that found it happened to live.
     const repo = conflictFixture();
@@ -1531,14 +1471,14 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
   });
 
   it('refuses to mint a gate fix on UPSTREAM main, and reports it instead', async () => {
-    // Live 2026-08-04: an ownership probe of upstream's head ran with the wrong
-    // dependencies, came back red for a module upstream actually declares,
-    // ownership moved to the parent, a bisect converged, and the driver minted
-    // `gate-fix-main-c1e3ddc6`. A fix committed to upstream could not be pushed
-    // anywhere the fork controls — the case was unusable by construction.
+    // An ownership probe of upstream's head can come back red (e.g. run with
+    // the wrong dependencies for a module upstream actually declares) and a
+    // bisect can then converge on upstream `main` itself. A fix committed to
+    // upstream could not be pushed
+    // anywhere the fork controls — such a case is unusable by construction.
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const checks = checksFile(ws);
     const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
     seedPriorFailure(dir, caseId, 'typecheck', ['tsc --noEmit']);
@@ -1561,7 +1501,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
   it('a failure IN a conflicted path is refused without probing — it is the agent’s by definition', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const checks = checksFile(ws);
     const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
     seedPriorFailure(dir, caseId, 'typecheck', ['tsc --noEmit']);
@@ -1590,7 +1530,7 @@ describe('sweep report-case — the checks gate (D-060 §5a)', () => {
   });
 });
 
-describe('sweep report-pr (D-053 §2)', () => {
+describe('sweep report-pr (SWEEP-STATE-MACHINE.md §2)', () => {
   async function toAwaiting(
     repo: FixtureRepo,
     ws: string,
@@ -1607,10 +1547,10 @@ describe('sweep report-pr (D-053 §2)', () => {
     return { dir, caseId };
   }
 
-  it('held: single cold read over code+desc -> records intent, PUBLISHES NOTHING; finish creates the draft PR post-verify (D-058)', async () => {
+  it('held: single cold read over code+desc -> records intent, PUBLISHES NOTHING; finish creates the draft PR post-verify', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     const tokenFile = join(ws, 'tok.txt');
@@ -1647,7 +1587,7 @@ describe('sweep report-pr (D-053 §2)', () => {
     expect(pub.mode).toBe('held');
     expect(pub.draft).toBe(true);
     // Ordering: the held PR is created AFTER the pass's target push and AFTER
-    // the green verify (all PRs at finish, post-verify — D-058).
+    // the green verify (all PRs at finish, post-verify).
     const pubIdx = journal.findIndex((e) => e.action === 'pr-published' && e.caseId === caseId);
     const pushIdx = journal.findIndex((e) => e.action === 'push' && e.kind === 'target');
     const verifyIdx = journal.findIndex((e) => e.action === 'verify' && e.ok === true);
@@ -1664,7 +1604,7 @@ describe('sweep report-pr (D-053 §2)', () => {
   it('held with a MARKER-CLEAN resolution (scope-exceeded confirm) -> intent (active) at report-pr; finish creates the ACTIVE PR with the prefix', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     const tokenFile = join(ws, 'tok.txt');
@@ -1723,7 +1663,7 @@ describe('sweep report-pr (D-053 §2)', () => {
   it('judged: records PR intent + merges locally, NO push / NO PR created', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const { dir, caseId } = await toAwaiting(repo, ws, inv, 'judged');
     const out = join(ws, 'pr.json');
     expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), confirm)).toBe(0);
@@ -1736,10 +1676,10 @@ describe('sweep report-pr (D-053 §2)', () => {
     expect(readJournal(dir).some((e) => e.action === 'push')).toBe(false);
   });
 
-  it('D-060: report-pr runs NO cold read — the invoker is never called; the PR text is recorded as-is', async () => {
+  it('report-pr runs NO cold read — the invoker is never called; the PR text is recorded as-is', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const { dir, caseId } = await toAwaiting(repo, ws, inv, 'judged');
     const coldreads = (): number =>
       readJournal(dir).filter((e) => e.action === 'coldread' && e.caseId === caseId).length;
@@ -1759,10 +1699,10 @@ describe('sweep report-pr (D-053 §2)', () => {
     expect(machineState(dir).phase).toBe('open');
   });
 
-  it('D-060: the H1 first line of pr/body.md IS the title (no title.txt); a body with no H1 is ERR08', async () => {
+  it('the H1 first line of pr/body.md IS the title (no title.txt); a body with no H1 is ERR08', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     await cmdSweepStart(baseCli(repo, ws, inv));
     await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const dir = dirOf(repo, ws);
@@ -1772,7 +1712,7 @@ describe('sweep report-pr (D-053 §2)', () => {
     const prDir = join(dir, caseId, 'pr');
     mkdirSync(prDir, { recursive: true });
     const out = join(ws, 'pr.json');
-    // No H1, no title.txt -> the driver never invents PR prose (D-048).
+    // No H1, no title.txt -> the driver never invents PR prose.
     writeFileSync(join(prDir, 'body.md'), 'Decision needed: resolution of src/x.ts.\n');
     expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true, out }), neverInvoked)).toBe(
       1,
@@ -1796,7 +1736,7 @@ describe('sweep report-pr (D-053 §2)', () => {
   });
 });
 
-describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
+describe('sweep finish (SWEEP-STATE-MACHINE.md §2) — multi-step, resumable', () => {
   const passCmds = (ws: string): string => {
     const f = join(ws, 'cmds-true.json');
     writeFileSync(f, JSON.stringify([{ cmd: 'true' }]));
@@ -1811,7 +1751,7 @@ describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
   it('verify green -> creates the JUDGED PR, then pushes the target (closure confirmed), in order', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
@@ -1847,10 +1787,10 @@ describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
     expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).toBe(repo.sha('main_patched'));
   });
 
-  it('D-060: RED TESTS at finish stop the pass — nothing LANDS, but held escalations still publish; a re-run with a green gate completes', async () => {
+  it('RED TESTS at finish stop the pass — nothing LANDS, but held escalations still publish; a re-run with a green gate completes', async () => {
     const repo = cleanFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
@@ -1881,13 +1821,13 @@ describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
     // NOTHING LANDS — that is what the red gate guarantees, and it still holds.
     expect(readJournal(dir).some((e) => e.action === 'finish-tests-failed')).toBe(true);
     expect(readJournal(dir).some((e) => e.action === 'push')).toBe(false);
-    // ...but the ESCALATIONS are published (2026-08-05). A held PR is a REVIEW
+    // ...but the ESCALATIONS are published. A held PR is a REVIEW
     // ref the owner merges; it never touches a target branch, and the red is
-    // very often the thing it is ABOUT. Live: a gate fix whose real fix lived
-    // outside the case's named files was correctly claimed `--tier held`, which
-    // meant it was not merged, which kept verify red, which suppressed the
-    // publish — so the PR carrying the two-line fix never reached GitHub and the
-    // sweep reported "nothing published" while holding the answer.
+    // very often the thing it is ABOUT: a gate fix whose real fix lives
+    // outside the case's named files is correctly claimed `--tier held`, so it
+    // is not merged and verify stays red — suppressing the
+    // publish would keep the PR carrying the fix off GitHub while the
+    // sweep reports "nothing published" holding the answer.
     expect(f1.instruction).toContain('NOTHING was merged or pushed');
     expect(f1.instruction).toContain('held review PR');
     // Re-run from the verify phase with a green gate -> completes; push not redone before.
@@ -1901,10 +1841,10 @@ describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
     expect(machineState(dir).phase).toBe('complete');
   });
 
-  it('a failed target push (ERR15 per-branch, D-059 FINAL) -> finish reports PARTIAL (no hard halt); re-running after the fix completes without re-pushing', async () => {
+  it('a failed target push (ERR15 per-branch) -> finish reports PARTIAL (no hard halt); re-running after the fix completes without re-pushing', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
@@ -1957,7 +1897,7 @@ describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
   it('held publish crash window (finding #1): PR exists API-side but the pr-published row was lost -> finish RECONCILES and completes, no duplicate PR, no halt', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
@@ -2071,11 +2011,11 @@ describe('sweep finish (D-053 §2) — multi-step, resumable', () => {
   });
 });
 
-describe('sweep — crash resume (machine-state drives re-entry, D-053 §5)', () => {
+describe('sweep — crash resume (machine-state drives re-entry, SWEEP-STATE-MACHINE.md §5)', () => {
   it('a re-invoked next-case re-serves the same open case idempotently', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
     await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
@@ -2095,7 +2035,7 @@ describe('sweep — crash resume (machine-state drives re-entry, D-053 §5)', ()
   });
 });
 
-describe('sweep progress — SWEEP-STEP observability (D-054)', () => {
+describe('sweep progress — SWEEP-STEP observability', () => {
   // Capture STDOUT faithfully: `progress` goes through process.stdout.write, `emit`
   // through console.log — both land on fd 1 (interleaved) in production, but under
   // vitest console.log is intercepted separately, so we swap BOTH into one shared,
@@ -2121,7 +2061,7 @@ describe('sweep progress — SWEEP-STEP observability (D-054)', () => {
       },
     };
   }
-  // The TWO-PREFIX contract (D-054): SWEEP-STEP lines are relayed progress;
+  // The TWO-PREFIX contract: SWEEP-STEP lines are relayed progress;
   // SWEEP-RESULT is the SINGLE guidance line (compact JSON) the agent acts on;
   // any BARE JSON line (a line starting with `{`) would be a nested command that
   // failed to be silenced — the hazard this closes, so we assert there are none.
@@ -2138,7 +2078,7 @@ describe('sweep progress — SWEEP-STEP observability (D-054)', () => {
   it('report-case mechanical: interleaved SWEEP-STEP lines, exactly one SWEEP-RESULT line that parses to the guidance', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
     await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
@@ -2173,7 +2113,7 @@ describe('sweep progress — SWEEP-STEP observability (D-054)', () => {
   it('next-case: batched merge summary + case-ready steps, and cmdRun (internal) emits NO JSON — exactly one SWEEP-RESULT', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     await cmdSweepStart(baseCli(repo, ws, inv));
 
     const cap = captureStdout();
@@ -2200,7 +2140,7 @@ describe('sweep progress — SWEEP-STEP observability (D-054)', () => {
   it('next-case on a clean pass: batched summary, `no more cases`, one finalize SWEEP-RESULT, no bare JSON', async () => {
     const repo = cleanFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     await cmdSweepStart(baseCli(repo, ws, inv));
 
     const cap = captureStdout();
@@ -2220,7 +2160,7 @@ describe('sweep progress — SWEEP-STEP observability (D-054)', () => {
   it('finish: nested verify/publish/push (internal) emit NO JSON — exactly one SWEEP-RESULT for the whole command', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
@@ -2266,7 +2206,7 @@ describe('sweep progress — SWEEP-STEP observability (D-054)', () => {
   });
 });
 
-describe('cold-read infra failure ≠ content reject (D-054, ERR35_COLDREAD_UNAVAILABLE)', () => {
+describe('cold-read infra failure ≠ content reject (ERR35_COLDREAD_UNAVAILABLE)', () => {
   it('parseMachineVerdict: a valid confirm/reject is content; unparseable OR auth text is an infra error', () => {
     expect(parseMachineVerdict('noise\n{"verdict":"confirm","notes":"ok"}\n').verdict).toBe('confirm');
     expect(parseMachineVerdict('{"verdict":"reject","notes":"drops behaviour"}').verdict).toBe('reject');
@@ -2280,7 +2220,7 @@ describe('cold-read infra failure ≠ content reject (D-054, ERR35_COLDREAD_UNAV
     expect(auth.reason).toMatch(/auth\/login failure/i);
   });
 
-  it('parseMachineVerdict: the 1-2 line `feedback` field is carried through and BOUNDED (D-057)', () => {
+  it('parseMachineVerdict: the 1-2 line `feedback` field is carried through and BOUNDED', () => {
     const withFeedback = parseMachineVerdict(
       '{"verdict":"reject","notes":"drops behaviour","feedback":"restore the fork guard in src/x.ts"}',
     );
@@ -2298,7 +2238,7 @@ describe('cold-read infra failure ≠ content reject (D-054, ERR35_COLDREAD_UNAV
   it('report-case mechanical: infra error -> HARD HALT (ERR35), case NOT held, still case-ready', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
     await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
@@ -2324,7 +2264,7 @@ describe('cold-read infra failure ≠ content reject (D-054, ERR35_COLDREAD_UNAV
   it('report-case mechanical: a cold read that RAN and rejected is a CONTENT decision — retry path, never ERR35', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
     await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
@@ -2357,7 +2297,7 @@ describe('cold-read infra failure ≠ content reject (D-054, ERR35_COLDREAD_UNAV
   it('report-case mechanical: confirm -> merges (no halt, no freeze)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
     await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
@@ -2373,10 +2313,10 @@ describe('cold-read infra failure ≠ content reject (D-054, ERR35_COLDREAD_UNAV
     expect(readJournal(dir).some((e) => e.action === 'halt' && e.id === 'ERR35_COLDREAD_UNAVAILABLE')).toBe(false);
   });
 
-  it('report-case JUDGED: infra error -> HARD HALT (ERR35), never awaiting-pr, nothing merged (D-060 moved this gate)', async () => {
+  it('report-case JUDGED: infra error -> HARD HALT (ERR35), never awaiting-pr, nothing merged', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
     await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
@@ -2403,7 +2343,7 @@ describe('cold-read infra failure ≠ content reject (D-054, ERR35_COLDREAD_UNAV
   });
 });
 
-describe('sweep start — origin-derived merge_status (D-058)', () => {
+describe('sweep start — origin-derived merge_status', () => {
   /**
    * Manufacture an UNMERGED origin fix/sweep ref for main_patched: a driver-
    * shaped PR-head commit (2nd parent = the conflict head U1, so the block
@@ -2427,7 +2367,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
   it('unmerged ref + open PR -> PR_ID: the branch derives blocked (origin-blocked journal row), takes nothing', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     const { fixBranch, fixHead } = pushFixRef(repo);
@@ -2468,7 +2408,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
   it('merged ref -> RESOLVED: not blocked, the origin ref is deleted (cleanup)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     const { fixBranch, fixHead } = pushFixRef(repo);
@@ -2504,10 +2444,10 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     );
   });
 
-  it('unmerged ref with NO PR at all (crashed publish) -> the PR is (RE)CREATED from the ref; branch blocked; ref NEVER deleted (D-059 case 5)', async () => {
+  it('unmerged ref with NO PR at all (crashed publish) -> the PR is (RE)CREATED from the ref; branch blocked; ref NEVER deleted', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     const { fixBranch, fixHead } = pushFixRef(repo);
@@ -2519,7 +2459,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     const journal = readJournal(dir);
     // The crashed publish is COMPLETED, never discarded: PR created from the
     // authoritative ref (marker-clean resolution head -> ACTIVE, not draft),
-    // no marker comment (nothing addressed yet), D-058's orphan-delete is retired.
+    // no marker comment (nothing addressed yet), and the orphan ref is never deleted.
     const created = journal.find((e) => e.action === 'origin-pr-created')!;
     expect(created.ref).toBe(fixBranch);
     expect(created.prNumber).toBe(7);
@@ -2544,12 +2484,12 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
 
   it('ref present + PR CLOSED (not merged) -> the case is WITHDRAWN: ref deleted, branch NOT gated, no reopen', async () => {
     // The driver never closes a PR, so a closed one was closed by a person, and
-    // that is the owner saying "drop this". This used to REOPEN it — overriding
-    // the decision — and because the gate is keyed on the REF, closing by hand
-    // did not lift it either: the owner had to close a PR AND delete a ref.
+    // that is the owner saying "drop this". Reopening it would override the
+    // decision — and were the gate keyed on the REF, closing by hand
+    // would not lift it either: the owner would have to close a PR AND delete a ref.
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     const { fixBranch } = pushFixRef(repo);
@@ -2581,7 +2521,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
   it('REVIEW-only trigger: a NEW loose comment (and bot reviews, and a quote-reply embedding the marker) do NOT reissue; only a review above the marker would', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     pushFixRef(repo);
@@ -2633,7 +2573,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
   it('a failing comment list is ERR13 (fail-closed): start halts, no block journaled, no pass opened, ref intact', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     const { fixBranch, fixHead } = pushFixRef(repo);
@@ -2658,7 +2598,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
   it('a REJECTED token (403) is ERR41 naming the token SOURCE — not a generic ERR13 the agent would retry', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     const { fixBranch, fixHead } = pushFixRef(repo);
@@ -2683,10 +2623,10 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     expect(repo.git('-C', bare, 'rev-parse', `refs/heads/${fixBranch}`)).toBe(fixHead);
   });
 
-  it('ERR41 names $GH_TOKEN / $GITHUB_TOKEN when the token came from the environment (D-060 env default)', async () => {
+  it('ERR41 names $GH_TOKEN / $GITHUB_TOKEN when the token came from the environment', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     pushFixRef(repo);
@@ -2713,7 +2653,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
   it('a non-auth API failure stays ERR13 (the retry-once path is unchanged)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     pushFixRef(repo);
@@ -2728,10 +2668,10 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
   });
 
 
-  it('ref ABSENT (crashed in flight, resolution lost) -> fresh re-derive: ordinary case, no origin rows, no token needed (D-059 case 6)', async () => {
+  it('ref ABSENT (crashed in flight, resolution lost) -> fresh re-derive: ordinary case, no origin rows, no token needed', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     // No fix/sweep ref anywhere: the prior pass died before its publish.
@@ -2753,10 +2693,10 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
     expect(readFileSync(join(dir, caseId, 'worktree', 'src/x.ts'), 'utf8')).toContain('<<<<<<<');
   });
 
-  it('open PR + NEW review (CHANGES_REQUESTED) -> REISSUE: revision case from the PRIOR resolution, time-ordered DIALOG in materials, forced HELD; finish live-rechecks + force-updates the SAME PR + posts the review-id marker (D-059 case 3)', async () => {
+  it('open PR + NEW review (CHANGES_REQUESTED) -> REISSUE: revision case from the PRIOR resolution, time-ordered DIALOG in materials, forced HELD; finish live-rechecks + force-updates the SAME PR + posts the review-id marker', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     const { fixBranch, fixHead } = pushFixRef(repo); // prior resolution: src/x.ts = OWNER-RESOLVED
@@ -2932,7 +2872,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
   it('APPROVED review + still merges cleanly -> LANDED (no reissue): merged locally at start, verify-gated push at finish auto-flips the PR', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     const { fixHead } = pushFixRef(repo);
@@ -3006,7 +2946,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
   it('APPROVED but the target ADVANCED (no longer merges cleanly) -> REISSUE against the new base; nothing landed', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     const { fixHead } = pushFixRef(repo); // resolution against the OLD tip
@@ -3050,7 +2990,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
   it('APPROVED head ALREADY CONTAINED in the local tip (prior landing whose push crashed) -> NO duplicate empty merge on the re-derive; finish pushes the existing merge', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     const { fixHead } = pushFixRef(repo);
@@ -3215,7 +3155,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
   it('a human-pasted out-of-range sweep-addressed marker does NOT silence the review loop (finding 4): a real review above the real marker still reissues', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     pushFixRef(repo);
@@ -3264,7 +3204,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
   it('a DISMISSED review beyond the marker does NOT reissue (nothing actionable): the marker is advanced instead and the branch just stays blocked', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     pushFixRef(repo);
@@ -3298,7 +3238,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
   it('PR CLOSED with merged_at (squash/rebase merge — head not an ancestor) -> resolved + ref deleted; NEVER a reopen PATCH (no 422 halt)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     pushFixRef(repo);
@@ -3340,7 +3280,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
   it('pagination: the NEWEST review lives past 100 items (page 2) and still triggers the reissue', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     pushFixRef(repo);
@@ -3384,7 +3324,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
   it('owner pushed onto fix/sweep (head not driver-shaped) -> case REBUILT from the CURRENT ref head; the owner edit is the revision base', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     const { fixBranch, fixHead } = pushFixRef(repo);
@@ -3430,7 +3370,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
   it('truly unusable ref (unparseable name) + new review -> ESCALATED ONCE on the PR (marker advanced to the review id), blocked, no case, no warn-loop', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     // An unparseable fix ref (no -h<n>-<sha8> tail) pointing at an unmerged commit.
@@ -3472,7 +3412,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
   it('finish live-recheck: the owner MERGED the review PR mid-pass -> republish SKIPPED (no 2nd PR, no ref clobber), finish still green', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     const { fixBranch, fixHead } = pushFixRef(repo);
@@ -3537,7 +3477,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
   it('unmerged refs REQUIRE the token (fail-closed): no --token-file -> ERR11, no pass opened, nothing deleted', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     const { fixBranch, fixHead } = pushFixRef(repo);
@@ -3559,7 +3499,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
   it('a pass aborted before finish leaves NO PR on origin; a re-start re-derives a clean picture and redoes the pass', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     const dir = dirOf(repo, ws);
@@ -3593,7 +3533,7 @@ describe('sweep start — origin-derived merge_status (D-058)', () => {
   });
 });
 
-describe('sweep finish — owner-facing PR + stats summary on the success SWEEP-RESULT (D-059)', () => {
+describe('sweep finish — owner-facing PR + stats summary on the success SWEEP-RESULT', () => {
   it('a green finish carries pullRequests (start-found-open + created) with titles/status, stats, and the REPORT cue', async () => {
     // Two related PRs: feat/other is blocked at start by an OPEN review PR
     // (#12) on its origin fix ref; main_patched freezes HELD this pass and its
@@ -3675,7 +3615,7 @@ describe('sweep finish — owner-facing PR + stats summary on the success SWEEP-
   });
 });
 
-describe('sweep finish — push resilience (D-059 FINAL): per-branch, categorized, resumable', () => {
+describe('sweep finish — push resilience: per-branch, categorized, resumable', () => {
   it('the FIRST target diverged -> the rest still land; partial factual report (ERR15 label, no halt); a healed re-run retries only the failure', async () => {
     // Two clean targets: main_patched (upstream-chain) and feat/other (child).
     const repo = cleanFixture();
@@ -3774,7 +3714,7 @@ describe('sweep finish — push resilience (D-059 FINAL): per-branch, categorize
     // push of the fix ref) over the same dead network.
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
@@ -3836,7 +3776,7 @@ describe('sweep finish — push resilience (D-059 FINAL): per-branch, categorize
   it('blocking push-phase issues (ERR16) ride the PARTIAL payload instead of being dropped when per-branch failures also occurred', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
@@ -3885,17 +3825,17 @@ describe('sweep finish — push resilience (D-059 FINAL): per-branch, categorize
   });
 });
 
-describe('sweep start — canonical pass location + clean-slate boundary (D-055)', () => {
+describe('sweep start — canonical pass location + clean-slate boundary', () => {
   it('clears a COMPLETE/STALE prior pass at the canonical dir — no inherited journal/machine-state', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     const wm = repo.sha('main');
 
     // Plant a STALE prior pass at the canonical location: a leftover journal with
-    // a D-053 HELD + a machine-state marked complete (a finished/aborted run at
-    // the same watermark). This is the 2026-07-22 contamination shape.
+    // a stale HELD + a machine-state marked complete (a finished/aborted run at
+    // the same watermark) — the contamination shape the clean slate must clear.
     mkdirSync(dir, { recursive: true });
     writeFileSync(
       join(dir, 'journal.jsonl'),
@@ -3925,7 +3865,7 @@ describe('sweep start — canonical pass location + clean-slate boundary (D-055)
   it('refuses when a pass is still OPEN (phase != complete) — never blind-wipe an in-flight pass', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     expect(await cmdSweepStart(baseCli(repo, ws, inv))).toBe(0); // a real open pass (phase 'open')
     const startTs = readJournal(dir).find((e) => e.action === 'sweep-start')!.ts;
@@ -3946,7 +3886,7 @@ describe('sweep start — canonical pass location + clean-slate boundary (D-055)
   it('C-1: start REFUSES a --workspace that IS the --repo clone (never lands in the clone)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const out = join(ws, 'refuse.json');
     // workspace === the clone toplevel -> refused, no pass created.
     expect(await cmdSweepStart(baseCli(repo, ws, inv, { workspace: repo.dir, out }))).toBe(1);
@@ -3957,7 +3897,7 @@ describe('sweep start — canonical pass location + clean-slate boundary (D-055)
 
   it('C-1: start REFUSES a --workspace that is a SUBDIRECTORY of the --repo clone', async () => {
     const repo = conflictFixture();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const sub = join(repo.dir, 'nested', 'ws');
     mkdirSync(sub, { recursive: true });
     const out = join(mkWorkspace(), 'refuse-sub.json');
@@ -3971,7 +3911,7 @@ describe('sweep start — canonical pass location + clean-slate boundary (D-055)
     // `~/nanoclaw2/groups/<g>` = dirname(repo). The guard must key off --repo
     // ONLY, so a group root nested in an OUTER work tree is accepted.
     const repo = conflictFixture(); // the fork clone (its own git work tree, elsewhere)
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const outer = mkdtempSync(join(tmpdir(), 'sm-outer-'));
     cleanups.push(() => rmSync(outer, { recursive: true, force: true }));
     execFileSync('git', ['-C', outer, 'init', '-q']); // outer is a git work tree
@@ -4013,7 +3953,7 @@ describe('sweep start — canonical pass location + clean-slate boundary (D-055)
     // parseCli default: no --workspace -> dirname(repo) = groupRoot.
     const cli = parseCli(['sweep-start', '--repo', cloneDir]);
     expect(cli.workspace).toBe(groupRoot);
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const started: Cli = {
       cmd: 'sweep-start',
       repo: cloneDir,
@@ -4030,7 +3970,7 @@ describe('sweep start — canonical pass location + clean-slate boundary (D-055)
   it('C-4: abort seals the pass with `pass-complete` so it is not re-attached as the latest open pass', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
     await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge); // merges the U0 prefix, serves the conflict case
@@ -4043,17 +3983,17 @@ describe('sweep start — canonical pass location + clean-slate boundary (D-055)
 });
 
 // ---------------------------------------------------------------------------
-// D-061 (B): GATE-FIX. An unattributable verify red used to dead-end in an
+// GATE-FIX. An unattributable verify red must not dead-end in an
 // ERR18/ERR40 asking a HUMAN to fix something the agent may not deliver (it
-// cannot push or open a PR). It now becomes a case.
+// cannot push or open a PR). It becomes a case.
 // ---------------------------------------------------------------------------
 
 /**
- * PRE-MERGE BRANCH CHECK (owner decision 2026-07-31). Detection runs FORWARD,
+ * PRE-MERGE BRANCH CHECK (owner decision). Detection runs FORWARD,
  * with the sweep, at the one place merging actually happens — `next-case`, which
  * calls cmdRun. A branch already red must not be merged into or propagated from:
  * either way every descendant inherits a defect it cannot fix inside its own
- * conflict scope, which is what livelocked the live 2026-07-31 pass.
+ * conflict scope — a livelock.
  */
 describe('next-case — a participating branch that is RED before any merge', () => {
   /** main_patched carries a defect; module/cg branches off it and has work pending. */
@@ -4102,8 +4042,8 @@ describe('next-case — a participating branch that is RED before any merge', ()
       instruction: string;
     };
     // SERVED ON THIS CALL — not "run next-case again". Returning a pointer here
-    // stranded the case: the next call re-ran the check, hit the mint dedup, and
-    // could never hand it over (live 2026-07-31).
+    // would strand the case: the next call re-runs the check, hits the mint
+    // dedup, and can never hand it over.
     expect(res.status).toBe('case-ready');
     expect(res.caseId).toContain('gate-fix-main_patched');
     expect(res.branch).toBe('main_patched');
@@ -4126,7 +4066,7 @@ describe('next-case — a participating branch that is RED before any merge', ()
     repo.commit('U0: upstream moves', { 'src/util.ts': 'u\n' });
     cleanups.push(() => repo.destroy());
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     const checks = join(ws, 'checks.json');
     writeFileSync(checks, JSON.stringify({ typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }], test: [] }));
@@ -4156,11 +4096,11 @@ describe('next-case — a participating branch that is RED before any merge', ()
   });
 
   /**
-   * REGRESSION (live 2026-07-31): the check silently did nothing in production
-   * while every fixture passed. `applyPassConfig` RETURNS the pass's checks file
+   * REGRESSION GUARD: the check can silently do nothing in production
+   * while every fixture passes. `applyPassConfig` RETURNS the pass's checks file
    * rather than assigning it onto `cli`, so reading `cli.checksFile` in
-   * `next-case` got undefined, `loadChecksConfig` returned null, and the check
-   * exited at its first line — indistinguishable from "no checks file".
+   * `next-case` gets undefined, `loadChecksConfig` returns null, and the check
+   * exits at its first line — indistinguishable from "no checks file".
    *
    * This test resolves the path the way production does: `start` persists it
    * into machine state and later commands read it FROM THERE. `next-case` is
@@ -4208,10 +4148,10 @@ describe('next-case — a participating branch that is RED before any merge', ()
 
   /**
    * A HELD fix only reaches the owner when `finish` pushes its ref and opens the
-   * PR. Live 2026-07-31: the agent fixed the red trunk, the case was held for an
-   * unrelated hunk, and `next-case` then said "the pass stopped, report to the
-   * owner" — so the agent reported and never ran `finish`. pr-intent journaled,
-   * zero refs pushed, zero PRs: the fix existed only in the pass directory.
+   * PR. If the agent fixes the red trunk, the case is held for an
+   * unrelated hunk, and `next-case` then says "the pass stopped, report to the
+   * owner" — the agent reports and never runs `finish`: pr-intent journaled,
+   * zero refs pushed, zero PRs, the fix existing only in the pass directory.
    */
   it('a red branch with an UNPUBLISHED held fix points at `finish`, not at a stop', async () => {
     const repo = redBaseRepo();
@@ -4258,12 +4198,12 @@ describe('next-case — a participating branch that is RED before any merge', ()
   });
 });
 
-describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
-  // ROOT CAUSE of the serving bug, fixed 2026-07-28: `crashHeal` journaled `resolved` for every
+describe('sweep finish — gate-fix on an unattributable red', () => {
+  // Serving hazard: `crashHeal` must not journal `resolved` for every
   // gate-fix case on the next command. Its heuristic is "the ref already
   // contains the case head, so it was resolved before a crash" — but a gate-fix
   // case's head IS the branch tip, and a commit is its own ancestor, so it
-  // matched instantly. `openCases` then dropped it and `next-case` answered
+  // matches instantly. `openCases` would then drop it and `next-case` answer
   // `finalize` with the case unserved.
   /** A fixture where a FEATURE branch owns the file the build fails on. */
   function gateFixRepo(withChild = false): FixtureRepo {
@@ -4299,12 +4239,11 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
   }
 
   it('NOT minted beneath an ancestor that already took a gate fix this pass', async () => {
-    // Live 2026-08-06: `main_patched` froze with a gate fix at 23:20 and 57
-    // minutes later the driver minted a SECOND gate fix on its descendant. That
-    // case produced PR #77, whose own title reads "fixes belong at
-    // main_patched" — work downstream of a trunk the pass had already stopped
+    // When the trunk freezes with a gate fix, the driver must not mint a
+    // SECOND gate fix on its descendant — that is
+    // work downstream of a trunk the pass has already stopped
     // on. The cross-pass skip reads ORIGIN refs, which do not exist until finish
-    // publishes, so within a pass a trunk gate blocked nothing.
+    // publishes, so within a pass it blocks nothing on its own.
     const repo = gateFixRepo();
     const ws = mkWorkspace();
     const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'], parents: ['main_patched'] }]);
@@ -4316,10 +4255,8 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     // The trunk took a gate fix earlier in THIS pass and is red. This is the
     // AGENT-HELD shape — a held gate-FIX case, which carries no `reason` at all
-    // (only the §9 rollback hold does). The first version of the guard matched
-    // on `reason: 'gate'` and so never fired on the shape that actually occurs:
-    // live 2026-08-06 `main_patched` held like this at 09:15 and a descendant
-    // gate fix was minted anyway 53 minutes later.
+    // (only the §9 rollback hold does). A guard matching on `reason: 'gate'`
+    // would never fire on this shape — the one that actually occurs.
     appendJournal(dir, { action: 'gate-fix', branch: 'main_patched', caseId: 'gate-fix-main_patched-dead' });
     appendJournal(dir, { action: 'held', branch: 'main_patched', caseId: 'gate-fix-main_patched-dead' });
 
@@ -4340,8 +4277,8 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     // The ancestor gate is for the FINISH path, where blame is by elimination
     // and therefore unreliable beneath a red ancestor. `--not-my-bug` proves the
     // failure pre-existing and LOCATES the owner by probing, so refusing it
-    // discards evidence. Live 2026-08-06 it cost three ~20-minute rounds naming
-    // the same owner from three different case branches, recording nothing.
+    // discards evidence — round after round naming
+    // the same owner from different case branches, recording nothing.
     const repo = gateFixRepo();
     const ws = mkWorkspace();
     const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'], parents: ['main_patched'] }]);
@@ -4410,7 +4347,7 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
   });
 
   /**
-   * BATCHING (owner-approved 2026-07-28). A red build routinely names files that
+   * BATCHING (owner-approved). A red build routinely names files that
    * belong to DIFFERENT branches. One case forced them all onto one branch's
    * worktree, where the fix for someone else's file either cannot be made or
    * lands where it reaches nobody. One case PER BRANCH, carrying that branch's
@@ -4690,13 +4627,13 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
   });
 
   /**
-   * THE ID WAS A LIE (2026-07-28). A gate fix has no merge and therefore no
-   * height, but `--case` was validated against the CONFLICT id shape
-   * (`…-h<n>`): a bare `gate-fix-<branch>` was refused with ERR25_BAD_CASE_ID,
-   * so no HELD gate fix could ever publish however green the rest of the
-   * pipeline was. The workaround appended a FAKE height of `-h-1` — which then
-   * flowed into the fix-ref name, into the origin ref reader, and into every
-   * height reader downstream. The id now states the case's real identity
+   * THE ID STATES THE TRUTH. A gate fix has no merge and therefore no
+   * height, so `--case` must not validate it against the CONFLICT id shape
+   * (`…-h<n>`): refusing a bare `gate-fix-<branch>` with ERR25_BAD_CASE_ID
+   * would keep every HELD gate fix from publishing however green the rest of
+   * the pipeline is, and a FAKE `-h-1` height would
+   * flow into the fix-ref name, into the origin ref reader, and into every
+   * height reader downstream. The id states the case's real identity
    * (branch + failing-file digest) and the N5 guard accepts that shape AS
    * ITSELF; the head carries its real height.
    */
@@ -4720,10 +4657,10 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
     };
     // The head IS the branch tip; its height is that tip's real coverage on the
     // pass chain (`deriveCoverage`), so every height reader computes from a
-    // fact — see the D-004 machine-block test below for what -1 cost.
+    // fact — see the machine-block test below for what a -1 would cost.
     expect(cf.head.sha).toBe(repo.sha('module/cg'));
     // The branch absorbed the trunk during this pass's run, so its coverage is a
-    // real chain index — never the -1 placeholder that used to sit here.
+    // real chain index — never a -1 placeholder.
     expect(Number(repo.git('rev-list', '--count', 'module/cg..main').trim())).toBe(0);
     expect(cf.head.height).toBeGreaterThanOrEqual(0);
     expect(cf.run).toEqual([cf.head]); // run[run.length - 1] === head (types.ts)
@@ -4808,19 +4745,19 @@ describe('sweep finish — gate-fix on an unattributable red (D-061 B)', () => {
   });
 
   /**
-   * WHAT THE FAKE HEIGHT COST. The D-004 machine block on a held PR reports
+   * WHAT A FAKE HEIGHT WOULD COST. The machine block on a held PR reports
    * `pendingAbove = chain.heads.length - 1 - head.height`. With `head.height =
    * -1` that is `heads.length` — MORE pending commits than the pass's chain
-   * even holds — on every held gate-fix PR, for a branch that had in fact
-   * absorbed the whole trunk this pass. The head's height is now the tip's
+   * even holds — on every held gate-fix PR, for a branch that has in fact
+   * absorbed the whole trunk this pass. The head's height is the tip's
    * coverage, so the count is the truth.
    *
-   * The fix REF NAME is the same lie in the other direction: it spelled
+   * The fix REF NAME is the same hazard in the other direction: a lie spells
    * `--<slug('(gate-fix)')>-h-1-<sha8>`, putting a parent label that is not a
    * branch and a height that does not exist into a name the NEXT pass's origin
    * reader parses a real scope branch and a real trunk height out of.
    */
-  it('a held gate fix publishes with a truthful D-004 count and an honest fix-ref name', async () => {
+  it('a held gate fix publishes with a truthful pending-commits count and an honest fix-ref name', async () => {
     const repo = gateFixRepo();
     const ws = mkWorkspace();
     const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
@@ -5176,12 +5113,12 @@ describe('sweep finish — a gate-fix case is never served with NO files (defect
    * Red on the full recipe, red again on the identical re-run, GREEN once a
    * branch is removed, red on the re-verify.
    *
-   * Run 2 is the determinism probe (D-064): verify re-runs the SAME tree before
+   * Run 2 is the determinism probe: verify re-runs the SAME tree before
    * attributing, because attribution is meaningless under a flaky test. A
    * DETERMINISTIC failure — which is what this fixture models — must fail twice
    * before anything else happens.
    *
-   * Run 3 is the base probe (D-065): the base alone must come back GREEN here,
+   * Run 3 is the base probe: the base alone must come back GREEN here,
    * because this fixture models a failure a BRANCH introduced. Run 4 is the
    * leave-one-out build that isolates it, also green. The stub sequences by call
    * count, so both of those are green and everything else is red.
@@ -5227,7 +5164,7 @@ describe('sweep finish — a gate-fix case is never served with NO files (defect
     expect(res.status).not.toBe('gate-fix-required');
   });
 
-  // --- finish must not verify a base that is under repair (D-065) -------------
+  // --- finish must not verify a base that is under repair ---------------------
   describe('finish — a gated BASE is not re-verified', () => {
     it('skips verify, rolls nothing back, and says the owner must merge the base gate fix', async () => {
       const repo = rollbackFixture();
@@ -5280,7 +5217,7 @@ describe('report-case — a FAILED pristine reset is not reported as success (de
   it('DEFECT 9b — a worktree reset that fails is not announced as "the worktree is now pristine"', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
     expect(await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge)).toBe(0);
@@ -5338,7 +5275,7 @@ describe('report-case — a green that follows a red is confirmed', () => {
   it('a pass that does not reproduce is WARN21, not a resolved case', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     const checksFile = redGreenRedChecks(ws);
     await cmdSweepStart(baseCli(repo, ws, inv, { checksFile }));
@@ -5378,7 +5315,7 @@ describe('report-case — a green that follows a red is confirmed', () => {
   it('a FIRST-attempt green is believed as-is — no confirm run, no extra cost', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     const counter = join(ws, 'gate-runs2');
     const checksFile = join(ws, 'checks2.json');
@@ -5406,13 +5343,13 @@ describe('gate-fix — failing locations are rooted at the REPO, not the command
   it("a bun failure under cwd 'container/agent-runner' is emitted with the full repo path", async () => {
     // `bun test` runs with `cwd: container/agent-runner` (checks.json), so it
     // prints `src/poll-loop.test.ts` for a file at
-    // `container/agent-runner/src/poll-loop.test.ts`. Live 2026-08-10 the agent
-    // hit `ls: cannot access` on that path — in the very section whose purpose
-    // is "do not hunt". `rootChecksOutput` already solves this for blame; this
-    // section had bypassed it.
+    // `container/agent-runner/src/poll-loop.test.ts`. Unrooted, the agent
+    // hits `ls: cannot access` on that path — in the very section whose purpose
+    // is "do not hunt". `rootChecksOutput` solves this for blame; this
+    // section must use it too.
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     const checksFile = join(ws, 'checks.json');
     writeFileSync(
@@ -5442,7 +5379,7 @@ describe('gate-fix — the briefing prices the exit and names the repro class', 
   it('a full-suite-only failure says so at the TOP, and points at held', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
     // The shape `--not-my-bug` mints when the bisect had to use the FULL command.
@@ -5465,8 +5402,8 @@ describe('gate-fix — the briefing prices the exit and names the repro class', 
     const m = gateFixCaseMaterialsForTest(dir, jc, caseRow);
     expect(m).toContain('REPRODUCTION: FULL SUITE ONLY');
     expect(m).toContain('--tier held');
-    // …and it appears BEFORE the file list, not in a footer: the agent read the
-    // materials 23 minutes into the case on 2026-08-10 and immediately said "now
+    // …and it appears BEFORE the file list, not in a footer: an agent must not
+    // have to read deep into the materials before it can say "now
     // I can see the full picture".
     expect(m.indexOf('REPRODUCTION: FULL SUITE ONLY')).toBeLessThan(m.indexOf('## SCOPE'));
   });
@@ -5474,7 +5411,7 @@ describe('gate-fix — the briefing prices the exit and names the repro class', 
   it('an ordinary gate fix carries no repro banner', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
     const caseId = 'gate-fix-main_patched-beef';
@@ -5499,7 +5436,7 @@ describe('next-case — the materials say WHERE the markers are', () => {
   it('lists each pending file with its hunk line ranges', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     await cmdSweepStart(baseCli(repo, ws, inv));
     const out = join(ws, 'nc.json');
     expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), greenPreMerge)).toBe(0);
@@ -5516,7 +5453,7 @@ describe('next-case — the serve bound (a case handed out and never concluded)'
   it('warns on the 3rd serve, refuses the 5th, and journals every one', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     await cmdSweepStart(baseCli(repo, ws, inv));
 
@@ -5540,7 +5477,7 @@ describe('next-case — the serve bound (a case handed out and never concluded)'
     const out5 = join(ws, 'n5.json');
     expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: out5 }), greenPreMerge)).toBe(1);
     const r5 = JSON.parse(readFileSync(out5, 'utf8')) as { issues?: Array<{ id: string }> };
-    expect(r5.issues!.map((i) => i.id)).toContain('ERR48_CASE_LOOPING');
+    expect(r5.issues!.map((i) => i.id)).toContain('ERR44_CASE_LOOPING');
 
     // Every serve is on the record — `case` rows never showed this.
     const journal = readJournal(dir);
@@ -5551,7 +5488,7 @@ describe('next-case — the serve bound (a case handed out and never concluded)'
   it('an ordinary first serve carries no warning and no loop block', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
-    const inv = emptyInventory();
+    const inv = branchlessInventory();
     await cmdSweepStart(baseCli(repo, ws, inv));
     const out = join(ws, 'a.json');
     expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), greenPreMerge)).toBe(0);

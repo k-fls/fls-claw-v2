@@ -22,10 +22,9 @@ repo.commit('upstreamable fix', { 'src/candidate.ts': 'export const x = 1;\n' })
 repo.checkout('edition/ed', { create: true, at: 'main' });
 repo.git('merge', '--no-edit', 'fix/candidate');
 repo.checkout('main');
-const realTip = repo.sha('feat/real');
 
 function entry(partial: Partial<FeatureEntry> & { id: string }): FeatureEntry {
-  return { name: partial.id, kind: 'feat', status: 'shipped', branch: 'feat/real', ...partial } as FeatureEntry;
+  return { name: partial.id, kind: 'feat', branch: 'feat/real', ...partial } as FeatureEntry;
 }
 
 const GOOD = entry({
@@ -34,12 +33,11 @@ const GOOD = entry({
   test_anchors: ['src/modules/example/e2e.test.ts'],
   design_docs: ['docs/design/example.md@feat/real'],
   key_symbols: ['registerExample — src/modules/example/index.ts'],
-  maintenance: { last_verified: '2026-07-09', verified_against: realTip },
 });
 
 describe('validateRegistry', () => {
   it('a fully consistent entry produces no issues for itself', async () => {
-    const res = await validateRegistry(repo.dir, [GOOD], { now: new Date('2026-07-10') });
+    const res = await validateRegistry(repo.dir, [GOOD]);
     expect(res.issues.filter((i) => i.featureId === 'feat.good')).toEqual([]);
     expect(res.alertedFeatureIds).toEqual([]);
   });
@@ -99,21 +97,10 @@ describe('validateRegistry', () => {
     expect(res.alertedFeatureIds).toEqual([]);
   });
 
-  it('rule 6: stale verified_against and old last_verified are WARNs', async () => {
-    const res = await validateRegistry(
-      repo.dir,
-      [entry({ id: 'feat.stale6', maintenance: { verified_against: '0'.repeat(40), last_verified: '2026-01-01' } })],
-      { now: new Date('2026-07-10'), staleDays: 21 },
-    );
-    const issues = res.issues.filter((i) => i.featureId === 'feat.stale6');
-    expect(issues.map((i) => i.rule)).toEqual([6, 6]);
-    expect(issues.every((i) => i.level === 'WARN')).toBe(true);
-  });
-
-  it('planned and retired entries are skipped entirely', async () => {
+  it('entries without a branch skip the git-backed rules entirely', async () => {
     const res = await validateRegistry(repo.dir, [
-      { id: 'planned.x', name: 'x', kind: 'planned', status: 'planned' },
-      entry({ id: 'feat.retired', status: 'retired', branch: 'feat/does-not-exist' }),
+      { id: 'planned.x', name: 'x', kind: 'planned' },
+      { id: 'feat.observational', name: 'o', kind: 'feat', owned_paths: ['src/gone/**'] },
     ]);
     expect(res.issues.filter((i) => i.featureId !== null)).toEqual([]);
   });

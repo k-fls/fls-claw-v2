@@ -9,7 +9,7 @@
  * use the PINNED chain (chain.txt) rather than live `upstream/main`, so they
  * stay stable if upstream advances.
  *
- * PIN-BY-PATCH (2026-07-20): a single-commit fork branch whose tip became
+ * PIN-BY-PATCH: a single-commit fork branch whose pinned tip is
  * unreachable (owner rebase) is re-synthesizable from a `pins/<case>.patch`
  * (`git diff --binary main <tip>`): apply it to `main` in a detached temp
  * worktree and commit-tree → a commit with the EXACT tip tree and merge-base
@@ -85,7 +85,7 @@ function synthesizePinnedTip(repo: string, baseSha: string, patchAbsPath: string
   const wt = mkdtempSync(join(tmpdir(), 'prop-pin-'));
   try {
     execFileSync('git', ['-C', repo, 'worktree', 'add', '-q', '--detach', wt, baseSha]);
-    // D-027: a formatter hook can leave a checked-out worktree dirty — restore
+    // A formatter hook can leave a checked-out worktree dirty — restore
     // to the pristine base before applying so the patch lands cleanly.
     try {
       execFileSync('git', ['-C', wt, 'checkout', '--', '.'], { stdio: 'ignore' });
@@ -145,11 +145,11 @@ const pinnedChain = (): Chain => ({
 // The whole suite is a no-op unless the pinned fork DAG is present.
 const AVAILABLE = present(BASE) && present(WATERMARK) && chainShas().length === 98;
 
-describe.skipIf(!AVAILABLE)('propagation real-DAG cases (mined 2026-07-18)', () => {
+describe.skipIf(!AVAILABLE)('propagation real-DAG cases (mined from the live fork)', () => {
   // p7 — largest-clean-height / linear conflict profile (§3, class 7). VERIFIED.
-  // The fork tip was rebased unreachable 2026-07-20 → pin-by-patch fallback.
+  // The mined fork tip can be unreachable (owner rebase) → pin-by-patch fallback.
   const P7_HEIGHTS = [1, 30, 61, 62, 80, 98];
-  it('p7: entry-model sweep merges at height 61; the case run starts at 62 and stacks to the sparse-line top (D-049 §2)', () => {
+  it('p7: entry-model sweep merges at height 61; the case run starts at 62 and stacks to the sparse-line top (MERGE-POLICY.md §2)', () => {
     const c = loadCase('p7-conflict-profile-role-grant.yaml');
     // Chain commits it probes must be present (loud); the fork tip resolves via
     // the pinned sha or, once rebased away, the pin patch.
@@ -172,7 +172,7 @@ describe.skipIf(!AVAILABLE)('propagation real-DAG cases (mined 2026-07-18)', () 
 
     return mergePointSweep(REPO, branch, line).then((res) => {
       expect(res.mergePoint).toEqual({ sha: c.expected.largest_clean_sha, height: c.expected.largest_clean_height });
-      // D-049 §2 stacking: the real profile conflicts on the SAME single path
+      // DRIVER.md §4.4 stacking: the real profile conflicts on the SAME single path
       // from 62 to the watermark, so on this sparse line the run stacks over
       // all three conflicting candidate heads (62, 80, 98; below the cap of 5)
       // and the case head is the run's TOP. The run still STARTS at the
@@ -217,7 +217,7 @@ describe.skipIf(!AVAILABLE)('propagation real-DAG cases (mined 2026-07-18)', () 
     };
     return mergePointSweep(REPO, branch, line).then((res) => {
       expect(res.mergePoint).toEqual({ sha: c.expected.largest_clean_sha, height: 61 });
-      // D-049 §2: run starts at 62 and stacks over the sparse line's other
+      // DRIVER.md §4.4: run starts at 62 and stacks over the sparse line's other
       // conflicting head (98, same single-path conflict set).
       expect(res.firstConflict?.run[0]).toEqual({ sha: c.expected.smallest_conflicting_sha, height: 62 });
       expect(res.firstConflict?.run.map((h) => h.height)).toEqual([62, 98]);
@@ -242,7 +242,7 @@ describe.skipIf(!AVAILABLE)('propagation real-DAG cases (mined 2026-07-18)', () 
     expect(childProbe.conflictFiles).toEqual(c.child.conflicted_paths);
 
     // The DIRECT parent is HELD (blocked) at height 1; the child conflicts at
-    // height 1 -> MIN(1) <= 1 -> DEFERRED (paths no longer matter, D-057).
+    // height 1 -> MIN(1) <= 1 -> DEFERRED (paths do not matter).
     const d = checkDeferred(1, [{ branch: c.parent.branch, height: 1 }]);
     expect(d.deferred).toBe(true);
     expect(d.blockedBy).toBe(c.parent.branch);
@@ -262,9 +262,9 @@ describe.skipIf(!AVAILABLE)('propagation real-DAG cases (mined 2026-07-18)', () 
     expect(probe.conflictFiles).not.toContain('src/cli/resources/groups.ts');
 
     // module/host-rpc is a SIBLING, not a DIRECT parent of the telegram branch,
-    // so under the direct-parent rule (D-057) it contributes NO blocked parent —
+    // so under the direct-parent rule it contributes NO blocked parent —
     // NOT deferred (telegram's own independent conflict). It is parent-ness, not
-    // path disjointness, that prevents the defer now.
+    // path disjointness, that prevents the defer.
     const d = checkDeferred(1, []);
     expect(d.deferred).toBe(false);
     expect(d.blockedBy).toBeNull();
@@ -325,7 +325,7 @@ describe.skipIf(!AVAILABLE)('propagation real-DAG cases (mined 2026-07-18)', () 
     }
   });
 
-  // p6 — clean-through-held (§1 D-002, class 6). VERIFIED.
+  // p6 — clean-through-held (§1, class 6). VERIFIED.
   it('p6: clean-through branches merge the whole range clean (stable result trees)', async () => {
     const c = loadCase('p6-clean-through-held-docs-notes.yaml');
     for (const b of c.clean_branches as any[]) {

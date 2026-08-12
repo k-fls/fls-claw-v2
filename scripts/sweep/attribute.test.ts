@@ -1,18 +1,18 @@
 /**
- * scripts/sweep/attribute.test.ts — D-061 (B) blame.
+ * scripts/sweep/attribute.test.ts — blame attribution for a failing check.
  *
- * The live 2026-07-28 failure is the reference case throughout: verify accused
- * `feat/mitm-credential-proxy`, but the type error was in `src/command-gate.ts`
- * — a file FOUR registry entries declare in their paths and NONE of them has
- * ever modified. Blame is therefore decided by GIT HISTORY, not by declarations;
- * these tests build real repos and assert against real commits.
+ * The reference case throughout: verify accuses `feat/mitm-credential-proxy`,
+ * but the type error is in `src/command-gate.ts` — a file FOUR registry
+ * entries declare in their paths and NONE of them has ever modified. Blame is
+ * therefore decided by GIT HISTORY, not by declarations; these tests build
+ * real repos and assert against real commits.
  *
- * The history rule itself then had to be corrected. Counting a branch's own work
- * as a SET DIFFERENCE (`^<inventory parents>`) credited the fork trunk with 6
- * commits over `src/command-gate.ts` — two merges plus three edits AUTHORED on
- * `module/command-gate` and absorbed by a propagation merge — while the branch
- * that actually wrote the file scored 0, because `^main_patched` subtracted its
- * own work back out of it. Authorship is the FIRST-PARENT LINE:
+ * Counting a branch's own work as a SET DIFFERENCE (`^<inventory parents>`)
+ * credits the fork trunk with commits over `src/command-gate.ts` — merges plus
+ * edits AUTHORED on `module/command-gate` and absorbed by a propagation merge
+ * — while the branch that actually wrote the file scores 0, because
+ * `^main_patched` subtracts its own work back out of it. So that rule is not
+ * the one in force. Authorship is the FIRST-PARENT LINE:
  * `--first-parent --no-merges <branch> ^main`. So the fixture below carries a
  * REAL propagation merge (receiver first parent, donor second): a linear fixture
  * cannot tell the two rules apart, which is the whole point.
@@ -33,7 +33,6 @@ function feat(over: Partial<FeatureEntry> & { id: string }): FeatureEntry {
   return {
     name: over.id,
     kind: 'module',
-    status: 'shipped',
     ...over,
   } as FeatureEntry;
 }
@@ -44,7 +43,7 @@ function tsc(...files: string[]): string {
 }
 
 describe('parseFailingFiles', () => {
-  it('parses the real tsc bracket form (the 2026-07-28 diagnostic)', () => {
+  it('parses the real tsc bracket form', () => {
     const out = [
       'src/command-gate.ts(343,45): error TS2345: Argument of type \'string | null | undefined\' is not',
       "  assignable to parameter of type 'string'.",
@@ -176,7 +175,7 @@ const liveShape: FeatureEntry[] = [
     id: 'cg',
     branch: 'module/command-gate',
     parents: ['main_patched'],
-    touch_paths: ['src/command-gate.ts'],
+    owned_paths: ['src/command-gate.ts'],
   }),
   feat({
     id: 'leaf',
@@ -189,9 +188,8 @@ const liveShape: FeatureEntry[] = [
     id: 'sweep',
     branch: 'feat/maintenance-sweep',
     parents: ['main_patched'],
-    owned_paths: ['scripts/sweep/**'],
     // …and another: four live entries claim src/command-gate.ts, none wrote it.
-    touch_paths: ['src/command-gate.ts'],
+    owned_paths: ['scripts/sweep/**', 'src/command-gate.ts'],
   }),
 ];
 
@@ -294,7 +292,7 @@ describe('blameCandidates — authored commits, not declarations', () => {
     expect(byFile.get('src/command-gate.ts')!.map((c) => c.branch)).toEqual(['module/command-gate', 'feat/leaf']);
   });
 
-  it('an ORIGIN-ONLY branch still counts (D-045 §13: no local ref is not no history)', async () => {
+  it('an ORIGIN-ONLY branch still counts (§13: no local ref is not no history)', async () => {
     const repo = blameRepo();
     repo.checkout('feat/remote-only', { create: true, at: 'main_patched' });
     repo.commit('remote: author the file', { 'src/remote.ts': 'r\n' });
@@ -307,13 +305,11 @@ describe('blameCandidates — authored commits, not declarations', () => {
   });
 
   /**
-   * REPLACES `an UNRESOLVABLE parent skips the branch — never counts inherited
-   * commits as own`. There is no per-branch exclusion set left to be missing, so
-   * the hazard it guarded is gone; the assertion is inverted to pin what now
-   * happens instead. `parents` still decides DEPTH, so a broken edge costs the
+   * Evidence comes from the first-parent line, not from any per-branch
+   * exclusion set. `parents` decides DEPTH only, so a broken edge costs the
    * branch its rank (UNRESOLVED sorts last) but never its evidence.
    */
-  it('a broken `parents` edge no longer removes a branch from blame — it only costs it its depth', async () => {
+  it('a broken `parents` edge keeps the branch in blame — it only costs it its depth', async () => {
     const repo = blameRepo();
     const broken = [
       feat({ id: 'leaf', branch: 'feat/leaf', parents: ['module/ghost'] }),
@@ -335,13 +331,13 @@ describe('blameCandidates — authored commits, not declarations', () => {
   });
 });
 
-describe('attributeFailure — the 2026-07-28 reference case, blamed by git history', () => {
+describe('attributeFailure — the reference case, blamed by git history', () => {
   it('roots the fix on the branch that AUTHORED the defect, not the absorber, the declarer or the accused', async () => {
     const repo = blameRepo();
     const a = await attributeFailure(repo.dir, tsc('src/command-gate.ts'), liveShape, 'feat/mitm-credential-proxy');
     // NOT the accused, NOT feat/maintenance-sweep (which declares the path), and
-    // NOT main_patched — which is what the `^parents` set difference answered
-    // here and live, having absorbed the module's work by propagation merge.
+    // NOT main_patched — the absorber a `^parents` set difference would answer,
+    // having taken in the module's work by propagation merge.
     expect(a.branch).toBe('module/command-gate');
     expect(a.files).toEqual(['src/command-gate.ts']);
     expect(a.groups).toHaveLength(1);
@@ -403,11 +399,9 @@ describe('attributeFailure — the 2026-07-28 reference case, blamed by git hist
 });
 
 /**
- * REPLACES the `owned_paths are GLOBS, not literal prefixes (defect 5)` suite.
- * That defect — and its fix — lived entirely inside the registry-glob matcher
- * that no longer takes part in blame; `globMatchAny` is still exercised by
- * routing.test.ts / globs.test.ts, which own it. What that suite was really
- * protecting is that blame reaches a real answer instead of falling back to the
+ * The registry-glob matcher takes no part in blame; `globMatchAny` is
+ * exercised by routing.test.ts / globs.test.ts, which own it. What matters
+ * here is that blame reaches a real answer instead of falling back to the
  * accused branch, and that is what these assert, over git.
  */
 describe('attributeFailure — BATCHING: one group per branch, shallowest first', () => {

@@ -1,14 +1,14 @@
 /**
  * scripts/sweep/not-my-bug.test.ts — adjudicating `report-case --not-my-bug`.
  *
- * The reference case throughout is the live 2026-08-01 deadlock: a case that
- * resolved `src/cli/resources/groups.ts` was blocked by
+ * The reference case throughout is a deadlock shape: a case that
+ * resolves `src/cli/resources/groups.ts` is blocked by
  * `container/agent-runner/src/poll-loop.test.ts`, a bun test it never touched and
- * could not edit, whose internal 5000 ms deadline sits under bun's 5000 ms
+ * cannot edit, whose internal 5000 ms deadline sits under bun's 5000 ms
  * timeout — so it fails or passes by luck under load. Every rule below exists
  * because that case would otherwise be decided wrongly:
  *
- *  - a bun failure names no file in the OLD parser, so nothing could be compared;
+ *  - a bun failure names no file unless the parser reads the header, so nothing could be compared;
  *  - a single probe of a coin-flip test decides nothing, in either direction;
  *  - "the bug reproduces" is not the same claim as "you introduced nothing new";
  *  - a green-because-unbuildable commit is the classic bad bisect anchor.
@@ -293,8 +293,8 @@ describe('findIntroducingCommit', () => {
 });
 
 describe('classifyEnvironmentFault', () => {
-  // The real 2026-08-03 shape: a pool installed with --ignore-scripts, so the
-  // native addon never compiled and every DB-touching suite died at require time.
+  // The real shape: an install run with --ignore-scripts, so the
+  // native addon never compiles and every DB-touching suite dies at require time.
   const BINDINGS = [
     ' FAIL  src/modules/scheduling/recurrence.test.ts > handleRecurrence',
     'Error: Could not locate the bindings file. Tried:',
@@ -344,7 +344,7 @@ describe('findIntroducingCommit — full-command fallback and last-failed rootin
   });
 
   it('falls back to the FULL command when the narrowed form does not reproduce', async () => {
-    // Exactly the 2026-08-03 failure: narrowed it passes (no load), whole it fails.
+    // A load-dependent failure: narrowed it passes (no load), whole it fails.
     const r = await findIntroducingCommit('c9', [POLL_LOOP], never, linear(), redFrom(6));
     expect(r.status).toBe('found');
     expect(r.sha).toBe('c6');
@@ -360,10 +360,10 @@ describe('findIntroducingCommit — full-command fallback and last-failed rootin
   });
 
   it('never searches BELOW the floor — a failure older than the trunk head is not this branch’s to root', async () => {
-    // Live 2026-08-04: the bisect named a commit 299 behind the branch tip, so
-    // the case worktree became a three-week-old tree and the checks gate demanded
-    // THAT suite green — red in a second, unrelated file whose fix had not been
-    // written yet. One test in scope, a whole pre-history demanded green.
+    // Unfloored, a bisect can name a commit hundreds of commits behind the
+    // branch tip: the case worktree becomes a weeks-old tree and the checks gate
+    // demands THAT suite green — red in a second, unrelated file whose fix has
+    // not been written yet. One test in scope, a whole pre-history demanded green.
     const commits = Array.from({ length: 10 }, (_, i) => `c${i}`);
     const probed: string[] = [];
     const alwaysRed: SubsetProbe = async (t) => {
@@ -398,7 +398,7 @@ describe('findIntroducingCommit — full-command fallback and last-failed rootin
   });
 });
 
-describe('environment faults never become code blame (2026-08-03/04)', () => {
+describe('environment faults never become code blame', () => {
   const { install, checks } = makeEnvAwareRunners({ native: ['better-sqlite3'], skipScripts: true });
 
   it('a native package installed WITHOUT its addon reads as an environment fault', async () => {
@@ -415,9 +415,9 @@ describe('environment faults never become code blame (2026-08-03/04)', () => {
   });
 
   it('a DECLARED dependency that was never installed reads as an environment fault (TS2307)', async () => {
-    // The 2026-08-04 shape: upstream declares `yaml`, the environment predates
-    // the merge that brought it. `error TS…` used to veto this wholesale, which
-    // made the classifier dead code for the entire typecheck kind.
+    // Upstream declares `yaml`; the environment predates the merge that brings
+    // it. A wholesale `error TS…` veto here would make the classifier dead code
+    // for the entire typecheck kind.
     const wt = mkdtempSync(join(tmpdir(), 'env-'));
     writeFileSync(join(wt, 'package.json'), JSON.stringify({ dependencies: { yaml: '2' } }));
     mkdirSync(join(wt, 'node_modules'), { recursive: true }); // installed, but not `yaml`
@@ -438,8 +438,8 @@ describe('environment faults never become code blame (2026-08-03/04)', () => {
   });
 
   it('ONE environment answers for TWO different trees — the reuse that made it six pools', async () => {
-    // 2026-08-03 was not one bad install, it was one bad environment reused for
-    // every tree that shared its manifests. Two trees, one broken environment,
+    // Not one bad install: one bad environment gets reused for
+    // every tree that shares its manifests. Two trees, one broken environment,
     // both must report the fault rather than blaming their own code.
     const a = mkdtempSync(join(tmpdir(), 'env-a-'));
     const b = mkdtempSync(join(tmpdir(), 'env-b-'));
@@ -457,10 +457,10 @@ describe('environment faults never become code blame (2026-08-03/04)', () => {
 
 describe('breadth backstop — an experiment that distinguished nothing', () => {
   it('identical failures with the runner reporting ZERO passes is UNDECIDABLE, not pre-existing', async () => {
-    // The 2026-08-03 environment fault. What made it anomalous was not the file
-    // COUNT — it was that not one test passed anywhere, which is what a broken
-    // toolchain looks like. The fixture has to SAY that now; it used to rely on
-    // a breadth threshold standing in for it.
+    // An environment fault is anomalous not for the file COUNT but because not
+    // one test passes anywhere — which is what a broken toolchain looks like.
+    // The fixture SAYS that outright rather than leaving a breadth threshold
+    // to stand in for it.
     const files = Array.from({ length: 44 }, (_, i) => `src/f${i}.test.ts`);
     const resolved = new Map(files.map((f) => [f, 1]));
     const { probe } = scriptedProbe([
@@ -557,11 +557,10 @@ describe('classifyEnvironmentFault — which dependency tree the diagnostic is a
 // --- failing locations in the gate-fix briefing ----------------------------
 describe('failingLocations — the coordinates the output already carries', () => {
   it('BUN: carries the file down from the header and names the failing TEST (there is no line number)', () => {
-    // The shape that made the first version emit NOTHING on the live run of
-    // 2026-08-10: bun names the file ONCE as a header and the `(fail)` line
+    // Bun names the file ONCE as a header and the `(fail)` line
     // carries neither a file nor a line — only a test name. `checks.test` is a
-    // bun command, so this is THE shape that matters, and the section was
-    // silently omitted from every gate-fix briefing.
+    // bun command, so this is THE shape that matters: missing it would silently
+    // omit the section from every gate-fix briefing.
     const out = [
       '[poll-loop] Duplicate result event — skipping',
       'src/poll-loop.test.ts:',
@@ -599,9 +598,9 @@ describe('failingLocations — the coordinates the output already carries', () =
   });
 
   it('an absolute worktree frame is REPO-ROOTED — the agent must be able to open it', () => {
-    // Live 2026-08-10, first run with the section populated: every entry read
+    // An absolute worktree frame like
     //   /workspace/agent/propagation/pass-743e32df4e6c/<case>/worktree/src/x.ts:153
-    // Unopenable twice over — it names a DIFFERENT pass (checks output is
+    // is unopenable twice over — it names a DIFFERENT pass (checks output is
     // captured before the case is minted, carrying the tree it ran in) and that
     // directory is gone after a clean-slate.
     const out = [

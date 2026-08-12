@@ -1,12 +1,12 @@
 /**
  * scripts/sweep/tiers.ts — tier types, floors, and the ONLY legal tier
- * transitions (DRIVER.md §8.1, D-035/D-015/D-012).
+ * transitions (DRIVER.md §8.1).
  *
  * Tier decisions are demote-only in the driver:
  *  - CLEAN vs conflict is computed mechanically (new-style merge-tree).
  *  - MECHANICAL vs JUDGED is CLAIMED by the resolving agent but only ever
  *    DEMOTED, never promoted: a scope-guard violation goes straight to HELD
- *    with NO merge (§7, tightened 2026-07-20 — a one-tier demotion would still
+ *    with NO merge (§7 — a one-tier demotion would still
  *    land the out-of-scope content); a cold-read rejection demotes to HELD; a
  *    red verification gate (§9) demotes any executed tier to HELD.
  *  - `edition/*` and entries flagged `tier_floor: judged` never merge below
@@ -28,13 +28,13 @@ export function severity(tier: Exclude<Tier, 'deferred'>): number {
 }
 
 /**
- * Tier floor for a branch (§1, D-015). `edition/*` and any inventory entry
+ * Tier floor for a branch (§1). `edition/*` and any inventory entry
  * flagged `tier_floor: judged` never merge below JUDGED; everyone else floors
  * at CLEAN.
  */
-export function tierFloor(branch: string, entry?: FeatureEntry & { tier_floor?: string }): Tier {
+export function tierFloor(branch: string, entry?: FeatureEntry): Tier {
   if (/^edition\//.test(branch)) return 'judged';
-  if (entry && (entry as { tier_floor?: string }).tier_floor === 'judged') return 'judged';
+  if (entry?.tier_floor === 'judged') return 'judged';
   return 'clean';
 }
 
@@ -50,7 +50,7 @@ export function applyFloor(
  * Cold-read rejection, scope-guard violation, or red verification gate all
  * demote straight to HELD (§1/§7/§9). A scope violation is HELD-with-no-merge:
  * demoting one tier (to JUDGED) would still land the out-of-scope content, so
- * the guard would not actually guard (owner may relax this later).
+ * the guard would not actually guard.
  */
 export function demoteToHeld(): 'held' {
   return 'held';

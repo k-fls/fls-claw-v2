@@ -14,8 +14,6 @@ beyond the pointers given here plus targeted `git show`/`git diff`/`git log`
 {{feature.invariants}}
 - design docs (read via `git show <branch>:<path>` if you need depth): {{feature.design_docs}}
 - test anchors (proof the feature works): {{feature.test_anchors}}
-- what upstream work would count as duplicating this feature: {{feature.overlap_hints}}
-- owner standing guidance for this feature: {{feature.extra_context}}
 
 ## The upstream change set
 - repo: {{upstream_remote}} | commit range: {{upstream_range}}

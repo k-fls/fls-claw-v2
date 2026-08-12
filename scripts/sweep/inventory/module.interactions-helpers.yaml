@@ -1,47 +1,31 @@
 id: module.interactions-helpers
 name: Interactive-prompt helpers
 kind: module
-status: shipped
 branch: module/interactions-helpers
 parents:
-- module/agent-group-contributions
+  - module/agent-group-contributions
 dependents:
-- module/credentials
-- module/runtime-updater
-- feat/mitm-credential-proxy
-- feat/ssh-auth
-summary: 'Reusable interactive-prompt building blocks on top of interaction-status: confirm-action, paste-plain,
-  paste-pgp, pick-from-buttons (pick-option added later on the mitm stack).'
+  - module/credentials
+  - module/runtime-updater
+  - feat/mitm-credential-proxy
+  - feat/ssh-auth
+summary: "Reusable interactive-prompt building blocks on top of interaction-status: confirm-action,
+  paste-plain, paste-pgp, pick-from-buttons (pick-option added later on the mitm stack)."
 owned_paths:
-- src/modules/interactions/**
-- docs/interactions-helpers.md
-touch_paths:
-- src/index.ts
-- src/modules/index.ts
-- src/router.ts
+  - src/modules/interactions/**
+  - docs/interactions-helpers.md
 key_symbols: []
-symbol_watch: []
-invariants: []
 design_docs:
-- docs/interactions-helpers.md@module/interactions-helpers
+  - docs/interactions-helpers.md@module/interactions-helpers
 test_anchors:
-- src/modules/interactions/confirm-action.test.ts
-- src/modules/interactions/paste-pgp.test.ts
-- src/modules/interactions/pick-from-buttons.test.ts
-overlap_hints: Upstream adding button/confirm/secure-paste interaction primitives to chat channels.
+  - src/modules/interactions/confirm-action.test.ts
+  - src/modules/interactions/paste-pgp.test.ts
+  - src/modules/interactions/pick-from-buttons.test.ts
 routing:
   keywords:
-  - interaction
-  - confirm
-  - paste
-  - buttons
-  - prompt
+    - interaction
+    - confirm
+    - paste
+    - buttons
+    - prompt
   always_check_on: []
-prompt:
-  template: prompts/overlap-check.md
-maintenance:
-  owner: sweep-agent-group
-  last_verified: '2026-07-10'
-  verified_against: 8fc0ca9e3684485be8e3497cc3bfea272b4649bb
-  notes: skeleton — needs enrichment. src/modules/interactions/pick-option.* is owned by feat/mitm-credential-proxy
-    (added there), though the glob here matches it — acceptable double-routing.

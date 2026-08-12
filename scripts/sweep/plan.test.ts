@@ -102,9 +102,9 @@ describe('derivePlan — DAG barrier ordering + tier floor', () => {
   afterAll(() => repo.destroy());
 
   const features: FeatureEntry[] = [
-    { id: 'a', name: 'a', kind: 'feat', status: 'shipped', branch: 'feat/a', parents: ['main_patched'] },
-    { id: 'b', name: 'b', kind: 'feat', status: 'shipped', branch: 'feat/b', parents: ['feat/a'] },
-    { id: 'z', name: 'z', kind: 'edition', status: 'shipped', branch: 'edition/z', parents: ['main_patched'] },
+    { id: 'a', name: 'a', kind: 'feat', branch: 'feat/a', parents: ['main_patched'] },
+    { id: 'b', name: 'b', kind: 'feat', branch: 'feat/b', parents: ['feat/a'] },
+    { id: 'z', name: 'z', kind: 'edition', branch: 'edition/z', parents: ['main_patched'] },
   ];
   const scope: SweepScope = {};
 
@@ -138,7 +138,7 @@ describe('derivePlan — DEFERRED to a HELD ancestor', () => {
   afterAll(() => repo.destroy());
 
   const features: FeatureEntry[] = [
-    { id: 'p', name: 'p', kind: 'feat', status: 'shipped', branch: 'feat/p', parents: ['main_patched'] },
+    { id: 'p', name: 'p', kind: 'feat', branch: 'feat/p', parents: ['main_patched'] },
   ];
 
   it('DEFERRED when the conflict height + paths match the HELD ancestor', async () => {
@@ -150,7 +150,7 @@ describe('derivePlan — DEFERRED to a HELD ancestor', () => {
     expect(p.parents[0].case).toBeNull(); // DEFERRED emits NO case / PR
   });
 
-  it('DEFERS even when the HELD parent paths are DISJOINT (D-057 dropped path-intersection)', async () => {
+  it('DEFERS even when the HELD parent paths are DISJOINT', async () => {
     const held = [{ branch: 'main_patched', height: 0, conflictedPaths: ['src/other.ts'], caseId: 'main_patched-h0' }];
     const plan = await derivePlan({ repo: repo.dir, upstreamRef: 'main', base, features, scope: {}, held });
     const p = plan.branches.find((b) => b.branch === 'feat/p')!;
@@ -170,8 +170,8 @@ describe('derivePlan — DEFERRED to a HELD ancestor', () => {
   });
 });
 
-// --- merge_status views in derivation (D-057) ------------------------------
-describe('derivePlan — mergeStatusOf (D-057: PR_ID empty interval, DEFERRED sticky)', () => {
+// --- merge_status views in derivation --------------------------------------
+describe('derivePlan — mergeStatusOf (PR_ID empty interval, DEFERRED sticky)', () => {
   // Same fixture as the DEFERRED wiring above: feat/p conflicts vs main_patched at h0.
   const repo = initFixtureRepo();
   repo.commit('base: x', { 'src/x.ts': 'orig\n' });
@@ -187,7 +187,7 @@ describe('derivePlan — mergeStatusOf (D-057: PR_ID empty interval, DEFERRED st
   afterAll(() => repo.destroy());
 
   const features: FeatureEntry[] = [
-    { id: 'p', name: 'p', kind: 'feat', status: 'shipped', branch: 'feat/p', parents: ['main_patched'] },
+    { id: 'p', name: 'p', kind: 'feat', branch: 'feat/p', parents: ['main_patched'] },
   ];
 
   it('a PR_ID branch arrives with an EMPTY interval (skip rows, no probes act)', async () => {
@@ -242,8 +242,8 @@ describe('derivePlan — mergeStatusOf (D-057: PR_ID empty interval, DEFERRED st
   });
 });
 
-// --- §6 un-skip vs blocked branches (D-057) --------------------------------
-describe('derivePlan — un-skip never merges into/through a blocked branch (D-057)', () => {
+// --- §6 un-skip vs blocked branches ----------------------------------------
+describe('derivePlan — un-skip never merges into/through a blocked branch', () => {
   // leaf feat/l -> feat/d -> entry main_patched. main_patched is PR_ID-blocked
   // (which keeps feat/d sticky-DEFERRED); U0 gives the pass progress so the
   // leaf un-skip rule fires — but its only chain runs through blocked hops.
@@ -257,8 +257,8 @@ describe('derivePlan — un-skip never merges into/through a blocked branch (D-0
   afterAll(() => repo.destroy());
 
   const features: FeatureEntry[] = [
-    { id: 'd', name: 'd', kind: 'feat', status: 'shipped', branch: 'feat/d', parents: ['main_patched'] },
-    { id: 'l', name: 'l', kind: 'feat', status: 'shipped', branch: 'feat/l', parents: ['feat/d'] },
+    { id: 'd', name: 'd', kind: 'feat', branch: 'feat/d', parents: ['main_patched'] },
+    { id: 'l', name: 'l', kind: 'feat', branch: 'feat/l', parents: ['feat/d'] },
   ];
 
   it('aborts the un-skip instead of force-merging a DEFERRED intermediate hop', async () => {
@@ -294,7 +294,7 @@ describe('derivePlan — un-skip never merges into/through a blocked branch (D-0
   });
 });
 
-// --- §6 un-skip vs a CONFLICTING chain hop (2026-07-23 ERR21 pre-probe) -----
+// --- §6 un-skip vs a CONFLICTING chain hop (ERR21 pre-probe) ----------------
 describe('derivePlan — un-skip never marks a chain forced when a hop conflicts', () => {
   // leaf feat/l -> feat/m -> entry main_patched. feat/m genuinely conflicts
   // with main_patched's CURRENT tip (its own case — a conflict is NOT a
@@ -317,8 +317,8 @@ describe('derivePlan — un-skip never marks a chain forced when a hop conflicts
   afterAll(() => repo.destroy());
 
   const features: FeatureEntry[] = [
-    { id: 'm', name: 'm', kind: 'feat', status: 'shipped', branch: 'feat/m', parents: ['main_patched'] },
-    { id: 'l', name: 'l', kind: 'feat', status: 'shipped', branch: 'feat/l', parents: ['feat/m'] },
+    { id: 'm', name: 'm', kind: 'feat', branch: 'feat/m', parents: ['main_patched'] },
+    { id: 'l', name: 'l', kind: 'feat', branch: 'feat/l', parents: ['feat/m'] },
   ];
 
   it('aborts the un-skip: no forced verdicts, the hop keeps its OWN case, leaf rows carry unskip-conflict', async () => {
@@ -338,7 +338,7 @@ describe('derivePlan — un-skip never marks a chain forced when a hop conflicts
   });
 });
 
-// --- annotate-class detection (§1 D-002, SPEC 2) --------------------------
+// --- annotate-class detection (§1, SPEC 2) --------------------------------
 describe('derivePlan — annotate-class (clean merge THROUGH a HELD-ancestor height)', () => {
   // feat/c (coverage -1) merges main_patched cleanly to height 0; main_patched
   // is a transitive ancestor recorded HELD at height 0 (within the merge window).
@@ -355,7 +355,7 @@ describe('derivePlan — annotate-class (clean merge THROUGH a HELD-ancestor hei
   afterAll(() => repo.destroy());
 
   const features: FeatureEntry[] = [
-    { id: 'c', name: 'c', kind: 'feat', status: 'shipped', branch: 'feat/c', parents: ['main_patched'] },
+    { id: 'c', name: 'c', kind: 'feat', branch: 'feat/c', parents: ['main_patched'] },
   ];
 
   it('flags annotate when a HELD ancestor height lies in the merge window', async () => {

@@ -2,12 +2,11 @@
  * scripts/sweep/config.ts — static defaults for the sweep toolkit.
  *
  * Durable tooling config (routing.yaml, scope.yaml, prompts, schema, test
- * cases, bootstrap inventory snapshot) lives in this directory and is read
- * from the LOCAL WORKING TREE. Live state is derived (merge-base) or
- * group-owned (files in the sweep workspace). There is no state
- * branch (dissolved 2026-07-10 by owner decision).
+ * cases, the inventory) lives in this directory and is read from the LOCAL
+ * WORKING TREE. Live state is derived (from git/origin) or group-owned (files
+ * in the sweep workspace) — there is no state branch.
  */
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -35,19 +34,13 @@ export const DEFAULT_SCOPE_FILE = join(SWEEP_DIR, 'registry', 'scope.yaml');
 export const DEFAULT_CUT_POINT_EXCEPTIONS_FILE = join(SWEEP_DIR, 'cut-point-exceptions.yaml');
 
 /**
- * Default live inventory = the latest committed bootstrap snapshot
- * (scripts/sweep/bootstrap/fork-registry@<hash>/features). Groups pass
- * --inventory to point at a regenerated inventory in their workspace.
+ * The inventory = `scripts/sweep/inventory/` — config tracked in the fork
+ * repo. `--inventory` overrides it for tests/fixtures only; an inventory dir
+ * at the group root is start-guard residue, not an input.
  */
 export function defaultInventoryDir(): string | null {
-  const bootstrap = join(SWEEP_DIR, 'bootstrap');
-  if (!existsSync(bootstrap)) return null;
-  const snapshots = readdirSync(bootstrap)
-    .filter((name) => name.startsWith('fork-registry@'))
-    .sort();
-  if (snapshots.length === 0) return null;
-  const features = join(bootstrap, snapshots[snapshots.length - 1], 'features');
-  return existsSync(features) ? features : null;
+  const inventory = join(SWEEP_DIR, 'inventory');
+  return existsSync(inventory) ? inventory : null;
 }
 
 /** Group-workspace file/dir names (all under --workspace, default cwd). */
@@ -57,13 +50,13 @@ export const DEFAULT_UPSTREAM_REF = 'upstream/main';
 
 /**
  * Fork point (nanocoai v2.1.1) — bounds the fork-era merge-edge walk of the
- * D-033 edition-composition closure. Repos without this commit (fixtures)
+ * transitive edition-composition closure. Repos without this commit (fixtures)
  * walk unbounded.
  */
 export const FORK_POINT = 'd85efea229ea63fb0bd4f57a039f4ef73ece563b';
 
 /**
- * Case-stacking cap (D-049 §2): a case is the maximal run of consecutive
+ * Case-stacking cap (DRIVER.md §4.4): a case is the maximal run of consecutive
  * path-intersecting conflicting heights, capped here by default. The lever:
  * global `stack_cap` in registry/routing.yaml; per-feature `stack_cap` on the
  * inventory entry (mirroring the scope-guard lever).
@@ -73,8 +66,9 @@ export const DEFAULT_STACK_CAP = 5;
 /**
  * Branch name globs never swept, never merged into, never enumerated as
  * scope. NOTE: fix/* (upstream-PR candidates) and docs/notes ARE swept in
- * this fork's practice — they enter scope via registry/scope.yaml include
- * globs, so they must not be excluded here (only fix/sweep/* is ours).
+ * this fork's practice — they enter scope via the transitive
+ * edition-composition closure, so they must not be excluded here (only
+ * fix/sweep/* is ours).
  */
 export const EXCLUDED_BRANCH_GLOBS = [
   'everything*',

@@ -1,48 +1,31 @@
 id: feat.autonomy-matrix
 name: Autonomy matrix / checkAutonomy (design 08 WS-E)
 kind: feat
-status: in-progress
 branch: feat/autonomy-matrix
 parents:
-- feat/ops-registry
+  - feat/ops-registry
 dependents: []
-summary: 'checkAutonomy for approval handlers (design 08 §3.4): per-action autonomy resolution over the
-  ops registry with DB-backed overrides (migration 022), autonomy module + `ncl autonomy` CLI resource.'
+summary: "checkAutonomy for approval handlers (design 08 §3.4): per-action autonomy resolution over
+  the ops registry with DB-backed overrides (migration 022), autonomy module + `ncl autonomy` CLI
+  resource."
 owned_paths:
-- src/modules/autonomy/**
-- src/modules/approvals/autonomy-wiring.test.ts
-- src/cli/resources/autonomy.ts
-- src/cli/resources/autonomy.test.ts
-- src/db/migrations/022-autonomy-overrides.ts
-touch_paths:
-- src/modules/approvals/primitive.ts
-- src/types.ts
-- src/cli/resources/index.ts
-- src/db/migrations/index.ts
+  - src/modules/autonomy/**
+  - src/modules/approvals/autonomy-wiring.test.ts
+  - src/cli/resources/autonomy.ts
+  - src/cli/resources/autonomy.test.ts
+  - src/db/migrations/022-autonomy-overrides.ts
 key_symbols: []
-symbol_watch: []
-invariants: []
 design_docs:
-- docs/design/08-implementation-plan.md@design/flsclaw
+  - docs/design/08-implementation-plan.md@design/flsclaw
 test_anchors:
-- src/modules/autonomy/autonomy.test.ts
-- src/modules/approvals/autonomy-wiring.test.ts
-- src/cli/resources/autonomy.test.ts
-overlap_hints: Upstream adding auto-approval policies, permission matrices, or approval-gating configuration
-  is OVERLAP-HIGH.
+  - src/modules/autonomy/autonomy.test.ts
+  - src/modules/approvals/autonomy-wiring.test.ts
+  - src/cli/resources/autonomy.test.ts
 routing:
   keywords:
-  - autonomy
-  - approval
-  - auto-approve
-  - gated
-  - policy
+    - autonomy
+    - approval
+    - auto-approve
+    - gated
+    - policy
   always_check_on: []
-prompt:
-  template: prompts/overlap-check.md
-maintenance:
-  owner: sweep-agent-group
-  last_verified: '2026-07-10'
-  verified_against: 7e0b90c1cb151a74f8ef80a88e344240ef3a1772
-  notes: skeleton — needs enrichment. WS-E done+reviewed; stacked on feat/ops-registry. Wiring checkAutonomy
-    into approval handlers is WS-D's job (F5 follow-up, not blocking).

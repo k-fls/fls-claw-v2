@@ -1,13 +1,14 @@
 /**
  * scripts/sweep/registry.ts — load the fork feature inventory + tooling
- * config from the LOCAL WORKING TREE (no state branch; dissolved
- * 2026-07-10). The live inventory is a directory of <id>.yaml entries
- * (--inventory; default = the committed bootstrap snapshot), routing/scope
- * config live in scripts/sweep/registry/.
+ * config from the LOCAL WORKING TREE. The live inventory is
+ * scripts/sweep/inventory/*.yaml — strict config tracked in the fork repo,
+ * loaded by default; `--inventory` overrides it for tests/fixtures.
+ * Routing/scope config live in scripts/sweep/registry/.
  *
- * Fail-closed loader in the feat/ops-registry idiom: a malformed entry never
- * crashes the sweep — it is dropped and surfaced as a load warning, and the
- * router treats its PoIs via catch-all.
+ * The loader itself is per-entry fail-soft: a malformed entry never crashes a
+ * load — it is dropped and surfaced as a load warning, and the router treats
+ * its PoIs via catch-all. `sweep start` is fail-closed on top of that: ANY
+ * entry warning is fatal there (ERR46_INVENTORY_INVALID).
  */
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -25,7 +26,38 @@ export interface RegistryLoad {
 }
 
 const KINDS = new Set(['module', 'feat', 'edition', 'fix', 'planned']);
-const STATUSES = new Set(['planned', 'in-progress', 'shipped', 'experimental', 'absorbed', 'retired']);
+
+// ---------------------------------------------------------------------------
+// Strict config schema. The inventory is CONFIGURATION ONLY: every key
+// must be a declared config field with a well-shaped value; anything else is
+// an entry ERROR, and `sweep start` fails hard on entry errors.
+// ---------------------------------------------------------------------------
+
+const isStr = (v: unknown): boolean => typeof v === 'string' && v.length > 0;
+const isStrArray = (v: unknown): boolean => Array.isArray(v) && v.every((x) => typeof x === 'string');
+const isMapping = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
+
+const ENTRY_KEYS: Record<string, (v: unknown) => boolean> = {
+  id: isStr,
+  name: isStr,
+  kind: (v) => typeof v === 'string' && KINDS.has(v),
+  branch: isStr,
+  parents: isStrArray,
+  dependents: isStrArray,
+  summary: isStr,
+  owned_paths: isStrArray,
+  key_symbols: isStrArray,
+  design_docs: isStrArray,
+  test_anchors: isStrArray,
+  scope_guard: (v) => v === 'same-files' || v === 'conflict-hunks',
+  stack_cap: (v) => typeof v === 'number' && Number.isInteger(v) && v >= 1,
+  tier_floor: (v) => v === 'judged',
+  always_merge: (v) => typeof v === 'boolean',
+  routing: (v) =>
+    isMapping(v) &&
+    Object.entries(v).every(([k, val]) => (k === 'keywords' || k === 'always_check_on') && isStrArray(val)),
+};
 
 export function parseFeatureEntry(raw: string, sourceName: string): { entry?: FeatureEntry; error?: string } {
   let doc: unknown;
@@ -34,16 +66,18 @@ export function parseFeatureEntry(raw: string, sourceName: string): { entry?: Fe
   } catch (err) {
     return { error: `${sourceName}: YAML parse error: ${(err as Error).message}` };
   }
-  if (typeof doc !== 'object' || doc === null || Array.isArray(doc)) {
+  if (!isMapping(doc)) {
     return { error: `${sourceName}: not a mapping` };
   }
-  const e = doc as FeatureEntry;
-  if (!e.id || !e.name || !e.kind || !e.status) {
-    return { error: `${sourceName}: missing required field (id/name/kind/status)` };
+  for (const [key, value] of Object.entries(doc)) {
+    const check = ENTRY_KEYS[key];
+    if (!check) return { error: `${sourceName}: unknown key '${key}' (the inventory is strict config only)` };
+    if (!check(value)) return { error: `${sourceName}: bad value for '${key}'` };
   }
-  if (!KINDS.has(e.kind)) return { error: `${sourceName}: bad kind '${e.kind}'` };
-  if (!STATUSES.has(e.status)) return { error: `${sourceName}: bad status '${e.status}'` };
-  if (e.status !== 'planned' && !e.branch) return { error: `${sourceName}: branch required unless status=planned` };
+  const e = doc as unknown as FeatureEntry;
+  if (!e.id || !e.name || !e.kind) {
+    return { error: `${sourceName}: missing required field (id/name/kind)` };
+  }
   return { entry: e };
 }
 
@@ -106,7 +140,7 @@ export function loadScopeConfig(scopeFile: string = DEFAULT_SCOPE_FILE): { scope
 }
 
 export interface LoadRegistryOptions {
-  /** undefined = use the bootstrap snapshot; null = no inventory. */
+  /** undefined = use the default inventory dir; null = no inventory. */
   inventoryDir?: string | null;
   routingFile?: string;
   scopeFile?: string;

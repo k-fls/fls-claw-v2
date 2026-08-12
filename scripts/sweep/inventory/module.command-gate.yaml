@@ -1,56 +1,27 @@
 id: module.command-gate
 name: Command gate extensions + host interactions
 kind: module
-status: shipped
 branch: module/command-gate
 parents:
-- main_patched
+  - main_patched
 dependents: []
-summary: Extends the inbound command gate and adds host-side interaction commands operators can invoke
-  (host commands surface). Standalone root module.
+summary: Extends the inbound command gate and adds host-side interaction commands operators can
+  invoke (host commands surface). Standalone root module.
 owned_paths:
-- src/host-interactions.ts
-- src/host-interactions.test.ts
-- docs/host-commands.md
-touch_paths:
-- src/command-gate.ts
-- src/command-gate.test.ts
-- src/delivery.ts
-- src/router.ts
-- src/host-core.test.ts
+  - src/host-interactions.ts
+  - src/host-interactions.test.ts
+  - docs/host-commands.md
 key_symbols: []
-symbol_watch: []
-invariants: []
 design_docs:
-- docs/host-commands.md@module/command-gate
+  - docs/host-commands.md@module/command-gate
 test_anchors:
-- src/host-interactions.test.ts
-- src/command-gate.test.ts
-overlap_hints: Upstream changes to command parsing/dispatch (parseSlashCommand, command-gate) or any new
-  host-command/admin-command surface.
+  - src/host-interactions.test.ts
+  - src/command-gate.test.ts
 routing:
   keywords:
-  - command
-  - slash
-  - gate
-  - host-command
-  - dispatch
+    - command
+    - slash
+    - gate
+    - host-command
+    - dispatch
   always_check_on: []
-prompt:
-  template: prompts/overlap-check.md
-  extra_context: >
-    DECIDED 2026-07-21 (owner, from freeze-PR forensics): the command-gate x
-    main_patched conflict (src/command-gate.ts, command-gate.test.ts, src/router.ts)
-    is COMPOSITION, not a choice: upstream/main_patched classifiableText
-    mention-prefix stripping MUST survive (it fixes this branch entry recorded open
-    slash-mention bug) AND the host command registry stays (the branch reason to
-    exist). Compose once at module/command-gate vs main_patched (keep /start
-    filtered, isAdmin->hasAdminPrivilege), deliver as a case-3 provisional-resolution
-    draft PR with a real minimal diff, then replay downward to
-    agent-group-contributions descendants via rerere. Do NOT freeze or re-ask this.
-maintenance:
-  owner: sweep-agent-group
-  last_verified: '2026-07-10'
-  verified_against: 3d5dde16a9ea1c073968db240807ba3bc01e0f9a
-  notes: 'skeleton — needs enrichment. OPEN fork bug lives on this surface: slash commands unreachable
-    in Slack group channels (@mention prefix defeats parseSlashCommand); fix belongs in src/command-gate.ts.'

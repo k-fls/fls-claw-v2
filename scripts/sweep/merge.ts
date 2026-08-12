@@ -5,7 +5,7 @@
  * before merging and exported back after, so a conflict resolved once at the
  * topmost affected branch replays on every descendant (DRIVER.md §8.3).
  * The propagation driver (`propagate.ts`) owns the DAG-ordered merging
- * (DRIVER.md §4) and the DRIVER.md §10.2 rollback; this module only moves the cache.
+ * (DRIVER.md §4) and the §9 rollback; this module only moves the cache.
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';

@@ -1,41 +1,31 @@
 /**
  * scripts/sweep/publish.ts — mechanics for `propagate publish --case <id>`
  * (the ONLY sanctioned PR-creation path) and the `propagate push` publication
- * stage (DRIVER.md §10, D-048/D-049).
+ * stage (DRIVER.md §10).
  *
- * Born from the 2026-07-21 forensic reviews of the freeze PRs, corrected the
- * same day by D-049 (DRIVER.md §10):
- *  - PR heads are REAL commits pushed by the driver via `git push` (D-049 §5;
- *    unified per D-057): HELD with a marker-clean resolution = the resolved
- *    merge commit (ACTIVE PR — the owner reviews & merges); HELD without one
- *    = the pristine-conflict head (clean-prefix commit + the automerge tree
- *    with its markers, DRAFT PR — no agent edits, the owner resolves fresh);
- *    JUDGED = the real merge commit, published BEFORE the target push so the
- *    push auto-flips the PR to merged (D-040). The 2026-07-21 synthetic
- *    exhibit-head mechanism (and its ERR03/ERR04 asserts) is RETIRED — the
- *    pre-PR height check (checkBaseHeight, ERR14) plus the §14.4 push order
- *    are the guarantees. Refs move via `git push` ONLY; the API is never used
- *    to fabricate refs/commits, and a failing push is ERR15 — a D-046 case-2
- *    owner report, never worked around.
- *  - the driver's template PR prose could never pass its own text gate (a
- *    3-round rewrite loop); the driver NEVER generates prose — the agent
- *    writes pr/title.txt + pr/body.md itself. The two-round PR-text cold read
- *    that once gated this text is RETIRED (D-050: zero unique catches ever;
- *    ~300k tokens/~19 min burned in one batch) — checks on the agent's text
- *    are MECHANICAL only (advisory lint WARNs + ERR05/ERR06); the D-031
- *    catch-list survives as writing rules in the doctrine. The only
- *    driver-written body content is the clearly-delimited D-004 machine block
- *    below the agent's prose (pending-count bookkeeping, refreshed by urges).
- *  - no gate asked "should this PR exist": decidedAlready (ERR05) matches the
- *    conflict against decisions recorded in inventory `prompt.extra_context` /
- *    `decided_paths`; duplicate-signature detection (ERR06) lives in the CLI.
+ *  - PR heads are REAL commits pushed by the driver via `git push`: HELD with
+ *    a marker-clean resolution = the resolved merge commit (ACTIVE PR — the
+ *    owner reviews & merges); HELD without one = the pristine-conflict head
+ *    (clean-prefix commit + the automerge tree with its markers, DRAFT PR —
+ *    no agent edits, the owner resolves fresh); JUDGED = the real merge
+ *    commit, published BEFORE the target push so the push auto-flips the PR
+ *    to merged. The pre-PR height check (checkBaseHeight, ERR14) plus the
+ *    §14.4 push order are the guarantees. Refs move via `git push` ONLY; the
+ *    API is never used to fabricate refs/commits, and a failing push is
+ *    ERR15 — an owner report, never worked around.
+ *  - the driver NEVER generates prose — the agent writes pr/title.txt +
+ *    pr/body.md itself; checks on the agent's text are MECHANICAL only
+ *    (advisory lint WARNs + ERR06). The only driver-written body content is
+ *    the clearly-delimited machine block below the agent's prose
+ *    (pending-count bookkeeping, refreshed by urges).
+ *  - "should this PR exist" is answered by duplicate-signature detection
+ *    (ERR06, in the CLI) and by the PR channel itself.
  *
  * Every check returns a machine-readable Issue {id, detail}; ERR* ids block,
- * WARN* ids are advisory. HALT_IDS maps the existing DriverHalt reasons onto
- * the same scheme for run/resolve CLI output. The registry of ids is
- * DRIVER.md §11 (single source of truth). ERR03/ERR04 (D-049, the exhibit
- * mechanism) and ERR09/ERR10/WARN04 (D-050, the PR-text cold read) are retired
- * permanently and their numbers are never reused.
+ * WARN* ids are advisory. HALT_IDS maps DriverHalt reasons onto the same
+ * scheme for run/resolve CLI output. The registry of ids is DRIVER.md
+ * §11 (single source of truth), including the reserved numbers that must
+ * never be assigned.
  *
  * Network: the GitHub REST API is used for PR creation/comments only (normal
  * API use). Requests go to api.github.com with `Authorization: Bearer
@@ -49,10 +39,9 @@ import { connect as netConnect, type Socket } from 'node:net';
 import { connect as tlsConnect } from 'node:tls';
 
 import { isAncestor, refExists, revParse } from './git.js';
-import type { FeatureEntry } from './types.js';
 
 // ---------------------------------------------------------------------------
-// Result ids (§14, D-048). ERR* blocks, WARN* is advisory. The full registry
+// Result ids (DRIVER.md §11). ERR* blocks, WARN* is advisory. The full registry
 // with meanings + prescribed agent actions lives in DRIVER.md §11 and the
 // doctrine's "Tool result IDs" table.
 // ---------------------------------------------------------------------------
@@ -85,12 +74,12 @@ export function haltIdFor(reason: string): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// Pre-PR height check (D-049 §5; replaces the retired exhibit asserts).
+// Pre-PR height check (DRIVER.md §10.4).
 // ---------------------------------------------------------------------------
 
 /**
  * ERR14_BASE_BEHIND — the origin base branch must be AT LEAST at the expected
- * pass height before a PR is created on it (D-049 §5); higher is fine (someone
+ * pass height before a PR is created on it (DRIVER.md §10.4); higher is fine (someone
  * else committed), lower or diverged is a halt. In ancestry terms:
  *  - HELD (published AFTER the pass's target pushes, §14.4 order): the local
  *    branch tip must be contained in origin/<branch> — the clean prefix was
@@ -111,8 +100,7 @@ export async function checkBaseHeight(
    * That rule enforces a PREMISE — "held PRs are published after the pass's
    * target pushes" — and at a red finish the premise is void by construction:
    * the tests failed, so nothing is pushed, so origin is necessarily behind and
-   * every held escalation was refused (live 2026-08-05, three of three, which is
-   * how this parameter came to exist).
+   * every held escalation would be refused.
    *
    * The escalation satisfies what the rule PROTECTS — a PR whose diff is the
    * case's own work, not the pass's unpushed and unverified merges — by
@@ -130,7 +118,7 @@ export async function checkBaseHeight(
   if (!(await refExists(repo, originRef))) {
     return {
       id: 'ERR14_BASE_BEHIND',
-      detail: `no origin ref for base '${branch}' — the target branch must exist on origin before a PR can be based on it (D-049 §5)`,
+      detail: `no origin ref for base '${branch}' — the target branch must exist on origin before a PR can be based on it (MERGE-POLICY.md §5)`,
     };
   }
   const originTip = await revParse(repo, originRef);
@@ -148,7 +136,7 @@ export async function checkBaseHeight(
       id: 'ERR14_BASE_BEHIND',
       detail:
         `origin/${branch} (${originTip.slice(0, 12)}) is BEHIND the expected pass height (local ${localTip.slice(0, 12)}) — ` +
-        `HELD PRs are published after the pass's target pushes: run \`propagate push --execute\` first (D-049 §5, §14.4)`,
+        `HELD PRs are published after the pass's target pushes: run \`propagate push --execute\` first (MERGE-POLICY.md §5, PROPAGATION.md §14.4)`,
     };
   }
   if (mode === 'judged' && (await isAncestor(repo, headSha, originTip))) {
@@ -156,29 +144,29 @@ export async function checkBaseHeight(
       id: 'ERR14_BASE_BEHIND',
       detail:
         `origin/${branch} already contains the judged merge commit ${headSha.slice(0, 12)} — ` +
-        `JUDGED PRs are created BEFORE the target push (D-049 order); nothing to publish against this base`,
+        `JUDGED PRs are created BEFORE the target push (MERGE-POLICY.md §5 order); nothing to publish against this base`,
     };
   }
   return null;
 }
 
 // ---------------------------------------------------------------------------
-// D-004 machine block (D-049 decision 8): the ONLY driver-written body content
-// on a HELD PR — appended below the agent's prose at publish, refreshed by
-// every posted urge. The agent never edits it; the driver never touches the
-// prose above it.
+// The machine block (`sweep:d004` markers, DRIVER.md §5.5): the ONLY
+// driver-written body content on a HELD PR — appended below the agent's prose
+// at publish, refreshed by every posted urge. The agent never edits it; the
+// driver never touches the prose above it.
 // ---------------------------------------------------------------------------
 
 export const MACHINE_BLOCK_BEGIN = '<!-- sweep:d004 -->';
 export const MACHINE_BLOCK_END = '<!-- /sweep:d004 -->';
 
-/** Render the D-004 machine block for a HELD PR (pending count behind the freeze). */
+/** Render the machine block for a HELD PR (pending count behind the freeze). */
 export function renderMachineBlock(pendingCount: number, watermark12: string): string {
   return [
     MACHINE_BLOCK_BEGIN,
     '## Sweep status (driver-maintained — do not edit)',
     `Pending upstream commits beyond this freeze: **${pendingCount}** (as of pass ${watermark12}).`,
-    'Kept current by posted urge comments (D-004, DRIVER.md §5.5).',
+    'Kept current by posted urge comments (PROPAGATION.md §14.4).',
     MACHINE_BLOCK_END,
   ].join('\n');
 }
@@ -197,51 +185,12 @@ export function withMachineBlock(body: string, block: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// ERR05 — "should this PR exist": recorded-decision match (§14).
-// ---------------------------------------------------------------------------
-
-/** The line(s) of `text` mentioning `needle`, capped — quoted in the ERR05 detail. */
-function excerptAround(text: string, needle: string, cap = 400): string {
-  const lines = text.split('\n').filter((l) => l.includes(needle));
-  const joined = (lines.length ? lines : [text]).join(' / ').trim();
-  return joined.length > cap ? `${joined.slice(0, cap)}…` : joined;
-}
-
-/**
- * ERR05_DECIDED_ALREADY: a conflicted path hits a decision already recorded in
- * the inventory — an explicit `prompt.decided_paths` entry, or a path
- * mentioned verbatim in `prompt.extra_context` (D-030 write-back records).
- * Three of the six 2026-07-21 freeze PRs re-raised recorded decisions; the
- * prescribed action is to APPLY the quoted record as a judged resolution, not
- * to re-ask the owner.
- */
-export function decidedAlready(features: FeatureEntry[], branch: string, conflictedPaths: string[]): Issue | null {
-  for (const f of features) {
-    const decided = f.prompt?.decided_paths ?? [];
-    const ctx = f.prompt?.extra_context ?? '';
-    const hit =
-      conflictedPaths.find((p) => decided.includes(p)) ?? (ctx ? conflictedPaths.find((p) => ctx.includes(p)) : undefined);
-    if (!hit) continue;
-    const record = ctx ? excerptAround(ctx, hit) : `decided_paths: ${decided.join(', ')}`;
-    return {
-      id: 'ERR05_DECIDED_ALREADY',
-      detail:
-        `'${hit}' (case branch ${branch}) is covered by a decision recorded in inventory entry '${f.id}'` +
-        `${f.branch ? ` (branch ${f.branch})` : ''}: "${record}" — apply the recorded decision as a judged resolution; do not re-ask the owner`,
-    };
-  }
-  return null;
-}
-
-// ---------------------------------------------------------------------------
-// Mechanical text checks (§14). The PR-text cold read (prTextGate, prtext-*
-// artifacts, ERR09/ERR10/WARN04) that used to live here is RETIRED by D-050.
+// Mechanical text checks (§14).
 // ---------------------------------------------------------------------------
 
 /**
- * Tautology phrases of the retired driver-generated PR bodies (the templates
- * that looped the 2026-07-21 text gate for 3 rounds) — their presence in an
- * agent-written body is WARN01_TEMPLATE_TEXT.
+ * Boilerplate phrases that mark a machine-templated PR body — the agent must
+ * write its own prose; their presence is WARN01_TEMPLATE_TEXT.
  */
 export const TAUTOLOGY_PHRASES = [
   'behavior kept:',
@@ -257,8 +206,8 @@ export const TAUTOLOGY_PHRASES = [
  * skills: it asks for a skill type and whether SKILL.md is under 500 lines,
  * none of which describes a merge resolution or a gate fix. It is also the most
  * template-shaped file in the clone, so an agent told only to "write it
- * yourself" reaches for it (live: PR #61). The driver now hands over an explicit
- * per-case `pr/TEMPLATE.md`; these markers catch the other one being used anyway.
+ * yourself" reaches for it. The driver hands over an explicit per-case
+ * `pr/TEMPLATE.md`; these markers catch the other one being used anyway.
  */
 export const FOREIGN_TEMPLATE_MARKERS = [
   'contributing-guide:',
@@ -271,7 +220,7 @@ export const FOREIGN_TEMPLATE_MARKERS = [
   'I tested this skill on a fresh clone',
 ];
 
-/** Advisory text checks (WARN01/WARN02) — returned, never blocking (D-050: the only text checks besides ERR08). */
+/** Advisory text checks (WARN01/WARN02) — returned, never blocking (DRIVER.md §10.5: the only text checks besides ERR08). */
 export function advisoryTextIssues(title: string, body: string, conflictedPaths: string[]): Issue[] {
   const issues: Issue[] = [];
   const mentions = conflictedPaths.filter((p) => body.includes(p) || body.includes(p.split('/').pop() ?? p));
@@ -284,7 +233,7 @@ export function advisoryTextIssues(title: string, body: string, conflictedPaths:
         ? `body/title came from the WRONG template ("${foreign}" belongs to upstream's contribution guide for new ` +
           `skills) — rewrite it from this case's pr/TEMPLATE.md, the only template that applies here`
         : tautology
-          ? `body/title contains a retired template phrase ("${tautology}") — rewrite from the case materials`
+          ? `body/title contains a banned template phrase ("${tautology}") — rewrite from the case materials`
           : 'body references none of the conflicted files — rewrite from the case materials',
     });
   }
@@ -327,10 +276,8 @@ const GITHUB_HOST = 'api.github.com';
  * and it works under node — but the agent runs `finish` under BUN as often as
  * under tsx, and Bun's node:http shim cannot express CONNECT: it builds a fetch
  * URL from `path`, `api.github.com:443` is not a path, and it fails with
- * `fetch() URL is invalid`. That is verbatim what every held publish journaled
- * on 2026-08-05 — six refusals across three finish runs, no PRs — while the
- * same code had published fine the pass before, under tsx. The runtime the
- * agent happens to type is not something the driver may depend on.
+ * `fetch() URL is invalid` — under Bun, every publish is refused. The runtime
+ * the agent happens to type is not something the driver may depend on.
  *
  * CONNECT is a request line and a blank line; doing it by hand costs a few
  * lines and works on any runtime with a TCP socket.
@@ -426,7 +373,7 @@ export function realGithubTransport(token: string): GithubTransport {
 
 /**
  * Throwing request helper for driver API writes (normal API use only —
- * PR creation, PR body PATCH, comments; NEVER ref/commit fabrication, D-049).
+ * PR creation, PR body PATCH, comments; NEVER ref/commit fabrication — DRIVER.md §2.5).
  */
 export async function ghExpect(
   transport: GithubTransport,
@@ -448,7 +395,7 @@ export interface RemotePublishResult {
 
 /**
  * Create the PR on GitHub for a head branch the DRIVER ALREADY PUSHED via
- * `git push` (D-049 §5 — the API never moves refs). HELD PRs are drafts;
+ * `git push` (DRIVER.md §2.5 — the API never moves refs). HELD PRs are drafts;
  * JUDGED PRs are non-draft history that the target push auto-flips to merged.
  */
 export async function createPullRequest(
@@ -484,7 +431,7 @@ export async function getOpenPrByHead(
 }
 
 // ---------------------------------------------------------------------------
-// D-059 — interactive PR review loop primitives (REVIEW-trigger model).
+// Interactive PR review loop primitives (REVIEW-trigger model, DRIVER.md §5.3).
 //
 // The `sweep-addressed` marker is the STATELESS record of the review loop
 // (solves the shared-PAT problem): a driver comment on the held PR carrying
@@ -509,7 +456,7 @@ export async function getOpenPrByHead(
 /** The marker recognized ONLY as its own line (a quote-reply embedding it stays human). */
 export const SWEEP_ADDRESSED_LINE_RE = /^<!--\s*sweep-addressed:\s*(\d+)\s*-->$/;
 
-/** Render the sweep-addressed marker for a driver comment (D-059). */
+/** Render the sweep-addressed marker for a driver comment. */
 export function renderSweepAddressed(id: number): string {
   return `<!-- sweep-addressed: ${id} -->`;
 }
@@ -517,16 +464,11 @@ export function renderSweepAddressed(id: number): string {
 /**
  * The URGE marker: which upstream head a driver urge comment was about.
  *
- * This replaces the sweep ledger's `lastUrgedHead` (2026-08-04). That field was
- * the last surviving reason for a durable local state file, and it was the same
- * mistake D-058 §2 abolished everywhere else: a fact about what is ON ORIGIN,
- * cached locally, where it could go stale, survive a clean-slate, and be read
- * back by a later session as authority. One did exactly that — a 12-day-old
- * `sweep-ledger.json` was reported as the current sweep state while an open pass
- * sat in the same directory.
- *
  * The comment IS the record: if the PR already carries an urge for this head,
- * the urge was posted. Same shape as `sweep-addressed`, same reasoning.
+ * the urge was posted. There is deliberately NO durable local bookkeeping for
+ * this — a fact about what is ON ORIGIN, cached locally, can go stale, survive
+ * a clean-slate, and be read back by a later session as authority. Same shape
+ * as `sweep-addressed`, same reasoning.
  */
 export const SWEEP_URGE_LINE_RE = /^<!--\s*sweep-urge:\s*([0-9a-f]{7,40})\s*-->$/;
 
@@ -557,7 +499,7 @@ export async function urgedHeads(
  * is exactly the marker (hardened detection: an embedded/quoted occurrence
  * does not count). Multiple marker lines take the MAX.
  *
- * `maxRealReviewId` bounds the marker TO REALITY (D-059 FINAL finding 4): the
+ * `maxRealReviewId` bounds the marker TO REALITY: the
  * driver only ever posts 0 or a review id actually present on the PR, so a
  * marker value ABOVE the max real review id cannot be driver-posted — it is a
  * human paste (which would otherwise permanently silence the review loop) and
@@ -603,13 +545,13 @@ export interface PrComment {
 }
 
 /**
- * Split a PR's issue comments into the review-loop inputs (D-059, pure):
+ * Split a PR's issue comments into the review-loop inputs (pure):
  *  - `humans`: comments WITHOUT an own-line marker (content-based bot exclusion);
  *  - `driver`: comments WITH the marker (the agent's own prior messages);
  *  - `markerId`: the effective sweep-addressed REVIEW id — MAX over every
  *    marker occurrence (null when no marker was ever posted).
  *
- * `maxRealReviewId` (finding 4): when the PR's reviews are known, pass their
+ * `maxRealReviewId`: when the PR's reviews are known, pass their
  * max id — marker values above it are IGNORED (see extractSweepAddressed), so
  * a human pasting `<!-- sweep-addressed: 999999999 -->` neither silences the
  * loop nor gets their comment mislabeled as an agent turn.
@@ -637,7 +579,7 @@ export function classifyComments(
   return { humans, driver, markerId };
 }
 
-/** A submitted PR review (D-059 trigger unit). */
+/** A submitted PR review (the review-loop trigger unit). */
 export interface PrReview {
   id: number;
   /** APPROVED | CHANGES_REQUESTED | COMMENTED | DISMISSED | ... */
@@ -648,7 +590,7 @@ export interface PrReview {
 }
 
 /**
- * The review-trigger classification (D-059 FINAL, pure): reissue is due iff a
+ * The review-trigger classification (pure): reissue is due iff a
  * SUBMITTED non-bot review exists whose id is above the sweep-addressed marker
  * (or any such review exists and no marker was ever posted). `latest` is the
  * newest such review — its STATE drives the action table (APPROVED → land /
@@ -695,7 +637,7 @@ export async function ghPaginated(transport: GithubTransport, path: string): Pro
   }
 }
 
-/** FAIL-CLOSED, PAGINATED list of a PR's issue comments (D-059). Throws on failure (ERR13). */
+/** FAIL-CLOSED, PAGINATED list of a PR's issue comments. Throws on failure (ERR13). */
 export async function listIssueComments(
   transport: GithubTransport,
   slug: { owner: string; repo: string },
@@ -710,7 +652,7 @@ export async function listIssueComments(
   }));
 }
 
-/** FAIL-CLOSED, PAGINATED list of a PR's INLINE review comments (D-059 dialog feed). */
+/** FAIL-CLOSED, PAGINATED list of a PR's INLINE review comments (the reissue dialog feed). */
 export async function listReviewComments(
   transport: GithubTransport,
   slug: { owner: string; repo: string },
@@ -729,7 +671,7 @@ export async function listReviewComments(
 }
 
 /**
- * FAIL-CLOSED, PAGINATED list of a PR's SUBMITTED reviews (D-059 trigger).
+ * FAIL-CLOSED, PAGINATED list of a PR's SUBMITTED reviews (the review-loop trigger).
  * PENDING (unsubmitted) reviews are dropped here; bot exclusion is the
  * trigger's job (`classifyReviewTrigger` — bots stay visible to the dialog).
  */
@@ -762,7 +704,7 @@ export interface PrByHead {
 }
 
 /**
- * FAIL-CLOSED PR lookup by head branch across ALL states (D-059 start
+ * FAIL-CLOSED PR lookup by head branch across ALL states (the start
  * classification needs open vs closed-unmerged vs merged vs none): non-200 /
  * non-array THROWS (ERR13 at the caller) — never "no PR" on an API failure.
  */
@@ -815,9 +757,9 @@ export async function getPullRequest(
 }
 
 /**
- * Reopen a closed-NOT-MERGED PR (D-059 case 4 — replaces the D-058 ref delete).
- * The caller MUST have excluded merged PRs (GitHub 422s a reopen of a merged
- * PR — the ERR13 halt this guard retired). Throws on failure (ERR13).
+ * Reopen a closed-NOT-MERGED PR (the start classification's closed-unmerged
+ * case). The caller MUST have excluded merged PRs — GitHub 422s a reopen of a
+ * merged PR, which this guard forecloses. Throws on failure (ERR13).
  */
 export async function reopenPullRequest(
   transport: GithubTransport,
@@ -828,7 +770,7 @@ export async function reopenPullRequest(
 }
 
 /**
- * Post the sweep-addressed marker comment (D-059): the driver records the
+ * Post the sweep-addressed marker comment: the driver records the
  * highest SUBMITTED REVIEW id the just-published resolution addressed.
  * Append-only — a fresh comment is posted each republish and readers take the
  * MAX (`classifyComments`), so no review-id bookkeeping is needed. Throws on
@@ -836,14 +778,15 @@ export async function reopenPullRequest(
  *
  * NOTHING IS POSTED WHEN THERE IS NOTHING TO ADDRESS (`addressedId` 0 — a first
  * publish, no review yet). The marker is bookkeeping between the driver and
- * itself; a PR with no reviewer feedback has nothing for it to record, and the
- * comment was landing on every freshly-opened PR saying the resolution
- * "addresses PR reviews up to id 0" — driver internals printed into the owner's
- * PR, meaning nothing to the person reading it. `classifyComments` already
- * treats an absent marker as 0, so not posting is exactly equivalent.
+ * itself; a PR with no reviewer feedback has nothing for it to record, and a
+ * comment on a freshly-opened PR saying the resolution "addresses PR reviews up
+ * to id 0" is driver internals printed into the owner's PR, meaning nothing to
+ * the person reading it. `classifyComments` already treats an absent marker as
+ * 0, so not posting is exactly equivalent.
  *
- * The prose line is gone with it. What the driver needs is the machine marker;
- * the sentence was a human-readable gloss on a number that is not for humans.
+ * The marker is posted bare, with no prose line: what the driver needs is the
+ * machine marker, and a human-readable gloss on a number that is not for humans
+ * helps no one.
  */
 export async function postSweepAddressed(
   transport: GithubTransport,

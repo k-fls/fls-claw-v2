@@ -14,7 +14,7 @@ afterAll(() => repo.destroy());
 repo.checkout('automerge', { create: true, at: 'main' });
 const automergeTree = repo.git('rev-parse', 'automerge^{tree}');
 
-describe('scopeGuard (§7, D-038)', () => {
+describe('scopeGuard (§7)', () => {
   it('passes when the resolution only touches conflicted paths', () => {
     repo.checkout('resolved-ok', { create: true, at: 'main' });
     repo.commit('resolve within scope', { 'src/app.ts': 'export const app = () => 2;\n' });

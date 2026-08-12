@@ -1,64 +1,43 @@
 id: feat.onecli-broker
 name: OneCLI broker routing for provider calls
 kind: feat
-status: in-progress
 branch: feat/onecli-broker
 parents:
-- feat/mitm-credential-proxy
+  - feat/mitm-credential-proxy
 dependents: []
-summary: 'Routes provider API traffic through a OneCLI gateway/broker: broker registry + routing inside
-  the mitm proxy, per-group broker config (DB + migration 16-fls-02), OneCLI client, onecli-broker/onecli-credential
-  providers, `ncl broker` resource, and broker approvals.'
+summary: "Routes provider API traffic through a OneCLI gateway/broker: broker registry + routing
+  inside the mitm proxy, per-group broker config (DB + migration 16-fls-02), OneCLI client,
+  onecli-broker/onecli-credential providers, `ncl broker` resource, and broker approvals."
 owned_paths:
-- src/modules/mitm-proxy/broker-registry.ts
-- src/modules/mitm-proxy/broker-registry.test.ts
-- src/modules/mitm-proxy/broker-routing.ts
-- src/modules/mitm-proxy/broker-routing.test.ts
-- src/modules/mitm-proxy/broker-dispatch.test.ts
-- src/onecli-client.ts
-- src/providers/onecli-broker.ts
-- src/providers/onecli-broker.test.ts
-- src/providers/onecli-credential.ts
-- src/providers/onecli-credential.test.ts
-- src/db/broker-config.ts
-- src/db/broker-config.test.ts
-- src/db/migrations/16-fls-02-broker-config.ts
-- src/cli/resources/broker.ts
-- src/cli/resources/broker.test.ts
-- docs/onecli-broker.md
-touch_paths:
-- src/modules/mitm-proxy/credential-proxy.ts
-- src/modules/mitm-proxy/index.ts
-- src/modules/mitm-proxy/observer.ts
-- src/modules/approvals/onecli-approvals.ts
-- src/container-runner.ts
-- src/cli/resources/index.ts
-- src/db/migrations/index.ts
+  - src/modules/mitm-proxy/broker-registry.ts
+  - src/modules/mitm-proxy/broker-registry.test.ts
+  - src/modules/mitm-proxy/broker-routing.ts
+  - src/modules/mitm-proxy/broker-routing.test.ts
+  - src/modules/mitm-proxy/broker-dispatch.test.ts
+  - src/onecli-client.ts
+  - src/providers/onecli-broker.ts
+  - src/providers/onecli-broker.test.ts
+  - src/providers/onecli-credential.ts
+  - src/providers/onecli-credential.test.ts
+  - src/db/broker-config.ts
+  - src/db/broker-config.test.ts
+  - src/db/migrations/16-fls-02-broker-config.ts
+  - src/cli/resources/broker.ts
+  - src/cli/resources/broker.test.ts
+  - docs/onecli-broker.md
 key_symbols: []
-symbol_watch: []
-invariants: []
 design_docs:
-- docs/onecli-broker.md@feat/onecli-broker
+  - docs/onecli-broker.md@feat/onecli-broker
 test_anchors:
-- src/modules/mitm-proxy/broker-routing.test.ts
-- src/providers/onecli-broker.test.ts
-- src/db/broker-config.test.ts
-- src/cli/resources/broker.test.ts
-overlap_hints: Upstream adding LLM gateway/router support (LiteLLM-style brokers, provider fallback routing,
-  gateway credentials) is OVERLAP-HIGH.
+  - src/modules/mitm-proxy/broker-routing.test.ts
+  - src/providers/onecli-broker.test.ts
+  - src/db/broker-config.test.ts
+  - src/cli/resources/broker.test.ts
 routing:
   keywords:
-  - broker
-  - gateway
-  - onecli
-  - routing
-  - provider
+    - broker
+    - gateway
+    - onecli
+    - routing
+    - provider
   always_check_on: []
-prompt:
-  template: prompts/overlap-check.md
-maintenance:
-  owner: sweep-agent-group
-  last_verified: '2026-07-10'
-  verified_against: 49f6b0720413df20ca6084a39681ebcb13d93b2f
-  notes: skeleton — needs enrichment. Feature-complete, maintained and pushed to origin; NOT merged into
-    edition/fls-ai-bot, hence in-progress under the content-based shipped rule.

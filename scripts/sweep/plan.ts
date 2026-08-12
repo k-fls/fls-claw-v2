@@ -1,7 +1,7 @@
 /**
  * scripts/sweep/plan.ts — DAG validation + breadth-wise whole-pass plan
  * derivation, including no-op/skip detection and the leaf/always_merge un-skip
- * logic (DRIVER.md §4.1/§4.5, D-036/D-039).
+ * logic (DRIVER.md §4.1, §4.5).
  *
  * The plan is a PURE derivation from git state + inventory: regenerating it must
  * be a no-op (idempotent, resumable — §7). Branches are processed strictly
@@ -57,7 +57,7 @@ export function allParentsSkipped(plan: BranchPlan): boolean {
  * child->parents, shortest hop count. Returns [branch, ..., entry] or [] when no
  * entry is reachable.
  *
- * `blocked` (D-057): branches with merge_status != NONE (PR_ID | DEFERRED).
+ * `blocked`: branches with merge_status != NONE (PR_ID | DEFERRED).
  * The un-skip chain must NEVER merge into or through a blocked branch — a
  * PR_ID branch is waiting on its own owner PR and a DEFERRED branch takes
  * NOTHING while sticky, so a forced merge on such a hop would push content
@@ -90,7 +90,7 @@ export function shortestUnskipChain(
 }
 
 /**
- * §6 un-skip chain conflict pre-probe (2026-07-23 live ERR21 halt): before ANY
+ * §6 un-skip chain conflict pre-probe: before ANY
  * hop of `uchain` is forced, simulate the WHOLE top-down forcing sequence —
  * every `child <- parent` hop probed via merge-tree, INCLUDING the leaf's own
  * forced merge (`uchain[0] <- uchain[1]`). Each clean hop advances the child's
@@ -148,18 +148,18 @@ export interface DerivePlanOptions {
   /**
    * PR_ID-blocked branches with their LIVE-derived block heights (this-pass
    * holds + cross-pass PR_ID entries whose height was re-derived from the
-   * stored head sha, D-057). Seeds blockHeightOf; also the annotate input.
+   * stored head sha). Seeds blockHeightOf; also the annotate input.
    */
   held?: HeldRecord[];
   /**
-   * Per-branch merge_status view (D-057): PR_ID | DEFERRED; absence = NONE.
+   * Per-branch merge_status view: PR_ID | DEFERRED; absence = NONE.
    * PR_ID branches arrive with empty intervals (blocked on their own PR).
    * DEFERRED branches are sticky while a DIRECT parent is blocked (no merges,
    * block height re-probed live for their children) and derive NORMALLY when
    * every parent is NONE (the "re-merge fresh" view — `run` commits the clear).
    */
   mergeStatusOf?: Map<string, 'PR_ID' | 'DEFERRED'>;
-  /** Global case-stacking cap (routing.yaml `stack_cap`, D-049 §2); per-feature `stack_cap` overrides. */
+  /** Global case-stacking cap (routing.yaml `stack_cap`; DRIVER.md §4.4); per-feature `stack_cap` overrides. */
   stackCap?: number;
 }
 
@@ -179,7 +179,7 @@ async function analyzeParent(
 ): Promise<ParentPlan> {
   const line = await buildEligibleLine({ repo, branch, branchTip, parent, parentRef, model, chain });
   // Probe from the pinned branch TIP sha, not the ref name: deterministic
-  // (§3 probe determinism) and valid for remote-only branches (§13, D-045).
+  // (§3 probe determinism) and valid for remote-only branches (§13).
   const sweep = await mergePointSweep(repo, branchTip, line, stackCap);
 
   const pp: ParentPlan = {
@@ -206,7 +206,7 @@ async function analyzeParent(
 
   if (sweep.firstConflict) {
     const fc = sweep.firstConflict;
-    // DEFERRED = pure height-MIN over X's blocked DIRECT parents (D-057): defer
+    // DEFERRED = pure height-MIN over X's blocked DIRECT parents: defer
     // iff any direct parent is blocked and this conflict is at/above the lowest
     // blocked parent's height. No path/window/ancestor-set test.
     const decision = checkDeferred(fc.head.height, blockedParents);
@@ -224,7 +224,7 @@ async function analyzeParent(
     }
   }
 
-  // Annotate-class (§1, D-002): a CLEAN merge whose merged range passes THROUGH
+  // Annotate-class (§1): a CLEAN merge whose merged range passes THROUGH
   // a height at which a transitive ancestor is HELD. Never gates — surfaced in
   // the pass report. Window is (coverage, mergePoint.height].
   if (realMerge && sweep.mergePoint) {
@@ -255,12 +255,12 @@ export interface DeriveBranchArgs {
   alwaysMerge: boolean;
   held: HeldRecord[];
   /** Block-height of each currently-blocked branch (merge_status != NONE), for the
-   * D-057 height-MIN DEFER over this branch's blocked DIRECT parents. */
+   * height-MIN DEFER over this branch's blocked DIRECT parents. */
   blockHeightOf?: Map<string, number>;
-  /** Effective case-stacking cap (D-049 §2 lever); DEFAULT_STACK_CAP when omitted. */
+  /** Effective case-stacking cap (DRIVER.md §4.4 lever); DEFAULT_STACK_CAP when omitted. */
   stackCap?: number;
   /**
-   * This branch's own merge_status when blocked (D-057; omitted = NONE):
+   * This branch's own merge_status when blocked (omitted = NONE):
    *  - `{state:'PR_ID'}`: blocked on its own PR — empty interval, skip rows.
    *  - `{state:'DEFERRED', behind}`: sticky-deferred (a DIRECT parent is still
    *    blocked). Parents are PROBED normally so the branch's own conflict
@@ -271,7 +271,7 @@ export interface DeriveBranchArgs {
    */
   mergeBlocked?: { state: 'PR_ID' } | { state: 'DEFERRED'; behind: string };
   /**
-   * D-045 (§13): the branch is remote-only — read its tip from origin/<branch>
+   * §13: the branch is remote-only — read its tip from origin/<branch>
    * and flag the plan row `materialize`. `run --execute` creates the local ref
    * (through the guardRef choke point) before the branch's first mutation.
    */
@@ -290,7 +290,7 @@ export interface DeriveBranchArgs {
  * (like merge.ts probes live source tips); `derivePlan` calls it for the
  * up-front snapshot.
  *
- * NOTE (D-047/B11): all per-parent probes here run against the SAME pinned
+ * NOTE: all per-parent probes here run against the SAME pinned
  * `branchTip` — the tip at derivation time. Execution merges parents
  * SEQUENTIALLY, so a later parent's verdict goes stale once an earlier parent's
  * merge advances the tip; `run` re-probes each merge against the CURRENT tip
@@ -300,7 +300,7 @@ export interface DeriveBranchArgs {
 export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> {
   const { repo, branch, kind, model, parents, chain, ancestors, tierFloor, isLeaf, alwaysMerge, held } = args;
   const mergeBlocked = args.mergeBlocked ?? null;
-  // D-057: X's blocked DIRECT parents (with their block-heights) — the input to
+  // X's blocked DIRECT parents (with their block-heights) — the input to
   // the height-MIN DEFER rule. Restricted to DIRECT parents (never transitive):
   // a clean intermediate parent (absent here) stops propagation until it re-merges.
   const blockHeightOf = args.blockHeightOf ?? new Map<string, number>();
@@ -310,7 +310,7 @@ export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> 
   const refOf = args.refOf ?? ((b: string) => b);
   const materialize = args.materialize === true;
   const stackCap = args.stackCap ?? DEFAULT_STACK_CAP;
-  // merge_status PR_ID (D-057): blocked on its own PR — no merges this pass
+  // merge_status PR_ID: blocked on its own PR — no merges this pass
   // (barrier satisfied by an empty interval).
   if (mergeBlocked?.state === 'PR_ID') {
     const parentPlans: ParentPlan[] = parents.map((parent) => ({
@@ -356,7 +356,7 @@ export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> 
       ),
     );
   }
-  // merge_status DEFERRED, sticky (D-057): a DIRECT parent is still blocked, so
+  // merge_status DEFERRED, sticky: a DIRECT parent is still blocked, so
   // the branch takes NOTHING this pass — it waits until ALL parents are NONE,
   // then re-merges fresh. The probes above still ran so the branch's own
   // conflict height is LIVE (its children's height-MIN input); here every
@@ -390,8 +390,8 @@ export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> 
 }
 
 /**
- * D-045 code enforcement of "the inventory may only contain branches with
- * proper/valid inheritance" (§13): an in-scope inventory entry whose declared
+ * Code enforcement (§13) of "the inventory may only contain branches with
+ * proper/valid inheritance": an in-scope inventory entry whose declared
  * parent is missing from the inventory/structural set is a HARD HALT naming
  * the entry — never a silently rewired root. (Cycles already hard-halt in
  * scope.ts's DAG validation.) Parents dropped by explicit exclusion globs are
@@ -411,7 +411,7 @@ export function validateInventoryInheritance(
     for (const p of e.parents ?? []) {
       if (excluded(p) || inventorySet.has(p) || structuralSet.has(p)) continue;
       throw new Error(
-        `inventory inheritance invalid (D-045): entry '${e.id}' (branch '${e.branch}') declares parent '${p}', ` +
+        `inventory inheritance invalid (PROPAGATION.md §13): entry '${e.id}' (branch '${e.branch}') declares parent '${p}', ` +
           `which is not in the inventory/structural set — the inventory may only contain branches with ` +
           `proper/valid inheritance; fix the entry (or add/restore the parent) before planning`,
       );
@@ -432,7 +432,7 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
 
   // scope.ts validates the DAG (throws on a cycle) and returns topological
   // order; origin/* refs are considered so remote-only inventory branches are
-  // in scope, flagged `materialize` (§13, D-045).
+  // in scope, flagged `materialize` (§13).
   const scopeResult = await resolveScope(repo, features, scope, { includeRemote: true });
   validateInventoryInheritance(features, scopeResult, scope);
   const ordered = scopeResult.ordered;
@@ -452,7 +452,7 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
   const branches: BranchPlan[] = [];
   const byBranch = new Map<string, BranchPlan>();
 
-  // D-057 block-height map: every currently-blocked branch (merge_status != NONE)
+  // Block-height map: every currently-blocked branch (merge_status != NONE)
   // with the height it is blocked at, for the height-MIN DEFER rule. Seeded from
   // the HELD registry (PR_ID branches, this-pass + cross-pass; height re-derived
   // in `held`) and GROWN in DAG order — a branch DEFERRED this pass (or sticky
@@ -471,8 +471,8 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
   for (const entry of ordered) {
     const model: 'entry' | 'parents' = entry.mergeModel === 'upstream-chain' ? 'entry' : 'parents';
     const parents = model === 'entry' ? ['main'] : entry.parents;
-    const feat = featureByBranch.get(entry.branch) as (FeatureEntry & { always_merge?: boolean }) | undefined;
-    // This branch's own merge_status view (D-057): PR_ID → empty interval;
+    const feat = featureByBranch.get(entry.branch);
+    // This branch's own merge_status view: PR_ID → empty interval;
     // DEFERRED → sticky iff a DIRECT parent is still blocked (STAY rule —
     // recomputed from the parents, never trusted as an independent flag);
     // with every parent NONE it derives NORMALLY (the "re-merge fresh" view;
@@ -502,7 +502,7 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
       alwaysMerge: feat?.always_merge === true,
       held,
       blockHeightOf,
-      // D-049 §2 lever: per-feature `stack_cap` beats the routing.yaml global.
+      // DRIVER.md §4.4 lever: per-feature `stack_cap` beats the routing.yaml global.
       stackCap: feat?.stack_cap ?? opts.stackCap ?? DEFAULT_STACK_CAP,
       mergeBlocked,
       materialize: entry.materialize === true,
@@ -512,7 +512,7 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
     byBranch.set(bp.branch, bp);
     if (mergeBlocked) blockedNow.add(bp.branch); // PR_ID or sticky-DEFERRED stays blocked
     // A branch DEFERRED this pass (fresh or sticky) is itself blocked: record its
-    // lowest own-conflict height so its children defer behind it (D-057).
+    // lowest own-conflict height so its children defer behind it.
     const deferHeights = bp.parents.filter((pp) => pp.verdict === 'defer' && pp.deferHeight !== undefined).map((pp) => pp.deferHeight!);
     if (deferHeights.length) {
       blockedNow.add(bp.branch);
@@ -529,7 +529,7 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
       if (blockedNow.has(bp.branch)) continue; // blocked leaves stay blocked (merge_status != NONE)
       if (!(bp.isLeaf || bp.alwaysMerge)) continue;
       if (!allParentsSkipped(bp)) continue;
-      // D-057: the chain must not merge into/through a blocked hop — blocked
+      // The chain must not merge into/through a blocked hop — blocked
       // branches are excluded from the search (no unblocked chain = no un-skip).
       const uchain = shortestUnskipChain(bp.branch, scopeResult.edges, entrySet, blockedNow);
       if (uchain.length < 2) {
@@ -543,7 +543,7 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
         }
         continue; // no (unblocked) entry reachable
       }
-      // §6 conflict pre-probe (2026-07-23 live ERR21): never mark a chain
+      // §6 conflict pre-probe: never mark a chain
       // forced when any hop — including the leaf's own — does not merge CLEAN
       // (simulated top-down, post-force ancestry). The leaf stays skipped this
       // pass ('unskip-conflict', the sanctioned all-skip); the conflicting hop

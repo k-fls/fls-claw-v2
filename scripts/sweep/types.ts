@@ -2,10 +2,7 @@
  * scripts/sweep/types.ts — shared types for the upstream-sweep toolkit.
  *
  * The driver keeps NO durable local state: everything a pass produces lives in
- * the pass dir, and everything about origin is re-derived from origin. (A
- * group-owned `sweep-ledger.json` existed until 2026-08-04; it was deleted after
- * a 12-day-old copy was read back by a fresh session and reported as the current
- * sweep state while an open pass sat beside it.)
+ * the pass dir, and everything about origin is re-derived from origin.
  */
 
 /** PoI routing classes (feature-inventory design §4) plus pipeline extensions. */
@@ -20,7 +17,7 @@ export type PoiType =
   | 'test-fail'
   | 'generic-diff';
 
-/** Pipeline classification (spec D-002): annotate = merge proceeds, gate = stops the branch. */
+/** Pipeline classification (DRIVER.md §8.1): annotate = merge proceeds, gate = stops the branch. */
 export type PoiClass = 'annotate' | 'gate';
 
 export interface Poi {
@@ -37,13 +34,13 @@ export interface Poi {
   branches: string[];
   /** Free-text detail (e.g. file size, sensitive rule hit). */
   detail?: string;
-  /** Capped diff text for symbol_watch routing (filled by the route stage). */
+  /** Capped diff text for keyword routing (filled by the route stage). */
   diffText?: string;
-  /** Basenames of newly added files (symbol_watch routing input). */
+  /** Basenames of newly added files (routing input). */
   newBasenames?: string[];
 }
 
-/** How a branch participates in the sweep (2026-07-14 merge-source correction). */
+/** How a branch participates in the sweep. */
 export type ScopeKind = 'structural' | 'inventory' | 'edition-ancestor';
 
 /**
@@ -62,7 +59,7 @@ export interface ScopeEntry {
   /** DAG parents (merge sources) for mergeModel 'parents'; empty otherwise. */
   parents: string[];
   /**
-   * D-045 (DRIVER.md §4.7): the branch has no local ref but exists as
+   * DRIVER.md §4.7: the branch has no local ref but exists as
    * `origin/<branch>` — in scope, planned from the origin commit; `run
    * --execute` creates the local branch at the origin tip before its first
    * mutation. Absent/false for locally-present branches.
@@ -71,78 +68,47 @@ export interface ScopeEntry {
 }
 
 /**
- * Per-branch merge status. D-058 RETIRED this as stored state for the
- * propagation driver: blockedness is DERIVED — cross-pass from the origin
- * fix/sweep refs at `sweep start` (an unmerged ref WITH an open PR ⇔ PR_ID),
- * within a pass from the journal (origin-blocked/held/defer rows); DEFERRED
- * is recomputed from the parents' PR_ID during derivation, never stored. The
- * three-state model and the invariant blocked(X) ⇔ merge_status(X) != NONE
- * (D-057) survive as the DERIVED view's semantics. This type
- * field remain ONLY as a non-authoritative legacy cache read by the old sweep
- * merge stage (merge.ts) — the propagation driver never reads or writes it.
+ * Inventory entry <id>.yaml (scripts/sweep/inventory/, config tracked in the
+ * fork repo). The inventory is CONFIGURATION ONLY — owner-authored
+ * declarations of intent, never written by the driver. An entry with a
+ * `branch` is swept; one without is planned/observational. Removing a feature
+ * = deleting its entry. `parseFeatureEntry` (registry.ts) enforces this
+ * schema STRICTLY — an unknown key is an entry error, and `sweep start`
+ * fails hard on entry errors.
  */
-export type MergeStatus =
-  | {
-      state: 'PR_ID';
-      /** The case that blocked the branch ('gate' for a §9 verify rollback hold). */
-      caseId: string;
-      /**
-       * The conflicting head sha at hold time (null for gate holds). Dual duty:
-       * the block height is re-derived from it against each pass's chain, and
-       * completion = the branch tip contains it (the owner's PR merge landed).
-       */
-      headSha: string | null;
-      /** Freeze-PR head branch on origin (urge comments target its PR). */
-      fixBranch: string | null;
-      /** Freeze-PR number on GitHub (urge posting + D-004 machine-block target). */
-      prNumber: number | null;
-    }
-  | { state: 'DEFERRED' };
-
-/** Inventory entry <id>.yaml (feature-inventory design §3; --inventory dir). */
 export interface FeatureEntry {
   id: string;
   name: string;
   kind: 'module' | 'feat' | 'edition' | 'fix' | 'planned';
-  status: 'planned' | 'in-progress' | 'shipped' | 'experimental' | 'absorbed' | 'retired';
   branch?: string;
   parents?: string[];
   dependents?: string[];
   summary?: string;
   owned_paths?: string[];
-  touch_paths?: string[];
   key_symbols?: string[];
-  symbol_watch?: string[];
-  invariants?: string[];
   design_docs?: string[];
   test_anchors?: string[];
-  overlap_hints?: string;
   /** Per-feature scope-guard override (§7 lever); beats the global default. */
   scope_guard?: ScopeGuardMode;
-  /** Per-feature case-stacking cap override (D-049 §2 lever); beats routing.yaml `stack_cap`. */
+  /** Per-feature case-stacking cap override (DRIVER.md §4.4 lever); beats routing.yaml `stack_cap`. */
   stack_cap?: number;
+  /** Tier floor (§1): 'judged' floors every merge of this branch at JUDGED. */
+  tier_floor?: 'judged';
+  /** Leaf/always_merge rule (§6): force an (empty) merge even when parents no-op. */
+  always_merge?: boolean;
   routing?: { keywords?: string[]; always_check_on?: string[] };
-  /**
-   * `extra_context` carries recorded owner decisions (D-030 write-back);
-   * `decided_paths` (D-048) optionally pins the paths a recorded decision
-   * governs — `propagate publish` blocks (ERR05_DECIDED_ALREADY) a PR whose
-   * conflicted paths hit either the explicit list or a path mentioned in the
-   * `extra_context` text (DRIVER.md §3.1).
-   */
-  prompt?: { template?: string; extra_context?: string; decided_paths?: string[] };
-  maintenance?: { owner?: string; last_verified?: string; verified_against?: string; notes?: string };
 }
 
 /** scripts/sweep/registry/routing.yaml — the two global driver levers. */
 export interface RoutingConfig {
   /** Global default scope-guard mode (§7 lever); per-feature `scope_guard` overrides. */
   scopeGuardMode?: ScopeGuardMode;
-  /** Global case-stacking cap (D-049 §2, `stack_cap`); per-feature `stack_cap` overrides. */
+  /** Global case-stacking cap (DRIVER.md §4.4, `stack_cap`); per-feature `stack_cap` overrides. */
   stackCap?: number;
 }
 
 /**
- * Scope-guard mode (§7 lever, owner 2026-07-20). `same-files` (default): the
+ * Scope-guard mode (§7 lever). `same-files` (default): the
  * resolution may touch only the recomputed conflicted FILES. `conflict-hunks`
  * (strict, opt-in): within those files, changed line regions must lie inside
  * the automerge tree's conflict-marker regions.
@@ -153,8 +119,10 @@ export type ScopeGuardMode = 'same-files' | 'conflict-hunks';
  * scripts/sweep/registry/scope.yaml — committed scope POLICY (exclusions are
  * config, not state). Scope = inventory branches + main_patched (structural)
  * + non-inventory branches whose tip is an ancestor of any edition/* branch
- * (owner rule 2026-07-14: "agent ignores non-inventory branches, unless they
- * are present in any edition branch"). No include-glob mechanism anymore.
+ * (the standing scope rule: "agent ignores non-inventory branches, unless
+ * they are present in any edition branch"). There is no include-glob
+ * mechanism: inclusion is derived from the inventory and the edition
+ * composition; only exclusions are globs.
  */
 export interface SweepScope {
   exclude?: string[];
@@ -179,7 +147,7 @@ export interface ValidationResult {
 }
 
 // ---------------------------------------------------------------------------
-// Mechanical propagation driver (DRIVER.md §12.1, D-035..D-040). New flat
+// Mechanical propagation driver (DRIVER.md §12.1). Flat
 // modules: heights / interval / tiers / plan / deferred / scope-guard / steps /
 // propagate. These are the shared data-model + JSON artifact schemas; the
 // per-module computational result types stay local to their modules.
@@ -198,7 +166,7 @@ export interface Head {
 }
 
 /**
- * Tier ladder (§1, D-035). `deferred` is off-ladder (a conflict that belongs to
+ * Tier ladder (§1). `deferred` is off-ladder (a conflict that belongs to
  * a HELD ancestor). Ladder severity: clean < mechanical < judged < held.
  */
 export type Tier = 'clean' | 'mechanical' | 'judged' | 'held' | 'deferred';
@@ -216,7 +184,7 @@ export type ParentVerdict = 'merge' | 'skip' | 'defer' | 'up-to-date' | 'case';
 
 /**
  * Reported conflict handed to the resolving agent (§3 step 4). The case unit is
- * a STACKED RUN (D-049 §2): the maximal run of consecutive conflicting heights
+ * a STACKED RUN (DRIVER.md §4.4): the maximal run of consecutive conflicting heights
  * whose conflicted path sets intersect, capped (`stack_cap`). `head` is the
  * run's TOP commit — merging it resolves the whole run in one case/cold read;
  * DEFERRED windows and urge tracking are computed against it.
@@ -242,17 +210,17 @@ export interface ParentPlan {
   verdict: ParentVerdict;
   /** Reported conflict above the merge point (the smallest conflicting height). */
   case: ConflictCase | null;
-  /** DEFERRED: the lowest blocked DIRECT parent this conflict defers behind (D-057). */
+  /** DEFERRED: the lowest blocked DIRECT parent this conflict defers behind. */
   deferredTo: string | null;
   /** DEFERRED: the height of X's own conflict (the run TOP) — the block-height this
-   * branch contributes to its children's height-MIN when it is itself deferred (D-057). */
+   * branch contributes to its children's height-MIN when it is itself deferred. */
   deferHeight?: number;
   /** No-op reason when verdict is skip. */
   skipReason: string | null;
   /** Forced (empty) merge to honour the leaf/always_merge rule (§6). */
   forced?: boolean;
   /**
-   * Annotate-class flag (§1, D-002): a CLEAN merge whose merged range passes
+   * Annotate-class flag (§1): a CLEAN merge whose merged range passes
    * THROUGH a height at which a transitive ancestor is HELD. Never gates — the
    * pass report surfaces it. `null` unless it applies.
    */
@@ -268,13 +236,13 @@ export interface BranchPlan {
   alwaysMerge: boolean;
   /** Transitive inventory ancestors (for DEFERRED matching). */
   ancestors: string[];
-  /** Effective case-stacking cap for this branch (D-049 §2 lever, resolved at derivation). */
+  /** Effective case-stacking cap for this branch (DRIVER.md §4.4 lever, resolved at derivation). */
   stackCap?: number;
   parents: ParentPlan[];
   /** Cheapest parent chain un-skipped to keep the leaf/always_merge invariant (§6). */
   unskipChain?: string[];
   /**
-   * D-045 (§13): remote-only branch — probes/coverage in this plan read the
+   * §13: remote-only branch — probes/coverage in this plan read the
    * `origin/<branch>` commit; `run --execute` materializes the local ref
    * before the branch's first mutation. `plan` and dry-run `run` never write refs.
    */
@@ -312,7 +280,7 @@ export interface StepFile {
   schemaVersion: 1;
   branch: string;
   watermark: string;
-  /** Legal inventory parents (or `main` for entry/D-032b branches). */
+  /** Legal inventory parents (or `main` for entry-point branches). */
   legalParents: string[];
   /** Inventory parents that must have arrived this pass (journal barrier). */
   requiredParents: string[];
@@ -327,9 +295,9 @@ export interface CaseFile {
   id: string;
   branch: string;
   parent: string;
-  /** The case run's TOP head (D-049 §2). */
+  /** The case run's TOP head (DRIVER.md §4.4). */
   head: Head;
-  /** The stacked run (ascending). Optional only for pre-D-049 case files. */
+  /** The stacked run (ascending); when absent the case is its single head. */
   run?: Head[];
   tierFloor: Tier;
   conflictedPaths: string[];
