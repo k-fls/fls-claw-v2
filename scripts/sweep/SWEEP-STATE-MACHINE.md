@@ -1,12 +1,18 @@
-# Sweep state machine — canonical agent interface
+# Sweep state machine — driver specification
 
-AUTHORITY on the agent-facing sweep interface — and the ONLY interface: there is no
-flag-based `plan/run/resolve/publish/push/verify/unfreeze/status/report` command
-surface. Those internals (merge-tree, heights, stacking, MERGE-POLICY tiers, verify,
-push) are the driver's implementation, reachable only through this machine's
-commands — `start` runs planning, `next-case` executes, `finish` runs
-verify → publish → push → report. MERGE-POLICY.md governs tiers/merge/publication
-semantics; this file governs the command surface and who-does-what.
+DEVELOPER documentation for the state machine behind the sweep commands: what each
+command does internally, what it refuses, and why. The sweep agent does NOT read
+it — the agent's entire world is the two documents under `doctrine/`, which state the
+same contract from the outside. Keep them consistent: a change here that alters what
+the agent sees must land in the doctrine in the same commit.
+
+The command surface is the ONLY interface: there is no flag-based
+`plan/run/resolve/publish/push/verify/unfreeze/status/report` surface. Those internals
+(merge-tree, heights, stacking, tiers, verify, push) are the driver's implementation,
+reachable only through this machine's commands — `start` runs planning, `next-case`
+executes, `finish` runs verify → publish → push → report. MERGE-POLICY.md governs
+tiers/merge/publication semantics; this file governs the command surface and
+who-does-what.
 
 Standing rules that frame every command below:
 
@@ -17,8 +23,7 @@ Standing rules that frame every command below:
   has published nothing, so `start` always re-derives a clean picture.
 - The sweep is a pure function of (GitHub, config). Its only legitimate local inputs
   are the committed config in the clone and git-bound caches (`rr-cache`); anything
-  else the sweep recognizes as its own is residue that `start` refuses (see the start
-  guards below).
+  else is residue with no effect on a pass: nothing local is ever a sweep input.
 - The GitHub token comes from the ENVIRONMENT (`GH_TOKEN`, fallback `GITHUB_TOKEN`)
   at each networked write — the agent manages no token file (`--token-file` is an
   internal/test override). An in-flight networked 401/403 is `ERR41_TOKEN_REJECTED`,
@@ -70,18 +75,7 @@ Standing rules that frame every command below:
   wipe — that check READS the file, it does not run it, and a gate that cannot parse
   its config silently checks nothing. An ABSENT checks file skips the gate silently,
   which is intended.
-- **START GUARDS — run right after the workspace check, BEFORE the fetch.** `start`
-  fails hard on anything that would make the pass a function of stale local state:
-  - `ERR47_SWEEP_RESIDUE`: refuses when the sweep finds its own residue — pinned refs
-    under `refs/sweep/*` in the clone, a workspace `inventory/` dir (the inventory is
-    config in the repo, never a workspace dir), a workspace `inventory-candidates/`
-    dir (candidates are derived fresh from git every pass), or `sweep-*.json` /
-    `sweep-*.jsonl` files at the workspace root. The operator must recover-or-delete:
-    the pinned refs are PRESERVED ABANDONED RESOLUTIONS — recover each into a pushed
-    branch/PR or delete it (`git update-ref -d <ref>`); the dirs and stray state
-    files are deleted. Exempt: `propagation/` (pass-owned — the open-pass refusal and
-    the start wipe govern it) and `rr-cache/` (a git-bound cache keyed to conflict
-    content, reconstructible from pushed merges).
+- **START GUARD — runs right after the workspace check, BEFORE the fetch.**
   - `ERR46_INVENTORY_INVALID`: a missing or empty inventory, or ANY entry error
     (unknown key, bad value), refuses `start`. The resolved inventory path is pinned
     into machine state; mid-pass commands re-read the pinned path and stay
@@ -352,9 +346,7 @@ Standing rules that frame every command below:
       The agent's resolution is PINNED at `refs/sweep/abandoned/<caseId>` first:
       the reopen rebuilds the worktree from the automerge tree and nothing else
       references that tree (the driver commits by plumbing, so rerere never
-      recorded this resolution). A pinned ref must be RECOVERED OR DELETED before
-      the next `sweep start` — `ERR47_SWEEP_RESIDUE` refuses while any survive:
-      recover the resolution into a pushed branch/PR, or `git update-ref -d` it.
+      recorded this resolution).
     - Every stage emits `SWEEP-STEP:` progress and journals (`not-my-bug`,
       `not-my-bug-owner`, `not-my-bug-bisect`, with the probe log); the result
       carries a `notMyBug` block plus `introducedBy` for the agent to relay. The

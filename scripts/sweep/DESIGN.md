@@ -112,11 +112,6 @@ The driver keeps NO durable local state — the sweep is a pure function of
   the disposable pass dir `<workspace>/propagation/pass-<watermark12>/`; every
   mutation goes through journaled driver commands (PROPAGATION.md §7-8).
 - Exclusions are CONFIG (`registry/scope.yaml`), not state.
-- `sweep start` fails hard on sweep residue it might otherwise be tempted to
-  read (ERR47_SWEEP_RESIDUE): pinned `refs/sweep/*` refs in the clone, a
-  workspace `inventory/` or `inventory-candidates/` dir, and
-  `sweep-*.json(l)` files at the workspace root. `propagation/` (pass-owned)
-  and `rr-cache/` (a cache keyed to git conflict content) are exempt.
 
 ## 5. Scripted core — stages
 

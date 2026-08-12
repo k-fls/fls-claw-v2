@@ -11,8 +11,9 @@ pnpm exec tsx scripts/sweep/sweep-machine.ts <start|next-case|report-case|report
 ```
 
 `start` / `next-case` / `report-case --tier` / `report-pr` / `finish` / `abort`
-— spec: `SWEEP-STATE-MACHINE.md` (AUTHORITY on the interface), mechanics:
-`PROPAGATION.md`, tier/merge/publication semantics: `MERGE-POLICY.md`. The
+— driver spec: `SWEEP-STATE-MACHINE.md`, mechanics: `PROPAGATION.md`,
+tier/merge/publication semantics: `MERGE-POLICY.md`. Everything in this
+directory is DEVELOPER documentation; the sweep agent reads only `doctrine/`. The
 deterministic stages (plan, run, verify, publish, push, report) are the driver's
 INTERNALS with no standalone entry point.
 
@@ -36,7 +37,10 @@ group-owned. There is no state branch.
 scripts/sweep/
   *.ts                       toolkit + colocated *.test.ts
   README.md  DESIGN.md       this file; the pipeline design spec
-  SWEEP-STATE-MACHINE.md     the agent-facing command surface
+  doctrine/                  THE AGENT'S ONLY DOCS — self-contained by rule:
+    SWEEP-DOCTRINE.md          how to run a sweep, what to claim, what to write
+    RESULT-CODES.md            one line per ERR*/WARN*: meaning + what to do
+  SWEEP-STATE-MACHINE.md     driver spec for the command surface
   PROPAGATION.md             the propagation driver's specification
   MERGE-POLICY.md            tier ladder + merge/publication policy
   sweep.ts                   the inventory validator CLI (validate-registry)
@@ -72,10 +76,7 @@ scripts/sweep/
   `git merge-base <branch> upstream/main`. Blockedness (`merge_status`) is
   derived from the origin `fix/sweep/*` refs at `start` plus the pass journal.
   There is NO durable local state file: everything a pass produces lives in
-  the pass dir, and anything about origin is re-read from origin. `start`
-  refuses on sweep residue it would otherwise be tempted to read
-  (ERR47_SWEEP_RESIDUE: `refs/sweep/*` refs, workspace `inventory/` or
-  `inventory-candidates/` dirs, stray `sweep-*.json(l)` files).
+  the pass dir, and anything about origin is re-read from origin.
 - **Group-owned state** (`--workspace <dir>`, default = the parent of
   `--repo`): `propagation/pass-<wm12>/` (plan + step + case files,
   `journal.jsonl`, machine state) and `rr-cache/` (shared rerere resolutions,
@@ -89,8 +90,8 @@ From a clone where `origin` = k-fls/fls-claw-v2 and `upstream` =
 nanocoai/nanoclaw (never a human's checkout with WIP). The group root — the
 PARENT of the clone — is the workspace: `propagation/` and `rr-cache/` live
 there, never inside the clone. The inventory ships in the clone at
-`scripts/sweep/inventory/`. Then run the loop in `SWEEP-STATE-MACHINE.md`;
-the clone persists across sessions.
+`scripts/sweep/inventory/`. Then run the loop described in
+`doctrine/SWEEP-DOCTRINE.md`; the clone persists across sessions.
 
 Registry-schema notes (verified against the live authored content):
 
@@ -142,7 +143,10 @@ feature branch" — see the `fork-registry-generate` skill.
 
 ## References
 
-- `scripts/sweep/SWEEP-STATE-MACHINE.md` — the agent-facing command surface.
+- `scripts/sweep/doctrine/` — the sweep agent's only documentation: doctrine +
+  result codes. Self-contained by rule: nothing in it may reference another
+  file, and nothing outside it may be put in front of the agent.
+- `scripts/sweep/SWEEP-STATE-MACHINE.md` — driver spec for the command surface.
 - `scripts/sweep/PROPAGATION.md` — the propagation driver's specification.
 - `scripts/sweep/MERGE-POLICY.md` — the authoritative tier ladder.
 - `scripts/sweep/DESIGN.md` — the pipeline design spec.

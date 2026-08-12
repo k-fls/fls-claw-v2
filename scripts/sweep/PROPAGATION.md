@@ -371,17 +371,8 @@ report   [finish]     # journal-ONLY end-of-sweep summary (merged / resolved /
 preconditions fail — each surfaced as a §14.3 start-time refusal. The workspace
 check runs first: `--workspace` must be the group root, never the `--repo` clone
 or a subdirectory of it (`ERR37_WORKSPACE_IN_CLONE`). Right after it, and BEFORE
-any fetch, two guards run:
+any fetch, one guard runs:
 
-- **`ERR47_SWEEP_RESIDUE`** — the sweep is a pure function of (GitHub, config),
-  so anything local the sweep recognizes as its own is residue, and `start`
-  refuses rather than reading or silently ignoring it: refs under
-  `refs/sweep/*` in the clone (preserved abandoned resolutions — recover each
-  into a pushed branch/PR or delete it with `git update-ref -d <ref>`), a
-  workspace `inventory/` dir (the inventory is config in the repo, §2), a
-  workspace `inventory-candidates/` dir (candidates are derived fresh from git
-  every pass, §13), or `sweep-*.json`/`sweep-*.jsonl` files at the workspace
-  root. Exempt: `propagation/` (pass-owned) and `rr-cache/` (git-bound cache).
 - **`ERR46_INVENTORY_INVALID`** — a missing or empty inventory, or any entry
   error (unknown key, bad value — §2), refuses the start. On success the
   resolved inventory path is pinned into machine state and every later command
@@ -663,8 +654,7 @@ both directions, every finding recorded with SHAs.
   the placement.
 
 **Artifacts + reporting (code):** candidates are derived FRESH from git every
-pass — no cross-pass candidate store of any kind (a workspace
-`inventory-candidates/` dir is `ERR47_SWEEP_RESIDUE`, §8). Every pass appends a
+pass — no cross-pass candidate store of any kind. Every pass appends a
 `candidate` journal entry per discovery (append-only audit) and writes the full
 derived set to the pass dir's `candidates.json` — per candidate: branch, tip,
 remoteOnly, forkPoint {sha,height}, coverage,
@@ -794,7 +784,6 @@ block `start` itself):
 
 | id | meaning |
 |----|---------|
-| `ERR47_SWEEP_RESIDUE` | sweep residue found (§8 start guards): refs under `refs/sweep/*` in the clone (preserved abandoned resolutions — recover each into a pushed branch/PR or `git update-ref -d`), a workspace `inventory/` or `inventory-candidates/` dir, or `sweep-*.json`/`sweep-*.jsonl` files at the workspace root; `propagation/` (pass-owned) and `rr-cache/` (git-bound cache) are exempt |
 | `ERR46_INVENTORY_INVALID` | missing or empty inventory, or any entry error (unknown key, bad value — §2); on success the resolved inventory path is pinned into machine state |
 
 Advisory (returned in `issues`, never block):
