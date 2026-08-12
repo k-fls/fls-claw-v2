@@ -1,6 +1,6 @@
 # Sweep result codes
 
-Every sweep command returns `issues: [{id, detail}]`. Look the id up here: one line per
+A sweep command's answer may carry `issues: [{id, detail}]`. Look the id up here: one line per
 code, each giving what happened and what you do about it. `ERR*` blocks the command,
 `WARN*` never does. The `detail` on the result carries the specifics (which file, which
 branch, which output to read) — this list tells you what to DO. If a command's own
@@ -13,7 +13,7 @@ thing, run the same command again. REPORT AND STOP: tell the owner the id and th
 and do nothing else — retrying or improvising makes it worse. ASK THE OWNER: present the
 choice and wait.
 
-ERR01_CASE_NOT_OPEN — the case has no open disposition to publish against: it was never reported, or it already merged. You are working a case that is finished. Run next-case; if that disagrees, REPORT AND STOP.
+ERR01_CASE_NOT_OPEN — you ran report-pr while no case is waiting for a pull-request description: the case has not been reported yet, or it already merged. Run report-case for the current case first; if there is no current case, run next-case.
 ERR02_CASE_STALE — git moved since this case was prepared: the resolution landed elsewhere, the conflict healed by itself, or the conflicted files drifted. Nothing here is yours to salvage. Stop working this case and run next-case.
 ERR06_DUPLICATE_CASE — another open case or an already-published pull request has the same conflict signature; the detail names the case that owns it. Do not resolve this one twice: consolidate into the named case and take the next one.
 ERR07_PR_EXISTS — a pull request is already recorded for this case. Do not write or publish a second one. Take the next case, and mention it in your report.
@@ -23,7 +23,7 @@ ERR12_ORIGIN_UNRESOLVED — the origin remote's URL does not yield an owner/repo
 ERR13_API_FAILED — a GitHub API call failed (non-2xx or transport error). One retry is legitimate if the instruction says so; if it fails again, REPORT AND STOP.
 ERR41_TOKEN_REJECTED — GitHub answered 401/403: the token was REJECTED. The detail names where the token came from, never the token itself. Retrying with the same token can never clear it. REPORT AND STOP.
 ERR14_BASE_BEHIND — the base branch on origin is missing, behind the pass, diverged from it, or already contains this merge. Publication order or the remote state is wrong, and neither is yours to correct. REPORT AND STOP.
-ERR15_PUSH_FAILED — a `git push` failed. Never hand-push, never retry by another route: publication stays blocked until the infrastructure is fixed. REPORT AND STOP.
+ERR15_PUSH_FAILED — a `git push` failed. Never hand-push and never retry by another route. At finish this is a PER-BRANCH label and not a halt: the other branches proceed, so report factually which branches landed and which failed with what category, then re-run finish — landed branches skip and transient failures retry. Entries the result lists under needsOwner require the owner to act first.
 ERR16_CLOSURE_FAILED — a merged-history pull request did not flip to merged after its push landed. Nothing is broken in your work; the owner needs to know. REPORT AND STOP.
 ERR17_URGE_FAILED — posting the pending-count comment on a blocked branch's pull request failed. Harmless to the pass and retried on a later one; mention it in your report.
 ERR18_VERIFY_PENDING — something tried to publish before the full verify was green for the current state. Follow the instruction (it names the stage to run); do not push anything yourself.
@@ -39,7 +39,7 @@ ERR32_UNRESOLVED — conflict markers are still present, or nothing changed at a
 ERR34_CASES_REMAIN — finish was called while cases are still open (a fix that advanced a branch reopens its descendants, which is expected). Run next-case, work what it serves, then finish again. The same pass still completes.
 ERR35_COLDREAD_UNAVAILABLE — the independent reviewer could not RUN: a spawn failure, an authentication failure, or unreadable output. This is tooling, never a judgment on your resolution — your case is not held and not rejected. REPORT AND STOP; the command is re-runnable once the tooling is fixed.
 ERR36_TYPECHECK_FAILED — the typecheck gate failed inside your worktree; the detail names the output file. Read it, fix the pending files, and FIX AND RETRY report-case. This costs you no attempt. If you are convinced the failure predates your edit, re-run with `--not-my-bug` IN ADDITION to your `--tier` (it is ignored on the first reported failure, and on gate-fix and reissue cases).
-ERR40_TESTS_FAILED — the test gate failed. At report-case: same as the typecheck gate — read the named output, fix, FIX AND RETRY, `--not-my-bug` if it is not yours. At finish: the build is red with no single branch to blame, so nothing was merged or pushed anywhere — REPORT AND STOP, saying plainly that the pass published nothing and naming the failing tests.
+ERR40_TESTS_FAILED — the test gate failed. At report-case: same as the typecheck gate — read the named output, fix, FIX AND RETRY, `--not-my-bug` if it is not yours. At finish: the build is red with no single branch to blame, so nothing was merged or pushed to any branch — REPORT AND STOP, naming the failing tests. Report what the result says was published: a red finish still publishes the held review pull requests, and the result carries their count. Never tell the owner the pass published nothing unless the result says so.
 ERR37_WORKSPACE_IN_CLONE — the pass was pointed at a workspace inside the clone, which would break the shared conflict-resolution cache. A configuration fault. REPORT AND STOP.
 ERR38_PASS_CLEAR_FAILED — the previous pass directory could not be removed, so a new pass cannot safely open. REPORT AND STOP.
 ERR39_FETCH_FAILED — `git fetch` failed at start, so the pass would open on a stale view of the remote. REPORT AND STOP.
@@ -53,7 +53,7 @@ WARN03_MANY_PRS — this pass produced an unusually large number of pull request
 WARN06_RESOLUTION_TREE_MISSING — the recorded resolution for a held case is gone from the object store, so the pristine conflict is published as a draft instead. Nothing to redo; state it in your report.
 WARN07_RESOLUTION_TIP_MOVED — the branch moved after the case was frozen and the frozen resolution no longer merges cleanly, so the pristine conflict is published as a draft instead. State it in your report.
 WARN08_CUT_POINT_EXCEPTION_STALE — an owner-approved exception used for blaming red builds no longer matches the repository. Relay it to the owner; only they can update it.
-WARN09_GATE_FIX_SERVED — a failing check was proven not to be caused by your resolution, and a fix case was created on the branch that owns it. This is the good outcome of `--not-my-bug`. Run next-case and work it.
+WARN09_GATE_FIX_SERVED — a failing check was proven not to be caused by your resolution. If a fix case was created on the branch that owns the failure, run next-case and work it. If the result says no case could be prepared, relay the reason the instruction gives and continue with next-case.
 WARN11_PRE_MERGE_CHECK_SKIPPED — the pre-merge branch check did not run, so branches merged unverified. Mention it in your report.
 WARN12_SCOPE_WIDENED — the failure is owned by this merge rather than by either side, so your allowed files now ALSO include the named ones. Fix the failure there and re-run report-case; the reviewer is told those files were added and why, so this is not a scope violation.
 WARN13_DEPS_UNUSABLE — a branch's dependencies would not install, so it could not be checked at all. Report it; a tree with no working environment yields no verdict.
@@ -65,4 +65,4 @@ WARN18_BASE_GATED — the base branch is itself waiting on a fix pull request, s
 WARN19_GATE_COVERS_OTHER_DEFECT — the branch is gated by a fix for a DIFFERENT set of failing files, so merging it will not turn this branch green and a second fix will be needed. No case was created. Relay both facts to the owner.
 WARN20_ANCESTOR_GATED — the branch descends from an ancestor that took a fix this pass and is still red; nothing below it can pass until that lands. Relay it.
 WARN21_CHECKS_FLAKY — a check failed and then passed on the same tree. Follow the instruction; if the case proceeds, say in your report that a gate was unstable.
-WARN46_CASE_LOOPING — this case has been served repeatedly with no conclusion, and one more serve will be refused outright. Stop investigating now: claim `--tier held` and write the diagnosis you have.
+WARN46_CASE_LOOPING — this case has been served repeatedly with no conclusion, and the serve limit is close; once it is passed the case is refused with ERR48_CASE_LOOPING. Stop investigating now: claim `--tier held` and write the diagnosis you have.

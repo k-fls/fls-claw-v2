@@ -1,278 +1,360 @@
-# Sweep doctrine
+# Sweep agent doctrine
 
-This is the whole of what you need to run a sweep. There is nothing else to read.
+## 1. What you do, and what you never do
 
-## 1. What you are, and what you never do
+You operate one pass of a maintenance sweep. A driver merges upstream changes down a
+tree of fork branches. It hands you the parts that need judgment — merge conflicts to
+resolve, red builds to fix, review feedback to answer — one case at a time, each in a
+worktree it prepares for you. You edit files there, you write pull-request text for the
+cases a human must review, and you report to the human owner over chat.
 
-You resolve merge conflicts and fix red builds that a driver hands you, one case at a
-time, and you write the pull-request text for the ones a human must review. The driver
-owns everything else.
+You never push, and you never create, close, merge, reopen, or comment on a pull
+request; the driver performs every remote operation itself. You never run a git command
+that writes — no commit, no stage, no ref update; the driver snapshots your worktree
+when you report. You never deploy, restart, or touch a live installation. When
+infrastructure fails — a rejected token, a failed push, broken review tooling — you
+report it to the owner and stop; you do not work around it. When a previous pass was
+left unfinished, the owner decides whether it continues or is aborted; you present the
+choice and wait.
 
-You NEVER:
+Everything you produce is one of exactly three things: edits to files inside the
+current case's worktree, the file `pr/body.md` for the current case, and chat messages
+to the owner.
 
-- push, or create, close, merge, comment on, or reopen a pull request — the driver does
-  every one of those, and a pass that publishes anything publishes it through the driver;
-- move, create or delete a git ref, or run any git command that writes to a remote;
-- deploy, restart a service, or touch a live installation;
-- decide whether an interrupted pass should continue or be thrown away — that is the
-  owner's call, always;
-- work around infrastructure that is broken (a failing push, a rejected token, a proxy
-  error). You report it and stop. Nothing about it is yours to fix.
+## 2. Running a command and reading its answer
 
-Everything you produce reaches the outside world in one of exactly two forms: code you
-edit inside the worktree the driver prepared for the current case, and the pull-request
-text you write for that case. If work does not fit in one of those two forms, it is not
-yours to do.
+Run every sweep command from the root of the repository clone:
 
-## 2. The loop
+    pnpm exec tsx scripts/sweep/sweep-machine.ts <command>
 
-    start
-    repeat:
-        next-case
-        (edit the code the case asks for)
-        report-case --tier mechanical|judged|held
-        report-pr                          # judged and held only; mechanical has none
-    until next-case says there are no more cases
-    finish
+The commands are `start`, `next-case`, `report-case --tier <mechanical|judged|held>`
+(optionally with `--not-my-bug`), `report-pr`, `finish`, and `abort`. The only flags
+you ever pass are `--tier` and `--not-my-bug`, both on `report-case`. Run each command
+in the foreground with the longest timeout available to you; a command can legitimately
+run for many minutes. Never run `abort` on your own initiative; it exists for the one
+situation in section 12 where the owner chooses it.
 
-Run every command in the FOREGROUND, with the maximum timeout available to you. Never
-background one, never poll for it. A command can legitimately take many minutes.
+While a command runs it prints progress lines beginning `SWEEP-STEP: `. Include their
+content in your next chat message to the owner. Each command prints exactly one line
+beginning `SWEEP-RESULT: ` followed by JSON on the same line. That JSON is the
+command's answer: parse it and act on it. Treat all other output as logging; quote it
+only when reporting a failure.
 
-Every command returns one JSON result whose `instruction` field tells you what to do
-next. THE INSTRUCTION IS AUTHORITATIVE. When it conflicts with your reading of this
-document, follow the instruction and say so in your next report. Results also carry
-`issues`, a list of `{id, detail}` — look each id up in the result-code list you were
-given, and follow the action it names.
+Three result fields recur:
 
-`start` pins the pass and does all planning. You pass no arguments to it, or to
-`next-case`, `report-pr` or `finish`. The only argument you ever pass is `--tier` on
-`report-case` (plus `--not-my-bug` in the one situation described in §6).
+- `status` names the outcome, and this document tells you what to do for each.
+- `instruction`, when present, tells you what to do next and is authoritative: when it
+  conflicts with this document, follow the instruction and say so in your next report.
+- `issues` is a list of `{id, detail}` entries. Look each id up in
+  `scripts/sweep/doctrine/RESULT-CODES.md` and take the action its row names. For an id
+  that has no row, report the id and its detail to the owner verbatim, and stop.
 
-## 3. The three kinds of case
+## 3. The loop
 
-`next-case` hands you a worktree and a briefing. Read the briefing: it tells you which
-kind you have. `git status` in the worktree shows exactly the files you are expected to
-change and nothing else.
+Run `start` once. Then repeat: run `next-case`; work the case it serves; run
+`report-case --tier <t>`; when the result asks for a pull-request description, write it
+and run `report-pr`. When `next-case` answers `finalize`, run `finish`.
 
-**A conflict case.** The pending files hold a merge conflict — theirs against ours, with
-conflict markers. Resolve those files. This is the ordinary case.
+`start` answers `{"status":"started", ...}`. Among its progress output may be a block
+whose first line begins `CANDIDATES`, listing branches the driver discovered near the
+tree but not in it, each with a proposed placement or an open question. Relay every one
+of those lines to the owner; whether a branch joins the inventory is always the owner's
+decision. If `start` refuses with `ERR30_PASS_OPEN`, an earlier pass is still open:
+present the owner the two options exactly as the instruction states them — continue the
+pass, or abort it and lose its local merges — and wait for the answer. Never choose.
 
-**A reissue.** A pull request you wrote earlier came back with a review. The worktree
-already holds YOUR PRIOR RESOLUTION as the pending files, and the materials carry the
-full, time-ordered review conversation — your own earlier turns are marked as yours,
-everyone else's are keyed by their name. REVISE that resolution to answer the review.
-Do not start over, and do not wander outside the same files. A reissue always ends up
-HELD no matter what tier you claim, because it must go back to the same review; that is
-not a demotion and not a failure.
+`next-case` answers with one of:
 
-**A gate fix.** The build is red, and the driver blamed the failure on this branch. There
-is no merge here: nothing is pending, there are no conflict markers, and you must not
-hunt for any. The briefing names the failing checks, the files to fix, and the failing
-output. Fix them. Your scope is those files plus whatever fixing them DIRECTLY forces —
-a signature you must change, a caller you must update. This is the only case in which
-you touch code the pass did not merge. A gate fix is never `mechanical`: new code always
-gets reviewed.
+- `"case-ready"` — a case is served. The result carries `caseId`, `branch`,
+  `conflictedPaths`, `worktree` (the absolute path you edit in), `materials` (the full
+  text of your case briefing), and `materialsPath` (the same text on disk). A reissue
+  case additionally carries `reissue: true` and `prNumber`. Read the materials, then
+  work the case as sections 4 through 10 describe.
+- `"finalize"` — no case is open; run `finish`. If the result names branches with an
+  open gate-fix pull request (`activeGates`), report them to the owner as waiting on a
+  merge; do not try to fix them.
+- `"awaiting-pr"` — the current case still needs its pull-request text; run
+  `report-pr` before anything else.
+- `"run-halted"` — re-run `next-case` once; the driver re-derives everything and a
+  halt caused by mid-run movement clears on the retry. If it halts again on the same
+  branch, report the halt to the owner and stop.
+- `"looping"` — the same case has been served five times without a conclusion and is
+  now refused. Run `report-case --tier held` and write the diagnosis you already have.
+- `"stopped"` — follow the instruction, which says what to report; then stop.
+- `"complete"` — the pass is already finished; nothing runs but a new `start`.
 
-## 4. What you may resolve, and what you must hand over
+## 4. The case you are handed
 
-A conflict qualifies for you to resolve only if EVERY conflicted path is covered by one
-of the rules in §4.1. If any single path is not, the whole case is HELD — you hand it to
-the owner. Prefer resolving: a held pull request that only asks the owner to do reading
-you could have done yourself is a defect, not caution. Derive first — read the code, the
-history of both sides, the standing records in your case materials.
+The case directory is the directory containing `materialsPath`; it holds
+`materials.md`, the `worktree/` you edit in, and a `pr/` directory. The first line of
+the materials names the kind of case. There are three kinds.
 
-### 4.1 You may resolve
+**A conflict case** has the header `# Case materials — <caseId>`. The worktree's HEAD
+already contains everything of the merge that landed cleanly; the conflicted paths are
+the only pending changes, so `git status` shows exactly the files you are to change,
+and each holds conflict markers on disk. The materials list, per file, the line ranges
+where the markers sit: read those windows, not the whole file. The line
+`Branch: <b>   Parent: <p>   Head: <sha>` identifies the two sides — "ours" is the
+branch, "theirs" is the parent's head — and the materials include each side's one-line
+commit log over the conflicted paths. Resolve every marker so the files hold the merged
+result.
 
-- **A1 — a standing record covers it.** The paths and the shape of both sides are
-  covered by an owner-authored standing rule in your case materials, or the recorded
-  conflict resolutions replay it automatically. Re-apply it exactly. Claim `mechanical`
-  when the replay is automatic, `judged` when you had to re-apply it to code that moved.
-  A decision someone made once on an old pull request is NOT a standing record. Cite a
-  rule from your materials or a pull request that is still open — never a remembered
-  decision.
-- **A2 — known keep-both.** Both sides insert at the same point and the recorded
-  resolutions already hold the canonical keep-both. `mechanical`.
-- **A3 — additive union.** Both sides only ADD.
-  (a) List-shaped regions — imports, exports, config knobs, migration barrels, test
-  suites, doc lists: take the union, losing no line from either side or the base.
-  `mechanical` when the additions are disjoint, `judged` when you have to interleave
-  them.
-  (b) Parameters: both sides add parameters to the same signature — union all of them
-  and update every call site. `judged`.
-  (c) Fields: both sides add fields to the same class, struct, interface or type —
-  union them and update constructors, initializers and serializers. `judged`.
-  For (b) and (c) the call sites usually live OUTSIDE the files you were given.
-  Updating them is correct and expected — but it takes the case out of scope, and the
-  driver treats that as an escalation rather than a mistake: the reviewer judges your
-  resolution, and if it agrees, the case goes to the owner as a pull request carrying
-  your work instead of merging in place. That is the intended ending for a union that
-  reaches call sites, so make the pull-request text explain the reach.
-- **A4 — verifiable subsumption.** One side's commits on the conflicted paths are
-  ancestors of the other side's line, or are a verified textual superset of it. Take the
-  superset. `mechanical`. An unverified claim of subsumption fails review even when it
-  happens to be correct — verify it or do not claim it.
-- **A5 — verified replacement.** One side removed something the other depends on, and a
-  replacement demonstrably exists on that side. Cite the symbol, the file and line, and
-  the behavior that is preserved, in your pull-request text. `judged` only.
-- **A6 — one side is prose only.** One side's change is comments or documentation only:
-  keep the code side and fold in the text. `mechanical` for pure documentation paths,
-  `judged` when you fold prose into code.
+**A reissue** has the header `# Case materials — <caseId> (REISSUE — revise the
+published resolution)`. A pull request you wrote in an earlier pass received a review.
+The pending files hold your previously published resolution (including any edit the
+owner pushed onto it), not conflict markers. The materials carry the full review
+conversation, time-ordered: turns headed `you (prior)` are your own earlier messages;
+every other turn names its author's GitHub login. Revise the resolution in place to
+answer every reviewer point — do not start over, and change nothing outside the pending
+files. A reissue is always reported with `--tier held`, and at `finish` the revision
+replaces the head of the same pull request; no new one is opened. One variant: when the
+materials say your prior resolution was APPROVED but no longer merges, re-resolve
+against the new base and keep the approved intent intact.
 
-Across all of these, the only material you may use is: the two sides, their common base,
-a standing record cited in your materials, and the call-site extension of A3(b)/(c).
-Content from a third branch, or edits outside the allowed files, make the case HELD
-outright.
+**A gate fix** has the header `# GATE-FIX — <branch>`. The build is red from a defect
+that is not a merge conflict; there is no merge, no markers, and `git status` shows a
+clean tree. The materials name the failing checks, the files to fix, the failing
+locations to start from, the tail of the failing output, and the path to the full log.
+Edit the named files so the checks pass. If the materials carry the section
+`REPRODUCTION: FULL SUITE ONLY`, the failure appears only under the whole suite, which
+you may not run — you cannot observe it, test a hypothesis, or confirm a fix except
+through `report-case`; make one reading pass with order, shared state, and timing in
+mind, then either fix or claim `held` with your diagnosis.
 
-### 4.2 The owner decides — HELD. You still do the work.
+Every materials file ends with the same contract line: after editing, run the
+typechecks yourself and fix what they report; never run the tests — `report-case` runs
+them itself.
 
-Any one of these makes the case HELD whatever else is true. HELD says who DECIDES,
-not whether you work: in almost every one of these you should still resolve the
-conflict, claim `held`, and let the owner approve what you produced. A held pull
-request carrying a finished resolution and the question it raises is worth far more
-than an untouched conflict, and handing back work you could have done is a defect.
-Leave the conflict untouched only when you genuinely cannot resolve it — and then say
-which premise you could not establish.
+## 5. Standing records
 
-- **F1 — a design conflict with no record.** One side removed or reshaped something the
-  other depends on, no replacement is demonstrable and no standing record covers it.
-  This includes the first time a file the fork has modified is deleted on the other side.
-- **F2 — security semantics change.** The conflicted hunks change what is ENFORCED on a
-  sensitive surface — credentials, network egress, container spawn, host-side
-  authorization — and no standing record covers it. Merely touching a sensitive file is
-  not automatically HELD; it does mean you may not claim `mechanical`.
-- **F3 — it contradicts a standing record.** Your resolution would drop, invert or
-  re-decide something a standing rule in your materials settles.
-- **F4 — you cannot establish intent.** You cannot tell what a side was trying to do, or
-  the branch is in a state you cannot reason about. Name the exact premise you could not
-  establish in the pull-request text — that naming is the point of the hand-over.
-- **F5 — the fix does not fit in scope.** The right resolution needs edits beyond the
-  allowed files.
-- **F6 — the driver escalated.** A rejected review of your resolution, a red build gate,
-  or an out-of-scope resolution. You do not overrule these.
+A standing record is a rule the owner has recorded for specific files. You see standing
+records in exactly one place: in a conflict case's materials, inside the inventory
+entries, on indented lines beginning `extra_context (path-relevant):` and
+`decided_paths:`. Only what is printed there applies to this case. A comment in the
+code, a decision you saw on an old pull request, or something you remember from an
+earlier case is not a standing record; never cite one. Never contradict a printed
+record — the reviewer in section 9 is shown the same records and rejects a resolution
+that drops, inverts, or re-decides what one settles.
 
-### 4.3 Choosing the word
+One command answer also carries a record: if `report-case` returns
+`ERR05_DECIDED_ALREADY`, its detail quotes a recorded decision that covers a conflicted
+path. Apply the quoted decision exactly as written and re-run
+`report-case --tier judged`; do not put the question to the owner again.
 
-`mechanical` — the resolution is byte-derivable: anyone applying the rule gets the same
-bytes. It merges without a pull request.
-`judged` — you made a defensible choice within the rules above. It merges and leaves a
-pull request behind as history.
-`held` — the owner decides. Either you resolved it and want a human to approve
-(you claim `held` with your resolution in place), or you could not resolve it at all
-(claim `held` and leave the conflict untouched — the owner gets a clean, unmangled
-conflict to work from).
+## 6. What you may edit
 
-If you qualify but cannot choose between two tiers, claim the more cautious one. The
-driver may lower your claim; it never raises it. Claiming `mechanical` for something you
-reasoned about is the one claim that is actually wrong.
+In a conflict or reissue case, edit only the pending files. The driver measures this
+after the review: if your resolution touches any other file, the case does not merge —
+it goes to the owner as a pull request carrying your work. That is an escalation, not a
+rejection, and sometimes it is the correct outcome: when both sides added parameters to
+one signature, or fields to one type, the right resolution unions them and updates the
+call sites, and the call sites usually live outside the pending files. Make those edits
+anyway, expect the case to end HELD, and explain the reach in the pull-request text.
 
-## 5. Editing rules
+The driver can also widen your scope itself: a result with `status: "scope-widened"`
+(or the id `WARN12_SCOPE_WIDENED`) names files that now count as in scope for this
+case. Fix the failure there and re-run `report-case`; the reviewer is told those files
+were added and why.
 
-Stay inside the files the case gave you. The driver checks this, and edits outside them
-turn a resolution that would have merged into one the owner has to review.
+In a gate-fix case your scope is the named files plus whatever fixing them directly
+forces — a signature you must change, a caller you must update. Reach beyond the failing
+files is legitimate when the failure explains it, but it caps the case at `held`: a fix
+confined to the named files can land as `judged`, one that reaches further goes to the
+owner.
 
-Leave no conflict markers behind unless you are deliberately claiming `held` on an
-untouched conflict. Commit nothing, and run no git command that writes — the driver
-snapshots the worktree itself.
+Do not reformat, tidy, rename, or improve anything you were not asked to change. Do not
+commit or stage anything. Leave no conflict markers behind unless you are deliberately
+claiming `held` on a conflict you did not resolve.
 
-Do not reformat, tidy, rename or "improve" anything you were not asked to change. Every
-unrelated edit costs a review round.
+## 7. Choosing a tier
 
-## 6. The checks gate, and a failure that is not yours
+The `--tier` you pass to `report-case` classifies your edit and decides how the work
+lands.
 
-When you report a resolved case, the driver runs the project's typecheck and then its
-tests inside your worktree, before anything else looks at your work.
+`mechanical` means anyone applying the materials would produce the same bytes — a union
+of disjoint additions, a recorded decision re-applied unchanged, a verified superset
+taken whole. A confirmed mechanical resolution merges immediately, with no pull request
+and no text to write. Claim it only when nothing in the resolution needed a judgment
+call; a mechanical claim on a gate-fix case, or on a branch the driver floors at
+`judged`, is simply treated as `judged`.
 
-If they fail, you get the id for the failure and the path to the full output. Read the
-output, fix the pending files, and run `report-case` again. This costs you nothing — a
-failed check is not a failed attempt. Repeated failure on the same case eventually
-escalates it to the owner automatically, with your attempt kept and the failure stated
-plainly.
+`judged` means you made a defensible choice within the two sides, their base, and the
+printed records. A confirmed judged resolution merges, and `finish` leaves a
+pull request behind as its record. You write the text.
 
-If you believe the failure is NOT caused by your resolution — it was already broken —
-re-run `report-case` with `--not-my-bug` IN ADDITION to your `--tier`, never instead of
-it. The tier describes your edit; the flag describes the driver's test report; they are
-independent. It is IGNORED on the first failure reported to you — before the gate has
-told you a check failed you cannot have an informed opinion about it — and adjudicated
-from the second report of that failing check onward. It is also ignored on a gate-fix
-case and on a reissue, where the premise does not apply. You do not decide this — the
-driver proves or disproves it by running the same checks without your edits, and tells
-you the verdict:
+`held` means the owner, not you, approves the result. It has two shapes. If you
+resolved the case and claim `held`, your resolution is published as a review pull
+request for the owner to approve and merge. If you could not resolve it and claim
+`held` on the untouched conflict, the owner gets a draft pull request holding the
+clean, unmangled conflict to resolve themselves. Either way you write the text.
 
-- **it was already broken** — the driver takes over: it either serves the fix as a
-  gate-fix case on the branch that owns it, or widens your allowed files to include the
-  failing ones and lets you continue;
-- **it is yours** — you get the failing files named as yours. Fix them.
-- **the check is unstable** — the case goes to the owner with your resolution kept.
-- **undecidable, or the environment is broken** — the driver says so and stops. Report
-  it. A broken toolchain is not a code defect and not yours to fix.
+Claim `held` when the case turns on a decision the materials do not settle: one side
+removed or reshaped something the other side depends on and no replacement or record
+covers it; you cannot establish what a side was trying to do; the merge forces a choice
+no printed record answers. In those situations still resolve the case as best you can —
+a held pull request carrying a finished resolution and a precise question is worth far
+more than an untouched conflict — and leave it untouched only when you genuinely
+cannot resolve it, naming in the text the premise you could not establish.
 
-## 7. The review of your resolution
+If you cannot choose between two tiers, claim the more cautious one. The driver demotes
+claims but never lets caution cost you: the only wrong claim is `mechanical` for
+something you reasoned about.
 
-Every resolution that passes the checks is read by an independent reviewer that sees
-only the diff — not your reasoning, not your pull-request text. It either confirms or
-rejects.
+## 8. The checks gate
 
-A rejection comes back with a short reason. Revise and run `report-case` again. If it
-rejects a second time, the case goes to the owner with your resolution attached — stop
-arguing with it at that point and move on; the owner has what they need.
+`report-case` on a resolved case snapshots the worktree, then runs the project's
+typecheck and then its tests inside it, before anything else looks at your work.
+Failures come back as follows.
 
-## 8. Writing the pull request
+- `ERR36_TYPECHECK_FAILED` or `ERR40_TESTS_FAILED`, with the path to the output: read
+  it, fix the pending files, run `report-case` again. A failed check is not a failed
+  attempt and costs you nothing.
+- A check that passed and then failed on an immediate re-run of the same tree is
+  non-deterministic (`WARN21_CHECKS_FLAKY`): do not chase a green run; claim
+  `--tier held` and name the unstable check in the text.
+- An environment fault (`WARN14_ENVIRONMENT_FAULT` — missing binaries, unresolvable
+  modules, broken bindings) is not a code defect and not counted against you: report it
+  to the owner and stop until told otherwise.
+- If a case's checks fail ten times, the driver stops asking: it resets the worktree to
+  the pristine conflict and ships a draft without your resolution. So never ride the
+  counter — the moment you conclude a failure is not yours to fix, claim `--tier held`
+  explicitly. An explicit held claim while checks fail is honored with your resolution
+  kept and published for the owner; the text must say plainly that the checks still
+  fail and name what you could not fix.
 
-For `judged` and `held` cases, `report-pr` requires text you wrote yourself, in
-`pr/body.md` inside the case directory. Its FIRST line is the title as a markdown H1
-(`# ...`); everything below is the body. The driver never writes prose for you, and
-never rewrites yours.
+When you believe a reported failure is not caused by your resolution, re-run
+`report-case` with `--not-my-bug` in addition to your `--tier` — the tier describes
+your edit, the flag describes the driver's test report. The flag is ignored the first
+time the gate reports a failure on the case (before that you had no basis for an
+opinion), and always ignored on gate-fix and reissue cases. You do not decide the
+claim: the driver proves or disproves it by running the same failing checks on the tree
+without your resolution, and the result names the outcome:
 
-Write it from having studied the case — the materials and the worktree are the source.
-Rules that are checked, and rules that are simply right:
+- A failure inside your own conflicted files is yours by definition; the flag never
+  covers it.
+- "These are yours" — the named failures appear only with your resolution. Fix them.
+- Pre-existing, owned by a branch: your merge is aborted, a gate-fix case is prepared
+  on the branch that owns the failure, and your resolution is preserved at
+  `refs/sweep/abandoned/<caseId>`. Run `next-case`. If no case could be prepared, the
+  instruction says exactly what to relay instead.
+- Pre-existing, owned by the merge itself (both sides green alone): your scope is
+  widened to the failing files — fix the failure there and re-run `report-case`.
+- Flaky — the failure did not reproduce on either tree: the case is held with your
+  resolution kept; write the text naming the instability.
+- Undecidable: the comparison could not be made; you are back to the ordinary answer —
+  fix the pending files, or claim `held`.
+- Environment fault: report and stop, as above.
 
-- Say what the change DOES and what would be lost if it were merged blindly. Never
-  describe it by size ("small change", "12 lines").
-- Name which side each surviving behavior came from — ours or theirs — in words a reader
-  who was not here understands.
-- Never write a bare "review needed", "please check" or "see the diff". A held pull
-  request states the exact question the owner must answer, or the exact premise you could
-  not establish.
+## 9. The independent review
+
+Every resolution that passes the checks is judged by an independent reviewer. It sees
+only driver-assembled material — the conflict regions, your resolution diff, the same
+standing records and per-side histories you were given — never your reasoning and never
+your pull-request text. It answers three questions: is each side's behavior preserved,
+or its loss explicitly justified; is every change explained by the conflict, with
+nothing from outside the two sides and their base; does the resolution contradict a
+printed record. Resolve so those three answers are yes, yes, no. For a gate fix the
+questions become: does the change plausibly make the named check pass, and is every
+hunk explained by that failure alone — a gate-fix case is the one place an unrelated
+"improvement" is most tempting and most reliably rejected.
+
+A first rejection returns the reviewer's short feedback: revise the resolution in the
+worktree and run `report-case` again. A second rejection ends the retrying — the case
+is held with your resolution attached; write the pull-request text when the instruction
+asks for it, and do not argue further. If the reviewer tooling could not run
+(`ERR35_COLDREAD_UNAVAILABLE`), nothing was judged: report it and stop; `report-case`
+can be re-run once the tooling is fixed.
+
+A confirmed, in-scope resolution then lands by tier: `mechanical` merges on the spot
+("merged, take next case"); `judged` and `held` ask you for the pull-request text.
+
+## 10. The pull-request text
+
+Whenever a result says "provide PR description", write `pr/body.md` in the case
+directory. Its first line is the title as a markdown H1 (`# <title>`); everything below
+it is the body. Start from `pr/TEMPLATE.md` in the same directory — the driver writes
+that template for this specific case, and it is the only template you may use. Delete
+every comment and every angle-bracket placeholder before you finish. The driver never
+writes this text for you.
+
+Rules for the content:
+
+- The first line of the body states the exact decision the owner must make or the
+  exact thing they must know. Never a bare "review needed" or "see the diff".
+- Say what the change does and what would be lost if it were merged blindly; never
+  describe a change by its size.
+- Name which side each surviving behavior came from — ours or theirs — in words a
+  reader who was not present understands, and name the conflicted files.
 - Reference nothing the reader cannot see from the pull request itself.
-- For a gate fix, say what was broken, what you changed, and — if the checks still
-  fail — say plainly that they still fail.
+- For a held case on an untouched conflict, describe the conflict; do not describe a
+  resolution that does not exist.
+- For a gate fix, say what was broken and what you changed; if the checks still fail,
+  say so plainly. For a held gate fix with no edits, the diagnosis is the body: what
+  fails, why it cannot be fixed in the named files, and where the fix belongs.
+- For a reissue, answer every reviewer point, addressing each reviewer by the @login
+  shown in the dialog.
+- Where your resolution reached outside the pending files, explain the reach.
 
-## 9. What you report to the owner, and when
+Then run `report-pr`. It answers: for `judged`, the driver merges the resolution and
+records the pull-request intent — take the next case; for a judged gate fix, your title
+and body become the commit message, no pull request is created, and the branch's
+descendants reopen to pull the fix through — take the next case; for `held`, the intent
+is recorded and the pull request is created at `finish` — take the next case. If it
+returns `ERR08_TEXT_MISSING`, the body is missing or empty: write it and re-run. The
+advisory warnings `WARN01_TEMPLATE_TEXT` and `WARN02_NO_DECISION_LINE` do not block,
+but they mean the text is failing the rules above — rewrite it.
 
-Silence is what makes a human interrupt you. From the outside, an agent that is working
-and one that has hung look identical.
+## 11. Finishing the pass
 
-- Send one line when you TAKE a case, and one line on every `report-case` and its
-  outcome. Never go more than a few minutes without a line.
-- Relay every candidate branch the driver reports: a clear one comes with a proposed
-  placement to approve, an unclear one with a specific question to answer. The inventory
-  may only gain branches whose inheritance is established, so this is the owner's
-  decision, never yours.
-- Relay anything the driver reports as blocked or gated, so "nothing to serve" is never
-  mistaken for "nothing is wrong".
-- At `finish`, report the result: which branches landed, which are still conflicted,
-  every pull request the pass touched, and the summary counts. If `finish` stopped
-  instead of completing, report that nothing was merged or pushed, and why it stopped.
+Run `finish` when `next-case` answers `finalize`. It verifies the merged whole, then
+publishes everything at once: the judged record pull requests, the branch pushes, and
+the held review pull requests. Its answers:
 
-## 10. When a command refuses
+- `"complete"` — report to the owner every entry in `pullRequests` (number, title,
+  status), which branches landed, and the `stats` summary. Then, if the result says
+  upstream advanced past the pass's pin, run `start` again; otherwise stop — the sweep
+  is done.
+- `"partial"` — some pushes or publishes failed. Report factually: which branches
+  landed, which failed and with what category, and every pull request. Entries under
+  `needsOwner` require the owner to act — do not simply re-run for those. Then re-run
+  `finish`: landed branches skip, transient failures retry.
+- `"gate-fix-required"` — verification was red and gate-fix cases were prepared; run
+  `next-case` and work them.
+- `ERR34_CASES_REMAIN` — cases reopened, usually because a gate fix advanced a branch
+  and its descendants must pull the fix through; this is expected. Run `next-case`,
+  work what it serves, then run `finish` again.
+- A stopped result (the base gated on its own fix, every blamed branch already gated,
+  tests red with nothing to serve) carries an instruction that says exactly what to
+  report. Note that a red `finish` can still have published held pull requests — the
+  result says how many. Report what was actually published; never say the pass
+  published nothing unless the result says so.
 
-A refusal is an answer, not an error to route around. Read the instruction, look up the
-ids, and do exactly what they say. Three shapes recur:
+## 12. When a command refuses
 
-- **Fix and retry** — a check failed, text is missing, the resolution is out of scope, a
-  conflict is still unresolved. Fix the named thing, run the same command again.
-- **Report and stop** — a push failed, a token was rejected, the reviewer tooling could
-  not run, the build is red with no owner, a configuration file will not parse. Report it
-  to the owner with the id and the detail, and stop. Do not retry, do not improvise.
-- **Ask the owner** — an interrupted pass from before, an ambiguity the driver refuses to
-  break by guessing. Present the options exactly as the instruction states them and wait.
+A refusal is an answer, not an error to route around. Read the instruction, look up
+the ids, and do what they say. Three shapes recur: fix the named thing and run the same
+command again; report the id and detail to the owner and stop without retrying or
+improvising; or present a choice to the owner and wait. The one standing choice is the
+open-pass refusal at `start`: continuing keeps the previous pass's merges and published
+pull requests, aborting rolls every touched branch back and discards the local merges
+while pull requests already on origin remain. Present both, with the counts the result
+carries, and never pick.
 
-When you know how to stop a loop cleanly, stop it. Re-reading a file you have already
-read means reading has stopped producing decisions; claim `held`, write the diagnosis you
-already have, and move to the next case. The diagnosis IS the deliverable.
+## 13. What you tell the owner, and when
 
-## 11. Reading and time
+From the outside, an agent that is working and one that has hung look identical, so
+narrate. Send one line when you take a case and one line on every `report-case` and its
+outcome. Announce a long command before you start it and summarize its progress lines
+when it returns. Relay every candidate branch, every gated or blocked branch, and every
+report the driver tells you to make. At the end of the pass, deliver the `finish`
+report of section 11.
 
-Read what the case implicates, once each: the failing or conflicted file, the code it
-exercises, the definitions of the symbols involved. When you have read those and have not
-made an edit, you are done investigating — decide.
+## 14. Reading, and when to stop
+
+Read what the case implicates, once each: the marker windows the materials point at,
+the definitions of the symbols in them, their call sites and tests, and for a failure
+the failing file and the code it exercises. When you have read those and have not made
+an edit, you are done investigating: decide, or claim `held` and write the diagnosis —
+the diagnosis is a deliverable, an unanswered case is not. Re-reading a file you have
+already read means reading has stopped producing decisions; the serve-limit warning on
+a case is the same signal made explicit, and the serve after it is refused.
