@@ -123,9 +123,15 @@ a standing record cited in your materials, and the call-site extension of A3(b)/
 Content from a third branch, or edits outside the allowed files, make the case HELD
 outright.
 
-### 4.2 You must hand it over — always HELD
+### 4.2 The owner decides — HELD. You still do the work.
 
-Any one of these makes the whole case HELD, whatever else is true.
+Any one of these makes the case HELD whatever else is true. HELD says who DECIDES,
+not whether you work: in almost every one of these you should still resolve the
+conflict, claim `held`, and let the owner approve what you produced. A held pull
+request carrying a finished resolution and the question it raises is worth far more
+than an untouched conflict, and handing back work you could have done is a defect.
+Leave the conflict untouched only when you genuinely cannot resolve it — and then say
+which premise you could not establish.
 
 - **F1 — a design conflict with no record.** One side removed or reshaped something the
   other depends on, no replacement is demonstrable and no standing record covers it.
