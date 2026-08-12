@@ -1,6 +1,6 @@
 /**
  * scripts/sweep/steps.ts — step/case JSON artifacts and their FIRST-PRINCIPLES
- * re-verification (PROPAGATION.md §7, D-035/D-038).
+ * re-verification (PROPAGATION.md §7).
  *
  * The driver is the only author of merge parameters, but the merge executor
  * NEVER trusts the file author: for every step it independently recomputes,
@@ -220,9 +220,9 @@ export async function verifyStepFile(repo: string, step: StepFile, ctx: StepVeri
   // carries progress, such a branch must land at least one real merge (a forced
   // empty merge counts). A branch that is BLOCKED — a conflict case pending, a
   // DEFERRED parent, an un-skip aborted because every chain to an entry passes
-  // a merge_status-blocked hop (D-057 'unskip-blocked'), or an un-skip aborted
-  // because a chain hop genuinely conflicts ('unskip-conflict', the 2026-07-23
-  // ERR21 pre-probe) — is not no-op'ing and is exempt (it cannot merge yet).
+  // a merge_status-blocked hop ('unskip-blocked'), or an un-skip aborted
+  // because a chain hop genuinely conflicts ('unskip-conflict', the §6
+  // pre-probe) — is not no-op'ing and is exempt (it cannot merge yet).
   const blocked = step.merges.some(
     (m) =>
       m.action === 'skip' &&

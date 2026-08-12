@@ -1,6 +1,6 @@
 /**
- * scripts/sweep/sweep-machine.ts — the AGENT-FACING sweep CLI (D-053,
- * SWEEP-STATE-MACHINE.md). Five commands, driven by a resumable machine-state
+ * scripts/sweep/sweep-machine.ts — the AGENT-FACING sweep CLI
+ * (SWEEP-STATE-MACHINE.md). Six commands, driven by a resumable machine-state
  * record in the pass dir; the agent passes ZERO identifying params (no --case,
  * no --resolved-ref, no --branch) — the driver holds the watermark, the current
  * case, the phase and the journal.
@@ -10,16 +10,16 @@
  *
  * Commands (do what each RETURNS; never pass ids):
  *   start                         fetch origin/upstream, derive the blocked set from the origin
- *                                 fix/sweep refs (D-058), then open a pass and pin the watermark
+ *                                 fix/sweep refs, then open a pass and pin the watermark
  *                                 (refuses an open pass — finish/abort first). Resolves + persists
- *                                 the inventory + checks-file (D-060); later commands read them from
+ *                                 the inventory + checks-file; later commands read them from
  *                                 state. Optional start-only flags: --inventory <dir> (default
  *                                 ../inventory), --checks-file <path> (default scripts/sweep/checks.json)
  *   next-case                     advance the deterministic machinery; returns {status:"case-ready",…}
  *                                 (worktree/branch/conflictedPaths/materials) or {status:"finalize"}
  *   report-case --tier T          T ∈ mechanical|judged|held — the SINGLE quality gate: checks
  *              [--not-my-bug]     (typecheck THEN tests) then the cold read (mechanical → merge;
- *                                 judged/held → provide PR description). D-060
+ *                                 judged/held → provide PR description).
  *                                 `--not-my-bug` is ADDITIONAL to the tier, never instead of it: the
  *                                 tier classifies your EDIT, the flag classifies the DRIVER'S TEST
  *                                 REPORT. Raise it when a reported failure is not caused by your
@@ -31,14 +31,14 @@
  *                                 FIRST report-case — nothing has been reported to you yet.
  *   report-pr                     PR AUTHORING ONLY — reads pr/body.md (first line is the H1 title,
  *                                 `# <title>`; rest is the body), records PR intent, PUBLISHES NOTHING
- *                                 (every PR is created at finish). No cold read, no tests. D-060
+ *                                 (every PR is created at finish). No cold read, no tests.
  *   finish                        verify (runs checks.test — tests red → STOP, publish nothing) → JUDGED
  *                                 PRs → push targets → urges → HELD PRs → owner report → start-again/done
  *   abort                         discard the open pass cleanly (rolls mutated branches back to pre-ref)
  *
  * Execute is the DEFAULT; --dry-run computes without writing. The substitute
  * GitHub token comes from the environment (GH_TOKEN, fallback GITHUB_TOKEN) at
- * each networked write (D-060) — the agent manages no token file. The cold read
+ * each networked write — the agent manages no token file. The cold read
  * is a real `claude -p` subprocess. All the deterministic internals are the
  * `propagate` driver's — this file only wraps them as the six-command surface.
  */

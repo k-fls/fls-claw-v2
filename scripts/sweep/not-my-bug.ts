@@ -1,15 +1,14 @@
 /**
  * scripts/sweep/not-my-bug.ts — adjudicating `report-case --not-my-bug`.
  *
- * THE DEADLOCK THIS EXISTS FOR (live 2026-08-01, pass 87175bdb89ad). A case
- * resolved `src/cli/resources/groups.ts` cleanly; the checks gate then failed on
- * `container/agent-runner/src/poll-loop.test.ts`, a test the case never touched
- * and the agent was not allowed to edit. The gate's answer to a test failure is
- * "fix the pending files" — impossible when the failure is not in them — and the
- * only other exit was ten more deliberate failures. The agent claimed `--tier
- * held` twice, was refused twice, filed a stop-case and idled for four hours.
+ * THE DEADLOCK THIS EXISTS FOR. A case resolves its conflict cleanly; the
+ * checks gate then fails on a test the case never touched and the agent is not
+ * allowed to edit. The gate's answer to a test failure is "fix the pending
+ * files" — impossible when the failure is not in them — and without this flag
+ * the only other exits are deliberate failures and refused `--tier held`
+ * claims: the agent has no legal move and the case deadlocks.
  *
- * THE SHAPE OF THE FIX (owner, 2026-08-03). The agent gets a flag it can raise
+ * THE SHAPE OF THE FIX. The agent gets a flag it can raise
  * ALONGSIDE its tier — the tier classifies the agent's EDIT, the flag classifies
  * the driver's TEST REPORT, and they are independent axes. The claim is then
  * ADJUDICATED MECHANICALLY here; the agent's belief decides nothing. It cannot:
@@ -36,9 +35,9 @@
  *     cannot have been caused by edits that tree does not contain, so one red
  *     run settles it. The damaging error is the false REFUSE — the baseline
  *     coming back green by luck and shoving the agent back into the deadlock —
- *     so every refusing observation is re-run before it is believed. The 08-01
- *     test has an internal 5000 ms deadline under a 5000 ms runner timeout: it
- *     is a coin flip under load, and a single run decides nothing.
+ *     so every refusing observation is re-run before it is believed. A test
+ *     with an internal deadline equal to its runner timeout is a coin flip
+ *     under load, and a single run decides nothing.
  *  3. UNBUILDABLE IS NOT GREEN. A tree whose dependencies cannot be prepared, or
  *     whose checks failed without naming a single file, is SKIPPED. Reading it as
  *     a pass is how a bisect converges on the commit that touched `package.json`,
@@ -56,13 +55,13 @@
  * ENVIRONMENT-FAULT SIGNATURES. A failure whose diagnostics look like these did
  * not come from the code under test — it came from the tree it was run in.
  *
- * This is the failure MODE the whole mechanism is most dangerous in, and it bit
- * live on 2026-08-03. The adjudication compares two trees that share ONE
- * dependency pool, so a broken pool reproduces identically on both: the verdict
- * is a correct "not caused by your resolution", and the driver then confidently
- * blames a branch, mints a gate-fix case and asks an agent to fix source code
- * for a missing compiled addon. One case named 44 files; the log held 76
- * "Could not locate the bindings file" and NOT ONE assertion failure.
+ * This is the failure MODE the whole mechanism is most dangerous in. The
+ * adjudication compares two trees that share ONE dependency pool, so a broken
+ * pool reproduces identically on both: the verdict is a correct "not caused by
+ * your resolution", and the driver then confidently blames a branch, mints a
+ * gate-fix case and asks an agent to fix source code for something like a
+ * missing compiled addon — dozens of files named, a log full of "Could not
+ * locate the bindings file" and NOT ONE assertion failure.
  *
  * The discriminator is what a diagnostic is ABOUT. Code defects assert and
  * type-error; environments fail to RESOLVE — a binding, a module, a binary. The
@@ -101,15 +100,15 @@ export interface EnvFaultVerdict {
  * NOTHING in the output looks like a genuine test assertion, and it demands that
  * an unresolved module is not one of the repo's OWN files.
  *
- * That third demand replaces a claim this comment used to make and that the
- * pipeline made false: "a real defect that merely happens to mention a missing
- * module (a resolution that deleted an import, say) still asserts somewhere."
- * It does not. Typecheck short-circuits before the tests, so an assertion is
- * impossible in the only output this ever sees, and the named counterexample was
- * classified ENVIRONMENT — halting the sweep to tell the agent not to fix a
- * broken import it had just written.
+ * The third demand is load-bearing. It is tempting to assume that "a real
+ * defect that merely happens to mention a missing module (a resolution that
+ * deleted an import, say) still asserts somewhere." It does not: typecheck
+ * short-circuits before the tests, so an assertion is impossible in the only
+ * output this ever sees, and without the specifier check that counterexample
+ * would be classified ENVIRONMENT — halting the sweep to tell the agent not to
+ * fix a broken import it had just written.
  *
- * The asymmetry is still deliberate — mis-classifying an environment fault as
+ * The asymmetry is deliberate — mis-classifying an environment fault as
  * code produces confident branch-targeted nonsense, while mis-classifying code
  * as environment produces a stop case a human reads.
  */
@@ -119,14 +118,14 @@ export function classifyEnvironmentFault(output: string): EnvFaultVerdict {
   // A genuine assertion anywhere means code is being exercised and failing on
   // its own terms; the resolution error is then incidental, not the story.
   //
-  // `error TS…` USED TO VETO WHOLESALE, and that made this function dead code for
-  // the entire typecheck kind — `checks.typecheck` runs before `checks.test` and
-  // short-circuits, so a typecheck failure was the only thing it could ever be
-  // asked about, and every one of them carries `error TS`. Worse, TS2307 "Cannot
-  // find module" IS a resolution diagnostic: exactly this class. Live 2026-08-04,
-  // a missing `yaml` was read as the agent's code defect. So TS codes are split —
-  // resolution codes are environment evidence, everything else is a real
-  // compile error and vetoes as before.
+  // TS codes are SPLIT, never vetoed wholesale. A wholesale `error TS…` veto
+  // makes this function dead code for the entire typecheck kind —
+  // `checks.typecheck` runs before `checks.test` and short-circuits, so a
+  // typecheck failure is the only thing it can ever be asked about, and every
+  // one of them carries `error TS`. Worse, TS2307 "Cannot find module" IS a
+  // resolution diagnostic: exactly this class — a missing dependency would be
+  // read as the agent's code defect. So resolution codes are environment
+  // evidence, and everything else is a real compile error and vetoes.
   const otherTsError = /error TS(?!2307\b|2688\b|5012\b|6053\b|2318\b)\d+/.test(output);
   const asserts =
     /AssertionError|expected .* (?:to|but)\b|toBe\(|toEqual\(|Expected:.*Received:/is.test(output) || otherTsError;
@@ -138,12 +137,12 @@ export function classifyEnvironmentFault(output: string): EnvFaultVerdict {
   // and short-circuits, so a typecheck failure is the ONLY thing this is ever
   // asked about (the comment above says so) — its output can therefore never
   // contain a test assertion, and a lone TS2307 carries no other TS error to
-  // veto with. So the doc's own counterexample, "a resolution that deleted an
-  // import", was classified ENVIRONMENT and the sweep halted telling the agent
-  // not to fix its own one-line mistake. Verified by calling this directly:
+  // veto with. Without this check, the counterexample above, "a resolution that
+  // deleted an import", would be classified ENVIRONMENT and the sweep would
+  // halt telling the agent not to fix its own one-line mistake:
   //
-  //   Cannot find module './command-gate'  -> ENVIRONMENT   (wrong)
-  //   Cannot find module 'yaml'            -> ENVIRONMENT   (right)
+  //   Cannot find module './command-gate'  -> the agent's defect (repo source)
+  //   Cannot find module 'yaml'            -> ENVIRONMENT (dependency tree)
   //
   // What a diagnostic is ABOUT is the right discriminator; the specifier says
   // which tree it is about. `'./x'` and `'../x'` are repo sources the agent
@@ -197,7 +196,7 @@ export interface History {
   listFirstParent(from: string, to: string): Promise<string[]>;
   /** Does at least one of these paths exist at this commit? (rule 3.) */
   hasAnyFile(sha: string, files: string[]): Promise<boolean>;
-  /** Does `sha` contain `ancestor`? Used to enforce the search FLOOR. */
+  /** Does `sha` contain `ancestor`? Enforces the search FLOOR. */
   contains?(sha: string, ancestor: string): Promise<boolean>;
 }
 
@@ -235,21 +234,19 @@ function mergeCounts(a: Map<string, number>, b: Map<string, number>): Map<string
 /**
  * Did the runner report that ANYTHING passed?
  *
- * This replaces a file-count threshold (`IMPLAUSIBLE_BREADTH = 10`) that could
- * not do the job asked of it. The guard below wants to know "is this a broken
- * toolchain rather than a defect", and breadth is a proxy for that: the 08-03
- * environment fault happened to touch 44 files. But a genuine pre-existing
- * defect fails IDENTICALLY on both trees — the guard's own comment calls that
- * "the NORMAL shape of a confirmed pre-existing defect" — so `hasControl` is
- * false for every one of them, and any real defect touching >= 10 files became
- * `undecidable` by construction, unconfirmable no matter how many probes ran.
- * The observed real defects were 1 and 3 files; the threshold sat at 10 while
- * its comment said "dozens".
+ * This is the right question for the guard below, which wants to know "is this
+ * a broken toolchain rather than a defect". Breadth (a file-count threshold) is
+ * only a proxy for that and cannot do the job: a genuine pre-existing defect
+ * fails IDENTICALLY on both trees — the guard's own comment calls that "the
+ * NORMAL shape of a confirmed pre-existing defect" — so `hasControl` is false
+ * for every one of them, and any real defect touching more files than the
+ * threshold becomes `undecidable` by construction, unconfirmable no matter how
+ * many probes run.
  *
- * What was actually anomalous on 08-03 is what the guard's own message says:
- * "nothing passed on either". A broken toolchain runs nothing; a code defect
- * leaves the rest of the suite green. That is reported by the runner and can be
- * read instead of guessed at.
+ * What actually distinguishes a broken environment is what the guard's own
+ * message says: "nothing passed on either". A broken toolchain runs nothing; a
+ * code defect leaves the rest of the suite green. That is reported by the
+ * runner and can be read instead of guessed at.
  *
  * Returns null when NO count was reported at all (a clean `tsc` prints nothing).
  * Absence of a pass count is not evidence that nothing passed, so the caller
@@ -316,15 +313,15 @@ export async function classifyFailure(
   // Rule 2, confirming half: one red on a tree that does not contain the agent's
   // edits is proof enough. No repetition — repeating it cannot change the answer.
   if (uncovered(resolved, b1.counts).length === 0) {
-    // TOOLCHAIN BACKSTOP (owner, 2026-08-04). "Both sides fail identically" is the
-    // NORMAL shape of a confirmed pre-existing defect — the 08-01 poll-loop case
-    // is exactly one file failing the same way on both trees — so identity alone
-    // proves nothing either way and must not be treated as suspicious.
+    // TOOLCHAIN BACKSTOP. "Both sides fail identically" is the NORMAL shape of
+    // a confirmed pre-existing defect — typically one file failing the same way
+    // on both trees — so identity alone proves nothing either way and must not
+    // be treated as suspicious.
     //
-    // What was anomalous on 2026-08-03 was that NOTHING PASSED: 44 files at
-    // once and not one green test anywhere. A broken toolchain or dependency
-    // tree runs nothing; a code defect, however broad, leaves the rest of the
-    // suite green. So the guard fires on a runner-reported zero WITH no
+    // What IS anomalous is when NOTHING PASSES: many files at once and not one
+    // green test anywhere. A broken toolchain or dependency tree runs nothing;
+    // a code defect, however broad, leaves the rest of the suite green. So the
+    // guard fires on a runner-reported zero WITH no
     // discriminating observation — never on a defect that merely touches many
     // files, and never when the runner reported no counts at all (a clean `tsc`
     // prints nothing, and silence is not evidence).
@@ -558,7 +555,7 @@ export interface BisectOutcome {
    * seen red, whatever the status.
    *
    * This is what an inconclusive search still knows, and it is enough to root a
-   * gate fix (owner, 2026-08-04): rooting at the oldest confirmed-red point puts
+   * gate fix: rooting at the oldest confirmed-red point puts
    * the fix as far down the history as the evidence supports, so branches that
    * share that ancestor can take one fix instead of one each. It is NOT a claim
    * about where the defect was introduced — for an unstable failure it is
@@ -591,20 +588,20 @@ export async function findIntroducingCommit(
    * The same probe with NO file narrowing. A load-dependent failure exists only
    * under whole-suite load, so the narrowed form cannot see it and the
    * determinism gate below rejects it as unstable — which is precisely the class
-   * this search exists for. Live 2026-08-03: `poll-loop.test.ts` (5000 ms
-   * internal deadline under a 5000 ms runner timeout) passed twice narrowed at
-   * the tip, and a real, reproducible failure was written off as a coin flip.
-   * Only the FAILED command re-runs, so the fallback costs seconds per probe.
+   * this search exists for. A test whose internal deadline sits at its runner
+   * timeout can pass twice narrowed at the tip while failing reliably whole —
+   * a real, reproducible failure written off as a coin flip. Only the FAILED
+   * command re-runs, so the fallback costs seconds per probe.
    */
   fullProbe?: SubsetProbe,
   /**
-   * The OLDEST commit the search may consider — the current trunk head (owner,
-   * 2026-08-04). Below this line history is shared and already integrated, so a
-   * fix rooted there drags every intervening divergence with it: live, a bisect
-   * named a commit 299 behind the branch tip, and the case worktree became a
-   * three-week-old tree whose suite was red in a second, unrelated file nobody
-   * had fixed yet. The agent could not win — one test in scope, a whole
-   * pre-history demanded green.
+   * The OLDEST commit the search may consider — the current trunk head. Below
+   * this line history is shared and already integrated, so a fix rooted there
+   * drags every intervening divergence with it: a bisect can name a commit
+   * hundreds behind the branch tip, and the case worktree becomes a weeks-old
+   * tree whose suite is red in a second, unrelated file nobody has fixed yet.
+   * The agent cannot win there — one test in scope, a whole pre-history
+   * demanded green.
    *
    * Bounding the SEARCH rather than clamping its answer afterwards is the honest
    * version: it never spends probes on commits whose answer we would refuse, and
@@ -668,8 +665,8 @@ export async function findIntroducingCommit(
   // ABSENCE OF THE FILE IS A GREEN BOUNDARY, not a skip. A commit that predates
   // the failing file cannot be failing in it — that is a stronger statement than
   // any test run, and it is the COMMON history ("someone added a failing test").
-  // Skipping those instead, as the first cut did, left every ancestor of such an
-  // addition unprobed and reported `no-anchor` for a commit the search can name
+  // Skipping those instead would leave every ancestor of such an addition
+  // unprobed and report `no-anchor` for a commit the search can name
   // exactly. What must never be read as green is a tree that HAS the file and
   // could not be built — that one is skipped below.
   let anchor: string | null = null;
@@ -750,9 +747,9 @@ export async function findIntroducingCommit(
     // Candidates stop at `hi - 1`: `commits[hi]` is ALREADY KNOWN RED (the tip,
     // or whatever the last red probe set it to), so probing it again learns
     // nothing and re-assigns `hi = hi`. With `hi` in the candidate list, a run of
-    // unbuildable commits below it made every iteration pick `hi`, leave the
-    // window unchanged, and spin until the probe budget ran out — reported as
-    // `inconclusive` for a history the search could actually resolve.
+    // unbuildable commits below it would make every iteration pick `hi`, leave
+    // the window unchanged, and spin until the probe budget ran out — reported
+    // as `inconclusive` for a history the search can actually resolve.
     let mid = (lo + hi) >> 1;
     let r: ProbeResult | null = null;
     let exhausted = false;

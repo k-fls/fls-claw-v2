@@ -5,19 +5,17 @@
  *   pnpm exec tsx scripts/sweep/sweep.ts validate-registry [--repo <path>] [--inventory <dir>] [--out <file>]
  *
  * ONE subcommand:
- *   validate-registry  6-rule inventory validator vs --inventory (exit 1 on ALERTs)
+ *   validate-registry  5-rule inventory validator vs --inventory (exit 1 on ALERTs)
  *
  * Flags:
  *   --repo <path>       repo to validate against  (default: cwd)
- *   --inventory <dir>   inventory to validate     (default: latest bootstrap snapshot)
+ *   --inventory <dir>   inventory to validate     (default: scripts/sweep/inventory)
  *   --out <file>        write the JSON result to a file instead of stdout
  *
- * This is all that remains of the M0 sweep pipeline
- * (`fetch|ff-main|scan|stop-points|merge|verify|record|status|route|replay|seed-rerere`,
- * removed 2026-07-30 — nothing on the agent's doctrined surface reached it, and the
- * propagation driver does its own merging/verifying/publishing). `validate-registry`
- * survives because it IS reached: it is step 3 of the `fork-registry-generate` skill,
- * which doctrine tells the maintainer to run whenever an inventory entry is added or
+ * The propagation driver (sweep-machine.ts, the six-command state machine)
+ * owns all merging/verifying/publishing; this CLI is the inventory validator
+ * only. It exists for the `fork-registry-generate` skill, which runs
+ * `validate-registry` as its step 3 whenever an inventory entry is added or
  * regenerated. Read-only — it never mutates anything.
  */
 import { writeFileSync } from 'node:fs';

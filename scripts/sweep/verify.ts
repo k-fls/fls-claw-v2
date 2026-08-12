@@ -2,11 +2,12 @@
  * scripts/sweep/verify.ts — everything-rebuild + test-matrix runner.
  *
  * Rebuilds the throwaway integration target from the recipe (ordered branch
- * list) in a TEMPORARY worktree: seed the recorded rerere cache (D-051), reset
+ * list) in a TEMPORARY worktree: seed the recorded rerere cache (PROPAGATION.md
+ * §9), reset
  * --hard to the base ref, then sequential merges with rerere. Then runs the CI
  * command list (injectable — fixture tests use `true`/`false` stubs instead of
  * the real matrix). The recipe + base are the caller's (cmdVerify passes THIS
- * PASS'S publishable set, DAG-ordered, on the fork-trunk base per D-051; the
+ * PASS'S publishable set, DAG-ordered, on the fork-trunk base; the
  * static sweep-scope.yaml `recipe` is only a planless fallback). On failure,
  * attributes the breakage by re-building with one
  * recipe branch removed at a time (reverse recipe order); the offender is
@@ -88,9 +89,7 @@ export interface VerifyResult {
    * the one whose removal turns the matrix green the offender. Under a flaky
    * test that logic blames whichever branch happened to be out when the test
    * passed — an innocent branch rolled back and a gate fix minted against a
-   * defect that is not there. Live 2026-08-05: three consecutive passes, three
-   * DIFFERENT branches blamed, every one "no clean attribution"; the agent
-   * spotted the pattern before the driver had any way to express it.
+   * defect that is not there, with a DIFFERENT branch blamed on every rerun.
    */
   nonDeterministic?: boolean;
   /** Which commands disagreed between the two identical runs. */
@@ -101,11 +100,8 @@ export interface VerifyResult {
    * Then no branch caused it and none may be rolled back. Leave-one-out cannot
    * see this: removing a branch never fixes a defect that is already in the
    * base, so attribution either blames whoever happens to flip the matrix or
-   * reports "no clean attribution" — and the pass peels one branch per run
-   * before it ever reaches the real cause. Live 2026-08-05:
-   * module/credentials -> feat/ssh-auth -> module/runtime-updater -> (none),
-   * four finish runs and three frozen branches to arrive at a `main_patched`
-   * defect that was reproducible on the base from the first second.
+   * reports "no clean attribution" — and the pass peels one innocent branch
+   * per run before it ever reaches the real cause.
    */
   baseRed?: boolean;
   /** The base-alone failure output, for blame + the gate-fix case materials. */
@@ -126,9 +122,7 @@ export interface VerifyResult {
    *
    * The file lists above are not enough on their own — both come back empty
    * when the runner's output names no file the parser recognises, and an empty
-   * pair reads identically whether the base was clean or red-but-unparseable
-   * (live 2026-08-05, exactly the question that could not be answered about the
-   * module/credentials rollback).
+   * pair reads identically whether the base was clean or red-but-unparseable.
    */
   baseGreen?: boolean;
   /** Commands that failed on the base alone (empty when the base was green). */
@@ -142,7 +136,7 @@ export interface VerifyOptions {
   /** Attribution rebuild attempts cap (default: recipe length). */
   maxAttribution?: number;
   /**
-   * Workspace rr-cache directory (D-051): installed into `.git/rr-cache` BEFORE
+   * Workspace rr-cache directory (PROPAGATION.md §9): installed into `.git/rr-cache` BEFORE
    * the recipe build so the rebuild replays the sweep's RECORDED resolutions
    * (the same install the driver's own merges do), not merely whatever preimages
    * happen to already live in the shared cache. Null/omitted → no seeding (fixtures).
@@ -152,18 +146,15 @@ export interface VerifyOptions {
    * Prepare the freshly-created temp worktree before anything is built in it.
    *
    * A `git worktree add` checkout holds TRACKED FILES ONLY — `node_modules` is
-   * gitignored, so it is absent. The case and gate-fix worktrees have always had
-   * dependencies put in; THIS worktree never did, so `finish`'s verify ran `tsc`
-   * with no `@types/node` and no `vitest` and could not compile on ANY pass. Its
-   * output was a wall of "Cannot find name 'process'" / "Cannot find module
-   * 'vitest'" — which blame then attributed to whichever source files those
-   * lines named, minting gate-fix cases for a defect that was never in the code
-   * (live 2026-07-31: pnpm said it outright — "Local package.json exists, but
-   * node_modules missing").
+   * gitignored, so it is absent. Run `tsc` there without preparation and it has
+   * no `@types/node` and no `vitest` and cannot compile on ANY pass: the
+   * output is a wall of "Cannot find name 'process'" / "Cannot find module
+   * 'vitest'" — which blame then attributes to whichever source files those
+   * lines name, minting gate-fix cases for a defect that was never in the code.
    *
    * This worktree is base + every publishable branch MERGED, so its manifests
    * are the merged ones and only they can describe what it needs — the driver
-   * installs from them (`installDeps`, 2026-08-04).
+   * installs from them (`installDeps`).
    *
    * Injected rather than imported: the installer lives in propagate.ts, which
    * imports THIS module. Omitted → no preparation (fixtures, whose stub commands
@@ -242,7 +233,7 @@ async function buildAndTest(
 export async function verifyEverything(repo: string, opts: VerifyOptions): Promise<VerifyResult> {
   const baseRef = opts.baseRef ?? 'main';
   const commands = opts.commands ?? VERIFY_COMMANDS;
-  // D-051 defense in depth: seed the shared rerere cache (common git dir, so the
+  // Defense in depth (PROPAGATION.md §9): seed the shared rerere cache (common git dir, so the
   // temp worktree's merges see it) with the sweep's recorded resolutions before
   // the rebuild — otherwise a would-be conflict that WAS resolved this pass
   // could reappear in the recipe build and mis-attribute a false offender.

@@ -4,7 +4,7 @@ Scripted core of the FLSclaw self-maintenance pipeline. Deterministic,
 idempotent, resumable; the agentic layer runs the commands and resolves the
 conflicts they hand it, and never does raw git surgery the scripts can do.
 
-The ONLY command surface is the six-command D-053 state machine:
+The ONLY command surface is the sweep state machine:
 
 ```
 pnpm exec tsx scripts/sweep/sweep-machine.ts <start|next-case|report-case|report-pr|finish|abort> [flags]
@@ -14,36 +14,36 @@ pnpm exec tsx scripts/sweep/sweep-machine.ts <start|next-case|report-case|report
 — spec: `SWEEP-STATE-MACHINE.md` (AUTHORITY on the interface), mechanics:
 `PROPAGATION.md`, tier/merge/publication semantics: `MERGE-POLICY.md`. The
 deterministic stages (plan, run, verify, publish, push, report) are the driver's
-INTERNALS with no standalone entry point; the old `sweep.ts` pipeline
-(`fetch|ff-main|scan|stop-points|merge|verify|record|status|route|replay|seed-rerere`)
-and the flag-based `propagate resolve|unfreeze|status` are retired
-(2026-07-30) — nothing on the agent's doctrined surface reached them.
+INTERNALS with no standalone entry point.
 
-One inventory tool survives beside the machine, because the
+One inventory tool sits beside the machine, because the
 `fork-registry-generate` skill's step 3 invokes it:
 
 ```
 pnpm exec tsx scripts/sweep/sweep.ts validate-registry --repo <repo> --inventory <dir>
 ```
 
-6-rule inventory validator (`validate.ts`); read-only, exit 1 on ALERTs, and
-ALERTed entries fail closed in routing.
+5-rule inventory validator (`validate.ts`); read-only, exit 1 on ALERTs, and
+ALERTed entries fail closed in routing. Entries without a `branch`
+(planned/observational config) skip rules 1-4.
 
-## Layout & data model (post-2026-07-10 restructure)
+## Layout & data model
 
-The registry branch is DISSOLVED (owner decision): everything durable lives
-here with the code; live state is derived or group-owned.
+Everything durable lives here with the code; live state is derived or
+group-owned. There is no state branch.
 
 ```
 scripts/sweep/
   *.ts                       toolkit + colocated *.test.ts
-  README.md  DESIGN.md       this file; pipeline spec + deviations (§10)
-  SWEEP-STATE-MACHINE.md     the agent-facing command surface (D-053)
+  README.md  DESIGN.md       this file; the pipeline design spec
+  SWEEP-STATE-MACHINE.md     the agent-facing command surface
   PROPAGATION.md             the propagation driver's specification
   MERGE-POLICY.md            tier ladder + merge/publication policy
-  sweep.ts                   the surviving inventory validator CLI (validate-registry)
+  sweep.ts                   the inventory validator CLI (validate-registry)
   checks.json                host+runner typecheck/test command lists (the checks gate)
   cut-point-exceptions.yaml  owner-approved cut-point exceptions (blame input)
+  inventory/
+    <id>.yaml                THE inventory: one strict-config entry per fork feature
   registry/
     schema/feature-entry.schema.json
     routing.yaml             global driver levers (scope_guard_mode, stack_cap)
@@ -52,48 +52,53 @@ scripts/sweep/
   test-cases/
     propagation/cases/*.yaml propagation cases (propagation-cases.test.ts)
     fixtures/                dated recon snapshots
-  bootstrap/
-    fork-registry@<hash12>/  stamped verbatim inventory snapshot + MANIFEST.md
-      features/*.yaml        default --inventory (27 entries @ ca693b0e)
 .claude/skills/fork-registry-generate/
   SKILL.md  seeds.yaml       inventory (re)generation; judgment seeds live HERE
 ```
 
-- **Inventory** (`--inventory <dir>`, default = latest bootstrap snapshot):
-  one YAML entry per fork feature. Regenerate into a group workspace with the
-  `fork-registry-generate` skill; mechanical fields derive fresh from git,
-  judgment fields merge from `seeds.yaml`.
+- **Inventory** (`scripts/sweep/inventory/*.yaml`): strict config tracked in
+  the fork repo, one YAML entry per fork feature, loaded by default from the
+  clone; `--inventory` exists for tests/fixtures. Required fields
+  `id`/`name`/`kind`; `branch` is optional — an entry with a `branch` is
+  swept, one without is planned/observational. Legal fields include
+  `tier_floor` (`judged`), `always_merge`, `scope_guard`, `stack_cap`, and
+  `prompt.extra_context` (owner-authored STANDING guidance, embedded
+  path-matched into case materials — never a decision store). Unknown keys are
+  entry errors, and `sweep start` refuses on any entry error
+  (ERR46_INVENTORY_INVALID). Regeneration is the `fork-registry-generate`
+  skill: mechanical fields derive fresh from git, judgment fields merge from
+  `seeds.yaml`.
 - **Derived state:** `lastMergedUpstream` is never stored — it is
   `git merge-base <branch> upstream/main`. Blockedness (`merge_status`) is
-  derived from the origin `fix/sweep/*` refs at `start` plus the pass journal
-  (D-058). There is NO durable local state file: a `sweep-ledger.json` existed
-  until 2026-08-04 and was deleted after a 12-day-old copy was read back by a
-  fresh session and reported as the current sweep state while an open pass sat
-  beside it. Anything about origin is re-read from origin.
+  derived from the origin `fix/sweep/*` refs at `start` plus the pass journal.
+  There is NO durable local state file: everything a pass produces lives in
+  the pass dir, and anything about origin is re-read from origin. `start`
+  refuses on sweep residue it would otherwise be tempted to read
+  (ERR47_SWEEP_RESIDUE: `refs/sweep/*` refs, workspace `inventory/` or
+  `inventory-candidates/` dirs, stray `sweep-*.json(l)` files).
 - **Group-owned state** (`--workspace <dir>`, default = the parent of
   `--repo`): `propagation/pass-<wm12>/` (plan + step + case files,
   `journal.jsonl`, machine state) and `rr-cache/` (shared rerere resolutions,
-  local/ephemeral). The workspace MUST be outside any git work tree (D-055).
+  local/ephemeral). The workspace MUST NOT be the `--repo` clone or a
+  subdirectory of it (ERR37_WORKSPACE_IN_CLONE); a group root inside an outer
+  git work tree is fine.
 
 ## Bootstrapping a group workspace
 
 From a clone where `origin` = k-fls/fls-claw-v2 and `upstream` =
 nanocoai/nanoclaw (never a human's checkout with WIP). The group root — the
 PARENT of the clone — is the workspace: `propagation/` and `rr-cache/` live
-there, never inside the clone. Inventory: either take the
-default bootstrap snapshot or regenerate a live inventory into the group root
-with the `fork-registry-generate` skill and pass `--inventory <dir>`. Then run
-the loop in `SWEEP-STATE-MACHINE.md`; the clone and the inventory persist
-across sessions.
+there, never inside the clone. The inventory ships in the clone at
+`scripts/sweep/inventory/`. Then run the loop in `SWEEP-STATE-MACHINE.md`;
+the clone persists across sessions.
 
 Registry-schema notes (verified against the live authored content):
 
-- `routing.yaml` carries the two live driver levers `scope_guard_mode` (§7) and
-  `stack_cap` (D-049 §2); the retired matcher's tuning (`weights`, `threshold`,
-  `top_k`, `large_new_file_kb`, `sensitive_surfaces`, `catch_all`) is gone.
-  `key_symbols` may list several symbols per anchor (`"SymA / SymB — path"`).
+- `routing.yaml` carries the two live driver levers `scope_guard_mode` (§7)
+  and `stack_cap` (the case-stacking cap). `key_symbols` may list several
+  symbols per anchor (`"SymA / SymB — path"`).
 
-**Execute is the DEFAULT** on the agent surface (D-060); `--dry-run` opts into
+**Execute is the DEFAULT** on the agent surface; `--dry-run` opts into
 computing without writing.
 
 ## Safety model
@@ -110,39 +115,37 @@ computing without writing.
   workspace (pass dir, rr-cache); the toolkit never commits to any branch
   except the merges a pass performs.
 - **The driver pushes, verify-gated** — refs move via `git push` only, after a
-  green `verify`, and any push failure is journaled and reported to the owner
-  (D-046 case 2), never worked around.
+  green `verify`, and any push failure is journaled and reported to the owner,
+  never worked around.
 - **Conflict detection is new-style `git merge-tree --write-tree`** (full
   ort, virtual multi-base). Never `--merge-base=<x>` single-base previews —
-  they produce bogus conflicts on branches with two merge bases (verified
-  2026-07-01, mitm <-> onecli-broker), and never cherry-pick fallbacks.
+  they produce bogus conflicts on branches with two merge bases — and never
+  cherry-pick fallbacks.
 - **Checked-out branches** are merged in their own worktree only when its
   status is clean; non-checked-out branches merge via plumbing or a temp
   worktree, so no human checkout is ever touched.
 - **Tests never mutate real branches** — all mutating stages are exercised
   against throwaway fixture repos in `os.tmpdir()` (`fixtures.ts`).
 
-Scope (owner rule 2026-07-14, D-033): the swept set is main_patched
-(structural) + inventory entries' branches + non-inventory branches in the
-TRANSITIVE edition composition — tip-ancestor of an `edition/*` branch OR
-ever merged (fork-era merge-edge closure, transitively) into any branch
-whose merge history reaches an edition (merge source `main` ONLY —
-upstream-PR candidates never absorb main_patched/fork content; flagged "add
-an inventory entry"). Every other non-inventory branch is IGNORED — one
-digest drift line at most. Explicit + namespace exclusions apply first. Merge sources: `main` ff-only, `main_patched` merges main;
-every inventory branch merges its DAG parents — conflicts resolve once at
-the topmost affected branch, descendants inherit via parent merges.
-"Registry entry (seed + regenerate) is step 3 of every new feature branch" —
-see the `fork-registry-generate` skill.
+Scope: the swept set is main_patched (structural) + inventory entries'
+branches + non-inventory branches in the TRANSITIVE edition composition —
+tip-ancestor of an `edition/*` branch OR ever merged (fork-era merge-edge
+closure, transitively) into any branch whose merge history reaches an edition
+(merge source `main` ONLY — upstream-PR candidates never absorb
+main_patched/fork content; flagged "add an inventory entry"). Every other
+non-inventory branch is IGNORED — one digest drift line at most. Explicit +
+namespace exclusions apply first. Merge sources: `main` ff-only,
+`main_patched` merges main; every inventory branch merges its DAG parents —
+conflicts resolve once at the topmost affected branch, descendants inherit
+via parent merges. "Registry entry (seed + regenerate) is step 3 of every new
+feature branch" — see the `fork-registry-generate` skill.
 
 ## References
 
 - `scripts/sweep/SWEEP-STATE-MACHINE.md` — the agent-facing command surface.
 - `scripts/sweep/PROPAGATION.md` — the propagation driver's specification.
 - `scripts/sweep/MERGE-POLICY.md` — the authoritative tier ladder.
-- `scripts/sweep/DESIGN.md` — the original pipeline spec, committed verbatim,
-  plus documented implementation deviations (§10, incl. the 2026-07-10
-  registry-branch dissolution). §5-6 and §8 are historical record.
+- `scripts/sweep/DESIGN.md` — the pipeline design spec.
 - `docs/design/02-self-maintaining-flsclaw.md` §5 — component mapping.
 - `.claude/skills/fork-registry-generate/` — inventory regeneration + the
   canonical judgment seeds.

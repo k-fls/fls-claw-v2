@@ -4,7 +4,7 @@ beyond the pointers given here plus targeted `git show`/`git diff`/`git log`
 (read-only; never checkout/merge/fetch).
 
 ## The fork feature you are responsible for
-- id: {{feature.id}} | name: {{feature.name}} | status: {{feature.status}}
+- id: {{feature.id}} | name: {{feature.name}} | kind: {{feature.kind}}
 - owning branch: {{feature.branch}} (parents: {{feature.parents}}; dependents: {{feature.dependents}})
 - summary: {{feature.summary}}
 - owned paths (canonical home = owning branch): {{feature.owned_paths}}
@@ -15,7 +15,7 @@ beyond the pointers given here plus targeted `git show`/`git diff`/`git log`
 - design docs (read via `git show <branch>:<path>` if you need depth): {{feature.design_docs}}
 - test anchors (proof the feature works): {{feature.test_anchors}}
 - what upstream work would count as duplicating this feature: {{feature.overlap_hints}}
-- feature-specific notes: {{feature.extra_context}}
+- owner standing guidance for this feature: {{feature.extra_context}}
 
 ## The upstream change set
 - repo: {{upstream_remote}} | commit range: {{upstream_range}}

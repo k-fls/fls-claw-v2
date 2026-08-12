@@ -1,7 +1,7 @@
 # Sweep scope configuration — POLICY, not state (exclusions are config;
 # blocked state is origin-derived; the driver keeps no durable local state).
 #
-# Scope rule (owner directive 2026-07-14): the sweep covers
+# Scope rule (owner directive): the sweep covers
 #   - main_patched (structural: the only upstream entry point besides main's ff),
 #   - every branch owned by a sweepable inventory entry (merge source = its
 #     DAG parents, parents-before-children; NEVER upstream/main directly),
@@ -22,14 +22,14 @@ exclude:
 # extra_edges: child -> parents DAG edges not expressible in the inventory.
 extra_edges: {}
 
-# recipe: PLANLESS FALLBACK ONLY (D-051). `propagate verify` now derives the
+# recipe: PLANLESS FALLBACK ONLY. `propagate verify` derives the
 # verify recipe from THIS PASS'S publishable result — the branches that advanced
 # this pass, in the plan's DAG order, minus held/frozen/open-case branches — and
 # rebuilds them on the fork-trunk base (main_patched). This static list is used
 # only when there is no pass plan on disk (e.g. a manual `sweep verify` with no
 # propagation pass), and is NOT the everything-integration order: it starts with
 # a module branch that is frozen most passes, so using it as the primary recipe
-# recreated historical stack conflicts and wedged the gate (the D-051 bug).
+# would recreate historical stack conflicts and wedge the gate.
 recipe:
   - module/runtime-updater
   - feat/mitm-credential-proxy

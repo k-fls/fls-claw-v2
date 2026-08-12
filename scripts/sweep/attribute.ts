@@ -1,44 +1,31 @@
 /**
- * scripts/sweep/attribute.ts — D-061 (B): blame a failing build on a BRANCH.
+ * scripts/sweep/attribute.ts — blame a failing build on a BRANCH.
  *
  * `finish`'s verify can go red with no clean attribution: the offender is not a
  * branch the pass mutated, so the driver halts and asks a human to go fix
- * something (live 2026-07-28 — verify accused `feat/mitm-credential-proxy`
- * while the defect was in `src/command-gate.ts`). To turn that halt into a
+ * something. To turn that halt into a
  * fixable case, the driver first has to know WHICH BRANCH the fix belongs on.
  *
- * GIT HISTORY IS THE EVIDENCE — NOT THE REGISTRY (owner-approved 2026-07-28).
- * -------------------------------------------------------------------------
- * Blame used to match the failing paths against the registry's `owned_paths` /
- * `touch_paths`. On the LIVE registry that answer is simply wrong. For the real
- * failure (`src/command-gate.ts`) FOUR entries declare the file in their paths —
- * `module/command-gate`, `feat/ops-registry`, `module/agent-group-contributions`,
- * `edition/fls-ai-bot` — and NOT ONE of them has ever modified it; meanwhile the
- * branch that carries the defect is NOT one of them. Declarations are
+ * GIT HISTORY IS THE EVIDENCE — NOT THE REGISTRY.
+ * ----------------------------------------------
+ * Matching the failing paths against the registry's `owned_paths` /
+ * `touch_paths` gives wrong answers: several entries can declare a failing file
+ * in their paths without one of them ever having modified it, while the branch
+ * that actually carries the defect declares nothing. Declarations are
  * aspirational — they say where a feature INTENDS to live. Git history says who
  * actually wrote the line that broke. Blame uses history.
  *
- * AUTHORSHIP IS THE FIRST-PARENT LINE — NOT A SET DIFFERENCE (2026-07-28, round
- * two). The first history rule counted a branch's own work as
+ * AUTHORSHIP IS THE FIRST-PARENT LINE — NOT A SET DIFFERENCE. A set-difference
+ * count of a branch's own work, such as
  *
  *     git rev-list --count <branch> ^<inventory parents> -- <file>
  *
- * A set difference CANNOT identify authorship once work has propagated: the
+ * CANNOT identify authorship once work has propagated: the
  * moment a commit is merged up or down, it enters the other set and the answer
- * inverts. Measured on the live fork for `src/command-gate.ts`:
- *
- *     rule                          main_patched   module/command-gate
- *     ^parents (what shipped)            6                 0
- *     ^main ^all-other-branches          2                 0
- *     --first-parent                     3                 3
- *     --first-parent --no-merges         0                 3   <- correct
- *
- * The trunk's six "own" commits were two merges — one of them a propagation
- * merge the sweep itself had just made — plus three edits AUTHORED on
- * `module/command-gate` and absorbed by the trunk. Meanwhile the branch that
- * actually wrote the file scored 0, because `^main_patched` subtracted its own
- * work back out of it the instant the trunk absorbed it. Blame therefore reads
- * authorship off the first-parent chain:
+ * inverts. The receiving trunk scores for merges and for edits it merely
+ * absorbed, while the branch that actually wrote the file scores 0, because the
+ * exclusion subtracts its own work back out the instant the trunk absorbs it.
+ * Blame therefore reads authorship off the first-parent chain:
  *
  *     authored(branch, file) =
  *       git rev-list --count --first-parent --no-merges <branch> ^main -- <file>
@@ -47,28 +34,25 @@
  * donated branch as second, so `--first-parent` walks a branch's OWN authoring
  * line and steps straight over everything it absorbed; `--no-merges` then drops
  * the integration commits themselves, which are not edits to the file — they are
- * the act of accepting someone else's edit. `3d5dde16` ("parse slash commands
- * from the bot-mention boundary", authored on `module/command-gate`, absorbed by
- * the trunk) is reachable from `main_patched` but is NOT on its first-parent
- * line: exactly the distinction the set difference could not draw.
+ * the act of accepting someone else's edit. A commit authored on a module
+ * branch and absorbed by the trunk is reachable from the trunk but is NOT on
+ * its first-parent line: exactly the distinction the set difference cannot
+ * draw.
  *
  * The exclusion is `^main` for EVERY branch, the trunk included. `main` is
  * upstream — never ours to fix — and it is the only floor that does not move as
- * work propagates. Inventory `parents` take no part in blame any more; they stay
- * what they always were, the input to hierarchy DEPTH (hierarchy.ts), which is
+ * work propagates. Inventory `parents` take no part in blame; they are the
+ * input to hierarchy DEPTH (hierarchy.ts), which is
  * what decides WHICH candidate wins.
  *
  * A branch CUT from another (rather than merged from it) carries that branch's
  * commits on its own first-parent line, so it can appear as a candidate for work
  * it inherited. Normally harmless — the true author is then an ANCESTOR, hence
  * shallower, and the OWNER RULE below picks it. It stops being harmless when the
- * inventory's `parents` DISAGREE with git: censused over the 710 real `.ts` paths
- * of the live fork, 59 refuse as a depth tie, every one of them a branch cut off
- * another that its entry does not declare as a parent — `module/runtime-updater`
- * was cut from `module/credentials`, `module/host-rpc` and
- * `module/interactions-helpers` from `module/container-bootstrap`, yet all of
- * them are declared as SIBLINGS off a common parent and therefore land at the
- * same depth. That refusal is the correct outcome and a useful signal: the fix
+ * inventory's `parents` DISAGREE with git: a branch cut off another that its
+ * entry does not declare as a parent can be declared a SIBLING of its true
+ * author off a common parent, land at the same depth, and refuse as a depth
+ * tie. That refusal is the correct outcome and a useful signal: the fix
  * is to add the missing edge to the inventory, not to break the tie by spelling
  * here.
  *
@@ -80,8 +64,8 @@
  * trunk itself, and the trunk is the only place a fix reaches everyone. A TIE at
  * the shallowest depth is REFUSED, never broken by spelling.
  *
- * `owned_paths`/`touch_paths` are untouched elsewhere (routing.ts, validate.ts
- * still score and validate with them) — they simply no longer decide blame.
+ * `owned_paths`/`touch_paths` keep their other roles (routing.ts, validate.ts
+ * score and validate with them) — they simply do not decide blame.
  */
 import { git } from './git.js';
 import {
@@ -106,11 +90,11 @@ const VITEST_FAIL = /^\s*FAIL\s+([\w./@-]+\.[cm]?tsx?)/;
  * never repeated on the failure line. Parsing it needs the two together, which
  * is why this runner is stateful where the others are line-local.
  *
- * Without it a bun failure named NO file at all: `parseFailingFiles` returned
- * empty, so blame fell through to the trunk, `rootChecksOutput` re-rooted
- * nothing, and the not-my-bug comparison had no identity to compare. Live
- * 2026-08-01 that was the ENTIRE failure — `container/agent-runner`'s suite is
- * bun, and the one failing test was invisible to every reader in this file.
+ * Without it a bun failure names NO file at all: `parseFailingFiles` returns
+ * empty, blame falls through to the trunk, `rootChecksOutput` re-roots
+ * nothing, and the not-my-bug comparison has no identity to compare —
+ * `container/agent-runner`'s suite is bun, so its failing tests would be
+ * invisible to every reader in this file.
  */
 const BUN_FILE_HEADER = /^([\w./@-]+\.[cm]?tsx?):\s*$/;
 const BUN_FAIL = /^\((?:fail|error)\)\s/;
@@ -183,10 +167,10 @@ export interface BranchCandidate {
 
 /**
  * Resolve a branch NAME to something git can read: the local ref, else the
- * remote-tracking one (D-045 §13 — an inventory branch may legitimately exist
- * only as `origin/<branch>`). Null when neither exists, which is not an error:
- * a planned entry simply has no history to blame. Cached — the same 27 branches
- * are resolved once per failing file otherwise.
+ * remote-tracking one (PROPAGATION.md §13 — an inventory branch may legitimately
+ * exist only as `origin/<branch>`). Null when neither exists, which is not an
+ * error: a planned entry simply has no history to blame. Cached — the same
+ * branches would otherwise be re-resolved once per failing file.
  */
 async function resolveRef(repo: string, branch: string, cache: Map<string, string | null>): Promise<string | null> {
   const hit = cache.get(branch);
@@ -210,16 +194,13 @@ async function resolveRef(repo: string, branch: string, cache: Map<string, strin
  * merges dropped. A propagation merge puts the RECEIVING branch first and the
  * donated branch second, so `--first-parent` never walks into absorbed work, and
  * `--no-merges` removes the integration commits — accepting an edit is not
- * making one. Live check: `main_patched` scores 6 with a plain `^main` set
- * difference over `src/command-gate.ts` and 0 here, while the branch that wrote
- * the file, `module/command-gate`, scores 0 with the set difference and 3 here.
+ * making one.
  *
  * `exclude` — OWNER-APPROVED DUPLICATE CUT-POINT EXCEPTIONS (cut-points.ts).
  * A rebase COPY of another branch's commit sits on the copying branch's own
  * first-parent line, so this count credits it as that branch's work and no
- * exclusion of the ORIGINAL's branch can remove it: `3b8c5896` (patch-id
- * 25c7b6481c3a) is a copy of `dc3cb7f6` on `module/host-rpc`, and it is on
- * `module/credentials`' first-parent line, so `^module/host-rpc` does nothing.
+ * exclusion of the ORIGINAL's branch can remove it — the copy is a different
+ * sha, so `^<original-branch>` does nothing.
  * The exception is re-verified against the repo before it reaches here (both
  * patch-ids recomputed), so a listed sha is a MEASURED copy, not a claim. With
  * an exclusion the count must be listed and filtered rather than counted by
@@ -278,9 +259,9 @@ export async function blameCandidates(
   const order = byHierarchy(hier);
   const refs = new Map<string, string | null>();
   const byFile = new Map<string, BranchCandidate[]>(files.map((f) => [f, []]));
-  // ONE exclusion for every branch, resolved once: upstream. It replaces the
-  // per-branch `^parents` set, which inverted the answer the moment work
-  // propagated (see the header — the trunk scored 6 for a file it never wrote).
+  // ONE exclusion for every branch, resolved once: upstream. A per-branch
+  // `^parents` set would invert the answer the moment work propagated (see the
+  // header — the trunk would score for edits it merely absorbed).
   const rootRef = await resolveRef(repo, ROOT_BRANCH, refs);
   if (!rootRef) return byFile;
   for (const node of hier.byBranch.values()) {
@@ -355,8 +336,8 @@ function blameFile(file: string, candidates: BranchCandidate[]): FileBlame {
   const first = candidates[0];
   const tied = candidates.filter((c) => c.depth === first.depth);
   if (tied.length > 1) {
-    // Indistinguishable on the ONE real signal. The previous version fell
-    // through to `localeCompare` and then reported "earliest by hierarchy" — a
+    // Indistinguishable on the ONE real signal. Falling through to name order
+    // and reporting "earliest by hierarchy" would be a
     // decision made by spelling, described as a rule. Determinism orders the
     // listing; it never decides.
     return {
@@ -461,15 +442,14 @@ export async function attributeFailure(
  * WHERE the failure is, per failing test — the gate-fix analogue of a conflict
  * case's hunk ranges.
  *
- * A conflict case now says where the markers are, so the agent reads two windows
- * instead of paging the file. A gate fix had no equivalent: file list plus a
- * 120-line output tail, and the agent locates the code itself. Measured on the
- * 2026-08-06 pass, a gate fix on `poll-loop.ts`: 50 reads, 42 with offset, 34
- * repeats of a path at DIFFERENT offsets, `poll-loop.ts` seventeen times.
+ * A conflict case says where the markers are, so the agent reads two windows
+ * instead of paging the file. Without this equivalent, a gate fix hands over a
+ * file list plus a bounded output tail and the agent locates the code itself —
+ * dozens of reads at different offsets, re-paging the same path over and over.
  *
- * THE RUNNERS DISAGREE ABOUT WHAT A LOCATION IS, and the first version of this
- * only knew two of the three shapes — so on the run that motivated it, it
- * emitted NOTHING and the section was silently omitted:
+ * THE RUNNERS DISAGREE ABOUT WHAT A LOCATION IS, and all three shapes must be
+ * parsed — miss one and this emits NOTHING for that runner, so the section is
+ * silently omitted:
  *
  *   tsc      `src/x.ts(12,3): error TS2345`     file + line on the failing line
  *   vitest   ` ❯ src/x.test.ts:85:21`            file + line on the failing line
@@ -523,12 +503,12 @@ export function failingLocations(output: string, limit = 12): string[] {
       let file = f[1].replace(/^\.\//, '');
       if (file.includes('node_modules/')) continue; // the runner's own stack, not the defect
       // ABSOLUTE FRAMES ARE REPO-ROOTED. Stack traces print the worktree's full
-      // path, so the first live run emitted
-      //   /workspace/agent/propagation/pass-743e32df4e6c/<case>/worktree/src/x.ts:153
+      // path, e.g.
+      //   …/propagation/pass-<id>/<case>/worktree/src/x.ts:153
       // — a path the agent cannot open. It names a DIFFERENT pass (the checks
       // output is captured before the case is minted and carries the tree it ran
-      // in), and that directory is gone after a clean-slate. Everything after the
-      // worktree root is the repo-relative path the agent works in, which is what
+      // in), and that directory does not survive a clean-slate. Everything after
+      // the worktree root is the repo-relative path the agent works in, which is what
       // the conflict-case hunk ranges give and what `parseFailingFiles` produces.
       const cut = file.lastIndexOf('/worktree/');
       if (cut >= 0) {

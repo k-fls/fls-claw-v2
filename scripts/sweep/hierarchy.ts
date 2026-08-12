@@ -2,10 +2,9 @@
  * scripts/sweep/hierarchy.ts — THE branch hierarchy. One implementation.
  *
  * Every piece of logic that needs "where does this branch sit in the fork DAG"
- * MUST come through `branchHierarchy`. Depth was previously computed ad hoc
- * inside the attribution code and got it wrong three ways at once (keyed by the
- * wrong field, wrong aggregate, silent zero on failure), so the rule it fed
- * never actually ran. There is no second copy.
+ * MUST come through `branchHierarchy`. An ad-hoc reimplementation is exactly
+ * where depth goes wrong silently (keyed by the wrong field, wrong aggregate,
+ * silent zero on failure) — so there is no second copy.
  *
  * MODEL
  * -----
@@ -16,12 +15,10 @@
  *
  * DEPTH = 1 + MAX(parent depths) — the LONGEST path to the root.
  * A branch can only be merged after ALL of its parents, so its position is
- * governed by its deepest one. Using MIN (the shortest route) puts a child at or
- * above its own parent: on the live inventory it produced 8 such violations,
- * e.g. `feat/mitm-credential-proxy` at 3 alongside its parent `module/host-rpc`
- * at 3, and it ranked `edition/fls-ai-bot` ABOVE three depth-2 modules.
+ * governed by its deepest one. Using MIN (the shortest route) puts a child at
+ * or above its own parent and ranks leaf editions above root-adjacent modules.
  * `assertNoParentInversion` exists to make that class of error impossible to
- * ship again.
+ * ship.
  *
  * MIN PATH = the SHORTEST chain of parents from a branch up to (but excluding)
  * `main`. Depth answers "how late must this merge"; minPath answers "through
@@ -63,7 +60,7 @@ export interface Hierarchy {
  *
  * Unresolvable branches get `depth: null`, NOT 0 — a missing edge must never
  * masquerade as "closest to the root", which is precisely how a leaf edition
- * outranked three root-adjacent modules.
+ * would outrank root-adjacent modules.
  */
 export function branchHierarchy(features: FeatureEntry[]): Hierarchy {
   const parentsOf = new Map<string, string[]>();
@@ -157,8 +154,8 @@ export function byHierarchy(h: Hierarchy): (a: string, b: string) => number {
 
 /**
  * INVARIANT: no branch may sit at or above the depth of any of its parents.
- * The MIN-vs-MAX bug produced exactly this and nothing caught it until the
- * numbers were read by hand. Returns the violations, empty when sound.
+ * A MIN-aggregate depth produces exactly this violation and nothing else
+ * catches it. Returns the violations, empty when sound.
  */
 export function assertNoParentInversion(h: Hierarchy): Array<{ branch: string; parent: string; depth: number; parentDepth: number }> {
   const bad: Array<{ branch: string; parent: string; depth: number; parentDepth: number }> = [];

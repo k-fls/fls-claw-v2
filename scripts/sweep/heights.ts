@@ -1,11 +1,11 @@
 /**
  * scripts/sweep/heights.ts — watermark pinning, trunk-chain enumeration,
- * height<->sha, and coverage derivation (PROPAGATION.md §2, D-036/D-029).
+ * height<->sha, and coverage derivation (PROPAGATION.md §2).
  *
  * A PASS pins `upstream/main`'s tip once (the watermark); the trunk
  * first-parent chain is enumerated ONCE from the fork point and each commit
  * gets a 0-based index (its HEIGHT). A merge head is a `{sha, height}` pair.
- * Coverage is NEVER stored (D-029): a branch's covered height is the highest
+ * Coverage is NEVER stored (§2): a branch's covered height is the highest
  * chain index whose commit is an ancestor of the branch tip. Ancestry along a
  * first-parent chain is monotonic, so coverage is binary-searchable with
  * `git merge-base --is-ancestor` (O(log n) probes). Conflict-ness is NOT
@@ -61,7 +61,7 @@ export function heightOfSha(chain: Chain, sha: string): number {
 }
 
 /**
- * DERIVED coverage (D-029): the largest chain height whose commit is an
+ * DERIVED coverage (§2): the largest chain height whose commit is an
  * ancestor of `branchTip`, or -1 when even the oldest chain commit is not yet
  * reached. Binary search over the monotone ancestry predicate — O(log n)
  * `--is-ancestor` probes. Returns the probe count for cost assertions.

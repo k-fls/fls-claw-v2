@@ -1,14 +1,11 @@
 /**
  * scripts/sweep/merge.ts — the shared rerere cache.
  *
- * The batch merge engine that used to live here (planMerges / executeMerges /
- * rollbackBranch, driven by the retired `sweep.ts merge|verify --rollback`
- * pipeline) is gone: the propagation driver does its own DAG-ordered merging
- * (`propagate.ts`, PROPAGATION.md §8) and its own §9 rollback. What survives is
- * the shared rerere cache — a plain directory in the group workspace, installed
- * into `.git/rr-cache` before merging and exported back after, so a conflict
- * resolved once at the topmost affected branch replays on every descendant
- * (D-006).
+ * A plain directory in the group workspace, installed into `.git/rr-cache`
+ * before merging and exported back after, so a conflict resolved once at the
+ * topmost affected branch replays on every descendant (MERGE-POLICY.md §4).
+ * The propagation driver (`propagate.ts`) owns the DAG-ordered merging
+ * (PROPAGATION.md §8) and the §9 rollback; this module only moves the cache.
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';

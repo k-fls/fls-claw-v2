@@ -13,7 +13,7 @@ chain:
   enumerate_cmd: git rev-list --first-parent --reverse main..upstream/main
 branch: fix/main/role-grant-scope-clarity
 tip: a512bc9f57fe3b7b38c0467bde751951ec2589cc
-# Pin-by-patch fallback (2026-07-20): the owner rebased this branch, so `tip`
+# Pin-by-patch fallback: the owner rebased this branch, so `tip`
 # (a512bc9f) is unreachable and will be gc-pruned. `pin_patch` = git diff --binary
 # main..a512bc9f; applied to main it recreates the EXACT tip tree
 # (278894c58d4e067d73be2b9133260ff3a2851446), merge-base main, so every probe

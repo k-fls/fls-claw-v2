@@ -1,31 +1,31 @@
 # FLSclaw self-maintenance: upstream-sweep pipeline specification
 
-Status: DRAFT v2 (2026-07-10). Decision references D-001..D-021 point to the decision log
-(`self-maintenance-decisions.md`). SUPERSEDED IN PART (D-049, 2026-07-21): the §6
-case-1..4 ladder and the §8 merge/review policy are replaced by the tier ladder of
-`MERGE-POLICY.md` (authoritative) + `PROPAGATION.md`; §6/§8 below are kept as
-historical record only.
+This file is the top-level design of the upstream sweep: purpose, fixed
+principles, scope/topology rules, and the division of labor between the
+deterministic driver and the agent. Authority split: `MERGE-POLICY.md` owns
+tiers, batching, noise, review, and publication; `PROPAGATION.md` owns the
+propagation driver's mechanics; `SWEEP-STATE-MACHINE.md` owns the agent-facing
+command surface. On conflict, those files win for their domains.
 
-**Relationship to existing design:** this spec is the detailed mechanics of
-`docs/design/02-self-maintaining-flsclaw.md` §5 (flows a+b). Component mapping: stage
-scan = `fls-upstream-watcher`, PoI classification/plan = `fls-maintainer`, merge/PR
-execution = `fls-change-author`, approval = owner on GitHub. Everything here is
-M0-runnable standalone (operator invokes the scripts directly) — the estate is the
-wrapper, not a dependency (D-020).
+**Relationship to the estate design:** this spec is the detailed mechanics of
+`docs/design/02-self-maintaining-flsclaw.md` §5 (flows a+b). Everything here is
+runnable standalone (operator invokes the scripts directly) — the estate is the
+wrapper, not a dependency.
 
-**Placement (D-017/D-018/D-021):**
+**Placement:**
 - Tooling: `scripts/sweep/*.ts` (tsx, positional args + `Usage:` line, `*.test.ts`
-  siblings picked up by the vitest scripts glob). No new deps; JSON not YAML.
-- Data: `estate/sweep/` — `sweep-scope.json` (branch list + DAG edges + exclusions),
-  `feature-inventory/` (JSON index + per-feature markdown prompt templates),
-  `test-cases.json`, `prompts/` (PoI-analysis prompt templates).
-- Mutable state: `estate/sweep/state/` (sweep-state.json, sweep-log.jsonl, rr-cache/,
-  reports/) committed ONLY on the never-merged ops branch `maint/state`; job lifecycle
-  stays in the doc-02 maintainer ledger (SQLite), referencing state commits by SHA.
-- Design-doc refinements: append to doc 02 + `scratchpads/topic-2-self-maintenance.md`
-  (no new doc number, D-016).
-- Branch naming: batch merges pushed as `sweep/<date>`; conflict resolutions as
-  `fix/sweep/<date>-<topic>` (D-019).
+  siblings picked up by the vitest scripts glob). No new deps.
+- Config, tracked in the fork repo with the code: the feature inventory
+  `scripts/sweep/inventory/*.yaml` (§10 item 1); driver levers
+  `scripts/sweep/registry/routing.yaml`; scope policy
+  `scripts/sweep/registry/scope.yaml`; the checks gate's command list
+  `scripts/sweep/checks.json`; blame's history facts
+  `scripts/sweep/cut-point-exceptions.yaml`; prompt templates
+  `scripts/sweep/registry/prompts/`.
+- Mutable state: none durable — see §4.
+- Branch naming: conflict-case refs are
+  `fix/sweep/<slug(branch)>--<slug(parent)>-h<height>-<sha8>`; gate-fix refs are
+  `fix/sweep/<slug(branch)>--gate-fix-…` (the case id).
 - Verification commands (from CI, authoritative): `pnpm install --frozen-lockfile`;
   `(cd container/agent-runner && bun install --frozen-lockfile)`; `pnpm run format:check`;
   `pnpm exec tsc --noEmit`; `pnpm exec tsc -p container/agent-runner/tsconfig.json
@@ -38,357 +38,252 @@ A half-scripted / half-agentic procedure, operated by a dedicated agent group
 ("maintenance group"), that keeps the FLSclaw fork current with upstream
 `nanocoai/nanoclaw`:
 
-- **Scripted core** (deterministic, idempotent, resumable): fetch, fast-forward `main`,
-  per-branch conflict scan, rerere-assisted clean merges propagated down the branch DAG,
-  `everything` rebuild, full test matrix, machine-readable sweep report, state journal.
-- **Agentic layer** (judgment): classify points of interest, correlate conflicts with
-  fork features via the feature inventory, author conflict resolutions as `fix/*` PRs,
-  post human-facing reports, maintain the registries.
+- **Scripted core** — the propagation driver (deterministic, idempotent,
+  resumable): fetch, fast-forward `main`, per-branch conflict probing,
+  rerere-assisted clean merges propagated down the branch DAG, the `everything`
+  rebuild + checks as the verification gate, journaled pass artifacts, and
+  every push and PR creation.
+- **Agentic layer** (judgment): resolve the conflict cases the driver serves,
+  write PR prose, analyze overlap between upstream changes and fork features,
+  relay candidates and reports to the owner.
 
-The scripted core never needs an LLM; the agentic layer never does raw git surgery that
-the scripts can do. The boundary artifact is the **sweep report** (JSON): scripts emit
-it, agents consume it.
+The scripted core's one LLM call is the cold read — a context-free `claude -p`
+subprocess the driver runs itself; the agentic layer never does raw git surgery
+the driver can do. The boundary is the state machine's command results plus the
+pass-dir artifacts (journal, `plan.json`, case files, the `SWEEP-RESULT`): the
+driver emits them, the agent consumes them.
 
 ## 2. Fixed principles (owner-approved)
 
 - `main` = pristine upstream mirror, FF-only. All real merges happen on `main_patched`
-  and below, along the DAG, merge-forward, resolving each conflict once at the topmost
-  affected branch (D-003). `git rerere` replays known resolutions (D-006).
+  and below, along the DAG, merge-forward, resolving each conflict once at the
+  topmost affected branch. `git rerere` replays known resolutions.
 - Detection = per-branch new-style `git merge-tree` (full ort, virtual multi-base).
   NEVER `--merge-base=<x>` single-base preview, NEVER cherry-pick fallback (known
   two-merge-base pitfall). `everything` is rebuilt only as the verification gate,
-  never merged anywhere (D-001).
-- PoI classes (D-002):
-  - **annotate** — merge proceeds, analysis is async: new directory, new skill, new file
-    over threshold (default 15 KB source / 40 KB any), touches to sensitive surfaces
-    (credentials, egress/firewall, container spawn, host-rpc auth), dependency/SDK bumps.
-  - **gate** — stops propagation for the affected branch only: textual merge conflict
-    not resolved by rerere; test/build failure after a textually clean merge.
-- Textually clean ≠ done: a sweep batch is only recorded/pushed after the everything
-  rebuild + full test matrix passes. Clean-merge-but-red-tests demotes to gate (case 4).
-- No deep PR chains (D-004): a branch with an open conflict PR is **frozen**; the
-  sweeper only annotates the PR with the count of newer pending upstream commits
-  (D-049: a driver-maintained machine block + posted urge comments). The former
-  case-3 advance-on-top exception is retired with case 3 itself (D-049).
-- Freeze/status is registry-authoritative (D-005): `sweep-state.json` on the
-  maintenance branch; cosmetic `sweep-frozen/<branch>` lightweight tags mirror it.
+  never merged anywhere.
+- Awareness vs gating: a CLEAN merge whose merged range passes through a height
+  at which a transitive ancestor is HELD is annotate-class — flagged in the pass
+  report, never gated (PROPAGATION.md §1). Gating — an unresolved conflict, or a
+  red verify on a publishable branch — blocks the affected branch only, per the
+  tier ladder (MERGE-POLICY.md §1).
+- Sensitive surfaces (credentials, egress/firewall, container spawn, host-rpc
+  auth) carry security invariants on their inventory entries; a conflicted hunk
+  that alters enforcement behavior on one with no covering record is HELD, and a
+  sensitive path alone floors the tier claim at JUDGED (MERGE-POLICY.md §7 F2).
+- Textually clean ≠ done: a pass pushes and publishes only after the
+  full-integration rebuild + checks are green at `finish`. A red verify on a
+  publishable branch rolls it back to its journaled pre-pass ref and demotes it
+  to HELD(gate).
+- No deep PR chains: a branch with an open conflict PR is **blocked**; the sweep
+  only annotates the PR (a driver-maintained machine block plus posted urge
+  comments carrying the count of newer pending upstream commits).
+- Blocked state is origin-authoritative: derived at `sweep start` from the
+  `fix/sweep/*` refs and their PRs (MERGE-POLICY.md §1), never read from a local
+  store.
 
 ## 3. Repos, branches, isolation
 
-- Canonical clone: TBD(deploy) — the maintenance group gets its OWN clone/worktree;
-  it never operates in a human's checkout and never touches the running deployment.
-- **Maintenance branch** `maint/self-update` (final name TBD(recon)): holds
-  `sweep/` tooling, `sweep-state.json`, feature inventory, test-case registry,
-  shared rerere cache, sweep reports archive. Not part of the product DAG; never
-  merged into module/feat/edition branches.
-- **Scope config** (`sweep-scope.yaml`): explicit branch list with DAG edges
-  (parent→child propagation order), plus exclusions: `experimental/*`, `wip/*`,
-  `everything*`, blocked branches (e.g. `fix/channels/telegram-markdown-nesting`,
-  status: excluded/needs-rebase). The DAG here is the executable copy of the
-  confirmed topology; the agent group updates it when branches are added/retired,
-  and the script cross-checks it against `git branch -r` every run (drift alert).
+- The maintenance group operates in its OWN clone under its group workspace
+  (`--workspace` = the group root, parent of the clone); it never operates in a
+  human's checkout and never touches the running deployment.
+- There is no maintenance/state branch: durable tooling config is committed with
+  the code under `scripts/sweep/` (see Placement), and everything else is
+  derived per pass (§4). Cross-pass holds live on origin as `fix/sweep/*` refs.
+- **Scope** = inventory branches + `main_patched` (structural) + non-inventory
+  branches in the transitive edition composition (§10 items 3-4), minus
+  `registry/scope.yaml` exclusions and the namespace exclusions (`everything*`,
+  `experimental/*`, `wip/*`, `design/*`, `maint/*`, `worktree-agent-*`,
+  `integration/*`, `test/*`, `sweep/*`, `fix/sweep/*`). The validator
+  cross-checks the inventory against the repo's branches every run (§10 item 2,
+  rule 5).
 
-## 4. State schema (sweep-state.json, authoritative)
+## 4. State model (derived; no durable local store)
 
-```json
-{
-  "schemaVersion": 1,
-  "lastSweep": {"id": "2026-07-10T12:00Z", "upstreamTip": "<sha>", "result": "clean|partial|blocked"},
-  "branches": {
-    "<branch>": {
-      "status": "active | frozen | excluded",
-      "lastMergedUpstream": "<sha>",   // last upstream first-parent commit merged in
-      "frozenBy": "PR #NN | null",
-      "pendingBehindFreeze": 0,
-      "notes": "free text"
-    }
-  },
-  "openPois": [ {"id": "...", "class": "annotate|gate", "type": "new-skill|new-dir|large-file|sensitive|conflict|test-fail",
-                 "upstreamCommits": ["<sha>"], "paths": [], "branches": [], "state": "open|reported|resolved", "pr": null} ]
-}
-```
+The driver keeps NO durable local state — the sweep is a pure function of
+(GitHub, committed config):
 
-Written only by the scripted core (agents request changes via script subcommands, so
-every mutation is validated + journaled). Every sweep appends a row to
-`sweep-log.jsonl` (audit trail).
+- Upstream coverage is DERIVED per branch (`git merge-base` ancestry against the
+  pass's pinned trunk chain, PROPAGATION.md §2) — never stored.
+- Blocked state lives on ORIGIN as `fix/sweep/*` refs plus their PRs;
+  `sweep start` re-derives the blocked set from them every pass
+  (MERGE-POLICY.md §1).
+- Pass state (`journal.jsonl`, `plan.json`, step/case files, reports) lives in
+  the disposable pass dir `<workspace>/propagation/pass-<watermark12>/`; every
+  mutation goes through journaled driver commands (PROPAGATION.md §7-8).
+- Exclusions are CONFIG (`registry/scope.yaml`), not state.
+- `sweep start` fails hard on sweep residue it might otherwise be tempted to
+  read (ERR47_SWEEP_RESIDUE): pinned `refs/sweep/*` refs in the clone, a
+  workspace `inventory/` or `inventory-candidates/` dir, and
+  `sweep-*.json(l)` files at the workspace root. `propagation/` (pass-owned)
+  and `rr-cache/` (a cache keyed to git conflict content) are exempt.
 
 ## 5. Scripted core — stages
 
-> **RETIRED (2026-07-30).** The `fetch|ff-main|scan|stop-points|merge|verify|record|
-> status|route|replay|seed-rerere` pipeline below no longer exists: nothing outside this
-> document invoked it and none of it was on the agent's doctrined surface. Propagation,
-> verification and publication are the propagation driver's (`PROPAGATION.md`), driven by
-> the six-command state machine (`SWEEP-STATE-MACHINE.md`). `sweep.ts` survives with ONE
-> subcommand — `validate-registry` (stage 0 of the runbook, step 3 of the
-> `fork-registry-generate` skill). Kept as historical record.
+Propagation, verification, and publication are the propagation driver
+(`PROPAGATION.md`): internal stages `plan → run → verify → publish → push →
+report`, reachable ONLY through the state machine's commands
+(`SWEEP-STATE-MACHINE.md`) — `start` runs plan, `next-case` runs run, `finish`
+runs verify → publish → push → report; `report-case` is the resolution gate,
+and `abort` seals a pass. Each command is idempotent and crash-resumable: a
+dead session resumes at the exact phase, and a pass that crashes before
+`finish` has published nothing.
 
-`sweep.ts` subcommands (each idempotent; a crashed sweep re-runs from the top and
-converges — no partial-state corruption):
+`sweep.ts` has ONE subcommand — `validate-registry`, the inventory validator
+(§10 item 2; stage 0 of the runbook, step 3 of the `fork-registry-generate`
+skill). Read-only; exit 1 on ALERTs.
 
-1. **fetch** — `git fetch upstream origin --prune`. Exit early if `upstream/main` tip
-   == `lastSweep.upstreamTip` and no open work.
-2. **ff-main** — `git merge --ff-only` upstream/main into main. Any non-FF = loud
-   failure (mirror invariant violated; agent alert, stop).
-3. **scan** — for every active branch: new-style `git merge-tree upstream/main <branch>`
-   → conflict file list. For upstream range `lastMergedUpstream..upstream/main`
-   (first-parent): detect annotate-PoIs via `git diff-tree`/`log --stat` (new dirs, new
-   skills = new dir under the skills root, large files, sensitive-path touches,
-   lockfile/SDK bumps). Route changed paths through the feature inventory to shortlist
-   overlap checks. Emit `sweep-report.json`.
-4. **stop-points** — per branch: if tip merge is clean → stop point = upstream tip.
-   Else bisect the upstream **first-parent chain** (unit of merge = upstream PR merge
-   commit) for the largest clean prefix; stop point = last clean first-parent commit.
-   Per-branch stop points — one branch's conflict never holds back the others.
-5. **merge** — with shared rerere cache installed: propagate in DAG order
-   (main_patched first, then parents before children). For each branch, merge its stop
-   point. rerere-resolved conflicts count as clean but are listed in the report
-   (annotate-PoI, type `rerere-replay`). Checked-out branches via temp worktrees;
-   others via merge-tree + commit-tree + update-ref (July-sweep technique). Nothing
-   pushed yet.
-6. **verify** — rebuild `everything` from the recipe in scope config (temp worktree,
-   reset --hard main, scripted merge sequence + rerere), then: pnpm install
-   --frozen-lockfile, build, host tests, container typecheck + bun tests (exact CI
-   command list in the placement section above). Failures map back to the last-merged range → the offending
-   branch is rolled back to its pre-sweep ref (recorded in stage 5) and demoted to
-   gate-PoI (case 4). Re-verify without it.
-7. **record** — update sweep-state.json + sweep-log.jsonl, archive sweep-report.json,
-   create/delete `sweep-frozen/*` tags, push per push-policy (§8).
-8. **status** — human-readable dump for the agent group / owner.
+## 6. Agentic layer — case handling and awareness
 
-## 6. Agentic layer — PoI handling
+Merge and review handling is the CLEAN/MECHANICAL/JUDGED/HELD/DEFERRED tier
+ladder — MERGE-POLICY.md §1 (authoritative) + PROPAGATION.md §1. HELD is the
+only review state; anything review-worthy escalates to it. The agent's judgment
+work:
 
-> **SUPERSEDED (D-049, 2026-07-21).** The case-1..4 ladder below is retired:
-> merge/review handling is the CLEAN/MECHANICAL/JUDGED/HELD/DEFERRED tier ladder
-> of `MERGE-POLICY.md` §1 (authoritative) + `PROPAGATION.md` §1. In particular:
-> case 3 (open provisional PR) no longer exists — HELD is the ONLY review state
-> and anything review-worthy escalates to it; JUDGED (incl. the `edition/*`
-> floor) auto-merges via the D-040 closure push. Case 1 (annotate-PoI overlap
-> checks) remains current. Kept as historical record.
+- **Conflict cases:** resolve the case the driver serves inside its
+  driver-managed worktree, claim `--tier`, and write the PR description
+  (`pr/body.md`). What the agent may resolve is regulated by
+  MERGE-POLICY.md §7.
+- **Gate-fix cases:** fix a red build on the branch the driver blamed
+  (MERGE-POLICY.md §8).
+- **Overlap awareness:** for annotate-class flags and new upstream content,
+  spawn overlap-check subagents (`registry/prompts/overlap-check.md` with the
+  matched inventory entries' context; `catch-all-triage.md` when nothing
+  matches). Findings: (a) overlap with an implemented/planned fork feature →
+  HIGH-PRIORITY owner report (dedup/retire/adopt decision for the owner);
+  (b) independent new feature/skill/improvement → NORMAL awareness line;
+  (c) nothing interesting → one line in the sweep digest.
+- **Candidates:** relay the CANDIDATES section to the owner verbatim; propose
+  `clear` placements for approval; ask the `unclear` open questions
+  (PROPAGATION.md §13, §10 item 6 here).
+- **Reports:** one sweep digest per pass, built from the `finish`
+  `SWEEP-RESULT`: landed vs conflicted branches, the PR list, stats,
+  escalations. HIGH-PRIORITY overlaps are called out on top.
 
-The maintenance group wakes on schedule (e.g. daily; upstream does ~2-15 PRs/month),
-runs `sweep.ts` through stage 7, then processes the report:
-
-**Case 1 — annotate-PoIs (merged already, analysis async):**
-For each, spawn an overlap-check subagent using the ready-made prompt from the feature
-inventory (only the shortlisted features; catch-all prompt when nothing matches):
-- (a) OVERLAP with implemented/planned fork feature → report HIGH PRIORITY (upstream
-  built something we have/planned — dedup/retire/adopt decision for the owner).
-- (b) independent new feature/skill/improvement → report NORMAL (awareness).
-- (c) nothing interesting → PoI dissolves; one line in the sweep digest.
-
-**Case 2 — resolvable conflict:** correlate with owning fork branch (inventory +
-topmost-affected-branch rule). Branch `fix/sweep/<date>-<topic>` off the target branch
-(which already has prior upstream merged, i.e. its stop point). Resolve, run the
-branch-relevant tests, open PR (traceability), auto-merge it, record the resolution in
-rerere cache, unfreeze, resume the merge loop for that branch (script stage 4-7 rerun).
-
-**Case 3 — resolvable but confirmation wanted:** same as 2, but PR stays open with the
-provisional resolution + rationale; branch may continue advancing on top of the
-provisional resolution (the one sanctioned continue-on-top case). Owner merge = final.
-
-**Case 4 — unresolvable (needs decision / tests non-trivially broken):** push
-`fix/sweep/<date>-<topic>` pointing at the upstream stop-point commit — the pending
-upstream commits verbatim, no resolution, no committed conflict markers, and never a
-NOTES.md file (D-030; supersedes the earlier branch-at-stop-point+NOTES.md shape,
-which produced content-free single-file PRs). Open a DRAFT PR against the affected
-branch: GitHub shows the real upstream diff and flags the PR unmergeable — the
-unmergeable state IS the conflict exhibit. ALL analysis (conflict inventory, per-file
-ours/theirs hunks, options, one-command reproduction) goes in the PR DESCRIPTION.
-Don't resolve, freeze branch, alert owner. When the owner decides and the agent
-implements, the resolution merge commit lands on the same fix/sweep branch, turning
-the PR mergeable (case-3 shape) — same PR, full history.
-
-**Case-4 guards (D-030, from the 2026-07-13 #5/#12 duplicate-freeze incident):**
-- Before opening a freeze PR, check existing `fix/sweep/*` PRs for the same branch —
-  open AND closed (`gh pr list --state all`). A closed freeze PR plus a merged fix PR
-  means the decision was already made: record it (next bullet), never re-open.
-- Decision write-back is mandatory, not optional upkeep: once a freeze resolves,
-  record the outcome immediately in the live inventory entry (`prompt.extra_context`)
-  and propose the matching seeds.yaml update via a fix/sweep PR. An overlap whose
-  decision is recorded is one digest line, never a new freeze.
-- Never open a freeze PR for a branch the current scan reports as merging clean —
-  no textual conflict and no undecided overlap means there is nothing to freeze.
-
-**Multiple gates on one branch:** they queue in the state file; the branch stays at its
-earliest stop point until the first PR lands (no stacking, D-004).
-
-**Reports:** one sweep digest per run to the owner's channel: merged range per branch,
-PoIs by class/priority, frozen branches with PR links, test-matrix result, inventory/
-registry updates made. HIGH-PRIORITY overlaps are called out on top.
+The agent never opens PRs, never pushes, and never mutates refs itself —
+publication is driver-only (§8).
 
 ## 7. Registries the group maintains
 
-- **Feature inventory** — spec from design subagent (separate doc).
-- **Test-case registry** — mined cases (separate doc). The `replay`/`seed-rerere`
-  harness is retired with `sweep.ts` and the `test-cases/cases/*.yaml` corpus it
-  consumed is deleted (recoverable from history); the propagation cases under
-  `test-cases/propagation/` are still exercised by `propagation-cases.test.ts`.
-- **rerere cache** — `sweep/rr-cache/` committed on the maintenance branch; installed
-  into the clone's .git/rr-cache (or via rerere.rrCachePath equivalent symlink) before
-  stage 5; new resolutions from case-2 PRs are exported back.
+- **Feature inventory** — `scripts/sweep/inventory/*.yaml` (§10 item 1).
+  Entries are created/amended only with owner approval, via the
+  `fork-registry-generate` skill (judgment fields seeded from its
+  `seeds.yaml`), then validated with `sweep.ts validate-registry`.
+- **Test cases** — pinned-SHA propagation cases under
+  `scripts/sweep/test-cases/propagation/`, exercised by
+  `propagation-cases.test.ts` (checkout-free replay model; regression anchors).
+- **rerere cache** — `<workspace>/rr-cache/` (durable per group root); the
+  driver installs it into the clone's `.git/rr-cache` before merging, and new
+  resolutions are recorded as driver merges commit.
 
 ## 8. Safety rails / policy
 
-- Push policy (rewritten by D-049 §5): the DRIVER pushes — verify-gated,
-  journaled pass pushes (the driver's `push` + `publish` stages, run by `finish`)
-  are the ONLY pushes; the
-  agent never hand-pushes anything. `edition/*` merges floor at JUDGED and
-  AUTO-MERGE (D-049 — owner-gating only by escalation to HELD; supersedes the
-  earlier "case-3 minimum"). NOTHING is deployed by this procedure; "ready to
-  deploy" is a report line.
+- The DRIVER pushes: verify-gated, journaled pass pushes at `finish` are the
+  ONLY pushes; the agent never hand-pushes anything. `edition/*` merges floor
+  at JUDGED and AUTO-MERGE; owner-gating happens only by escalation to HELD.
+  NOTHING is deployed by this procedure; "ready to deploy" is a report line.
 - The group never force-pushes, never rebases published branches, never touches
-  `everything` except scripted rebuilds in temp worktrees, never writes to `main`
-  except FF.
-- All destructive-ish git (update-ref, worktree add/remove) happens inside the driver
-  with journaling; agents call its commands, not raw git, for state mutations.
-- API-error resilience (D-008): the group's orchestration retries dead subagents (≤2),
-  checkpoints between stages (state file), and every stage is resumable.
+  `everything` except scripted rebuilds in temp worktrees, never writes to
+  `main` except FF.
+- All destructive-ish git (update-ref, worktree add/remove) happens inside the
+  driver with journaling; the agent calls the state-machine commands, not raw
+  git, for state mutations. A protected-ref guard at the single ref-write choke
+  point refuses to move `main`, `design/*`, `maint/*`, `everything*`, `test/*`,
+  and anything outside the pass's resolved scope (PROPAGATION.md §8).
+- Resilience: every stage is journaled and re-runnable. Infrastructure failures
+  (pushes, cold-read tooling, GitHub API) hard-halt and are reported to the
+  owner — never worked around; such issues are not sweep-agent duty.
 
-## 9. Agent group installation — per design doc 02
+## 9. Agent group installation
 
-The estate topology, credentials (GitHub App per-child scopes), trust chain, updater,
-and bootstrap sequence are already designed in `docs/design/02-self-maintaining-flsclaw.md`
-(§3, §6-8, §11) — this spec does not redesign them. The sweep scripts slot in as:
-watcher runs the fetch/scan stages in its no-push clone; maintainer consumes the report
-and runs PoI classification subagents (feature-inventory prompts); change-author runs the
-merge/verify/record stages in its RW working clone and opens the PRs. (Retired with
-`sweep.ts` — see the §5 banner; the live shape is one group running the state machine.)
-Estate scaffolds live under `estate/` per doc 02 §11
-(to be authored when the estate is bootstrapped; blocked on feat/dependent-groups
-recovery — out of scope for this implementation round beyond the directory layout).
+The estate topology, credentials (GitHub App per-child scopes), trust chain,
+updater, and bootstrap sequence are designed in
+`docs/design/02-self-maintaining-flsclaw.md` (§3, §6-8, §11) — this spec does
+not redesign them. The live shape is ONE maintenance group running the state
+machine in its own clone. Estate scaffolds live under `estate/` per doc 02 §11;
+authoring them is out of scope for this toolkit beyond the directory layout.
 
-## 10. Implementation deviations (scripts/sweep, 2026-07-10)
+## 10. Implementation notes (scripts/sweep)
 
-The toolkit in this directory implements §5 with the following deliberate
-deviations from the letter of this spec and the feature-registry design:
-
-1. **Ref-only replay.** The test-case replay harness (`replay.ts`) does not
-   create a throwaway worktree/clone at the case's base commit: new-style
-   `git merge-tree` and `rev-list` operate on the pinned commits directly, so
-   the replay is checkout-free and structurally unable to mutate anything.
-
-2. **Adaptation to the live registry schema** (`maint/fork-registry`, which
-   evolved past the written designs while being authored): `upstream_range`
-   may be `{from, to}` as well as `a..b`; propagation cases use
-   `merge_source` (fork-internal merge into `fork_base_commit`) instead of
-   an upstream range; rich taxonomy classifications are normalized to the
-   mechanical outcome (`semantic`/`semantic-collision`/`mixed`/
-   `agent-resolvable`/`feature-overlap`/`known-recurring` -> conflict;
-   `clean-with-semantic-poi`/`clean-with-security-poi` -> clean; `excluded`
-   -> skipped) and **unknown classification labels fail closed** (case
-   fails, never silently passes); expected conflict paths may carry
-   `(modify/delete)`-style annotations; `expected.pois` prose strings are
-   notes, not assertions; `key_symbols` may pack several symbols per anchor
-   (`"A / B — path"`, any hit passes rule 4).
-
-3. **Leave-one-out verify attribution.** Stage 6 maps a red test matrix to
-   the offending branch by re-building the recipe with one branch removed at
-   a time (reverse recipe order) rather than reasoning over the last-merged
-   range; deterministic and unit-testable, at the cost of extra rebuilds.
-
-4. **Scope rule.** The sweep scope is the UNION of (feature-registry
-   entries' owning branches) and (`sweep-state.json` branches with status
-   `active`); branches present only in the state file (fix/* upstream-PR
-   candidates, docs/notes) have a null feature link and no DAG edges but are
-   scanned/merged like any other. Namespace exclusions (`everything*`,
-   `experimental/*`, `wip/*`, `design/*`, `maint/*`, `worktree-agent-*`,
-   `integration/*`, `test/*`, `sweep/*`, `fix/sweep/*`) and status
-   `excluded`/`frozen` rules apply on top of both sources.
-
-5. **2026-07-10 restructure — registry branch dissolved (owner decision).**
-   The spec's "maintenance branch" / state-branch model (§3 `maint/self-update`,
-   §4 sweep-state.json on a branch, D-017/D-018 `estate/sweep` data placement,
-   D-023 `maint/fork-registry`) is superseded by a snapshot+seeds model:
-   - Durable tooling config is committed WITH the code:
-     `scripts/sweep/registry/` (schema, routing.yaml, scope.yaml, prompts) and
-     `scripts/sweep/test-cases/` (replay cases, read from the local tree).
-   - The feature inventory is a GENERATED artifact: mechanical fields derived
-     fresh from git, judgment fields (invariants, overlap hints, routing
-     keywords) merged from `.claude/skills/fork-registry-generate/seeds.yaml`
-     — their canonical home. A stamped verbatim snapshot
-     (`scripts/sweep/bootstrap/fork-registry@<tree-hash>/` + MANIFEST.md,
-     moment of capture explicit) provides cheap re-bootstrap and is the
-     default `--inventory`.
-   - Live state is DERIVED: `lastMergedUpstream` is never stored (computed as
-     `git merge-base <branch> upstream/main`), and blockedness is re-read from
-     the origin `fix/sweep/*` refs at `start` (D-058). SUPERSEDED as written:
-     this paragraph originally put exclude overrides, open PoIs and the
-     last-sweep record in a group-owned `sweep-ledger.json`. That file was
-     deleted 2026-08-04 — a 12-day-old copy was read back by a fresh session
-     and reported as the current sweep state while an open pass sat beside it.
-     Exclusions are CONFIG (below); everything else is derived.
-   - Exclusion policy is CONFIG, not state: `scripts/sweep/registry/scope.yaml`
-     (include globs main_patched/fix/**/docs/notes; explicit exclusion of the
-     telegram branch). Scope = inventory branches UNION include-glob matches,
-     minus exclusions — no state file participates.
-   - The rerere cache is local/ephemeral under the workspace
-     (`<workspace>/rr-cache/`); the driver installs it into `.git/rr-cache`
-     before merging (`merge.ts`). The `seed-rerere` rebuild-from-pinned-cases
-     stage is retired with `sweep.ts`.
-   - `--state-branch` no longer exists anywhere in the CLI.
-
-6. **2026-07-14 merge-source correction (owner directive).** The original
-   merge stage fanned upstream/main directly into EVERY branch (July-sweep
-   style). With real conflicts this made leaf branches re-present their
-   PARENTS' conflicts — edition/fls-ai-bot's freeze PR (#16, closed) carried
-   10 conflicted files, none edition-owned — duplicating resolution work
-   across parallel PRs and violating "resolve each conflict once at the
-   topmost affected branch" (D-003). Corrected model (the branch-topology
-   rule):
-   - `main` only ever fast-forwards from upstream/main; `main_patched`
-     merges `main` — these are the ONLY upstream entry points.
-   - Every other inventory branch merges its DAG **parents'** tips
-     (inventory `parents`; roots default to `[main_patched]`),
-     parents-before-children. Upstream content reaches leaves exclusively
-     through the parent chain, so a conflict gates the topmost affected
-     branch and every descendant inherits the resolution via its parent
-     merge — no re-conflicts, no duplicate PRs.
-   - Stop points are bisected against the upstream first-parent chain only
-     at the upstream entry points; descendants inherit gating naturally (a
-     gated parent's tip does not advance, so children have nothing new to
-     merge and can never overshoot).
-   - `scan` forecasts each branch against its ACTUAL merge source (parents'
-     current tips) — that is what the merge stage will do; an informational
-     upstream/main probe is kept per branch (`upstreamInfo`).
-   - **Scope rule (owner, verbatim intent: "agent ignores non-inventory
-     branches, unless they are present in any edition branch"):** a branch
-     with no inventory entry is IGNORED (no scan, no PRs, at most one digest
-     drift line) UNLESS its tip is an ancestor of an `edition/*` branch
-     (`git merge-base --is-ancestor`). Such edition-composition branches are
-     swept with merge source `main` ONLY (upstream-PR candidates — never
-     polluted with main_patched/fork content) and are flagged by the
-     validator/digest: "in edition composition but no inventory entry — add
-     one". Explicit exclusions (scope.yaml, telegram) apply first; the
-     scope.yaml include-glob mechanism is removed.
-
-7. **D-033 (2026-07-14): the edition-composition test is TRANSITIVE and
-   HISTORICAL.** Plain tip-ancestry misses the lagging case: a fix merged
-   into main_patched, where main_patched was historically merged into the
-   edition but the edition has not absorbed the newest tip yet, was wrongly
-   ignored (real instance: fix/main/command-gate-mention-prefix). A
-   non-inventory branch now qualifies if it was ever merged into any branch
-   whose merge history (transitively) reaches an edition/* branch:
-   - Tip-ancestry into a composition member remains the cheap first check.
-   - General test (fork-era, bounded at d85efea2; unbounded in repos without
-     that commit, e.g. fixtures): "B was merged into X" ⇔ some commit on
-     B's FIRST-PARENT line — excluding commits reachable from `main` (pure
-     upstream merges never qualify anything) and commits on the first-parent
-     line of a DIFFERENT composition member (a branch cut FROM main_patched
-     inherits its whole line; those commits are main_patched's own work, not
-     evidence about the cut — without this exclusion anything cut from a
-     member would qualify) — is reachable from member X. Reachability of
-     second-parent/own-line commits is the test; merge-commit subjects are
-     never trusted (squash/rename fragile). This is a strengthening of the
-     originally sketched merge-edge extraction (`M^2 ∈ B` per merge M),
-     which cannot distinguish a merged-in branch from a branch cut from the
-     member after the merge.
-   - Closure: seeds = edition/* branches plus main_patched (structural — it
-     flows into every edition by construction); grow to fixpoint, prune
-     members whose evidence got claimed by later-joining members, alternate
-     until stable. All git reads (rev-list, first-parent lines, ancestry)
-     are memoized per run; real-repo cost ≈ 4-6 s for 40 branches.
-   - Qualifying branches keep the D-032b treatment: in scope, merge `main`
-     ONLY, flagged "in edition composition but no inventory entry — add
-     one". Everything else non-inventory stays ignored; explicit exclusions
-     beat the closure; `everything*` and other namespace-excluded branches
-     can never pull branches in.
+1. **Inventory contract (strict config).** The inventory is
+   `scripts/sweep/inventory/*.yaml`, one entry per file, loaded by default from
+   the repo tree; `--inventory` overrides it for tests/fixtures ONLY. It is
+   CONFIGURATION ONLY — owner-authored declarations of intent, never written by
+   the driver; removing a feature = deleting its entry. Required fields: `id`,
+   `name`, `kind` (`module`|`feat`|`edition`|`fix`|`planned`). `branch` is
+   optional: an entry WITH a branch is swept; one without is
+   planned/observational (validator rules 1-4 skip it). Legal fields:
+   `parents`, `dependents`, `summary`, `owned_paths`, `touch_paths`,
+   `key_symbols`, `symbol_watch`, `invariants`, `design_docs`, `test_anchors`,
+   `overlap_hints`, `scope_guard` (`same-files` | `conflict-hunks`),
+   `stack_cap` (integer ≥ 1), `tier_floor` (`judged` only), `always_merge`
+   (boolean), `routing` (`keywords` / `always_check_on` string lists), and
+   `prompt.extra_context` — owner-authored STANDING guidance, embedded
+   path-matched into case materials and cold-read context; never a decision
+   store (one-time adjudications live on their PRs and die with their refs).
+   Unknown keys and bad values are entry ERRORS, and `sweep start` fails hard
+   on them (ERR46_INVENTORY_INVALID), as it does on a missing or empty
+   inventory. `key_symbols` anchors may pack several symbols per line
+   (`"A / B — path"`; any hit passes validator rule 4).
+2. **Registry validator** — `validateRegistry(repo, features)`, CLI
+   `sweep.ts validate-registry`. Rules 1-5: (1) owning branch exists — ALERT;
+   (2) every `owned_paths` glob matches ≥ 1 file on the branch — ALERT;
+   (3) `test_anchors` + `design_docs` exist — ALERT; (4) `key_symbols` found
+   via `git grep -F` — WARN; (5) sweepable branch (`module/**`, `feat/**`,
+   `edition/**`, minus exclusions) without an entry — ALERT, and an
+   edition-composition branch without an entry — WARN ("add one"). Entries
+   without `branch` skip rules 1-4 (nothing on git to check them against).
+   ALERTed entries make routing fail closed.
+3. **Branch topology.** `main` only ever fast-forwards from `upstream/main`;
+   `main_patched` merges `main` — these are the ONLY upstream entry points.
+   Every other inventory branch merges its DAG **parents'** tips (inventory
+   `parents`; roots default to `[main_patched]`), parents-before-children:
+   upstream content reaches leaves exclusively through the parent chain, so a
+   conflict gates the topmost affected branch and every descendant inherits the
+   resolution via its parent merge — no re-conflicts, no duplicate PRs. A gated
+   parent's tip does not advance, so children have nothing new to merge and can
+   never overshoot. A branch with no inventory entry is IGNORED (no scan, no
+   PRs, at most one digest drift line) UNLESS it is in the edition composition
+   (item 4): such branches are swept with merge source `main` ONLY (upstream-PR
+   candidates — never polluted with main_patched/fork content) and are flagged
+   by the validator/digest until they get an inventory entry. Explicit
+   exclusions (`scope.yaml`) apply first.
+4. **The edition-composition test is TRANSITIVE and HISTORICAL.** Plain
+   tip-ancestry alone would miss the lagging case: a branch merged into
+   `main_patched`, where main_patched was historically merged into the edition
+   but the edition has not absorbed the newest tip yet. A non-inventory branch
+   qualifies if it was ever merged into any branch whose merge history
+   (transitively) reaches an `edition/*` branch:
+   - Tip-ancestry into a composition member is the cheap first check.
+   - General test (fork-era, bounded at the fork point `d85efea2` —
+     `FORK_POINT` in `config.ts`; unbounded in repos without that commit, e.g.
+     fixtures): "B was merged into X" ⇔ some commit on B's FIRST-PARENT line —
+     excluding commits reachable from `main` (pure upstream merges never
+     qualify anything) and commits on the first-parent line of a DIFFERENT
+     composition member (a branch cut FROM main_patched inherits its whole
+     line; those commits are main_patched's own work, not evidence about the
+     cut) — is reachable from member X. Reachability of second-parent/own-line
+     commits is the test; merge-commit subjects are never trusted
+     (squash/rename fragile).
+   - Closure: seeds = `edition/*` branches plus `main_patched` (structural — it
+     flows into every edition by construction); grow to fixpoint, prune members
+     whose evidence got claimed by later-joining members, alternate until
+     stable. All git reads (rev-list, first-parent lines, ancestry) are
+     memoized per run; real-repo cost ≈ 4-6 s for 40 branches.
+   - Qualifying branches are in scope, merge `main` ONLY, and are flagged "in
+     edition composition but no inventory entry — add one". Everything else
+     non-inventory stays ignored; explicit exclusions beat the closure;
+     `everything*` and other namespace-excluded branches can never pull
+     branches in.
+5. **Leave-one-out verify attribution.** The verify stage maps a red test
+   matrix to the offending branch by re-building the recipe with one branch
+   removed at a time (reverse recipe order) — deterministic and unit-testable,
+   at the cost of extra rebuilds. Reds that survive attribution become gate-fix
+   cases or stop the pass (MERGE-POLICY.md §5, §8).
+6. **Inventory candidates.** Candidates — sweepable-namespace or
+   edition-composition branches with no inventory entry — are derived FRESH
+   from git every pass: no cross-pass store, no report throttle. Each pass
+   journals them and writes the pass dir's `candidates.json`; a candidate is
+   reported every pass until the owner acts in config (an inventory entry or a
+   scope exclusion). Candidates are never merged or planned for propagation
+   (PROPAGATION.md §13).

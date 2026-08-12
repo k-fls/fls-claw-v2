@@ -27,14 +27,14 @@ Raw probe transcripts: `probes/`, full per-branch linear profiles: `profiles/`
 
 `chain.txt` = `git rev-list --first-parent --reverse main..upstream/main`
 (98 commits; line N = height N; the unit of merge is the upstream PR merge
-commit per D-011). NOTE: the "~330 pending commits" figure is total commits;
+commit). NOTE: the "~330 pending commits" figure is total commits;
 the first-parent chain has exactly 98 heads.
 
 The `#2890` hot spot is height 1 (`c87f2e55…`) and the disputed path is
 `src/cli/resources/groups.ts` — **not** `src/groups.ts` (that path does not
 exist in either tree; the briefing's path was wrong).
 
-## Schema — fields beyond the old test-case format
+## Schema — propagation-specific fields
 
 New fields needed by the propagation semantics (documented here, used in
 `cases/*.yaml`):
@@ -87,10 +87,10 @@ Only SINGLE-commit fork branches are patch-pinned. The multi-commit fork tips
 (`p2`/`p4`/`p5`/`p6`) are NOT: a patch vs `main` would be huge and fragile — if
 those branches rebase, **re-mine** the case rather than patch-pin it.
 
-## Verification quirks (inherited + new)
+## Verification quirks
 
 - Never use `--merge-base=` single-base merge-tree (multiple merge bases
-  exist between fork branch pairs; see old README).
+  exist between fork branch pairs).
 - `git merge-tree --write-tree` writes loose tree/blob objects but no refs —
   safe on a read-only repo.
 - Heights below a branch's `coverage_height` probe as trivially CLEAN

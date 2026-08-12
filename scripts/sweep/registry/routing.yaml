@@ -1,13 +1,10 @@
 # Global driver levers, read by loadRoutingConfig (scripts/sweep/registry.ts).
 # Tuning lives here so lever changes never touch code.
-#
-# The PoI -> feature-entry matcher this file used to configure (weights,
-# threshold, top_k, poi_classes, large_new_file_kb, sensitive_surfaces,
-# catch_all) went out with the `route`/`scan` commands; nothing read it.
+# Only levers with a live reader belong in this file.
 
 schemaVersion: 1
 
-# Case stacking (D-049 §2): a case is the maximal run of consecutive
+# Case stacking (MERGE-POLICY.md §2): a case is the maximal run of consecutive
 # path-intersecting conflicting heights, capped here. Per-feature override:
 # `stack_cap:` on the inventory entry (mirrors the scope-guard lever).
 stack_cap: 5

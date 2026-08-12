@@ -20,20 +20,28 @@
 # in the repo at hand is skipped quietly: it can suppress nothing.
 #
 # A MALFORMED file is LOUD (ERR45_CUT_POINTS_MALFORMED) and stops the command,
-# the ERR43_CHECKS_MALFORMED precedent. An ABSENT file is a silent skip.
+# exactly as ERR43_CHECKS_MALFORMED does for checks.json. An ABSENT file is a
+# silent skip.
+#
+# KINDS:
+#
+# DUPLICATE — a rebase/cherry-pick COPY of another branch's commit, sitting on
+# THIS branch's own first-parent line. Blame counts that line
+# (`rev-list --count --first-parent --no-merges <branch> ^main -- <file>`), so
+# without an entry the copy is credited to the copying branch and NO exclusion
+# of the original's branch can remove it.
+#
+# ABSORBED — a branch its parent has already merged down (`as_of` contains the
+# branch, remainder empty). It has NO DRIVER CONSUMER: the schema,
+# re-verification and reporting exist, but the cut-point derivation that would
+# use it is analysis, not driver code. An absorbed claim is only true until the
+# branch's next commit, so any entry of this kind should be expected to drift
+# and be dropped by re-verification.
 
 cut_point_exceptions:
-  # DUPLICATE — a rebase/cherry-pick COPY of another branch's commit, sitting on
-  # THIS branch's own first-parent line. Blame counts that line
-  # (`rev-list --count --first-parent --no-merges <branch> ^main -- <file>`), so
-  # without this entry the copy is credited to the copying branch and NO
-  # exclusion of the original's branch can remove it.
-  #
-  # Measured on the live fork 2026-07-29: `3b8c5896` and `dc3cb7f6` have the
-  # identical patch-id 25c7b6481c3a and the identical subject. `dc3cb7f6` is on
-  # module/host-rpc; `3b8c5896` is on module/credentials and on
-  # module/runtime-updater. 23 of 458 non-merge commits (5%) are duplicates of
-  # this shape.
+  # `3b8c5896` (module/credentials, module/runtime-updater) and `dc3cb7f6`
+  # (module/host-rpc) carry the identical patch-id 25c7b6481c3a and the
+  # identical subject: a rebase copy on this branch's first-parent line.
   module/credentials:
     duplicate:
       - sha: 3b8c5896
@@ -41,23 +49,3 @@ cut_point_exceptions:
         twin: dc3cb7f6
         authored_on: module/host-rpc
         why: rebase copy; excluding module/host-rpc does not remove it
-
-  # ABSORBED — REMOVED 2026-07-31, falsified by the repo it describes.
-  #
-  # The entry claimed module/crypto was absorbed into main_patched as of
-  # e4c82f34: an ancestor, remainder empty. Both halves are now false —
-  # main_patched is at 11d82a65, module/crypto is NOT an ancestor of it, and
-  # `git rev-list --count module/crypto ^main_patched` is 7, not 0. The branch
-  # carried on after the observation.
-  #
-  # The re-verification caught it on the live 2026-07-31 run and refused to
-  # apply it (WARN08_CUT_POINT_EXCEPTION_STALE, journaled), which is the
-  # file's own contract working: "NOTHING HERE IS TRUSTED ... A falsified entry
-  # is dropped with a STALE warning rather than applied." It is removed rather
-  # than corrected because a true `absorbed` claim would say nothing the
-  # topology does not already say, and nothing reads the field.
-  #
-  # `absorbed` has NO DRIVER CONSUMER: the schema, re-verification and reporting
-  # exist, but the cut-point derivation that would use it is analysis, not
-  # driver code. If a future entry is added, expect the same drift — an absorbed
-  # claim is only true until the branch's next commit.

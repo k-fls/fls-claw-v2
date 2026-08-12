@@ -10,7 +10,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-// Belt-and-braces network isolation (D-059 FINAL review, finding 1): every git
+// Belt-and-braces network isolation: every git
 // process a test spawns — the fixture helpers below AND the driver under test
 // (git.ts inherits process.env) — runs with terminal prompts off and the
 // machine-global/system config masked, so no credential manager, no global
@@ -81,7 +81,7 @@ export class FixtureRepo {
    * Fake an `origin` remote-tracking ref (refs/remotes/origin/<branch>) at
    * `at` (default: the branch itself). Lets tests simulate remote-only /
    * behind / ahead / diverged branch states without a second repo
-   * (PROPAGATION.md §13, D-045).
+   * (PROPAGATION.md §13).
    */
   setOrigin(branch: string, at?: string): string {
     const sha = this.sha(at ?? branch);
@@ -95,7 +95,7 @@ export class FixtureRepo {
   }
 
   /**
-   * Attach a REAL, pushable `origin` (D-049 push tests): a bare repo on disk,
+   * Attach a REAL, pushable `origin` (for push tests): a bare repo on disk,
    * while the configured remote URL stays github-shaped (parseGithubSlug must
    * work) — `url.<bare>.insteadOf` rewrites it for actual git transport, so
    * `git push origin …` really moves refs into the bare repo and updates the
@@ -112,7 +112,7 @@ export class FixtureRepo {
   }
 
   /**
-   * Break the origin TRANSPORT deterministically (D-059 FINAL finding 1):
+   * Break the origin TRANSPORT deterministically:
    * repoint the `url.<…>.insteadOf` rewrite from the bare repo to a DEAD LOCAL
    * path, so `git push origin …` fails locally in ~10ms with a repository-not-
    * found error (categorized `transient`). NEVER merely unset the rewrite —
@@ -231,8 +231,8 @@ export function makePropagationFixture(): {
 }
 
 /**
- * THE 2026-08-01 INCIDENT, as a repo (pass `87175bdb89ad`, case
- * `main_patched--main-h174`). Everything a sweep needs to walk straight into the
+ * THE NOT-MY-BUG DEADLOCK, as a repo. Everything a sweep needs to walk
+ * straight into the
  * deadlock `--not-my-bug` exists for, with real commits and REAL check commands:
  *
  *   main            base  groups.ts = "base", poll-loop.test.ts GREEN
@@ -246,14 +246,14 @@ export function makePropagationFixture(): {
  *
  * So the case's conflict is `src/cli/resources/groups.ts`, while the checks fail
  * on `container/agent-runner/src/poll-loop.test.ts` — a file the case never
- * touches, already red on the branch three commits before the tip, exactly as
- * upstream `3d4b349b` left it live. A bisect over `main_patched` has a genuine
+ * touches, already red on the branch three commits before the tip. A bisect
+ * over `main_patched` has a genuine
  * green anchor (P1/P2) and one right answer (P3).
  *
  * The checks are real programs, not a stubbed `ChecksRunner`: `run-tests.sh`
  * prints BUN-SHAPED output (a `<file>:` header, then `(fail)` lines under it),
- * because parsing that shape is itself part of what broke — a bun failure named
- * no file at all, so blame fell to the trunk and there was nothing to compare.
+ * because parsing that shape is itself under test — a bun failure that names
+ * no file leaves blame to fall to the trunk with nothing to compare.
  * The test file is the ONLY input, so any tree can be probed and the answer is
  * a property of that tree.
  */
@@ -322,17 +322,16 @@ export function makeNotMyBugIncidentFixture(): {
  * An install runner and a checks runner that are FUNCTIONS OF THE TREE — so a
  * broken or mismatched environment is representable in tests at all.
  *
- * Every environment bug this suite has shipped (2026-08-01 → 08-04) was found in
- * production, and could not have been found here: the stub installer just
- * `mkdir`ed `node_modules`, so a tree's environment always looked perfect
- * regardless of what its manifests said. A harness in which the bug cannot be
- * expressed is a harness that certifies its absence.
+ * A stub installer that just `mkdir`s `node_modules` makes every tree's
+ * environment look perfect regardless of what its manifests say, so no
+ * environment bug can ever surface in the suite. A harness in which the bug
+ * cannot be expressed is a harness that certifies its absence.
  *
- * `makeEnvAwareRunners` models the two failures that actually happened:
+ * `makeEnvAwareRunners` models the two environment-failure shapes that matter:
  *   - a DECLARED dependency that is not installed  → `TS2307 Cannot find module`
- *     (live: `yaml`, declared by upstream, absent from the branch's environment)
+ *     (e.g. a dependency declared upstream, absent from the branch's environment)
  *   - a NATIVE package installed without its addon → `Could not locate the
- *     bindings file` (live: `--ignore-scripts`, 76 occurrences, 0 assertions)
+ *     bindings file` (the `--ignore-scripts` shape: package present, addon absent)
  *
  * No real install, no network: `install` reads the worktree's own manifests and
  * creates exactly what they declare, and `checks` reports on what it finds on

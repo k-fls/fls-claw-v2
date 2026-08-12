@@ -13,7 +13,7 @@ checkout/merge/fetch. Inspect diffs just enough to route confidently.
 - unrouted points of interest:
 {{pois}}    <!-- each: class, paths, commit subjects, why routing scored below threshold -->
 
-## Index of ALL registered fork features (id | status | name | keywords | summary)
+## Index of ALL registered fork features (id | kind | name | keywords | summary)
 {{registry_index}}
 
 ## Decide, per PoI

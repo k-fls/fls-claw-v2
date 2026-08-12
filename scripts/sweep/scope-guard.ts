@@ -1,6 +1,6 @@
 /**
  * scripts/sweep/scope-guard.ts — the automerge-vs-resolved scope check
- * (PROPAGATION.md §7, D-038; lever added 2026-07-20).
+ * (PROPAGATION.md §7).
  *
  * On `resolve`, the driver computes `git diff --name-only <automerge-tree>
  * <resolved-tree>` and enforces the configured mode:

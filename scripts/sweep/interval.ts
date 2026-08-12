@@ -1,16 +1,15 @@
 /**
  * scripts/sweep/interval.ts — eligible-line construction (§4) and the LINEAR
- * merge-point sweep (§3, D-037).
+ * merge-point sweep (§3).
  *
  * "Merging up to height k conflicts" is NOT monotonic in k: a later upstream
  * commit can rewrite a disputed region so the tip-level three-way merge is
- * clean again. So we NEVER bisect for conflicts (that is stop-points.ts's
- * monotonicity assumption, kept for the scan forecast only). Instead: one
+ * clean again. So we NEVER bisect for conflicts. Instead: one
  * full-range merge-tree probe first (the common case — clean, one probe); on
  * conflict, a linear oldest->newest sweep, merging at the LARGEST clean height
  * (which may lie beyond intermediate conflicting heights).
  *
- * Case stacking (D-049 §2): the reported case STARTS at the smallest
+ * Case stacking (MERGE-POLICY.md §2): the reported case STARTS at the smallest
  * conflicting height above the merge point and is the MAXIMAL RUN of
  * consecutive conflicting heights whose conflicted path sets intersect (one
  * logical decision), capped (`stack_cap`, default 5). The run breaks at a
@@ -43,7 +42,7 @@ export interface BuildEligibleLineArgs {
   branchTip: string;
   parent: string;
   /**
-   * Ref to READ the parent's tip from (D-045, §13): defaults to the parent's
+   * Ref to READ the parent's tip from (§13): defaults to the parent's
    * branch name; a remote-only (materialize) parent is read as
    * `origin/<parent>` — plan-time probes never require a local ref.
    */
@@ -61,7 +60,7 @@ export interface BuildEligibleLineArgs {
  *    parent commit per distinct covered height above the branch's coverage.
  *    If the parent advanced in one big merge, intermediate heights simply do
  *    not exist — the child cannot merge them this pass (relevant to DEFERRED).
- *  - Fork-only parent content (§4, updated 2026-07-18): when the height-filtered
+ *  - Fork-only parent content (§4): when the height-filtered
  *    line would be EMPTY but the parent tip is NOT an ancestor of the child, the
  *    parent tip itself (at its derived height, which may equal the child's
  *    coverage) is the single candidate head — otherwise a fork fix merged into a
@@ -119,7 +118,7 @@ export interface MergePointResult {
   /** Largest clean head (§3 step 3); null when even the oldest head conflicts. */
   mergePoint: Head | null;
   /**
-   * The stacked conflict run ABOVE the merge point (§3 step 4, D-049 §2):
+   * The stacked conflict run ABOVE the merge point (§3 step 4; MERGE-POLICY.md §2):
    * starts at the smallest conflicting height, extends over consecutive
    * path-intersecting conflicting heights, capped. `head` is the run's TOP;
    * paths/tree are the top probe's.
@@ -142,7 +141,7 @@ function reproCommand(branch: string, headSha: string): { command: string } {
 /**
  * Linear merge-point sweep over an eligible line (§3). One full-range probe;
  * on conflict a linear oldest->newest sweep. Returns the largest clean head as
- * the merge point and the stacked conflict run above it as the case (D-049 §2):
+ * the merge point and the stacked conflict run above it as the case (MERGE-POLICY.md §2):
  * the run starts at the smallest conflicting height and extends over
  * consecutive path-intersecting conflicting heights up to `stackCap`.
  */
@@ -200,7 +199,7 @@ export async function mergePointSweep(
   for (const p of probes)
     if (p.clean && (mergePoint === null || p.head.height > mergePoint.height)) mergePoint = p.head;
 
-  // Step 4 (D-049 §2): the case run. It STARTS at the smallest conflicting
+  // Step 4 (MERGE-POLICY.md §2): the case run. It STARTS at the smallest conflicting
   // height above the merge point (when there is no clean head the floor is
   // below EVERY head — heights can be -1 (fork-only), so -Infinity, not -1, or
   // a fork-only conflict at height -1 would be missed) and STACKS consecutive

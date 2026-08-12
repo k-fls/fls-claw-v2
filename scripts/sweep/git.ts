@@ -4,8 +4,7 @@
  * All invocations go through execFile (argv arrays, no shell interpolation).
  * Conflict detection uses NEW-STYLE `git merge-tree --write-tree` (full ort,
  * virtual multi-base). NEVER pass `--merge-base=<x>`: single-base previews
- * report bogus conflicts on branches with two merge bases (verified pitfall,
- * 2026-07-01 mitm <-> onecli-broker).
+ * report bogus conflicts on branches with two merge bases.
  */
 import { execFile } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -96,7 +95,7 @@ export async function localBranches(repo: string): Promise<string[]> {
 
 /**
  * Branch names present on a remote (refs/remotes/<remote>/*, HEAD excluded),
- * WITHOUT the remote prefix. Input to the D-045 remote-branch scope rule
+ * WITHOUT the remote prefix. Input to the remote-branch scope rule
  * (PROPAGATION.md §13): an inventory branch with no local ref but an existing
  * origin/<branch> is still in scope.
  */
@@ -130,7 +129,7 @@ export interface MergeTreeResult {
  * New-style merge-tree preview. Full ort merge with virtual multi-base;
  * returns the conflicted file list without touching any worktree or index.
  *
- * DETERMINISM (2026-07-20): the written automerge tree must be reproducible
+ * DETERMINISM: the written automerge tree must be reproducible
  * across invocations, clones and user git configs, because the driver records
  * it and re-verifies against it at resolve. Two sources of nondeterminism are
  * neutralized here, the single choke point: (a) conflict-marker LINES embed the
@@ -166,10 +165,10 @@ export async function newStyleMergeTree(repo: string, ours: string, theirs: stri
  * Replay ONE commit's own delta on top of another commit — a cherry-pick preview
  * that leaves the caller's worktree and index untouched.
  *
- * WHY NOT `merge-tree --merge-base=`. That option arrived in git 2.40 and the
- * agent container runs 2.39.5, so it exits 129 ("unknown option") and took
- * `finish` down mid-publish with no SWEEP-RESULT (filed by the agent as #70).
- * Local tests could never have caught it — this box is 2.43. A cherry-pick in a
+ * WHY NOT `merge-tree --merge-base=`. That option requires git 2.40 and the
+ * agent container runs 2.39.5, where it exits 129 ("unknown option") — taking
+ * the caller down with no result. Local tests cannot catch that class of
+ * failure: dev boxes run a newer git. A cherry-pick in a
  * throwaway worktree needs nothing newer than git 2.x and expresses the intent
  * directly: take what THIS commit changed, and only that, onto `onto`.
  *
@@ -225,20 +224,11 @@ export async function replayCommitOnto(repo: string, commit: string, onto: strin
  * later (dropping `--first-parent`, following a second parent) cannot silently
  * reintroduce date ordering.
  *
- * THE FAILURE SHAPE THIS FORECLOSES, measured on the live fork 2026-07-29 —
- * `feat/mitm-credential-proxy ^main_patched` with `--first-parent` dropped:
- *
- *     position   date order (--reverse)   topological order
- *        6       9a661b02                 …
- *        8       …                        2fe44d15
- *        9       2fe44d15                 …
- *       15       …                        9a661b02
- *
- * `9a661b02` is an egress-lockdown commit AUTHORED 06-13 but COMMITTED 06-19 by
- * a rebase; `2fe44d15` is mitm's own first commit. Date order puts the rebased
- * import 3 places AHEAD of the branch's own root, topological order puts it 7
- * places behind — 9 positions apart, and NEITHER is an ancestor of the other, so
- * no consumer could have recovered the right order from the list itself.
+ * THE FAILURE SHAPE THIS FORECLOSES: once the traversal is widened, a commit
+ * whose COMMIT date was refreshed by a rebase can land in date order several
+ * positions AHEAD of the branch's own root commit, while topological order
+ * puts it behind — and when neither commit is an ancestor of the other, no
+ * consumer can recover the right order from the list itself.
  */
 export async function firstParentChain(repo: string, ref: string, not: string): Promise<string[]> {
   const res = await git(repo, ['rev-list', '--first-parent', '--topo-order', '--reverse', ref, `^${not}`]);
@@ -294,7 +284,7 @@ export async function diffText(
 }
 
 /**
- * The July-sweep technique: create a merge commit on a branch that is NOT
+ * Create a merge commit on a branch that is NOT
  * checked out anywhere, entirely via plumbing (merge-tree + commit-tree +
  * update-ref). Only valid for a CLEAN merge-tree result.
  */
@@ -319,16 +309,17 @@ export async function commitTreeMerge(
 }
 
 /**
- * Driver push (D-049 §5): move a ref on origin via `git push` — the ONLY way
- * refs move to the remote (the API is never used to fabricate refs/commits as
- * a push workaround). `src` is a committish (branch name or sha); `dstBranch`
- * the remote branch name. Never force — with ONE compare-and-swap exception
- * (D-059): a reissue republish replaces the prior resolution head on the
- * fix/sweep ref (non-fast-forward by construction), so the caller passes the
- * EXPECTED old sha as `forceWithLease` and the push succeeds only if the
- * remote ref is still exactly there (no blind force, ever). Throws GitError on
- * failure — callers journal the halt and surface ERR15_PUSH_FAILED (a D-046
- * case-2 owner report, no fallback of any kind).
+ * Driver push (MERGE-POLICY.md §5): move a ref on origin via `git push` — the
+ * ONLY way refs move to the remote (the API is never used to fabricate
+ * refs/commits as a push workaround). `src` is a committish (branch name or
+ * sha); `dstBranch` the remote branch name. Never force — with ONE
+ * compare-and-swap exception: a reissue republish replaces the prior
+ * resolution head on the fix/sweep ref (non-fast-forward by construction), so
+ * the caller passes the EXPECTED old sha as `forceWithLease` and the push
+ * succeeds only if the remote ref is still exactly there (no blind force,
+ * ever). Throws GitError on failure — callers journal the halt and surface
+ * ERR15_PUSH_FAILED (an owner report per MERGE-POLICY.md §5, no fallback of
+ * any kind).
  */
 export async function gitPush(
   repo: string,
@@ -354,9 +345,8 @@ export async function gitPushDelete(repo: string, ref: string): Promise<void> {
  *
  * The clone's origin is plain `https://github.com/...` with no credential
  * helper anywhere — not in the clone, the image, or the container config — so
- * `git push` had nothing to authenticate with and died on
- * `could not read Username for 'https://github.com'`. That is why no pass has
- * ever published: every fix/sweep ref now on origin was pushed by hand in July.
+ * a bare `git push` has nothing to authenticate with and dies on
+ * `could not read Username for 'https://github.com'`.
  *
  * The token is the SUBSTITUTE `GH_TOKEN` the credential proxy already swaps on
  * the wire for this driver's API calls; a push is the same path (HTTPS_PROXY is
