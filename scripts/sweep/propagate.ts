@@ -90,7 +90,15 @@ import {
   worktreeBranches,
 } from './git.js';
 import { CANDIDATE_STANDING_INSTRUCTION, candidateSectionLines, deriveCandidates } from './candidates.js';
-import { attributeFailure, countFailingFiles, failingLocations, parseFailingFiles } from './attribute.js';
+import {
+  attributeFailure,
+  countFailingFiles,
+  describeFingerprint,
+  failingLocations,
+  fingerprintKeys,
+  parseFailingFiles,
+  parseFailureFingerprints,
+} from './attribute.js';
 import { ROOT_BRANCH, TRUNK_BRANCH } from './hierarchy.js';
 import {
   classifyEnvironmentFault,
@@ -1342,6 +1350,26 @@ const ESCALATE_CHECKS = '[AUTO-ESCALATED: checks failing]';
 export const CHECKS_FAIL_LIMIT = 10;
 
 /**
+ * How many consecutive checks failures prove a DEAD END: distinct resolutions
+ * that all fail with the identical fingerprint set (`deadEndEvidence`).
+ *
+ * Three is the smallest number that can distinguish "the agent is converging" from
+ * "the agent is orbiting". Two identical failures are ordinary — the first fix
+ * missed. Three, each from a DIFFERENT tree, say the failure is insensitive to
+ * everything the agent has tried, which is a fact about the case and not about
+ * the agent's effort.
+ *
+ * It is EVIDENCE, not a gate. Reaching it changes no disposition, forces no
+ * tier, and does not touch `CHECKS_FAIL_LIMIT` above: the agent is told what the
+ * driver can prove and keeps every option it had, including spending the
+ * remaining attempts. A driver that decided here would be guessing at the one
+ * thing it cannot see — whether the cause is reachable from this case.
+ */
+export const DEAD_END_ATTEMPTS = 3;
+/** How many fingerprints the dead-end sentence names before it stops listing. */
+const DEAD_END_NAMED = 3;
+
+/**
  * How many times `next-case` may hand the SAME case to the agent before it says
  * so, and before it refuses.
  *
@@ -1706,18 +1734,35 @@ function shellQuote(p: string): string {
  * price and stays correct. Commands with no failing file are dropped entirely.
  */
 export function subsetCommands(commands: VerifyCommand[], files: string[]): VerifyCommand[] {
+  return subsetCommandMap(commands, files).map((m) => m.narrowed);
+}
+
+/**
+ * The same narrowing, WITH the command each narrowed one came from.
+ *
+ * A narrowed command reports itself under a different name (`bun test 'src/x.test.ts'`,
+ * not `bun test`), and every consumer downstream of a checks run — the journal's
+ * `failed`, the HELD escalation text, `--not-my-bug`'s
+ * `list.filter(c => failedNames.includes(c.cmd))` — matches those names against
+ * the CONFIGURED command list. Without the way back, a narrowed run's failure
+ * matches nothing and adjudication is handed an empty command list.
+ */
+export function subsetCommandMap(
+  commands: VerifyCommand[],
+  files: string[],
+): Array<{ from: VerifyCommand; narrowed: VerifyCommand }> {
   const norm = (cwd: string | undefined): string => (cwd ?? '').replace(/^\.\/?/, '').replace(/\/+$/, '');
   const under = (f: string, cwd: string): boolean => cwd === '' || f === cwd || f.startsWith(`${cwd}/`);
   const cwds = commands.map((c) => norm(c.cwd));
   const ownerOf = (f: string): string =>
     cwds.filter((c) => under(f, c)).sort((a, b) => b.length - a.length)[0] ?? '';
-  const out: VerifyCommand[] = [];
+  const out: Array<{ from: VerifyCommand; narrowed: VerifyCommand }> = [];
   for (const c of commands) {
     const cwd = norm(c.cwd);
     const mine = files.filter((f) => under(f, cwd) && ownerOf(f) === cwd);
     if (mine.length === 0) continue;
     if (!c.filter) {
-      out.push({ cmd: c.cmd, cwd: c.cwd });
+      out.push({ from: c, narrowed: { cmd: c.cmd, cwd: c.cwd } });
       continue;
     }
     const rel = mine.map((f) => (cwd && f.startsWith(`${cwd}/`) ? f.slice(cwd.length + 1) : f));
@@ -1725,7 +1770,7 @@ export function subsetCommands(commands: VerifyCommand[], files: string[]): Veri
     // "$`" and `$'` INSIDE the replacement text, so a path containing them would
     // rewrite the command.
     const joined = rel.map(shellQuote).join(' ');
-    out.push({ cmd: c.filter.replace('{files}', () => joined), cwd: c.cwd });
+    out.push({ from: c, narrowed: { cmd: c.filter.replace('{files}', () => joined), cwd: c.cwd } });
   }
   return out;
 }
@@ -1877,6 +1922,154 @@ function checksFailCount(journal: JournalEntry[], caseId: string): number {
     else if (e.action === 'checks-fail') count++;
   }
   return count;
+}
+
+/**
+ * The files the case's LAST failure of this kind named, since its last
+ * `checks-pass` — the set a re-run may narrow to.
+ *
+ * Per KIND, always. The narrowing assigns files to commands by cwd, so feeding
+ * typecheck's failing source files to the test list would re-run
+ * `pnpm test src/x.ts` — a path matching no test file, which exits non-zero with
+ * "No test files found" and reads as a red that nothing in the tree caused.
+ *
+ * The MOST RECENT row only. A row that named nothing (an unparseable runner)
+ * yields nothing, and the caller then runs the full list — the older row's files
+ * describe a tree two edits ago and re-running them would answer a question
+ * nobody asked.
+ */
+function priorFailingFiles(journal: JournalEntry[], caseId: string, kind: string): string[] {
+  let files: string[] = [];
+  for (const e of journal) {
+    if (e.caseId !== caseId) continue;
+    if (e.action === 'checks-pass') files = [];
+    else if (e.action === 'checks-fail' && e.kind === kind) {
+      files = Array.isArray(e.files) ? (e.files as unknown[]).filter((f): f is string => typeof f === 'string') : [];
+    }
+  }
+  return files;
+}
+
+/** One checks run for the gate, with what it cost and what it is allowed to say. */
+interface GatedChecksRun {
+  /** The verdict the gate acts on. An `ok` here can only have come from a FULL run. */
+  result: ChecksRunResult;
+  /** The commands `result.output` came from — blame re-roots by their cwd. */
+  used: VerifyCommand[];
+  /** The narrow probe, when one ran. */
+  narrow?: { files: string[]; red: boolean };
+}
+
+/**
+ * Run one checks list, re-running the PREVIOUSLY FAILING FILES first.
+ *
+ * Cost, and only cost. On attempts 2+ the overwhelmingly likely outcome is that
+ * the same files still fail, and proving that costs one test file instead of a
+ * whole suite; the full suite is then never run for a negative it already knows.
+ * A red narrow run is a complete negative — the check IS failing — so it is
+ * reported exactly as a full red would be.
+ *
+ * A GREEN NARROW RUN PROVES NOTHING and may not end the gate: the fix could have
+ * broken a file the narrowing dropped, and closing a case on the subset that was
+ * already suspect is how a regression ships. So green means "now pay for the
+ * full list", in this same invocation.
+ *
+ * That rule is STRUCTURAL, not conventional: the probe below returns a result
+ * only on its `red` arm, so no expression in this function can carry a narrow
+ * run's verdict into `ok` — the single full `runChecks` is the only source of
+ * one. A command with no `filter` (a project typecheck cannot be narrowed
+ * without dropping its tsconfig) runs whole either way; narrowing then only
+ * drops the commands that own no failing file.
+ */
+async function runGatedChecks(
+  runChecks: ChecksRunner,
+  list: VerifyCommand[],
+  baseDir: string,
+  priorFiles: string[],
+): Promise<GatedChecksRun> {
+  const map = priorFiles.length > 0 ? subsetCommandMap(list, priorFiles) : [];
+  const narrowed = map.map((m) => m.narrowed);
+  const probe = async (): Promise<{ red: true; result: ChecksRunResult } | { red: false }> => {
+    if (narrowed.length === 0) return { red: false };
+    const r = await runChecks(narrowed, baseDir);
+    return r.ok ? { red: false } : { red: true, result: r };
+  };
+  const p = await probe();
+  if (p.red) {
+    // Report the CONFIGURED command name, not the narrowed spelling. Which files
+    // were re-run is a cost decision, recorded on the `checks-fail` row as
+    // `narrowedTo`; the thing that FAILED is `bun test`, which is the name every
+    // consumer downstream — journal, escalation text, adjudication — matches on.
+    const byNarrowed = new Map(map.map((m) => [m.narrowed.cmd, m.from.cmd]));
+    const failedNames = [...new Set(p.result.failedNames.map((n) => byNarrowed.get(n) ?? n))];
+    return { result: { ...p.result, failedNames }, used: narrowed, narrow: { files: priorFiles, red: true } };
+  }
+  const result = await runChecks(list, baseDir);
+  return { result, used: list, ...(narrowed.length > 0 ? { narrow: { files: priorFiles, red: false } } : {}) };
+}
+
+/** A case whose failure has outlived three distinct resolutions unchanged. */
+interface DeadEndEvidence {
+  /** The distinct trees, oldest first. */
+  trees: string[];
+  /** The fingerprint set they all share, sorted (`fingerprintKeys`). */
+  fingerprints: string[];
+}
+
+/**
+ * PROOF that the last `DEAD_END_ATTEMPTS` resolutions did not touch the failure.
+ *
+ * Both halves are required and neither is inferable from the other:
+ *
+ *   DIFFERENT TREES — the agent actually edited between attempts. Re-reporting
+ *   the same tree fails identically by definition, and calling that a dead end
+ *   would tell an agent that has not yet tried anything to stop trying.
+ *
+ *   IDENTICAL FINGERPRINTS — the same items failed the same way in the same
+ *   places. Same FILES is not enough: a file that fails a different test, or the
+ *   same test at a different line, is a failure that MOVED, which is exactly the
+ *   sign the edits are reaching it.
+ *
+ * An empty fingerprint set is never evidence. It means the runner named nothing
+ * the parser understands, so nothing was compared — and "we could not read the
+ * output" must never be reported to the agent as "you are provably stuck".
+ */
+function deadEndEvidence(journal: JournalEntry[], caseId: string): DeadEndEvidence | null {
+  let rows: JournalEntry[] = [];
+  for (const e of journal) {
+    if (e.caseId !== caseId) continue;
+    if (e.action === 'checks-pass') rows = [];
+    else if (e.action === 'checks-fail') rows.push(e);
+  }
+  const last = rows.slice(-DEAD_END_ATTEMPTS);
+  if (last.length < DEAD_END_ATTEMPTS) return null;
+  const trees = last.map((e) => (typeof e.resolvedTree === 'string' ? e.resolvedTree : ''));
+  if (trees.some((t) => t === '') || new Set(trees).size !== trees.length) return null;
+  const sets = last.map((e) =>
+    Array.isArray(e.fingerprints) ? (e.fingerprints as unknown[]).filter((f): f is string => typeof f === 'string') : [],
+  );
+  if (sets.some((s) => s.length === 0)) return null;
+  // Journaled sorted and de-duplicated, so string equality IS set equality.
+  const first = sets[0].join('\n');
+  if (!sets.every((s) => s.join('\n') === first)) return null;
+  return { trees, fingerprints: sets[0] };
+}
+
+/**
+ * The dead end in words, for the agent that has to decide what to do about it.
+ *
+ * It states the fact and stops. No instruction to claim held, no tier, no
+ * verdict on whether the case is fixable — the driver knows the failure did not
+ * move and nothing else, and an agent told "give up" on evidence that only
+ * supports "look elsewhere" would abandon cases it could still close.
+ */
+function deadEndNote(ev: DeadEndEvidence): string {
+  const named = ev.fingerprints.slice(0, DEAD_END_NAMED).map(describeFingerprint).join('; ');
+  const more = ev.fingerprints.length > DEAD_END_NAMED ? ` (+${ev.fingerprints.length - DEAD_END_NAMED} more)` : '';
+  return (
+    ` Your last ${ev.trees.length} resolutions were different trees but ${named}${more}. ` +
+    `Nothing you changed affected it — the cause is somewhere you have not looked, or it cannot be fixed within this case.`
+  );
 }
 
 /** A HELD escalation carried from freeze to publish: prefix tag + the
@@ -8159,7 +8352,17 @@ export async function cmdSweepReportCase(
     for (const kind of ['typecheck', 'test'] as const) {
       const list = checks[kind];
       if (list.length === 0) continue;
-      const r = await runChecks(list, wtPath);
+      // `--not-my-bug` BUYS A COMPARISON, and its price is the whole population.
+      // The adjudication below measures this run's failing files against probes
+      // that run the failed commands WHOLE; a narrowed run on this side compares
+      // a file list against a full suite, and the difference between the two
+      // populations — not the trees — decides the verdict. A deadline-bound test
+      // that only fails under whole-suite load is exactly the failure the flag
+      // exists for, and it would be called flaky or pre-existing on a subset.
+      const adjudicable = cli.notMyBug && !isGateFixCase && !isReissue;
+      const narrowTo = adjudicable ? [] : priorFailingFiles(journal, caseId, kind);
+      const gated = await runGatedChecks(runChecks, list, wtPath, narrowTo);
+      const r = gated.result;
       if (r.ok) {
         // CONFIRM A GREEN THAT FOLLOWS A RED. One run cannot tell "fixed" from
         // "got lucky", and on a non-deterministic check the difference matters:
@@ -8232,8 +8435,45 @@ export async function cmdSweepReportCase(
         });
         return 1;
       }
-      appendJournal(dir, { action: 'checks-fail', caseId, resolvedTree, kind, failed: r.failedNames });
-      const n = checksFailCount(readJournal(dir), caseId);
+      // WHAT failed, at both grains, RE-ROOTED at the repo root the same way
+      // blame reads it (`rootChecksOutput`). The bun suite prints `src/x.test.ts`
+      // from its own cwd, while the narrowing assigns files to commands BY cwd
+      // prefix — an un-rooted path would be handed to the ROOT command and
+      // re-run there as a file that does not exist.
+      //
+      // FILES are what the next attempt narrows its re-run to; FINGERPRINTS are
+      // what make "the same failure again" a comparison instead of an
+      // impression. Both are journaled because both are read back from the
+      // journal, and a derivation kept only in this frame would cost a whole
+      // checks run to recover.
+      const rootedOutput = rootChecksOutput(r.output, gated.used);
+      appendJournal(dir, {
+        action: 'checks-fail',
+        caseId,
+        resolvedTree,
+        kind,
+        failed: r.failedNames,
+        files: parseFailingFiles(rootedOutput),
+        fingerprints: fingerprintKeys(parseFailureFingerprints(rootedOutput)),
+        ...(gated.narrow ? { narrowedTo: gated.narrow.files, narrowRed: gated.narrow.red } : {}),
+      });
+      const afterFail = readJournal(dir);
+      const n = checksFailCount(afterFail, caseId);
+      // Decided on the journal, which now holds this attempt, and journaled the
+      // moment it is found — whichever way the case then goes. A reader must be
+      // able to see that the driver knew, not reconstruct it from three rows of
+      // fingerprints.
+      const deadEnd = deadEndEvidence(afterFail, caseId);
+      if (deadEnd) {
+        appendJournal(dir, {
+          action: 'checks-dead-end',
+          caseId,
+          kind,
+          trees: deadEnd.trees,
+          fingerprints: deadEnd.fingerprints,
+        });
+        progress(`dead end: ${DEAD_END_ATTEMPTS} distinct trees, identical failure (${deadEnd.fingerprints.length} fingerprint(s))`);
+      }
 
       // ---- `--not-my-bug`: adjudicate the claim, then route the failure -----
       // A GATE FIX case is exempt: it has no clean prefix to compare against
@@ -8397,7 +8637,13 @@ export async function cmdSweepReportCase(
         return 0;
       }
       const id = kind === 'typecheck' ? 'ERR36_TYPECHECK_FAILED' : 'ERR40_TESTS_FAILED';
-      const detail = `${kind} failed: ${r.failedNames.join(', ')} (see ${outFile})${notMyBug.note ? ` — ${notMyBug.note}` : ''}`;
+      // The dead end rides on the ORDINARY failure payload and nowhere else. It
+      // is one more thing the agent knows on its way back into the fix loop —
+      // the id, the tier, the attempt count and the limit are all exactly what
+      // they would be without it, because what the evidence supports is
+      // "look somewhere else", and the agent is the one that can.
+      const stuck = deadEnd ? deadEndNote(deadEnd) : '';
+      const detail = `${kind} failed: ${r.failedNames.join(', ')} (see ${outFile})${notMyBug.note ? ` — ${notMyBug.note}` : ''}${stuck}`;
       console.error(`report-case [${id}]: ${detail}`);
       // The escape hatch is ADVERTISED HERE, in the same message that reports the
       // failure. This is the only moment the agent learns a check failed at all,
@@ -8429,7 +8675,8 @@ export async function cmdSweepReportCase(
             ? ` This is attempt ${n} of ${CHECKS_FAIL_LIMIT}. If you cannot name the fix from the code, do not ` +
               `spend another cycle guessing — \`report-case --tier held\` with what you found is a valid ` +
               `outcome and the diagnosis is the deliverable.`
-            : ''),
+            : '') +
+          stuck,
         tier: claimed,
         ...(notMyBug.note ? { notMyBug: { verdict: 'refused', detail: notMyBug.note, files: notMyBug.yours ?? [] } } : {}),
         issues: [...issues, { id, detail }],

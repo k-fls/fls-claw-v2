@@ -152,6 +152,284 @@ export function countFailingFiles(output: string): Map<string, number> {
   return counts;
 }
 
+/**
+ * WHAT failed, at a grain that survives an edit to the SOURCE.
+ *
+ * `countFailingFiles` answers "which files"; two attempts that fail in the same
+ * file tell you nothing about whether they failed for the same reason. A
+ * fingerprint is the identity of a single failing ITEM, chosen so that repeating
+ * it across attempts is evidence and not coincidence:
+ *
+ *   test        file + test name + the line IN THE TEST FILE + a class
+ *   typecheck   file + TS code + the normalized message, and NO line
+ *
+ * The line is in the TEST because the test is what the agent is NOT editing: it
+ * edits source, so a stable test line means the failure landed in the same place
+ * twice. When the agent edits the TEST FILE itself the line moves, the
+ * fingerprint changes, and any comparison against earlier attempts correctly
+ * resets — that is a different failure now. A tsc diagnostic points INTO the
+ * source being edited, so its line moves under it with every edit and carrying
+ * one would make every attempt look different; the normalized message carries
+ * the identity instead.
+ *
+ * NUMERIC NOISE IS STRIPPED. `[10001.43ms]` versus `[8004.12ms]`, byte offsets,
+ * "Received length: 1" — all of it varies run to run on an unchanged defect, and
+ * a fingerprint that moves with the clock proves nothing. What may NOT collapse
+ * is the CLASS: a test that times out and a test that fails an assertion are two
+ * different failures of the same test, and telling the agent "nothing you did
+ * moved it" when the failure mode changed would be false.
+ */
+export type FailureClass = 'assertion' | 'timeout' | 'throw' | 'suite-error';
+
+export interface FailureFingerprint {
+  kind: 'test' | 'typecheck';
+  /** Repo-relative, as `parseFailingFiles` reports it. */
+  file: string;
+  /** Test name; '' for a whole-file/suite failure. Empty for a diagnostic. */
+  test: string;
+  /** Line in the TEST file. Null when the runner named none, and for a diagnostic. */
+  line: number | null;
+  cls: FailureClass | null;
+  /** `TS2345` — diagnostics only. */
+  code: string;
+  /** Normalized diagnostic text — diagnostics only. */
+  message: string;
+  /** The stable serialization; the only form that is stored or compared. */
+  key: string;
+}
+
+/** Names get long (a bun suite path is a sentence); the journal is not a log. */
+const FP_NAME_CAP = 120;
+const FP_MESSAGE_CAP = 160;
+
+/** `src/x.ts(12,3): error TS2345: msg` and `src/x.ts:12:3 - error TS2345: msg`. */
+const TSC_MESSAGE = /^\s*([\w./@-]+\.[cm]?tsx?)(?:\(\d+,\d+\)|:\d+:\d+\s*-)\s*:?\s*error\s+(TS\d+):\s*(.*)$/;
+/** ` FAIL  src/x.test.ts > suite > case` — vitest names the test on the FAIL line. */
+const VITEST_FAIL_NAMED = /^\s*FAIL\s+([\w./@-]+\.[cm]?tsx?)\s+>\s+(.+?)\s*$/;
+/** `(fail) suite > case [155.42ms]`, `(error) suite`. */
+const BUN_VERDICT = /^\((fail|error)\)\s*(.*)$/;
+/** `(pass)`/`(skip)`/`(todo)` close the block above them without failing. */
+const BUN_QUIET = /^\((?:pass|skip|todo)\)/;
+/**
+ * A timeout says so in words in every runner: bun `Test "x" timed out after
+ * 5007ms`, vitest `Error: Test timed out in 5000ms.` It is tested FIRST because
+ * both spell it as an `Error:`, which would otherwise class as a throw.
+ */
+const CLS_TIMEOUT = /\btimed\s*out\b|\btimeout\b/i;
+/** bun `error: expect(received)…`, vitest `AssertionError: expected true to be false`. */
+const CLS_ASSERTION = /AssertionError|\bexpect\(|\bexpected\b.*\b(?:to|but)\b/;
+/**
+ * ANCHORED, and that is the whole defense. Test output is full of application
+ * logging (`[poll-loop] Query error: …` runs through the real capture below by
+ * the dozen) and an unanchored `error:` would class a log line as the failure.
+ */
+const CLS_THROW = /^\s*(?:[A-Za-z_$][\w$]*Error|error|Error|Uncaught|Unhandled)\b\s*:/;
+
+function classOf(line: string): FailureClass | null {
+  if (CLS_TIMEOUT.test(line)) return 'timeout';
+  if (CLS_ASSERTION.test(line)) return 'assertion';
+  if (CLS_THROW.test(line)) return 'throw';
+  return null;
+}
+
+/** Drop the numbers, keep the names: `Expected 2 arguments` -> `Expected # arguments`. */
+function normalizeMessage(msg: string): string {
+  return msg.replace(/\b\d+\b/g, '#').replace(/\s+/g, ' ').trim().slice(0, FP_MESSAGE_CAP);
+}
+
+function testKey(file: string, line: number | null, cls: FailureClass, test: string): string {
+  return `test ${file}:${line ?? '?'} ${cls} ${test.slice(0, FP_NAME_CAP)}`;
+}
+
+/**
+ * The failure fingerprints a checks run named — same input as
+ * `parseFailingFiles`, and the same rule: OUTPUT THAT NAMES NOTHING YIELDS
+ * NOTHING. An empty result means "cannot compare", never "identical"; every
+ * caller must treat it as the absence of evidence, because a runner is free to
+ * print whatever it likes and a parser that guesses would manufacture proof.
+ *
+ * Feed it the RE-ROOTED output (`rootChecksOutput`) for the same reason blame
+ * does: bun prints `src/x.test.ts` from its own cwd while the stack frame under
+ * it prints an absolute path, and only re-rooting makes the two the same file.
+ * Suffix matching below covers what re-rooting cannot.
+ *
+ * Runner shapes, all three of which must be parsed:
+ *
+ *   tsc     `src/x.ts(12,3): error TS2345: …`   line-local, one diagnostic per line
+ *   vitest  ` FAIL  src/x.test.ts > s > case`   name FIRST, then message, then frame
+ *   bun     `src/x.test.ts:` … `(fail) <name>`  file is a HEADER, the message and
+ *                                               frame come BEFORE the verdict line
+ *
+ * bun and vitest print the pieces in OPPOSITE ORDER, which is why this carries a
+ * pending block rather than reading line by line: bun's message/frame are
+ * accumulated and claimed by the `(fail)` that follows, vitest's FAIL opens a
+ * block that the following lines fill in.
+ *
+ * Duplicates are collapsed by key and nothing else. A runner that prints the
+ * same failure twice (vitest lists it in the run and again under "Failed Tests",
+ * a retry prints it once per try) does so on EVERY attempt, so the set stays
+ * identical across attempts — which is the only property the comparison needs.
+ */
+export function parseFailureFingerprints(output: string): FailureFingerprint[] {
+  const out: FailureFingerprint[] = [];
+  const seen = new Set<string>();
+  const emit = (fp: FailureFingerprint): void => {
+    if (seen.has(fp.key)) return;
+    seen.add(fp.key);
+    out.push(fp);
+  };
+  /** The failure being assembled: bun's armed file, or vitest's open FAIL. */
+  let file: string | null = null;
+  let test: string | null = null;
+  let cls: FailureClass | null = null;
+  let line: number | null = null;
+  const sameFile = (frame: string, f: string): boolean =>
+    frame === f || frame.endsWith(`/${f}`) || f.endsWith(`/${frame}`);
+  const clear = (): void => {
+    cls = null;
+    line = null;
+  };
+  /** vitest's block is only complete when something else starts. */
+  const flushVitest = (): void => {
+    if (test === null || file === null) return;
+    emit({
+      kind: 'test',
+      file,
+      test,
+      line,
+      cls: cls ?? 'throw',
+      code: '',
+      message: '',
+      key: testKey(file, line, cls ?? 'throw', test),
+    });
+    test = null;
+    file = null;
+    clear();
+  };
+  for (const raw of output.split('\n')) {
+    // `$ <cmd>` separates one command's output from the next (`defaultChecksRunner`);
+    // nothing may stay armed across it (same hazard as `countFailingFiles`).
+    if (raw.startsWith('$ ')) {
+      flushVitest();
+      file = null;
+      test = null;
+      clear();
+      continue;
+    }
+    const diag = TSC_MESSAGE.exec(raw);
+    if (diag) {
+      const f = diag[1].replace(/^\.\//, '');
+      const message = normalizeMessage(diag[3]);
+      emit({
+        kind: 'typecheck',
+        file: f,
+        test: '',
+        line: null,
+        cls: null,
+        code: diag[2],
+        message,
+        key: `ts ${f} ${diag[2]} ${message}`,
+      });
+      continue;
+    }
+    const named = VITEST_FAIL_NAMED.exec(raw);
+    if (named) {
+      flushVitest();
+      file = named[1].replace(/^\.\//, '');
+      test = named[2];
+      clear();
+      continue;
+    }
+    // ` FAIL  src/x.test.ts [ src/x.test.ts ]` with no `>` is the FILE failing to
+    // load — no test ran, so there is no test name and no line in it to have
+    // failed at.
+    const bare = VITEST_FAIL.exec(raw);
+    if (bare) {
+      flushVitest();
+      file = bare[1].replace(/^\.\//, '');
+      test = '';
+      clear();
+      cls = 'suite-error';
+      continue;
+    }
+    const header = BUN_FILE_HEADER.exec(raw);
+    if (header) {
+      flushVitest();
+      file = header[1].replace(/^\.\//, '');
+      test = null;
+      clear();
+      continue;
+    }
+    const verdict = BUN_VERDICT.exec(raw);
+    if (verdict) {
+      // A verdict with no armed header names no file — nothing to fingerprint.
+      if (file === null) continue;
+      const name = verdict[2].replace(/\s*\[[\d.]+\s*m?s\]\s*$/, '').trim();
+      // `(error)` is bun reporting a failure that is not a test's own assertion —
+      // a hook or module-scope throw. Classing it with the test's own failures
+      // would let a suite that stops loading look like the same defect as a test
+      // that runs and fails.
+      const c: FailureClass = verdict[1] === 'error' ? 'suite-error' : (cls ?? 'throw');
+      emit({
+        kind: 'test',
+        file,
+        test: name,
+        line,
+        cls: c,
+        code: '',
+        message: '',
+        key: testKey(file, line, c, name),
+      });
+      clear();
+      continue;
+    }
+    if (BUN_QUIET.test(raw)) {
+      clear();
+      continue;
+    }
+    if (file === null) continue;
+    cls ??= classOf(raw);
+    if (line === null) {
+      for (const f of raw.matchAll(STACK_FRAME)) {
+        const frame = repoRootedFrame(f[1]);
+        // ONLY the test file's own frames. The first frame of a bun trace is
+        // usually the assertion inside the test; the deeper ones are in the
+        // SOURCE the agent is editing, and taking one of those would make the
+        // fingerprint move on every edit — the exact instability this avoids.
+        if (!frame || !sameFile(frame, file)) continue;
+        line = Number(f[2]);
+        break;
+      }
+    }
+  }
+  flushVitest();
+  return out;
+}
+
+/** The journaled form: de-duplicated and SORTED, so two runs compare as strings. */
+export function fingerprintKeys(fps: FailureFingerprint[]): string[] {
+  return [...new Set(fps.map((f) => f.key))].sort();
+}
+
+/**
+ * One fingerprint key as a clause an agent can act on. Reads the KEY rather than
+ * the record because the comparison that needs this reads keys out of the
+ * journal — the records themselves belong to a run that is over. An unparseable
+ * key is returned verbatim: a slightly ugly sentence beats a thrown parse.
+ */
+export function describeFingerprint(key: string): string {
+  const t = /^test (\S+?):(\d+|\?) (\S+) ?(.*)$/.exec(key);
+  if (t) {
+    const [, file, line, cls, name] = t;
+    if (!name) return `${file} still fails to load in the same way (${cls})`;
+    if (line === '?') return `"${name}" still fails in the same way (${file}, ${cls})`;
+    return `"${name}" still fails at the same line in the same way (${file}:${line})`;
+  }
+  const d = /^ts (\S+) (TS\d+) ?(.*)$/.exec(key);
+  if (d) return `${d[1]} still reports the same ${d[2]}${d[3] ? `: ${d[3]}` : ''}`;
+  return key;
+}
+
 /** A branch that AUTHORED commits over a failing file, with why and how deep it sits. */
 export interface BranchCandidate {
   branch: string;
@@ -498,32 +776,44 @@ export function failingLocations(output: string, limit = 12): string[] {
       add(`${m[1].replace(/^\.\//, '')}:${m[2]}`);
       continue;
     }
-    // vitest frames + node stack frames: `at fn (file:line:col)`, ` ❯ file:line:col`.
-    for (const f of line.matchAll(/(?:^|\s|\()(\/?[\w./@-]+\.[cm]?tsx?):(\d+)(?::\d+)?/g)) {
-      let file = f[1].replace(/^\.\//, '');
-      if (file.includes('node_modules/')) continue; // the runner's own stack, not the defect
-      // ABSOLUTE FRAMES ARE REPO-ROOTED. Stack traces print the worktree's full
-      // path, e.g.
-      //   …/propagation/pass-<id>/<case>/worktree/src/x.ts:153
-      // — a path the agent cannot open. It names a DIFFERENT pass (the checks
-      // output is captured before the case is minted and carries the tree it ran
-      // in), and that directory does not survive a clean-slate. Everything after
-      // the worktree root is the repo-relative path the agent works in, which is what
-      // the conflict-case hunk ranges give and what `parseFailingFiles` produces.
-      const cut = file.lastIndexOf('/worktree/');
-      if (cut >= 0) {
-        file = file.slice(cut + '/worktree/'.length);
-      } else if (file.startsWith('/')) {
-        // No worktree segment: a clone root, a temp verify worktree, wherever the
-        // runner happened to be. The repo-relative part still starts at the first
-        // source directory, and naming a `src/…`/`container/…` path the agent can
-        // actually open beats dropping a real location for want of a prefix.
-        const m = /\/((?:src|container|scripts|test|tests)\/.*)$/.exec(file);
-        if (!m) continue;
-        file = m[1];
-      }
+    for (const f of line.matchAll(STACK_FRAME)) {
+      const file = repoRootedFrame(f[1]);
+      if (!file) continue;
       add(`${file}:${f[2]}`);
     }
   }
   return out;
+}
+
+/** vitest frames + node stack frames: `at fn (file:line:col)`, ` ❯ file:line:col`. */
+const STACK_FRAME = /(?:^|\s|\()(\/?[\w./@-]+\.[cm]?tsx?):(\d+)(?::\d+)?/g;
+
+/**
+ * A stack frame's path as the agent can open it — repo-relative — or null when
+ * it names nothing the agent works in.
+ *
+ * Stack traces print the worktree's FULL path, e.g.
+ *   …/propagation/pass-<id>/<case>/worktree/src/x.ts:153
+ * — unopenable twice over: it names a DIFFERENT pass (checks output is captured
+ * before the case is minted and carries the tree it ran in), and that directory
+ * does not survive a clean-slate. Everything after the worktree root is the
+ * repo-relative path, which is what the conflict-case hunk ranges give and what
+ * `parseFailingFiles` produces.
+ *
+ * With no worktree segment — a clone root, a temp verify worktree, wherever the
+ * runner happened to be — the repo-relative part still starts at the first
+ * source directory, and naming a `src/…`/`container/…` path the agent can
+ * actually open beats dropping a real location for want of a prefix. A frame in
+ * `node_modules` is the runner's own stack, not the defect.
+ */
+function repoRootedFrame(raw: string): string | null {
+  const file = raw.replace(/^\.\//, '');
+  if (file.includes('node_modules/')) return null;
+  const cut = file.lastIndexOf('/worktree/');
+  if (cut >= 0) return file.slice(cut + '/worktree/'.length);
+  if (file.startsWith('/')) {
+    const m = /\/((?:src|container|scripts|test|tests)\/.*)$/.exec(file);
+    return m ? m[1] : null;
+  }
+  return file;
 }

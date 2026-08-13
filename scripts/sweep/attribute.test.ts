@@ -19,7 +19,14 @@
  */
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { attributeFailure, blameCandidates, parseFailingFiles } from './attribute.js';
+import {
+  attributeFailure,
+  blameCandidates,
+  describeFingerprint,
+  fingerprintKeys,
+  parseFailingFiles,
+  parseFailureFingerprints,
+} from './attribute.js';
 import { type FixtureRepo, initFixtureRepo } from './fixtures.js';
 import { assertNoParentInversion, branchHierarchy, depthOf, minPathOf } from './hierarchy.js';
 import type { FeatureEntry } from './types.js';
@@ -62,6 +69,160 @@ describe('parseFailingFiles', () => {
 
   it('returns nothing for output with no recognizable diagnostics (=> caller must fall back)', () => {
     expect(parseFailingFiles('ELIFECYCLE Command failed.\nsh: 1: tsc: not found')).toEqual([]);
+  });
+});
+
+/**
+ * The fingerprint is what makes "the same failure again" a claim the driver can
+ * PROVE. Every case below is a pair: two runs that must compare equal, or two
+ * that must not. The bun blocks are the real shape — the message and the frame
+ * arrive BEFORE the `(fail)` line that names the test.
+ */
+describe('parseFailureFingerprints', () => {
+  /** A bun failure block: header, message, frame in the TEST file, verdict. */
+  function bun(over: { file?: string; message: string; line: number; test: string; verdict?: string; ms?: string }): string {
+    return [
+      `${over.file ?? 'src/a.test.ts'}:`,
+      over.message,
+      `      at <anonymous> (/w/propagation/pass-abc/case/worktree/${over.file ?? 'src/a.test.ts'}:${over.line}:20)`,
+      `(${over.verdict ?? 'fail'}) ${over.test} [${over.ms ?? '155.42'}ms]`,
+    ].join('\n');
+  }
+
+  it('the same test timing out at two DIFFERENT durations is ONE fingerprint — the clock is not the defect', () => {
+    const slow = bun({ message: 'error: Test "waits for the queue" timed out after 8004ms', line: 42, test: 'queue > waits for the queue', ms: '8004.12' });
+    const slower = bun({ message: 'error: Test "waits for the queue" timed out after 10001ms', line: 42, test: 'queue > waits for the queue', ms: '10001.43' });
+    expect(fingerprintKeys(parseFailureFingerprints(slow))).toEqual(fingerprintKeys(parseFailureFingerprints(slower)));
+    expect(fingerprintKeys(parseFailureFingerprints(slow))).toEqual(['test src/a.test.ts:42 timeout queue > waits for the queue']);
+  });
+
+  it('an ASSERTION and a TIMEOUT of the same test at the same line are DIFFERENT — the failure mode changed', () => {
+    const assertion = bun({ message: 'error: expect(received).toHaveLength(expected)', line: 42, test: 'queue > waits for the queue' });
+    const timeout = bun({ message: 'error: Test "waits for the queue" timed out after 5000ms', line: 42, test: 'queue > waits for the queue' });
+    expect(fingerprintKeys(parseFailureFingerprints(assertion))).not.toEqual(fingerprintKeys(parseFailureFingerprints(timeout)));
+  });
+
+  it('editing the TEST FILE moves the line and therefore the fingerprint — the comparison resets', () => {
+    const before = bun({ message: 'error: expect(received).toBe(expected)', line: 42, test: 'queue > waits' });
+    const after = bun({ message: 'error: expect(received).toBe(expected)', line: 47, test: 'queue > waits' });
+    expect(fingerprintKeys(parseFailureFingerprints(before))).toEqual(['test src/a.test.ts:42 assertion queue > waits']);
+    expect(fingerprintKeys(parseFailureFingerprints(after))).toEqual(['test src/a.test.ts:47 assertion queue > waits']);
+  });
+
+  it('output that names nothing yields an EMPTY set — the caller must read that as "cannot compare"', () => {
+    expect(parseFailureFingerprints('ELIFECYCLE Command failed.\nsh: 1: tsc: not found')).toEqual([]);
+    expect(parseFailureFingerprints('')).toEqual([]);
+    // A verdict with no file header above it names nothing either.
+    expect(parseFailureFingerprints('(fail) an orphaned verdict [1.00ms]')).toEqual([]);
+  });
+
+  it('the REAL bun capture: file from the header, line from the absolute frame, class from the message', () => {
+    // Verbatim from a gate-fix case's test-output.full.txt: the failure sits
+    // under dozens of the suite's own log lines, and the frame is an absolute
+    // worktree path belonging to a pass that no longer exists.
+    const out = [
+      'src/poll-loop.test.ts:',
+      '[poll-loop] Query error: API rate limit exceeded',
+      '[task-script] [t-err] error: Command failed: bash /tmp/task-script-t-err.sh',
+      '649 |     expect(nudges).toHaveLength(2);',
+      '                         ^',
+      'error: expect(received).toHaveLength(expected)',
+      '',
+      'Expected length: 2',
+      'Received length: 1',
+      '',
+      '      at <anonymous> (/workspace/agent/propagation/pass-639577c30456/gate-fix-main_patched-65026160/worktree/container/agent-runner/src/poll-loop.test.ts:649:20)',
+      '(fail) task-run turn wiring (real processQuery) > logs a second task run [155.42ms]',
+      ' 144 pass',
+      ' 1 fail',
+    ].join('\n');
+    expect(fingerprintKeys(parseFailureFingerprints(out))).toEqual([
+      'test src/poll-loop.test.ts:649 assertion task-run turn wiring (real processQuery) > logs a second task run',
+    ]);
+    // The suite's own `error:` logging is bracketed, so it never becomes the class.
+    expect(parseFailureFingerprints(out)[0].cls).toBe('assertion');
+  });
+
+  it('a TYPECHECK diagnostic carries NO line — the diagnostic points into the source being edited', () => {
+    const at343 = "src/command-gate.ts(343,45): error TS2345: Argument of type 'string | null' is not assignable to parameter of type 'string'.";
+    const at351 = "src/command-gate.ts(351,45): error TS2345: Argument of type 'string | null' is not assignable to parameter of type 'string'.";
+    expect(fingerprintKeys(parseFailureFingerprints(at343))).toEqual(fingerprintKeys(parseFailureFingerprints(at351)));
+    expect(fingerprintKeys(parseFailureFingerprints(at343))).toEqual([
+      "ts src/command-gate.ts TS2345 Argument of type 'string | null' is not assignable to parameter of type 'string'.",
+    ]);
+  });
+
+  it('a diagnostic message keeps the NAMES and drops the numbers, in either tsc spelling', () => {
+    const bracket = 'src/x.ts(12,3): error TS2554: Expected 2 arguments, but got 3.';
+    const colon = 'src/x.ts:99:1 - error TS2554: Expected 4 arguments, but got 1.';
+    expect(fingerprintKeys(parseFailureFingerprints(bracket))).toEqual(fingerprintKeys(parseFailureFingerprints(colon)));
+    expect(fingerprintKeys(parseFailureFingerprints(bracket))).toEqual(['ts src/x.ts TS2554 Expected # arguments, but got #.']);
+    // A DIFFERENT code in the same file is a different failure.
+    expect(fingerprintKeys(parseFailureFingerprints('src/x.ts(12,3): error TS2322: Type X is not assignable'))).toEqual([
+      'ts src/x.ts TS2322 Type X is not assignable',
+    ]);
+  });
+
+  it('vitest names the test FIRST and fills in the class and line from the lines under it', () => {
+    const out = [
+      ' FAIL  src/cli/groups.create.test.ts > groups > errors when required fields are missing',
+      'AssertionError: expected true to be false',
+      ' ❯ src/cli/groups.create.test.ts:85:21',
+      ' ❯ node_modules/vitest/dist/chunk.js:99:1',
+    ].join('\n');
+    expect(fingerprintKeys(parseFailureFingerprints(out))).toEqual([
+      'test src/cli/groups.create.test.ts:85 assertion groups > errors when required fields are missing',
+    ]);
+  });
+
+  it('a file that fails to LOAD is a suite-error, never the same failure as a test that ran and failed', () => {
+    const collect = ' FAIL  src/guard/conformance.test.ts [ src/guard/conformance.test.ts ]\nError: Cannot find module ./missing';
+    expect(fingerprintKeys(parseFailureFingerprints(collect))).toEqual(['test src/guard/conformance.test.ts:? suite-error ']);
+    const ran = bun({ file: 'src/guard/conformance.test.ts', message: 'error: expect(received).toBe(expected)', line: 9, test: 'conforms' });
+    expect(fingerprintKeys(parseFailureFingerprints(collect))).not.toEqual(fingerprintKeys(parseFailureFingerprints(ran)));
+  });
+
+  it('bun `(error)` — a hook or module-scope throw — is a suite-error, not the test`s own failure', () => {
+    const out = bun({ message: 'error: boom in beforeAll', line: 3, test: 'queue', verdict: 'error' });
+    expect(parseFailureFingerprints(out)[0].cls).toBe('suite-error');
+  });
+
+  it('a header does not stay armed across a `$ <cmd>` boundary, and each command keeps its own file', () => {
+    const out = [
+      '$ bun test',
+      'src/a.test.ts:',
+      'error: expect(received).toBe(expected)',
+      '      at <anonymous> (/w/worktree/src/a.test.ts:5:1)',
+      '(fail) a > one',
+      '$ pnpm test',
+      '(fail) belongs to the NEXT command',
+    ].join('\n');
+    expect(fingerprintKeys(parseFailureFingerprints(out))).toEqual(['test src/a.test.ts:5 assertion a > one']);
+  });
+
+  it('the keys are SORTED and de-duplicated, so two runs compare as strings', () => {
+    const out = [
+      bun({ file: 'src/z.test.ts', message: 'error: expect(received).toBe(expected)', line: 2, test: 'z' }),
+      bun({ file: 'src/a.test.ts', message: 'error: expect(received).toBe(expected)', line: 1, test: 'a' }),
+      // The same failure printed twice (a retry, or a reporter that lists it again).
+      bun({ file: 'src/a.test.ts', message: 'error: expect(received).toBe(expected)', line: 1, test: 'a' }),
+    ].join('\n');
+    expect(fingerprintKeys(parseFailureFingerprints(out))).toEqual([
+      'test src/a.test.ts:1 assertion a',
+      'test src/z.test.ts:2 assertion z',
+    ]);
+  });
+
+  it('describeFingerprint turns a key back into a clause, and never throws on one it cannot read', () => {
+    expect(describeFingerprint('test src/a.test.ts:42 assertion queue > waits')).toBe(
+      '"queue > waits" still fails at the same line in the same way (src/a.test.ts:42)',
+    );
+    expect(describeFingerprint('test src/a.test.ts:? timeout queue > waits')).toBe(
+      '"queue > waits" still fails in the same way (src/a.test.ts, timeout)',
+    );
+    expect(describeFingerprint('test src/a.test.ts:? suite-error ')).toBe('src/a.test.ts still fails to load in the same way (suite-error)');
+    expect(describeFingerprint('ts src/x.ts TS2345 not assignable')).toBe('src/x.ts still reports the same TS2345: not assignable');
+    expect(describeFingerprint('something else entirely')).toBe('something else entirely');
   });
 });
 

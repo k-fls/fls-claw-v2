@@ -25,6 +25,7 @@ import { initFixtureRepo, type FixtureRepo } from './fixtures.js';
 import { isAncestor } from './git.js';
 import {
   CHECKS_FAIL_LIMIT,
+  DEAD_END_ATTEMPTS,
   cmdPublish,
   cmdSweepAbort,
   cmdSweepFinish,
@@ -1527,6 +1528,262 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     expect(machineState(dir).phase).toBe('case-ready');
     const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string };
     expect(res.instruction).toContain('src/x.ts');
+  });
+
+  // ---- the DEAD END: evidence, not a gate ---------------------------------
+  //
+  // Three distinct trees that fail identically say the agent's edits are not
+  // reaching the cause. The driver can prove that and nothing more, so it says
+  // exactly that and leaves every decision where it was.
+
+  /** A prior failure carrying the fields the dead-end comparison reads. */
+  function seedFingerprintedFailure(dir: string, caseId: string, tree: string, fingerprints: string[]): void {
+    appendFileSync(
+      join(dir, 'journal.jsonl'),
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        action: 'checks-fail',
+        caseId,
+        kind: 'typecheck',
+        failed: ['tsc --noEmit'],
+        resolvedTree: tree,
+        fingerprints,
+      }) + '\n',
+    );
+  }
+  /** What `namingRunner(_, 'src/util.ts')`'s output fingerprints to. */
+  const UTIL_FP = ['ts src/util.ts TS2345 boom'];
+
+  it('3 DISTINCT trees failing identically -> the evidence is stated, and NOTHING about the disposition changes', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    seedFingerprintedFailure(dir, caseId, 'seed-tree-1', UTIL_FP);
+    seedFingerprintedFailure(dir, caseId, 'seed-tree-2', UTIL_FP);
+    const r = namingRunner(['tsc --noEmit'], 'src/util.ts');
+    const out = join(ws, 'rc.json');
+    // The same exit code as any other checks failure — one more sentence on the
+    // ordinary payload, not a new outcome.
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        neverInvoked,
+        r.fn,
+      ),
+    ).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      instruction: string;
+      tier: string;
+      issues: Array<{ id: string; detail: string }>;
+    };
+    expect(res.instruction).toContain(`Your last ${DEAD_END_ATTEMPTS} resolutions were different trees but`);
+    expect(res.instruction).toContain('src/util.ts still reports the same TS2345');
+    expect(res.instruction).toContain('the cause is somewhere you have not looked');
+    // The same sentence on the issue detail, which is what the owner reads.
+    expect(res.issues.find((i) => i.id === 'ERR36_TYPECHECK_FAILED')!.detail).toContain('Nothing you changed affected it');
+    // INFORMATION ONLY: the tier is still the agent's claim, the id is the
+    // ordinary one, the phase is unmoved and nothing was frozen.
+    expect(res.tier).toBe('mechanical');
+    expect(machineState(dir).phase).toBe('case-ready');
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
+    // The rope is the same length: this is attempt 3 of 10.
+    expect(CHECKS_FAIL_LIMIT).toBe(10);
+    expect(journal.filter((e) => e.action === 'checks-fail' && e.caseId === caseId)).toHaveLength(DEAD_END_ATTEMPTS);
+    // A reader of the journal can see the driver knew.
+    const stuck = journal.find((e) => e.action === 'checks-dead-end' && e.caseId === caseId)!;
+    expect(stuck).toBeTruthy();
+    expect(stuck.fingerprints).toEqual(UTIL_FP);
+    expect(stuck.trees).toHaveLength(DEAD_END_ATTEMPTS);
+  });
+
+  it('the SAME tree re-reported is not evidence — an agent that has not edited has proved nothing', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    seedFingerprintedFailure(dir, caseId, 'same-tree', UTIL_FP);
+    seedFingerprintedFailure(dir, caseId, 'same-tree', UTIL_FP);
+    const r = namingRunner(['tsc --noEmit'], 'src/util.ts');
+    const out = join(ws, 'rc.json');
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+      neverInvoked,
+      r.fn,
+    );
+    expect((JSON.parse(readFileSync(out, 'utf8')) as { instruction: string }).instruction).not.toContain('different trees');
+    expect(readJournal(dir).some((e) => e.action === 'checks-dead-end')).toBe(false);
+  });
+
+  it('a failure that MOVED is not evidence — different fingerprints mean the edits are reaching it', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    seedFingerprintedFailure(dir, caseId, 'seed-tree-1', ['ts src/util.ts TS2322 something else']);
+    seedFingerprintedFailure(dir, caseId, 'seed-tree-2', UTIL_FP);
+    const r = namingRunner(['tsc --noEmit'], 'src/util.ts');
+    const out = join(ws, 'rc.json');
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+      neverInvoked,
+      r.fn,
+    );
+    expect((JSON.parse(readFileSync(out, 'utf8')) as { instruction: string }).instruction).not.toContain('different trees');
+    expect(readJournal(dir).some((e) => e.action === 'checks-dead-end')).toBe(false);
+  });
+
+  it('an EMPTY fingerprint set is never evidence — "we could not read the output" is not "you are stuck"', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    // Three distinct trees, and a runner that names nothing in any of them.
+    seedFingerprintedFailure(dir, caseId, 'seed-tree-1', []);
+    seedFingerprintedFailure(dir, caseId, 'seed-tree-2', []);
+    const r = runner(['tsc --noEmit']);
+    const out = join(ws, 'rc.json');
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+      neverInvoked,
+      r.fn,
+    );
+    const journal = readJournal(dir);
+    expect(journal.filter((e) => e.action === 'checks-fail' && e.caseId === caseId).pop()!.fingerprints).toEqual([]);
+    expect((JSON.parse(readFileSync(out, 'utf8')) as { instruction: string }).instruction).not.toContain('different trees');
+    expect(journal.some((e) => e.action === 'checks-dead-end')).toBe(false);
+  });
+
+  // ---- NARROW RE-RUNS: cost only, and never a pass -------------------------
+
+  /** A checks file whose test command can be narrowed to a file list. */
+  function filterableChecks(ws: string): string {
+    const f = join(ws, 'checks-filter.json');
+    writeFileSync(
+      f,
+      JSON.stringify({
+        typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }],
+        test: [{ cmd: 'vitest run', cwd: '.', filter: 'vitest run {files}' }],
+      }),
+    );
+    return f;
+  }
+  /** Seed the previous attempt's failing FILES — what a re-run may narrow to. */
+  function seedFailingFiles(dir: string, caseId: string, files: string[]): void {
+    appendFileSync(
+      join(dir, 'journal.jsonl'),
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        action: 'checks-fail',
+        caseId,
+        kind: 'test',
+        failed: ['vitest run'],
+        resolvedTree: 'seed-tree-1',
+        files,
+        fingerprints: [],
+      }) + '\n',
+    );
+  }
+
+  it('a GREEN narrow run does not end the gate: the FULL list runs before any pass verdict', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = filterableChecks(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    seedFailingFiles(dir, caseId, ['src/x.test.ts']);
+    const r = runner([]);
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        confirm,
+        r.fn,
+      ),
+    ).toBe(0);
+    // typecheck (no filter, nothing to narrow), then the narrowed test run, then
+    // the FULL list, and only then the flake confirmation of the green.
+    expect(r.ran).toEqual([['tsc --noEmit'], ["vitest run 'src/x.test.ts'"], ['vitest run'], ['vitest run']]);
+    const narrowAt = r.ran.findIndex((l) => l[0].includes('src/x.test.ts'));
+    expect(r.ran.findIndex((l, i) => i > narrowAt && l[0] === 'vitest run')).toBeGreaterThan(narrowAt);
+    // The pass could only have come after the full run.
+    expect(readJournal(dir).some((e) => e.action === 'checks-pass' && e.caseId === caseId)).toBe(true);
+  });
+
+  it('a RED narrow run is the whole answer: no full suite, and it reports the CONFIGURED command', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = filterableChecks(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    seedFailingFiles(dir, caseId, ['src/x.test.ts']);
+    const r = runner(["vitest run 'src/x.test.ts'"]);
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        neverInvoked,
+        r.fn,
+      ),
+    ).toBe(1);
+    // The full suite was never paid for — the narrow red already proves the red.
+    expect(r.ran).toEqual([['tsc --noEmit'], ["vitest run 'src/x.test.ts'"]]);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string; detail: string }> };
+    const err = res.issues.find((i) => i.id === 'ERR40_TESTS_FAILED')!;
+    // `vitest run` is what failed; which files were re-run was a cost decision,
+    // and every consumer downstream matches the configured spelling.
+    expect(err.detail).toContain('test failed: vitest run (see');
+    expect(err.detail).not.toContain("vitest run 'src/x.test.ts'");
+    const row = readJournal(dir).filter((e) => e.action === 'checks-fail' && e.caseId === caseId).pop()!;
+    expect(row.failed).toEqual(['vitest run']);
+    expect(row.narrowedTo).toEqual(['src/x.test.ts']);
+    expect(row.narrowRed).toBe(true);
+  });
+
+  it('`--not-my-bug` turns narrowing OFF — that comparison is only valid between whole populations', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = filterableChecks(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    seedFailingFiles(dir, caseId, ['src/util.ts']);
+    const r = namingRunner(['vitest run'], 'src/util.ts');
+    const out = join(ws, 'rc.json');
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+      neverInvoked,
+      r.fn,
+      fakeInstall,
+    );
+    // The gate's own run is the FULL list, even though a prior attempt named
+    // files it could have narrowed to. The adjudication's probes narrow on BOTH
+    // sides of their own comparison; this side may not.
+    expect(r.ran[0]).toEqual(['tsc --noEmit']);
+    expect(r.ran[1]).toEqual(['vitest run']);
+  });
+
+  it('with no previous failure there is nothing to narrow to — the first attempt runs whole', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = filterableChecks(ws);
+    const { dir } = await toResolvedCase(repo, ws, inv, checks);
+    expect(dir).toBeTruthy();
+    const r = runner(['vitest run']);
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        neverInvoked,
+        r.fn,
+      ),
+    ).toBe(1);
+    expect(r.ran).toEqual([['tsc --noEmit'], ['vitest run']]);
   });
 });
 

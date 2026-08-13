@@ -898,6 +898,31 @@ failed reset is `ERR44_WORKTREE_RESET_FAILED`, never a "pristine" exhibit built
 from a tree nobody reset. For a gate fix the same limit KEEPS the attempted fix
 and freezes HELD ACTIVE instead (§9.3).
 
+A re-run after a failure is NARROWED to the files that failed, through each
+command's `filter` (`bun test {files}`) — for cost, and for nothing else. A
+narrow run that is RED is the whole answer, since the check is failing either
+way; a narrow run that is GREEN proves nothing about the files it dropped, so the
+FULL list runs in the same `report-case` invocation and only its result can pass
+the gate. A command with no `filter` (a project typecheck cannot be narrowed
+without dropping its tsconfig) runs whole. `--not-my-bug` turns narrowing off for
+that invocation: its adjudication measures this run against whole-suite probes,
+and a subset on one side would decide the verdict by population instead of by
+tree.
+
+Every failure is FINGERPRINTED (`parseFailureFingerprints` in `attribute.ts`) and
+the sorted set journaled on the `checks-fail` row — per failing test, its file +
+name + the line IN THE TEST FILE + a class (`assertion`, `timeout`, `throw`,
+`suite-error`), with numeric noise stripped so two timeouts of different
+durations are one fingerprint while an assertion is never the same as a timeout;
+per typecheck diagnostic, file + TS code + normalized message and NO line, since
+that line points into the source being edited and moves with every edit. When the
+last `DEAD_END_ATTEMPTS` (3) failures came from THREE DIFFERENT trees with an
+identical, non-empty fingerprint set, the driver journals `checks-dead-end` and
+appends one sentence to the ERR36/ERR40 payload naming what has not moved. It is
+EVIDENCE, not a gate: no tier, no disposition, no change to `CHECKS_FAIL_LIMIT` —
+the agent still decides what to do about it. An empty fingerprint set never
+qualifies; output nobody could parse is proof of nothing.
+
 Two classifiers sit on the failure path even without `--not-my-bug`:
 
 - **Non-determinism** — checks that pass after a previous `checks-fail` on the
