@@ -178,15 +178,13 @@ bootstrap snapshot `scripts/sweep/bootstrap/fork-registry@<hash>/features`
 machine state, so no later command takes the flag (§6.1).
 
 Required fields: `id`, `name`, `kind` (`module` | `feat` | `edition` | `fix` |
-`planned`), `status` (`planned` | `in-progress` | `shipped` | `experimental` |
-`absorbed` | `retired`). `branch` is required unless `status: planned`. Legal
-optional fields: `parents`, `dependents`, `summary`, `owned_paths`,
-`touch_paths`, `key_symbols`, `symbol_watch`, `invariants`, `design_docs`,
-`test_anchors`, `overlap_hints`, `scope_guard` (`same-files` |
-`conflict-hunks`), `stack_cap` (integer ≥ 1), `tier_floor` (`judged` only),
-`always_merge` (boolean), `routing` (`keywords` / `always_check_on` string
-lists), `prompt` (`template`, `extra_context`, `decided_paths`) and
-`maintenance` (`owner`, `last_verified`, `verified_against`, `notes`).
+`planned`). `branch` is optional: present means the entry is swept, absent means
+planned. Legal optional fields: `parents`, `dependents`, `summary`,
+`owned_paths`, `key_symbols`, `design_docs`, `test_anchors`, `scope_guard`
+(`same-files` | `conflict-hunks`), `stack_cap` (integer ≥ 1), `tier_floor`
+(`judged` only), `always_merge` (boolean) and `routing` (`keywords` /
+`always_check_on` string lists). Any other key is an entry error: the inventory
+carries no prose addressed to the agent and no record of a decision.
 
 `key_symbols` anchors may pack several symbols per line (`"A / B — path"`); any
 hit satisfies validator rule 4.
@@ -196,22 +194,14 @@ missing required field, a bad `kind`/`status`, or a missing `branch` on a
 non-planned entry is DROPPED with a load warning, and the rest of the inventory
 is used. Unknown keys are not rejected.
 
-**Standing records.** `prompt.extra_context` is owner-authored STANDING
-guidance — never a decision store; one-time adjudications live on their PRs and
-die with their refs. The driver embeds records into case materials and cold-read
-context MECHANICALLY (§6.3): entries matching the case branch or parent, entries
-whose `owned_paths` prefix-match a conflicted path, and entries whose
-`extra_context` names a conflicted path verbatim, each contributing its summary,
-`owned_paths`, `decided_paths` and the path-relevant slice of `extra_context`
-(capped). `prompt.decided_paths` (plus paths named verbatim in `extra_context`)
-also drives `ERR05_DECIDED_ALREADY`: a case whose conflicted paths hit a recorded
-decision is told to apply that decision rather than re-ask the owner.
+**Inventory context in case materials.** The driver embeds entries MECHANICALLY
+(§6.3): those matching the case branch or parent, and those whose `owned_paths`
+prefix-match a conflicted path. Each contributes its summary and `owned_paths`.
+The inventory states WHOSE code a case is in; it carries no prose telling the
+agent how to resolve anything, and nothing in it records a decision.
 
-Repo-wide resolution conventions that no single entry can carry live here:
-
-- **R1 migration numbering** — for `src/db/migrations/**` numbering collisions,
-  the fork side-numbers its migrations (`NN-fls-MM` files / `flsMigrationNNN`
-  symbols): renumber the FORK migration, never upstream's.
+Fork-wide conventions the agent must respect are doctrine, not driver config:
+`scripts/sweep/doctrine/FORK-CONVENTIONS.md`.
 
 ### 3.2 The validator
 
@@ -816,9 +806,9 @@ Branch order, first match wins:
    for the owner with no PR yet, so "resolve that case" is impossible; a terminal
    `held-duplicate` disposition drains the open case, opens no PR of its own (this
    case inherits the twin's held PR) and reopens descendants.
-2. **Adequacy block** — `ERR05_DECIDED_ALREADY` (§3.1) and `ERR06_DUPLICATE_CASE`.
-   Both are skipped for a reissue: its PR already exists, and re-litigating
-   adequacy would re-open a settled question inside a live review.
+2. **Adequacy block** — `ERR06_DUPLICATE_CASE`. Skipped for a reissue: its PR
+   already exists, and re-litigating adequacy would re-open a settled question
+   inside a live review.
 3. **Conflicts present + claim ≠ held** → `ERR32_UNRESOLVED`.
 4. **Claim `held` + conflicts present (a still-PRISTINE conflict)** → the worktree
    is reset to the pristine conflict and the case is frozen as a HELD DRAFT,
@@ -1017,7 +1007,7 @@ from one probe cannot decide the next.
 
 Every stage emits `SWEEP-STEP:` progress and journals (`not-my-bug`,
 `not-my-bug-owner`, `not-my-bug-bisect` with the probe log, plus
-`not-my-bug-environment`, `not-my-bug-premature`, `not-my-bug-preserved`,
+`not-my-bug-environment`, `not-my-bug-premature`, `not-my-bug-discarded`,
 `scope-widened`, `gate-fix-root-clamped`). The result carries a `notMyBug` block
 plus `introducedBy`. The proceed arm carries `WARN09_GATE_FIX_SERVED` — never an
 `ERR` id.
@@ -1606,7 +1596,6 @@ escalation's publish issues are written to `publish-<case>.json` and quoted into
 |---|---|---|
 | `ERR01_CASE_NOT_OPEN` | publish, `report-pr` | the case has no open disposition to publish against — never journaled, resolved at another tier, or `report-pr` run outside phase `awaiting-pr` |
 | `ERR02_CASE_STALE` | `report-case`, `report-pr`, publish | re-verification failed: branch ref gone, the held head is already an ancestor of the tip, the conflict re-probes clean, the path set drifted, the judged merge left the branch, or the case worktree is missing |
-| `ERR05_DECIDED_ALREADY` | `report-case` (once per case), publish | a conflicted path is covered by an inventory entry's `prompt.decided_paths` or is named verbatim in its `extra_context`; skipped for reissues and for a judged disposition, since applying the record as judged IS the prescribed action |
 | `ERR06_DUPLICATE_CASE` | `report-case`, publish | another non-superseded case with the same conflict signature (same path set + head sha, identical conflict blobs, or a subset with matching shared blobs) is published, held-and-topmost, or undispositioned-and-topmost |
 | `ERR07_PR_EXISTS` | publish | a `pr-published` journal row already exists for this case |
 | `ERR08_TEXT_MISSING` | `report-pr`, publish | `pr/body.md` has no resolvable H1 title + body (or the legacy `pr/title.txt`/`pr/body.md` pair is empty) |

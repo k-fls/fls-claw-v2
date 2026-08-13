@@ -48,6 +48,10 @@ Run the sweep when the owner asks and when the schedule fires; analysis never
 waits for permission, and you never ask permission for work this document
 authorizes.
 
+Run every sweep command from the clone root:
+
+    cd /workspace/agent/repo && pnpm exec tsx scripts/sweep/sweep-machine.ts <command>
+
 The clone persists between sessions. An open pass lives in `./propagation/pass-*/`
 and everything about origin is re-derived from origin; no other file is sweep
 state.

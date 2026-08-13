@@ -122,8 +122,12 @@ through `report-case`; make one reading pass with order, shared state, and timin
 mind, then either fix or claim `held` with your diagnosis.
 
 Every materials file ends with the same contract line: after editing, run the
-typechecks yourself and fix what they report; never run the tests — `report-case` runs
-them itself.
+typechecks yourself and fix what they report; never run the test suites. A hook
+refuses them, and `report-case` runs them for you.
+
+You never state that a check passes. `report-case` is the only thing that knows,
+and saying it before that command has answered is a claim about work you did not
+do. Report what the result told you, nothing more.
 
 ## 5. What governs a resolution
 
@@ -138,6 +142,11 @@ the constraint.
 The inventory entries printed in your materials carry identity, not instruction: which
 feature owns a branch, what it owns, and what it summarises. Read them to know whose
 code you are in. They will never tell you how to resolve anything.
+
+Two more things bind you, both written down because a single conflict does not
+show them: the standing guidance printed in your materials, and the fork
+conventions in `scripts/sweep/doctrine/FORK-CONVENTIONS.md`. Read that file once
+per sweep; it is short.
 
 Nothing you remember from another case, and nothing you find on an old pull request,
 governs this one. If you cannot establish what constrains the answer, that is exactly
@@ -160,10 +169,17 @@ case. Fix the failure there and re-run `report-case`; the reviewer is told those
 were added and why.
 
 In a gate-fix case your scope is the named files plus whatever fixing them directly
-forces — a signature you must change, a caller you must update. Reach beyond the failing
-files is legitimate when the failure explains it, but it caps the case at `held`: a fix
-confined to the named files can land as `judged`, one that reaches further goes to the
-owner.
+forces — a signature you must change, a caller you must update. A failing test names
+the TEST, not the source: when the defect is in the code those files exercise, fix it
+THERE. That is expected, not a violation — the driver measures the reach and tells the
+reviewer why those files were touched. It caps the case at `held`, which means the
+owner approves your fix instead of you merging it, and a held pull request carrying a
+working fix is the best outcome this case type has. A fix confined to the named files
+can land as `judged`.
+
+Claim `held` with an unchanged worktree only when the fix cannot be made here at all:
+it needs an owner decision, it belongs to upstream, or it is outside this repository.
+Then your diagnosis is the deliverable.
 
 Do not reformat, tidy, rename, or improve anything you were not asked to change. Do not
 commit or stage anything. Leave no conflict markers behind unless you are deliberately

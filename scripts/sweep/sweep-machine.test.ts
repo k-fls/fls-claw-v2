@@ -1160,11 +1160,11 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     // every round until the ten-strike backstop — the 08-01 deadlock, restored.
     expect(supersededCaseIds(journal).has(gateFix!.caseId as string)).toBe(false);
     expect(openCases(journal).map((c) => c.caseId)).toContain(gateFix!.caseId);
-    // The agent's resolution is PINNED, not discarded: reopening rebuilds the
-    // worktree from the automerge tree, and nothing else references that tree.
-    const preserved = journal.find((e) => e.action === 'not-my-bug-preserved')!;
-    expect(preserved).toBeTruthy();
-    expect(repo.git('rev-parse', '--verify', `${preserved.ref as string}^{tree}`)).toBe(preserved.tree);
+    // The agent's resolution is DISCARDED and the loss recorded: it was never
+    // pushed, and a local ref would never leave this clone.
+    const discarded = journal.find((e) => e.action === 'not-my-bug-discarded')!;
+    expect(discarded).toBeTruthy();
+    expect(repo.git('for-each-ref', '--format=%(refname)', 'refs/sweep/')).toBe('');
     expect(machineState(dir).phase).toBe('open');
     expect(machineState(dir).currentCase).toBeNull();
     const res = JSON.parse(readFileSync(out, 'utf8')) as {

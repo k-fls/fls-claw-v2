@@ -173,11 +173,13 @@ describe('the not-my-bug deadlock, end to end (real checks, real commits)', () =
 
     const afterAbort = readJournal(dir);
     // The conflict case is superseded; the gate fix is NOT (the defect that made
-    // the whole mechanism serve nothing), and the agent's work is pinned.
+    // the whole mechanism serve nothing), and the discard is recorded.
     expect(supersededCaseIds(afterAbort).has(conflictCaseId)).toBe(true);
     expect(supersededCaseIds(afterAbort).has(adjudicated.gateFix.caseId)).toBe(false);
-    const preserved = afterAbort.find((e: JournalEntry) => e.action === 'not-my-bug-preserved')!;
-    expect(repo.git('rev-parse', '--verify', `${preserved.ref as string}^{tree}`)).toBe(preserved.tree);
+    const discarded = afterAbort.find((e: JournalEntry) => e.action === 'not-my-bug-discarded')!;
+    expect(discarded).toBeTruthy();
+    // No local ref survives the abort: a ref is not a delivery channel.
+    expect(repo.git('for-each-ref', '--format=%(refname)', 'refs/sweep/')).toBe('');
     // Nothing merged: the branch tip is untouched by the aborted case.
     expect(repo.git('show', `main_patched:${conflictedPath}`)).toContain('"fork"');
 

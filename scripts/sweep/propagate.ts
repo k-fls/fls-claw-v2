@@ -1494,21 +1494,34 @@ function gateFixCaseId(branch: string, files: string[]): string {
 }
 
 /**
- * Gate fixes ELSEWHERE for the same failing files — this pass's journal plus the
- * open fix refs on origin from earlier passes. Matched on the files-only digest
- * carried in every gate-fix case id (see above), so no side table is needed.
+ * Gate fixes ELSEWHERE covering any of these failing files — this pass's journal
+ * plus the open fix refs on origin from earlier passes.
  *
  * Both cases are still minted: separate branches are separate lines of history
  * and each genuinely needs the fix. What the owner must not have to work out for
  * themselves is that they are ONE defect — merge one, then rebase or drop the
  * rest — so it goes in the PR text.
+ *
+ * WITHIN THE PASS the match is per-FILE, not whole-set. A descendant inherits an
+ * ancestor's red PLUS its own, so its file set is typically a SUPERSET of the
+ * ancestor's — the normal shape, and invisible to a digest comparison. The
+ * journal's `gate-fix` rows carry the files verbatim, so the intersection is
+ * exact and local. ACROSS PASSES only the whole-set digest in the ref name is
+ * available: a diagnosis-only held gate fix is an empty commit, so its files
+ * cannot be recovered by diffing the ref. Digest equality is the strongest
+ * sound cross-pass signal and stays.
  */
 async function duplicateGateFixes(cli: Cli, dir: string, branch: string, files: string[]): Promise<string[]> {
   const digest = gateFixFilesDigest(files);
+  const want = new Set(files);
   const out: string[] = [];
   for (const e of readJournal(dir)) {
     if (e.action !== 'gate-fix' || typeof e.caseId !== 'string' || e.branch === branch) continue;
-    if (e.caseId.endsWith(`-${digest}`)) out.push(`${String(e.caseId)} (this pass, on ${String(e.branch)})`);
+    const theirs = Array.isArray(e.files) ? (e.files as string[]) : [];
+    const shared = theirs.filter((f) => want.has(f));
+    if (shared.length === 0) continue;
+    const scope = shared.length === theirs.length && shared.length === want.size ? 'same files' : `shares ${shared.join(', ')}`;
+    out.push(`${String(e.caseId)} (this pass, on ${String(e.branch)} — ${scope})`);
   }
   for (const ref of await activeGateFixRefs(cli.repo)) {
     if (!ref.endsWith(`-${digest}`)) continue;
@@ -7688,7 +7701,12 @@ async function adjudicateNotMyBug(p: {
     // genuinely needs it (separate lines of history), but the owner must be told
     // they are one defect so they merge one and rebase or drop the rest.
     const dupes = await duplicateGateFixes(cli, dir, ownerBranch, owner.files);
-    const dupNote = dupes.length > 0 ? `[POSSIBLE DUPLICATE: ${dupes.join('; ')} — same failing files]` : '';
+    const dupNote = dupes.length > 0 ? `[POSSIBLE DUPLICATE: ${dupes.join('; ')}]` : '';
+    if (dupes.length > 0) {
+      // Journaled, not only briefed: the overlap is a fact about the pass, and a
+      // reader of the journal must not have to reconstruct it from PR prose.
+      appendJournal(dir, { action: 'gate-fix-duplicate', branch: ownerBranch, files: owner.files, duplicates: dupes });
+    }
 
     const gateOutput =
       `${failingOutput}\n\n--- not-my-bug ---\n${verdict.detail}\n${owner.detail}\n${bisect.detail}\n` +
@@ -7742,19 +7760,12 @@ async function adjudicateNotMyBug(p: {
     // `git gc` (nothing else references the tree; the driver commits by plumbing,
     // so rerere never recorded this resolution). Pin it under a ref instead: the
     // owner and the next attempt can both recover it by name.
-    const keepRef = `refs/sweep/abandoned/${caseId}`;
-    let preserved = false;
-    try {
-      const commit = await deterministicCommit(cli.repo, p.resolvedTree, [headSha], `abandoned resolution for ${caseId}`);
-      const pinned = await git(cli.repo, ['update-ref', keepRef, commit], { allowCodes: [1, 128] });
-      preserved = pinned.code === 0;
-      if (preserved) {
-        appendJournal(dir, { action: 'not-my-bug-preserved', caseId, ref: keepRef, tree: p.resolvedTree });
-        appendObservation(cli.workspace, { kind: 'abandoned-resolution-preserved', caseId, ref: keepRef });
-      }
-    } catch {
-      /* best-effort: losing the pin costs the agent a re-resolve, not correctness */
-    }
+    // The resolution is DISCARDED, not pinned. It was never pushed, and a local
+    // ref is not a delivery channel: it never leaves this clone and dies with it.
+    // Anything that must survive a pass is a PR. Recording the loss is enough —
+    // the next attempt re-derives the case from the automerge tree anyway.
+    appendJournal(dir, { action: 'not-my-bug-discarded', caseId, tree: p.resolvedTree });
+    appendObservation(cli.workspace, { kind: 'not-my-bug-resolution-discarded', caseId, branch: rc.branch });
 
     const gate = await materializeGateFixCases(cli, dir, ctx.chain, gateOutput, failedCommands, null, {
       rootBranch: ownerBranch,
@@ -7783,7 +7794,6 @@ async function adjudicateNotMyBug(p: {
         notMyBug: { verdict: verdict.verdict, files: verdict.files, owner: owner.owner, ownerBranch, detail: verdict.detail },
         instruction:
           `REPORT to the owner: ${verdict.detail}. ${owner.detail}. But ${gate.reason} — no new case could be prepared. ` +
-          (preserved ? `Your resolution is preserved at ${keepRef}. ` : '') +
           `Run \`next-case\` to continue with the rest of the pass.`,
       });
       return { handled: true, code: 1 };
@@ -7819,7 +7829,7 @@ async function adjudicateNotMyBug(p: {
         (rebaseNote ? `${rebaseNote} Put that line in the PR body. ` : '') +
         (dupNote ? `${dupNote} Say so in the PR body. ` : '') +
         `This case's merge is ABORTED and a gate-fix case is prepared on ${first.branch} — run \`next-case\`.` +
-        (preserved ? ` Your resolution is preserved at ${keepRef} if this case comes back.` : ''),
+        '',
     });
     return { handled: true, code: 1 };
   } finally {
@@ -8930,13 +8940,20 @@ function gateFixCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEn
     'The files above, plus what fixing them DIRECTLY forces. This is the ONLY case',
     'type where you change code this pass did not merge. Do NOT restructure.',
     '',
-    'If the fix genuinely does NOT belong in these files — the failure is REPORTED',
-    'here but caused elsewhere (a failing test names the TEST, not the source) —',
-    'that is `--tier held`, and an unchanged worktree is fine there. The PR then',
-    'carries your DIAGNOSIS instead of a fix: what fails, why it cannot be fixed in',
-    'these files, and where the fix belongs. That is a valid outcome, not a',
-    'failure. What is NOT valid is reporting the diagnosis in chat and stopping —',
-    'the PR is how it reaches the owner.',
+    'A failing test names the TEST, not the source. When the defect is in the code',
+    'the named files exercise, FIX IT THERE — that is what "what fixing them',
+    'directly forces" means. Reaching outside the named files is expected here and',
+    'is not a violation: the driver measures the reach, the reviewer is told why',
+    'those files were touched, and the case caps at `held`, which means the OWNER',
+    'approves your fix rather than you merging it. A held PR carrying a WORKING FIX',
+    'is the best outcome this case type has.',
+    '',
+    'Claim `--tier held` with an unchanged worktree only when the fix cannot be',
+    'made here at all — it needs an owner decision, or it belongs to upstream, or',
+    'it is outside this repository. Then the PR carries your DIAGNOSIS: what fails,',
+    'why it cannot be fixed, and where the fix belongs. That is a valid outcome.',
+    'What is NOT valid is reporting the diagnosis in chat and stopping — the PR is',
+    'how it reaches the owner.',
     '',
     '## WHEN TO STOP READING',
     'ONE pass over the implicated code, then decide. "Implicated" is: the failing',
@@ -9191,7 +9208,11 @@ async function materializeGateFixCases(
         {
           branch: rooted,
           files,
-          reason: `${a.reason}; rooted on the base ${rooted} — a commit on a descendant can never turn the base green`,
+          reason:
+            `${a.reason}; rooted on ${rooted} — ` +
+            (opts.rootBranch && a.groups.some((g) => g.branch === rooted)
+              ? `the located owner, which every failing file must be fixed on`
+              : `the base, and a commit on a descendant can never turn the base green`),
         },
       ]
     : a.groups.map((g) => ({ branch: g.branch, files: g.files, reason: g.reason }));
@@ -9273,28 +9294,46 @@ async function materializeGateFixCases(
       )
       .map((e) => e.branch as string),
   );
+  // Which FILES each gate-held branch's fix covers, read off the `gate-fix` row
+  // that minted it. Needed by the located-owner rule below: a located owner is
+  // only trustworthy for files the gated ancestor's own fix does not already
+  // cover.
+  const gateHeldFiles = new Map<string, Set<string>>();
+  for (const e of journal) {
+    if (e.action !== 'gate-fix' || typeof e.branch !== 'string' || !gateHeldThisPass.has(e.branch)) continue;
+    const set = gateHeldFiles.get(e.branch) ?? new Set<string>();
+    for (const f of Array.isArray(e.files) ? (e.files as string[]) : []) set.add(f);
+    gateHeldFiles.set(e.branch, set);
+  }
   const ancestorsOfBranch = transitiveAncestors(Object.fromEntries(directParentEdges(cli)));
   for (const g of mintable) {
-    // A LOCATED OWNER IS NOT A GUESS, so the ancestor gate does not apply to it.
+    // A LOCATED OWNER IS TRUSTED ONLY FOR FILES NO GATED ANCESTOR ALREADY OWNS.
     //
-    // The guard exists for the FINISH path, where a red integration build is
-    // attributed by elimination: beneath a gate-held ancestor that attribution
-    // is unreliable, because the ancestor's own defect is in everything below
-    // it. `--not-my-bug` is the opposite — the failure was PROVEN pre-existing
-    // against the pre-conflict tree and the owner was located by probing the
-    // branch tip and the parent head. `opts.rootBranch` is set only on that
-    // path.
+    // The ancestor gate exists for the FINISH path, where a red integration build
+    // is attributed by elimination: beneath a gate-held ancestor that attribution
+    // is unreliable, because the ancestor's own defect is in everything below it.
+    // `--not-my-bug` is stronger — the failure was PROVEN pre-existing against the
+    // pre-conflict tree and the owner was located by probing the branch tip and
+    // the parent head (`opts.rootBranch` is set only on that path) — so refusing
+    // it wholesale burns an adjudication round per descendant, each naming the
+    // SAME owner, and records nothing.
     //
-    // Refusing a located owner burns a full adjudication round per descendant,
-    // each naming the SAME owner: a branch owns a real defect, every descendant
-    // that merges it hits the same one, adjudicates correctly, and is refused
-    // because an UNRELATED ancestor happens to be gated. The
-    // defect is never recorded, so the next descendant repeats the whole
-    // adjudication. Refusing proven evidence is not caution.
+    // But it is not proof of OWNERSHIP.
+    // `locateOwner` proves the branch tip is RED — which inherited redness from a
+    // gate-held ancestor satisfies just as well as an own defect. When the
+    // ancestor's held fix covers files this mint also carries, the honest read is
+    // "the ancestor's defect seen from below": minting here asks the agent to
+    // re-fix it on a descendant (which the parents-merge model then turns into a
+    // future conflict) and asks the owner the same question twice. For files the
+    // ancestor's fix does NOT cover, the located owner stands and the case mints.
     const ownerLocated = typeof opts.rootBranch === 'string' && opts.rootBranch === g.branch;
-    const gatedAncestor = ownerLocated
-      ? undefined
-      : (ancestorsOfBranch[g.branch] ?? []).find((a) => gateHeldThisPass.has(a));
+    const coveringAncestor = (ancestorsOfBranch[g.branch] ?? []).find((a) => {
+      if (!gateHeldThisPass.has(a)) return false;
+      if (!ownerLocated) return true;
+      const covered = gateHeldFiles.get(a);
+      return covered ? g.files.some((f) => covered.has(f)) : false;
+    });
+    const gatedAncestor = coveringAncestor;
     if (gatedAncestor && !gateHeldThisPass.has(g.branch)) {
       gated.push(g.branch);
       appendJournal(dir, {
@@ -9306,7 +9345,12 @@ async function materializeGateFixCases(
         detail:
           `${g.branch} descends from '${gatedAncestor}', which took a gate fix this pass and is RED — everything ` +
           `beneath it inherits that. No case was minted for [${g.files.join(', ')}]: it cannot be judged until the ` +
-          `ancestor's fix lands, and it may well BE the ancestor's defect seen from below.`,
+          `ancestor's fix lands, and it may well BE the ancestor's defect seen from below` +
+          `${
+            gateHeldFiles.get(gatedAncestor)?.size
+              ? ` (its fix covers ${[...gateHeldFiles.get(gatedAncestor)!].join(', ')})`
+              : ''
+          }.`,
       });
       console.error(`gate-fix: ${g.branch} descends from gate-held '${gatedAncestor}' — not minting beneath a red ancestor`);
       continue;
