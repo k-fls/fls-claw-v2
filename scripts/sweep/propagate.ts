@@ -3075,11 +3075,20 @@ export async function cmdRun(cli: Cli): Promise<number> {
       }
 
       /**
-       * Emit a case, RECOMPUTING the automerge tree + conflicted paths against the
-       * branch's CURRENT tip (after any clean-prefix merge this iteration) so the
-       * recorded values match what resolve re-derives — the sha-labelled automerge
-       * tree (§3 determinism) depends on the ours tip, which the prefix merge
-       * advanced. If the conflict has HEALED post-merge, emit no case. Returns
+       * Emit a case AGAINST THE BRANCH'S CURRENT TIP.
+       *
+       * The plan row was probed before this branch's earlier parents merged, so
+       * by the time a case is emitted the tip has moved and every part of the
+       * row is a statement about a tree that no longer exists. Re-derive the
+       * parent row LIVE and take head, run, height, conflicted paths and
+       * automerge tree from that ONE derivation: recomputing only the paths and
+       * the tree against the moved tip leaves the caseId — branch, parent and
+       * HEIGHT — naming a height whose conflict set was measured at a different
+       * one, and the run describing commits the recomputed conflict no longer
+       * spans. Resolve then re-derives a case that does not match the one on
+       * disk.
+       *
+       * A conflict that HEALED against the moved tip emits nothing. Returns
        * whether a case was emitted (i.e. the branch gates).
        */
       const emitCase = async (pp: (typeof bp.parents)[number]): Promise<boolean> => {
@@ -3089,18 +3098,33 @@ export async function cmdRun(cli: Cli): Promise<number> {
           appendJournal(dir, { action: 'case-healed', branch: bp.branch, parent: pp.parent, head: pp.case!.head });
           return false;
         }
+        const live = (await deriveLive()).parents.find((p) => p.parent === pp.parent)?.case ?? null;
+        if (!live) {
+          // The conflict is still there against this tip, but the live
+          // derivation no longer offers it — the window closed above it while
+          // an earlier parent was merging. Serving it anyway hands the agent a
+          // conflict on content the branch may not take.
+          appendJournal(dir, {
+            action: 'case-withdrawn',
+            branch: bp.branch,
+            parent: pp.parent,
+            head: pp.case!.head,
+            detail: 'the live re-derivation offers no case here — the merge window closed above it',
+          });
+          return false;
+        }
         const caseFile: CaseFile = {
           schemaVersion: 1,
-          id: caseId(bp.branch, pp.parent, pp.case!.head.height), // B8: branch+PARENT+height (run TOP)
+          id: caseId(bp.branch, pp.parent, live.head.height), // B8: branch+PARENT+height (run TOP)
           branch: bp.branch,
           parent: pp.parent,
-          head: pp.case!.head, // the run's TOP commit (stacked-run model)
-          run: pp.case!.run,
+          head: live.head, // the run's TOP commit (stacked-run model)
+          run: live.run,
           tierFloor: bp.tierFloor,
-          conflictedPaths: probe.conflictFiles,
-          automergeTree: probe.treeOid,
-          reproduction: pp.case!.reproduction,
-          deferredCheck: { firstConflictHeight: pp.case!.head.height, transitiveAncestors: bp.ancestors },
+          conflictedPaths: live.conflictedPaths,
+          automergeTree: live.automergeTree,
+          reproduction: live.reproduction,
+          deferredCheck: { firstConflictHeight: live.head.height, transitiveAncestors: bp.ancestors },
         };
         const caseDir = join(dir, caseFile.id);
         writeJsonFile(join(caseDir, 'case.json'), caseFile);
