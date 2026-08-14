@@ -1749,6 +1749,7 @@ the vitest scripts glob.
 | `scope.ts` | scope partition, DAG ordering, the edition-composition closure (§3.3, §3.4) |
 | `hierarchy.ts` | THE branch hierarchy: depth, minPath, inversion assert (§3.6) |
 | `scope-guard.ts` | automerge-vs-resolved scope check (§7.4) |
+| `conflict-identity.ts` | conflict identity: marker-hunk extraction, label normalization, the set relation |
 | `steps.ts` | step/case JSON schemas + first-principles re-verification (§4.6) |
 | `not-my-bug.ts` | the `--not-my-bug` adjudication, ownership probe and bisect (§7.2, §7.3) |
 | `attribute.ts` | blame: failing-file parsing, per-file counts, branch candidates, attribution (§9.1) |
