@@ -4,6 +4,7 @@ import { initFixtureRepo, makePropagationFixture } from './fixtures.js';
 import { enumerateChain, type Chain } from './heights.js';
 import { buildEligibleLine, mergePointSweep } from './interval.js';
 import { revParse } from './git.js';
+import { WHOLE_RANGE_BLOCK } from './types.js';
 
 const { repo, base, chain } = makePropagationFixture();
 let c: Chain;
@@ -288,6 +289,165 @@ describe('buildEligibleLine (parents model, §4) — fork-only parent content', 
         chain: chn,
       });
       expect(line2.heads).toHaveLength(0);
+    } finally {
+      r.destroy();
+    }
+  });
+});
+
+describe('buildEligibleLine — the trim at an unresolved conflict (§5.2)', () => {
+  /**
+   * The trim is what stops a branch advancing onto content nobody has
+   * integrated. Every arm of it is pinned here: without coverage, a rewrite of
+   * the eligible line can silently drop the trim on one arm only, and the
+   * damage does not show until the integration rebuild blames a branch that
+   * merely took what it was handed.
+   */
+
+  it('entry model: candidates at or above the trim are dropped and the removal is announced', async () => {
+    const c2 = await enumerateChain(repo.dir, 'upstream-main', base);
+    const tip = await revParse(repo.dir, 'fork');
+    const args = { repo: repo.dir, branch: 'fork', branchTip: tip, parent: 'main', model: 'entry' as const, chain: c2 };
+
+    const trimmed = await buildEligibleLine({ ...args, blockedAtHeight: 2 });
+    expect(trimmed.heads.map((h) => h.height)).toEqual([0, 1]);
+    expect(trimmed.trimmedAt).toBe(2);
+
+    // The boundary is EXCLUSIVE at the trim: the blocked height itself is the
+    // content nobody integrated, so it is the first thing withheld, not the
+    // last thing allowed.
+    const atBoundary = await buildEligibleLine({ ...args, blockedAtHeight: 3 });
+    expect(atBoundary.heads.map((h) => h.height)).toEqual([0, 1, 2]);
+    expect(atBoundary.trimmedAt).toBe(3);
+  });
+
+  it('entry model: a trim above every candidate removes nothing and stays silent', async () => {
+    // "Nothing to take" and "something to take, blocked upstream" are different
+    // facts; announcing a trim that withheld nothing makes a quiet pass look
+    // like a stalled one in the report and in the urge counts.
+    const c2 = await enumerateChain(repo.dir, 'upstream-main', base);
+    const tip = await revParse(repo.dir, 'fork');
+    const line = await buildEligibleLine({
+      repo: repo.dir,
+      branch: 'fork',
+      branchTip: tip,
+      parent: 'main',
+      model: 'entry',
+      chain: c2,
+      blockedAtHeight: 99,
+    });
+    expect(line.heads.map((h) => h.height)).toEqual([0, 1, 2, 3]);
+    expect(line.trimmedAt).toBeUndefined();
+  });
+
+  it('entry model: a whole-range block leaves nothing eligible', async () => {
+    const c2 = await enumerateChain(repo.dir, 'upstream-main', base);
+    const tip = await revParse(repo.dir, 'fork');
+    const line = await buildEligibleLine({
+      repo: repo.dir,
+      branch: 'fork',
+      branchTip: tip,
+      parent: 'main',
+      model: 'entry',
+      chain: c2,
+      blockedAtHeight: WHOLE_RANGE_BLOCK,
+    });
+    expect(line.heads).toEqual([]);
+    expect(line.trimmedAt).toBe(WHOLE_RANGE_BLOCK);
+  });
+
+  /**
+   * A parent whose own first-parent line exposes heights 0, 1 and 2, and a
+   * child cut from the base — so the trim can be placed inside the line.
+   */
+  async function parentsFixture(): Promise<{ r: ReturnType<typeof initFixtureRepo>; chn: Chain }> {
+    const r = initFixtureRepo();
+    r.commit('base f', { 'src/f.ts': 'base\n' });
+    const b = r.sha('main');
+    r.commit('U0', { 'src/u0.ts': '0\n' });
+    r.commit('U1', { 'src/u1.ts': '1\n' });
+    r.commit('U2', { 'src/u2.ts': '2\n' });
+    r.checkout('P', { create: true, at: b });
+    r.commit('P: own file', { 'src/p.ts': 'p\n' });
+    // One merge per height, so every intermediate height is reachable on P's
+    // own first-parent line.
+    for (let h = 0; h <= 2; h++) r.git('merge', '--no-ff', '--no-edit', '-m', `P merges U${h}`, r.sha(`main~${2 - h}`));
+    r.checkout('C', { create: true, at: b });
+    r.checkout('main');
+    return { r, chn: await enumerateChain(r.dir, 'main', b) };
+  }
+
+  it('parents model: the parent line is cut at the trim, exclusive of the blocked height', async () => {
+    const { r, chn } = await parentsFixture();
+    try {
+      const cTip = await revParse(r.dir, 'C');
+      const args = { repo: r.dir, branch: 'C', branchTip: cTip, parent: 'P', model: 'parents' as const, chain: chn };
+      expect((await buildEligibleLine(args)).heads.map((h) => h.height)).toEqual([0, 1, 2]);
+
+      const trimmed = await buildEligibleLine({ ...args, blockedAtHeight: 1 });
+      expect(trimmed.heads.map((h) => h.height)).toEqual([0]);
+      expect(trimmed.trimmedAt).toBe(1);
+
+      const untouched = await buildEligibleLine({ ...args, blockedAtHeight: 3 });
+      expect(untouched.heads.map((h) => h.height)).toEqual([0, 1, 2]);
+      expect(untouched.trimmedAt).toBeUndefined();
+    } finally {
+      r.destroy();
+    }
+  });
+
+  /**
+   * A parent and child at the SAME coverage, the parent carrying one fork-only
+   * commit on top: the height filter yields nothing, so the parent tip itself
+   * is the candidate. This is the arm a blocked parent escapes through if the
+   * trim is not applied to it — its tip IS the state that cannot integrate, and
+   * every descendant would merge it cleanly, advance on it, and meet the trunk
+   * for the first time in the integration rebuild, which blames THEM.
+   */
+  async function forkOnlyFixture(): Promise<{ r: ReturnType<typeof initFixtureRepo>; chn: Chain }> {
+    const r = initFixtureRepo();
+    r.commit('base f', { 'src/f.ts': 'base\n' });
+    const b = r.sha('main');
+    r.commit('U0', { 'src/u0.ts': '0\n' });
+    r.checkout('P', { create: true, at: b });
+    r.git('merge', '--no-ff', '--no-edit', '-m', 'P merges U0', r.sha('main'));
+    r.commit('P: fork-only fix', { 'src/g.ts': 'g\n' });
+    r.checkout('C', { create: true, at: b });
+    r.git('merge', '--no-ff', '--no-edit', '-m', 'C merges U0', r.sha('main'));
+    r.checkout('main');
+    return { r, chn: await enumerateChain(r.dir, 'main', b) };
+  }
+
+  it('fork-only parent content is withheld by a trim at the parent tip height', async () => {
+    const { r, chn } = await forkOnlyFixture();
+    try {
+      const cTip = await revParse(r.dir, 'C');
+      const pTip = await revParse(r.dir, 'P');
+      const args = { repo: r.dir, branch: 'C', branchTip: cTip, parent: 'P', model: 'parents' as const, chain: chn };
+
+      // Untrimmed, the parent tip is the single candidate — coverage is equal
+      // on both sides, so nothing but this arm can carry the fork commit down.
+      const open = await buildEligibleLine(args);
+      expect(open.heads).toEqual([{ sha: pTip, height: 0 }]);
+      expect(open.trimmedAt).toBeUndefined();
+
+      // The parent tip sits AT the trim: withheld, and the withholding is
+      // announced even though the height filter had already emptied the line.
+      const cut = await buildEligibleLine({ ...args, blockedAtHeight: 0 });
+      expect(cut.heads).toEqual([]);
+      expect(cut.trimmedAt).toBe(0);
+
+      // A whole-range block takes it too — the fork-only height is below every
+      // real height, so only the bottom of the lattice can reach it.
+      const frozen = await buildEligibleLine({ ...args, blockedAtHeight: WHOLE_RANGE_BLOCK });
+      expect(frozen.heads).toEqual([]);
+      expect(frozen.trimmedAt).toBe(WHOLE_RANGE_BLOCK);
+
+      // A trim ABOVE the parent tip's height lets the fork content through and
+      // reports no removal.
+      const above = await buildEligibleLine({ ...args, blockedAtHeight: 1 });
+      expect(above.heads).toEqual([{ sha: pTip, height: 0 }]);
+      expect(above.trimmedAt).toBeUndefined();
     } finally {
       r.destroy();
     }
