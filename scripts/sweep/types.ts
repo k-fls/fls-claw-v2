@@ -310,18 +310,19 @@ export interface CaseFile {
 }
 
 /**
- * A block whose height cannot be measured covers the WHOLE range: nothing from
- * the branch is eligible for anything below it. A gate fix rooted at a tip says
- * "this branch is red", not "red above height k" — there is no clean prefix to
- * hand down. Compares below every real height, so every height test that trims
- * at a block trims everything without a special case.
+ * THE BOTTOM OF THE CUT LATTICE: a branch under repair says "this branch is
+ * red", not "red above height k", so it has no clean prefix to hand down and
+ * nothing from it is eligible for anything below it. The same value covers a
+ * block nobody could measure — an unmeasurable block is a total one, not an
+ * absent one. It compares below every real height, so a freeze needs no special
+ * case anywhere a cut is applied.
  */
 export const WHOLE_RANGE_BLOCK = Number.NEGATIVE_INFINITY;
 
-/** A HELD branch's registry record used for DEFERRED matching (§5). */
+/** A blocked branch's cut, used for the eligible-line trim and DEFERRED matching (§5). */
 export interface HeldRecord {
   branch: string;
-  /** The conflict height, or `WHOLE_RANGE_BLOCK` when it cannot be measured. */
+  /** The cut coordinate, or `WHOLE_RANGE_BLOCK` for a branch under repair. */
   height: number;
   conflictedPaths: string[];
   caseId: string;

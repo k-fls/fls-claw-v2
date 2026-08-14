@@ -25,6 +25,38 @@ async function treeOf(repo: string, commit: string): Promise<string> {
   return (await git(repo, ['rev-parse', `${commit}^{tree}`])).stdout.trim();
 }
 
+/**
+ * A branch's effective cut: the trunk coordinate above which nothing is
+ * eligible, and the parent that set it.
+ */
+export interface BranchCut {
+  height: number;
+  /** The parent whose cut is the minimum — the branch this one is waiting on. */
+  branch: string;
+}
+
+/**
+ * THE EFFECTIVE CUT IS THE MINIMUM OVER THE PARENTS' CUTS, and a branch passes
+ * that minimum on to its own descendants: a cut is a statement about content
+ * nobody has integrated, and content does not become integrable by travelling
+ * one more edge down. Taking the minimum is what makes the lattice compose —
+ * each branch only has to look at its DIRECT parents, because each of those
+ * already carries everything above it.
+ *
+ * `cutOf` is the live per-pass map, grown in DAG order: seeded with the blocked
+ * branches' own cuts, then extended with each branch's effective cut as it is
+ * derived.
+ */
+export function effectiveCut(parents: string[], cutOf: Map<string, number>): BranchCut | null {
+  let best: BranchCut | null = null;
+  for (const p of parents) {
+    const height = cutOf.get(p);
+    if (height === undefined) continue;
+    if (!best || height < best.height) best = { height, branch: p };
+  }
+  return best;
+}
+
 /** child -> full set of transitive inventory ancestors (DEFERRED matching input, §5). */
 export function transitiveAncestors(edges: Record<string, string[]>): Record<string, string[]> {
   const out: Record<string, string[]> = {};
@@ -173,25 +205,26 @@ async function analyzeParent(
   parentRef: string,
   model: 'entry' | 'parents',
   chain: Chain,
-  ancestors: string[],
-  held: HeldRecord[],
+  cut: BranchCut | null,
   blockedParents: BlockedParent[],
   stackCap: number,
 ): Promise<ParentPlan> {
-  // TRIM THE WINDOW AT THE LOWEST UNRESOLVED CONFLICT ABOVE THIS BRANCH (§5.2).
+  // THE CUT CLOSES THE WINDOW (§5.2), AND IT IS A CUT ON CONTENT.
   //
-  // A block anywhere above — this parent, or any transitive ancestor — means the
-  // content at and above it has not been integrated by anyone and cannot be
-  // until the conflict is resolved. Merging it here does not make it integrable;
-  // it advances THIS branch onto a state the trunk has never seen, and the
+  // Above it the content has been integrated by nobody and cannot be until the
+  // proposal is resolved. Merging it here does not make it integrable; it
+  // advances THIS branch onto a state the trunk has never seen, and the
   // integration rebuild then meets that state, blames this branch, and rolls it
   // back for a conflict it did not cause.
   //
-  // Below the trim the ancestors are genuinely clean, so what remains merges as
-  // usual and a conflict there is this branch's OWN — the trim gates what the
+  // The cut applies to EVERY parent's line, not just the one that set it — a
+  // sibling parent carrying the same trunk commits is cut at the same trunk
+  // coordinate, because what cannot integrate is the content, not the edge it
+  // arrives on. A parent's fork-only work, disjoint from the cut, still flows.
+  //
+  // Below the cut the parents are genuinely clean, so what remains merges as
+  // usual and a conflict there is this branch's OWN — the cut gates what the
   // branch TAKES, never what it REPORTS.
-  const blockedAbove = held.filter((h) => h.branch === parent || ancestors.includes(h.branch));
-  const blockedAtHeight = blockedAbove.length > 0 ? Math.min(...blockedAbove.map((h) => h.height)) : undefined;
   const line = await buildEligibleLine({
     repo,
     branch,
@@ -200,7 +233,7 @@ async function analyzeParent(
     parentRef,
     model,
     chain,
-    ...(blockedAtHeight !== undefined ? { blockedAtHeight } : {}),
+    ...(cut ? { blockedAtHeight: cut.height } : {}),
   });
   // Probe from the pinned branch TIP sha, not the ref name: deterministic
   // (§3 probe determinism) and valid for remote-only branches (§13).
@@ -221,7 +254,7 @@ async function analyzeParent(
   // back by someone else's unresolved conflict reads as "up to date" in the pass
   // report and in the urge counts, and nobody can see what the block is costing.
   if (line.trimmedAt !== undefined) {
-    pp.deferredTo = blockedAbove.reduce((lo, h) => (h.height < lo.height ? h : lo)).branch;
+    pp.deferredTo = cut!.branch;
     pp.deferHeight = line.trimmedAt;
   }
 
@@ -278,7 +311,11 @@ export interface DeriveBranchArgs {
   tierFloor: BranchPlan['tierFloor'];
   isLeaf: boolean;
   alwaysMerge: boolean;
-  held: HeldRecord[];
+  /**
+   * This branch's effective cut (`effectiveCut` over its parents), applied to
+   * EVERY parent's line. Null = nothing above this branch is blocked.
+   */
+  cut?: BranchCut | null;
   /** Block-height of each currently-blocked branch (merge_status != NONE), for the
    * height-MIN DEFER over this branch's blocked DIRECT parents. */
   blockHeightOf?: Map<string, number>;
@@ -323,8 +360,9 @@ export interface DeriveBranchArgs {
  * (§3 execution re-probe).
  */
 export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> {
-  const { repo, branch, kind, model, parents, chain, ancestors, tierFloor, isLeaf, alwaysMerge, held } = args;
+  const { repo, branch, kind, model, parents, chain, ancestors, tierFloor, isLeaf, alwaysMerge } = args;
   const mergeBlocked = args.mergeBlocked ?? null;
+  const cut = args.cut ?? null;
   // X's blocked DIRECT parents (with their block-heights) — the input to
   // the height-MIN DEFER rule. Restricted to DIRECT parents (never transitive):
   // a clean intermediate parent (absent here) stops propagation until it re-merges.
@@ -374,8 +412,7 @@ export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> 
         refOf(parent),
         model,
         chain,
-        ancestors,
-        held,
+        cut,
         blockedParents,
         stackCap,
       ),
@@ -477,14 +514,18 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
   const branches: BranchPlan[] = [];
   const byBranch = new Map<string, BranchPlan>();
 
-  // Block-height map: every currently-blocked branch (merge_status != NONE)
-  // with the height it is blocked at, for the height-MIN DEFER rule. Seeded from
-  // the HELD registry (PR_ID branches, this-pass + cross-pass; height re-derived
-  // in `held`) and GROWN in DAG order — a branch DEFERRED this pass (or sticky
-  // from a prior pass) becomes a blocked parent for its own children. Heights
-  // are live per-pass values, never read from merge_status.
+  // Cut map: every branch that closes a window, with the trunk coordinate it
+  // closes it at. It feeds two rules — the eligible-line cut (`effectiveCut`
+  // over a branch's parents) and the height-MIN DEFER over blocked DIRECT
+  // parents. Seeded from the blocked branches' own cuts and GROWN in DAG order,
+  // so each branch's effective cut is inherited by its descendants and a branch
+  // that DEFERS this pass closes the window for its own children. Heights are
+  // live per-pass values, never read from merge_status.
   const blockHeightOf = new Map<string, number>();
-  for (const rec of held) blockHeightOf.set(rec.branch, rec.height);
+  const recordCut = (branch: string, height: number): void => {
+    blockHeightOf.set(branch, Math.min(height, blockHeightOf.get(branch) ?? Infinity));
+  };
+  for (const rec of held) recordCut(rec.branch, rec.height);
   // The LIVE blocked set (merge_status != NONE) as of this point in DAG order:
   // PR_ID branches (origin rows + held registry) up front; DEFERRED branches join as
   // they are sticky-confirmed; freshly-deferring branches join as derived.
@@ -514,6 +555,7 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
         mergeBlocked = { state: 'DEFERRED', behind };
       }
     }
+    const cut = effectiveCut(parents, blockHeightOf);
     const bp = await deriveBranch({
       repo,
       branch: entry.branch,
@@ -525,7 +567,7 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
       tierFloor: tierFloor(entry.branch, feat),
       isLeaf: model === 'parents' && leaves.has(entry.branch),
       alwaysMerge: feat?.always_merge === true,
-      held,
+      cut,
       blockHeightOf,
       // DRIVER.md §4.4 lever: per-feature `stack_cap` beats the routing.yaml global.
       stackCap: feat?.stack_cap ?? opts.stackCap ?? DEFAULT_STACK_CAP,
@@ -536,12 +578,17 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
     branches.push(bp);
     byBranch.set(bp.branch, bp);
     if (mergeBlocked) blockedNow.add(bp.branch); // PR_ID or sticky-DEFERRED stays blocked
+    // The effective cut is INHERITED: this branch cannot hand its descendants
+    // what it could not take itself, so it closes their window at the same
+    // coordinate. Without this a grandchild would re-derive with no cut at all
+    // and merge straight past a block two edges up.
+    if (cut) recordCut(bp.branch, cut.height);
     // A branch DEFERRED this pass (fresh or sticky) is itself blocked: record its
     // lowest own-conflict height so its children defer behind it.
     const deferHeights = bp.parents.filter((pp) => pp.verdict === 'defer' && pp.deferHeight !== undefined).map((pp) => pp.deferHeight!);
     if (deferHeights.length) {
       blockedNow.add(bp.branch);
-      if (!blockHeightOf.has(bp.branch)) blockHeightOf.set(bp.branch, Math.min(...deferHeights));
+      recordCut(bp.branch, Math.min(...deferHeights));
     }
   }
 

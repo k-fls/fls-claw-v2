@@ -59,18 +59,17 @@ export interface BuildEligibleLineArgs {
   model: 'entry' | 'parents';
   chain: Chain;
   /**
-   * TRIM (DRIVER.md §5.2): the height of the lowest UNRESOLVED conflict at or
-   * above this branch — its own blocked parent, or any blocked transitive
-   * ancestor. Nothing at or above it is eligible: that content cannot integrate
-   * until the conflict is resolved, and merging it anyway advances the branch
-   * onto a state the trunk has never seen, which the integration rebuild then
-   * reports as the branch's own conflict.
+   * THE CUT (DRIVER.md §5.2): the trunk coordinate this branch's window closes
+   * at — the minimum over its parents' cuts. Nothing at or above it is
+   * eligible: that content cannot integrate until the proposal above is
+   * resolved, and merging it anyway advances the branch onto a state the trunk
+   * has never seen, which the integration rebuild then reports as the branch's
+   * own conflict.
    *
-   * `-Infinity` trims the WHOLE range. A gate fix rooted at a tip has no
-   * conflict head to measure against, so nothing below it is proven clean
-   * either; only a fix rooted at a located commit leaves a clean prefix.
+   * `-Infinity` closes the whole range — a branch under repair is red, not
+   * red-above-height-k, so no prefix of it is proven clean.
    *
-   * Omitted = nothing is blocked above this branch = the full line is eligible.
+   * Omitted = nothing above this branch is blocked = the full line is eligible.
    */
   blockedAtHeight?: number;
 }

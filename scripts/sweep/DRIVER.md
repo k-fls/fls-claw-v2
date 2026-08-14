@@ -556,6 +556,11 @@ re-derive as blocked. It then reconstructs the blocked set from the origin
   the ref head — the ref's resolution is authoritative and is never re-derived —
   and the branch is blocked. The recovery PR is a draft exactly when the ref's own
   diff still carries conflict markers.
+
+Every blocking row carries the KIND of the proposal, read from the head's shape
+at this moment (§5.2) — two parents merge, one parent fixes. The ref NAME never
+decides it: a name is a string the driver minted, not a fact about the objects,
+and by the time the plan reads the journal it would be all that survived.
 - **ref ABSENT** → nothing to carry: the conflict is re-derived fresh, and a new
   case yields a new PR at `finish`.
 - **slug matching no scope branch** → journaled `origin-ref-unknown` and left
@@ -577,24 +582,57 @@ internal/test override that wins when present.
 `start` is idempotent on origin: a pass that crashed before `finish` published
 nothing, so the re-derived picture is clean.
 
-### 5.2 The window is trimmed at the unresolved conflict
+### 5.2 The open proposal is the cut-off
 
-AN UNRESOLVED CONFLICT TRIMS THE MERGE WINDOW OF EVERYTHING BELOW IT. A branch's
-eligible line (§4) stops below the lowest height at which its parent — or any
-transitive ancestor — is blocked (`blockedAtHeight`, `interval.ts`). Content at or
-above that height has been integrated by nobody and cannot be until the conflict
-is resolved; merging it here does not make it integrable, it advances THIS branch
-onto a state the trunk has never seen, and the integration rebuild (§10.2) then
-meets that state, blames this branch and rolls it back for a conflict it did not
-cause.
+AN OPEN PULL REQUEST IS A PROPOSAL. Until it merges, nothing in it is part of the
+branch, so the branch tip is exactly what exists for anyone below it and the PR
+is the upper CUT-OFF of the merge window — for the branch itself and for every
+descendant. A cut-off exists iff the PR is open and its head is not reachable
+from the branch tip; GitHub squash- and rebase-merges land content without
+ancestry, so the PR's own state is the authority and reachability is
+corroboration. Heights are a comparable projection used to order candidates
+INSIDE an eligible line; they never decide whether a cut-off exists.
 
-A block whose height cannot be measured — a gate hold carries no conflict head —
-is a WHOLE-RANGE block (`WHOLE_RANGE_BLOCK`): a gate fix rooted at a tip says the
-branch is red, not red-above-height-k, so no prefix of it is proven clean and
-nothing from it is eligible. Only a fix rooted at a located commit (`rootAt`,
-§9.3) leaves a clean prefix below itself.
+**Two kinds of proposal, told apart by the HEAD'S SHAPE, never by the ref name.**
+`start` classifies each open sweep PR when it reads it — that is the only moment
+the objects are in hand — and journals the kind:
 
-Trimming gates what a branch TAKES, never what it REPORTS. Below the trim the
+- A head with TWO PARENTS proposes a MERGE. Its cut is the SECOND PARENT'S
+  coverage: that is the conflict head the resolution merges, and it is where the
+  window closes. The head's OWN coverage is the maximum of the two sides, so
+  once the branch tip moves past the conflict (an owner commit, another parent's
+  merge) it reads high and would hand descendants content nobody integrated.
+- A head with ONE PARENT proposes a FIX to the branch's own content, so the
+  branch is RED. It FREEZES the branch and every transitive descendant: they
+  take nothing from any parent, through the same empty-interval, all-skip path a
+  branch waiting on its own PR gets. That is about VERIFIABILITY, not
+  provenance — below a red branch every case is unjudgeable, `report-case`
+  checks fail on a defect the open fix already describes, `--not-my-bug` burns
+  adjudication rounds proving it, and the agent is handed work that cannot
+  complete. The only way to let merges flow past would be to exclude the tests,
+  which makes the gate meaningless.
+
+**Cut inheritance.** Each parent edge contributes a cut. A branch's EFFECTIVE
+CUT is the MINIMUM over its parents' cuts, and it passes that minimum to its own
+descendants — a cut is a statement about content nobody has integrated, and
+content does not become integrable by travelling one more edge down. Taking the
+minimum is what makes the lattice compose: each branch looks only at its DIRECT
+parents, because each of those already carries everything above it.
+
+**The cut is on CONTENT, not on an edge.** It trims EVERY parent's line at that
+trunk coordinate, so a sibling parent carrying the same trunk commits is cut
+there too; a parent's fork-only work, disjoint from the cut, still flows. A
+freeze is not a separate mechanism — it is the BOTTOM of the same lattice
+(`WHOLE_RANGE_BLOCK`), which is also what an unmeasurable block contributes: an
+unmeasurable block is a total one, not an absent one.
+
+Content at or above the cut has been integrated by nobody and cannot be until
+the proposal is resolved; merging it here does not make it integrable, it
+advances THIS branch onto a state the trunk has never seen, and the integration
+rebuild (§10.2) then meets that state, blames this branch and rolls it back for
+a conflict it did not cause.
+
+Cutting gates what a branch TAKES, never what it REPORTS. Below the cut the
 ancestors are genuinely clean, so what remains merges normally and a conflict
 there is the branch's OWN — its own case, its own PR, in this pass. Withheld
 content is journaled as DEFERRED rather than as "up to date": "nothing to take"
@@ -623,10 +661,6 @@ is sticky while any direct parent is blocked (the fixpoint also treats a DEFERRE
 direct parent as blocking), and it clears when all parents are NONE, at which
 point the branch re-merges fresh. Heights are live per-pass values and are never
 carried numerically across passes.
-
-A hold that carries no head (a verify-gate hold, §10.2) contributes no height, so
-it blocks the WHOLE range for descendants rather than none of it — an
-unmeasurable block is a total one, not an absent one.
 
 A branch below a blocked one derives differently from the plan on disk by
 construction, and a block can arrive mid-pass (a verify gate hold is journaled

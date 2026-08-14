@@ -399,7 +399,7 @@ describe('run — resume idempotence + window trimming (reached via next-case)',
     expect(readJournal(dir).filter((e) => e.action === 'arrived').length).toBe(arrivals1);
   });
 
-  it('a clean merge through a BLOCKED ancestor height is trimmed — the branch merges nothing', async () => {
+  it('the cut is the PR head’s SECOND PARENT, not the head’s own coverage', async () => {
     const repo = initFixtureRepo();
     repo.commit('base: x', { 'src/x.ts': 'orig\n' });
     const base = repo.sha('main'); // pin the fork point BELOW U0 so U0 is chain height 0
@@ -408,7 +408,22 @@ describe('run — resume idempotence + window trimming (reached via next-case)',
     repo.checkout('main');
     repo.commit('U0: util', { 'src/util.ts': 'u\n' });
     repo.checkout('main_patched');
-    repo.git('merge', '--no-edit', '-m', 'main_patched merges U0', 'main'); // main_patched covers h0
+    repo.git('merge', '--no-edit', '-m', 'main_patched merges U0', 'main'); // exposes h0
+    repo.checkout('main');
+    repo.commit('U1: more', { 'src/more.ts': 'm\n' });
+    repo.checkout('main_patched');
+    repo.git('merge', '--no-edit', '-m', 'main_patched merges U1', 'main'); // TIP covers h1
+    // The proposal: a driver-shaped PR head [branch tip, conflict head]. Its own
+    // coverage is the MAX of the two sides — h1, because the branch tip moved on
+    // — while the conflict it proposes to resolve sits at h0. Reading the head’s
+    // own coverage as the cut would leave h0 eligible and hand feat/c the very
+    // step nobody has integrated.
+    repo.checkout('conflict-head', { create: true, at: base });
+    repo.git('merge', '--no-edit', '-m', 'conflict head takes U0', repo.sha('main~1'));
+    repo.commit('conflict head: its own edit', { 'src/marker.ts': 'm\n' }); // coverage h0
+    repo.checkout('pr-head', { create: true, at: 'main_patched' });
+    repo.git('merge', '--no-ff', '--no-edit', '-m', 'Resolution for owner review', 'conflict-head');
+    const prHead = repo.sha('pr-head');
     repo.checkout('main');
     cleanups.push(() => repo.destroy());
 
@@ -416,53 +431,50 @@ describe('run — resume idempotence + window trimming (reached via next-case)',
     const inv = writeInventory([{ id: 'c', branch: 'feat/c', parents: ['main_patched'] }]);
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
     const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, { base, ...o });
-    // A HELD ancestor (main_patched blocked at h0), seeded as the `origin-blocked`
-    // journal row `sweep start` derives from origin: the row's headSha is a
-    // side commit at chain height 0 (like a fix/sweep ref head containing the
-    // conflict head), so the block height re-derives to 0 live. Appended AFTER
-    // start, whose clean-slate boundary would otherwise wipe it.
-    repo.checkout('held-marker', { create: true, at: 'main' });
-    repo.commit('marker: not in main_patched', { 'src/marker.ts': 'm\n' });
-    const markerSha = repo.sha('held-marker');
-    repo.checkout('main');
     expect(await cmdSweepStart(cli({ cmd: 'sweep-start' }))).toBe(0);
+    // The row `sweep start` writes for an unmerged fix/sweep ref with an open
+    // PR whose head has two parents. Appended AFTER start, whose clean-slate
+    // boundary would otherwise wipe it.
     appendJournal(dir, {
       action: 'origin-blocked',
       branch: 'main_patched',
       caseId: 'origin:fix/sweep/main_patched--main-h0-deadbeef',
       fixBranch: 'fix/sweep/main_patched--main-h0-deadbeef',
-      headSha: markerSha,
+      kind: 'merge',
+      headSha: prHead,
       prNumber: 12,
     });
     const cTip = repo.sha('feat/c');
     expect(await cmdRun(cli({ cmd: 'run', execute: true, internal: true }))).toBe(0);
-    // The merge was available and clean, and is NOT taken: height 0 is the
-    // ancestor's own unresolved conflict, so nothing at or above it has been
-    // integrated. Taking it would advance feat/c onto a state the trunk has never
-    // seen — which the integration rebuild would then blame feat/c for.
+    // The h0 merge was available and clean, and is NOT taken: h0 is where the
+    // proposal cuts, so nothing at or above it has been integrated by anyone.
     expect(repo.sha('feat/c')).toBe(cTip);
     expect(readJournal(dir).some((e) => e.action === 'merge' && e.branch === 'feat/c')).toBe(false);
-    // …and no pre-ref, so it is not "advanced this pass" and cannot enter the
-    // verify recipe. That is the whole mechanism, in one assertion.
+    // …and no pre-ref, so it did not advance this pass. That is the whole
+    // mechanism, in one assertion.
     expect(readJournal(dir).some((e) => e.action === 'pre-ref' && e.branch === 'feat/c')).toBe(false);
+    // The discriminator: the cut is 0 (the second parent), NOT 1 (the head).
+    const plan = JSON.parse(readFileSync(join(dir, 'plan.json'), 'utf8')) as {
+      branches: Array<{ branch: string; parents: Array<{ parent: string; deferHeight?: number }> }>;
+    };
+    const row = plan.branches.find((b) => b.branch === 'feat/c')!.parents[0];
+    expect(row.deferHeight).toBe(0);
   });
 
   /**
-   * A GATE fix keeps its scope after it becomes a PR.
-   *
-   * In the pass that takes it, a gate hold carries no conflict head, so it is
-   * unmeasurable and trims everything. One pass later the same block arrives
-   * from origin as a `fix/sweep/…--gate-fix-…` ref whose head has a perfectly
-   * measurable coverage — the offender's own tip. Reading that as a conflict
-   * height hands descendants everything below a branch that is still RED, and
-   * makes the trim depend on which pass took the hold.
+   * A ONE-PARENT head proposes a fix to the branch’s own content, so the branch
+   * is RED — and a red branch freezes everything under it. This is about
+   * VERIFIABILITY, not provenance: below a red branch every case is unjudgeable,
+   * the checks fail on a defect the open fix already describes, and the agent is
+   * handed work that cannot complete.
    */
-  it('a gate fix arriving from origin still trims the WHOLE range, not its ref height', async () => {
+  it('a one-parent PR head freezes the branch and its descendants', async () => {
     const repo = initFixtureRepo();
     repo.commit('base: x', { 'src/x.ts': 'orig\n' });
     const base = repo.sha('main');
     repo.checkout('main_patched', { create: true, at: 'main' });
     repo.checkout('feat/c', { create: true, at: 'main_patched' });
+    repo.checkout('feat/d', { create: true, at: 'feat/c' }); // one edge further down
     repo.checkout('main');
     repo.commit('U0: util', { 'src/util.ts': 'u\n' });
     repo.checkout('main_patched');
@@ -471,36 +483,47 @@ describe('run — resume idempotence + window trimming (reached via next-case)',
     repo.commit('U1: more', { 'src/more.ts': 'm\n' });
     repo.checkout('main_patched');
     repo.git('merge', '--no-edit', '-m', 'main_patched merges U1', 'main'); // tip covers h1
+    // The fix: a single-parent commit on the branch tip, exactly the shape the
+    // driver builds for a gate fix. It has a perfectly measurable coverage (h1)
+    // and reading it as a cut would leave h0 eligible — but h0 is not a
+    // conflict point here, the branch is simply red.
+    repo.checkout('gate-fix', { create: true, at: 'main_patched' });
+    repo.commit('fix the failing check', { 'src/util.ts': 'fixed\n' });
+    const fixHead = repo.sha('gate-fix');
     repo.checkout('main');
     cleanups.push(() => repo.destroy());
 
-    // The distinction this pins: main_patched's TIP covers h1, so reading the
-    // gate-fix ref head as a conflict height would trim at 1 and leave h0
-    // eligible — feat/c would merge the h0 step of a branch that is RED. Only a
-    // whole-range block leaves nothing.
     const ws = mkWorkspace();
-    const inv = writeInventory([{ id: 'c', branch: 'feat/c', parents: ['main_patched'] }]);
+    const inv = writeInventory([
+      { id: 'c', branch: 'feat/c', parents: ['main_patched'] },
+      { id: 'd', branch: 'feat/d', parents: ['feat/c'] },
+    ]);
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
     const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, { base, ...o });
     expect(await cmdSweepStart(cli({ cmd: 'sweep-start' }))).toBe(0);
-    // The gate-fix ref head is main_patched's OWN tip: a real, measurable height
-    // (0). Only the ref NAME says this is a gate fix rather than a conflict.
     appendJournal(dir, {
       action: 'origin-blocked',
       branch: 'main_patched',
       caseId: 'origin:fix/sweep/main_patched--gate-fix-main_patched-deadbeef',
       fixBranch: 'fix/sweep/main_patched--gate-fix-main_patched-deadbeef',
-      headSha: repo.sha('main_patched'),
+      kind: 'fix',
+      headSha: fixHead,
       prNumber: 13,
     });
     const cTip = repo.sha('feat/c');
+    const dTip = repo.sha('feat/d');
     expect(await cmdRun(cli({ cmd: 'run', execute: true, internal: true }))).toBe(0);
-    // Height 0 is NOT a conflict point here — the branch is red, so no prefix of
-    // it is proven clean and feat/c takes nothing, exactly as in the pass that
-    // took the hold.
+    const journal = readJournal(dir);
+    // Neither the child nor the grandchild moves, and neither takes the
+    // partial-window treatment — both get the empty interval a branch waiting on
+    // its own PR gets.
     expect(repo.sha('feat/c')).toBe(cTip);
-    expect(readJournal(dir).some((e) => e.action === 'merge' && e.branch === 'feat/c')).toBe(false);
-    expect(readJournal(dir).some((e) => e.action === 'pre-ref' && e.branch === 'feat/c')).toBe(false);
+    expect(repo.sha('feat/d')).toBe(dTip);
+    for (const b of ['main_patched', 'feat/c', 'feat/d']) {
+      expect(journal.some((e) => e.action === 'skip' && e.branch === b && e.reason === 'held')).toBe(true);
+      expect(journal.some((e) => e.action === 'merge' && e.branch === b)).toBe(false);
+      expect(journal.some((e) => e.action === 'pre-ref' && e.branch === b)).toBe(false);
+    }
   });
 });
 

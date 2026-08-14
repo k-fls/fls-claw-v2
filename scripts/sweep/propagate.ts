@@ -151,6 +151,7 @@ import {
   allParentsSkipped,
   deriveBranch,
   derivePlan,
+  effectiveCut,
   findLeaves,
   plansDiffer,
   shortestUnskipChain,
@@ -493,17 +494,27 @@ interface BlockedRow {
   /** Blocking case id ('origin:<ref>' for start-derived rows, 'gate*' for §9 holds). */
   caseId: string;
   /**
-   * Height-bearing sha: for an origin row the fix/sweep REF HEAD (it contains
-   * the conflict head as a parent, so deriveCoverage lands on the conflict
-   * height); for a this-pass hold the case's conflict head. Null for gate holds.
+   * WHAT THE OPEN PROPOSAL IS, from the SHAPE of its head when it was
+   * classified — never from the ref name, which is a string the driver minted
+   * rather than a fact about the objects:
+   *  - `merge` — a two-parent head proposes a merge. Its cut sits inside one
+   *    window: everything below the merge point is already in, everything at or
+   *    above it waits for the owner.
+   *  - `fix` — a one-parent head proposes a fix to the branch's own content, so
+   *    the branch is RED. Nothing on it is proven and the block is total.
+   * Only an explicit `fix` freezes: a proposal is a merge unless its head was
+   * seen to be one commit.
+   */
+  kind: 'merge' | 'fix';
+  /**
+   * The commit whose TRUNK COVERAGE is the cut. For a merge proposal that is
+   * the head, from which the cut point is recovered (a driver-built PR head is
+   * `[branch tip, conflict head]`, and the conflict head is the cut; a
+   * this-pass hold carries the conflict head itself, which is already it).
+   * Null when nothing measurable was recorded — which cuts the whole range,
+   * since an unmeasurable block is a total one, not an absent one.
    */
   headSha: string | null;
-  /**
-   * A GATE hold: the branch itself is RED, not blocked at some height by a
-   * conflict. Carried because the two block kinds have different SCOPE and the
-   * height machinery cannot express the difference.
-   */
-  gate?: boolean;
   /** fix/sweep head branch on origin (urge target); null until a PR exists. */
   fixBranch: string | null;
   prNumber: number | null;
@@ -538,16 +549,10 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
   for (const e of journal) {
     if (typeof e.branch !== 'string') continue;
     if (e.action === 'origin-blocked') {
-      // A GATE fix keeps its kind once it lives on origin. Its ref head has a
-      // perfectly measurable coverage — the offender's own tip — but that height
-      // is not a conflict point, and treating it as one lets descendants take
-      // everything below a branch that is simply RED. The kind is in the ref
-      // name, which is the only thing that survives the pass.
-      const ref = typeof e.fixBranch === 'string' ? e.fixBranch : typeof e.caseId === 'string' ? e.caseId : '';
       put({
         branch: e.branch,
         caseId: typeof e.caseId === 'string' ? e.caseId : 'origin',
-        gate: /--gate-fix-/.test(ref),
+        kind: e.kind === 'fix' ? 'fix' : 'merge',
         headSha: typeof e.headSha === 'string' ? e.headSha : null,
         fixBranch: typeof e.fixBranch === 'string' ? e.fixBranch : null,
         prNumber: typeof e.prNumber === 'number' ? e.prNumber : null,
@@ -558,7 +563,10 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
       put({
         branch: e.branch,
         caseId: typeof e.caseId === 'string' ? e.caseId : 'held',
-        gate: e.reason === 'gate',
+        // A gate hold is a fix on the branch's own content, so the PR it
+        // becomes has one parent — it freezes here already, one pass before
+        // origin can show the driver that shape.
+        kind: e.reason === 'gate' ? 'fix' : 'merge',
         headSha: jc?.head.sha ?? null,
         fixBranch: null, // no PR until `finish` publishes
         prNumber: null,
@@ -580,17 +588,37 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
 /**
  * The pass's merge_status view (branch → PR_ID | DEFERRED; absence = NONE),
  * derived from the journal alone:
- *  - PR_ID: `blockedRows` (origin-derived rows + this-pass holds).
+ *  - PR_ID: `blockedRows` (origin-derived rows + this-pass holds), PLUS every
+ *    transitive descendant of a FROZEN branch.
  *  - DEFERRED: branches with a journaled `defer` this pass, kept only while a
  *    DIRECT parent (registry edges) is still blocked — the STAY rule as
  *    a fixpoint over the journal instead of a stored flag, so a cleared
  *    parent releases its whole deferred chain on the next derivation. Across
  *    passes nothing is stored: DEFERRED is simply recomputed from the
  *    parents' PR_ID during derivation (the BECOME height-MIN rule re-runs).
+ *
+ * A FREEZE IS TRANSITIVE AND ABSOLUTE, and that is about VERIFIABILITY, not
+ * provenance. Below a red branch every case is unjudgeable: `report-case`
+ * checks fail on a defect the open fix already describes, `--not-my-bug` burns
+ * adjudication rounds proving it, and the agent is handed work that cannot
+ * complete. Letting merges flow past would take excluding the tests, which
+ * makes the gate meaningless. So the frozen branch and everything under it take
+ * NOTHING from any parent — the same empty-interval, all-skip treatment a
+ * branch waiting on its own PR gets.
  */
 function passStatusView(cli: Cli, journal: JournalEntry[]): Map<string, 'PR_ID' | 'DEFERRED'> {
   const pr = blockedRows(journal);
   const parentsOf = directParentEdges(cli);
+  const frozenRoots = new Set(
+    [...pr.entries()].filter(([, rows]) => rows.some((r) => r.kind === 'fix')).map(([branch]) => branch),
+  );
+  const frozen = new Set(frozenRoots);
+  if (frozenRoots.size > 0) {
+    const ancestorsOf = transitiveAncestors(Object.fromEntries(parentsOf));
+    for (const [branch, ancestors] of Object.entries(ancestorsOf)) {
+      if (ancestors.some((a) => frozenRoots.has(a))) frozen.add(branch);
+    }
+  }
   // A manual `unfrozen` clears a DEFERRED branch too (finding #2a): `defer`
   // rows OLDER than the branch's latest `unfrozen` are dropped, so an
   // unfreeze actually takes effect for DEFERRED (not just PR_ID). A later
@@ -607,14 +635,14 @@ function passStatusView(cli: Cli, journal: JournalEntry[]): Map<string, 'PR_ID' 
           e.action === 'defer' && typeof e.branch === 'string' && i > (lastUnfrozen.get(e.branch as string) ?? -1),
       )
       .map(({ e }) => e.branch as string)
-      .filter((b) => !pr.has(b)),
+      .filter((b) => !pr.has(b) && !frozen.has(b)),
   );
   let changed = true;
   while (changed) {
     changed = false;
     for (const b of [...deferred]) {
       const parents = parentsOf.get(b) ?? [];
-      if (!parents.some((p) => pr.has(p) || deferred.has(p))) {
+      if (!parents.some((p) => pr.has(p) || frozen.has(p) || deferred.has(p))) {
         deferred.delete(b);
         changed = true;
       }
@@ -622,6 +650,7 @@ function passStatusView(cli: Cli, journal: JournalEntry[]): Map<string, 'PR_ID' 
   }
   const out = new Map<string, 'PR_ID' | 'DEFERRED'>();
   for (const b of pr.keys()) out.set(b, 'PR_ID');
+  for (const b of frozen) out.set(b, 'PR_ID');
   for (const b of deferred) out.set(b, 'DEFERRED');
   return out;
 }
@@ -632,50 +661,79 @@ function prBlockedBranches(journal: JournalEntry[]): Set<string> {
 }
 
 /**
- * LIVE block-height records for the PR_ID branches:
- * no height is stored anywhere — heights are pass-relative (the
- * chain's fork point moves as branches absorb upstream), so each blocked
- * branch's height is RE-DERIVED against THIS pass's pinned chain from the
- * row's sha: an origin row's fix/sweep ref head CONTAINS the conflict head
- * (it is a parent of the driver-built PR-head commit) and nothing above it,
- * so its coverage IS the conflict height; a this-pass hold carries the
- * conflict head itself. DEFERRED branches are not here: their heights are
- * re-probed live during derivation.
+ * LIVE cut records for the blocked branches. No height is stored anywhere —
+ * heights are pass-relative (the chain's fork point moves as branches absorb
+ * upstream), so every cut is RE-DERIVED against THIS pass's pinned chain from
+ * the row's sha. DEFERRED branches are not here: their heights are re-probed
+ * live during derivation.
  *
- * A GATE block is WHOLE-RANGE (`-Infinity`) whatever sha it carries: a gate fix
- * says the branch is RED, not red-above-height-k, so no prefix of it is proven
- * clean and nothing from it is eligible. This holds across the pass boundary —
- * once the fix lives on origin its ref head has a measurable coverage (the
- * offender's own tip), and taking that for a conflict height would quietly hand
- * descendants everything below a branch that is still red.
+ * A MERGE proposal cuts at its SECOND PARENT'S coverage. A driver-built PR head
+ * is `[branch tip, conflict head]`, and it is the conflict head that says where
+ * the window closes — the head's OWN coverage is the max of the two sides, so
+ * once the branch tip moves past the conflict (an owner commit, another
+ * parent's merge) it reads high and hands descendants content nobody has
+ * integrated. A row whose sha is already the cut commit (a this-pass hold
+ * carries the conflict head itself) is its own second parent.
  *
- * A CONFLICT block whose sha cannot be resolved or falls below this pass's chain
- * has no conflict point inside the window, so it trims nothing: rule 8 trims AT
- * the conflict, and a conflict below the window is not in it. The branch's own
+ * A FIX proposal is the BOTTOM of the lattice (`-Infinity`): the branch is red,
+ * not red-above-height-k, so no prefix of it is proven clean and nothing from
+ * it is eligible. The same value covers a block whose sha cannot be resolved —
+ * an unmeasurable block is a total one, not an absent one.
+ *
+ * A cut BELOW this pass's window trims nothing: the window closes AT the
+ * conflict, and a conflict under the window is not in it. The branch's own
  * cases still gate it.
  */
 async function prBlockedRecords(cli: Cli, journal: JournalEntry[], chain: Chain): Promise<HeldRecord[]> {
   const out: HeldRecord[] = [];
   for (const [branch, rows] of blockedRows(journal)) {
     // Multiple concurrent blocks per branch: contribute the
-    // MINIMUM block — the safest trim for descendants (a higher survivor would
-    // let a child below it wrongly take content the lower block covers).
+    // MINIMUM cut — the safest trim for descendants (a higher survivor would
+    // let a child below it wrongly take content the lower cut covers).
     let best: HeldRecord | null = null;
     for (const row of rows) {
       let height: number;
-      if (row.gate) {
+      if (row.kind === 'fix' || !row.headSha || !(await refExists(cli.repo, row.headSha))) {
         height = WHOLE_RANGE_BLOCK;
       } else {
-        if (!row.headSha) continue;
-        if (!(await refExists(cli.repo, row.headSha))) continue;
-        height = (await deriveCoverage(cli.repo, chain, row.headSha)).height;
-        if (height < 0) continue; // no conflict point inside this pass's window
+        const head = await commitInfo(cli.repo, row.headSha);
+        const cutSha = head.parents.length >= 2 ? head.parents[1] : row.headSha;
+        height = (await deriveCoverage(cli.repo, chain, cutSha)).height;
+        if (height < 0) continue; // the cut is below this pass's window
       }
       if (!best || height < best.height) best = { branch, height, conflictedPaths: [], caseId: row.caseId };
     }
     if (best) out.push(best);
   }
   return out;
+}
+
+/**
+ * The pass's CUT MAP, rebuilt from the plan rows in DAG order: each blocked
+ * branch's own cut, then every branch's inherited minimum plus whatever its own
+ * rows deferred at.
+ *
+ * A derivation outside the run loop — a case re-verification — has to see the
+ * SAME cut the run derived. Rebuilding only the blocked branches' cuts would
+ * leave a branch two edges below a block with an open window, and the
+ * re-derivation would then find a conflict the run never served and call the
+ * live case stale.
+ */
+function passCutMap(plan: PropagationPlan, held: HeldRecord[]): Map<string, number> {
+  const cutOf = new Map<string, number>();
+  const put = (branch: string, height: number): void => {
+    cutOf.set(branch, Math.min(height, cutOf.get(branch) ?? Infinity));
+  };
+  for (const rec of held) put(rec.branch, rec.height);
+  for (const bp of plan.branches) {
+    const inherited = effectiveCut(
+      bp.parents.map((p) => p.parent),
+      cutOf,
+    );
+    if (inherited) put(bp.branch, inherited.height);
+    for (const pp of bp.parents) if (pp.deferHeight !== undefined) put(bp.branch, pp.deferHeight);
+  }
+  return cutOf;
 }
 
 /**
@@ -2734,24 +2792,25 @@ export async function cmdRun(cli: Cli): Promise<number> {
   const heldSet = new Set([...statusView.entries()].filter(([, s]) => s === 'PR_ID').map(([b]) => b));
   const preReffed = preReffedSet(journal);
 
-  // Block-height map for the LIVE execution path (mirrors derivePlan): every
-  // blocked branch (merge_status != NONE) with its block-height, seeded from the
-  // blocked set and GROWN as branches defer in DAG order — deriveLive and the §3
-  // re-probe use it for the height-MIN DEFER over blocked DIRECT parents. Without
-  // it the live re-derivation loses the defer that plan.json computed. PR_ID
-  // heights come re-derived from the stored head sha (`held`); DEFERRED branches
-  // that ALREADY ARRIVED this pass (they will not be re-processed below) seed
-  // from their live-probed plan rows — heights are never read from merge_status.
+  // Cut map for the LIVE execution path (mirrors derivePlan): every branch that
+  // closes a window, with the coordinate it closes it at. It feeds the
+  // eligible-line cut and the height-MIN DEFER over blocked DIRECT parents, and
+  // it GROWS in DAG order so a branch's effective cut reaches its descendants.
+  // Without it the live re-derivation loses what plan.json computed. Blocked
+  // branches' cuts come re-derived from their journaled heads (`held`);
+  // branches that ALREADY ARRIVED this pass (they will not be re-processed
+  // below) seed from their live-probed plan rows — heights are never read from
+  // merge_status.
   const blockHeightOf = new Map<string, number>();
-  for (const h of held) blockHeightOf.set(h.branch, h.height);
-  for (const bp of plan.branches) {
-    if (!arrived.has(bp.branch) || statusView.get(bp.branch) !== 'DEFERRED') continue;
-    const hs = bp.parents.filter((pp) => pp.verdict === 'defer' && pp.deferHeight !== undefined).map((pp) => pp.deferHeight!);
-    if (hs.length && !blockHeightOf.has(bp.branch)) blockHeightOf.set(bp.branch, Math.min(...hs));
-  }
-  const recordDefer = (branch: string, deferHeight?: number): void => {
-    if (deferHeight !== undefined) blockHeightOf.set(branch, Math.min(deferHeight, blockHeightOf.get(branch) ?? Infinity));
+  const recordCut = (branch: string, height?: number): void => {
+    if (height !== undefined) blockHeightOf.set(branch, Math.min(height, blockHeightOf.get(branch) ?? Infinity));
   };
+  for (const h of held) recordCut(h.branch, h.height);
+  for (const bp of plan.branches) {
+    if (!arrived.has(bp.branch)) continue;
+    const hs = bp.parents.filter((pp) => pp.deferHeight !== undefined).map((pp) => pp.deferHeight!);
+    if (hs.length) recordCut(bp.branch, Math.min(...hs));
+  }
 
   let gated = false;
   const diverged: string[] = [];
@@ -2810,19 +2869,22 @@ export async function cmdRun(cli: Cli): Promise<number> {
       // The same derivation is reused by the §3 execution re-probe below when a
       // per-parent verdict goes stale mid-branch.
       const model: 'entry' | 'parents' = snap.parents[0]?.model ?? 'entry';
+      const parentBranches = snap.parents.map((p) => p.parent);
+      // Read the cut FRESH on every derivation: an earlier sibling in this same
+      // loop can defer and close the window since the last read.
       const deriveLive = (mergeBlocked?: { state: 'DEFERRED'; behind: string }): Promise<BranchPlan> =>
         deriveBranch({
           repo: cli.repo,
           branch: snap.branch,
           kind: snap.kind,
           model,
-          parents: snap.parents.map((p) => p.parent),
+          parents: parentBranches,
           chain,
           ancestors: snap.ancestors,
           tierFloor: snap.tierFloor,
           isLeaf: snap.isLeaf,
           alwaysMerge: snap.alwaysMerge,
-          held,
+          cut: effectiveCut(parentBranches, blockHeightOf),
           blockHeightOf,
           stackCap: snap.stackCap, // effective cap resolved at plan derivation
           mergeBlocked,
@@ -2844,7 +2906,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
           for (const pp of bpSticky.parents) {
             if (pp.verdict !== 'defer') continue;
             appendJournal(dir, { action: 'defer', branch: snap.branch, parent: pp.parent, deferredTo: pp.deferredTo });
-            recordDefer(snap.branch, pp.deferHeight);
+            recordCut(snap.branch, pp.deferHeight);
           }
           appendJournal(dir, { action: 'skip', branch: snap.branch, reason: 'deferred' });
           appendJournal(dir, { action: 'arrived', branch: snap.branch });
@@ -2857,6 +2919,11 @@ export async function cmdRun(cli: Cli): Promise<number> {
       // against THIS tip, not a fresh read — see the note at the verify call.
       const tipAtDerive = await revParse(cli.repo, snap.branch);
       const bp = await deriveLive();
+      // The effective cut is INHERITED: this branch cannot hand its descendants
+      // what it could not take itself, so it closes their window at the same
+      // coordinate. Recorded before any merge below, so a child processed later
+      // in this same loop sees it.
+      recordCut(bp.branch, effectiveCut(parentBranches, blockHeightOf)?.height);
 
       // Leaf / always_merge un-skip (§6): if every parent no-op'd in a pass that
       // carries progress, force (empty) merges along the cheapest parent chain.
@@ -3061,7 +3128,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
             // derived view from this moment.
             if (pp.deferredTo) {
               appendJournal(dir, { action: 'defer', branch: bp.branch, parent: pp.parent, deferredTo: pp.deferredTo });
-              recordDefer(bp.branch, pp.deferHeight);
+              recordCut(bp.branch, pp.deferHeight);
             }
             // A clean merge up to the merge point can still leave a conflict ABOVE
             // it (§3 step 4): emit the case (recomputed post-merge) and halt.
@@ -3073,7 +3140,7 @@ export async function cmdRun(cli: Cli): Promise<number> {
             // BECOME DEFERRED: the journaled `defer` row is the state
             // — the branch is blocked in the derived view from now on.
             appendJournal(dir, { action: 'defer', branch: bp.branch, parent: pp.parent, deferredTo: pp.deferredTo });
-            recordDefer(bp.branch, pp.deferHeight);
+            recordCut(bp.branch, pp.deferHeight);
           } else if (pp.verdict === 'case') {
             if (await emitCase(pp)) {
               branchGated = true;
@@ -3452,7 +3519,9 @@ async function reverifyCase(
 
   const branchTip = await revParse(cli.repo, caseFile.branch);
 
-  // (1)+(2) re-derive the branch LIVE and locate the named parent's conflict.
+  // (1)+(2) re-derive the branch LIVE and locate the named parent's conflict,
+  // under the pass's own cut map — the window this branch was served under.
+  const cutOf = passCutMap(plan, await prBlockedRecords(cli, journal, ctx.chain));
   const bp = await deriveBranch({
     repo: cli.repo,
     branch: caseFile.branch,
@@ -3464,7 +3533,8 @@ async function reverifyCase(
     tierFloor: floor,
     isLeaf,
     alwaysMerge: feat?.always_merge === true,
-    held: await prBlockedRecords(cli, journal, ctx.chain),
+    cut: effectiveCut(parents, cutOf),
+    blockHeightOf: cutOf,
     stackCap,
   });
   const pp = bp.parents.find((p) => p.parent === caseFile.parent);
@@ -6783,6 +6853,13 @@ async function deriveOriginMergeStatus(
     };
 
     for (const u of unmerged) {
+      // WHAT THE PROPOSAL IS COMES FROM THE SHAPE OF ITS HEAD, and this is the
+      // only place that can see it: the ref name is a string the driver minted,
+      // and by the time the plan reads the journal it is all that survives. Two
+      // parents merge something and cut at the merge point; one parent fixes
+      // the branch's own content, which makes the branch red and freezes it
+      // whole.
+      const headKind = (await commitInfo(cli.repo, u.sha)).parents.length >= 2 ? 'merge' : 'fix';
       // journal the PR_ID row (shared by the blocked arms; every unmerged ref
       // with a live/reissued/recovered PR blocks its branch).
       const journalBlocked = (pr: { number: number; url: string }, markerId: number | null): void => {
@@ -6791,6 +6868,7 @@ async function deriveOriginMergeStatus(
           branch: u.branch,
           caseId: `origin:${u.ref}`,
           fixBranch: u.ref,
+          kind: headKind,
           headSha: u.sha,
           prNumber: pr.number,
           prUrl: pr.url,
