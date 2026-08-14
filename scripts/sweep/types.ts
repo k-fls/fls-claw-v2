@@ -295,6 +295,16 @@ export interface CaseFile {
   run?: Head[];
   tierFloor: Tier;
   conflictedPaths: string[];
+  /**
+   * Paths a PUBLISHED resolution reached beyond its conflict set, re-seeded so a
+   * revision holds the whole of what it is revising (§5.3).
+   *
+   * Kept OUT of `conflictedPaths` deliberately: that field is the conflict
+   * itself and the staleness check recomputes it (`ERR02_CASE_STALE`), so a path
+   * that is pending-but-not-conflicting there reads as the case having drifted.
+   * Pending and in scope, not conflicted.
+   */
+  carriedPaths?: string[];
   automergeTree: string;
   reproduction: { command: string };
   /** DEFERRED-check inputs (§5); firstConflictHeight = the run's TOP height. */

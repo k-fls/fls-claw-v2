@@ -2173,6 +2173,7 @@ describe('sweep finish (SWEEP-STATE-MACHINE.md §2) — multi-step, resumable', 
     // journal carries NO `pr-published` row for the case.
     const gh = fakeGithub({
       'GET /pulls?': { status: 200, body: [{ html_url: 'https://github.com/k-fls/fixture/pull/12', number: 12 }] },
+      'PATCH /pulls/12': { status: 200, body: { html_url: 'https://github.com/k-fls/fixture/pull/12', number: 12 } },
     });
     const out = join(ws, 'finish.json');
     expect(
@@ -2180,12 +2181,12 @@ describe('sweep finish (SWEEP-STATE-MACHINE.md §2) — multi-step, resumable', 
         baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, tokenFile, commandsFile: passCmds(ws), out }),
         gh.factory,
       ),
-    ).toBe(0); // NO halt — the loop reconciles and continues
+    ).toBe(0); // NO halt — the existing PR is adopted and the loop continues
     const res = JSON.parse(readFileSync(out, 'utf8')) as { ok: boolean; status: string };
     expect(res.ok).toBe(true);
     expect(res.status).toBe('complete');
     expect(machineState(dir).phase).toBe('complete');
-    // The reconciling row has the normal pr-published shape (journal healed).
+    // The published row has its normal shape, pointing at the PR that exists.
     const pub = readJournal(dir).find((e) => e.action === 'pr-published' && e.caseId === caseId)!;
     expect(pub.number).toBe(12);
     expect(pub.url).toBe('https://github.com/k-fls/fixture/pull/12');
@@ -2193,10 +2194,14 @@ describe('sweep finish (SWEEP-STATE-MACHINE.md §2) — multi-step, resumable', 
     expect(pub.branch).toBe('main_patched');
     expect(typeof pub.fixBranch).toBe('string');
     expect(typeof pub.head).toBe('string');
-    expect(pub.reconciled).toBe(true);
-    // NO duplicate PR was created and no pr-head push happened.
+    // Adopted, not created — and the driver says which PR it adopted.
+    expect(readJournal(dir).find((e) => e.action === 'pr-adopted')!.number).toBe(12);
+    // NO duplicate PR…
     expect(gh.calls.some((c) => c.method === 'POST' && c.path.endsWith('/pulls'))).toBe(false);
-    expect(readJournal(dir).some((e) => e.action === 'push' && e.kind === 'pr-head')).toBe(false);
+    // …and the PR now carries this pass's head and prose, because a PR the
+    // driver did not journal is still this case's PR (D-070 rule 3).
+    expect(gh.calls.some((c) => c.method === 'PATCH' && c.path.includes('/pulls/12'))).toBe(true);
+    expect(readJournal(dir).some((e) => e.action === 'push' && e.kind === 'pr-head')).toBe(true);
   });
 
   it('cross-tier duplicate (finding #3): a held case matching a published JUDGED sibling is journaled held-duplicate and finish completes (no ERR06 wedge)', async () => {

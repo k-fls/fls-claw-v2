@@ -539,9 +539,16 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
   for (const e of journal) {
     if (typeof e.branch !== 'string') continue;
     if (e.action === 'origin-blocked') {
+      // A GATE fix keeps its kind once it lives on origin. Its ref head has a
+      // perfectly measurable coverage — the offender's own tip — but that height
+      // is not a conflict point, and treating it as one lets descendants take
+      // everything below a branch that is simply RED. The kind is in the ref
+      // name, which is the only thing that survives the pass.
+      const ref = typeof e.fixBranch === 'string' ? e.fixBranch : typeof e.caseId === 'string' ? e.caseId : '';
       put({
         branch: e.branch,
         caseId: typeof e.caseId === 'string' ? e.caseId : 'origin',
+        gate: /--gate-fix-/.test(ref),
         headSha: typeof e.headSha === 'string' ? e.headSha : null,
         fixBranch: typeof e.fixBranch === 'string' ? e.fixBranch : null,
         prNumber: typeof e.prNumber === 'number' ? e.prNumber : null,
@@ -636,13 +643,17 @@ function prBlockedBranches(journal: JournalEntry[]): Set<string> {
  * conflict head itself. DEFERRED branches are not here: their heights are
  * re-probed live during derivation.
  *
- * A row with NO sha (a gate hold) or whose sha fell below the chain is a block
- * whose height cannot be measured — and an unmeasurable block is a WHOLE-RANGE
- * one (`-Infinity`), not an absent one. A gate fix rooted at the tip says the
- * branch is red, not red-above-height-k: no prefix of it is proven clean, so
- * nothing from it is eligible. Treating it as absent is what lets every
- * descendant merge a red tip, advance on it, and be blamed for the collision in
- * the integration rebuild.
+ * A GATE block is WHOLE-RANGE (`-Infinity`) whatever sha it carries: a gate fix
+ * says the branch is RED, not red-above-height-k, so no prefix of it is proven
+ * clean and nothing from it is eligible. This holds across the pass boundary —
+ * once the fix lives on origin its ref head has a measurable coverage (the
+ * offender's own tip), and taking that for a conflict height would quietly hand
+ * descendants everything below a branch that is still red.
+ *
+ * A CONFLICT block whose sha cannot be resolved or falls below this pass's chain
+ * has no conflict point inside the window, so it trims nothing: rule 8 trims AT
+ * the conflict, and a conflict below the window is not in it. The branch's own
+ * cases still gate it.
  */
 async function prBlockedRecords(cli: Cli, journal: JournalEntry[], chain: Chain): Promise<HeldRecord[]> {
   const out: HeldRecord[] = [];
@@ -652,11 +663,15 @@ async function prBlockedRecords(cli: Cli, journal: JournalEntry[], chain: Chain)
     // let a child below it wrongly take content the lower block covers).
     let best: HeldRecord | null = null;
     for (const row of rows) {
-      const measured =
-        row.headSha && (await refExists(cli.repo, row.headSha))
-          ? (await deriveCoverage(cli.repo, chain, row.headSha)).height
-          : -1;
-      const height = measured < 0 ? WHOLE_RANGE_BLOCK : measured;
+      let height: number;
+      if (row.gate) {
+        height = WHOLE_RANGE_BLOCK;
+      } else {
+        if (!row.headSha) continue;
+        if (!(await refExists(cli.repo, row.headSha))) continue;
+        height = (await deriveCoverage(cli.repo, chain, row.headSha)).height;
+        if (height < 0) continue; // no conflict point inside this pass's window
+      }
       if (!best || height < best.height) best = { branch, height, conflictedPaths: [], caseId: row.caseId };
     }
     if (best) out.push(best);
@@ -2342,7 +2357,10 @@ export async function createCaseWorktree(
     // automerge tree dropped it (delete/modify conflict), so `git status` = exactly
     // the conflict. The index still holds the prefix (ours) version — hence pending.
     const source = contentSource ?? caseFile.automergeTree;
-    for (const p of caseFile.conflictedPaths) {
+    // Carried paths are materialized the same way: they hold what the published
+    // resolution left there, so the revision starts from the whole resolution
+    // rather than from the part of it that still conflicts.
+    for (const p of [...caseFile.conflictedPaths, ...(caseFile.carriedPaths ?? [])]) {
       const abs = join(wtPath, p);
       const blob = await git(cli.repo, ['cat-file', '-p', `${source}:${p}`], { allowCodes: [128] });
       if (blob.code === 0) {
@@ -2367,7 +2385,7 @@ export async function createCaseWorktree(
       path: wtPath,
       rerereSeeded: seeded,
       linkedDeps,
-      pendingPaths: caseFile.conflictedPaths,
+      pendingPaths: [...caseFile.conflictedPaths, ...(caseFile.carriedPaths ?? [])],
       ...(contentSource ? { contentSource } : {}),
     });
     return true;
@@ -2667,11 +2685,20 @@ export async function cmdRun(cli: Cli): Promise<number> {
     // can also arrive mid-pass — a verify gate hold is journaled long after
     // `start` wrote the plan — and reading that as "git moved under us" halts a
     // pass for doing exactly what the block is supposed to make it do.
+    // Narrow on purpose: only a branch that now derives TOWARD the block —
+    // deferring or skipping rather than merging — is excused. A descendant that
+    // still derives a merge or a case has changed for some other reason, and
+    // that is exactly what the halt exists to catch; excusing the whole subtree
+    // would blind the guard across most of a tree with a held branch near its
+    // root.
     const ancestorsOf = transitiveAncestors(Object.fromEntries(directParentEdges(cli)));
+    const derivesTowardBlock = new Map(
+      plan.branches.map((b) => [b.branch, b.parents.every((p) => p.verdict === 'defer' || p.verdict === 'skip' || p.verdict === 'up-to-date')]),
+    );
     const belowBlocked = new Set(
       [...prev.branches, ...plan.branches]
         .map((b) => b.branch)
-        .filter((b) => (ancestorsOf[b] ?? []).some((a) => blockedSet.has(a))),
+        .filter((b) => (ancestorsOf[b] ?? []).some((a) => blockedSet.has(a)) && derivesTowardBlock.get(b) === true),
     );
     const exclude = new Set([
       ...arrived,
@@ -3250,6 +3277,8 @@ interface ResolvedCase {
   /** The stacked run (ascending); run[run.length - 1] === head. */
   run: Head[];
   conflictedPaths: string[];
+  /** Pending-and-in-scope reach re-seeded from a published resolution (CaseFile). */
+  carriedPaths?: string[];
   automergeTree: string;
   reproduction: { command: string };
   tierFloor: Tier;
@@ -3592,6 +3621,10 @@ async function reverifyReissueCase(
       head: rowHead,
       run: [rowHead],
       conflictedPaths: probe.conflictFiles,
+      // Carried through the re-derivation: they are pending in the worktree and
+      // in scope, and a guard that forgot them would charge the agent for the
+      // resolution it was handed.
+      ...(caseFile.carriedPaths?.length ? { carriedPaths: caseFile.carriedPaths } : {}),
       automergeTree: probe.treeOid,
       reproduction: caseFile.reproduction,
       tierFloor: floor,
@@ -4625,46 +4658,27 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
         return 0;
       }
     }
-    const existing = reissue ? null : await getOpenPrByHead(transport, slugParts!, fixBranch);
-    if (existing) {
-      // RECONCILE, never a livelock: reaching here means the
-      // journal carries NO `pr-published` row for this case (a journal-side row
-      // is blocking ERR07 above), yet the PR exists on the API side — the
-      // crash window between the prior run's PR create and its journal append.
-      // The head branch name is deterministic per case identity, so this IS
-      // this case's PR: journal the reconciling row (same shape as the normal
-      // path) and succeed, so a resumed `finish` continues instead of halting.
-      guardRef(fixBranch, new Set(), { fixSweep: true });
-      if (!(await refExists(cli.repo, fixBranch))) {
-        await git(cli.repo, ['update-ref', `refs/heads/${fixBranch}`, headSha, '']);
+    // PROVENANCE-BLIND: a PR either exists for this case's deterministic head
+    // ref or it does not. Which pass opened it — and whether this pass remembers
+    // opening it — is not a difference the driver may act on: the ref name
+    // derives from the case identity alone, so an open PR on it IS this case's
+    // PR. It gets UPDATED with the current head and prose, exactly as a reissue
+    // does. The only thing `finish` must never do is create a second one.
+    if (!reissueTarget) {
+      const existing = await getOpenPrByHead(transport, slugParts!, fixBranch);
+      if (existing) {
+        reissueTarget = existing;
+        appendJournal(dir, {
+          action: 'pr-adopted',
+          caseId: jc.caseId,
+          branch: jc.branch,
+          fixBranch,
+          url: existing.url,
+          number: existing.number,
+          detail: 'an open PR already exists on this case\'s head ref — updating it instead of creating a second',
+        });
+        console.error(`publish: open PR #${existing.number} already exists for head '${fixBranch}' — updating it`);
       }
-      // The crashed run may have died between PR create and the marker
-      // post — re-assert the sweep-addressed marker (0: first publish; readers
-      // take the MAX, so a duplicate is harmless).
-      if (mode === 'held') await postSweepAddressed(transport, slugParts!, existing.number, 0);
-      appendJournal(dir, {
-        action: 'pr-published',
-        caseId: jc.caseId,
-        branch: jc.branch,
-        mode,
-        draft,
-        fixBranch,
-        url: existing.url,
-        number: existing.number,
-        head: headSha,
-        reconciled: true,
-      });
-      console.error(
-        `reconciled: open PR #${existing.number} already exists for head '${fixBranch}' (${existing.url}) — journaled pr-published (crash-window heal), no new PR created`,
-      );
-      emit(cli, {
-        ok: true,
-        issues,
-        pr: { url: existing.url, number: existing.number },
-        head: headInfo,
-        reconciled: true,
-      });
-      return 0;
     }
   } catch (e) {
     emit(cli, { ok: false, issues: [...issues, apiFailureIssue(cli, e)] });
@@ -4676,7 +4690,16 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
   // NO fallback of any kind. A REISSUE replaces the prior resolution
   // head on the SAME ref (non-fast-forward by construction), so it pushes with
   // a compare-and-swap lease on the start-classified old head — never blind.
-  const priorHead = reissue && typeof caseRow!.priorHead === 'string' ? (caseRow!.priorHead as string) : null;
+  //
+  // An ADOPTED PR (found on the ref, not journaled by this pass) leases against
+  // the driver's own local anchor for that ref, which is what it last pushed
+  // there. Without a lease the push would clobber whatever the ref carries now;
+  // with one, a ref that moved under us fails loudly instead.
+  const localAnchor = (await refExists(cli.repo, fixBranch))
+    ? await revParse(cli.repo, fixBranch)
+    : null;
+  const priorHead =
+    reissue && typeof caseRow!.priorHead === 'string' ? (caseRow!.priorHead as string) : reissueTarget ? localAnchor : null;
   try {
     await gitPush(cli.repo, headSha, fixBranch, priorHead ? { forceWithLease: priorHead } : {});
     appendJournal(dir, {
@@ -4717,9 +4740,9 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
     }
     let result: { url: string; number: number };
     if (reissueTarget) {
-      // REISSUE: the revision replaces the EXISTING PR's head (the ref
-      // push above); refresh the PR's title/body from the agent's revised
-      // prose — never a second PR for the same review.
+      // UPDATE IN PLACE: the new head is already on the ref (the push above);
+      // refresh the PR's title and body from the current prose. Never a second
+      // PR — for a reissue, and equally for a PR this pass merely found.
       await ghExpect(transport, 'PATCH', `/repos/${slugParts!.owner}/${slugParts!.repo}/pulls/${reissueTarget.number}`, {
         title,
         body: finalBody,
@@ -4748,7 +4771,9 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
     guardRef(fixBranch, new Set(), { fixSweep: true });
     if (!(await refExists(cli.repo, fixBranch))) {
       await git(cli.repo, ['update-ref', `refs/heads/${fixBranch}`, headSha, '']);
-    } else if (reissue) {
+    } else {
+      // The anchor follows what was pushed, whatever put the ref there — it is
+      // the lease for the next update.
       await git(cli.repo, ['update-ref', `refs/heads/${fixBranch}`, headSha]);
     }
     appendJournal(dir, {
@@ -5394,8 +5419,11 @@ export async function cmdVerify(cli: Cli): Promise<number> {
       offender,
       nonBlocking: true,
       excluded: offender,
+      // `excludedFor`, not `failureKind`: `ok` here is the RE-VERIFY's verdict,
+      // and naming the conflict as this result's failure kind labels a GREEN
+      // answer a merge conflict — the same mistake the blocking arm fixes.
       ...(conflictDetail
-        ? { failureKind: 'merge-conflict', unresolved: first.build.unresolved ?? [], detail: conflictDetail }
+        ? { excludedFor: 'merge-conflict', unresolved: first.build.unresolved ?? [], detail: conflictDetail }
         : {}),
       reverify: { ok: reOk },
     });
@@ -6021,7 +6049,17 @@ async function conflictHunkRanges(repo: string, wtPath: string, paths: string[])
 }
 
 /** Driver-authored case materials for the case-ready hand-off. */
-async function machineCaseMaterials(cli: Cli, dir: string, jc: JournaledCase): Promise<string> {
+/**
+ * THE MERGE BRIEFING — the same for a conflict whoever is looking at it.
+ *
+ * What constrains a resolution is the two sides, what each of them did over the
+ * conflicted paths, and which feature owns the code (doctrine §5). None of that
+ * changes because the resolution has been published once and reviewed: a
+ * reissue is the SAME merge, and an agent revising it needs the same facts as
+ * the agent that first resolved it. Served in one shape so it cannot go missing
+ * from one kind of case and be present in another.
+ */
+async function conflictBriefing(cli: Cli, dir: string, jc: JournaledCase): Promise<string[]> {
   const tip = await revParse(cli.repo, jc.branch);
   const sides = await perSideLog(cli.repo, tip, jc.head.sha, jc.conflictedPaths);
   const registry = loadRegistry({
@@ -6030,10 +6068,6 @@ async function machineCaseMaterials(cli: Cli, dir: string, jc: JournaledCase): P
     routingFile: cli.routingFile,
   });
   return [
-    `# Case materials — ${jc.caseId}`,
-    '',
-    ...CASE_DIRECTIVES,
-    '',
     '## Conflicted paths (the pending files — your edit scope)',
     // Ranges only here: by `prepareCaseMaterials` the conflict is RESOLVED, so
     // there are no markers left to point at.
@@ -6045,6 +6079,16 @@ async function machineCaseMaterials(cli: Cli, dir: string, jc: JournaledCase): P
     ...inventoryContextLines(registry.features, jc.branch, jc.parent, jc.conflictedPaths),
     '',
     ...perSideBlocks(sides, jc.branch, jc.parent),
+  ];
+}
+
+async function machineCaseMaterials(cli: Cli, dir: string, jc: JournaledCase): Promise<string> {
+  return [
+    `# Case materials — ${jc.caseId}`,
+    '',
+    ...CASE_DIRECTIVES,
+    '',
+    ...(await conflictBriefing(cli, dir, jc)),
     '',
     'Resolve the conflict in the worktree above, then run `report-case --tier mechanical|judged|held`.',
   ].join('\n');
@@ -6141,7 +6185,12 @@ function renderDialogItem(item: DialogItem): string[] {
   return ['', `### ${who} — ${what}${item.at ? ` (${item.at})` : ''}`, item.body || '(no text)'];
 }
 
-function reissueCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEntry): string {
+async function reissueCaseMaterials(
+  cli: Cli,
+  dir: string,
+  jc: JournaledCase,
+  caseRow: JournalEntry,
+): Promise<string> {
   const dialogPath = join(dir, jc.caseId, 'dialog.json');
   const dialog: DialogItem[] = existsSync(dialogPath)
     ? (JSON.parse(readFileSync(dialogPath, 'utf8')) as DialogItem[])
@@ -6167,10 +6216,22 @@ function reissueCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEn
     'driver). Every other turn names its author by GitHub login — address them by that @login in your reply.',
     ...dialog.flatMap(renderDialogItem),
     '',
-    '## Conflicted paths (the pending files — your edit scope)',
-    ...jc.conflictedPaths.map((p) => `- ${p}`),
+    // THE SAME BRIEFING A FIRST-TIME CASE GETS. A reissue is the same merge, and
+    // the review is a reason to revise it, not a substitute for knowing what the
+    // two sides did. Without this the agent is handed a conversation and a list
+    // of filenames and has to reconstruct the merge from the diff.
+    ...(await conflictBriefing(cli, dir, jc)),
     '',
-    `Branch: ${jc.branch}   Parent: ${jc.parent}   Head: ${jc.head.sha.slice(0, 12)} (height ${jc.head.height})`,
+    ...(Array.isArray(caseRow.carriedPaths) && caseRow.carriedPaths.length
+      ? [
+          '## Files your published resolution reached outside the conflict',
+          'These are pending too, holding what the published resolution left there — the call sites you',
+          'updated, the signature you changed. They are NOT new conflicts and they are in scope: keep them',
+          'consistent with the revision, and say so in the PR text if the reviewer asked about the reach.',
+          ...(caseRow.carriedPaths as string[]).map((p) => `- ${p}`),
+          '',
+        ]
+      : []),
     `Existing PR: #${caseRow.prNumber}${typeof caseRow.prUrl === 'string' ? ` (${caseRow.prUrl})` : ''} — the revision replaces its head (fix ref '${caseRow.fixBranch}').`,
     '',
     'Revise the resolution in the worktree above, then run `report-case --tier held`.',
@@ -6361,6 +6422,27 @@ async function materializeReissueCase(
       `no live conflict remains for '${args.branch}' <- ${conflictHead.slice(0, 12)} (healed) — the PR may be obsolete`,
     );
   }
+  // WHAT THE PUBLISHED RESOLUTION TOUCHED OUTSIDE THE CONFLICT SET.
+  //
+  // A resolution may legitimately reach beyond the conflicted files — union two
+  // signatures, update the call sites — and that reach is exactly what the
+  // reviewer is looking at. Seeding only the still-conflicting paths hands the
+  // agent a resolution missing part of itself, to revise against a review that
+  // discusses the missing part.
+  //
+  // A path qualifies when the PR head differs from TODAY'S automerge there AND
+  // the branch has not moved on it since the PR head was built. That second
+  // condition is what makes this safe: where the base HAS moved, the PR head is
+  // stale rather than richer, and overlaying it would revert the branch's own
+  // progress under the guise of restoring a resolution.
+  const namesOf = async (a: string, b: string): Promise<string[]> =>
+    (await git(cli.repo, ['diff', '--name-only', a, b])).stdout.split('\n').filter(Boolean);
+  const priorBase = (await git(cli.repo, ['merge-base', args.refSha, tip], { allowCodes: [1] })).stdout.trim();
+  const movedSince = new Set(priorBase ? await namesOf(priorBase, tip) : []);
+  const conflicting = new Set(probe.conflictFiles);
+  const carried = (await namesOf(probe.treeOid, args.refSha)).filter(
+    (p) => !conflicting.has(p) && !movedSince.has(p),
+  );
   const cid = caseId(args.branch, parent, height);
   const head = { sha: conflictHead, height };
   const feat = args.features.find((f) => f.branch === args.branch);
@@ -6373,6 +6455,7 @@ async function materializeReissueCase(
     run: [head],
     tierFloor: tierFloor(args.branch, feat),
     conflictedPaths: probe.conflictFiles,
+    ...(carried.length ? { carriedPaths: carried } : {}),
     automergeTree: probe.treeOid,
     reproduction: { command: `git merge-tree --write-tree --name-only ${tip} ${conflictHead}` },
     deferredCheck: { firstConflictHeight: height, transitiveAncestors: args.ancestors },
@@ -6388,6 +6471,7 @@ async function materializeReissueCase(
     height,
     run: caseFile.run,
     conflictedPaths: caseFile.conflictedPaths,
+    ...(carried.length ? { carriedPaths: carried } : {}),
     reissue: true,
     fixBranch: args.ref,
     priorHead: args.refSha,
@@ -7617,7 +7701,7 @@ export async function cmdSweepNextCase(
     (isGateFix
       ? gateFixCaseMaterials(dir, jc, caseRow!)
       : isReissue
-        ? reissueCaseMaterials(dir, jc, caseRow!)
+        ? await reissueCaseMaterials(cli, dir, jc, caseRow!)
         : await machineCaseMaterials(cli, dir, jc)) +
     (loopWarning ? `\n\n## LOOP WARNING\n${loopWarning}\n` : '') +
     `\n\n${CHECKS_HANDOFF_LINE}`;
@@ -7631,6 +7715,9 @@ export async function cmdSweepNextCase(
     branch: jc.branch,
     caseId: jc.caseId,
     conflictedPaths: caseFile.conflictedPaths,
+    // Pending too, and in scope — the agent's report should not read them as
+    // files it wandered into.
+    ...(caseFile.carriedPaths?.length ? { carriedPaths: caseFile.carriedPaths } : {}),
     run: caseFile.run ?? [caseFile.head],
     ...(isReissue ? { reissue: true, prNumber: caseRow!.prNumber ?? null } : {}),
     ...(activeGates.length ? { activeGates } : {}),
@@ -8251,13 +8338,18 @@ export async function cmdSweepReportCase(
   );
   const widenedPaths = [...new Set(widenRows.flatMap((e) => e.files as string[]))];
   const widenedReason = String(widenRows[widenRows.length - 1]?.reason ?? '');
-  const allowedPaths = [...new Set([...rc.conflictedPaths, ...widenedPaths])];
+  // Carried paths are in scope by construction: they are the published
+  // resolution's own reach, seeded pending, and the reviewer is looking at them.
+  // Booking them as a violation would charge the agent for an edit it inherited.
+  const allowedPaths = [...new Set([...rc.conflictedPaths, ...(rc.carriedPaths ?? []), ...widenedPaths])];
   // `conflict-hunks` mode bounds edits to the automerge blob's MARKER SPANS. A
   // widened file has no markers, so every edit in it would be a hunk violation
   // and the widening would be inert — the extra-file violation simply renamed.
   // They are exempt from the hunk check and file-level allowed instead.
   const guard = await scopeGuard(cli.repo, rc.automergeTree, resolvedTree, allowedPaths, rc.scopeGuardMode, {
-    hunkExempt: widenedPaths,
+    // A carried path holds the prior resolution, not an automerge blob, so it
+    // has no marker spans to bound edits by — file-level allowed, like a widening.
+    hunkExempt: [...widenedPaths, ...(rc.carriedPaths ?? [])],
   });
 
   // Adequacy: duplicate detection (ERR06) — mechanical.

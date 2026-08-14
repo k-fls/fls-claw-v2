@@ -446,6 +446,62 @@ describe('run — resume idempotence + window trimming (reached via next-case)',
     // verify recipe. That is the whole mechanism, in one assertion.
     expect(readJournal(dir).some((e) => e.action === 'pre-ref' && e.branch === 'feat/c')).toBe(false);
   });
+
+  /**
+   * A GATE fix keeps its scope after it becomes a PR.
+   *
+   * In the pass that takes it, a gate hold carries no conflict head, so it is
+   * unmeasurable and trims everything. One pass later the same block arrives
+   * from origin as a `fix/sweep/…--gate-fix-…` ref whose head has a perfectly
+   * measurable coverage — the offender's own tip. Reading that as a conflict
+   * height hands descendants everything below a branch that is still RED, and
+   * makes the trim depend on which pass took the hold.
+   */
+  it('a gate fix arriving from origin still trims the WHOLE range, not its ref height', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    const base = repo.sha('main');
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.checkout('feat/c', { create: true, at: 'main_patched' });
+    repo.checkout('main');
+    repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+    repo.checkout('main_patched');
+    repo.git('merge', '--no-edit', '-m', 'main_patched merges U0', 'main'); // covers h0
+    repo.checkout('main');
+    repo.commit('U1: more', { 'src/more.ts': 'm\n' });
+    repo.checkout('main_patched');
+    repo.git('merge', '--no-edit', '-m', 'main_patched merges U1', 'main'); // tip covers h1
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+
+    // The distinction this pins: main_patched's TIP covers h1, so reading the
+    // gate-fix ref head as a conflict height would trim at 1 and leave h0
+    // eligible — feat/c would merge the h0 step of a branch that is RED. Only a
+    // whole-range block leaves nothing.
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'c', branch: 'feat/c', parents: ['main_patched'] }]);
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, { base, ...o });
+    expect(await cmdSweepStart(cli({ cmd: 'sweep-start' }))).toBe(0);
+    // The gate-fix ref head is main_patched's OWN tip: a real, measurable height
+    // (0). Only the ref NAME says this is a gate fix rather than a conflict.
+    appendJournal(dir, {
+      action: 'origin-blocked',
+      branch: 'main_patched',
+      caseId: 'origin:fix/sweep/main_patched--gate-fix-main_patched-deadbeef',
+      fixBranch: 'fix/sweep/main_patched--gate-fix-main_patched-deadbeef',
+      headSha: repo.sha('main_patched'),
+      prNumber: 13,
+    });
+    const cTip = repo.sha('feat/c');
+    expect(await cmdRun(cli({ cmd: 'run', execute: true, internal: true }))).toBe(0);
+    // Height 0 is NOT a conflict point here — the branch is red, so no prefix of
+    // it is proven clean and feat/c takes nothing, exactly as in the pass that
+    // took the hold.
+    expect(repo.sha('feat/c')).toBe(cTip);
+    expect(readJournal(dir).some((e) => e.action === 'merge' && e.branch === 'feat/c')).toBe(false);
+    expect(readJournal(dir).some((e) => e.action === 'pre-ref' && e.branch === 'feat/c')).toBe(false);
+  });
 });
 
 describe('report-case — cold-read request context + the scope-guard mode lever (§7)', () => {

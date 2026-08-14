@@ -912,36 +912,44 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
     expect(gh2.factories).toBe(0);
   });
 
-  it('execute: an open PR found via the API by head branch name RECONCILES (crash-window heal, finding #1) — journals pr-published, creates no second PR, pushes nothing', async () => {
-    // The PR exists API-side but the journal has NO pr-published row: the
-    // crash window between a prior run's PR create and its journal append.
+  it("execute: an open PR found on this case's head ref is UPDATED, never duplicated", async () => {
+    // The PR exists API-side with no `pr-published` row for it: a previous pass
+    // opened it, or this pass's own create crashed before journaling. Origin
+    // cannot tell those apart and the driver must not pretend otherwise — the
+    // PR on this case's deterministic head ref IS this case's PR, so it takes
+    // the current head and the current prose either way.
     const { repo, ws, dir, caseId, prDir, bareDir, cli } = await setupHeldCase();
     writeText(prDir, GOOD_TITLE, GOOD_BODY);
     const tokenFile = join(ws, 'token.txt');
     writeFileSync(tokenFile, 'substitute-token\n');
     const gh = fakeGithub({
       '/pulls?': { status: 200, body: [{ html_url: 'https://github.com/k-fls/fixture/pull/9', number: 9 }] },
+      '/pulls/9': { status: 200, body: { html_url: 'https://github.com/k-fls/fixture/pull/9', number: 9 } },
     });
     const out = join(ws, 'out.json');
     expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, tokenFile, out }), gh.factory)).toBe(0);
     const res = readOut(out);
     expect(res.ok).toBe(true);
     expect(res.pr).toEqual({ url: 'https://github.com/k-fls/fixture/pull/9', number: 9 });
-    // The reconcile probe only — no SECOND PR, and no marker comment either
-    // (nothing addressed yet, so nothing to record).
-    expect(gh.calls.length).toBe(1);
+    // No SECOND PR…
     expect(gh.calls.filter((c) => c.method === 'POST' && c.path.endsWith('/pulls')).length).toBe(0);
-    expect(gh.calls.some((c) => c.method === 'POST' && c.path.includes('/comments'))).toBe(false);
-    expect(repo.git('-C', bareDir, 'for-each-ref', 'refs/heads/fix')).toBe(''); // …and nothing pushed
-    // The reconciling journal row has the normal pr-published shape.
+    // …and the one that exists carries this pass's title and body.
+    const patch = gh.calls.find((c) => c.method === 'PATCH' && c.path.includes('/pulls/9'));
+    expect(patch).toBeTruthy();
+    expect((patch!.body as { title: string }).title).toBe(GOOD_TITLE);
+    // The adoption is on the record — found, not created.
+    const adopted = readJournal(dir).find((e) => e.action === 'pr-adopted')!;
+    expect(adopted.number).toBe(9);
+    expect(adopted.caseId).toBe(caseId);
+    // The head is really on the ref: an adopted PR is updated, not just claimed.
     const row = readJournal(dir).find((e) => e.action === 'pr-published')!;
+    expect(repo.git('-C', bareDir, 'rev-parse', `refs/heads/${row.fixBranch as string}`)).toBe(row.head);
     expect(row.caseId).toBe(caseId);
     expect(row.number).toBe(9);
     expect(row.url).toBe('https://github.com/k-fls/fixture/pull/9');
     expect(row.mode).toBe('held');
     expect(typeof row.fixBranch).toBe('string');
     expect(typeof row.head).toBe('string');
-    expect(row.reconciled).toBe(true);
     // A retried publish now stops at the journal-side ERR07 — no network.
     const gh2 = fakeGithub();
     expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, tokenFile, out }), gh2.factory)).toBe(1);
