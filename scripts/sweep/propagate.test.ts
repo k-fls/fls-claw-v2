@@ -1164,38 +1164,10 @@ describe('propagate verify — §9 gate rolls back a red offender (FIX B)', () =
     cleanups.push(() => repo.destroy());
 
     const ws = mkWorkspace();
-    const mainTip = repo.sha('main');
-    const wm12 = mainTip.slice(0, 12);
-    const dir = passDir(ws, wm12);
-    mkdirSync(dir, { recursive: true });
-    // Seed a minimal open pass: plan-initial.json + a pre-ref for feat/off (its
-    // clean pre-merge tip) — as if `run` had merged BAD into feat/off this pass.
-    const plan = {
-      schemaVersion: 1,
-      watermark: mainTip,
-      watermark12: wm12,
-      forkPoint: mainTip,
-      chainLength: 0,
-      order: ['feat/off'],
-      branches: [
-        {
-          branch: 'feat/off',
-          kind: 'inventory',
-          tierFloor: 'clean',
-          isLeaf: true,
-          alwaysMerge: false,
-          ancestors: [],
-          parents: [],
-        },
-      ],
-      warnings: [],
-    };
-    writeFileSync(join(dir, 'plan-initial.json'), JSON.stringify(plan));
-    writeFileSync(join(dir, 'plan.json'), JSON.stringify(plan));
-    appendFileSync(
-      join(dir, 'journal.jsonl'),
-      JSON.stringify({ ts: new Date().toISOString(), action: 'pre-ref', branch: 'feat/off', ref: cleanTip }) + '\n',
-    );
+    // A minimal open pass: the plan's order plus a pre-ref for feat/off at its
+    // clean pre-merge tip, as if `run` had merged BAD into it this pass. The
+    // recipe is DERIVED from exactly that — it advanced and is not held.
+    const { dir, wm12 } = seedVerifyPass(ws, repo, ['feat/off'], [{ branch: 'feat/off', ref: cleanTip }]);
     const cmdsFile = join(ws, 'cmds.json');
     writeFileSync(cmdsFile, JSON.stringify([{ cmd: 'test ! -f BAD' }]));
 
@@ -1204,7 +1176,6 @@ describe('propagate verify — §9 gate rolls back a red offender (FIX B)', () =
         cmd: 'verify',
         execute: true,
         pass: wm12,
-        recipe: ['feat/off'],
         commandsFile: cmdsFile,
       }),
     );
@@ -1427,46 +1398,6 @@ describe('propagate verify — publishable set', () => {
     expect(journal.some((e) => e.action === 'verify' && e.ok === true)).toBe(true);
     expect(journal.some((e) => e.action === 'verify-observation')).toBe(false); // never became an offender
     expect(repo.sha('module/held')).toBe(heldTip); // untouched — not rolled back
-  });
-
-  it('(a2) an EXPLICIT recipe forcing a held branch to build-conflict is non-blocking, not ERR18 (fix 2)', async () => {
-    const { repo } = divergedFixture();
-    const ws = mkWorkspace();
-    const { wm12 } = seedVerifyPass(
-      ws,
-      repo,
-      ['module/held', 'module/good'],
-      [{ branch: 'module/good', ref: repo.sha('module/good') }],
-      [{ action: 'held', branch: 'module/held', caseId: 'gate-x', height: -1, conflictedPaths: [] }],
-    );
-    // Heldness = the journaled `held` disposition above.
-    const heldTip = repo.sha('module/held');
-    const cmds = join(ws, 'cmds.json');
-    writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }]));
-    const out = join(ws, 'o.json');
-    const code = await cmdVerify(
-      baseCli(repo, ws, null, {
-        cmd: 'verify',
-        execute: true,
-        pass: wm12,
-        recipe: ['module/held', 'module/good'], // force the held branch into the build
-        commandsFile: cmds,
-        out,
-      }),
-    );
-    expect(code).toBe(0); // non-blocking: publishable set (module/good) verifies green
-    const res = JSON.parse(readFileSync(out, 'utf8')) as { ok: boolean; nonBlocking?: boolean; offender?: string };
-    expect(res).toMatchObject({ ok: true, nonBlocking: true, offender: 'module/held' });
-    const journal = readJournal(passDir(ws, wm12));
-    const obs = journal.find((e) => e.action === 'verify-observation');
-    expect(obs).toMatchObject({ offender: 'module/held', held: true });
-    expect(repo.sha('module/held')).toBe(heldTip); // NOT rolled back
-    // The held offender was not gate-frozen by verify (it is already held —
-    // no NEW gate `held` row was journaled for it).
-    const heldRows = readJournal(passDir(ws, wm12)).filter(
-      (e) => e.action === 'held' && e.branch === 'module/held',
-    );
-    expect(heldRows.length).toBe(1); // only the seeded row; no verify gate hold added
   });
 
   /**
@@ -2157,36 +2088,7 @@ describe('propagate — N1: ref writers keep a checked-out branch worktree consi
     const wtPath = addBranchWorktree(repo, 'feat/off'); // checked out at the BAD tip
 
     const ws = mkWorkspace();
-    const mainTip = repo.sha('main');
-    const wm12 = mainTip.slice(0, 12);
-    const dir = passDir(ws, wm12);
-    mkdirSync(dir, { recursive: true });
-    const plan = {
-      schemaVersion: 1,
-      watermark: mainTip,
-      watermark12: wm12,
-      forkPoint: mainTip,
-      chainLength: 0,
-      order: ['feat/off'],
-      branches: [
-        {
-          branch: 'feat/off',
-          kind: 'inventory',
-          tierFloor: 'clean',
-          isLeaf: true,
-          alwaysMerge: false,
-          ancestors: [],
-          parents: [],
-        },
-      ],
-      warnings: [],
-    };
-    writeFileSync(join(dir, 'plan-initial.json'), JSON.stringify(plan));
-    writeFileSync(join(dir, 'plan.json'), JSON.stringify(plan));
-    appendFileSync(
-      join(dir, 'journal.jsonl'),
-      JSON.stringify({ ts: new Date().toISOString(), action: 'pre-ref', branch: 'feat/off', ref: cleanTip }) + '\n',
-    );
+    const { wm12 } = seedVerifyPass(ws, repo, ['feat/off'], [{ branch: 'feat/off', ref: cleanTip }]);
     const cmdsFile = join(ws, 'cmds.json');
     writeFileSync(cmdsFile, JSON.stringify([{ cmd: 'test ! -f BAD' }]));
 
@@ -2196,7 +2098,6 @@ describe('propagate — N1: ref writers keep a checked-out branch worktree consi
           cmd: 'verify',
           execute: true,
           pass: wm12,
-          recipe: ['feat/off'],
           commandsFile: cmdsFile,
         }),
       ),

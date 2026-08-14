@@ -128,8 +128,6 @@ export interface SweepScope {
   exclude?: string[];
   /** child -> parents edges not expressible in the registry (e.g. main_patched roots). */
   extra_edges?: Record<string, string[]>;
-  /** Ordered branch list for the everything rebuild (verify stage). */
-  recipe?: string[];
 }
 
 export interface ValidationIssue {

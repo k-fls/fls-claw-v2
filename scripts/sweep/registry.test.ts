@@ -74,14 +74,14 @@ describe('local-tree loaders', () => {
   const routingFile = join(scratch, 'routing.yaml');
   writeFileSync(routingFile, 'schemaVersion: 1\nscope_guard_mode: conflict-hunks\nstack_cap: 3\n');
   const scopeFile = join(scratch, 'scope.yaml');
-  writeFileSync(scopeFile, 'exclude: ["wip/**"]\nrecipe: [module/a, feat/b]\n');
+  writeFileSync(scopeFile, 'exclude: ["wip/**"]\n');
 
   it('loads features/routing/scope from local files; bad entries become warnings', () => {
     const reg = loadRegistry({ inventoryDir: inventory, routingFile, scopeFile });
     expect(reg.features.map((f) => f.id)).toEqual(['feat.good']);
     expect(reg.warnings.some((w) => w.includes('feat.broken'))).toBe(true);
     expect(reg.routing).toEqual({ scopeGuardMode: 'conflict-hunks', stackCap: 3 });
-    expect(reg.scope).toEqual({ exclude: ['wip/**'], recipe: ['module/a', 'feat/b'] });
+    expect(reg.scope).toEqual({ exclude: ['wip/**'] });
   });
 
   it('warns on a missing inventory dir and returns defaults for missing config files', () => {

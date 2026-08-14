@@ -1517,11 +1517,11 @@ completes.
      `stoppedAt: "verify"`, with the gated branches named and no ERR id.
    - **Non-deterministic verify** — `WARN17_VERIFY_FLAKY`: nothing attributed,
      nothing rolled back.
-   - A build-conflict or leave-one-out offender that is itself held/frozen (or has
-     no this-pass `pre-ref`) is a NON-BLOCKING gate observation: journaled and
-     surfaced, the publishable set proceeds, and the gate re-verifies without it.
-     The blocking rollback+freeze path fires ONLY for a branch that would be pushed
-     this pass.
+   - A build-conflict or leave-one-out offender with no this-pass `pre-ref` is a
+     NON-BLOCKING gate observation: journaled and surfaced, the publishable set
+     proceeds, and the gate re-verifies without it. There is nothing to roll it
+     back to and no merge of ours to blame it for. The blocking rollback+freeze
+     path fires ONLY for a branch that would be pushed this pass.
 2. **Create the JUDGED history PRs** (non-draft), before the target push. JUDGED
    GATE FIXES ARE EXCLUDED: selection is by disposition, and a gate fix's
    disposition is `resolved`/`judged` like any other, so without the exclusion
@@ -1791,8 +1791,8 @@ Committed with the code:
   `scripts/sweep/bootstrap/` — the inventory (§3.1);
 - `scripts/sweep/registry/routing.yaml` — the two global driver levers
   (`scope_guard_mode`, `stack_cap`);
-- `scripts/sweep/registry/scope.yaml` — scope policy: `exclude`, `extra_edges`,
-  and the static `recipe` (a planless fallback for a manual verify);
+- `scripts/sweep/registry/scope.yaml` — scope policy: `exclude` and
+  `extra_edges`;
 - `scripts/sweep/registry/schema/feature-entry.schema.json` and
   `registry/prompts/` (`overlap-check.md`, `catch-all-triage.md`);
 - `scripts/sweep/checks.json` — the checks gate's typecheck/test command lists,

@@ -46,7 +46,7 @@ scripts/sweep/
   registry/
     schema/feature-entry.schema.json
     routing.yaml             global driver levers (scope_guard_mode, stack_cap)
-    scope.yaml               scope policy: exclusions, extra_edges, recipe
+    scope.yaml               scope policy: exclusions, extra_edges
     prompts/                 overlap-check.md, catch-all-triage.md
   test-cases/
     propagation/cases/*.yaml pinned-SHA propagation cases

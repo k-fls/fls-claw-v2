@@ -221,7 +221,6 @@ interface Cli {
    */
   tokenFile?: string;
   branch?: string;
-  recipe?: string[];
   commandsFile?: string;
   /**
    * checks-file: host+runner typecheck/test command lists shipped in the
@@ -903,11 +902,12 @@ function guardRef(branch: string, scope: Set<string>, opts: { fixSweep?: boolean
 
 /**
  * The pass's resolved scope (branch set) from its plan snapshot. Used ONLY by
- * the §9 rollback guard in cmdVerify: there the offender comes from the verify
- * recipe (registry config / pinned flag, §12), not from the plan, so plan.json
- * cannot steer WHICH branch rolls back — it can only forbid the write. The
- * resolve flow derives its scope from the registry instead (N2, reverifyCase):
- * there plan.json IS attacker-relevant and must not extend the scope.
+ * the §9 rollback guard in cmdVerify, where it can only ever FORBID a write:
+ * WHICH branch rolls back is the leave-one-out offender, and handing plan.json
+ * in as the allow-set lets a tampered plan narrow what may be written, never
+ * widen it. The resolve flow derives its scope from the registry instead (N2,
+ * reverifyCase): there plan.json IS attacker-relevant and must not extend the
+ * scope.
  */
 function passScope(dir: string): Set<string> {
   const p = join(dir, 'plan.json');
@@ -5153,19 +5153,16 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     scopeFile: cli.scopeFile,
     routingFile: cli.routingFile,
   });
-  // The recipe = THIS PASS'S publishable set (advanced branches, in
-  // the plan's DAG order, minus held/frozen/open-case), built on the fork-trunk
-  // base. An explicit `--recipe` overrides (manual re-verify / debugging,
-  // §12). The static scope.yaml `recipe` is only a PLANLESS fallback (no
-  // pass plan on disk): the gate validates publishable branches, never a
-  // fixed config stack that could pin a permanently-held branch at its head.
+  // The recipe = THIS PASS'S publishable set, in the plan's DAG order, built on
+  // the fork-trunk base. It is derived from the pass and nothing else: a gate
+  // that validated a fixed config stack instead would pin a permanently-held
+  // branch at its head and could never go green.
   // PR_ID-blocked branches are unpublished-by-design (their unresolved conflicts
   // would recreate stack conflicts in the rebuild); DEFERRED branches carry only
   // their clean prefix and stay publishable.
   const held = prBlockedBranches(journal);
   const order = passOrder(dir);
-  const derived = order.length > 0 ? publishableRecipe(journal, order, held) : (registry.scope.recipe ?? []);
-  const recipe = cli.recipe ?? derived;
+  const recipe = publishableRecipe(journal, order, held);
   const baseRef = await verifyBaseRef(cli);
   const rrCacheDir = join(cli.workspace, RR_CACHE_DIRNAME);
   // An in-memory command list (finish threads checks.test here) wins,
@@ -5194,7 +5191,9 @@ export async function cmdVerify(cli: Cli): Promise<number> {
 
   if (recipe.length === 0) {
     if (order.length === 0) {
-      console.error('verify: no recipe (pass --recipe a,b,c or add `recipe:` to registry/scope.yaml)');
+      // No plan on disk: `start` always writes one, so the pass this attached
+      // to is not a pass. Nothing is verified and nothing is claimed green.
+      console.error('verify: no plan in the pass directory — nothing to derive a recipe from');
       return 2;
     }
     // A plan exists but nothing publishable advanced this pass — vacuously green
@@ -5378,23 +5377,21 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     return 1;
   }
   const preRef = lastPreRef(journal, offender);
-  // A HELD/FROZEN offender (or any branch with no this-pass pre-ref)
-  // is NOT a publishable failure — it is already frozen and unpublished, so it
-  // must NEVER hard-block (ERR18). The recipe already excludes held/frozen
-  // branches, so this is defense in depth for an explicit `--recipe` (or a
-  // branch frozen after its pre-ref): journal a non-blocking gate OBSERVATION,
-  // re-verify the publishable set WITHOUT it, and let the rest proceed. ERR18
-  // fires ONLY when a branch that WOULD be pushed this pass fails verify.
-  if (held.has(offender) || !preRef) {
+  // AN OFFENDER THIS PASS NEVER MUTATED IS NOT A PUBLISHABLE FAILURE. The
+  // recipe is every branch with nothing blocked at or above it, whether or not
+  // it advanced, so a branch that merged nothing this pass is an ordinary
+  // member of the integration build — and there is no `pre-ref` to roll it back
+  // to, so the blocking path below would freeze a branch for a merge it never
+  // made and roll back a state it never left. Journal a non-blocking gate
+  // OBSERVATION instead, re-verify the publishable set without it, and let the
+  // rest proceed. ERR18 fires ONLY for a branch that WOULD be pushed this pass.
+  if (!preRef) {
     appendJournal(dir, {
       action: 'verify-observation',
       ok: false,
       offender,
-      held: held.has(offender),
       ...(conflictDetail ? { failureKind: 'merge-conflict', detail: conflictDetail } : {}),
-      note: held.has(offender)
-        ? 'offender is held/frozen — non-blocking (unpublished; validated by its own fix flow)'
-        : 'offender has no pre-ref — non-blocking (not mutated this pass)',
+      note: 'offender has no pre-ref — non-blocking (not mutated this pass)',
     });
     const reduced = recipe.filter((b) => b !== offender);
     const re = reduced.length > 0 ? await verifyEverything(cli.repo, { recipe: reduced, ...verifyOpts }) : null;
@@ -5410,7 +5407,7 @@ export async function cmdVerify(cli: Cli): Promise<number> {
       ...(conflictDetail ? { excludedFor: 'merge-conflict', unresolved: first.build.unresolved ?? [] } : {}),
     });
     console.error(
-      `verify: RED offender ${offender} is held/unpublished — non-blocking; ` +
+      `verify: RED offender ${offender} was not mutated this pass — non-blocking; ` +
         `${conflictDetail ? `${conflictDetail}; ` : ''}` +
         `${re ? `re-verify without it ${reOk ? 'green' : 'STILL RED'}` : 'no publishable branches remain'}`,
     );
