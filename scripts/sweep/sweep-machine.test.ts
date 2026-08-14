@@ -50,6 +50,7 @@ import {
   type ColdReadInvoker,
   type InstallRunner,
 } from './propagate.js';
+import { DRIVER_COMMIT_ENV } from './proposal.js';
 import type { GithubTransport } from './publish.js';
 
 const cleanups: Array<() => void> = [];
@@ -2665,6 +2666,100 @@ describe('sweep start — origin-derived merge_status', () => {
     expect(readJournal(dir).some((e) => e.action === 'skip' && e.branch === 'main_patched' && e.reason === 'held')).toBe(
       true,
     );
+  });
+
+  /**
+   * A DRIVER-shaped pristine-conflict exhibit on the deterministic fix ref: one
+   * commit whose tree is the automerge, parented on the branch tip and on the
+   * conflict head, under the driver's pinned identity.
+   */
+  function pushDriverExhibit(repo: FixtureRepo): { fixBranch: string; fixHead: string } {
+    const u1 = repo.sha('main');
+    const mpTip = repo.sha('main_patched');
+    // merge-tree exits 1 on conflict and still prints the automerge tree oid.
+    let out = '';
+    try {
+      out = execFileSync('git', ['-C', repo.dir, 'merge-tree', '--write-tree', mpTip, u1], { encoding: 'utf8' });
+    } catch (e) {
+      out = String((e as { stdout?: string }).stdout ?? '');
+    }
+    const merged = out.split('\n')[0].trim();
+    const fixHead = execFileSync(
+      'git',
+      ['-C', repo.dir, 'commit-tree', merged, '-p', mpTip, '-p', u1, '-m', 'Pristine conflict for a case'],
+      { encoding: 'utf8', env: { ...process.env, ...DRIVER_COMMIT_ENV } },
+    ).trim();
+    const fixBranch = `fix/sweep/main_patched--main-h1-${u1.slice(0, 8)}`;
+    repo.git('push', 'origin', `${fixHead}:refs/heads/${fixBranch}`);
+    return { fixBranch, fixHead };
+  }
+
+  const openPr = {
+    status: 200,
+    body: [{ html_url: 'https://github.com/k-fls/fixture/pull/12', number: 12, state: 'open' }],
+  };
+
+  it('a DRIVER exhibit whose conflict HEALED has its ref deleted and stops blocking', async () => {
+    // The PR poses a question. Once the question is gone, so is the PR: the ref
+    // is deleted, GitHub closes it and keeps the commits, and the branch derives
+    // fresh instead of waiting on an answer nobody needs.
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { fixBranch } = pushDriverExhibit(repo);
+    // The owner resolved it by hand on the branch: main_patched now CONTAINS
+    // the conflicting trunk head, so the merge probe is clean.
+    repo.checkout('main_patched');
+    repo.git('merge', '--no-ff', '--no-edit', '-X', 'ours', '-m', 'owner resolves U1 by hand', repo.sha('main'));
+    repo.git('push', 'origin', 'main_patched');
+    repo.checkout('main');
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = fakeGithub({ 'GET /pulls?': openPr });
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile }), gh.factory)).toBe(0);
+    const journal = readJournal(dirOf(repo, ws));
+    const dropped = journal.find((e) => e.action === 'proposal-dropped')!;
+    expect(dropped.ref).toBe(fixBranch);
+    expect(dropped.reason).toContain('healed');
+    expect(journal.some((e) => e.action === 'origin-blocked')).toBe(false); // no longer blocked
+    expect(repo.git('-C', bare, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep')).toBe('');
+  });
+
+  it('a rebuild reuses the journaled fix ref — one ref, one PR', async () => {
+    // Deriving a new name from a changed conflict would mint a second ref and a
+    // second pull request for one case.
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { fixBranch, fixHead } = pushDriverExhibit(repo);
+    // The branch moves and its own side of the conflict changes, so the exhibit
+    // now poses a different question.
+    repo.checkout('main_patched');
+    repo.commit('mp: x = fork-revised', { 'src/x.ts': 'fork-revised\n' });
+    repo.git('push', 'origin', 'main_patched');
+    repo.checkout('main');
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = fakeGithub({ 'GET /pulls?': openPr });
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile }), gh.factory)).toBe(0);
+    const journal = readJournal(dirOf(repo, ws));
+    const rebuilt = journal.find((e) => e.action === 'proposal-rebuilt' || e.action === 'proposal-rebased')!;
+    expect(rebuilt.ref).toBe(fixBranch);
+    expect(rebuilt.from).toBe(fixHead);
+    // ONE ref on origin, under the journaled name, moved in place.
+    expect(repo.git('-C', bare, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep')).toBe(
+      `refs/heads/${fixBranch}`,
+    );
+    expect(repo.git('-C', bare, 'rev-parse', `refs/heads/${fixBranch}`)).toBe(rebuilt.to);
+    // Still blocked, and the row names the head that is on origin NOW.
+    const blockedRow = journal.find((e) => e.action === 'origin-blocked')!;
+    expect(blockedRow.headSha).toBe(rebuilt.to);
+    // No second PR was created.
+    expect(gh.calls.filter((c) => c.method === 'POST' && /\/pulls$/.test(c.path)).length).toBe(0);
   });
 
   it('merged ref -> RESOLVED: not blocked, the origin ref is deleted (cleanup)', async () => {

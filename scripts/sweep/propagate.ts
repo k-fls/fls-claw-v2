@@ -117,6 +117,7 @@ import { scopeGuard } from './scope-guard.js';
 import {
   advisoryTextIssues,
   checkBaseHeight,
+  convertPullRequestToDraft,
   classifyComments,
   classifyReviewTrigger,
   createPullRequest,
@@ -159,6 +160,13 @@ import {
   unskipChainClean,
 } from './plan.js';
 import { deriveCoverage, enumerateChain, type Chain } from './heights.js';
+import { DRIVER_COMMIT_ENV, disposeProposal, driverShaped } from './proposal.js';
+import {
+  classifyConflict,
+  conflictIdentity,
+  type ConflictHunk,
+  type ConflictRelation,
+} from './conflict-identity.js';
 import { verifyEverything, type VerifyCommand } from './verify.js';
 import { WHOLE_RANGE_BLOCK } from './types.js';
 import type {
@@ -4230,19 +4238,9 @@ export function journaledCases(journal: JournalEntry[]): Map<string, JournaledCa
 }
 
 /**
- * Deterministic driver-built commit (publish heads): fixed identity and
- * dates so re-running publish rebuilds the SAME sha for the same tree/parents
- * — a retried push stays a no-op instead of a non-fast-forward.
+ * Deterministic driver-built commit (publish heads). The identity it stamps is
+ * also what the driver-shape test reads back, so both live in `proposal.ts`.
  */
-const DRIVER_COMMIT_ENV = {
-  GIT_AUTHOR_NAME: 'sweep-driver',
-  GIT_AUTHOR_EMAIL: 'sweep-driver@localhost',
-  GIT_COMMITTER_NAME: 'sweep-driver',
-  GIT_COMMITTER_EMAIL: 'sweep-driver@localhost',
-  GIT_AUTHOR_DATE: '2026-01-01T00:00:00Z',
-  GIT_COMMITTER_DATE: '2026-01-01T00:00:00Z',
-};
-
 async function deterministicCommit(repo: string, tree: string, parents: string[], message: string): Promise<string> {
   const args = ['commit-tree', tree, ...parents.flatMap((p) => ['-p', p]), '-m', message];
   return (await git(repo, args, { env: DRIVER_COMMIT_ENV })).stdout.trim();
@@ -4447,14 +4445,18 @@ async function publishHead(
       );
       return { headSha, mode: 'held', draft: true, escalation };
     }
-    // DRAFT: the pristine conflict — clean prefix + the original
-    // upstream-vs-ours conflict re-materialized, no agent edits.
-    const prefixTree = await cleanPrefixTree(cli.repo, probe.treeOid, tip, probe.conflictFiles);
-    const prefixCommit = await deterministicCommit(cli.repo, prefixTree, [tip], `Clean prefix for ${jc.caseId}`);
+    // DRAFT: the pristine conflict, as ONE commit — the automerge tree parented
+    // on the branch tip and the conflict head. The PR's diff against its base is
+    // that tree either way, so splitting it into a clean prefix and a conflict
+    // commit was presentational; and the single form makes `parents[0]` the base
+    // tip, which is what the first-parent walk down to the base reads to decide
+    // whether this head is still the driver's. The clean-prefix commit lives on
+    // in the case WORKTREE, where it is load-bearing: it is what makes
+    // `git status` show exactly the conflict and nothing else.
     const headSha = await deterministicCommit(
       cli.repo,
       probe.treeOid,
-      [prefixCommit, jc.head.sha],
+      [tip, jc.head.sha],
       `Pristine conflict for ${jc.caseId} (conflict markers in place — resolve fresh)`,
     );
     return { headSha, mode: 'held', draft: true, escalation };
@@ -6743,10 +6745,64 @@ async function createRecoveryPr(
  * `git push origin --delete` (refs move via git only); a failed delete
  * is journaled and non-fatal (the ref is re-examined at the next start).
  */
+/** Paths in a tree whose blobs carry conflict markers. */
+async function markerPaths(repo: string, tree: string): Promise<string[]> {
+  const res = await git(repo, ['grep', '-I', '--name-only', '-e', '^<<<<<<<', tree], { allowCodes: [1] });
+  return res.stdout
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => line.slice(line.indexOf(':') + 1));
+}
+
+/**
+ * The conflict a tree EXHIBITS. A pristine-conflict head IS its own baseline —
+ * its tree is the automerge — so the recorded question is recoverable from the
+ * objects, with no need to re-run the merge that produced it.
+ */
+async function exhibitedConflict(repo: string, tree: string): Promise<ConflictHunk[]> {
+  const paths = await markerPaths(repo, tree);
+  if (paths.length === 0) return [];
+  return conflictIdentity(paths, async (p) => {
+    const res = await git(repo, ['cat-file', 'blob', `${tree}:${p}`], { allowCodes: [128] });
+    return res.code === 0 ? res.stdout : null;
+  });
+}
+
+/**
+ * "Checks green" is the DRIVER'S OWN gate — the one `report-case` runs — on the
+ * MERGED tree, never GitHub's check-runs: the sweep judges by the checks it
+ * ships with, on the tree the merge would actually produce.
+ *
+ * No configured checks and no usable environment both mean NO VERDICT, and no
+ * verdict reads as green: every consequence of red here is an intervention on
+ * somebody's pull request, and the driver does not intervene on a measurement
+ * it did not take.
+ */
+async function mergedChecksGreen(
+  cli: Cli,
+  checksFile: string | undefined,
+  runChecks: ChecksRunner,
+  mergedTree: string,
+  parents: string[],
+): Promise<boolean> {
+  const checks = loadChecksConfig(checksFile);
+  if (!checks || checks.typecheck.length === 0) return true;
+  const probe = await deterministicCommit(cli.repo, mergedTree, parents, 'sweep: checks probe on the merged tree');
+  const wt = await addTempWorktree(cli.repo, probe);
+  try {
+    if (!(await installDeps(cli, wt.path))) return true;
+    return (await runChecks(checks.typecheck, wt.path)).ok;
+  } finally {
+    await wt.remove();
+  }
+}
+
 async function deriveOriginMergeStatus(
   cli: Cli,
   dir: string,
   makeTransport?: (token: string) => GithubTransport,
+  checksFile?: string,
+  runChecks: ChecksRunner = defaultChecksRunner,
 ): Promise<{ ok: boolean; issues: Issue[]; blocked: string[] }> {
   const prefix = 'refs/remotes/origin/';
   const res = await git(cli.repo, ['for-each-ref', '--format=%(refname) %(objectname)', `${prefix}fix/sweep`], {
@@ -6954,6 +7010,192 @@ async function deriveOriginMergeStatus(
       return true;
     };
 
+    /**
+     * DISPOSE OF AN OPEN PROPOSAL THAT CARRIES NOTHING NEW (§5.6). The agent is
+     * not called — there is no new review — but the base moves, conflicts heal
+     * and answers go stale, and the ref must not go on exhibiting a question
+     * nobody is asking.
+     *
+     * Returns `dropped` when the ref is gone (the branch is free to derive the
+     * conflict fresh), `blocked` when the proposal stands.
+     */
+    const disposeOpenProposal = async (
+      u: { ref: string; sha: string; branch: string },
+      open: PrByHead,
+      transport: GithubTransport,
+      slugParts: { owner: string; repo: string },
+    ): Promise<'blocked' | 'dropped'> => {
+      const originRef = `origin/${u.branch}`;
+      if (!(await refExists(cli.repo, originRef))) return 'blocked';
+      const targetTip = await revParse(cli.repo, originRef);
+      const head = await commitInfo(cli.repo, u.sha);
+      const shape = (await driverShaped(cli.repo, u.sha, targetTip)) ? 'driver' : 'owner';
+      const baseMoved = head.parents.length > 0 && head.parents[0] !== targetTip;
+      const conflictHead = head.parents[1] ?? null;
+
+      // EXHIBIT OR ANSWER, decided on CONTENT: a head whose tree still carries
+      // markers poses a question; one that does not offers an answer. The draft
+      // flag says the same thing on a good day, but it is a label somebody can
+      // flip, and the tree is not.
+      const exhibited = shape === 'driver' ? await exhibitedConflict(cli.repo, `${u.sha}^{tree}`) : [];
+      let relation: ConflictRelation | null = null;
+      if (exhibited.length > 0 && conflictHead) {
+        const now = await newStyleMergeTree(cli.repo, targetTip, conflictHead);
+        relation = classifyConflict(exhibited, now.clean ? [] : await exhibitedConflict(cli.repo, now.treeOid));
+      }
+
+      // The expensive question is asked only where the answer is used: an
+      // exhibit's disposition turns on the conflict alone.
+      let mergeable = false;
+      let checksGreen = false;
+      if (relation === null) {
+        const probe = await newStyleMergeTree(cli.repo, targetTip, u.sha);
+        mergeable = probe.clean;
+        checksGreen =
+          mergeable && (await mergedChecksGreen(cli, checksFile, runChecks, probe.treeOid, [targetTip, u.sha]));
+      }
+
+      const action = disposeProposal({ shape, relation, mergeable, checksGreen, approved: false, baseMoved });
+      const why =
+        relation !== null
+          ? `the conflict it exhibits is ${relation}`
+          : `it ${mergeable ? 'merges' : 'no longer merges'} and ${checksGreen ? 'passes' : 'does not pass'}`;
+
+      if (action === 'leave' || action === 'hold') return 'blocked';
+
+      if (action === 'delete') {
+        // DELETING IS NOT DESTRUCTIVE: GitHub closes the PR and keeps its
+        // commits, restorable. A head that poses no question, or answers one it
+        // can no longer answer, is dropped and the case derives fresh.
+        const deleteFailed = await deleteOriginRef(u.ref);
+        appendJournal(dir, {
+          action: 'proposal-dropped',
+          ref: u.ref,
+          branch: u.branch,
+          headSha: u.sha,
+          prNumber: open.number,
+          prUrl: open.url,
+          reason: why,
+          ...(deleteFailed ? { deleteFailed } : {}),
+        });
+        console.error(
+          `sweep start: dropped '${u.ref}' (PR #${open.number}) — ${why}${deleteFailed ? ' (ref delete failed)' : ', ref deleted'}; ${u.branch} derives fresh`,
+        );
+        return deleteFailed ? 'blocked' : 'dropped';
+      }
+
+      if (action === 'draft-and-report') {
+        // NEVER REBUILT, NEVER DELETED: force-pushing over commits somebody else
+        // put there is the one destructive operation available here. The draft
+        // flag is the "already told you" marker, so the conversion and the
+        // comment happen ONCE and a PR the owner opened as a draft gets neither
+        // — the REPORT at finish is what carries it every pass.
+        let alreadyDraft = true;
+        try {
+          alreadyDraft = (await getPullRequest(transport, slugParts, open.number)).draft;
+        } catch {
+          alreadyDraft = true; // unknown state: say nothing rather than say it twice
+        }
+        // The conversion and the comment are a COURTESY on the transition, and a
+        // courtesy that cannot be delivered must not stop the pass: the row
+        // below is what the finish report reads, and it says the same thing
+        // every pass whether or not the write landed.
+        let drafted = false;
+        if (!alreadyDraft) {
+          try {
+            await convertPullRequestToDraft(transport, slugParts, open.number);
+            await ghExpect(transport, 'POST', `/repos/${slugParts.owner}/${slugParts.repo}/issues/${open.number}/comments`, {
+              body:
+                `Sweep note (driver-posted): this pull request ${why} against \`${u.branch}\` as it stands on origin, ` +
+                `so it has been converted to a draft. Nothing here has been rewritten — fix it or close it. ` +
+                `This is said once; the sweep's end-of-pass report will keep listing it until it merges or passes.`,
+            });
+            drafted = true;
+          } catch (e) {
+            appendJournal(dir, {
+              action: 'owner-pr-notice-failed',
+              ref: u.ref,
+              branch: u.branch,
+              prNumber: open.number,
+              message: e instanceof Error ? e.message : String(e),
+            });
+            console.error(
+              `sweep start: could not draft/comment PR #${open.number} — ${e instanceof Error ? e.message : String(e)}; it is still reported at finish`,
+            );
+          }
+        }
+        appendJournal(dir, {
+          action: 'owner-pr-degraded',
+          ref: u.ref,
+          branch: u.branch,
+          prNumber: open.number,
+          prUrl: open.url,
+          mergeable,
+          checksGreen,
+          drafted,
+          reason: why,
+        });
+        console.error(
+          `sweep start: owner-shaped PR #${open.number} on '${u.ref}' ${why}${drafted ? ' — converted to draft, commented once' : ' (no notice posted)'}`,
+        );
+        return 'blocked';
+      }
+
+      // REBASE or REBUILD: the exhibit is re-cut against the target as it stands
+      // now. Both push onto the SAME ref, under a lease against the head this
+      // pass classified — a new name would mint a second ref and a second PR for
+      // one case. Only a head every commit of which is the driver's gets here.
+      if (!conflictHead) return 'blocked';
+      const now = await newStyleMergeTree(cli.repo, targetTip, conflictHead);
+      if (now.clean) return 'blocked'; // nothing to exhibit; the next pass drops it
+      const rebuilt = await deterministicCommit(
+        cli.repo,
+        now.treeOid,
+        [targetTip, conflictHead],
+        `Pristine conflict for ${u.ref} (conflict markers in place — resolve fresh)`,
+      );
+      if (rebuilt === u.sha) return 'blocked'; // identical rebuild: nothing moved
+      try {
+        await gitPush(cli.repo, rebuilt, u.ref, { forceWithLease: u.sha });
+      } catch (e) {
+        appendJournal(dir, {
+          action: 'proposal-repush-failed',
+          ref: u.ref,
+          branch: u.branch,
+          prNumber: open.number,
+          message: e instanceof Error ? e.message : String(e),
+        });
+        console.error(`sweep start: could not re-push '${u.ref}' — ${e instanceof Error ? e.message : String(e)}`);
+        return 'blocked';
+      }
+      appendJournal(dir, {
+        action: action === 'rebase' ? 'proposal-rebased' : 'proposal-rebuilt',
+        ref: u.ref,
+        branch: u.branch,
+        prNumber: open.number,
+        from: u.sha,
+        to: rebuilt,
+        onto: targetTip,
+        reason: why,
+      });
+      u.sha = rebuilt; // the blocked row must name the head that is on origin now
+      if (action === 'rebuild') {
+        // The body describes a question that is no longer being asked, and the
+        // driver never writes PR prose. Say so once; a review on this PR
+        // reissues the case and the agent rewrites it.
+        await ghExpect(transport, 'POST', `/repos/${slugParts.owner}/${slugParts.repo}/issues/${open.number}/comments`, {
+          body:
+            `Sweep note (driver-posted): the conflict this pull request exhibits has changed — ${why}. ` +
+            `The exhibit has been rebuilt against \`${u.branch}\` as it stands on origin, so the description above ` +
+            `no longer matches it. Review this PR to have the sweep re-serve the case and rewrite the description.`,
+        });
+      }
+      console.error(
+        `sweep start: ${action === 'rebase' ? 'rebased' : 'rebuilt'} '${u.ref}' onto ${targetTip.slice(0, 12)} — ${why}`,
+      );
+      return 'blocked';
+    };
+
     for (const u of unmerged) {
       // WHAT THE PROPOSAL IS COMES FROM THE SHAPE OF ITS HEAD, and this is the
       // only place that can see it: the ref name is a string the driver minted,
@@ -7013,15 +7255,23 @@ async function deriveOriginMergeStatus(
                 prNumber: open.number,
                 reviewId: dismissedBeyond,
               });
-              journalBlocked(open, dismissedBeyond);
               console.error(
                 `sweep start: ${u.branch} blocked — open PR #${open.number} on '${u.ref}'; review ${dismissedBeyond} was DISMISSED (nothing actionable) — marker advanced, NO reissue`,
               );
-            } else {
-              journalBlocked(open, markerId);
-              console.error(
-                `sweep start: ${u.branch} blocked — open PR #${open.number} on '${u.ref}' (origin-derived; no review beyond the marker)`,
-              );
+            }
+            // NOTHING NEW ON THE PR — so no agent is called, but the world moved
+            // underneath it and the proposal has to be kept honest. What happens
+            // to it follows from what it IS now (§5.6), not from why it got
+            // there.
+            const effectiveMarker = dismissedBeyond > 0 ? dismissedBeyond : markerId;
+            const outcome = await disposeOpenProposal(u, open, transport!, slugParts!);
+            if (outcome === 'blocked') {
+              journalBlocked(open, effectiveMarker);
+              if (dismissedBeyond === 0) {
+                console.error(
+                  `sweep start: ${u.branch} blocked — open PR #${open.number} on '${u.ref}' (origin-derived; no review beyond the marker)`,
+                );
+              }
             }
           } else if (trigger.latest!.state === 'APPROVED' && (await landApproved(u, open, trigger.latest!))) {
             // landed — logged inside; the branch is NOT blocked.
@@ -7170,6 +7420,8 @@ async function deriveOriginMergeStatus(
 export async function cmdSweepStart(
   cli: Cli,
   makeTransport?: (token: string) => GithubTransport,
+  /** The checks gate an open proposal's merged tree is judged by (§5.6); injectable for tests. */
+  runChecks: ChecksRunner = defaultChecksRunner,
 ): Promise<number> {
   // RESOLVE the pass config to flag-or-default up front, then persist the
   // absolute paths into machine state (below) so every later command reads them
@@ -7382,7 +7634,7 @@ export async function cmdSweepStart(
   // Blocking issues (token missing, API failure) leave
   // no plan-initial.json, so a re-run start clears + re-derives cleanly.
   progress('deriving merge status from origin');
-  const originDerive = await deriveOriginMergeStatus(cli, canonicalDir, makeTransport);
+  const originDerive = await deriveOriginMergeStatus(cli, canonicalDir, makeTransport, resolvedChecksFile, runChecks);
   if (!originDerive.ok) {
     console.error(`sweep start [${originDerive.issues[0]?.id}]: ${originDerive.issues[0]?.detail}`);
     result(cli, { ok: false, issues: originDerive.issues });
@@ -10830,6 +11082,26 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   const pushBlockingIssues = pushDelta
     .filter((e) => e.action === 'push-issue')
     .map((e) => ({ id: String(e.id), detail: String(e.detail) }));
+  // OWNER-SHAPED PULL REQUESTS THAT NO LONGER MERGE OR NO LONGER PASS. The
+  // driver will not touch these — force-pushing over someone else's commits is
+  // the one destructive act available to it — so it says so instead, EVERY
+  // pass. The one-time draft conversion is a courtesy on the transition; this
+  // list is the notification, and it is the only thing that keeps a degraded PR
+  // visible once the courtesy has been spent.
+  const ownerPrs = journalFinal
+    .filter((e) => e.action === 'owner-pr-degraded')
+    .map((e) => ({
+      branch: String(e.branch),
+      ref: String(e.ref),
+      number: typeof e.prNumber === 'number' ? e.prNumber : 0,
+      url: String(e.prUrl ?? ''),
+      mergeable: e.mergeable === true,
+      checksGreen: e.checksGreen === true,
+      reason: String(e.reason ?? ''),
+    }));
+  const ownerPrCue = ownerPrs.length
+    ? ` PRs you changed that no longer merge or no longer pass: fix or close — ${ownerPrs.map((p) => `#${p.number} (${p.branch}: ${p.reason})`).join('; ')}.`
+    : '';
   const stats = {
     branchesInScope: passOrder(dir).length,
     cleanMerges: journalFinal.filter((e) => e.action === 'merge').length,
@@ -10871,6 +11143,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
       // Needs-owner failures are a FIRST-CLASS field — a re-run
       // loop must stop re-trying these branches and hand them to the owner.
       needsOwner,
+      ...(ownerPrs.length ? { ownerPullRequests: ownerPrs } : {}),
       blockingIssues: pushBlockingIssues,
       ...(systemicOutage ? { systemicOutage: true, heldPublishesSkipped } : {}),
       stats,
@@ -10881,7 +11154,8 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
         `${pushBlockingIssues.length ? ` Blocking push-phase issues: ${pushBlockingIssues.map((i) => i.id).join(', ')}.` : ''} ` +
         `${needsOwner.length ? `OWNER ACTION REQUIRED (do NOT just re-run for these): ${needsOwner.map((n) => `${n.branch} (${n.category})`).join('; ')} — never force-resolve. ` : 'DIVERGED branches need the owner (never force-resolve); '}` +
         `${systemicOutage ? `Network outage: ${heldPublishesSkipped} held publish(es) were skipped, not attempted. ` : ''}` +
-        `then re-run \`finish\` — landed branches skip, transient failures retry.`,
+        `${ownerPrCue}` +
+        ` then re-run \`finish\` — landed branches skip, transient failures retry.`,
     });
     return 1;
   }
@@ -10893,9 +11167,11 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     upstreamAdvanced,
     pullRequests: annotated,
     branches,
+    ...(ownerPrs.length ? { ownerPullRequests: ownerPrs } : {}),
     stats,
     instruction:
-      `REPORT to the owner: every PR in pullRequests (number, title, status), the landed branches (branches list), and the stats summary; then ` +
+      `REPORT to the owner: every PR in pullRequests (number, title, status), the landed branches (branches list), and the stats summary.` +
+      `${ownerPrCue} Then ` +
       (upstreamAdvanced ? 'run `sweep start` again (upstream advanced past the pinned watermark)' : 'stop — the sweep is done'),
   });
   return 0;

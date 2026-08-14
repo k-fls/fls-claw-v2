@@ -898,14 +898,15 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
     expect(res.dryRun).toBe(true);
     expect(res.issues).toEqual([]);
     // No marker-clean resolution exists (--tier held on an untouched worktree) →
-    // the DRAFT head is the PRISTINE CONFLICT: clean-prefix commit on the
-    // branch tip + a conflict commit whose tree is the automerge tree (markers, no
-    // agent edits), parented on the case head so the owner's merge completes PR_ID.
+    // the DRAFT head is the PRISTINE CONFLICT as ONE commit: the automerge tree
+    // (markers, no agent edits) parented on the branch tip and on the case head,
+    // so the owner's merge completes PR_ID and the first-parent walk down to the
+    // base is a single driver commit.
     const caseHead = (readJournal(dir).find((e) => e.action === 'case')!.head as { sha: string }).sha;
     const head = res.head!.commit;
     expect(res.head!.mode).toBe('held');
     expect(repo.git('rev-parse', `${head}^2`)).toBe(caseHead); // 2nd parent = the conflict head
-    expect(repo.git('rev-parse', `${head}^1^`)).toBe(repo.sha('main_patched')); // prefix sits on the tip
+    expect(repo.git('rev-parse', `${head}^1`)).toBe(repo.sha('main_patched')); // first parent IS the base tip
     expect(repo.git('show', `${head}:src/x.ts`)).toContain('<<<<<<<'); // markers re-materialized
     expect(res.wouldCreate!.fixBranch).toMatch(/^fix\/sweep\//);
     expect(res.wouldCreate!.draft).toBe(true);

@@ -339,6 +339,12 @@ worked on can have been rolled back after you last saw it. State no pull request
 state, no blocker and no ordering you cannot point to in the result. If the result does
 not carry a fact, you do not have it.
 
+`ownerPullRequests`, when the result carries it, lists pull requests the OWNER pushed to
+that no longer merge or no longer pass. Relay every one of them, with the reason the
+result gives, and say plainly that they need fixing or closing. The driver will not
+rewrite somebody else's pull request, so this list is the only notice they get, and it
+is repeated every pass until they merge or pass.
+
 Its answers:
 
 - `"complete"` — report to the owner every entry in `pullRequests` (number, title,

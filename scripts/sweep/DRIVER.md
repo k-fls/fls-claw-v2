@@ -744,6 +744,70 @@ the urge retries on a later pass. One urge per new head, not per pass — quiet
 passes stay quiet. The plan and run stages only DETECT a would-be urge; posting
 lives exclusively in the networked push stage.
 
+### 5.6 Disposition of an open proposal
+
+A PR that carries NOTHING NEW calls no agent (§5.3) — but the base moves,
+conflicts heal and answers go stale, so the ref must not go on exhibiting a
+question nobody is asking. What happens to it follows from what it IS now, never
+from how it got there.
+
+**Whose head is it.** THE DRIVER-SHAPE TEST is the commits on the ref, not
+authorship metadata and not the ref name: walk the FIRST-PARENT line from the
+head down to the PR base; every commit on it must carry the driver's pinned
+identity (`proposal.ts`). Anything else on that walk is someone else's push. An
+empty walk — the head is already contained in the base — is not a driver head
+either. This is what the single-commit pristine-conflict head (§10.4) buys:
+`parents[0]` is the base tip, so the walk is one commit.
+
+**Exhibit or answer**, decided on CONTENT: a head whose tree still carries
+markers poses a question; one that does not offers an answer. The draft flag
+says the same thing on a good day, but it is a label somebody can flip.
+
+**Conflict identity** (`conflict-identity.ts`). The exhibit's own head IS the
+baseline — its tree is the pristine automerge — so the recorded question is
+recoverable from the objects with no need to re-run the old merge. Compare hunk
+by hunk, never tree by tree: the clean part of a merge moves constantly.
+Normalize by dropping the marker LABEL lines (all three forms) and by ignoring
+the hunk's position in the file; keep the ours/base/theirs bodies verbatim,
+because whitespace inside them is content. Identity is the set of
+`(path, hunk-hash)`, and the set relation classifies it: empty = healed, equal =
+same, strict superset = the body understates it, anything else = a different
+question. `git merge-tree` does not consult rerere, so a recorded resolution
+cannot make a probe look healed.
+
+**"Mergeable"** is a local `merge-tree` probe against the target as it stands on
+origin. **"Checks green"** is the DRIVER'S OWN checks gate — the one
+`report-case` runs — on the MERGED tree; never GitHub check-runs, never
+`mergeable` polling. No configured checks and no usable environment both mean NO
+VERDICT, and no verdict reads as green: every consequence of red here is an
+intervention on somebody's pull request, and the driver does not intervene on a
+measurement it did not take.
+
+| Head | State | Action |
+|---|---|---|
+| driver | conflict healed | delete the ref (the PR closes) |
+| driver | same conflict, base moved | rebase the ref; keep the PR and its body |
+| driver | conflict changed or superset | rebuild the ref; the body no longer matches |
+| driver | answer, mergeable + checks green | approved → land it (verify-gated); else rebase if the base moved |
+| driver | answer, not mergeable or checks red | delete the ref (the PR closes); proceed as a fresh case |
+| OWNER | mergeable + checks green | leave it alone entirely |
+| OWNER | not mergeable or checks red | convert to draft + comment ONCE; report at finish |
+
+NEVER REBUILD AN OWNER-SHAPED HEAD: force-pushing over commits someone else put
+there is the one destructive operation here. Deleting a ref is NOT destructive —
+GitHub closes the PR and keeps its commits, restorable — so an unusable head is
+deleted and reported, never force-rebuilt. A rebase or rebuild pushes onto the
+SAME ref under a lease against the head this pass classified; deriving a fresh
+name from a changed conflict would mint a second ref and a second PR for one
+case.
+
+The draft flag is the "already told you" marker, so an owner PR is converted and
+commented on ONCE and a PR the owner opened as a draft gets neither. The
+conversion and the comment are a courtesy on the transition and never stop the
+pass; the REPORT is the notification — `finish` lists every owner-shaped PR that
+no longer merges or no longer passes, drafted by us or not, every pass, phrased
+as "PRs you changed that no longer merge or no longer pass: fix or close".
+
 ## 6. The commands and the case loop
 
 ### 6.1 `start`
@@ -1620,7 +1684,13 @@ never API ref fabrication:
 - **HELD** — the fix/sweep ref is pushed at the case run's TOP commit verbatim
   (§4.4). Held PRs are created AFTER the pass's target pushes, so the origin base
   already carries the clean prefix and the diff is the run's real changes only, with
-  no pending-range bloat.
+  no pending-range bloat. A pristine-conflict draft head is ONE commit — the
+  automerge tree parented on the branch tip and the conflict head. The PR's diff
+  against its base is that tree either way, so splitting it into a prefix commit
+  and a conflict commit was presentational; the single form makes `parents[0]`
+  the base tip, which is what the driver-shape walk reads (§5.6). The clean-prefix
+  commit lives on in the case WORKTREE, where it is what makes `git status` show
+  exactly the conflict.
 - **JUDGED** — the fix/sweep ref is pushed at the REAL merge commit and the
   non-draft PR is created BEFORE the target push; the target push then lands the
   same commit on the base and GitHub auto-marks the PR merged — history preserved,
@@ -1686,6 +1756,10 @@ become gate-fix cases (§9) or stop the pass.
 (`complete` | `partial`), `next`, `upstreamAdvanced`, `branches` (per-branch landed
 vs failed), `failedPushes` / `failedPublishes`, and on a partial result
 `needsOwner`, `blockingIssues`, and the systemic-outage fields.
+
+`ownerPullRequests` lists every OWNER-shaped PR that no longer merges or no
+longer passes (§5.6), drafted by us or not, every pass — the one-time draft
+conversion is a courtesy, this list is the notification.
 
 `pullRequests` lists every PR the pass touched — each with number, url, title, live
 status, a landed/failureCategory annotation, and a `kind` of
@@ -1797,8 +1871,9 @@ the vitest scripts glob.
 | `deferred.ts` | the DEFERRED height-MIN rule (§5.2) |
 | `scope.ts` | scope partition, DAG ordering, the edition-composition closure (§3.3, §3.4) |
 | `hierarchy.ts` | THE branch hierarchy: depth, minPath, inversion assert (§3.6) |
+| `proposal.ts` | the driver-shape test + the open-proposal disposition table (§5.6) |
 | `scope-guard.ts` | automerge-vs-resolved scope check (§7.4) |
-| `conflict-identity.ts` | conflict identity: marker-hunk extraction, label normalization, the set relation |
+| `conflict-identity.ts` | conflict identity: marker-hunk extraction, label normalization, the set relation (§5.6) |
 | `steps.ts` | step/case JSON schemas + first-principles re-verification (§4.6) |
 | `not-my-bug.ts` | the `--not-my-bug` adjudication, ownership probe and bisect (§7.2, §7.3) |
 | `attribute.ts` | blame: failing-file parsing, per-file counts, branch candidates, attribution (§9.1) |
