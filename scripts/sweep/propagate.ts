@@ -159,6 +159,7 @@ import {
 } from './plan.js';
 import { deriveCoverage, enumerateChain, type Chain } from './heights.js';
 import { verifyEverything, type VerifyCommand } from './verify.js';
+import { WHOLE_RANGE_BLOCK } from './types.js';
 import type {
   BranchPlan,
   CaseFile,
@@ -632,23 +633,30 @@ function prBlockedBranches(journal: JournalEntry[]): Set<string> {
  * row's sha: an origin row's fix/sweep ref head CONTAINS the conflict head
  * (it is a parent of the driver-built PR-head commit) and nothing above it,
  * so its coverage IS the conflict height; a this-pass hold carries the
- * conflict head itself. Rows without a sha (gate holds) or whose sha fell
- * below the chain cannot be height-matched and degrade to an ordinary case
- * for descendants — the safe direction (extra review, never less). DEFERRED
- * branches are not here: their heights are re-probed live during derivation.
+ * conflict head itself. DEFERRED branches are not here: their heights are
+ * re-probed live during derivation.
+ *
+ * A row with NO sha (a gate hold) or whose sha fell below the chain is a block
+ * whose height cannot be measured — and an unmeasurable block is a WHOLE-RANGE
+ * one (`-Infinity`), not an absent one. A gate fix rooted at the tip says the
+ * branch is red, not red-above-height-k: no prefix of it is proven clean, so
+ * nothing from it is eligible. Treating it as absent is what lets every
+ * descendant merge a red tip, advance on it, and be blamed for the collision in
+ * the integration rebuild.
  */
 async function prBlockedRecords(cli: Cli, journal: JournalEntry[], chain: Chain): Promise<HeldRecord[]> {
   const out: HeldRecord[] = [];
   for (const [branch, rows] of blockedRows(journal)) {
     // Multiple concurrent blocks per branch: contribute the
-    // MINIMUM height-matched block — the safest DEFER for descendants (a
-    // higher survivor would let a child below it wrongly take its own case).
+    // MINIMUM block — the safest trim for descendants (a higher survivor would
+    // let a child below it wrongly take content the lower block covers).
     let best: HeldRecord | null = null;
     for (const row of rows) {
-      if (!row.headSha) continue;
-      if (!(await refExists(cli.repo, row.headSha))) continue;
-      const height = (await deriveCoverage(cli.repo, chain, row.headSha)).height;
-      if (height < 0) continue; // below this pass's chain — degrades to an ordinary case
+      const measured =
+        row.headSha && (await refExists(cli.repo, row.headSha))
+          ? (await deriveCoverage(cli.repo, chain, row.headSha)).height
+          : -1;
+      const height = measured < 0 ? WHOLE_RANGE_BLOCK : measured;
       if (!best || height < best.height) best = { branch, height, conflictedPaths: [], caseId: row.caseId };
     }
     if (best) out.push(best);
@@ -2653,7 +2661,27 @@ export async function cmdRun(cli: Cli): Promise<number> {
         .filter((e) => e.action === 'unfrozen' && typeof e.branch === 'string')
         .map((e) => e.branch as string),
     );
-    const exclude = new Set([...arrived, ...reopened, ...blockedSet, ...statusCleared, ...syncedBranches, ...driverTouched]);
+    // A branch BELOW a blocked one derives differently for the same sanctioned
+    // reason the blocked branch itself does: its window is trimmed at that block
+    // (§5.2), so heads the written plan listed are no longer eligible. The block
+    // can also arrive mid-pass — a verify gate hold is journaled long after
+    // `start` wrote the plan — and reading that as "git moved under us" halts a
+    // pass for doing exactly what the block is supposed to make it do.
+    const ancestorsOf = transitiveAncestors(Object.fromEntries(directParentEdges(cli)));
+    const belowBlocked = new Set(
+      [...prev.branches, ...plan.branches]
+        .map((b) => b.branch)
+        .filter((b) => (ancestorsOf[b] ?? []).some((a) => blockedSet.has(a))),
+    );
+    const exclude = new Set([
+      ...arrived,
+      ...reopened,
+      ...blockedSet,
+      ...belowBlocked,
+      ...statusCleared,
+      ...syncedBranches,
+      ...driverTouched,
+    ]);
     const drift = plansDiffer(prev, plan, exclude);
     if (drift.length) {
       // §14: DriverHalt reasons surface under the machine-readable id
@@ -3000,15 +3028,6 @@ export async function cmdRun(cli: Cli): Promise<number> {
             });
             // Annotate-class (§1): a CLEAN merge passing THROUGH a height a
             // transitive ancestor is HELD on — never gates, surfaced in the report.
-            if (pp.annotate) {
-              appendJournal(dir, {
-                action: 'annotate',
-                branch: bp.branch,
-                parent: pp.parent,
-                heldAncestor: pp.annotate.heldAncestor,
-                height: pp.annotate.height,
-              });
-            }
             // A clean prefix can merge while the conflict ABOVE it is DEFERRED to a
             // blocked DIRECT parent (§5): record the defer pointer — the journaled
             // `defer` row IS the DEFERRED state, so blocked(X) holds in the

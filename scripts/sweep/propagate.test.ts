@@ -379,7 +379,7 @@ describe('report-case — case re-verification rejects forged pointers (§7, FIX
   });
 });
 
-describe('run — resume idempotence + annotate journaling (reached via next-case)', () => {
+describe('run — resume idempotence + window trimming (reached via next-case)', () => {
   it('idempotent resume: a second run does not re-merge already-arrived branches', async () => {
     const { repo } = conflictFixture();
     const ws = mkWorkspace();
@@ -399,7 +399,7 @@ describe('run — resume idempotence + annotate journaling (reached via next-cas
     expect(readJournal(dir).filter((e) => e.action === 'arrived').length).toBe(arrivals1);
   });
 
-  it('journals annotate when a clean merge passes through a HELD ancestor height', async () => {
+  it('a clean merge through a BLOCKED ancestor height is trimmed — the branch merges nothing', async () => {
     const repo = initFixtureRepo();
     repo.commit('base: x', { 'src/x.ts': 'orig\n' });
     const base = repo.sha('main'); // pin the fork point BELOW U0 so U0 is chain height 0
@@ -434,11 +434,17 @@ describe('run — resume idempotence + annotate journaling (reached via next-cas
       headSha: markerSha,
       prNumber: 12,
     });
+    const cTip = repo.sha('feat/c');
     expect(await cmdRun(cli({ cmd: 'run', execute: true, internal: true }))).toBe(0);
-    const ann = readJournal(dir).find((e) => e.action === 'annotate' && e.branch === 'feat/c');
-    expect(ann).toBeTruthy();
-    expect(ann!.heldAncestor).toBe('main_patched');
-    expect(ann!.height).toBe(0);
+    // The merge was available and clean, and is NOT taken: height 0 is the
+    // ancestor's own unresolved conflict, so nothing at or above it has been
+    // integrated. Taking it would advance feat/c onto a state the trunk has never
+    // seen — which the integration rebuild would then blame feat/c for.
+    expect(repo.sha('feat/c')).toBe(cTip);
+    expect(readJournal(dir).some((e) => e.action === 'merge' && e.branch === 'feat/c')).toBe(false);
+    // …and no pre-ref, so it is not "advanced this pass" and cannot enter the
+    // verify recipe. That is the whole mechanism, in one assertion.
+    expect(readJournal(dir).some((e) => e.action === 'pre-ref' && e.branch === 'feat/c')).toBe(false);
   });
 });
 

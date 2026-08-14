@@ -33,6 +33,15 @@ export interface EligibleLine {
   heads: Head[];
   /** Branch's derived coverage at build time (§2). */
   coverage: number;
+  /**
+   * Set when the trim actually removed candidates: there IS content waiting for
+   * this branch and it is held back by an unresolved conflict above.
+   *
+   * "Nothing to take" and "something to take, blocked upstream" are different
+   * facts and the pass must not report them the same way — the second is what
+   * the owner is waiting on, and what the urge comments count.
+   */
+  trimmedAt?: number;
 }
 
 export interface BuildEligibleLineArgs {
@@ -49,6 +58,21 @@ export interface BuildEligibleLineArgs {
   parentRef?: string;
   model: 'entry' | 'parents';
   chain: Chain;
+  /**
+   * TRIM (DRIVER.md §5.2): the height of the lowest UNRESOLVED conflict at or
+   * above this branch — its own blocked parent, or any blocked transitive
+   * ancestor. Nothing at or above it is eligible: that content cannot integrate
+   * until the conflict is resolved, and merging it anyway advances the branch
+   * onto a state the trunk has never seen, which the integration rebuild then
+   * reports as the branch's own conflict.
+   *
+   * `-Infinity` trims the WHOLE range. A gate fix rooted at a tip has no
+   * conflict head to measure against, so nothing below it is proven clean
+   * either; only a fix rooted at a located commit leaves a clean prefix.
+   *
+   * Omitted = nothing is blocked above this branch = the full line is eligible.
+   */
+  blockedAtHeight?: number;
 }
 
 /**
@@ -71,10 +95,12 @@ export interface BuildEligibleLineArgs {
 export async function buildEligibleLine(args: BuildEligibleLineArgs): Promise<EligibleLine> {
   const { repo, branch, branchTip, parent, model, chain } = args;
   const coverage = (await deriveCoverage(repo, chain, branchTip)).height;
+  const trim = args.blockedAtHeight ?? Infinity;
 
   if (model === 'entry') {
-    const heads = chain.heads.filter((h) => h.height > coverage);
-    return { branch, parent, model, heads, coverage };
+    const above = chain.heads.filter((h) => h.height > coverage);
+    const heads = above.filter((h) => h.height < trim);
+    return { branch, parent, model, heads, coverage, ...(heads.length < above.length ? { trimmedAt: trim } : {}) };
   }
 
   // parents model: walk the parent's own first-parent line, oldest -> newest,
@@ -82,9 +108,15 @@ export async function buildEligibleLine(args: BuildEligibleLineArgs): Promise<El
   const parentTip = await revParse(repo, args.parentRef ?? parent);
   const lineShas = await firstParentChain(repo, parentTip, chain.base);
   const byHeight = new Map<number, string>();
+  let trimmed = false;
   for (const sha of lineShas) {
     const h = (await deriveCoverage(repo, chain, sha)).height;
-    if (h > coverage) byHeight.set(h, sha); // oldest->newest: last write = newest
+    if (h <= coverage) continue;
+    if (h >= trim) {
+      trimmed = true;
+      continue;
+    }
+    byHeight.set(h, sha); // oldest->newest: last write = newest
   }
   let heads: Head[] = [...byHeight.entries()]
     .map(([height, sha]) => ({ sha, height }))
@@ -93,11 +125,18 @@ export async function buildEligibleLine(args: BuildEligibleLineArgs): Promise<El
   // Fork-only parent content: no upstream progress above coverage, but the
   // parent carries new fork commits the child has not absorbed -> the parent
   // tip is the single candidate head.
+  //
+  // TRIMMED TOO, and this is the arm that matters most. A blocked parent has
+  // stopped at its conflict, so its TIP is precisely the state that cannot
+  // integrate; without the trim this arm hands that tip to every descendant as
+  // "fork content", they merge it cleanly, advance on it, and meet the trunk
+  // for the first time in the integration rebuild — which blames THEM.
   if (heads.length === 0 && !(await isAncestor(repo, parentTip, branchTip))) {
     const h = (await deriveCoverage(repo, chain, parentTip)).height;
-    heads = [{ sha: parentTip, height: h }];
+    if (h < trim) heads = [{ sha: parentTip, height: h }];
+    else trimmed = true;
   }
-  return { branch, parent, model, heads, coverage };
+  return { branch, parent, model, heads, coverage, ...(trimmed ? { trimmedAt: trim } : {}) };
 }
 
 export interface HeadProbe {

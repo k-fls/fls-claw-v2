@@ -219,12 +219,6 @@ export interface ParentPlan {
   skipReason: string | null;
   /** Forced (empty) merge to honour the leaf/always_merge rule (§6). */
   forced?: boolean;
-  /**
-   * Annotate-class flag (§1): a CLEAN merge whose merged range passes
-   * THROUGH a height at which a transitive ancestor is HELD. Never gates — the
-   * pass report surfaces it. `null` unless it applies.
-   */
-  annotate?: { heldAncestor: string; height: number } | null;
 }
 
 /** A branch's whole-pass plan row (`plan.json`). */
@@ -307,9 +301,19 @@ export interface CaseFile {
   deferredCheck: { firstConflictHeight: number; transitiveAncestors: string[] };
 }
 
+/**
+ * A block whose height cannot be measured covers the WHOLE range: nothing from
+ * the branch is eligible for anything below it. A gate fix rooted at a tip says
+ * "this branch is red", not "red above height k" — there is no clean prefix to
+ * hand down. Compares below every real height, so every height test that trims
+ * at a block trims everything without a special case.
+ */
+export const WHOLE_RANGE_BLOCK = Number.NEGATIVE_INFINITY;
+
 /** A HELD branch's registry record used for DEFERRED matching (§5). */
 export interface HeldRecord {
   branch: string;
+  /** The conflict height, or `WHOLE_RANGE_BLOCK` when it cannot be measured. */
   height: number;
   conflictedPaths: string[];
   caseId: string;

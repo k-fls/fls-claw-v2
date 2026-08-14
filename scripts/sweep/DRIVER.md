@@ -577,7 +577,32 @@ internal/test override that wins when present.
 `start` is idempotent on origin: a pass that crashed before `finish` published
 nothing, so the re-derived picture is clean.
 
-### 5.2 DEFERRED
+### 5.2 The window is trimmed at the unresolved conflict
+
+AN UNRESOLVED CONFLICT TRIMS THE MERGE WINDOW OF EVERYTHING BELOW IT. A branch's
+eligible line (§4) stops below the lowest height at which its parent — or any
+transitive ancestor — is blocked (`blockedAtHeight`, `interval.ts`). Content at or
+above that height has been integrated by nobody and cannot be until the conflict
+is resolved; merging it here does not make it integrable, it advances THIS branch
+onto a state the trunk has never seen, and the integration rebuild (§10.2) then
+meets that state, blames this branch and rolls it back for a conflict it did not
+cause.
+
+A block whose height cannot be measured — a gate hold carries no conflict head —
+is a WHOLE-RANGE block (`WHOLE_RANGE_BLOCK`): a gate fix rooted at a tip says the
+branch is red, not red-above-height-k, so no prefix of it is proven clean and
+nothing from it is eligible. Only a fix rooted at a located commit (`rootAt`,
+§9.3) leaves a clean prefix below itself.
+
+Trimming gates what a branch TAKES, never what it REPORTS. Below the trim the
+ancestors are genuinely clean, so what remains merges normally and a conflict
+there is the branch's OWN — its own case, its own PR, in this pass. Withheld
+content is journaled as DEFERRED rather than as "up to date": "nothing to take"
+and "something to take, blocked upstream" are different facts, and the second is
+what the owner is waiting on and what the urge counts (§5.5). A branch whose
+window trims to empty merges nothing, so it journals no `pre-ref`, so it is not
+publishable and cannot enter the integration recipe — the exclusion needs no rule
+of its own.
 
 DEFERRED is a PURE HEIGHT-MIN over the branch's BLOCKED DIRECT PARENTS
 (`deferred.ts`). When branch X hits its own conflict at height `conflictHeight`
@@ -599,9 +624,14 @@ direct parent as blocking), and it clears when all parents are NONE, at which
 point the branch re-merges fresh. Heights are live per-pass values and are never
 carried numerically across passes.
 
-Degradation is deliberately in the safe direction: a hold that carries no head
-(a verify-gate hold, §10.2) cannot contribute a height, so a next-pass descendant
-gets an ORDINARY case instead of DEFERRED — extra review, never less.
+A hold that carries no head (a verify-gate hold, §10.2) contributes no height, so
+it blocks the WHOLE range for descendants rather than none of it — an
+unmeasurable block is a total one, not an absent one.
+
+A branch below a blocked one derives differently from the plan on disk by
+construction, and a block can arrive mid-pass (a verify gate hold is journaled
+long after `start` wrote the plan). That is a sanctioned transition, excluded
+from the plan-drift halt (§6) exactly as the blocked branch itself is.
 
 ### 5.3 The held-PR review loop
 
@@ -1231,7 +1261,7 @@ the driver never loops.
 
 ### 8.4 Overlap awareness
 
-Annotate-class flags and new upstream content feed OVERLAP AWARENESS, which is a
+New upstream content feeds OVERLAP AWARENESS, which is a
 report to the owner and never an inline gate in the case loop. The agentic layer
 spawns overlap-check subagents from `registry/prompts/overlap-check.md` with the
 matched inventory entries' context, falling back to `catch-all-triage.md` when

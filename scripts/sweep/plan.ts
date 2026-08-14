@@ -148,7 +148,8 @@ export interface DerivePlanOptions {
   /**
    * PR_ID-blocked branches with their LIVE-derived block heights (this-pass
    * holds + cross-pass PR_ID entries whose height was re-derived from the
-   * stored head sha). Seeds blockHeightOf; also the annotate input.
+   * stored head sha). Seeds blockHeightOf, and is what trims each branch's
+   * window at the lowest block above it (§5.2).
    */
   held?: HeldRecord[];
   /**
@@ -177,7 +178,30 @@ async function analyzeParent(
   blockedParents: BlockedParent[],
   stackCap: number,
 ): Promise<ParentPlan> {
-  const line = await buildEligibleLine({ repo, branch, branchTip, parent, parentRef, model, chain });
+  // TRIM THE WINDOW AT THE LOWEST UNRESOLVED CONFLICT ABOVE THIS BRANCH (§5.2).
+  //
+  // A block anywhere above — this parent, or any transitive ancestor — means the
+  // content at and above it has not been integrated by anyone and cannot be
+  // until the conflict is resolved. Merging it here does not make it integrable;
+  // it advances THIS branch onto a state the trunk has never seen, and the
+  // integration rebuild then meets that state, blames this branch, and rolls it
+  // back for a conflict it did not cause.
+  //
+  // Below the trim the ancestors are genuinely clean, so what remains merges as
+  // usual and a conflict there is this branch's OWN — the trim gates what the
+  // branch TAKES, never what it REPORTS.
+  const blockedAbove = held.filter((h) => h.branch === parent || ancestors.includes(h.branch));
+  const blockedAtHeight = blockedAbove.length > 0 ? Math.min(...blockedAbove.map((h) => h.height)) : undefined;
+  const line = await buildEligibleLine({
+    repo,
+    branch,
+    branchTip,
+    parent,
+    parentRef,
+    model,
+    chain,
+    ...(blockedAtHeight !== undefined ? { blockedAtHeight } : {}),
+  });
   // Probe from the pinned branch TIP sha, not the ref name: deterministic
   // (§3 probe determinism) and valid for remote-only branches (§13).
   const sweep = await mergePointSweep(repo, branchTip, line, stackCap);
@@ -192,7 +216,19 @@ async function analyzeParent(
     skipReason: null,
   };
 
-  if (sweep.upToDate) return pp;
+  // TRIMMED CONTENT IS DEFERRED, NOT ABSENT. The branch takes nothing at or
+  // above the block, but content IS waiting for it — say so, or a branch held
+  // back by someone else's unresolved conflict reads as "up to date" in the pass
+  // report and in the urge counts, and nobody can see what the block is costing.
+  if (line.trimmedAt !== undefined) {
+    pp.deferredTo = blockedAbove.reduce((lo, h) => (h.height < lo.height ? h : lo)).branch;
+    pp.deferHeight = line.trimmedAt;
+  }
+
+  if (sweep.upToDate) {
+    if (pp.deferredTo) pp.verdict = 'defer';
+    return pp;
+  }
 
   let realMerge = false;
   if (sweep.mergePoint) {
@@ -222,17 +258,6 @@ async function analyzeParent(
         reproduction: fc.reproduction,
       };
     }
-  }
-
-  // Annotate-class (§1): a CLEAN merge whose merged range passes THROUGH
-  // a height at which a transitive ancestor is HELD. Never gates — surfaced in
-  // the pass report. Window is (coverage, mergePoint.height].
-  if (realMerge && sweep.mergePoint) {
-    const ancestorSet = new Set(ancestors);
-    const hit = held.find(
-      (h) => ancestorSet.has(h.branch) && h.height > line.coverage && h.height <= sweep.mergePoint!.height,
-    );
-    if (hit) pp.annotate = { heldAncestor: hit.branch, height: hit.height };
   }
 
   if (realMerge) pp.verdict = 'merge';

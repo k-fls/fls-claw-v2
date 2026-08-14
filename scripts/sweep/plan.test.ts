@@ -9,6 +9,7 @@ import {
   shortestUnskipChain,
   transitiveAncestors,
 } from './plan.js';
+import { WHOLE_RANGE_BLOCK } from './types.js';
 import type { BranchPlan, FeatureEntry, SweepScope } from './types.js';
 
 describe('plan pure helpers', () => {
@@ -338,10 +339,10 @@ describe('derivePlan — un-skip never marks a chain forced when a hop conflicts
   });
 });
 
-// --- annotate-class detection (§1, SPEC 2) --------------------------------
-describe('derivePlan — annotate-class (clean merge THROUGH a HELD-ancestor height)', () => {
-  // feat/c (coverage -1) merges main_patched cleanly to height 0; main_patched
-  // is a transitive ancestor recorded HELD at height 0 (within the merge window).
+// --- the window is trimmed at a blocked ancestor (§5.2) --------------------
+describe('derivePlan — a clean merge THROUGH a blocked-ancestor height is TRIMMED, not taken', () => {
+  // feat/c (coverage -1) would merge main_patched cleanly to height 0; main_patched
+  // is a transitive ancestor blocked at height 0 (inside that window).
   const repo = initFixtureRepo();
   repo.commit('base: x', { 'src/x.ts': 'orig\n' });
   const base = repo.sha('main');
@@ -358,19 +359,37 @@ describe('derivePlan — annotate-class (clean merge THROUGH a HELD-ancestor hei
     { id: 'c', name: 'c', kind: 'feat', branch: 'feat/c', parents: ['main_patched'] },
   ];
 
-  it('flags annotate when a HELD ancestor height lies in the merge window', async () => {
+  it('takes NOTHING when the blocked ancestor height lies in the merge window', async () => {
     const held = [{ branch: 'main_patched', height: 0, conflictedPaths: ['src/x.ts'], caseId: 'mp' }];
     const plan = await derivePlan({ repo: repo.dir, upstreamRef: 'main', base, features, scope: {}, held });
     const c = plan.branches.find((b) => b.branch === 'feat/c')!;
-    expect(c.parents[0].verdict).toBe('merge');
-    expect(c.parents[0].annotate).toEqual({ heldAncestor: 'main_patched', height: 0 });
+    // The merge was clean — and taking it would still be wrong: height 0 is the
+    // ancestor's own unresolved conflict, so nothing above it has been integrated
+    // by anyone. The branch waits instead of advancing onto an un-integrated state,
+    // and says it is waiting rather than reporting itself up to date.
+    expect(c.parents[0].verdict).toBe('defer');
+    expect(c.parents[0].deferredTo).toBe('main_patched');
+    expect(c.parents[0].mergePoint).toBeNull();
+    expect(c.parents[0].case).toBeNull();
   });
 
-  it('no annotate when the HELD ancestor height is outside the merge window', async () => {
+  it('merges normally when the blocked ancestor height is above the merge window', async () => {
     const held = [{ branch: 'main_patched', height: 5, conflictedPaths: ['src/x.ts'], caseId: 'mp' }];
     const plan = await derivePlan({ repo: repo.dir, upstreamRef: 'main', base, features, scope: {}, held });
     const c = plan.branches.find((b) => b.branch === 'feat/c')!;
     expect(c.parents[0].verdict).toBe('merge');
-    expect(c.parents[0].annotate ?? null).toBeNull();
+  });
+
+  it('a block with no measurable height trims the WHOLE range (a gate fix at a tip)', async () => {
+    const held = [
+      { branch: 'main_patched', height: WHOLE_RANGE_BLOCK, conflictedPaths: [], caseId: 'gate-main_patched' },
+    ];
+    const plan = await derivePlan({ repo: repo.dir, upstreamRef: 'main', base, features, scope: {}, held });
+    const c = plan.branches.find((b) => b.branch === 'feat/c')!;
+    // No height could be measured, so no prefix is proven clean: nothing at all
+    // is eligible, and the branch is waiting on the gate fix rather than idle.
+    expect(c.parents[0].verdict).toBe('defer');
+    expect(c.parents[0].deferredTo).toBe('main_patched');
+    expect(c.parents[0].mergePoint).toBeNull();
   });
 });
