@@ -18,8 +18,11 @@ import {
   checkBaseHeight,
   classifyComments,
   classifyReviewTrigger,
+  convertPullRequestToDraft,
   extractSweepAddressed,
+  ghGraphql,
   ghPaginated,
+  markPullRequestReadyForReview,
   haltIdFor,
   isBlocking,
   maxRealReviewId,
@@ -496,6 +499,70 @@ describe('review-loop primitives (hardened tag, review trigger, pagination)', ()
       },
     };
     await expect(ghPaginated(flaky, '/repos/o/r/pulls/12/reviews')).rejects.toThrow(/HTTP 502/);
+  });
+});
+
+describe('the draft transitions (GraphQL over the REST transport)', () => {
+  const slug = { owner: 'o', repo: 'r' };
+
+  /** Records every call so the test can assert the route, not just the result. */
+  function recorder(
+    handler: (method: string, path: string, body?: unknown) => { status: number; body: unknown },
+  ): { transport: GithubTransport; calls: Array<{ method: string; path: string; body?: unknown }> } {
+    const calls: Array<{ method: string; path: string; body?: unknown }> = [];
+    return {
+      calls,
+      transport: {
+        async request(method, path, body) {
+          calls.push({ method, path, body });
+          return handler(method, path, body);
+        },
+      },
+    };
+  }
+
+  const prGet = { status: 200, body: { number: 12, node_id: 'PR_kwDO', draft: false } };
+
+  it('converts to draft by node id, read from the PR the driver already fetches', async () => {
+    const { transport, calls } = recorder((method, path) =>
+      method === 'GET' ? prGet : { status: 200, body: { data: { convertPullRequestToDraft: { pullRequest: { isDraft: true } } } } },
+    );
+    await convertPullRequestToDraft(transport, slug, 12);
+    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual(['GET /repos/o/r/pulls/12', 'POST /graphql']);
+    const mutation = calls[1].body as { query: string; variables: Record<string, unknown> };
+    expect(mutation.query).toContain('convertPullRequestToDraft');
+    expect(mutation.variables).toEqual({ pullRequestId: 'PR_kwDO' });
+  });
+
+  it('marks ready for review over the same route', async () => {
+    const { transport, calls } = recorder((method) =>
+      method === 'GET' ? prGet : { status: 200, body: { data: { markPullRequestReadyForReview: { pullRequest: { isDraft: false } } } } },
+    );
+    await markPullRequestReadyForReview(transport, slug, 12);
+    const mutation = calls[1].body as { query: string; variables: Record<string, unknown> };
+    expect(mutation.query).toContain('markPullRequestReadyForReview');
+    expect(mutation.variables).toEqual({ pullRequestId: 'PR_kwDO' });
+  });
+
+  it('a refused mutation THROWS even though GraphQL answers 200', async () => {
+    // GraphQL reports failure in the body, not the status line: a status-only
+    // check would journal a conversion that never happened, and the next pass
+    // would read the PR as already told and stay silent forever.
+    const { transport } = recorder((method) =>
+      method === 'GET' ? prGet : { status: 200, body: { errors: [{ message: 'Resource not accessible' }] } },
+    );
+    await expect(convertPullRequestToDraft(transport, slug, 12)).rejects.toThrow(/Resource not accessible/);
+  });
+
+  it('a transport-level failure throws with its status', async () => {
+    const { transport } = recorder((method) => (method === 'GET' ? prGet : { status: 502, body: null }));
+    await expect(markPullRequestReadyForReview(transport, slug, 12)).rejects.toThrow(/HTTP 502/);
+    await expect(ghGraphql(transport, 'query { viewer { login } }', {})).rejects.toThrow(/HTTP 502/);
+  });
+
+  it('a PR with no node id is refused rather than mutated blind', async () => {
+    const { transport } = recorder(() => ({ status: 200, body: { number: 12 } }));
+    await expect(convertPullRequestToDraft(transport, slug, 12)).rejects.toThrow(/no node_id/);
   });
 });
 

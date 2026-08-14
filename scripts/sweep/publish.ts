@@ -770,6 +770,82 @@ export async function reopenPullRequest(
 }
 
 /**
+ * GraphQL request over the SAME transport as every REST call — `/graphql` is
+ * another path on the same host, so the token, the proxy tunnel and the
+ * fail-closed error handling are shared rather than reimplemented.
+ *
+ * GraphQL answers HTTP 200 with an `errors` array when the mutation FAILED, so
+ * a status check alone reads a refusal as a success. This throws on either.
+ */
+export async function ghGraphql(
+  transport: GithubTransport,
+  query: string,
+  variables: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const res = await transport.request('POST', '/graphql', { query, variables });
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error(`POST /graphql -> HTTP ${res.status}: ${JSON.stringify(res.body).slice(0, 300)}`);
+  }
+  const payload = (res.body ?? {}) as { data?: Record<string, unknown>; errors?: unknown };
+  if (Array.isArray(payload.errors) && payload.errors.length > 0) {
+    throw new Error(`POST /graphql -> GraphQL error: ${JSON.stringify(payload.errors).slice(0, 300)}`);
+  }
+  return payload.data ?? {};
+}
+
+/**
+ * The PR's GraphQL node id, read from the REST resource the driver already
+ * fetches. The draft mutations are keyed by node id and nothing else, and REST
+ * hands it over on the ordinary PR GET — so this needs no second lookup route
+ * and no separate client.
+ */
+export async function pullRequestNodeId(
+  transport: GithubTransport,
+  slug: { owner: string; repo: string },
+  prNumber: number,
+): Promise<string> {
+  const pr = await ghExpect(transport, 'GET', `/repos/${slug.owner}/${slug.repo}/pulls/${prNumber}`);
+  const id = typeof pr.node_id === 'string' ? pr.node_id : '';
+  if (!id) throw new Error(`PR #${prNumber} carries no node_id — the draft mutation has nothing to address`);
+  return id;
+}
+
+/**
+ * Convert an open PR to a DRAFT. REST cannot do this at all — the draft flag is
+ * write-only through GraphQL — which is why this one surface exists.
+ *
+ * The draft flag is the driver's "already told you" marker on an owner's PR, so
+ * the caller converts only a PR that is not already a draft and the next pass
+ * stays silent.
+ */
+export async function convertPullRequestToDraft(
+  transport: GithubTransport,
+  slug: { owner: string; repo: string },
+  prNumber: number,
+): Promise<void> {
+  const pullRequestId = await pullRequestNodeId(transport, slug, prNumber);
+  await ghGraphql(
+    transport,
+    'mutation($pullRequestId: ID!) { convertPullRequestToDraft(input: {pullRequestId: $pullRequestId}) { pullRequest { isDraft } } }',
+    { pullRequestId },
+  );
+}
+
+/** Take a PR out of draft. The inverse mutation, same constraints. */
+export async function markPullRequestReadyForReview(
+  transport: GithubTransport,
+  slug: { owner: string; repo: string },
+  prNumber: number,
+): Promise<void> {
+  const pullRequestId = await pullRequestNodeId(transport, slug, prNumber);
+  await ghGraphql(
+    transport,
+    'mutation($pullRequestId: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $pullRequestId}) { pullRequest { isDraft } } }',
+    { pullRequestId },
+  );
+}
+
+/**
  * Post the sweep-addressed marker comment: the driver records the
  * highest SUBMITTED REVIEW id the just-published resolution addressed.
  * Append-only — a fresh comment is posted each republish and readers take the

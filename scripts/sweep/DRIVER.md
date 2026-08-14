@@ -1755,7 +1755,7 @@ the vitest scripts glob.
 | `attribute.ts` | blame: failing-file parsing, per-file counts, branch candidates, attribution (§9.1) |
 | `cut-points.ts` | owner-approved cut-point exceptions: parse, re-verify, report (§9.2) |
 | `verify.ts` | the everything-rebuild + CI command runner with leave-one-out attribution (§10.2, §10.6) |
-| `publish.ts` | PR creation/push mechanics, the base-height check, mechanical text checks, the machine block, review/comment classification, the injectable GitHub REST transport |
+| `publish.ts` | PR creation/push mechanics, the base-height check, mechanical text checks, the machine block, review/comment classification, the injectable GitHub transport (REST, plus the GraphQL draft transitions REST cannot express) |
 | `candidates.ts` | inventory-candidate discovery + inheritance derivation (§3.7) |
 | `registry.ts` | inventory + routing/scope config loading (§3.1) |
 | `validate.ts` | the inventory validator (§3.2) |
