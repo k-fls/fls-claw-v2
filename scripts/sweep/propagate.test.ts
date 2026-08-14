@@ -41,6 +41,7 @@ import {
   passDir,
   publishableRecipe,
   readJournal,
+  recipeMember,
   supersededCaseIds,
   type Cli,
   type ColdReadInvoker,
@@ -1292,44 +1293,40 @@ function divergedFixture(opts: { withMainPatched?: boolean } = {}): { repo: Fixt
   return { repo };
 }
 
-describe('publishableRecipe — pure recipe derivation', () => {
-  it('keeps advanced branches in DAG order, drops held/frozen and open-case branches', () => {
-    const journal: JournalEntry[] = (
-      [
-        { action: 'pre-ref', branch: 'main_patched', ref: 'x' },
-        { action: 'pre-ref', branch: 'module/a', ref: 'x' },
-        { action: 'pre-ref', branch: 'module/b', ref: 'x' }, // advanced but held below
-        { action: 'pre-ref', branch: 'module/c', ref: 'x' }, // advanced but open case below
-        { action: 'held', branch: 'module/b', caseId: 'B1', height: -1, conflictedPaths: [] },
-        { action: 'case', branch: 'module/c', parent: 'main_patched', caseId: 'C1' },
-      ] as Array<Record<string, unknown>>
-    ).map((e) => ({ ts: '', ...e }) as JournalEntry);
-    const order = ['main_patched', 'module/a', 'module/b', 'module/c'];
-    // held = the PR_ID-blocked set (origin/journal-derived): module/b
-    // plus a blocked branch that never advanced — never in the recipe.
-    const held = new Set(['module/b', 'module/frozen-elsewhere']);
-    expect(publishableRecipe(journal, order, held)).toEqual(['main_patched', 'module/a']);
+describe('recipe membership — nothing blocked at or above it', () => {
+  // main_patched -> module/a -> module/a-leaf, and main_patched -> module/b.
+  const ancestorsOf: Record<string, string[]> = {
+    'module/a': ['main_patched'],
+    'module/b': ['main_patched'],
+    'module/a-leaf': ['module/a', 'main_patched'],
+  };
+  const order = ['main_patched', 'module/a', 'module/a-leaf', 'module/b'];
+
+  it('a blocked branch and everything under it are out; siblings stay in', () => {
+    // module/a carries an open proposal, so its content is not integrable and
+    // module/a-leaf holds a state the trunk has never seen — a rebuild with
+    // either in it blames the descendant for the ancestor's conflict.
+    expect(publishableRecipe(order, new Set(['module/a']), ancestorsOf)).toEqual(['main_patched', 'module/b']);
   });
 
-  it('bug #63: a case SUPERSEDED by a reopen (stale, never disposed) does NOT exclude its branch once the fresh re-emitted case resolves', () => {
-    // module/c: stale case C-h1 emitted, parent resolved → c reopened → fresh
-    // case C-h2 emitted against the advanced parent, then RESOLVED. The stale
-    // C-h1 is never dispositioned; without supersession it would keep c out of
-    // the publishable set forever (and, in openCases, be served first → an
-    // ERR02_CASE_STALE loop). It must be treated as dead.
-    const journal: JournalEntry[] = (
-      [
-        { action: 'pre-ref', branch: 'main_patched', ref: 'x' },
-        { action: 'pre-ref', branch: 'module/c', ref: 'x' },
-        { action: 'case', branch: 'module/c', parent: 'main_patched', caseId: 'C-h1', head: { sha: 'aaa', height: 1 } }, // stale
-        { action: 'resolved', branch: 'main_patched', caseId: 'M1' },
-        { action: 'reopened', branch: 'module/c' }, // supersedes C-h1
-        { action: 'case', branch: 'module/c', parent: 'main_patched', caseId: 'C-h2', head: { sha: 'bbb', height: 2 } }, // fresh
-        { action: 'resolved', branch: 'module/c', caseId: 'C-h2' },
-      ] as Array<Record<string, unknown>>
-    ).map((e) => ({ ts: '', ...e }) as JournalEntry);
-    const order = ['main_patched', 'module/c'];
-    expect(publishableRecipe(journal, order, new Set())).toEqual(['main_patched', 'module/c']);
+  it('a block at the root empties the recipe', () => {
+    expect(publishableRecipe(order, new Set(['main_patched']), ancestorsOf)).toEqual([]);
+  });
+
+  it('an UN-ADVANCED branch is in the recipe — merging nothing this pass is not a reason to skip verifying it', () => {
+    // The old rule gated on "a pre-ref was journaled this pass". Whether a
+    // branch happened to merge something in the last few minutes says nothing
+    // about whether its content integrates, and on a quiet pass it shrank the
+    // build to nothing.
+    expect(publishableRecipe(order, new Set(), ancestorsOf)).toEqual(order);
+  });
+
+  it('recipeMember is the whole rule, branch by branch', () => {
+    const blocked = new Set(['module/a']);
+    expect(recipeMember('module/a', blocked, ancestorsOf)).toBe(false);
+    expect(recipeMember('module/a-leaf', blocked, ancestorsOf)).toBe(false);
+    expect(recipeMember('module/b', blocked, ancestorsOf)).toBe(true);
+    expect(recipeMember('main_patched', blocked, ancestorsOf)).toBe(true);
   });
 });
 
@@ -1388,20 +1385,32 @@ describe('reopen-superseded cases (bug #63/#64 — every open-case reader)', () 
 });
 
 describe('propagate verify — publishable set', () => {
-  it('(a1) a held branch that would conflict on the base is EXCLUDED — the pass stays green (fix 1)', async () => {
+  it('(a1) a branch frozen behind an open PR would conflict on the base and is EXCLUDED — the pass stays green (fix 1)', async () => {
     const { repo } = divergedFixture();
     const ws = mkWorkspace();
-    // module/held is held (journal); module/good advanced cleanly. DAG order lists
-    // the held branch FIRST (like the real recipe whose head was a frozen module).
+    // module/held carries a proposal that predates the pass, so it has been
+    // held back for as long as the owner has taken with it and now lags the
+    // trunk; module/good advanced cleanly. DAG order lists the frozen branch
+    // FIRST (like the real recipe whose head was a long-frozen module).
     const { wm12 } = seedVerifyPass(
       ws,
       repo,
       ['module/held', 'module/good'],
       [{ branch: 'module/good', ref: repo.sha('module/good') }],
-      [{ action: 'held', branch: 'module/held', caseId: 'gate-x', height: -1, conflictedPaths: [] }],
+      [
+        {
+          action: 'origin-blocked',
+          branch: 'module/held',
+          caseId: 'origin:fix/sweep/module__held--main-h0-deadbeef',
+          fixBranch: 'fix/sweep/module__held--main-h0-deadbeef',
+          kind: 'merge',
+          headSha: null,
+          prNumber: 9,
+        },
+      ],
     );
-    // Heldness = the journaled `held` disposition above — the derived
-    // blocked view reads the journal; no local state file is involved.
+    // Blockedness = the journaled row above — the derived view reads the
+    // journal; no local state file is involved.
     const heldTip = repo.sha('module/held');
     const cmds = join(ws, 'cmds.json');
     writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }]));
@@ -1421,6 +1430,47 @@ describe('propagate verify — publishable set', () => {
     expect(journal.some((e) => e.action === 'verify' && e.ok === true)).toBe(true);
     expect(journal.some((e) => e.action === 'verify-observation')).toBe(false); // never became an offender
     expect(repo.sha('module/held')).toBe(heldTip); // untouched — not rolled back
+  });
+
+  it('an UN-ADVANCED branch is in the recipe, and a conflict on it is a non-blocking observation', async () => {
+    // Nothing is blocked, so both branches belong in the build whether or not
+    // they merged anything this pass. module/lagging merged nothing, so there
+    // is no pre-ref to roll it back to and no merge of ours to blame it for:
+    // the gate records what it saw, rebuilds without it, and lets the rest
+    // through, rather than freezing a branch this pass never touched.
+    const { repo } = divergedFixture();
+    const ws = mkWorkspace();
+    const { wm12 } = seedVerifyPass(
+      ws,
+      repo,
+      ['module/held', 'module/good'],
+      [{ branch: 'module/good', ref: repo.sha('module/good') }],
+    );
+    const laggingTip = repo.sha('module/held');
+    const cmds = join(ws, 'cmds.json');
+    writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }]));
+    const out = join(ws, 'dry.json');
+    await cmdVerify(baseCli(repo, ws, null, { cmd: 'verify', pass: wm12, commandsFile: cmds, out }));
+    expect((JSON.parse(readFileSync(out, 'utf8')) as { recipe: string[] }).recipe).toEqual([
+      'module/held',
+      'module/good',
+    ]);
+
+    const res = join(ws, 'res.json');
+    expect(
+      await cmdVerify(baseCli(repo, ws, null, { cmd: 'verify', execute: true, pass: wm12, commandsFile: cmds, out: res })),
+    ).toBe(0);
+    expect(JSON.parse(readFileSync(res, 'utf8'))).toMatchObject({
+      ok: true,
+      nonBlocking: true,
+      offender: 'module/held',
+    });
+    const journal = readJournal(passDir(ws, wm12));
+    const obs = journal.find((e) => e.action === 'verify-observation')!;
+    expect(obs.offender).toBe('module/held');
+    expect(journal.some((e) => e.action === 'held' && e.branch === 'module/held')).toBe(false); // not frozen
+    expect(journal.some((e) => e.action === 'pre-ref-rollback')).toBe(false); // nothing to roll back
+    expect(repo.sha('module/held')).toBe(laggingTip);
   });
 
   /**
@@ -1793,6 +1843,20 @@ describe('propagate — blocked-branch urging is POSTED by push, once per NEW pe
   });
 });
 
+/**
+ * Freeze the pass's open case, as `report-case --tier held` does. `finish`
+ * refuses while a case is still open, so a pass reaches the push stage only
+ * with every case disposed — and a branch with an unresolved conflict in hand
+ * is outside the verify recipe, and therefore outside the push set.
+ */
+function freezeOpenCases(dir: string): void {
+  for (const e of readJournal(dir)) {
+    if (e.action === 'case' && typeof e.caseId === 'string' && typeof e.branch === 'string') {
+      appendJournal(dir, { action: 'held', branch: e.branch, caseId: e.caseId });
+    }
+  }
+}
+
 describe('propagate push — verify-gated pass pushes (§14.4)', () => {
   it('refuses without a green verify (ERR18); with it, pushes mutated targets (one push per branch) and journals them', async () => {
     const { repo } = conflictFixture();
@@ -1804,6 +1868,7 @@ describe('propagate push — verify-gated pass pushes (§14.4)', () => {
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
     await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
     await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true })); // merges the U0 prefix, gates on U1
+    freezeOpenCases(dir);
     const localTip = repo.sha('main_patched');
     expect(localTip).not.toBe(preTip); // the prefix merge landed locally
 
@@ -1849,6 +1914,7 @@ describe('propagate push — verify-gated pass pushes (§14.4)', () => {
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
     await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
     await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    freezeOpenCases(dir);
     fakeGreenVerify(dir);
     // Break the transport (simulates the credential-proxy failure mode)
     // DETERMINISTICALLY: a dead local path — never the real github.com.
@@ -1887,6 +1953,7 @@ describe('propagate push — verify-gated pass pushes (§14.4)', () => {
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
     await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
     await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true }));
+    freezeOpenCases(dir);
     fakeGreenVerify(dir);
     // A REAL declining pre-receive hook on the bare origin (the branch-
     // protection shape): git reports "[remote rejected] … (pre-receive hook
@@ -1911,6 +1978,35 @@ describe('propagate push — verify-gated pass pushes (§14.4)', () => {
     expect(journal.some((e) => e.action === 'push-escalated' && e.branch === 'main_patched' && e.category === 'rejected')).toBe(true);
     expect(journal.some((e) => e.action === 'halt')).toBe(false);
     expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).not.toBe(repo.sha('main_patched')); // origin untouched
+  });
+
+  it('a branch outside the verify recipe is NOT pushed, however much this pass merged into it', async () => {
+    // The push set is the recipe intersected with what the driver mutated, from
+    // the ONE membership rule. Without that, a branch that merged and then had
+    // something above it block reaches origin carrying content no integration
+    // build ever saw — and the next build meets it as history.
+    const { repo } = conflictFixture();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const originTip = repo.sha('main_patched');
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
+    await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true })); // merges the U0 prefix
+    freezeOpenCases(dir);
+    expect(repo.sha('main_patched')).not.toBe(originTip); // it really did merge
+
+    // A verify gate hold arrives after the merge: the branch is under repair.
+    appendJournal(dir, { action: 'held', branch: 'main_patched', caseId: 'gate-main_patched', reason: 'gate' });
+    fakeGreenVerify(dir);
+    const out = join(ws, 'push.json');
+    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, out }))).toBe(0);
+    expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).toBe(originTip); // origin untouched
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'push' && e.branch === 'main_patched')).toBe(false);
+    const withheld = journal.find((e) => e.action === 'push-withheld')!;
+    expect(withheld.branches).toEqual(['main_patched']);
   });
 
   it('JUDGED closure check: a PR that did not flip to merged after the target push is ERR16', async () => {

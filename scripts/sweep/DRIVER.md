@@ -637,10 +637,9 @@ ancestors are genuinely clean, so what remains merges normally and a conflict
 there is the branch's OWN — its own case, its own PR, in this pass. Withheld
 content is journaled as DEFERRED rather than as "up to date": "nothing to take"
 and "something to take, blocked upstream" are different facts, and the second is
-what the owner is waiting on and what the urge counts (§5.5). A branch whose
-window trims to empty merges nothing, so it journals no `pre-ref`, so it is not
-publishable and cannot enter the integration recipe — the exclusion needs no rule
-of its own.
+what the owner is waiting on and what the urge counts (§5.5). A branch cut this
+way has a block above it, so the integration recipe leaves it out by the same
+rule that cut it (§10.2 step 1) — the exclusion needs no rule of its own.
 
 DEFERRED is a PURE HEIGHT-MIN over the branch's BLOCKED DIRECT PARENTS
 (`deferred.ts`). When branch X hits its own conflict at height `conflictHeight`
@@ -1498,12 +1497,21 @@ completes.
 0. **Base gate check.** If the verify base itself carries an open gate-fix ref,
    verify is SKIPPED, the held cases are published anyway, and `finish` stops with
    `WARN18_BASE_GATED` — nothing can land until the owner merges that PR.
-1. **Verify the publishable set.** The recipe is DERIVED from the pass: the
-   branches that ADVANCED this pass (a `pre-ref` was journaled), in the plan's DAG
-   order, MINUS any branch that is held/frozen or carries an open case — those are
-   unpublished and still carry unresolved conflicts, so verifying them would
-   recreate historical stack conflicts against the base and wedge the gate
-   permanently. The rebuild base is the fork trunk `main_patched`, not bare `main`:
+1. **Verify the publishable set.** The recipe is DERIVED from the pass by ONE
+   rule — **nothing blocked at or above it** — over the plan's DAG order. Whether
+   a branch happened to merge something in the last few minutes says nothing
+   about whether its content integrates, so an un-advanced branch is verified
+   like any other; a branch with something blocked above it is not, because its
+   window is cut there and what it holds above the cut is a state the trunk has
+   never seen. Three things block: a proposal that PREDATES the pass (it has held
+   its branch back for as long as the owner has taken with it, so the branch lags
+   the trunk and a rebuild onto a current base blames it for the conflict its own
+   freeze implies), a branch UNDER REPAIR and everything beneath it, and a case
+   still OPEN. A branch THIS PASS froze is IN: it landed exactly the prefix it
+   could integrate, and its held PR is opened against origin's copy of that
+   prefix, so the build must cover it and the push must land it. A recipe branch
+   with no local ref is dropped loudly rather than aborting the gate.
+   The rebuild base is the fork trunk `main_patched`, not bare `main`:
    merging a fork branch onto `main` recreates the fork-content conflicts it was
    merged past, and `main_patched ⊇ main`, so upstream-chain branches still
    integrate cleanly in this throwaway target. The workspace `rr-cache` is seeded
@@ -1577,6 +1585,13 @@ completes.
    "start again" or "done".
 
 ### 10.3 Push resilience
+
+THE PUSH SET IS THE RECIPE INTERSECTED WITH WHAT THE DRIVER MUTATED, through the
+same membership rule (§10.2 step 1). A branch that merged and then had something
+above it block would otherwise reach origin carrying content no integration
+build ever saw, and the next build would meet it as history. Its merge is not
+lost — it stays on the local ref, which `start` leaves alone while the branch is
+ahead of origin, and it lands on the pass where the recipe takes it back.
 
 Step 3 pushes each target branch INDEPENDENTLY — one push per branch, clean prefix
 and judged merge commits together. Already-up-to-date or origin-ahead branches are

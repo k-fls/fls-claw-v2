@@ -515,6 +515,15 @@ interface BlockedRow {
    * since an unmeasurable block is a total one, not an absent one.
    */
   headSha: string | null;
+  /**
+   * The proposal PREDATES this pass (it was read off origin at `start`), so the
+   * branch has been held back for as long as the owner has taken with it. That
+   * is what keeps it out of the integration build: it lags the trunk, and a
+   * rebuild onto a current base blames it for the conflict its own freeze
+   * implies. A branch frozen by THIS pass has landed exactly the prefix it
+   * could integrate and is in no such position.
+   */
+  carriedOver: boolean;
   /** fix/sweep head branch on origin (urge target); null until a PR exists. */
   fixBranch: string | null;
   prNumber: number | null;
@@ -554,6 +563,7 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
         caseId: typeof e.caseId === 'string' ? e.caseId : 'origin',
         kind: e.kind === 'fix' ? 'fix' : 'merge',
         headSha: typeof e.headSha === 'string' ? e.headSha : null,
+        carriedOver: true,
         fixBranch: typeof e.fixBranch === 'string' ? e.fixBranch : null,
         prNumber: typeof e.prNumber === 'number' ? e.prNumber : null,
         markerId: typeof e.markerId === 'number' ? e.markerId : null,
@@ -568,6 +578,7 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
         // origin can show the driver that shape.
         kind: e.reason === 'gate' ? 'fix' : 'merge',
         headSha: jc?.head.sha ?? null,
+        carriedOver: false,
         fixBranch: null, // no PR until `finish` publishes
         prNumber: null,
         markerId: null,
@@ -586,16 +597,7 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
 }
 
 /**
- * The pass's merge_status view (branch → PR_ID | DEFERRED; absence = NONE),
- * derived from the journal alone:
- *  - PR_ID: `blockedRows` (origin-derived rows + this-pass holds), PLUS every
- *    transitive descendant of a FROZEN branch.
- *  - DEFERRED: branches with a journaled `defer` this pass, kept only while a
- *    DIRECT parent (registry edges) is still blocked — the STAY rule as
- *    a fixpoint over the journal instead of a stored flag, so a cleared
- *    parent releases its whole deferred chain on the next derivation. Across
- *    passes nothing is stored: DEFERRED is simply recomputed from the
- *    parents' PR_ID during derivation (the BECOME height-MIN rule re-runs).
+ * Branches under repair, and every transitive descendant.
  *
  * A FREEZE IS TRANSITIVE AND ABSOLUTE, and that is about VERIFIABILITY, not
  * provenance. Below a red branch every case is unjudgeable: `report-case`
@@ -606,19 +608,35 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
  * NOTHING from any parent — the same empty-interval, all-skip treatment a
  * branch waiting on its own PR gets.
  */
+function frozenBranches(cli: Cli, journal: JournalEntry[]): Set<string> {
+  const roots = new Set(
+    [...blockedRows(journal).entries()].filter(([, rows]) => rows.some((r) => r.kind === 'fix')).map(([b]) => b),
+  );
+  if (roots.size === 0) return roots;
+  const out = new Set(roots);
+  const ancestorsOf = transitiveAncestors(Object.fromEntries(directParentEdges(cli)));
+  for (const [branch, ancestors] of Object.entries(ancestorsOf)) {
+    if (ancestors.some((a) => roots.has(a))) out.add(branch);
+  }
+  return out;
+}
+
+/**
+ * The pass's merge_status view (branch → PR_ID | DEFERRED; absence = NONE),
+ * derived from the journal alone:
+ *  - PR_ID: `blockedRows` (origin-derived rows + this-pass holds), PLUS every
+ *    transitive descendant of a FROZEN branch.
+ *  - DEFERRED: branches with a journaled `defer` this pass, kept only while a
+ *    DIRECT parent (registry edges) is still blocked — the STAY rule as
+ *    a fixpoint over the journal instead of a stored flag, so a cleared
+ *    parent releases its whole deferred chain on the next derivation. Across
+ *    passes nothing is stored: DEFERRED is simply recomputed from the
+ *    parents' PR_ID during derivation (the BECOME height-MIN rule re-runs).
+ */
 function passStatusView(cli: Cli, journal: JournalEntry[]): Map<string, 'PR_ID' | 'DEFERRED'> {
   const pr = blockedRows(journal);
   const parentsOf = directParentEdges(cli);
-  const frozenRoots = new Set(
-    [...pr.entries()].filter(([, rows]) => rows.some((r) => r.kind === 'fix')).map(([branch]) => branch),
-  );
-  const frozen = new Set(frozenRoots);
-  if (frozenRoots.size > 0) {
-    const ancestorsOf = transitiveAncestors(Object.fromEntries(parentsOf));
-    for (const [branch, ancestors] of Object.entries(ancestorsOf)) {
-      if (ancestors.some((a) => frozenRoots.has(a))) frozen.add(branch);
-    }
-  }
+  const frozen = frozenBranches(cli, journal);
   // A manual `unfrozen` clears a DEFERRED branch too (finding #2a): `defer`
   // rows OLDER than the branch's latest `unfrozen` are dropped, so an
   // unfreeze actually takes effect for DEFERRED (not just PR_ID). A later
@@ -653,11 +671,6 @@ function passStatusView(cli: Cli, journal: JournalEntry[]): Map<string, 'PR_ID' 
   for (const b of frozen) out.set(b, 'PR_ID');
   for (const b of deferred) out.set(b, 'DEFERRED');
   return out;
-}
-
-/** PR_ID-blocked branches (own open PR / §9 gate hold): empty intervals + run skips. */
-function prBlockedBranches(journal: JournalEntry[]): Set<string> {
-  return new Set(blockedRows(journal).keys());
 }
 
 /**
@@ -893,25 +906,65 @@ function openCaseBranches(journal: JournalEntry[]): Set<string> {
 }
 
 /**
- * The verify recipe (§9) = THIS PASS'S PUBLISHABLE RESULT: the branches that
- * ADVANCED this pass (a `pre-ref` was journaled, i.e. they were mutated),
- * ordered by the plan's DAG order (parents before children), MINUS any branch
- * that is held/frozen (`held`) or carries an OPEN case. Held/frozen branches are
- * frozen-by-design and UNPUBLISHED — they carry unresolved conflicts that, when
- * merged onto a bare base, recreate historical stack conflicts and wrongly abort
- * the build (otherwise a permanently-held module branch could never let the
- * gate go green). They are validated by their own fix/case flow, never here.
- * Branches missing from `order` (should not happen for a real plan) trail in
- * pre-ref order so nothing publishable is silently dropped.
+ * RECIPE MEMBERSHIP — the ONE rule, and the only one: a branch belongs iff
+ * NOTHING AT OR ABOVE IT IS BLOCKED.
+ *
+ * A blocked branch carries an unresolved proposal, so its content is not
+ * integrable and merging it onto the base recreates the conflict the proposal
+ * exists to settle. Everything under it is in the same position: its window is
+ * cut at that block, so what it holds above the cut is a state the trunk has
+ * never seen, and a rebuild that includes it blames the descendant for the
+ * ancestor's conflict.
+ *
+ * "Advanced this pass" is NOT the rule. Whether a branch happened to merge
+ * something in the last few minutes says nothing about whether its content
+ * integrates, and gating on it means the build validates a slice of the fork
+ * that shrinks to nothing on a quiet pass.
  */
-export function publishableRecipe(journal: JournalEntry[], order: string[], held: Set<string>): string[] {
-  const advanced = preReffedSet(journal);
-  const openCases = openCaseBranches(journal);
-  const publishable = new Set([...advanced].filter((b) => !held.has(b) && !openCases.has(b)));
-  const ordered = order.filter((b) => publishable.has(b));
-  const inOrder = new Set(ordered);
-  const trailing = [...publishable].filter((b) => !inOrder.has(b));
-  return [...ordered, ...trailing];
+export function recipeMember(branch: string, blocked: Set<string>, ancestorsOf: Record<string, string[]>): boolean {
+  if (blocked.has(branch)) return false;
+  return !(ancestorsOf[branch] ?? []).some((a) => blocked.has(a));
+}
+
+/**
+ * The verify recipe: every member of `order` (the plan's DAG order, parents
+ * before children) that passes `recipeMember`.
+ */
+export function publishableRecipe(
+  order: string[],
+  blocked: Set<string>,
+  ancestorsOf: Record<string, string[]>,
+): string[] {
+  return order.filter((b) => recipeMember(b, blocked, ancestorsOf));
+}
+
+/**
+ * The branches the integration build must leave out — and therefore, by the one
+ * shared rule, the branches the pass must not push. Three kinds, one idea: the
+ * build can only judge content the trunk could actually receive.
+ *
+ *  - A proposal that PREDATES this pass has held its branch back for as long as
+ *    the owner has taken with it, so the branch lags the trunk by that much;
+ *    rebuilt onto a current base it conflicts, and the build blames it for the
+ *    conflict its own freeze implies.
+ *  - A branch UNDER REPAIR, and everything beneath it, is red by definition.
+ *  - A branch with a case still OPEN holds an unresolved conflict in hand.
+ *
+ * A branch THIS PASS froze is deliberately not here. It landed exactly the
+ * prefix it could integrate — what it could not take is not in it — so the
+ * build can judge it, and it must: its held PR is opened against ORIGIN'S copy
+ * of that prefix. Withholding the push would base the PR on a commit the branch
+ * no longer sits on, and merging it would diverge the branch outright.
+ *
+ * A DEFERRED branch is not listed either — it is already out through the
+ * blocked ancestor it is deferring behind, and listing it would say the block
+ * is its own.
+ */
+function blockedForRecipe(cli: Cli, journal: JournalEntry[]): Set<string> {
+  const carriedOver = [...blockedRows(journal).entries()]
+    .filter(([, rows]) => rows.some((r) => r.carriedOver))
+    .map(([b]) => b);
+  return new Set([...carriedOver, ...frozenBranches(cli, journal), ...openCaseBranches(journal)]);
 }
 
 // --------------------------------------------------------------------------
@@ -4902,7 +4955,13 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
   const journal = readJournal(dir);
   const issues: Issue[] = [];
 
-  // Target set: branches the driver mutated this pass, in plan order.
+  // Target set: branches the driver mutated this pass, in plan order, AND IN
+  // THE VERIFY RECIPE — the same predicate the gate used. The push set must be
+  // a SUBSET of what the integration build saw, or a branch that merged before
+  // something above it blocked reaches origin carrying content no build ever
+  // integrated. Its merge is not lost: it stays on the local ref (start leaves
+  // a branch ahead of origin alone) and pushes on the pass where the recipe
+  // takes it back.
   const mutated = new Set(
     journal
       .filter((e) => (e.action === 'merge' || e.action === 'resolved') && typeof e.branch === 'string')
@@ -4912,8 +4971,16 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
   const order: string[] = existsSync(planPath)
     ? (JSON.parse(readFileSync(planPath, 'utf8')) as PropagationPlan).order
     : [...mutated];
-  const targets = order.filter((b) => mutated.has(b));
-  for (const b of mutated) if (!targets.includes(b)) targets.push(b);
+  const ancestorsOf = transitiveAncestors(Object.fromEntries(directParentEdges(cli)));
+  const blocked = blockedForRecipe(cli, journal);
+  const inRecipe = (b: string): boolean => recipeMember(b, blocked, ancestorsOf);
+  const targets = order.filter((b) => mutated.has(b) && inRecipe(b));
+  for (const b of mutated) if (inRecipe(b) && !targets.includes(b)) targets.push(b);
+  const withheld = [...mutated].filter((b) => !inRecipe(b));
+  if (withheld.length > 0) {
+    appendJournal(dir, { action: 'push-withheld', branches: withheld, reason: 'blocked at or above — outside the verify recipe' });
+    console.error(`push: not pushing ${withheld.join(', ')} — blocked at or above, so no integration build covered them`);
+  }
 
   interface PushIntent {
     branch: string;
@@ -5223,16 +5290,26 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     scopeFile: cli.scopeFile,
     routingFile: cli.routingFile,
   });
-  // The recipe = THIS PASS'S publishable set, in the plan's DAG order, built on
-  // the fork-trunk base. It is derived from the pass and nothing else: a gate
-  // that validated a fixed config stack instead would pin a permanently-held
-  // branch at its head and could never go green.
-  // PR_ID-blocked branches are unpublished-by-design (their unresolved conflicts
-  // would recreate stack conflicts in the rebuild); DEFERRED branches carry only
-  // their clean prefix and stay publishable.
-  const held = prBlockedBranches(journal);
+  // The recipe = every branch with nothing blocked at or above it, in the
+  // plan's DAG order, built on the fork-trunk base. It is derived from the pass
+  // and nothing else: a gate that validated a fixed config stack instead would
+  // pin a permanently-blocked branch at its head and could never go green.
   const order = passOrder(dir);
-  const recipe = publishableRecipe(journal, order, held);
+  const ancestorsOf = transitiveAncestors(Object.fromEntries(directParentEdges(cli)));
+  const blocked = blockedForRecipe(cli, journal);
+  // A branch with no ref here cannot be merged, and `git merge` on a name that
+  // does not resolve aborts the whole gate. Drop it LOUDLY: a build that
+  // silently covered less than it claims is the one failure this gate cannot
+  // afford.
+  const recipe: string[] = [];
+  const unresolvable: string[] = [];
+  for (const b of publishableRecipe(order, blocked, ancestorsOf)) {
+    ((await refExists(cli.repo, b)) ? recipe : unresolvable).push(b);
+  }
+  if (unresolvable.length > 0) {
+    appendJournal(dir, { action: 'verify-recipe-dropped', branches: unresolvable, reason: 'no local ref' });
+    console.error(`verify: recipe branch(es) with no local ref, excluded from the rebuild: ${unresolvable.join(', ')}`);
+  }
   const baseRef = await verifyBaseRef(cli);
   const rrCacheDir = join(cli.workspace, RR_CACHE_DIRNAME);
   // An in-memory command list (finish threads checks.test here) wins,
@@ -5266,11 +5343,12 @@ export async function cmdVerify(cli: Cli): Promise<number> {
       console.error('verify: no plan in the pass directory — nothing to derive a recipe from');
       return 2;
     }
-    // A plan exists but nothing publishable advanced this pass — vacuously green
-    // (nothing to integrate, nothing to push). Everything held is reported, not
-    // gated: a pass where every branch froze must still complete.
-    appendJournal(dir, { action: 'verify', ok: true, note: 'empty publishable recipe (nothing advanced this pass)' });
-    console.error('verify: green (no publishable branches advanced this pass — nothing to rebuild)');
+    // A plan exists but every branch has something blocked at or above it —
+    // vacuously green (nothing to integrate, nothing to push). Everything
+    // blocked is reported, not gated: a pass where every branch froze must
+    // still complete.
+    appendJournal(dir, { action: 'verify', ok: true, note: 'empty recipe (every branch is blocked or under a block)' });
+    console.error('verify: green (no unblocked branches to rebuild)');
     emit(cli, { ok: true, recipe: [], baseRef });
     return 0;
   }

@@ -3842,9 +3842,13 @@ describe('sweep finish — owner-facing PR + stats summary on the success SWEEP-
       },
     });
     const finOut = join(ws, 'fin.json');
+    // main_patched froze THIS pass, so it is still in the integration recipe
+    // and the gate really runs: give it a command list this fixture can pass.
+    const finCmds = join(ws, 'fin-cmds.json');
+    writeFileSync(finCmds, JSON.stringify([{ cmd: 'true' }]));
     expect(
       await cmdSweepFinish(
-        baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, tokenFile, out: finOut }),
+        baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, tokenFile, out: finOut, commandsFile: finCmds }),
         ghFin.factory,
       ),
     ).toBe(0);
