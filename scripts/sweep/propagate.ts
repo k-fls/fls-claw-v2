@@ -5191,7 +5191,9 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     failureKind: buildConflict ? 'merge-conflict' : 'checks',
     ...(buildConflict
       ? {
-          conflictBranch: first.build.conflictBranch ?? null,
+          // Never a `?? null` placeholder: the build sets this whenever it stops
+          // on a conflict, so a null here would be a claim nobody measured.
+          ...(first.build.conflictBranch ? { conflictBranch: first.build.conflictBranch } : {}),
           // The paths git left conflicted, and the branches that DID merge
           // ahead of the offender — together they say what the offender
           // collided with and where.
@@ -5353,7 +5355,16 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     const reduced = recipe.filter((b) => b !== offender);
     const re = reduced.length > 0 ? await verifyEverything(cli.repo, { recipe: reduced, ...verifyOpts }) : null;
     const reOk = re ? re.ok : true;
-    appendJournal(dir, { action: 'verify', ok: reOk, offender, excluded: offender, nonBlocking: true });
+    appendJournal(dir, {
+      action: 'verify',
+      ok: reOk,
+      offender,
+      excluded: offender,
+      nonBlocking: true,
+      // Same naming as the blocking arm: this row's `ok` is the re-verify's
+      // verdict, so what the EXCLUSION was for goes in its own field.
+      ...(conflictDetail ? { excludedFor: 'merge-conflict', unresolved: first.build.unresolved ?? [] } : {}),
+    });
     console.error(
       `verify: RED offender ${offender} is held/unpublished — non-blocking; ` +
         `${conflictDetail ? `${conflictDetail}; ` : ''}` +
@@ -5408,8 +5419,10 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     reason: 'gate',
     // WHY this branch was frozen, in the row that freezes it. A gate hold on a
     // conflict is otherwise indistinguishable from one on a red test suite, and
-    // the two ask the reader for entirely different evidence.
-    ...(conflictDetail ? { failureKind: 'merge-conflict', detail: conflictDetail } : {}),
+    // the two ask the reader for entirely different evidence. Both kinds are
+    // NAMED — absence would have to be read as "checks", which is a guess.
+    failureKind: conflictDetail ? 'merge-conflict' : 'checks',
+    ...(conflictDetail ? { detail: conflictDetail } : {}),
   });
   // APPROVED-LANDING offender: the rolled-back merge
   // was an owner-APPROVED resolution landed at `start`. Without a signal the
@@ -5443,27 +5456,39 @@ export async function cmdVerify(cli: Cli): Promise<number> {
   // it drops out of the recipe so its bad merge is excluded.
   const reRecipe = recipe.filter((b) => b !== offender);
   const re = await verifyEverything(cli.repo, { recipe: reRecipe, ...verifyOpts });
+  // THIS ROW IS THE RE-VERIFY'S VERDICT, not the rollback's. Its `ok` describes
+  // the publishable set WITHOUT the offender, so the conflict fields must not be
+  // named as if they described it — `failureKind` here would label a GREEN row
+  // `merge-conflict`, and a row red for an unrelated reason would wear the
+  // conflict as its cause. `rolledBackFor` says what the rollback was for and
+  // leaves the verdict to `ok`.
+  //
+  // The re-verify's own failing commands are journaled too: this red belongs to
+  // the branches that remain, the conflict did not cause it, and without them
+  // the only record of it is an `ok: false` with no evidence at all.
+  const reFailed = re.commands.filter((c) => c.code !== 0).map((c) => c.cmd);
   appendJournal(dir, {
     action: 'verify',
     ok: re.ok,
     offender,
     rolledBack: offender,
     ...(conflictDetail
-      ? { failureKind: 'merge-conflict', unresolved: first.build.unresolved ?? [], detail: conflictDetail }
+      ? { rolledBackFor: 'merge-conflict', unresolved: first.build.unresolved ?? [], detail: conflictDetail }
       : {}),
+    ...(re.ok ? {} : { reverifyFailedCommands: reFailed }),
   });
   console.error(
     `verify: ${conflictDetail ?? 'RED'} -> rolled back ${offender} to ${preRef.slice(0, 12)}, HELD(gate); ` +
-      `re-verify ${re.ok ? 'green' : 'STILL RED'}`,
+      `re-verify ${re.ok ? 'green' : `STILL RED (${reFailed.join(', ') || 'no command named'})`}`,
   );
   emit(cli, {
     ok: re.ok,
     offender,
     rolledBack: offender,
     ...(conflictDetail
-      ? { failureKind: 'merge-conflict', unresolved: first.build.unresolved ?? [], detail: conflictDetail }
+      ? { rolledBackFor: 'merge-conflict', unresolved: first.build.unresolved ?? [], detail: conflictDetail }
       : {}),
-    reverify: { ok: re.ok },
+    reverify: { ok: re.ok, ...(re.ok ? {} : { failedCommands: reFailed }) },
   });
   return re.ok ? 0 : 1;
 }
@@ -10105,11 +10130,19 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
       .find(
         (e) =>
           e.action === 'verify' &&
-          e.failureKind === 'merge-conflict' &&
+          e.rolledBackFor === 'merge-conflict' &&
           typeof e.detail === 'string' &&
           offender !== undefined &&
           e.rolledBack === offender,
       );
+    // The row's `ok` is the RE-VERIFY without the offender. Green means the
+    // conflict really was the whole failure; red means the remaining branches
+    // fail something else on top of it, and saying "no test failed" over that is
+    // simply untrue — the report has to carry both.
+    const reverifyStillRed = conflictRow ? conflictRow.ok === false : false;
+    const reverifyFailed = Array.isArray(conflictRow?.reverifyFailedCommands)
+      ? (conflictRow!.reverifyFailedCommands as string[])
+      : [];
 
     // An UNATTRIBUTABLE red is a build defect nobody in this pass
     // caused — dead-ending it in an ERR18/ERR40 whose message asks a
@@ -10226,9 +10259,14 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     );
     const detail =
       (conflictRow
-        ? `${conflictRow.detail as string}. It was rolled back and HELD(gate) — this is a MERGE CONFLICT in the ` +
-          `integration rebuild, not a failing check: no command ran and no test failed. Re-run \`finish\` (the ` +
-          `frozen offender drops out of the publishable set); the conflict itself is the owner's to place.`
+        ? `${conflictRow.detail as string}. It was rolled back and HELD(gate) — a MERGE CONFLICT in the ` +
+          `integration rebuild, not a failing check; the conflict itself is the owner's to place. ` +
+          (reverifyStillRed
+            ? `A SECOND, separate failure remains: without the offender the rebuild is STILL RED — ` +
+              `${reverifyFailed.join(', ') || 'no command named'} failed, which the conflict did not cause. ` +
+              `Report both; re-running \`finish\` will not clear the red one.`
+            : `Nothing else failed: no command ran on the conflicting build, and the re-verify without the ` +
+              `offender is green. Re-run \`finish\` (the frozen offender drops out of the publishable set).`)
         : verifyRc !== 0
           ? 'verify RED (no clean attribution) — investigate, fix, then re-run `finish` from the verify phase'
           : 'verify RED — offender rolled back + HELD(gate); re-run `finish` (the frozen offender drops out of the publishable set)') +
@@ -10251,6 +10289,10 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
             failureKind: 'merge-conflict',
             offender,
             unresolved: Array.isArray(conflictRow.unresolved) ? conflictRow.unresolved : [],
+            // A second failure the conflict did not cause, if there is one. The
+            // report is assembled from this object, so a red that survives the
+            // rollback has to be IN it or it is not reported at all.
+            reverify: { ok: !reverifyStillRed, ...(reverifyStillRed ? { failedCommands: reverifyFailed } : {}) },
           }
         : {}),
       heldPublished: haltEscalated,

@@ -5479,6 +5479,7 @@ describe('sweep finish — a gate-fix case is never served with NO files (defect
         failureKind?: string;
         offender?: string;
         unresolved?: string[];
+        reverify?: { ok: boolean };
         issues: Array<{ id: string; detail: string }>;
       };
       expect(res.failureKind).toBe('merge-conflict');
@@ -5489,7 +5490,57 @@ describe('sweep finish — a gate-fix case is never served with NO files (defect
       expect(detail).toContain('src/s.ts');
       // …and it does not send the reader after a red suite that never ran.
       expect(detail).not.toContain('no clean attribution');
-      expect(detail).toContain('no command ran and no test failed');
+      expect(detail).toContain('no command ran on the conflicting build');
+      // The re-verify without the offender was green, and the result says so.
+      expect(res.reverify).toMatchObject({ ok: true });
+    });
+
+    /**
+     * A conflict does not make the rest of the recipe green.
+     *
+     * The rollback removes the branch that would not merge; the branches that
+     * remain can still fail a check for reasons of their own. Reporting only the
+     * conflict there states "nothing else failed" over a red build and promises a
+     * re-run that clears it — the second failure would reach the owner in no
+     * message at all.
+     */
+    it('a SECOND failure surviving the rollback is reported alongside the conflict', async () => {
+      const repo = siblingCollisionFixture();
+      const ws = mkWorkspace();
+      const inv = writeInventory([
+        { id: 'a', branch: 'feat/a', parents: ['main_patched'] },
+        { id: 'b', branch: 'feat/b', parents: ['main_patched'] },
+      ]);
+      const dir = dirOf(repo, ws);
+      repo.attachBareOrigin();
+      repo.git('push', 'origin', 'main_patched', 'feat/a', 'feat/b');
+      // Red on EVERY run: the conflict stops build 1, and the re-verify without
+      // the offender then fails this check — a failure the conflict did not cause.
+      const cmds = join(ws, 'cmds.json');
+      writeFileSync(cmds, JSON.stringify([{ cmd: 'echo boom; exit 1' }]));
+      await cmdSweepStart(baseCli(repo, ws, inv));
+      await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
+      const out = join(ws, 'f1.json');
+      expect(
+        await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out })),
+      ).toBe(1);
+      const res = JSON.parse(readFileSync(out, 'utf8')) as {
+        failureKind?: string;
+        reverify?: { ok: boolean; failedCommands?: string[] };
+        issues: Array<{ id: string; detail: string }>;
+      };
+      expect(res.failureKind).toBe('merge-conflict');
+      expect(res.reverify?.ok).toBe(false);
+      expect(res.reverify?.failedCommands).toEqual(['echo boom; exit 1']);
+      const detail = res.issues.find((i) => i.id === 'ERR18_VERIFY_PENDING')!.detail;
+      expect(detail).toContain('could not be merged into the integration rebuild'); // still says the conflict
+      expect(detail).toContain('SECOND, separate failure'); // …and does not stop there
+      expect(detail).not.toContain('Nothing else failed');
+      // The re-verify's own red is on the record, not just in the message.
+      const rolled = readJournal(dir).find((e) => e.action === 'verify' && e.rolledBackFor === 'merge-conflict')!;
+      expect(rolled.ok).toBe(false);
+      expect(rolled.reverifyFailedCommands).toEqual(['echo boom; exit 1']);
+      expect(rolled.failureKind).toBeUndefined(); // the row's verdict is the re-verify's, not the conflict's
     });
   });
 

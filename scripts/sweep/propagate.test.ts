@@ -1473,13 +1473,32 @@ describe('propagate verify — publishable set', () => {
     expect(gateHold.branch).toBe('module/b');
     expect(gateHold.detail as string).toContain('could not be merged into the integration rebuild');
     expect(gateHold.detail as string).toContain('src/x.ts');
-    // …and so does the result the agent reports from.
+    // …and so does the result the agent reports from. `rolledBackFor`, not
+    // `failureKind`: this result's `ok` is the RE-VERIFY without the offender,
+    // and it is GREEN — naming the conflict as this verdict's kind would label a
+    // green answer a merge conflict.
     const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      ok?: boolean;
       failureKind?: string;
+      rolledBackFor?: string;
       unresolved?: string[];
       rolledBack?: string;
+      reverify?: { ok: boolean };
     };
-    expect(res).toMatchObject({ failureKind: 'merge-conflict', unresolved: ['src/x.ts'], rolledBack: 'module/b' });
+    expect(res).toMatchObject({
+      ok: true,
+      rolledBackFor: 'merge-conflict',
+      unresolved: ['src/x.ts'],
+      rolledBack: 'module/b',
+      reverify: { ok: true },
+    });
+    expect(res.failureKind).toBeUndefined();
+    // The post-rollback journal row follows the same rule.
+    const rolled = journal.find((e) => e.action === 'verify' && e.rolledBack === 'module/b')!;
+    expect(rolled.ok).toBe(true);
+    expect(rolled.rolledBackFor).toBe('merge-conflict');
+    expect(rolled.failureKind).toBeUndefined();
+    expect(rolled.reverifyFailedCommands).toBeUndefined(); // green: nothing to name
   });
 
   it('(b) a module branch verifies against main_patched, not bare main (fix 1 base)', async () => {
