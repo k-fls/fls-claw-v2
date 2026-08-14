@@ -5174,29 +5174,65 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     emit(cli, { ok: true, build: first.build });
     return 0;
   }
+  // TWO SHAPES OF RED, and they need DIFFERENT evidence.
+  //
+  // A recipe branch that would not MERGE fails before a single command runs:
+  // no base probe, no failing tests, no output. Journaling the test-shaped
+  // fields there writes an accusation whose every evidence field is empty —
+  // exactly the bare row the auditability rule below forbids — and a reader who
+  // trusts them concludes "blamed on nothing". The evidence for THIS failure is
+  // the conflicted paths and what got merged before the offender, so journal
+  // that instead and say plainly which kind of failure it was.
+  const buildConflict = !first.build.ok;
   appendJournal(dir, {
     action: 'verify',
     ok: false,
     offender: first.offender ?? null,
-    // What the base probe SAW, on every red. A verdict of "this branch did it"
-    // is a claim that the merged tree fails something the BASE does not, and
-    // that claim has to be auditable from the journal alone — otherwise a
-    // correct attribution and a missed base defect read exactly the same, and
-    // branches get rolled back for a defect that was never theirs.
-    baseFailingFiles: first.baseFailingFiles ?? [],
-    mergedFailingFiles: first.mergedFailingFiles ?? [],
-    // Whether the BASE ALONE was green. A bare offender row —
-    // no commands, no output, no base verdict — is an
-    // accusation that cannot be checked without re-running the pass by hand.
-    // A branch is only credibly to blame if the base was green.
-    baseGreen: first.baseGreen ?? null,
-    ...(first.baseFailedCommands?.length ? { baseFailedCommands: first.baseFailedCommands } : {}),
-    // The failing commands on EVERY red, not only the unattributable ones — the
-    // attributed path is precisely the one that accuses a branch and rolls it
-    // back, so it must carry its diagnostics too.
-    failedCommands: first.commands.filter((c) => c.code !== 0).map((c) => c.cmd),
+    failureKind: buildConflict ? 'merge-conflict' : 'checks',
+    ...(buildConflict
+      ? {
+          conflictBranch: first.build.conflictBranch ?? null,
+          // The paths git left conflicted, and the branches that DID merge
+          // ahead of the offender — together they say what the offender
+          // collided with and where.
+          unresolved: first.build.unresolved ?? [],
+          merged: first.build.merged,
+        }
+      : {
+          // What the base probe SAW, on every checks red. A verdict of "this
+          // branch did it" is a claim that the merged tree fails something the
+          // BASE does not, and that claim has to be auditable from the journal
+          // alone — otherwise a correct attribution and a missed base defect
+          // read exactly the same, and branches get rolled back for a defect
+          // that was never theirs.
+          baseFailingFiles: first.baseFailingFiles ?? [],
+          mergedFailingFiles: first.mergedFailingFiles ?? [],
+          // Whether the BASE ALONE was green. A bare offender row —
+          // no commands, no output, no base verdict — is an
+          // accusation that cannot be checked without re-running the pass by hand.
+          // A branch is only credibly to blame if the base was green.
+          baseGreen: first.baseGreen ?? null,
+          ...(first.baseFailedCommands?.length ? { baseFailedCommands: first.baseFailedCommands } : {}),
+          // The failing commands on EVERY checks red, not only the
+          // unattributable ones — the attributed path is precisely the one that
+          // accuses a branch and rolls it back, so it must carry its
+          // diagnostics too.
+          failedCommands: first.commands.filter((c) => c.code !== 0).map((c) => c.cmd),
+        }),
     ...(first.nonDeterministic ? { nonDeterministic: true, flakyCommands: first.flakyCommands ?? [] } : {}),
   });
+  // The one sentence that says what actually happened when the rebuild hit a
+  // CONFLICT, reused by every arm that reports the offender. Without it a
+  // build-shaped failure is narrated in the checks-red wording — "red, fix the
+  // tests, investigate the diff" — for a failure where no test ever ran, and
+  // the reader goes looking for evidence that does not exist.
+  const conflictDetail = buildConflict
+    ? `${first.build.conflictBranch ?? '(unknown branch)'} could not be merged into the integration rebuild; ` +
+      `unresolved conflicts in ${(first.build.unresolved ?? []).join(', ') || '(no paths reported)'}` +
+      (first.build.merged.length
+        ? ` — merged ahead of it: ${first.build.merged.join(', ')}`
+        : ' — nothing merged ahead of it')
+    : null;
   // A NON-DETERMINISTIC red belongs to no branch, so there is nothing to
   // attribute, roll back or gate-fix. Say that plainly instead of the generic
   // "investigate" — the agent's next move is completely different (report the
@@ -5309,6 +5345,7 @@ export async function cmdVerify(cli: Cli): Promise<number> {
       ok: false,
       offender,
       held: held.has(offender),
+      ...(conflictDetail ? { failureKind: 'merge-conflict', detail: conflictDetail } : {}),
       note: held.has(offender)
         ? 'offender is held/frozen — non-blocking (unpublished; validated by its own fix flow)'
         : 'offender has no pre-ref — non-blocking (not mutated this pass)',
@@ -5319,9 +5356,19 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     appendJournal(dir, { action: 'verify', ok: reOk, offender, excluded: offender, nonBlocking: true });
     console.error(
       `verify: RED offender ${offender} is held/unpublished — non-blocking; ` +
+        `${conflictDetail ? `${conflictDetail}; ` : ''}` +
         `${re ? `re-verify without it ${reOk ? 'green' : 'STILL RED'}` : 'no publishable branches remain'}`,
     );
-    emit(cli, { ok: reOk, offender, nonBlocking: true, excluded: offender, reverify: { ok: reOk } });
+    emit(cli, {
+      ok: reOk,
+      offender,
+      nonBlocking: true,
+      excluded: offender,
+      ...(conflictDetail
+        ? { failureKind: 'merge-conflict', unresolved: first.build.unresolved ?? [], detail: conflictDetail }
+        : {}),
+      reverify: { ok: reOk },
+    });
     return reOk ? 0 : 1;
   }
   // Offender is a PUBLISHABLE branch with a journaled pre-ref → the gate bites:
@@ -5359,6 +5406,10 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     branch: offender,
     caseId: `gate-${offender.replace(/\//g, '__')}`,
     reason: 'gate',
+    // WHY this branch was frozen, in the row that freezes it. A gate hold on a
+    // conflict is otherwise indistinguishable from one on a red test suite, and
+    // the two ask the reader for entirely different evidence.
+    ...(conflictDetail ? { failureKind: 'merge-conflict', detail: conflictDetail } : {}),
   });
   // APPROVED-LANDING offender: the rolled-back merge
   // was an owner-APPROVED resolution landed at `start`. Without a signal the
@@ -5392,11 +5443,28 @@ export async function cmdVerify(cli: Cli): Promise<number> {
   // it drops out of the recipe so its bad merge is excluded.
   const reRecipe = recipe.filter((b) => b !== offender);
   const re = await verifyEverything(cli.repo, { recipe: reRecipe, ...verifyOpts });
-  appendJournal(dir, { action: 'verify', ok: re.ok, offender, rolledBack: offender });
+  appendJournal(dir, {
+    action: 'verify',
+    ok: re.ok,
+    offender,
+    rolledBack: offender,
+    ...(conflictDetail
+      ? { failureKind: 'merge-conflict', unresolved: first.build.unresolved ?? [], detail: conflictDetail }
+      : {}),
+  });
   console.error(
-    `verify: RED -> rolled back ${offender} to ${preRef.slice(0, 12)}, HELD(gate); re-verify ${re.ok ? 'green' : 'STILL RED'}`,
+    `verify: ${conflictDetail ?? 'RED'} -> rolled back ${offender} to ${preRef.slice(0, 12)}, HELD(gate); ` +
+      `re-verify ${re.ok ? 'green' : 'STILL RED'}`,
   );
-  emit(cli, { ok: re.ok, offender, rolledBack: offender, reverify: { ok: re.ok } });
+  emit(cli, {
+    ok: re.ok,
+    offender,
+    rolledBack: offender,
+    ...(conflictDetail
+      ? { failureKind: 'merge-conflict', unresolved: first.build.unresolved ?? [], detail: conflictDetail }
+      : {}),
+    reverify: { ok: re.ok },
+  });
   return re.ok ? 0 : 1;
 }
 
@@ -9583,14 +9651,23 @@ async function materializeGateFixCases(
     const gatedAncestor = coveringAncestor;
     if (gatedAncestor && !gateHeldThisPass.has(g.branch)) {
       gated.push(g.branch);
+      // FIELD NAMES THAT CANNOT BE MISREAD. This row is the only place the
+      // failing FILES appear next to a branch name, and a reader looking for
+      // "who owns this failure" reads the most branch-shaped field it has. So
+      // the branch this row is ABOUT must never sit in a field that reads like
+      // the answer: `owner` is the branch that holds the defect and the fix,
+      // `skipped` is the branch no case was minted on, and the files are named
+      // `skippedFiles` because they are the mint that did NOT happen — not the
+      // owner's failing set. The detail leads with the owner for the same
+      // reason.
       appendJournal(dir, {
         action: 'gate-fix-skipped',
         id: 'WARN20_ANCESTOR_GATED',
-        branch: g.branch,
-        ancestor: gatedAncestor,
-        files: g.files,
+        owner: gatedAncestor,
+        skipped: g.branch,
+        skippedFiles: g.files,
         detail:
-          `${g.branch} descends from '${gatedAncestor}', which took a gate fix this pass and is RED — everything ` +
+          `'${gatedAncestor}' took a gate fix this pass and is RED; ${g.branch} descends from it — everything ` +
           `beneath it inherits that. No case was minted for [${g.files.join(', ')}]: it cannot be judged until the ` +
           `ancestor's fix lands, and it may well BE the ancestor's defect seen from below` +
           `${
@@ -9625,11 +9702,16 @@ async function materializeGateFixCases(
     if (gateRef) {
       const sameDefect = gateRef.endsWith(`--${gateFixCaseId(g.branch, g.files)}`);
       gated.push(g.branch);
+      // Same field names as the ancestor skip above: one action, one shape, so
+      // no reader has to work out which kind of skip it is holding before it can
+      // tell which branch is which. Here the skipped branch is its OWN owner —
+      // the gate is on itself — and `ref` names the open fix.
       appendJournal(dir, {
         action: 'gate-fix-skipped',
-        branch: g.branch,
+        owner: g.branch,
+        skipped: g.branch,
         ref: gateRef,
-        files: g.files,
+        skippedFiles: g.files,
         sameDefect,
         ...(sameDefect
           ? {}
@@ -10011,6 +10093,23 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
       .find((e) => e.action === 'verify' && e.attributionFailed === true && Array.isArray(e.failedCommands));
     const failedTests = attrib ? (attrib.failedCommands as string[]) : [];
     const offender = gateAfter > gateBefore ? (gatesNow[gatesNow.length - 1].branch as string | undefined) : undefined;
+    // A gate hold taken on a MERGE CONFLICT in the integration rebuild, and the
+    // sentence verify wrote for it. This finish report is what the agent relays,
+    // so it must not describe a conflict in the words of a red test suite —
+    // "investigate, fix, re-run" sends the agent hunting through a diff for a
+    // failure that is a collision between two branches. Matched to THIS run's
+    // rollback (same branch, rows written after the verify call) so an earlier
+    // conflict cannot narrate a later, different red.
+    const conflictRow = readJournal(dir)
+      .slice(verifyLenBefore)
+      .find(
+        (e) =>
+          e.action === 'verify' &&
+          e.failureKind === 'merge-conflict' &&
+          typeof e.detail === 'string' &&
+          offender !== undefined &&
+          e.rolledBack === offender,
+      );
 
     // An UNATTRIBUTABLE red is a build defect nobody in this pass
     // caused — dead-ending it in an ERR18/ERR40 whose message asks a
@@ -10126,16 +10225,34 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
       'finish-verify-halt',
     );
     const detail =
-      (verifyRc !== 0
-        ? 'verify RED (no clean attribution) — investigate, fix, then re-run `finish` from the verify phase'
-        : 'verify RED — offender rolled back + HELD(gate); re-run `finish` (the frozen offender drops out of the publishable set)') +
+      (conflictRow
+        ? `${conflictRow.detail as string}. It was rolled back and HELD(gate) — this is a MERGE CONFLICT in the ` +
+          `integration rebuild, not a failing check: no command ran and no test failed. Re-run \`finish\` (the ` +
+          `frozen offender drops out of the publishable set); the conflict itself is the owner's to place.`
+        : verifyRc !== 0
+          ? 'verify RED (no clean attribution) — investigate, fix, then re-run `finish` from the verify phase'
+          : 'verify RED — offender rolled back + HELD(gate); re-run `finish` (the frozen offender drops out of the publishable set)') +
       (haltHeld > 0 ? ` — ${haltEscalated}/${haltHeld} held PR(s) published for the owner` : '');
-    progress(`verify: RED ${offender ?? '(unattributed)'} — rolled back`);
+    progress(
+      conflictRow
+        ? `verify: MERGE CONFLICT ${offender} — rolled back`
+        : `verify: RED ${offender ?? '(unattributed)'} — rolled back`,
+    );
     console.error(`finish: ${detail}`);
     result(cli, {
       ok: false,
       issues: [{ id: 'ERR18_VERIFY_PENDING', detail }],
       halted: 'verify',
+      // The report is assembled from THIS object, so what the failure WAS has to
+      // be in it — a reader that only sees `halted: "verify"` writes "the tests
+      // failed" over a conflict.
+      ...(conflictRow
+        ? {
+            failureKind: 'merge-conflict',
+            offender,
+            unresolved: Array.isArray(conflictRow.unresolved) ? conflictRow.unresolved : [],
+          }
+        : {}),
       heldPublished: haltEscalated,
     });
     return 1;

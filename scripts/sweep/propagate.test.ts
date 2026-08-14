@@ -1407,6 +1407,81 @@ describe('propagate verify — publishable set', () => {
     expect(heldRows.length).toBe(1); // only the seeded row; no verify gate hold added
   });
 
+  /**
+   * A build conflict is journaled as a CONFLICT, with the evidence it has.
+   *
+   * The row that motivated this carried an offender, no failing commands, no
+   * base verdict and no files — every evidence field empty, because none of them
+   * applies before a single command runs. Read cold it is a branch accused of
+   * nothing, and the only rows nearby holding filenames belong to other branches.
+   * The conflicted paths ARE the evidence; they belong in the row that accuses.
+   */
+  it('a build-conflict red journals the conflict and its paths — not empty test-shaped fields', async () => {
+    const repo = initFixtureRepo();
+    cleanups.push(() => repo.destroy());
+    repo.commit('base: x', { 'src/x.ts': 'base\n' });
+    repo.checkout('module/a', { create: true, at: 'main' });
+    repo.commit('a: x -> AAA', { 'src/x.ts': 'AAA\n' });
+    repo.checkout('main');
+    repo.checkout('module/b', { create: true, at: 'main' });
+    repo.commit('b: x -> BBB', { 'src/x.ts': 'BBB\n' });
+    repo.checkout('main');
+    const ws = mkWorkspace();
+    const bTip = repo.sha('module/b');
+    // Both advanced this pass, so the offender is PUBLISHABLE: the gate bites,
+    // rolls it back to its pre-ref and freezes it HELD(gate).
+    const { wm12 } = seedVerifyPass(
+      ws,
+      repo,
+      ['module/a', 'module/b'],
+      [
+        { branch: 'module/a', ref: repo.sha('module/a') },
+        { branch: 'module/b', ref: bTip },
+      ],
+    );
+    const cmds = join(ws, 'cmds.json');
+    writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }]));
+    const out = join(ws, 'o.json');
+    // module/a merges, module/b collides with it on src/x.ts -> the build stops
+    // there; the re-verify without module/b is green, so the command succeeds.
+    const code = await cmdVerify(
+      baseCli(repo, ws, null, {
+        cmd: 'verify',
+        execute: true,
+        pass: wm12,
+        commandsFile: cmds,
+        out,
+      }),
+    );
+    expect(code).toBe(0);
+    const journal = readJournal(passDir(ws, wm12));
+    const red = journal.find((e) => e.action === 'verify' && e.ok === false)!;
+    expect(red).toMatchObject({
+      offender: 'module/b',
+      failureKind: 'merge-conflict',
+      conflictBranch: 'module/b',
+      unresolved: ['src/x.ts'],
+      merged: ['module/a'],
+    });
+    // The test-shaped fields are ABSENT, not empty: no command ran, no base
+    // probe ran, and an empty `failedCommands` reads as "the tests passed".
+    expect(red.failedCommands).toBeUndefined();
+    expect(red.baseGreen).toBeUndefined();
+    expect(red.baseFailingFiles).toBeUndefined();
+    // The freeze says why it froze, in the row that freezes.
+    const gateHold = journal.find((e) => e.action === 'held' && e.reason === 'gate')!;
+    expect(gateHold.branch).toBe('module/b');
+    expect(gateHold.detail as string).toContain('could not be merged into the integration rebuild');
+    expect(gateHold.detail as string).toContain('src/x.ts');
+    // …and so does the result the agent reports from.
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      failureKind?: string;
+      unresolved?: string[];
+      rolledBack?: string;
+    };
+    expect(res).toMatchObject({ failureKind: 'merge-conflict', unresolved: ['src/x.ts'], rolledBack: 'module/b' });
+  });
+
   it('(b) a module branch verifies against main_patched, not bare main (fix 1 base)', async () => {
     const { repo } = divergedFixture({ withMainPatched: true });
     const ws = mkWorkspace();

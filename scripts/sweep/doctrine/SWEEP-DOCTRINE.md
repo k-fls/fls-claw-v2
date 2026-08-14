@@ -327,7 +327,19 @@ but they mean the text is failing the rules above — rewrite it.
 
 Run `finish` when `next-case` answers `finalize`. It verifies the merged whole, then
 publishes everything at once: the judged record pull requests, the branch pushes, and
-the held review pull requests. Its answers:
+the held review pull requests.
+
+Assemble the report from the result object, never from your memory of working the pass.
+Every pull request number, title and live status, whether each one is a draft or open
+for review, which branches landed, which branch a failure names, and what has to happen
+first — all of it is in the result, and you read it there at the moment you report it.
+What you remember is not what was published: a case you claimed `held` can be published
+as either shape, a pull request can be reissued rather than opened, and a branch you
+worked on can have been rolled back after you last saw it. State no pull request's
+state, no blocker and no ordering you cannot point to in the result. If the result does
+not carry a fact, you do not have it.
+
+Its answers:
 
 - `"complete"` — report to the owner every entry in `pullRequests` (number, title,
   status), which branches landed, and the `stats` summary. Then, if the result says
@@ -366,7 +378,7 @@ narrate. Send one line when you take a case and one line on every `report-case` 
 outcome. Announce a long command before you start it and summarize its progress lines
 when it returns. Relay every candidate branch, every gated or blocked branch, and every
 report the driver tells you to make. At the end of the pass, deliver the `finish`
-report of section 11.
+report of section 11, assembled from the result as that section requires.
 
 ## 14. Reading, and when to stop
 

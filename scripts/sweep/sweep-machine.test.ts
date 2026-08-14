@@ -4526,8 +4526,14 @@ describe('sweep finish — gate-fix on an unattributable red', () => {
     // ...and the reason is on the record, naming the ancestor.
     const skipped = journal.find((e) => e.action === 'gate-fix-skipped' && e.id === 'WARN20_ANCESTOR_GATED');
     expect(skipped).toBeTruthy();
-    expect(skipped!.branch).toBe('module/cg');
-    expect(skipped!.ancestor).toBe('main_patched');
+    // The two branches sit in fields that say which is which. This row is the
+    // only one carrying the failing FILES, so a `branch` field on it reads as
+    // "the branch that owns them" — which is the branch it is NOT.
+    expect(skipped!.skipped).toBe('module/cg');
+    expect(skipped!.owner).toBe('main_patched');
+    expect(skipped!.branch).toBeUndefined();
+    // The owner leads the sentence for the same reason.
+    expect(skipped!.detail as string).toMatch(/^'main_patched' took a gate fix/);
   });
 
   it('a LOCATED owner (--not-my-bug) is minted even beneath a gate-held ancestor', async () => {
@@ -5225,7 +5231,7 @@ describe('sweep finish — gate-fix on an unattributable red', () => {
     expect(res.instruction).toContain('do NOT open another PR');
     // No case dir was minted for a second gate fix.
     const journal = readJournal(dirOf(repo, ws));
-    expect(journal.some((e) => e.action === 'gate-fix-skipped' && e.branch === 'module/cg')).toBe(true);
+    expect(journal.some((e) => e.action === 'gate-fix-skipped' && e.skipped === 'module/cg')).toBe(true);
     expect(journal.filter((e) => e.action === 'gate-fix').length).toBe(0);
   });
 
@@ -5419,6 +5425,72 @@ describe('sweep finish — a gate-fix case is never served with NO files (defect
     expect(journal.filter((e) => e.action === 'gate-fix')).toEqual([]);
     const res = JSON.parse(readFileSync(out, 'utf8')) as { status?: string; gateFix?: { files: string[] } };
     expect(res.status).not.toBe('gate-fix-required');
+  });
+
+  /**
+   * A CONFLICT in the integration rebuild is reported as a conflict.
+   *
+   * The rollback is right — a branch that cannot integrate must not publish —
+   * but it left `finish` narrating the freeze in the checks-red wording, and the
+   * agent relayed that: a branch accused with no evidence, and a reader sent to
+   * hunt for a red test that never ran. The result the report is built from now
+   * says which kind of failure it was and where the collision is.
+   */
+  describe('finish — a rebuild MERGE CONFLICT is not reported as a failing check', () => {
+    /** Two siblings under main_patched editing the SAME line: they merge one at
+     * a time cleanly, and collide only in the everything-rebuild. */
+    function siblingCollisionFixture(): FixtureRepo {
+      const repo = initFixtureRepo();
+      repo.commit('base: s', { 'src/s.ts': 'orig\n' });
+      repo.checkout('main_patched', { create: true, at: 'main' });
+      repo.commit('mp: y', { 'src/y.ts': 'fork\n' });
+      repo.checkout('feat/a', { create: true, at: 'main_patched' });
+      repo.commit('a: s = AAA', { 'src/s.ts': 'AAA\n' });
+      repo.checkout('feat/b', { create: true, at: 'main_patched' });
+      repo.commit('b: s = BBB', { 'src/s.ts': 'BBB\n' });
+      repo.checkout('main');
+      repo.commit('U0: util', { 'src/util.ts': 'u\n' }); // upstream advances -> the pass has work
+      cleanups.push(() => repo.destroy());
+      return repo;
+    }
+
+    it('names the conflict and its paths, and carries them in the result', async () => {
+      const repo = siblingCollisionFixture();
+      const ws = mkWorkspace();
+      const inv = writeInventory([
+        { id: 'a', branch: 'feat/a', parents: ['main_patched'] },
+        { id: 'b', branch: 'feat/b', parents: ['main_patched'] },
+      ]);
+      const dir = dirOf(repo, ws);
+      repo.attachBareOrigin();
+      repo.git('push', 'origin', 'main_patched', 'feat/a', 'feat/b');
+      const cmds = join(ws, 'cmds.json');
+      writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }])); // every check is GREEN: only the merge fails
+      await cmdSweepStart(baseCli(repo, ws, inv));
+      await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
+      const out = join(ws, 'f1.json');
+      expect(
+        await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out })),
+      ).toBe(1);
+      const journal = readJournal(dir);
+      const gateHold = journal.find((e) => e.action === 'held' && e.reason === 'gate')!;
+      expect(gateHold.failureKind).toBe('merge-conflict');
+      const res = JSON.parse(readFileSync(out, 'utf8')) as {
+        failureKind?: string;
+        offender?: string;
+        unresolved?: string[];
+        issues: Array<{ id: string; detail: string }>;
+      };
+      expect(res.failureKind).toBe('merge-conflict');
+      expect(res.offender).toBe(gateHold.branch);
+      expect(res.unresolved).toEqual(['src/s.ts']);
+      const detail = res.issues.find((i) => i.id === 'ERR18_VERIFY_PENDING')!.detail;
+      expect(detail).toContain('could not be merged into the integration rebuild');
+      expect(detail).toContain('src/s.ts');
+      // …and it does not send the reader after a red suite that never ran.
+      expect(detail).not.toContain('no clean attribution');
+      expect(detail).toContain('no command ran and no test failed');
+    });
   });
 
   // --- finish must not verify a base that is under repair ---------------------

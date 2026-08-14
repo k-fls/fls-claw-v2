@@ -1352,7 +1352,13 @@ upstream commit.
   merging that fix will not turn this branch green and a second fix will be
   needed), and a branch descending from an ancestor that took a gate fix this pass
   and is still red (`WARN20_ANCESTOR_GATED`; the not-my-bug path is exempt when
-  the branch is itself the located owner).
+  the branch is itself the located owner). Both refusals journal
+  `gate-fix-skipped` in ONE shape: `owner` (the branch that holds the defect and
+  its fix — itself, for the `WARN19` self-gate), `skipped` (the branch no case was
+  minted on) and `skippedFiles` (the mint that did not happen). The row carries the
+  only filenames in the vicinity, so it must never name the skipped branch in a
+  field a reader takes for the owner — `branch` is deliberately absent, and the
+  detail leads with the owner.
 - **Cross-branch duplicates.** An unstable failure surfaces wherever luck puts it,
   so one defect can earn a gate fix on several branches. The case-id digest covers
   the FAILING FILES ONLY — branch+files would make cross-branch duplicates
@@ -1451,6 +1457,17 @@ completes.
      branch: it is rolled back to its journaled `pre-ref` and demoted HELD(gate),
      the held cases are published, and `finish` halts with `ERR18_VERIFY_PENDING`,
      machine state staying at `finishing`/`verify` so it is resumable.
+   - **Merge conflict in the rebuild** — a recipe branch would not merge, so the
+     build stops there and NO command runs. Directly attributable, and handled by
+     the same rollback+HELD(gate) path, but its evidence is different in kind:
+     every verify row on this path carries `failureKind: "merge-conflict"` with
+     `conflictBranch`, `unresolved` (the conflicted paths) and `merged` (what got
+     in ahead of it), and NONE of the test-shaped fields — a base probe that never
+     ran and an empty failing-command list are not evidence, and journaling them
+     writes an accusation whose every field is blank. `finish` reports it in its
+     own words (a conflict, not a failing check) and carries `failureKind` and
+     `unresolved` in the result, so the agent's report cannot restate it as a red
+     test suite.
    - **Unattributable red** — the failing files are blamed by git history (§9.1)
      and served as gate-fix case(s): `status: "gate-fix-required"`,
      `stoppedAt: "verify"`, `WARN09_GATE_FIX_SERVED`, with `gateFix` (the first
