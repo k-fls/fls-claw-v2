@@ -237,8 +237,9 @@ function fakeGithub(overrides: Record<string, { status: number; body: unknown }>
           return { status: 201, body: { html_url: 'https://github.com/k-fls/fixture/pull/7', number: 7 } };
         if (method === 'GET' && /\/pulls\/\d+\/reviews/.test(path)) return { status: 200, body: [] }; // review trigger
         if (method === 'GET' && /\/pulls\/\d+\/comments/.test(path)) return { status: 200, body: [] }; // inline dialog
+        if (method === 'POST' && path === '/graphql') return { status: 200, body: { data: {} } };
         if (method === 'GET' && /\/pulls\/\d+$/.test(path))
-          return { status: 200, body: { number: 7, merged: true, body: 'x' } };
+          return { status: 200, body: { number: 7, node_id: 'PR_fake', merged: true, body: 'x' } };
         if (method === 'PATCH' && /\/pulls\/\d+$/.test(path)) return { status: 200, body: {} };
         if (method === 'GET' && /\/issues\/\d+\/comments/.test(path)) return { status: 200, body: [] }; // review-loop comments
         if (method === 'POST' && path.includes('/comments')) return { status: 201, body: {} };
@@ -2762,6 +2763,46 @@ describe('sweep start — origin-derived merge_status', () => {
     expect(gh.calls.filter((c) => c.method === 'POST' && /\/pulls$/.test(c.path)).length).toBe(0);
   });
 
+  it('an OWNER head that no longer merges is drafted and reported — the ref is never touched', async () => {
+    // Force-pushing over commits somebody else put there is the one destructive
+    // operation available here, so an owner-shaped head is neither rebuilt nor
+    // deleted however unusable it is. The report is what carries it.
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    // An owner commit on the fix ref, carrying an edit that collides with the
+    // branch's own content on origin.
+    repo.checkout('owner-work', { create: true, at: 'main' });
+    repo.commit('owner: x = mine', { 'src/x.ts': 'mine\n' });
+    const ownerHead = repo.sha('owner-work');
+    const fixBranch = `fix/sweep/main_patched--main-h1-${repo.sha('main').slice(0, 8)}`;
+    repo.git('push', 'origin', `${ownerHead}:refs/heads/${fixBranch}`);
+    repo.checkout('main');
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = fakeGithub({
+      'GET /pulls?': {
+        status: 200,
+        body: [{ html_url: 'https://github.com/k-fls/fixture/pull/12', number: 12, state: 'open' }],
+      },
+    });
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile }), gh.factory)).toBe(0);
+    const journal = readJournal(dirOf(repo, ws));
+    const degraded = journal.find((e) => e.action === 'owner-pr-degraded')!;
+    expect(degraded.prNumber).toBe(12);
+    expect(degraded.mergeable).toBe(false);
+    expect(degraded.drafted).toBe(true);
+    // Converted once, through GraphQL, and commented once.
+    expect(gh.calls.filter((c) => c.path === '/graphql').length).toBe(1);
+    expect(gh.calls.filter((c) => c.method === 'POST' && /\/issues\/12\/comments$/.test(c.path)).length).toBe(1);
+    // The ref is EXACTLY where the owner left it, and the branch stays blocked.
+    expect(repo.git('-C', bare, 'rev-parse', `refs/heads/${fixBranch}`)).toBe(ownerHead);
+    expect(journal.some((e) => e.action === 'proposal-dropped' || e.action === 'proposal-rebuilt')).toBe(false);
+    expect(journal.some((e) => e.action === 'origin-blocked' && e.branch === 'main_patched')).toBe(true);
+  });
+
   it('merged ref -> RESOLVED: not blocked, the origin ref is deleted (cleanup)', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
@@ -3950,6 +3991,7 @@ describe('sweep finish — owner-facing PR + stats summary on the success SWEEP-
     const fin = JSON.parse(readFileSync(finOut, 'utf8')) as {
       ok: boolean;
       pullRequests: Array<{ number: number; url: string; title: string | null; status: string; kind: string }>;
+      ownerPullRequests?: Array<{ branch: string; number: number; mergeable: boolean; reason: string }>;
       stats: Record<string, unknown>;
       instruction: string;
     };
@@ -3973,6 +4015,13 @@ describe('sweep finish — owner-facing PR + stats summary on the success SWEEP-
     expect(fin.stats.branchesInScope).toBe(2);
     expect(fin.instruction).toContain('REPORT to the owner');
     expect(fin.instruction).toContain('pullRequests');
+    // The owner pushed the head on feat/other's fix ref and it no longer merges.
+    // The driver will not rewrite it, so the RESULT is the notification — and it
+    // says so again on every pass, not only on the one that drafted it.
+    expect(fin.ownerPullRequests).toEqual([
+      expect.objectContaining({ branch: 'feat/other', number: 12, mergeable: false }),
+    ]);
+    expect(fin.instruction).toContain('fix or close');
   });
 });
 

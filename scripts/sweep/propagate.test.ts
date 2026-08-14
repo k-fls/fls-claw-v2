@@ -2230,6 +2230,169 @@ describe('propagate — N1: ref writers keep a checked-out branch worktree consi
 });
 
 // --- B4: merge + defer combined verdict (§5) + origin-rebuilt HELD (N3) ------
+describe('propagate run — the cut is inherited, and it is a cut on content', () => {
+  it('a grandchild is cut at its grandparent’s coordinate, on EVERY parent’s line', async () => {
+    // main_patched carries an open proposal cutting at height 0. feat/c sits
+    // under it and inherits that cut; feat/d sits under feat/c and inherits it
+    // again — one edge further from the block, with nothing blocked in between.
+    // feat/e is nobody's descendant and perfectly clean, but its line carries
+    // the SAME trunk commits, and those are what cannot integrate: the cut is on
+    // content, not on the edge it arrives by.
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    const base = repo.sha('main');
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.checkout('feat/c', { create: true, at: 'main_patched' });
+    repo.checkout('feat/d', { create: true, at: 'main_patched' });
+    repo.checkout('main');
+    const u0 = repo.commit('U0: util', { 'src/util.ts': 'u\n' }); // height 0
+    const u1 = repo.commit('U1: more', { 'src/more.ts': 'm\n' }); // height 1
+    // feat/e: no inventory parents of its own, already carrying both heights.
+    repo.checkout('feat/e', { create: true, at: base });
+    repo.git('merge', '--no-ff', '--no-edit', '-m', 'e merges U0', u0);
+    repo.git('merge', '--no-ff', '--no-edit', '-m', 'e merges U1', u1);
+    // The proposal on main_patched: a two-parent head whose SECOND parent sits
+    // at height 0.
+    repo.checkout('cut-point', { create: true, at: u0 });
+    repo.commit('the conflict head', { 'src/marker.ts': 'm\n' });
+    repo.checkout('pr-head', { create: true, at: 'main_patched' });
+    repo.git('merge', '--no-ff', '--no-edit', '-m', 'Resolution for owner review', 'cut-point');
+    const prHead = repo.sha('pr-head');
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'c', branch: 'feat/c', parents: ['main_patched'] },
+      { id: 'e', branch: 'feat/e' },
+      { id: 'd', branch: 'feat/d', parents: ['feat/c', 'feat/e'] },
+    ]);
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, { base, ...o });
+    appendJournal(dir, {
+      action: 'origin-blocked',
+      branch: 'main_patched',
+      caseId: 'origin:fix/sweep/main_patched--main-h0-deadbeef',
+      fixBranch: 'fix/sweep/main_patched--main-h0-deadbeef',
+      kind: 'merge',
+      headSha: prHead,
+      prNumber: 12,
+    });
+    await cmdPlan(cli({ cmd: 'plan' }));
+    const dTip = repo.sha('feat/d');
+    expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
+
+    // feat/e's content is at and above the cut, so feat/d takes none of it —
+    // even though feat/e is unblocked and merges cleanly.
+    expect(repo.sha('feat/d')).toBe(dTip);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'merge' && e.branch === 'feat/d')).toBe(false);
+    expect(journal.some((e) => e.action === 'pre-ref' && e.branch === 'feat/d')).toBe(false);
+    // And the plan says WHERE it is waiting: at height 0, behind its own parent.
+    const plan = JSON.parse(readFileSync(join(dir, 'plan.json'), 'utf8')) as {
+      branches: Array<{ branch: string; parents: Array<{ parent: string; deferredTo: string | null; deferHeight?: number }> }>;
+    };
+    const dRows = plan.branches.find((b) => b.branch === 'feat/d')!.parents;
+    const viaE = dRows.find((p) => p.parent === 'feat/e')!;
+    expect(viaE.deferHeight).toBe(0);
+    expect(viaE.deferredTo).toBe('feat/c'); // the parent whose cut is the minimum
+    // Nothing was withheld on the feat/c edge — feat/c has nothing to give —
+    // and a trim that removed nothing announces nothing.
+    expect(dRows.find((p) => p.parent === 'feat/c')!.deferHeight).toBeUndefined();
+  });
+});
+
+describe('propagate run — a freeze that arrives after the plan was written', () => {
+  /**
+   * main_patched (trunk) with a child and a grandchild, and two upstream
+   * commits both branches could take.
+   */
+  function stack(): { repo: FixtureRepo; base: string; inv: string } {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    const base = repo.sha('main');
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.checkout('feat/c', { create: true, at: 'main_patched' });
+    repo.checkout('feat/d', { create: true, at: 'feat/c' });
+    repo.checkout('main');
+    repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+    repo.commit('U1: more', { 'src/more.ts': 'm\n' });
+    cleanups.push(() => repo.destroy());
+    return {
+      repo,
+      base,
+      inv: writeInventory([
+        { id: 'c', branch: 'feat/c', parents: ['main_patched'] },
+        { id: 'd', branch: 'feat/d', parents: ['feat/c'] },
+      ]),
+    };
+  }
+
+  /** No branch under a frozen ancestor merged anything, or advanced at all. */
+  function nothingUnderTheFreeze(dir: string, branches: string[]): void {
+    const journal = readJournal(dir);
+    for (const b of branches) {
+      expect(journal.some((e) => e.action === 'merge' && e.branch === b)).toBe(false);
+      expect(journal.some((e) => e.action === 'pre-ref' && e.branch === b)).toBe(false);
+    }
+  }
+
+  it('a block journaled after the plan is not read as drift, and the run honours it', async () => {
+    // A verify gate hold is journaled long after `start` wrote the plan, so
+    // every branch under it derives differently from the plan on disk BY
+    // CONSTRUCTION. Reading that as "git moved under us" would halt a pass for
+    // doing exactly what the block is supposed to make it do.
+    const { repo, base, inv } = stack();
+    const ws = mkWorkspace();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, { base, ...o });
+    await cmdPlan(cli({ cmd: 'plan' }));
+    const tips = ['main_patched', 'feat/c', 'feat/d'].map((b) => [b, repo.sha(b)] as const);
+    appendJournal(dir, { action: 'held', branch: 'main_patched', caseId: 'gate-main_patched', reason: 'gate' });
+
+    expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'halt')).toBe(false);
+    nothingUnderTheFreeze(dir, ['main_patched', 'feat/c', 'feat/d']);
+    for (const [b, tip] of tips) {
+      expect(repo.sha(b)).toBe(tip);
+      // The empty-interval, all-skip treatment — not a partial window.
+      expect(journal.some((e) => e.action === 'skip' && e.branch === b && e.reason === 'held')).toBe(true);
+      expect(journal.some((e) => e.action === 'defer' && e.branch === b)).toBe(false);
+    }
+  });
+
+  it('a freeze arriving mid-pass is honoured by the RESUMED run', async () => {
+    const { repo, base, inv } = stack();
+    const ws = mkWorkspace();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, { base, ...o });
+    await cmdPlan(cli({ cmd: 'plan' }));
+    expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
+    // The whole stack advanced on the first run.
+    expect(readJournal(dir).some((e) => e.action === 'merge' && e.branch === 'feat/d')).toBe(true);
+    const afterFirst = ['main_patched', 'feat/c', 'feat/d'].map((b) => [b, repo.sha(b)] as const);
+
+    // Then the trunk goes red and the descendants are reopened to be re-derived
+    // against it — the shape the gate-fix protocol journals.
+    appendJournal(dir, { action: 'held', branch: 'main_patched', caseId: 'gate-main_patched', reason: 'gate' });
+    for (const b of ['feat/c', 'feat/d']) appendJournal(dir, { action: 'reopened', branch: b });
+    const before = readJournal(dir).length;
+
+    expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
+    const added = readJournal(dir).slice(before);
+    expect(added.some((e) => e.action === 'halt')).toBe(false);
+    // The resumed run adds no merge and no pre-ref for anything under the freeze…
+    for (const b of ['feat/c', 'feat/d']) {
+      expect(added.some((e) => e.action === 'merge' && e.branch === b)).toBe(false);
+      expect(added.some((e) => e.action === 'pre-ref' && e.branch === b)).toBe(false);
+      expect(added.some((e) => e.action === 'skip' && e.branch === b && e.reason === 'held')).toBe(true);
+    }
+    // …and moves no ref.
+    for (const [b, tip] of afterFirst) expect(repo.sha(b)).toBe(tip);
+  });
+});
+
 describe('propagate run — a case is emitted against the tip it will be resolved on', () => {
   it('the run, head and height come from ONE live derivation after an earlier parent moved the tip', async () => {
     // Parents merge SEQUENTIALLY, so by the time the second parent's case is
