@@ -1060,6 +1060,55 @@ export function pushMember(branch: string, mutated: ReadonlySet<string>): boolea
   return mutated.has(branch);
 }
 
+/** The pass's coverage, from the journal and the plan on disk (§10.7). */
+function passCoverage(
+  cli: Cli,
+  dir: string,
+  journal: JournalEntry[],
+): { built: string[]; excluded: RecipeExclusion[] } {
+  const noRef = journal
+    .filter((e) => e.action === 'verify-recipe-dropped')
+    .flatMap((e) => (Array.isArray(e.branches) ? (e.branches as string[]) : []));
+  return recipeCoverage(
+    passOrder(dir),
+    directExclusions(cli, journal),
+    transitiveAncestors(Object.fromEntries(directParentEdges(cli))),
+    noRef,
+  );
+}
+
+/**
+ * BRANCHES THIS PASS MERGED ON WHOSE MERGES NEVER REACHED ORIGIN, with the
+ * reason. Up-to-date and origin-ahead skips are not here — there was nothing to
+ * send — and neither are push FAILURES, which the result reports as failures.
+ * What is left is work the pass did and did not ship, which the owner is
+ * otherwise left to notice for himself.
+ */
+function withheldPushRows(journal: JournalEntry[]): Array<{ branch: string; reason: string }> {
+  const mutated = new Set(
+    journal
+      .filter((e) => (e.action === 'merge' || e.action === 'resolved') && typeof e.branch === 'string')
+      .map((e) => e.branch as string),
+  );
+  const seenByPush = new Set(
+    journal
+      .filter(
+        (e) =>
+          (e.action === 'push' || e.action === 'push-skip' || e.action === 'push-failed') &&
+          typeof e.branch === 'string',
+      )
+      .map((e) => e.branch as string),
+  );
+  const stated = new Map(
+    journal
+      .filter((e) => e.action === 'push-withheld' && typeof e.branch === 'string')
+      .map((e) => [e.branch as string, String(e.reason ?? '')]),
+  );
+  return [...mutated]
+    .filter((b) => !seenByPush.has(b))
+    .map((branch) => ({ branch, reason: stated.get(branch) || 'the push stage did not reach this branch' }));
+}
+
 // --------------------------------------------------------------------------
 // Journaled ref mutations (reuse merge.ts's commit-tree + update-ref technique).
 // --------------------------------------------------------------------------
@@ -10705,15 +10754,23 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     appendJournal(dir, { action: 'verify-skipped', id: 'WARN18_BASE_GATED', branch: verifyBase, gateRef: baseGate, detail });
     progress(`verify: SKIPPED — base '${verifyBase}' is gated; ${escalated}/${total} held PR(s) published`);
     console.error(`finish: ${detail}`);
+    // A pass that merged locally and shipped nothing has to SAY which merges
+    // are sitting on local refs; "stopped" alone reads as "nothing happened".
+    const gatedWithheld = withheldPushRows(readJournal(dir)).map((w) => ({
+      branch: w.branch,
+      reason: `the verify base '${verifyBase}' is gated — no verify, no push`,
+    }));
     result(cli, {
       ok: false,
       status: 'stopped',
       stoppedAt: 'base-gated',
       heldPublished: escalated,
+      withheldPushes: gatedWithheld,
       issues: [{ id: 'WARN18_BASE_GATED', detail }],
       instruction:
         `REPORT to the owner: the base '${verifyBase}' is waiting on its own gate-fix PR (${baseGate}); nothing ` +
         `can be verified or landed until that is merged. ${escalated} held PR(s) are published and named above. ` +
+        `${gatedWithheld.length ? `Merged locally and NOT pushed: ${gatedWithheld.map((w) => w.branch).join(', ')}. ` : ''}` +
         `Do NOT re-run finish until the owner merges it.`,
     });
     return 1;
@@ -11144,6 +11201,18 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     if (!o) return pr;
     return { ...pr, landed: o.landed, ...(o.category ? { failureCategory: o.category } : {}) };
   });
+  // WHAT THE BUILD COVERED, WHAT LANDED WITHOUT ONE, AND WHAT DID NOT LAND.
+  // A partial integration build is a valid pass — `ok` stays true — and what
+  // makes it valid is that the result SAYS so: which branches were built, which
+  // were left out and why, which reached origin from outside the build, and
+  // which merged locally and went nowhere. A pass that ships a cut prefix and
+  // reports it in a log line only is indistinguishable from a healthy one.
+  const coverage = passCoverage(cli, dir, journalFinal);
+  const pushedUnbuilt = journalFinal
+    .filter((e) => e.action === 'push' && e.kind === 'target' && typeof e.branch === 'string')
+    .map((e) => e.branch as string)
+    .filter((b, i, all) => all.indexOf(b) === i && !coverage.built.includes(b));
+  const withheldPushes = withheldPushRows(journalFinal);
   const resolvedRows = journalFinal.filter((e) => e.action === 'resolved');
   const publishedRows = journalFinal.filter((e) => e.action === 'pr-published');
   const failedByCategory = { diverged: 0, transient: 0, auth: 0, rejected: 0 };
@@ -11185,6 +11254,16 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   const ownerPrCue = ownerPrs.length
     ? ` PRs you changed that no longer merge or no longer pass: fix or close — ${ownerPrs.map((p) => `#${p.number} (${p.branch}: ${p.reason})`).join('; ')}.`
     : '';
+  // The partial-build cue. A pass that built a slice of the fork and pushed
+  // beyond it says both, in one sentence, or the owner reads "complete" and
+  // assumes everything was verified together.
+  const coverageCue =
+    coverage.excluded.length || pushedUnbuilt.length || withheldPushes.length
+      ? ` PARTIAL BUILD: the integration verify covered ${coverage.built.join(', ') || 'nothing'}` +
+        `${coverage.excluded.length ? ` and left out ${coverage.excluded.map((x) => `${x.branch} (${x.reason}${x.via ? `: ${x.via}` : ''})`).join('; ')}` : ''}.` +
+        `${pushedUnbuilt.length ? ` Pushed with no build behind it: ${pushedUnbuilt.join(', ')}.` : ''}` +
+        `${withheldPushes.length ? ` Merged locally and NOT pushed: ${withheldPushes.map((w) => `${w.branch} (${w.reason})`).join('; ')}.` : ''}`
+      : '';
   const stats = {
     branchesInScope: passOrder(dir).length,
     cleanMerges: journalFinal.filter((e) => e.action === 'merge').length,
@@ -11229,6 +11308,9 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
       ...(ownerPrs.length ? { ownerPullRequests: ownerPrs } : {}),
       blockingIssues: pushBlockingIssues,
       ...(systemicOutage ? { systemicOutage: true, heldPublishesSkipped } : {}),
+      coverage,
+      pushedUnbuilt,
+      withheldPushes,
       stats,
       instruction:
         `REPORT to the owner FACTUALLY: which branches LANDED (${branches.filter((b) => b.landed).map((b) => b.branch).join(', ') || 'none'}) ` +
@@ -11237,7 +11319,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
         `${pushBlockingIssues.length ? ` Blocking push-phase issues: ${pushBlockingIssues.map((i) => i.id).join(', ')}.` : ''} ` +
         `${needsOwner.length ? `OWNER ACTION REQUIRED (do NOT just re-run for these): ${needsOwner.map((n) => `${n.branch} (${n.category})`).join('; ')} — never force-resolve. ` : 'DIVERGED branches need the owner (never force-resolve); '}` +
         `${systemicOutage ? `Network outage: ${heldPublishesSkipped} held publish(es) were skipped, not attempted. ` : ''}` +
-        `${ownerPrCue}` +
+        `${ownerPrCue}${coverageCue}` +
         ` then re-run \`finish\` — landed branches skip, transient failures retry.`,
     });
     return 1;
@@ -11251,10 +11333,13 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     pullRequests: annotated,
     branches,
     ...(ownerPrs.length ? { ownerPullRequests: ownerPrs } : {}),
+    coverage,
+    pushedUnbuilt,
+    withheldPushes,
     stats,
     instruction:
       `REPORT to the owner: every PR in pullRequests (number, title, status), the landed branches (branches list), and the stats summary.` +
-      `${ownerPrCue} Then ` +
+      `${ownerPrCue}${coverageCue} Then ` +
       (upstreamAdvanced ? 'run `sweep start` again (upstream advanced past the pinned watermark)' : 'stop — the sweep is done'),
   });
   return 0;

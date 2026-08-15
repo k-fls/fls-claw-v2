@@ -2206,6 +2206,57 @@ describe('sweep finish (SWEEP-STATE-MACHINE.md §2) — multi-step, resumable', 
     expect(readJournal(dir).some((e) => e.action === 'push' && e.kind === 'pr-head')).toBe(true);
   });
 
+  it('a blocked trunk makes the build VACUOUS: the prefix merge still lands, and the result says what was covered', async () => {
+    // Everything in the pass sits at or under the cut, so there is nothing the
+    // integration build can judge — a valid pass, not a degraded one. What
+    // makes it valid is the report: `coverage` names the branch it left out and
+    // why, `pushedUnbuilt` names the branch that reached origin with no build
+    // behind it, and `withheldPushes` is empty because nothing was held back.
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const originBefore = repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched');
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
+    const caseId = currentCaseId(dir);
+    await cmdSweepReportCase(baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true }), confirm);
+    writePr(dir, caseId, 'held x', 'Decision needed: resolution of src/x.ts — study before merge.');
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge); // finalize
+    expect(repo.sha('main_patched')).not.toBe(originBefore); // the clean prefix merged
+
+    const out = join(ws, 'finish.json');
+    expect(
+      await cmdSweepFinish(
+        baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, tokenFile, commandsFile: passCmds(ws), out }),
+        fakeGithub().factory,
+      ),
+    ).toBe(0);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      ok: boolean;
+      status: string;
+      coverage: { built: string[]; excluded: Array<{ branch: string; reason: string; via?: string }> };
+      pushedUnbuilt: string[];
+      withheldPushes: Array<{ branch: string; reason: string }>;
+      instruction: string;
+    };
+    expect(res.ok).toBe(true); // a partial build is a valid pass
+    expect(res.status).toBe('complete');
+    expect(res.coverage.built).toEqual([]);
+    expect(res.coverage.excluded).toEqual([{ branch: 'main_patched', reason: 'cut-this-pass' }]);
+    expect(res.pushedUnbuilt).toEqual(['main_patched']);
+    expect(res.withheldPushes).toEqual([]);
+    expect(res.instruction).toContain('PARTIAL BUILD');
+    // The verify was vacuous and the merge still landed at its cut point.
+    expect(readJournal(dir).some((e) => e.action === 'verify' && e.ok === true && typeof e.note === 'string')).toBe(true);
+    expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).toBe(repo.sha('main_patched'));
+  });
+
   it('cross-tier duplicate (finding #3): a held case matching a published JUDGED sibling is journaled held-duplicate and finish completes (no ERR06 wedge)', async () => {
     // feat/a (judged) and feat/b (held) carry the SAME fork edit and conflict
     // identically against the same main_patched tip: same paths + same head.

@@ -41,10 +41,12 @@ import {
   passDir,
   publishableRecipe,
   readJournal,
+  recipeCoverage,
   recipeMember,
   supersededCaseIds,
   type Cli,
   type ColdReadInvoker,
+  type ExclusionReason,
   type JournalEntry,
   type MachineVerdict,
 } from './propagate.js';
@@ -1327,6 +1329,19 @@ describe('recipe membership — nothing blocked at or above it', () => {
     expect(recipeMember('module/a-leaf', blocked, ancestorsOf)).toBe(false);
     expect(recipeMember('module/b', blocked, ancestorsOf)).toBe(true);
     expect(recipeMember('main_patched', blocked, ancestorsOf)).toBe(true);
+  });
+
+  it('coverage names every branch the build left out, with the reason and the block above it', () => {
+    // The exclusions are the report, so each one has to carry WHY: its own
+    // block, an ancestor's (and which), or a ref the rebuild could not resolve.
+    const direct = new Map<string, ExclusionReason>([['module/a', 'cut-this-pass']]);
+    const cov = recipeCoverage(order, direct, ancestorsOf, ['module/b']);
+    expect(cov.built).toEqual(['main_patched']);
+    expect(cov.excluded).toEqual([
+      { branch: 'module/a', reason: 'cut-this-pass' },
+      { branch: 'module/a-leaf', reason: 'blocked-above', via: 'module/a' },
+      { branch: 'module/b', reason: 'no-local-ref' },
+    ]);
   });
 });
 
