@@ -6943,27 +6943,37 @@ async function createRecoveryPr(
  * `git push origin --delete` (refs move via git only); a failed delete
  * is journaled and non-fatal (the ref is re-examined at the next start).
  */
-/** Paths in a tree whose blobs carry conflict markers. */
-async function markerPaths(repo: string, tree: string): Promise<string[]> {
-  const res = await git(repo, ['grep', '-I', '--name-only', '-e', '^<<<<<<<', tree], { allowCodes: [1] });
-  return res.stdout
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => line.slice(line.indexOf(':') + 1));
-}
-
 /**
- * The conflict a tree EXHIBITS. A pristine-conflict head IS its own baseline —
- * its tree is the automerge — so the recorded question is recoverable from the
- * objects, with no need to re-run the merge that produced it.
+ * The conflict hunks at GIT'S OWN conflicted paths, read out of `tree`.
+ *
+ * The paths come from a merge probe and never from grepping the tree for
+ * marker-shaped lines: a file may legitimately contain a line of seven angle
+ * brackets (this repo's own sweep fixtures do), and such a phantom hunk is
+ * invisible while both sides carry it and flips the verdict to `different` the
+ * moment that file is edited for unrelated reasons — which force-pushes and
+ * comments on a pull request whose conflict never moved.
  */
-async function exhibitedConflict(repo: string, tree: string): Promise<ConflictHunk[]> {
-  const paths = await markerPaths(repo, tree);
+async function conflictAt(repo: string, tree: string, paths: readonly string[]): Promise<ConflictHunk[]> {
   if (paths.length === 0) return [];
   return conflictIdentity(paths, async (p) => {
     const res = await git(repo, ['cat-file', 'blob', `${tree}:${p}`], { allowCodes: [128] });
     return res.code === 0 ? res.stdout : null;
   });
+}
+
+/**
+ * The conflict an exhibit head EXHIBITS. The head IS a merge commit and its
+ * tree IS the pristine automerge, so re-probing `merge-tree` on its own two
+ * parents recovers the conflicted-file list authoritatively and the bodies come
+ * from the tree the pull request actually shows. A head with fewer than two
+ * parents proposes no merge and exhibits no conflict.
+ */
+async function exhibitedConflict(repo: string, head: string): Promise<ConflictHunk[]> {
+  const info = await commitInfo(repo, head);
+  if (info.parents.length < 2) return [];
+  const probe = await newStyleMergeTree(repo, info.parents[0], info.parents[1]);
+  if (probe.clean) return [];
+  return conflictAt(repo, `${head}^{tree}`, probe.conflictFiles);
 }
 
 /**
@@ -7274,11 +7284,14 @@ async function deriveOriginMergeStatus(
       // markers poses a question; one that does not offers an answer. The draft
       // flag says the same thing on a good day, but it is a label somebody can
       // flip, and the tree is not.
-      const exhibited = shape === 'driver' ? await exhibitedConflict(cli.repo, `${u.sha}^{tree}`) : [];
+      const exhibited = shape === 'driver' ? await exhibitedConflict(cli.repo, u.sha) : [];
       let relation: ConflictRelation | null = null;
       if (exhibited.length > 0 && conflictHead) {
         const now = await newStyleMergeTree(cli.repo, targetTip, conflictHead);
-        relation = classifyConflict(exhibited, now.clean ? [] : await exhibitedConflict(cli.repo, now.treeOid));
+        relation = classifyConflict(
+          exhibited,
+          now.clean ? [] : await conflictAt(cli.repo, now.treeOid, now.conflictFiles),
+        );
       }
 
       // The expensive question is asked only where the answer is used: an

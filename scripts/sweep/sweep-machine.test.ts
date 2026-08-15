@@ -2779,6 +2779,47 @@ describe('sweep start — origin-derived merge_status', () => {
     expect(repo.git('-C', bare, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep')).toBe('');
   });
 
+  it('a marker-shaped line in an UNCONFLICTED file is not part of the conflict, however it changes', async () => {
+    // The conflicted paths come from git. A file that merely CONTAINS a line of
+    // seven angle brackets is not a conflict, and editing it for unrelated
+    // reasons must not turn "the same question" into "a different question" —
+    // which force-pushes a rebuilt exhibit and comments on a PR whose conflict
+    // never moved.
+    const repo = initFixtureRepo();
+    repo.commit('base: x + a file that talks about markers', {
+      'src/x.ts': 'orig\n',
+      'docs/markers.md': 'how a conflict looks:\n<<<<<<< ours\nalpha\n',
+    });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: x = fork', { 'src/x.ts': 'fork\n' });
+    repo.checkout('main');
+    repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' });
+    cleanups.push(() => repo.destroy());
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    pushDriverExhibit(repo);
+    // The branch moves for a reason that has nothing to do with the conflict —
+    // it edits the marker-shaped text.
+    repo.checkout('main_patched');
+    repo.commit('mp: reword the marker example', {
+      'docs/markers.md': 'how a conflict looks:\n<<<<<<< ours\nbeta\n',
+    });
+    repo.git('push', 'origin', 'main_patched');
+    repo.checkout('main');
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = fakeGithub({ 'GET /pulls?': openPr });
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile }), gh.factory)).toBe(0);
+    const journal = readJournal(dirOf(repo, ws));
+    // The same conflict against a moved base: rebased, body kept, nothing said.
+    const rebased = journal.find((e) => e.action === 'proposal-rebased')!;
+    expect(rebased.reason).toContain('same');
+    expect(journal.some((e) => e.action === 'proposal-rebuilt')).toBe(false);
+    expect(gh.calls.some((c) => c.method === 'POST' && c.path.includes('/comments'))).toBe(false);
+  });
+
   /**
    * A DRIVER-shaped ANSWER on the fix ref: a resolution tree with no markers,
    * so its disposition turns on whether it still merges and still passes.

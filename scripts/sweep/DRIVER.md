@@ -768,7 +768,15 @@ says the same thing on a good day, but it is a label somebody can flip.
 
 **Conflict identity** (`conflict-identity.ts`). The exhibit's own head IS the
 baseline — its tree is the pristine automerge — so the recorded question is
-recoverable from the objects with no need to re-run the old merge. Compare hunk
+recoverable from the objects with no need to re-run the old merge. THE
+CONFLICTED PATHS COME FROM GIT: the head is a merge commit, so re-probing
+`merge-tree` on its own two parents returns the conflicted-file list
+authoritatively, and the hunk bodies are read from the tree the PR shows. Never
+grep a tree for marker-shaped lines — a file may legitimately carry a line of
+seven angle brackets (this repo's own sweep fixtures do), and such a phantom
+hunk is invisible while both sides hold it and flips the verdict to `different`
+the moment that file is edited for unrelated reasons, force-pushing and
+commenting on a PR whose conflict never moved. Compare hunk
 by hunk, never tree by tree: the clean part of a merge moves constantly.
 Normalize by dropping the marker LABEL lines (all three forms) and by ignoring
 the hunk's position in the file; keep the ours/base/theirs bodies verbatim,
