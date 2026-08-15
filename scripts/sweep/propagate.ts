@@ -946,33 +946,118 @@ export function publishableRecipe(
   return order.filter((b) => recipeMember(b, blocked, ancestorsOf));
 }
 
+/** Why a branch sits outside the integration build (§10.7 `coverage.excluded`). */
+export type ExclusionReason =
+  | 'cut-this-pass'
+  | 'blocked-before-this-pass'
+  | 'under-repair'
+  | 'open-case'
+  | 'blocked-above'
+  | 'no-local-ref';
+
+/** One branch the build left out, and why — `via` names the block above it. */
+export interface RecipeExclusion {
+  branch: string;
+  reason: ExclusionReason;
+  via?: string;
+}
+
 /**
- * The branches the integration build must leave out — and therefore, by the one
- * shared rule, the branches the pass must not push. Three kinds, one idea: the
- * build can only judge content the trunk could actually receive.
+ * THE BRANCHES THE INTEGRATION BUILD LEAVES OUT, each with the reason. The
+ * build can only judge content the trunk could actually receive, so a branch
+ * standing at a cut is outside it whichever pass cut it:
  *
- *  - A proposal that PREDATES this pass has held its branch back for as long as
- *    the owner has taken with it, so the branch lags the trunk by that much;
- *    rebuilt onto a current base it conflicts, and the build blames it for the
- *    conflict its own freeze implies.
- *  - A branch UNDER REPAIR, and everything beneath it, is red by definition.
- *  - A branch with a case still OPEN holds an unresolved conflict in hand.
+ *  - CUT THIS PASS — a hold taken here closes the window at the conflict, and a
+ *    sibling carrying content ABOVE that cut re-materialises the very conflict
+ *    the cut represents inside the rebuild; the held branch is then named the
+ *    offender and rolled back for a conflict that is pending propagation, not
+ *    integration breakage. Two branches at different cut points do not merge
+ *    into one tree. Structural, not policy — and no statement about whether the
+ *    pass produced something legitimate there (see `pushMember`).
+ *  - BLOCKED BEFORE THIS PASS — a proposal read off origin has held its branch
+ *    back for as long as the owner has taken with it, so the branch lags the
+ *    trunk by that much.
+ *  - UNDER REPAIR — a branch with a fix proposal on its own content, and every
+ *    transitive descendant, is red by definition.
+ *  - OPEN CASE — an unresolved conflict still in hand.
  *
- * A branch THIS PASS froze is deliberately not here. It landed exactly the
- * prefix it could integrate — what it could not take is not in it — so the
- * build can judge it, and it must: its held PR is opened against ORIGIN'S copy
- * of that prefix. Withholding the push would base the PR on a commit the branch
- * no longer sits on, and merging it would diverge the branch outright.
- *
- * A DEFERRED branch is not listed either — it is already out through the
- * blocked ancestor it is deferring behind, and listing it would say the block
- * is its own.
+ * A DEFERRED branch is not listed: it is already out through the blocked
+ * ancestor it is deferring behind, and naming it would say the block is its own.
  */
+function directExclusions(cli: Cli, journal: JournalEntry[]): Map<string, ExclusionReason> {
+  const out = new Map<string, ExclusionReason>();
+  for (const [branch, rows] of blockedRows(journal)) {
+    out.set(
+      branch,
+      rows.some((r) => r.kind === 'fix')
+        ? 'under-repair'
+        : rows.some((r) => r.carriedOver)
+          ? 'blocked-before-this-pass'
+          : 'cut-this-pass',
+    );
+  }
+  for (const b of frozenBranches(cli, journal)) if (!out.has(b)) out.set(b, 'under-repair');
+  for (const b of openCaseBranches(journal)) if (!out.has(b)) out.set(b, 'open-case');
+  return out;
+}
+
+/** The set form of `directExclusions` — the recipe's blocked input. */
 function blockedForRecipe(cli: Cli, journal: JournalEntry[]): Set<string> {
-  const carriedOver = [...blockedRows(journal).entries()]
-    .filter(([, rows]) => rows.some((r) => r.carriedOver))
-    .map(([b]) => b);
-  return new Set([...carriedOver, ...frozenBranches(cli, journal), ...openCaseBranches(journal)]);
+  return new Set(directExclusions(cli, journal).keys());
+}
+
+/**
+ * WHAT THE INTEGRATION BUILD COVERED AND WHAT IT LEFT OUT, per branch and with
+ * the reason (§10.7). A PARTIAL build is a valid pass; what makes it valid is
+ * that the result says which branches shipped without one, so the owner never
+ * has to infer it from a log line.
+ *
+ * `unresolvable` are recipe members with no local ref: dropped loudly at the
+ * gate, and dropped here for the same reason rather than counted as built.
+ */
+export function recipeCoverage(
+  order: string[],
+  direct: Map<string, ExclusionReason>,
+  ancestorsOf: Record<string, string[]>,
+  unresolvable: readonly string[] = [],
+): { built: string[]; excluded: RecipeExclusion[] } {
+  const built: string[] = [];
+  const excluded: RecipeExclusion[] = [];
+  const noRef = new Set(unresolvable);
+  for (const branch of order) {
+    const own = direct.get(branch);
+    if (own) {
+      excluded.push({ branch, reason: own });
+      continue;
+    }
+    const via = (ancestorsOf[branch] ?? []).find((a) => direct.has(a));
+    if (via) excluded.push({ branch, reason: 'blocked-above', via });
+    else if (noRef.has(branch)) excluded.push({ branch, reason: 'no-local-ref' });
+    else built.push(branch);
+  }
+  return { built, excluded };
+}
+
+/**
+ * PUSH MEMBERSHIP — a DIFFERENT question from recipe membership, and coupling
+ * the two is a defect.
+ *
+ * The recipe answers "can this be integration-built". This answers "did the
+ * pass produce something legitimate here", and a branch merged to its cut point
+ * has: the prefix below the cut is a complete, consistent position, and its
+ * held PR is opened against ORIGIN'S copy of that prefix. Withholding the push
+ * bases the PR on a commit the branch no longer sits on (`checkBaseHeight` then
+ * refuses with ERR14, and the transplant fallback leaves the branch diverged),
+ * and the same work is redone every pass until the owner acts.
+ *
+ * So blockedness never withholds a push. Content pushed at a cut point was in
+ * no integration build — that is REPORTED (`coverage`, `pushedUnbuilt`), never
+ * prevented by holding the branch back. The gate on pushing is that the pass
+ * succeeded (a green verify for this pass, §9), not that the branch was in the
+ * recipe.
+ */
+export function pushMember(branch: string, mutated: ReadonlySet<string>): boolean {
+  return mutated.has(branch);
 }
 
 // --------------------------------------------------------------------------
@@ -4982,13 +5067,11 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
   const journal = readJournal(dir);
   const issues: Issue[] = [];
 
-  // Target set: branches the driver mutated this pass, in plan order, AND IN
-  // THE VERIFY RECIPE — the same predicate the gate used. The push set must be
-  // a SUBSET of what the integration build saw, or a branch that merged before
-  // something above it blocked reaches origin carrying content no build ever
-  // integrated. Its merge is not lost: it stays on the local ref (start leaves
-  // a branch ahead of origin alone) and pushes on the pass where the recipe
-  // takes it back.
+  // Target set: every branch the driver mutated this pass, in plan order
+  // (`pushMember`). Blockedness does NOT withhold a push — a branch merged to
+  // its cut point holds a complete prefix, and its held PR is opened against
+  // origin's copy of it. What the integration build did not cover is REPORTED
+  // (`coverage` / `pushedUnbuilt` at finish), never held back.
   const mutated = new Set(
     journal
       .filter((e) => (e.action === 'merge' || e.action === 'resolved') && typeof e.branch === 'string')
@@ -4998,16 +5081,8 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
   const order: string[] = existsSync(planPath)
     ? (JSON.parse(readFileSync(planPath, 'utf8')) as PropagationPlan).order
     : [...mutated];
-  const ancestorsOf = transitiveAncestors(Object.fromEntries(directParentEdges(cli)));
-  const blocked = blockedForRecipe(cli, journal);
-  const inRecipe = (b: string): boolean => recipeMember(b, blocked, ancestorsOf);
-  const targets = order.filter((b) => mutated.has(b) && inRecipe(b));
-  for (const b of mutated) if (inRecipe(b) && !targets.includes(b)) targets.push(b);
-  const withheld = [...mutated].filter((b) => !inRecipe(b));
-  if (withheld.length > 0) {
-    appendJournal(dir, { action: 'push-withheld', branches: withheld, reason: 'blocked at or above — outside the verify recipe' });
-    console.error(`push: not pushing ${withheld.join(', ')} — blocked at or above, so no integration build covered them`);
-  }
+  const targets = order.filter((b) => pushMember(b, mutated));
+  for (const b of mutated) if (pushMember(b, mutated) && !targets.includes(b)) targets.push(b);
 
   interface PushIntent {
     branch: string;
@@ -5016,7 +5091,14 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
   }
   const intents: PushIntent[] = [];
   for (const branch of targets) {
-    if (!(await refExists(cli.repo, branch))) continue;
+    if (!(await refExists(cli.repo, branch))) {
+      // Mutated but gone by push time: nothing to send, and a silent `continue`
+      // is how a branch drops out of the pass with no line anywhere. Journaled
+      // per branch so the finish result can name it (§10.7 `withheldPushes`).
+      appendJournal(dir, { action: 'push-withheld', branch, reason: 'no local ref at push time' });
+      console.error(`push: not pushing ${branch} — it has no local ref`);
+      continue;
+    }
     const localTip = await revParse(cli.repo, branch);
     const originRef = `origin/${branch}`;
     if (!(await refExists(cli.repo, originRef))) {

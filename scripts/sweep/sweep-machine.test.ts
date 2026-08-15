@@ -4655,8 +4655,16 @@ describe('sweep finish — gate-fix on an unattributable red', () => {
     // on. The cross-pass skip reads ORIGIN refs, which do not exist until finish
     // publishes, so within a pass it blocks nothing on its own.
     const repo = gateFixRepo();
+    // Something for the build to actually cover: a gate-held branch and
+    // everything under it are out of the recipe, so without an unrelated member
+    // the rebuild is vacuous and no red is produced to blame anyone for.
+    repo.checkout('module/ind', { create: true, at: 'main_patched' });
+    repo.checkout('main');
     const ws = mkWorkspace();
-    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'], parents: ['main_patched'] }]);
+    const inv = writeInventory([
+      { id: 'cg', branch: 'module/cg', owned: ['src/x.ts'], parents: ['main_patched'] },
+      { id: 'ind', branch: 'module/ind' },
+    ]);
     const dir = dirOf(repo, ws);
     repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
@@ -4696,8 +4704,15 @@ describe('sweep finish — gate-fix on an unattributable red', () => {
     // discards evidence — round after round naming
     // the same owner from different case branches, recording nothing.
     const repo = gateFixRepo();
+    // An unrelated recipe member, so the rebuild covers something: the gate-held
+    // trunk and everything under it are out of it.
+    repo.checkout('module/ind', { create: true, at: 'main_patched' });
+    repo.checkout('main');
     const ws = mkWorkspace();
-    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'], parents: ['main_patched'] }]);
+    const inv = writeInventory([
+      { id: 'cg', branch: 'module/cg', owned: ['src/x.ts'], parents: ['main_patched'] },
+      { id: 'ind', branch: 'module/ind' },
+    ]);
     const dir = dirOf(repo, ws);
     repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');

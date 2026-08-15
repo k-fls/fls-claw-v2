@@ -1663,12 +1663,16 @@ completes.
 
 ### 10.3 Push resilience
 
-THE PUSH SET IS THE RECIPE INTERSECTED WITH WHAT THE DRIVER MUTATED, through the
-same membership rule (§10.2 step 1). A branch that merged and then had something
-above it block would otherwise reach origin carrying content no integration
-build ever saw, and the next build would meet it as history. Its merge is not
-lost — it stays on the local ref, which `start` leaves alone while the branch is
-ahead of origin, and it lands on the pass where the recipe takes it back.
+THE PUSH SET IS WHAT THE DRIVER MUTATED THIS PASS, in plan order — every branch
+it merged or resolved on, whether or not the build covered it (§10.2 step 1).
+Blockedness never withholds a push: a branch merged to its cut point holds a
+complete prefix, and its held PR is opened against ORIGIN's copy of that prefix,
+so withholding it would base the PR on a commit the branch no longer sits on
+(ERR14) and repeat the work every pass. What no integration build covered is
+REPORTED — `coverage` and `pushedUnbuilt` (§10.7) — never held back. The gate on
+pushing is a green verify for the pass (§9), not membership of the recipe.
+A branch that has no local ref by push time is journaled `push-withheld` and
+named in the result rather than dropped in silence.
 
 Step 3 pushes each target branch INDEPENDENTLY — one push per branch, clean prefix
 and judged merge commits together. Already-up-to-date or origin-ahead branches are

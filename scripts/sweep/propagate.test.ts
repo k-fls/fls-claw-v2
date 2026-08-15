@@ -1980,11 +1980,12 @@ describe('propagate push — verify-gated pass pushes (§14.4)', () => {
     expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).not.toBe(repo.sha('main_patched')); // origin untouched
   });
 
-  it('a branch outside the verify recipe is NOT pushed, however much this pass merged into it', async () => {
-    // The push set is the recipe intersected with what the driver mutated, from
-    // the ONE membership rule. Without that, a branch that merged and then had
-    // something above it block reaches origin carrying content no integration
-    // build ever saw — and the next build meets it as history.
+  it('a branch left OUT of the verify recipe is still PUSHED at its cut point', async () => {
+    // The recipe answers "can this be integration-built"; the push answers "did
+    // the pass produce something legitimate here". A branch under repair is out
+    // of the build and its prefix merge still lands: the fix PR it is about to
+    // carry is opened against ORIGIN's copy of that prefix, and withholding the
+    // push bases it on a commit the branch no longer sits on.
     const { repo } = conflictFixture();
     const bare = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
@@ -1995,18 +1996,22 @@ describe('propagate push — verify-gated pass pushes (§14.4)', () => {
     await cmdPlan(baseCli(repo, ws, inv, { cmd: 'plan' }));
     await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true })); // merges the U0 prefix
     freezeOpenCases(dir);
-    expect(repo.sha('main_patched')).not.toBe(originTip); // it really did merge
+    const merged = repo.sha('main_patched');
+    expect(merged).not.toBe(originTip); // it really did merge
 
     // A verify gate hold arrives after the merge: the branch is under repair.
     appendJournal(dir, { action: 'held', branch: 'main_patched', caseId: 'gate-main_patched', reason: 'gate' });
     fakeGreenVerify(dir);
     const out = join(ws, 'push.json');
     expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, out }))).toBe(0);
-    expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).toBe(originTip); // origin untouched
+    expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/main_patched')).toBe(merged); // landed
     const journal = readJournal(dir);
-    expect(journal.some((e) => e.action === 'push' && e.branch === 'main_patched')).toBe(false);
-    const withheld = journal.find((e) => e.action === 'push-withheld')!;
-    expect(withheld.branches).toEqual(['main_patched']);
+    expect(journal.some((e) => e.action === 'push' && e.branch === 'main_patched')).toBe(true);
+    expect(journal.some((e) => e.action === 'push-withheld')).toBe(false);
+    // …and it is OUT of the recipe all the same.
+    const dry = join(ws, 'verify-dry.json');
+    expect(await cmdVerify(baseCli(repo, ws, inv, { cmd: 'verify', out: dry }))).toBe(0);
+    expect((JSON.parse(readFileSync(dry, 'utf8')) as { recipe: string[] }).recipe).not.toContain('main_patched');
   });
 
   it('JUDGED closure check: a PR that did not flip to merged after the target push is ERR16', async () => {
@@ -2035,6 +2040,117 @@ describe('propagate push — verify-gated pass pushes (§14.4)', () => {
     expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true, tokenFile, out }), ghOpen.factory)).toBe(1);
     const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> };
     expect(res.issues.some((i) => i.id === 'ERR16_CLOSURE_FAILED')).toBe(true);
+  });
+});
+
+// --- the recipe and the push set are different questions (§5.2, §10.2 step 1) ---
+describe('propagate — a branch cut THIS pass is out of the build and still lands', () => {
+  /**
+   * The shape the split exists for: `module/c` is CUT this pass (a held merge
+   * case), and `module/p` advanced through the very content the cut is about.
+   * In one tree those two re-materialise `module/c`'s held conflict, verify goes
+   * red, leave-one-out names `module/c` the offender, and — because it has a
+   * this-pass pre-ref — the blocking arm rolls back its legitimate clean-prefix
+   * merge and freezes it, while the pass reports ok.
+   */
+  function cutBesideCarrier(): {
+    repo: FixtureRepo;
+    ws: string;
+    inv: string;
+    dir: string;
+    cPreRef: string;
+    cTip: string;
+    commandsFile: string;
+  } {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'a\nb\nMID\nd\ne\n' });
+    const base = repo.sha('main');
+    repo.checkout('module/p', { create: true, at: base });
+    repo.commit('p: line 3 -> UP1', { 'src/x.ts': 'a\nb\nUP1\nd\ne\n' });
+    repo.checkout('module/c', { create: true, at: base });
+    repo.commit('c: line 3 -> FORK', { 'src/x.ts': 'a\nb\nFORK\nd\ne\n' });
+    const cPreRef = repo.sha('module/c');
+    repo.commit('c: clean prefix, merged this pass', { 'src/prefix.ts': 'prefix\n' });
+    const cTip = repo.sha('module/c');
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const wm = repo.sha('main');
+    const dir = passDir(ws, wm.slice(0, 12));
+    mkdirSync(dir, { recursive: true });
+    const order = ['module/p', 'module/c'];
+    const plan = {
+      schemaVersion: 1,
+      watermark: wm,
+      watermark12: wm.slice(0, 12),
+      forkPoint: wm,
+      chainLength: 0,
+      order,
+      branches: order.map((branch) => ({
+        branch,
+        kind: 'inventory',
+        tierFloor: 'clean',
+        isLeaf: true,
+        alwaysMerge: false,
+        ancestors: [],
+        parents: [],
+      })),
+      warnings: [],
+    };
+    writeFileSync(join(dir, 'plan-initial.json'), JSON.stringify(plan));
+    writeFileSync(join(dir, 'plan.json'), JSON.stringify(plan));
+    // Both branches were mutated this pass; module/c's case was HELD (a merge
+    // conflict, NOT a gate) after its clean prefix landed.
+    appendJournal(dir, { action: 'pre-ref', branch: 'module/p', ref: base });
+    appendJournal(dir, { action: 'merge', branch: 'module/p', parent: 'main' });
+    appendJournal(dir, { action: 'pre-ref', branch: 'module/c', ref: cPreRef });
+    appendJournal(dir, { action: 'merge', branch: 'module/c', parent: 'module/p' });
+    appendJournal(dir, {
+      action: 'case',
+      branch: 'module/c',
+      parent: 'module/p',
+      caseId: 'c-h1',
+      head: { sha: repo.sha('module/p'), height: 1 },
+      conflictedPaths: ['src/x.ts'],
+    });
+    appendJournal(dir, { action: 'held', branch: 'module/c', caseId: 'c-h1' });
+    const commandsFile = join(ws, 'commands.json');
+    writeFileSync(commandsFile, JSON.stringify([{ cmd: 'true' }]));
+    return { repo, ws, inv, dir, cPreRef, cTip, commandsFile };
+  }
+
+  it('verify leaves the cut branch out, blames nobody and rolls nothing back', async () => {
+    const { repo, ws, inv, dir, cPreRef, cTip, commandsFile } = cutBesideCarrier();
+    const dry = join(ws, 'dry.json');
+    expect(await cmdVerify(baseCli(repo, ws, inv, { cmd: 'verify', commandsFile, out: dry }))).toBe(0);
+    expect((JSON.parse(readFileSync(dry, 'utf8')) as { recipe: string[] }).recipe).toEqual(['module/p']);
+
+    const out = join(ws, 'verify.json');
+    expect(await cmdVerify(baseCli(repo, ws, inv, { cmd: 'verify', execute: true, commandsFile, out }))).toBe(0);
+    expect((JSON.parse(readFileSync(out, 'utf8')) as { ok: boolean }).ok).toBe(true);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'verify' && e.ok === true)).toBe(true);
+    // No offender, no rollback, no second (gate) hold on the branch the cut
+    // already covers.
+    expect(journal.some((e) => e.action === 'pre-ref-rollback')).toBe(false);
+    expect(journal.some((e) => e.action === 'held' && e.reason === 'gate')).toBe(false);
+    expect(repo.sha('module/c')).toBe(cTip);
+    expect(repo.sha('module/c')).not.toBe(cPreRef);
+  });
+
+  it('push lands the cut branch at its cut point, alongside the branch that was built', async () => {
+    const { repo, ws, inv, dir, cPreRef, cTip, commandsFile } = cutBesideCarrier();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'module/p');
+    repo.git('push', 'origin', `${cPreRef}:refs/heads/module/c`);
+    expect(await cmdVerify(baseCli(repo, ws, inv, { cmd: 'verify', execute: true, commandsFile }))).toBe(0);
+    expect(await cmdPush(baseCli(repo, ws, inv, { cmd: 'push', execute: true }))).toBe(0);
+    expect(repo.git('-C', bare, 'rev-parse', 'refs/heads/module/c')).toBe(cTip);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'push' && e.branch === 'module/c')).toBe(true);
+    expect(journal.some((e) => e.action === 'push-withheld')).toBe(false);
   });
 });
 
