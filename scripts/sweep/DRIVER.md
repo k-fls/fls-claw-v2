@@ -1777,6 +1777,13 @@ vs failed), `failedPushes` / `failedPublishes`, and on a partial result
 longer passes (§5.6), drafted by us or not, every pass — the one-time draft
 conversion is a courtesy, this list is the notification.
 
+`droppedProposals` lists every proposal the pass DELETED (§5.6) — branch, PR
+number, url and what made it inapplicable, plus `deleteFailed` when the ref
+survived and the PR is therefore still open. Deleting closes the pull request
+and discards the resolution on it, and the next `start` wipes the journal that
+recorded it, so this list is the only account of it there will ever be. It is
+carried by EVERY exit from `finish`, not only the completing one.
+
 `coverage` says what the integration build actually covered: `built` (the recipe)
 and `excluded`, one entry per branch with the reason it was left out — cut this
 pass, blocked before it, under repair, or carrying an open case. A partial build

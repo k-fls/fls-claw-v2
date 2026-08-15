@@ -1060,6 +1060,29 @@ export function pushMember(branch: string, mutated: ReadonlySet<string>): boolea
   return mutated.has(branch);
 }
 
+/**
+ * THE PROPOSALS THIS PASS DROPPED. `start` deletes a ref whose head poses no
+ * question any more, or answers one it can no longer answer, and GitHub closes
+ * the pull request with it. That is a PR disappearing from the owner's list and
+ * an agent's resolution going with it, so it is named in the finish report —
+ * branch, number, url and what made it inapplicable — and a delete that failed
+ * says so, because then the PR is still open.
+ */
+function droppedProposalRows(
+  journal: JournalEntry[],
+): Array<{ branch: string; ref: string; number: number; url: string; reason: string; deleteFailed?: string }> {
+  return journal
+    .filter((e) => e.action === 'proposal-dropped')
+    .map((e) => ({
+      branch: String(e.branch ?? ''),
+      ref: String(e.ref ?? ''),
+      number: typeof e.prNumber === 'number' ? e.prNumber : 0,
+      url: String(e.prUrl ?? ''),
+      reason: String(e.reason ?? ''),
+      ...(typeof e.deleteFailed === 'string' ? { deleteFailed: e.deleteFailed } : {}),
+    }));
+}
+
 /** The pass's coverage, from the journal and the plan on disk (§10.7). */
 function passCoverage(
   cli: Cli,
@@ -10661,6 +10684,28 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   const ctx = await attachPass(cli);
   const dir = ctx.dir;
   let st = readMachineState(dir);
+  /**
+   * EVERY EXIT FROM FINISH REPORTS THE PROPOSALS THE PASS CLOSED. Deleting a
+   * ref closes its pull request and discards the resolution on it, and the next
+   * pass wipes the journal that recorded it — so a drop the report skips is a
+   * closed PR carrying an agent's work that nobody is ever told about. It rides
+   * out through whichever door the pass leaves by, cue included.
+   */
+  const finishResult = (artifact: Record<string, unknown>): void => {
+    const dropped = droppedProposalRows(readJournal(dir));
+    if (dropped.length === 0) {
+      result(cli, artifact);
+      return;
+    }
+    const cue =
+      ` The sweep CLOSED ${dropped.length} pull request(s) whose proposal no longer applies: ` +
+      `${dropped.map((d) => `#${d.number} (${d.branch}: ${d.reason})`).join('; ')} — report them, they are gone from the owner's list otherwise.`;
+    result(cli, {
+      ...artifact,
+      droppedProposals: dropped,
+      ...(typeof artifact.instruction === 'string' ? { instruction: artifact.instruction + cue } : {}),
+    });
+  };
   const checksFile = applyPassConfig(cli, st);
   // The finish verify gate runs the checks from the pass's pinned
   // checks-file on the publishable set; a persisted checks-file wins over any
@@ -10681,7 +10726,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   if (badChecks) {
     appendJournal(dir, { action: 'warning', id: badChecks.id, message: badChecks.detail });
     console.error(`finish [${badChecks.id}]: ${badChecks.detail}`);
-    result(cli, { ok: false, issues: [badChecks], halted: 'verify', instruction: badChecks.detail });
+    finishResult({ ok: false, issues: [badChecks], halted: 'verify', instruction: badChecks.detail });
     return 1;
   }
   const finishChecks = loadChecksConfig(checksFile);
@@ -10700,7 +10745,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
         `reopened to pull the fix through. This is expected: run \`next-case\` and work them, then finish again.`
       : 'cases remain — resolve every case (next-case/report-case/report-pr) before finish';
     console.error(`finish [ERR34_CASES_REMAIN]: ${detail}`);
-    result(cli, { ok: false, issues: [{ id: 'ERR34_CASES_REMAIN', detail }] });
+    finishResult({ ok: false, issues: [{ id: 'ERR34_CASES_REMAIN', detail }] });
     return 1;
   }
   st = { ...st, phase: 'finishing', finishStep: st.finishStep ?? 'verify' };
@@ -10718,7 +10763,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     const held = [...journaledCases(journal).values()].filter(
       (jc) => lastDisposition(journal, jc.caseId)?.action === 'held' && unpublished(jc),
     );
-    result(cli, {
+    finishResult({
       dryRun: true,
       verifyGreen: canComplete(journal),
       judgedToPublish: judged.map((j) => j.caseId),
@@ -10760,7 +10805,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
       branch: w.branch,
       reason: `the verify base '${verifyBase}' is gated — no verify, no push`,
     }));
-    result(cli, {
+    finishResult({
       ok: false,
       status: 'stopped',
       stoppedAt: 'base-gated',
@@ -10849,7 +10894,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
         // must ADVISE, not BLOCK. `ERR18_VERIFY_PENDING` also still marks the two
         // genuine blocks (an ungated push, and a halted verify below), and an id
         // cannot mean "stop" in one arm and "continue" in another.
-        result(cli, {
+        finishResult({
           ok: false,
           status: 'gate-fix-required',
           stoppedAt: 'verify',
@@ -10870,7 +10915,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
         const who = gate.gated.join(', ');
         progress(`verify: RED — ${who} gated on an open gate-fix PR; nothing to serve`);
         console.error(`finish: RED but gated — ${who} awaiting the owner`);
-        result(cli, {
+        finishResult({
           ok: false,
           status: 'stopped',
           stoppedAt: 'verify',
@@ -10909,7 +10954,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
           `verify: RED — ${failedTests.join(', ')} — no branch lands; ${escalated}/${heldPending.length} held PR(s) published for the owner`,
         );
         console.error(`finish: ${failedTests.join(', ')} failed; ${gate.reason}; ${escalated} held PR(s) escalated, no targets pushed`);
-        result(cli, {
+        finishResult({
           ok: false,
           status: 'stopped',
           stoppedAt: 'finish-tests',
@@ -10957,7 +11002,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
         : `verify: RED ${offender ?? '(unattributed)'} — rolled back`,
     );
     console.error(`finish: ${detail}`);
-    result(cli, {
+    finishResult({
       ok: false,
       issues: [{ id: 'ERR18_VERIFY_PENDING', detail }],
       halted: 'verify',
@@ -11004,7 +11049,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
       );
       if (rcPub !== 0) {
         console.error(`finish: JUDGED publish failed for ${jc.caseId} — re-run finish after fixing`);
-        result(cli, { ok: false, halted: 'judged-prs', caseId: jc.caseId });
+        finishResult({ ok: false, halted: 'judged-prs', caseId: jc.caseId });
         return 1;
       }
       closuresN++;
@@ -11031,7 +11076,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     }));
   if (pushRc !== 0 && pushFailures.length === 0) {
     console.error('finish: push halted (ERR16/ERR18/token) — re-run finish from the push phase; pushes never redo');
-    result(cli, { ok: false, halted: 'push' });
+    finishResult({ ok: false, halted: 'push' });
     return 1;
   }
   progress(`push: targets (${pushDelta.filter((e) => e.action === 'push' && e.kind === 'target').length})`);
@@ -11293,7 +11338,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
       `sweep finish PARTIAL — ${pushFailures.length} push failure(s), ${publishFailures.length} publish failure(s)` +
         `${needsOwner.length ? `, ${needsOwner.length} OWNER-ACTION-REQUIRED` : ''}${systemicOutage ? ' (systemic outage — held publishes skipped)' : ''}; re-run finish`,
     );
-    result(cli, {
+    finishResult({
       ok: false,
       status: 'partial',
       next,
@@ -11325,7 +11370,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     return 1;
   }
   console.error(`sweep finish complete — ${next}`);
-  result(cli, {
+  finishResult({
     ok: true,
     status: 'complete',
     next,

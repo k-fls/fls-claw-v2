@@ -2779,6 +2779,46 @@ describe('sweep start — origin-derived merge_status', () => {
     expect(repo.git('-C', bare, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep')).toBe('');
   });
 
+  it('a dropped proposal is NAMED in the finish result — a closed PR is never silent', async () => {
+    // The drop closes somebody's pull request and takes the resolution on it
+    // with it, and the next `start` wipes the journal that recorded it. If the
+    // result does not carry it, nothing ever does.
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    pushDriverExhibit(repo);
+    repo.checkout('main_patched');
+    repo.git('merge', '--no-ff', '--no-edit', '-X', 'ours', '-m', 'owner resolves U1 by hand', repo.sha('main'));
+    repo.git('push', 'origin', 'main_patched');
+    repo.checkout('main');
+    repo.commit('U2: clean', { 'src/z.ts': 'z\n' }); // the pass has ordinary work to do
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = fakeGithub({ 'GET /pulls?': openPr });
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile }), gh.factory)).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge); // clean merge -> finalize
+
+    const out = join(ws, 'finish.json');
+    const cmds = join(ws, 'cmds-true.json');
+    writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }]));
+    await cmdSweepFinish(
+      baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, tokenFile, commandsFile: cmds, out }),
+      gh.factory,
+    );
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      droppedProposals: Array<{ branch: string; ref: string; number: number; url: string; reason: string }>;
+      instruction: string;
+    };
+    expect(res.droppedProposals.length).toBe(1);
+    expect(res.droppedProposals[0].branch).toBe('main_patched');
+    expect(res.droppedProposals[0].number).toBe(12);
+    expect(res.droppedProposals[0].url).toBe('https://github.com/k-fls/fixture/pull/12');
+    expect(res.droppedProposals[0].reason).toContain('healed');
+    expect(res.instruction).toContain('CLOSED 1 pull request');
+  });
+
   it('a rebuild reuses the journaled fix ref — one ref, one PR', async () => {
     // Deriving a new name from a changed conflict would mint a second ref and a
     // second pull request for one case.
