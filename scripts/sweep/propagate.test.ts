@@ -18,6 +18,7 @@ import { addTempWorktree, commitInfo, gitPush, isAncestor } from './git.js';
 import { exportRrCache, writeRrCacheDir } from './merge.js';
 import {
   createCaseWorktree,
+  defaultChecksRunner,
   DriverHalt,
   failureSummary,
   firstRedParticipant,
@@ -1294,6 +1295,25 @@ function divergedFixture(opts: { withMainPatched?: boolean } = {}): { repo: Fixt
   cleanups.push(() => repo.destroy());
   return { repo };
 }
+
+describe('the checks runner — a command that never ran is not a failing check', () => {
+  it('a signal-killed command is booked as an ENVIRONMENT FAULT (spawnSync status null), not merely as red', async () => {
+    // `null !== 0`, so a process that never started or was killed reads as a
+    // failing check — and a red is what deletes a pull request.
+    const res = await defaultChecksRunner([{ cmd: 'kill -KILL $$' }], tmpdir());
+    expect(res.ok).toBe(false); // gates that must fail closed still see a failure…
+    expect(res.failedNames).toEqual(['kill -KILL $$']);
+    expect(res.environmentFault?.cmd).toBe('kill -KILL $$'); // …and everyone else sees WHY
+    expect(res.environmentFault?.detail).toContain('did not run');
+  });
+
+  it('an ordinary non-zero exit is a red, with no environment fault attached', async () => {
+    const res = await defaultChecksRunner([{ cmd: 'echo boom >&2; exit 1' }], tmpdir());
+    expect(res.ok).toBe(false);
+    expect(res.environmentFault).toBeUndefined();
+    expect(res.output).toContain('boom');
+  });
+});
 
 describe('recipe membership — nothing blocked at or above it', () => {
   // main_patched -> module/a -> module/a-leaf, and main_patched -> module/b.
