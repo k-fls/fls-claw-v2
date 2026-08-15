@@ -639,7 +639,10 @@ content is journaled as DEFERRED rather than as "up to date": "nothing to take"
 and "something to take, blocked upstream" are different facts, and the second is
 what the owner is waiting on and what the urge counts (§5.5). A branch cut this
 way has a block above it, so the integration recipe leaves it out by the same
-rule that cut it (§10.2 step 1) — the exclusion needs no rule of its own.
+rule that cut it (§10.2 step 1) — the exclusion needs no rule of its own. It is
+still PUSHED at its cut point: the prefix below the cut is a complete position,
+and leaving it unpushed diverges the branch from the PR base its own held case is
+opened against. Not built, still landed, and the result says which (§10.7).
 
 DEFERRED is a PURE HEIGHT-MIN over the branch's BLOCKED DIRECT PARENTS
 (`deferred.ts`). When branch X hits its own conflict at height `conflictHeight`
@@ -1561,20 +1564,30 @@ completes.
 0. **Base gate check.** If the verify base itself carries an open gate-fix ref,
    verify is SKIPPED, the held cases are published anyway, and `finish` stops with
    `WARN18_BASE_GATED` — nothing can land until the owner merges that PR.
-1. **Verify the publishable set.** The recipe is DERIVED from the pass by ONE
-   rule — **nothing blocked at or above it** — over the plan's DAG order. Whether
-   a branch happened to merge something in the last few minutes says nothing
-   about whether its content integrates, so an un-advanced branch is verified
-   like any other; a branch with something blocked above it is not, because its
-   window is cut there and what it holds above the cut is a state the trunk has
-   never seen. Three things block: a proposal that PREDATES the pass (it has held
-   its branch back for as long as the owner has taken with it, so the branch lags
-   the trunk and a rebuild onto a current base blames it for the conflict its own
-   freeze implies), a branch UNDER REPAIR and everything beneath it, and a case
-   still OPEN. A branch THIS PASS froze is IN: it landed exactly the prefix it
-   could integrate, and its held PR is opened against origin's copy of that
-   prefix, so the build must cover it and the push must land it. A recipe branch
-   with no local ref is dropped loudly rather than aborting the gate.
+1. **Verify what can be integration-built.** The recipe is DERIVED from the pass
+   by ONE rule — **nothing blocked at or above it** — over the plan's DAG order.
+   Whether a branch happened to merge something in the last few minutes says
+   nothing about whether its content integrates, so an un-advanced branch is
+   verified like any other; a branch with something blocked above it is not,
+   because its window is cut there and a sibling carrying content ABOVE that cut
+   re-creates, inside the rebuild, the very conflict the cut represents — the
+   branch is then named the offender and rolled back for a conflict that is
+   pending propagation, not integration breakage. Structural, not policy: two
+   branches at different cut points do not merge into one tree. Blocked: a
+   proposal that PREDATES the pass, a branch UNDER REPAIR and everything beneath
+   it, a case still OPEN, and a branch THIS PASS cut. A recipe branch with no
+   local ref is dropped loudly rather than aborting the gate.
+
+   **The recipe is not the push set.** "Can this be integration-built" and "did
+   the pass produce something legitimate here" are different questions, and
+   coupling them is a defect. A branch merged to its cut point holds a complete,
+   consistent prefix, and its held PR is opened against origin's copy of that
+   prefix — so it is pushed even though it cannot be built. Withholding it
+   diverges the branch from its own PR base and repeats the work every pass until
+   the owner acts. A PARTIAL build is a valid pass, not a degraded one; what makes
+   it valid is that the result says what it covered and what it left out. Content
+   pushed at a cut point was in no integration build, and that is reported per
+   branch with its reason (§10.7) — never prevented by withholding the push.
    The rebuild base is the fork trunk `main_patched`, not bare `main`:
    merging a fork branch onto `main` recreates the fork-content conflicts it was
    merged past, and `main_patched ⊇ main`, so upstream-chain branches still
@@ -1685,12 +1698,11 @@ never API ref fabrication:
   (§4.4). Held PRs are created AFTER the pass's target pushes, so the origin base
   already carries the clean prefix and the diff is the run's real changes only, with
   no pending-range bloat. A pristine-conflict draft head is ONE commit — the
-  automerge tree parented on the branch tip and the conflict head. The PR's diff
-  against its base is that tree either way, so splitting it into a prefix commit
-  and a conflict commit was presentational; the single form makes `parents[0]`
-  the base tip, which is what the driver-shape walk reads (§5.6). The clean-prefix
-  commit lives on in the case WORKTREE, where it is what makes `git status` show
-  exactly the conflict.
+  automerge tree parented on the branch tip and the conflict head — because the
+  driver-shape walk (§5.6) needs `parents[0]` to BE the base tip to tell whether
+  anyone else has pushed to the ref. The PR's diff against its base is that tree
+  however many commits carry it. The clean-prefix commit belongs to the case
+  WORKTREE, where it is what makes `git status` show exactly the conflict.
 - **JUDGED** — the fix/sweep ref is pushed at the REAL merge commit and the
   non-draft PR is created BEFORE the target push; the target push then lands the
   same commit on the base and GitHub auto-marks the PR merged — history preserved,
@@ -1760,6 +1772,18 @@ vs failed), `failedPushes` / `failedPublishes`, and on a partial result
 `ownerPullRequests` lists every OWNER-shaped PR that no longer merges or no
 longer passes (§5.6), drafted by us or not, every pass — the one-time draft
 conversion is a courtesy, this list is the notification.
+
+`coverage` says what the integration build actually covered: `built` (the recipe)
+and `excluded`, one entry per branch with the reason it was left out — cut this
+pass, blocked before it, under repair, or carrying an open case. A partial build
+is a valid pass, so `ok` stays true; what the owner must not have to infer is
+WHICH branches shipped without one. `pushedUnbuilt` names the branches whose
+merges landed on origin while sitting outside the build — every branch pushed at
+a cut point is in it, and an empty list is the ordinary case worth stating.
+
+`withheldPushes` names branches whose merges were NOT pushed, with the reason. A
+pass that merges locally and ships nothing must say so in the result; reporting
+it in a log line only is how a stalled estate looks like a healthy one.
 
 `pullRequests` lists every PR the pass touched — each with number, url, title, live
 status, a landed/failureCategory annotation, and a `kind` of

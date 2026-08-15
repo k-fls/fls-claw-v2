@@ -4446,13 +4446,14 @@ async function publishHead(
       return { headSha, mode: 'held', draft: true, escalation };
     }
     // DRAFT: the pristine conflict, as ONE commit — the automerge tree parented
-    // on the branch tip and the conflict head. The PR's diff against its base is
-    // that tree either way, so splitting it into a clean prefix and a conflict
-    // commit was presentational; and the single form makes `parents[0]` the base
-    // tip, which is what the first-parent walk down to the base reads to decide
-    // whether this head is still the driver's. The clean-prefix commit lives on
-    // in the case WORKTREE, where it is load-bearing: it is what makes
-    // `git status` show exactly the conflict and nothing else.
+    // on the branch tip and the conflict head. One commit because the ref has to
+    // stay readable as the driver's: the first-parent walk down to the base is
+    // what decides whether anyone else has pushed here, and it needs
+    // `parents[0]` to BE the base tip. The PR's diff against its base is this
+    // tree however many commits carry it, so nothing is lost by not splitting.
+    //
+    // The clean-prefix commit belongs to the case WORKTREE, where it is
+    // load-bearing: it is what makes `git status` show exactly the conflict.
     const headSha = await deterministicCommit(
       cli.repo,
       probe.treeOid,
