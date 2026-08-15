@@ -2779,6 +2779,120 @@ describe('sweep start — origin-derived merge_status', () => {
     expect(repo.git('-C', bare, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep')).toBe('');
   });
 
+  /**
+   * A DRIVER-shaped ANSWER on the fix ref: a resolution tree with no markers,
+   * so its disposition turns on whether it still merges and still passes.
+   */
+  function pushDriverAnswer(repo: FixtureRepo): { fixBranch: string; fixHead: string } {
+    const u1 = repo.sha('main');
+    const mpTip = repo.sha('main_patched');
+    repo.checkout('tmp-answer', { create: true, at: 'main_patched' });
+    repo.commit('tmp: resolution content', { 'src/x.ts': 'RESOLVED\n' });
+    const tree = repo.git('rev-parse', 'tmp-answer^{tree}');
+    repo.checkout('main');
+    repo.git('branch', '-D', 'tmp-answer');
+    const fixHead = execFileSync(
+      'git',
+      ['-C', repo.dir, 'commit-tree', tree, '-p', mpTip, '-p', u1, '-m', 'Resolution for owner review'],
+      { encoding: 'utf8', env: { ...process.env, ...DRIVER_COMMIT_ENV } },
+    ).trim();
+    const fixBranch = `fix/sweep/main_patched--main-h1-${u1.slice(0, 8)}`;
+    repo.git('push', 'origin', `${fixHead}:refs/heads/${fixBranch}`);
+    return { fixBranch, fixHead };
+  }
+  /** A checks-file with one typecheck command the fake runners key off. */
+  function answerChecks(ws: string): string {
+    const f = join(ws, 'answer-checks.json');
+    writeFileSync(f, JSON.stringify({ typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }], test: [] }));
+    return f;
+  }
+
+  it('a driver ANSWER whose checks are RED has its ref deleted — the case derives fresh', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    pushDriverAnswer(repo);
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const runs: string[][] = [];
+    const alwaysRed: ChecksRunner = async (commands) => {
+      runs.push(commands.map((c) => c.cmd));
+      return { ok: false, failedNames: commands.map((c) => c.cmd), output: 'boom\n' };
+    };
+    const gh = fakeGithub({ 'GET /pulls?': openPr });
+    expect(
+      await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile, checksFile: answerChecks(ws) }), gh.factory, alwaysRed),
+    ).toBe(0);
+    // Red twice on the same tree IS a red: the probe confirms it and the delete
+    // goes ahead.
+    expect(runs.length).toBe(2);
+    const journal = readJournal(dirOf(repo, ws));
+    expect(journal.find((e) => e.action === 'proposal-dropped')!.reason).toContain('does not pass');
+    expect(repo.git('-C', bare, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep')).toBe('');
+  });
+
+  it('a FLAKY red never deletes: red then green on the same tree is non-determinism, reported and left alone', async () => {
+    // Deleting is the one row the next pass cannot walk back — it closes the
+    // review thread and discards the resolution. Under a flaky check the driver
+    // would delete and re-create the same PR on alternating passes, with a new
+    // number each time.
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { fixBranch, fixHead } = pushDriverAnswer(repo);
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    let call = 0;
+    const flaky: ChecksRunner = async (commands) => {
+      call += 1;
+      const failedNames = call === 1 ? commands.map((c) => c.cmd) : [];
+      return { ok: failedNames.length === 0, failedNames, output: failedNames.length ? 'boom\n' : '' };
+    };
+    const gh = fakeGithub({ 'GET /pulls?': openPr });
+    expect(
+      await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile, checksFile: answerChecks(ws) }), gh.factory, flaky),
+    ).toBe(0);
+    const journal = readJournal(dirOf(repo, ws));
+    expect(journal.some((e) => e.action === 'proposal-dropped')).toBe(false);
+    const undecided = journal.find((e) => e.action === 'proposal-check-undecided')!;
+    expect(undecided.id).toBe('WARN17_VERIFY_FLAKY');
+    expect(undecided.prNumber).toBe(12);
+    expect(undecided.detail as string).toContain('PASSED on a re-run');
+    // The ref is untouched and the branch stays blocked on its open proposal.
+    expect(repo.git('-C', bare, 'rev-parse', `refs/heads/${fixBranch}`)).toBe(fixHead);
+    expect(journal.some((e) => e.action === 'origin-blocked' && e.branch === 'main_patched')).toBe(true);
+  });
+
+  it('a SPAWN fault never deletes: a check that could not run is an environment fault, not a red', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { fixBranch, fixHead } = pushDriverAnswer(repo);
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    // What `defaultChecksRunner` books when spawnSync returns status null.
+    const spawnFault: ChecksRunner = async (commands) => ({
+      ok: false,
+      failedNames: commands.map((c) => c.cmd),
+      output: '',
+      environmentFault: { cmd: commands[0].cmd, detail: `'${commands[0].cmd}' did not run: spawn ENOENT` },
+    });
+    const gh = fakeGithub({ 'GET /pulls?': openPr });
+    expect(
+      await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile, checksFile: answerChecks(ws) }), gh.factory, spawnFault),
+    ).toBe(0);
+    const journal = readJournal(dirOf(repo, ws));
+    expect(journal.some((e) => e.action === 'proposal-dropped')).toBe(false);
+    expect(journal.find((e) => e.action === 'proposal-check-undecided')!.id).toBe('WARN14_ENVIRONMENT_FAULT');
+    expect(repo.git('-C', bare, 'rev-parse', `refs/heads/${fixBranch}`)).toBe(fixHead);
+  });
+
   it('a dropped proposal is NAMED in the finish result — a closed PR is never silent', async () => {
     // The drop closes somebody's pull request and takes the resolution on it
     // with it, and the next `start` wipes the journal that recorded it. If the

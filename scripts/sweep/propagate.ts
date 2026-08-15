@@ -1083,6 +1083,27 @@ function droppedProposalRows(
     }));
 }
 
+/**
+ * THE PROPOSALS NOBODY COULD JUDGE. The merged-tree probe disagreed with itself
+ * on the same tree, or never ran at all, so the disposition that a red would
+ * have driven — deleting the ref — did not happen. The pull request stands
+ * exactly where it was; what needs reporting is the unstable check.
+ */
+function undecidedProposalRows(
+  journal: JournalEntry[],
+): Array<{ branch: string; ref: string; number: number; url: string; id: string; detail: string }> {
+  return journal
+    .filter((e) => e.action === 'proposal-check-undecided')
+    .map((e) => ({
+      branch: String(e.branch ?? ''),
+      ref: String(e.ref ?? ''),
+      number: typeof e.prNumber === 'number' ? e.prNumber : 0,
+      url: String(e.prUrl ?? ''),
+      id: String(e.id ?? ''),
+      detail: String(e.detail ?? ''),
+    }));
+}
+
 /** The pass's coverage, from the journal and the plan on disk (§10.7). */
 function passCoverage(
   cli: Cli,
@@ -1988,6 +2009,15 @@ export interface ChecksRunResult {
   failedNames: string[];
   /** Concatenated stdout+stderr of the failed commands (written to an output file). */
   output: string;
+  /**
+   * A command that never RAN — the process could not be spawned (missing
+   * binary, OOM killer, fork failure), which `spawnSync` reports as a null
+   * status. That is an ENVIRONMENT FAULT, not a red check: the tree was never
+   * measured. It still counts as a failure for gates that must fail closed, but
+   * a reader deciding to destroy something on the strength of a red must see
+   * this field and refuse.
+   */
+  environmentFault?: { cmd: string; detail: string };
 }
 
 /**
@@ -2000,6 +2030,7 @@ export type ChecksRunner = (commands: VerifyCommand[], baseDir: string) => Promi
 export const defaultChecksRunner: ChecksRunner = async (commands, baseDir) => {
   const failedNames: string[] = [];
   let output = '';
+  let environmentFault: { cmd: string; detail: string } | undefined;
   for (const { cmd, cwd } of commands) {
     const res = spawnSync('bash', ['-c', cmd], {
       cwd: cwd ? join(baseDir, cwd) : baseDir,
@@ -2010,8 +2041,20 @@ export const defaultChecksRunner: ChecksRunner = async (commands, baseDir) => {
       failedNames.push(cmd);
       output += `$ ${cmd}\n${(res.stdout ?? '') + (res.stderr ?? '')}\n`;
     }
+    // A NULL STATUS IS NOT A VERDICT. The process did not run (or was killed by
+    // a signal), so the tree was never measured — reporting that as a failing
+    // check hands every consumer a red they can act on, including the ones that
+    // destroy something.
+    if (res.status === null && !environmentFault) {
+      environmentFault = {
+        cmd,
+        detail:
+          `'${cmd}' did not run: ${res.error ? res.error.message : `terminated by ${res.signal ?? 'an unknown signal'}`}` +
+          ' — an environment fault, not a failing check',
+      };
+    }
   }
-  return { ok: failedNames.length === 0, failedNames, output };
+  return { ok: failedNames.length === 0, failedNames, output, ...(environmentFault ? { environmentFault } : {}) };
 };
 
 /** Single-quote a path for `bash -c`. Paths here come from git, but never trust. */
@@ -6924,6 +6967,15 @@ async function exhibitedConflict(repo: string, tree: string): Promise<ConflictHu
 }
 
 /**
+ * The verdict of the merged-tree checks probe. `undecided` means the tree was
+ * not measured, and it is NOT a red: nothing may be destroyed on it.
+ */
+interface MergedChecksVerdict {
+  green: boolean;
+  undecided: { id: string; detail: string } | null;
+}
+
+/**
  * "Checks green" is the DRIVER'S OWN gate — the one `report-case` runs — on the
  * MERGED tree, never GitHub's check-runs: the sweep judges by the checks it
  * ships with, on the tree the merge would actually produce.
@@ -6932,6 +6984,15 @@ async function exhibitedConflict(repo: string, tree: string): Promise<ConflictHu
  * verdict reads as green: every consequence of red here is an intervention on
  * somebody's pull request, and the driver does not intervene on a measurement
  * it did not take.
+ *
+ * A RED IS RE-RUN BEFORE IT IS BELIEVED. The consequence of red on a driver
+ * answer is deleting the ref, which closes the review thread and discards the
+ * resolution — the one thing the next pass cannot walk back. A flaky check
+ * would delete and re-create the same pull request on alternating passes, with
+ * a new number each time. So the failing commands run AGAIN on the identical
+ * tree, exactly as the integration gate does, and a disagreement between the
+ * two runs is non-determinism: undecided, reported, nothing destroyed. A
+ * SPAWN-LEVEL fault is undecided for the same reason and never a red at all.
  */
 async function mergedChecksGreen(
   cli: Cli,
@@ -6939,14 +7000,35 @@ async function mergedChecksGreen(
   runChecks: ChecksRunner,
   mergedTree: string,
   parents: string[],
-): Promise<boolean> {
+): Promise<MergedChecksVerdict> {
+  const green: MergedChecksVerdict = { green: true, undecided: null };
   const checks = loadChecksConfig(checksFile);
-  if (!checks || checks.typecheck.length === 0) return true;
+  if (!checks || checks.typecheck.length === 0) return green;
   const probe = await deterministicCommit(cli.repo, mergedTree, parents, 'sweep: checks probe on the merged tree');
   const wt = await addTempWorktree(cli.repo, probe);
   try {
-    if (!(await installDeps(cli, wt.path))) return true;
-    return (await runChecks(checks.typecheck, wt.path)).ok;
+    if (!(await installDeps(cli, wt.path))) return green;
+    const first = await runChecks(checks.typecheck, wt.path);
+    if (first.environmentFault) {
+      return { green: false, undecided: { id: 'WARN14_ENVIRONMENT_FAULT', detail: first.environmentFault.detail } };
+    }
+    if (first.ok) return green;
+    const failed = checks.typecheck.filter((c) => first.failedNames.includes(c.cmd));
+    const again = await runChecks(failed, wt.path);
+    if (again.environmentFault) {
+      return { green: false, undecided: { id: 'WARN14_ENVIRONMENT_FAULT', detail: again.environmentFault.detail } };
+    }
+    const flaky = first.failedNames.filter((c) => !again.failedNames.includes(c));
+    if (flaky.length > 0) {
+      return {
+        green: false,
+        undecided: {
+          id: 'WARN17_VERIFY_FLAKY',
+          detail: `${flaky.join(', ')} failed and then PASSED on a re-run of the same tree`,
+        },
+      };
+    }
+    return { green: false, undecided: null };
   } finally {
     await wt.remove();
   }
@@ -7206,8 +7288,30 @@ async function deriveOriginMergeStatus(
       if (relation === null) {
         const probe = await newStyleMergeTree(cli.repo, targetTip, u.sha);
         mergeable = probe.clean;
-        checksGreen =
-          mergeable && (await mergedChecksGreen(cli, checksFile, runChecks, probe.treeOid, [targetTip, u.sha]));
+        if (mergeable) {
+          const verdict = await mergedChecksGreen(cli, checksFile, runChecks, probe.treeOid, [targetTip, u.sha]);
+          // AN UNDECIDED PROBE DECIDES NOTHING. A red here deletes the ref and
+          // closes the review thread, so a measurement that disagreed with
+          // itself, or never ran, must leave the proposal exactly as it stands
+          // and say so. The next pass measures again.
+          if (verdict.undecided) {
+            appendJournal(dir, {
+              action: 'proposal-check-undecided',
+              id: verdict.undecided.id,
+              ref: u.ref,
+              branch: u.branch,
+              headSha: u.sha,
+              prNumber: open.number,
+              prUrl: open.url,
+              detail: verdict.undecided.detail,
+            });
+            console.error(
+              `sweep start: '${u.ref}' (PR #${open.number}) left alone [${verdict.undecided.id}]: ${verdict.undecided.detail} — nothing deleted`,
+            );
+            return 'blocked';
+          }
+          checksGreen = verdict.green;
+        }
       }
 
       const action = disposeProposal({ shape, relation, mergeable, checksGreen, approved: false, baseMoved });
@@ -10692,17 +10796,26 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
    * out through whichever door the pass leaves by, cue included.
    */
   const finishResult = (artifact: Record<string, unknown>): void => {
-    const dropped = droppedProposalRows(readJournal(dir));
-    if (dropped.length === 0) {
+    const journalNow = readJournal(dir);
+    const dropped = droppedProposalRows(journalNow);
+    const undecided = undecidedProposalRows(journalNow);
+    if (dropped.length === 0 && undecided.length === 0) {
       result(cli, artifact);
       return;
     }
     const cue =
-      ` The sweep CLOSED ${dropped.length} pull request(s) whose proposal no longer applies: ` +
-      `${dropped.map((d) => `#${d.number} (${d.branch}: ${d.reason})`).join('; ')} — report them, they are gone from the owner's list otherwise.`;
+      (dropped.length
+        ? ` The sweep CLOSED ${dropped.length} pull request(s) whose proposal no longer applies: ` +
+          `${dropped.map((d) => `#${d.number} (${d.branch}: ${d.reason})`).join('; ')} — report them, they are gone from the owner's list otherwise.`
+        : '') +
+      (undecided.length
+        ? ` ${undecided.length} pull request(s) could not be judged and were left untouched: ` +
+          `${undecided.map((u) => `#${u.number} (${u.branch}: ${u.detail})`).join('; ')} — report the unstable check, do not re-run hoping for a verdict.`
+        : '');
     result(cli, {
       ...artifact,
-      droppedProposals: dropped,
+      ...(dropped.length ? { droppedProposals: dropped } : {}),
+      ...(undecided.length ? { undecidedProposals: undecided } : {}),
       ...(typeof artifact.instruction === 'string' ? { instruction: artifact.instruction + cue } : {}),
     });
   };

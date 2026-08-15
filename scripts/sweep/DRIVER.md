@@ -786,6 +786,20 @@ VERDICT, and no verdict reads as green: every consequence of red here is an
 intervention on somebody's pull request, and the driver does not intervene on a
 measurement it did not take.
 
+**A RED IS RE-RUN BEFORE IT IS BELIEVED, because DELETE is the one row the next
+pass cannot walk back.** Rebase, rebuild, leave and draft-and-report all
+re-evaluate next pass and converge; deleting closes the review thread where the
+decisions live and discards the resolution, so the case re-derives from zero and
+a flaky check deletes and re-creates the same PR on alternating passes with a
+new number each time. So before any delete driven by a red check, the failing
+commands run AGAIN on the identical tree — the integration gate's determinism
+probe (§10.2) — and a disagreement between the two runs is NON-DETERMINISM, not
+a red: nothing is deleted, the proposal stands, and the unstable check is
+reported (`undecidedProposals`, §10.7). A SPAWN-LEVEL fault — the command never
+ran (missing binary, OOM), which `spawnSync` reports as a null status — is an
+ENVIRONMENT FAULT (`WARN14_ENVIRONMENT_FAULT`) and never a failing check: the
+tree was not measured, so there is no verdict to act on.
+
 | Head | State | Action |
 |---|---|---|
 | driver | conflict healed | delete the ref (the PR closes) |
@@ -1784,6 +1798,12 @@ and discards the resolution on it, and the next `start` wipes the journal that
 recorded it, so this list is the only account of it there will ever be. It is
 carried by EVERY exit from `finish`, not only the completing one.
 
+`undecidedProposals` lists every proposal whose merged-tree checks could not be
+judged — the probe disagreed with itself on the same tree, or the command never
+ran — with the branch, PR number, url, the id (`WARN17_VERIFY_FLAKY` /
+`WARN14_ENVIRONMENT_FAULT`) and the detail. Nothing was deleted for these; what
+needs the owner is the unstable check.
+
 `coverage` says what the integration build actually covered: `built` (the recipe)
 and `excluded`, one entry per branch with the reason it was left out — cut this
 pass, blocked before it, under repair, or carrying an open case. A partial build
@@ -1873,10 +1893,10 @@ escalation's publish issues are written to `publish-<case>.json` and quoted into
 | `WARN11_PRE_MERGE_CHECK_SKIPPED` | `next-case` | a checks file was configured but unreadable, or its typecheck list is empty, so branches merged unverified |
 | `WARN12_SCOPE_WIDENED` | `report-case` | the `--not-my-bug` ownership probe returned `interaction`; the edit scope now includes the failing files |
 | `WARN13_DEPS_UNUSABLE` | `next-case` | a branch's dependencies would not install, so it could not be checked or blamed |
-| `WARN14_ENVIRONMENT_FAULT` | `report-case` | the failing output classifies as an environment fault, on the adjudication path or the ordinary checks path |
+| `WARN14_ENVIRONMENT_FAULT` | `report-case`, `start` | the failing output classifies as an environment fault, on the adjudication path or the ordinary checks path — or a proposal's checks command never ran, so its ref is left alone |
 | `WARN15_UPSTREAM_RED` | gate-fix minting | blame landed on upstream `main`; the mint is refused (journal + stderr) |
 | `WARN16_ESCALATION_BASE_BEHIND` | publish | a red-finish held escalation could not be transplanted onto origin's tip, so a wider-diff draft ships |
-| `WARN17_VERIFY_FLAKY` | verify | a verify command failed and then passed on the same tree; nothing blamed, nothing rolled back |
+| `WARN17_VERIFY_FLAKY` | verify, `start` | a command failed and then passed on the same tree: in verify nothing is blamed or rolled back; on a proposal's checks nothing is deleted |
 | `WARN18_BASE_GATED` | `finish` | the verify base carries an open gate-fix ref; verify is skipped and nothing can land |
 | `WARN19_GATE_COVERS_OTHER_DEFECT` | gate-fix minting | an active gate ref on the branch has a different failing-file digest |
 | `WARN20_ANCESTOR_GATED` | gate-fix minting | the branch descends from an ancestor that took a gate fix this pass and is still red |
