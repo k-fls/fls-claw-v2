@@ -21,7 +21,7 @@ import fs from 'fs';
 
 import { heartbeatPath } from '../../session-manager.js';
 import { readEnvFile } from '../../env.js';
-import type { ReactionOutcome } from '../../channels/adapter.js';
+import type { OutboundFile, ReactionOutcome } from '../../channels/adapter.js';
 
 const TYPING_REFRESH_MS = 4000;
 /**
@@ -61,7 +61,7 @@ const POST_DELIVERY_PAUSE_MS = 10000;
  * would need a coordinated change there before this could ship. See the plan's
  * KTD3.
  */
-const REACTION_INDICATOR_CHANNELS = new Set(['slack']);
+const WORKING_INDICATOR_CHANNELS = new Set(['slack']);
 
 const INDICATOR_EMOJI_KEY = 'SLACK_TYPING_EMOJI';
 /**
@@ -109,7 +109,7 @@ interface TypingAdapter {
     threadId: string | null,
     kind: string,
     content: string,
-    files?: unknown[],
+    files?: OutboundFile[],
     instance?: string,
   ): Promise<string | undefined>;
   deleteMessage?(
@@ -136,9 +136,9 @@ interface TypingTarget {
    * indicator reaction sits on. Null when the channel does not use the
    * reaction path, or when the inbound event carried no usable id.
    */
-  reactionMessageId: string | null;
+  indicatorMessageId: string | null;
   /** Whether THIS session currently holds a count on that message. */
-  reactionShown: boolean;
+  indicatorShown: boolean;
 }
 
 let adapter: TypingAdapter | null = null;
@@ -155,7 +155,7 @@ const typingRefreshers = new Map<string, TypingTarget>();
  * are still working. The instance is part of the key because two Slack apps in
  * one workspace are two distinct Slack users whose reactions are independent.
  */
-const reactionHolders = new Map<string, number>();
+const indicatorHolders = new Map<string, number>();
 
 /**
  * Adapter instances whose app cannot place reactions, latched on the first
@@ -225,24 +225,28 @@ function isHeartbeatFresh(agentGroupId: string, sessionId: string): boolean {
 }
 
 /**
- * True when this session signals work with a held reaction rather than
+ * True when this session signals work with the held indicator rather than
  * `setTyping`. Gated on the channel and on having a real target message —
  * NOT on thread shape, because neither Slack code path renders natively.
  */
-function usesReactionIndicator(entry: TypingTarget): boolean {
+function usesWorkingIndicator(entry: TypingTarget): boolean {
   return (
-    INDICATOR_EMOJI !== '' && entry.reactionMessageId !== null && REACTION_INDICATOR_CHANNELS.has(entry.channelType)
+    INDICATOR_EMOJI !== '' && entry.indicatorMessageId !== null && WORKING_INDICATOR_CHANNELS.has(entry.channelType)
   );
 }
 
-/** Snapshot the entry's indicator address; see IndicatorTarget. */
+/**
+ * Snapshot the entry's indicator address; see IndicatorTarget. Only called
+ * from paths that already established a target: show checks
+ * usesWorkingIndicator, and hide runs only for a holder, which implies one.
+ */
 function targetOf(entry: TypingTarget): IndicatorTarget {
   return {
     channelType: entry.channelType,
     platformId: entry.platformId,
     threadId: entry.threadId,
     instance: entry.instance,
-    messageId: entry.reactionMessageId!,
+    messageId: entry.indicatorMessageId!,
   };
 }
 
@@ -252,7 +256,7 @@ function instanceKey(t: IndicatorTarget): string {
 }
 
 /** Reference-count key: the indicator's full identity on the platform. */
-function reactionKey(t: IndicatorTarget): string {
+function indicatorKey(t: IndicatorTarget): string {
   return `${instanceKey(t)}|${t.platformId}|${t.messageId}`;
 }
 
@@ -279,16 +283,14 @@ async function pulseIndicator(t: IndicatorTarget, on: boolean): Promise<Reaction
 /** Post the fallback placeholder, returning its id — or undefined if it failed. */
 async function postPlaceholder(t: IndicatorTarget): Promise<string | undefined> {
   try {
-    return (
-      (await adapter?.deliver?.(
-        t.channelType,
-        t.platformId,
-        t.threadId,
-        'chat',
-        JSON.stringify({ text: PLACEHOLDER_TEXT }),
-        undefined,
-        t.instance,
-      )) ?? undefined
+    return await adapter?.deliver?.(
+      t.channelType,
+      t.platformId,
+      t.threadId,
+      'chat',
+      JSON.stringify({ text: PLACEHOLDER_TEXT }),
+      undefined,
+      t.instance,
     );
   } catch {
     // Best-effort, exactly like the reaction path: no indicator this turn.
@@ -328,13 +330,13 @@ async function acquireIndicator(t: IndicatorTarget): Promise<string | undefined>
  * Idempotent: a session that already holds one issues nothing, which is what
  * makes the interval tick a liveness check rather than a reaction driver.
  */
-function showReaction(entry: TypingTarget): void {
-  if (entry.reactionShown || !usesReactionIndicator(entry)) return;
+function showIndicator(entry: TypingTarget): void {
+  if (entry.indicatorShown || !usesWorkingIndicator(entry)) return;
   const t = targetOf(entry);
-  const key = reactionKey(t);
-  const held = reactionHolders.get(key) ?? 0;
-  reactionHolders.set(key, held + 1);
-  entry.reactionShown = true;
+  const key = indicatorKey(t);
+  const held = indicatorHolders.get(key) ?? 0;
+  indicatorHolders.set(key, held + 1);
+  entry.indicatorShown = true;
   if (held === 0) indicatorOps.set(key, acquireIndicator(t));
 }
 
@@ -344,17 +346,17 @@ function showReaction(entry: TypingTarget): void {
  * releases is the one it acquired, and the snapshot it tears down with is the
  * address it acquired against.
  */
-function hideReaction(entry: TypingTarget): void {
-  if (!entry.reactionShown) return;
+function hideIndicator(entry: TypingTarget): void {
+  if (!entry.indicatorShown) return;
   const t = targetOf(entry);
-  const key = reactionKey(t);
-  const remaining = (reactionHolders.get(key) ?? 1) - 1;
-  entry.reactionShown = false;
+  const key = indicatorKey(t);
+  const remaining = (indicatorHolders.get(key) ?? 1) - 1;
+  entry.indicatorShown = false;
   if (remaining > 0) {
-    reactionHolders.set(key, remaining);
+    indicatorHolders.set(key, remaining);
     return;
   }
-  reactionHolders.delete(key);
+  indicatorHolders.delete(key);
   // Chain off the acquire so teardown matches setup even when the burst ends
   // before the platform answered.
   const pending = indicatorOps.get(key) ?? Promise.resolve(undefined);
@@ -370,8 +372,8 @@ function hideReaction(entry: TypingTarget): void {
  * immediate tick, the interval tick, and the re-trigger so all three agree.
  */
 function fireWorkingSignal(entry: TypingTarget): void {
-  if (usesReactionIndicator(entry)) {
-    showReaction(entry);
+  if (usesWorkingIndicator(entry)) {
+    showIndicator(entry);
     return;
   }
   triggerTyping(entry.channelType, entry.platformId, entry.threadId, entry.instance).catch(() => {});
@@ -404,14 +406,14 @@ export function startTypingRefresh(
     //
     // A re-trigger can arrive from a different chat address (agent-shared
     // sessions span messaging groups, possibly on different platforms or
-    // instances). The held reaction belongs to the OLD address, so release it
-    // there before the address moves and drop the now-foreign target id —
+    // instances). The held indicator belongs to the OLD address, so release
+    // it there before the address moves and drop the now-foreign target id —
     // otherwise a later tick would toggle a Slack ts against Telegram.
     const addressChanged =
       existing.channelType !== channelType || existing.platformId !== platformId || existing.instance !== instance;
     if (addressChanged) {
-      hideReaction(existing);
-      existing.reactionMessageId = null;
+      hideIndicator(existing);
+      existing.indicatorMessageId = null;
     }
     existing.startedAt = Date.now();
     existing.pausedUntil = 0;
@@ -426,8 +428,8 @@ export function startTypingRefresh(
     // Seed a target only if we have none. The reaction is held for the whole
     // burst (R2), so a follow-up message inside one burst does not pay a
     // remove+add to move the indicator onto itself.
-    if (existing.reactionMessageId === null && triggerMessageId) {
-      existing.reactionMessageId = triggerMessageId;
+    if (existing.indicatorMessageId === null && triggerMessageId) {
+      existing.indicatorMessageId = triggerMessageId;
     }
     // Immediate signal for the new inbound, fired from the now-updated entry.
     fireWorkingSignal(existing);
@@ -459,7 +461,7 @@ export function startTypingRefresh(
     // Out of grace AND heartbeat stale — agent is idle, stop refreshing.
     // A reaction does not expire the way a native indicator does, so it has
     // to come off before the entry goes.
-    hideReaction(entry);
+    hideIndicator(entry);
     clearInterval(entry.interval);
     typingRefreshers.delete(sessionId);
   }, TYPING_REFRESH_MS);
@@ -474,8 +476,8 @@ export function startTypingRefresh(
     interval,
     startedAt,
     pausedUntil: 0,
-    reactionMessageId: triggerMessageId ?? null,
-    reactionShown: false,
+    indicatorMessageId: triggerMessageId ?? null,
+    indicatorShown: false,
   };
   typingRefreshers.set(sessionId, entry);
   // Immediate signal, fired from the stored entry so the reaction path and
@@ -500,7 +502,7 @@ export function pauseTypingRefreshAfterDelivery(sessionId: string): void {
   const entry = typingRefreshers.get(sessionId);
   if (!entry) return;
   entry.pausedUntil = Date.now() + POST_DELIVERY_PAUSE_MS;
-  hideReaction(entry);
+  hideIndicator(entry);
 }
 
 export function stopTypingRefresh(sessionId: string): void {
@@ -509,7 +511,7 @@ export function stopTypingRefresh(sessionId: string): void {
   // Unlike a native typing indicator, a reaction stays until removed — so
   // every exit edge (idle timeout, container exit, failed wake, shutdown)
   // has to take it off or it strands on the user's message.
-  hideReaction(entry);
+  hideIndicator(entry);
   clearInterval(entry.interval);
   typingRefreshers.delete(sessionId);
 }
