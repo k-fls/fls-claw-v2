@@ -574,3 +574,25 @@ describe('createChatSdkBridge.pulseReaction — indicator reaction seam', () => 
     }
   });
 });
+
+describe('createChatSdkBridge.deleteMessage', () => {
+  it('addresses the thread when there is one, else the chat — matching deliver', async () => {
+    const calls: Array<{ threadId: string; messageId: string }> = [];
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({
+        deleteMessage: async (threadId: string, messageId: string) => {
+          calls.push({ threadId, messageId });
+        },
+      }),
+      supportsThreads: true,
+    });
+
+    await bridge.deleteMessage!('slack:C1', 'slack:C1:1700.1', 'msg-a');
+    await bridge.deleteMessage!('slack:D1', null, 'msg-b');
+
+    expect(calls).toEqual([
+      { threadId: 'slack:C1:1700.1', messageId: 'msg-a' },
+      { threadId: 'slack:D1', messageId: 'msg-b' },
+    ]);
+  });
+});

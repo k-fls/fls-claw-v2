@@ -701,6 +701,12 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       }
     },
 
+    async deleteMessage(platformId: string, threadId: string | null, messageId: string) {
+      // Same address mapping as deliver(), because this deletes something
+      // deliver() posted.
+      await adapter.deleteMessage(threadId ?? platformId, messageId);
+    },
+
     async teardown() {
       gatewayAbort?.abort();
       await chat.shutdown();

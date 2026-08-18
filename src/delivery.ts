@@ -73,6 +73,14 @@ export interface ChannelDeliveryAdapter {
     on: boolean,
     instance?: string,
   ): Promise<ReactionOutcome>;
+  /** Delete a message this bot posted. See ChannelAdapter.deleteMessage. */
+  deleteMessage?(
+    channelType: string,
+    platformId: string,
+    threadId: string | null,
+    messageId: string,
+    instance?: string,
+  ): Promise<void>;
 }
 
 let deliveryAdapter: ChannelDeliveryAdapter | null = null;

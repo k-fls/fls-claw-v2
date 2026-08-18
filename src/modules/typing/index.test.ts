@@ -82,6 +82,15 @@ function touchHeartbeat(agentGroupId: string, sessionId: string): void {
   fs.utimesSync(hb, secs, secs);
 }
 
+/** Advance the clock with the agent visibly working (heartbeat kept fresh). */
+async function advanceWorking(ms: number, agentGroupId: string, sessionId: string): Promise<void> {
+  const STEP = 2_000;
+  for (let elapsed = 0; elapsed < ms; elapsed += STEP) {
+    touchHeartbeat(agentGroupId, sessionId);
+    await vi.advanceTimersByTimeAsync(Math.min(STEP, ms - elapsed));
+  }
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
 });
@@ -187,15 +196,6 @@ describe('Slack reaction indicator — hold-one lifecycle', () => {
     fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
   });
 
-  /** Advance the clock with the agent visibly working (heartbeat kept fresh). */
-  async function advanceWorking(ms: number, agentGroupId: string, sessionId: string): Promise<void> {
-    const STEP = 2_000;
-    for (let elapsed = 0; elapsed < ms; elapsed += STEP) {
-      touchHeartbeat(agentGroupId, sessionId);
-      await vi.advanceTimersByTimeAsync(Math.min(STEP, ms - elapsed));
-    }
-  }
-
   it('adds once on start and holds it across ticks (AE1)', async () => {
     const { typing, reactions } = captureBoth();
     startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, undefined, 'ts-100');
@@ -277,6 +277,7 @@ describe('Slack reaction indicator — hold-one lifecycle', () => {
     reactions.length = 0;
 
     stopTypingRefresh('sess-1');
+    await await vi.advanceTimersByTimeAsync(0);
     expect(reactions).toEqual([
       {
         channelType: 'slack',
@@ -290,6 +291,7 @@ describe('Slack reaction indicator — hold-one lifecycle', () => {
 
     // Idempotent: the entry is gone, so a second stop is silent.
     stopTypingRefresh('sess-1');
+    await await vi.advanceTimersByTimeAsync(0);
     expect(reactions).toHaveLength(1);
   });
 
@@ -298,9 +300,11 @@ describe('Slack reaction indicator — hold-one lifecycle', () => {
     startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, undefined, 'ts-100');
     await vi.advanceTimersByTimeAsync(0);
     pauseTypingRefreshAfterDelivery('sess-1'); // reply landed → reaction cleared
+    await await vi.advanceTimersByTimeAsync(0);
     reactions.length = 0;
 
     stopTypingRefresh('sess-1');
+    await await vi.advanceTimersByTimeAsync(0);
     expect(reactions).toHaveLength(0);
   });
 
@@ -313,6 +317,7 @@ describe('Slack reaction indicator — hold-one lifecycle', () => {
     // Agent-shared sessions span messaging groups, possibly across platforms.
     startTypingRefresh('sess-1', 'ag-1', 'telegram', 'tg:99', null, 'telegram', 'tg-msg-1');
     await vi.advanceTimersByTimeAsync(0);
+    await await vi.advanceTimersByTimeAsync(0);
 
     // The remove must go to the OLD Slack address and instance — sending it
     // with the new address would strand the reaction and poke Telegram with
@@ -380,9 +385,11 @@ describe('Slack reaction indicator — hold-one lifecycle', () => {
     expect(reactions).toEqual([expect.objectContaining({ messageId: 'ts-100', on: true })]);
 
     stopTypingRefresh('sess-1');
+    await await vi.advanceTimersByTimeAsync(0);
     expect(reactions).toHaveLength(1); // still one holder — indicator stays lit
 
     stopTypingRefresh('sess-2');
+    await await vi.advanceTimersByTimeAsync(0);
     expect(reactions.map((r) => r.on)).toEqual([true, false]);
   });
 
@@ -398,8 +405,10 @@ describe('Slack reaction indicator — hold-one lifecycle', () => {
     ]);
 
     stopTypingRefresh('sess-1');
+    await await vi.advanceTimersByTimeAsync(0);
     expect(reactions.at(-1)).toMatchObject({ instance: 'slack-tester', on: false });
     stopTypingRefresh('sess-2');
+    await await vi.advanceTimersByTimeAsync(0);
     expect(reactions.at(-1)).toMatchObject({ instance: 'slack-worker', on: false });
   });
 
@@ -411,6 +420,7 @@ describe('Slack reaction indicator — hold-one lifecycle', () => {
     expect(reactions).toHaveLength(1); // still held, never re-issued
 
     pauseTypingRefreshAfterDelivery('sess-1'); // an interim reply landed
+    await await vi.advanceTimersByTimeAsync(0);
     expect(reactions.at(-1)).toMatchObject({ messageId: 'ts-100', on: false });
     reactions.length = 0;
 
@@ -438,6 +448,7 @@ describe('Slack reaction indicator — hold-one lifecycle', () => {
     expect(reactions).toHaveLength(0); // no remove/add churn to chase ts-200
 
     stopTypingRefresh('sess-1');
+    await await vi.advanceTimersByTimeAsync(0);
     expect(reactions).toEqual([expect.objectContaining({ messageId: 'ts-100', on: false })]);
   });
 
@@ -448,6 +459,7 @@ describe('Slack reaction indicator — hold-one lifecycle', () => {
     const { reactions } = captureBoth();
     startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, undefined, 'ts-100');
     stopTypingRefresh('sess-1');
+    await await vi.advanceTimersByTimeAsync(0);
 
     expect(reactions.map((r) => r.on)).toEqual([true, false]);
   });
@@ -459,6 +471,7 @@ describe('Slack reaction indicator — hold-one lifecycle', () => {
     await advanceWorking(20_000, 'ag-1', 'sess-1');
 
     pauseTypingRefreshAfterDelivery('sess-1');
+    await await vi.advanceTimersByTimeAsync(0);
     reactions.length = 0;
 
     // Pause expires with a stale heartbeat and out of grace: that was the
@@ -469,5 +482,154 @@ describe('Slack reaction indicator — hold-one lifecycle', () => {
     // Proof the interval really stopped: a fresh heartbeat does not revive it.
     await advanceWorking(12_000, 'ag-1', 'sess-1');
     expect(reactions).toHaveLength(0);
+  });
+});
+
+describe('Slack working indicator — placeholder fallback', () => {
+  // reactions:write is a bot scope the Slack app was probably never installed
+  // with, and adding it needs a reinstall that mints a new token. Until that
+  // happens every reaction call fails, so the indicator falls back to posting
+  // a message and deleting it — which needs no scope beyond the chat:write
+  // the app already holds to reply at all.
+  type Posted = { platformId: string; threadId: string | null; content: string; instance?: string };
+  type Deleted = { platformId: string; threadId: string | null; messageId: string; instance?: string };
+
+  function captureFallback(opts: { reaction?: 'ok' | 'failed' | 'unsupported'; postFails?: boolean } = {}) {
+    const reactions: ReactionCall[] = [];
+    const posted: Posted[] = [];
+    const deleted: Deleted[] = [];
+    let postSeq = 0;
+    setTypingAdapter({
+      async setTyping() {},
+      async pulseReaction(channelType, platformId, messageId, emoji, on, instance) {
+        reactions.push({ channelType, platformId, messageId, emoji, on, instance });
+        return opts.reaction ?? 'unsupported';
+      },
+      async deliver(_channelType, platformId, threadId, _kind, content, _files, instance) {
+        posted.push({ platformId, threadId, content, instance });
+        if (opts.postFails) throw new Error('post failed');
+        return `placeholder-${++postSeq}`;
+      },
+      async deleteMessage(_channelType, platformId, threadId, messageId, instance) {
+        deleted.push({ platformId, threadId, messageId, instance });
+      },
+    });
+    return { reactions, posted, deleted };
+  }
+
+  afterEach(() => {
+    for (const id of ['sess-1', 'sess-2', 'sess-3']) stopTypingRefresh(id);
+    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  });
+
+  it('latches on a permission-class refusal and posts a placeholder instead (AE6)', async () => {
+    const { reactions, posted, deleted } = captureFallback();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'inst-latch-a', 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(reactions).toHaveLength(1);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).toMatchObject({ platformId: 'slack:D1', threadId: null, instance: 'inst-latch-a' });
+
+    stopTypingRefresh('sess-1');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(deleted).toEqual([
+      { platformId: 'slack:D1', threadId: null, messageId: 'placeholder-1', instance: 'inst-latch-a' },
+    ]);
+  });
+
+  it('stops attempting reactions on a latched instance', async () => {
+    const { reactions, posted } = captureFallback();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'inst-latch-b', 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+    stopTypingRefresh('sess-1');
+    await vi.advanceTimersByTimeAsync(0);
+    reactions.length = 0;
+
+    // A later burst on the same instance goes straight to the placeholder —
+    // one doomed API call per turn forever is exactly what the latch avoids.
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D2', null, 'inst-latch-b', 'ts-200');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reactions).toHaveLength(0);
+    expect(posted).toHaveLength(2);
+  });
+
+  it('does not latch on benign drift', async () => {
+    const { reactions, posted } = captureFallback({ reaction: 'failed' });
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'inst-drift', 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+    stopTypingRefresh('sess-1');
+    await vi.advanceTimersByTimeAsync(0);
+
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'inst-drift', 'ts-200');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(posted).toHaveLength(0); // never fell back
+    expect(reactions.filter((r) => r.on)).toHaveLength(2); // tried again
+  });
+
+  it('latches per instance — a sibling bot still tries reactions', async () => {
+    const { reactions, posted } = captureFallback();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null, 'inst-solo-a', 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(posted).toHaveLength(1);
+    reactions.length = 0;
+
+    // A second Slack app in the same workspace is a different install with a
+    // different token, so its scopes are its own question.
+    startTypingRefresh('sess-2', 'ag-2', 'slack', 'slack:C1', null, 'inst-solo-b', 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reactions).toEqual([expect.objectContaining({ instance: 'inst-solo-b', on: true })]);
+  });
+
+  it('deletes the placeholder when a reply lands, and re-posts if work continues', async () => {
+    const { posted, deleted } = captureFallback();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'inst-reply', 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+    await advanceWorking(20_000, 'ag-1', 'sess-1');
+    expect(posted).toHaveLength(1);
+
+    pauseTypingRefreshAfterDelivery('sess-1');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(deleted).toEqual([expect.objectContaining({ messageId: 'placeholder-1' })]);
+
+    await advanceWorking(12_000, 'ag-1', 'sess-1');
+    expect(posted).toHaveLength(2); // still working → indicator returns
+  });
+
+  it('deletes the placeholder when the agent goes idle rather than stranding it', async () => {
+    const { posted, deleted } = captureFallback();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'inst-idle', 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(posted).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(20_000); // no heartbeat ever
+    expect(deleted).toEqual([expect.objectContaining({ messageId: 'placeholder-1' })]);
+  });
+
+  it('posts one placeholder for a message that fanned out to several agents', async () => {
+    const { posted, deleted } = captureFallback();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null, 'inst-fan', 'ts-100');
+    startTypingRefresh('sess-2', 'ag-2', 'slack', 'slack:C1', null, 'inst-fan', 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(posted).toHaveLength(1);
+
+    stopTypingRefresh('sess-1');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(deleted).toHaveLength(0); // one agent still working
+
+    stopTypingRefresh('sess-2');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(deleted).toEqual([expect.objectContaining({ messageId: 'placeholder-1' })]);
+  });
+
+  it('issues no delete when the placeholder post itself failed', async () => {
+    const { deleted } = captureFallback({ postFails: true });
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'inst-postfail', 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+
+    stopTypingRefresh('sess-1');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(deleted).toHaveLength(0);
   });
 });
