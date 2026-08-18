@@ -418,6 +418,35 @@ describe('Slack reaction indicator — hold-one lifecycle', () => {
     expect(reactions).toHaveLength(1);
   });
 
+  it('keeps the reaction on the message that started the burst (AE1)', async () => {
+    // The target is the message that triggered the work, seeded at routing
+    // time — not the agent's last reply, and not moved by a follow-up inbound
+    // inside the same burst. Holding it is what makes turn one work at all:
+    // on turn one there is no agent reply to react to.
+    const { reactions } = captureBoth();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, undefined, 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+    reactions.length = 0;
+
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, undefined, 'ts-200');
+    await vi.advanceTimersByTimeAsync(4_500);
+    expect(reactions).toHaveLength(0); // no remove/add churn to chase ts-200
+
+    stopTypingRefresh('sess-1');
+    expect(reactions).toEqual([expect.objectContaining({ messageId: 'ts-100', on: false })]);
+  });
+
+  it('removes the reaction when the container never wakes', async () => {
+    // routeInbound starts the refresher, then stops it if wakeContainer
+    // reports a transient spawn failure. Without a removal on that edge the
+    // user is left looking at an indicator for work that never began.
+    const { reactions } = captureBoth();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, undefined, 'ts-100');
+    stopTypingRefresh('sess-1');
+
+    expect(reactions.map((r) => r.on)).toEqual([true, false]);
+  });
+
   it('does not re-add after the pause when the agent has gone quiet', async () => {
     const { reactions } = captureBoth();
     startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, undefined, 'ts-100');
