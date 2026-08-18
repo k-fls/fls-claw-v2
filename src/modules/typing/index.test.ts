@@ -22,6 +22,11 @@ vi.mock('../../config.js', async () => {
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-typing' };
 });
 
+// Pin the indicator emoji to its default: these arms are about lifecycle, and
+// a developer with SLACK_TYPING_EMOJI set in their own .env would otherwise
+// fail them. Resolution itself is covered in emoji-config.test.ts.
+vi.mock('../../env.js', () => ({ readEnvFile: () => ({}) }));
+
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter, startTypingRefresh, stopTypingRefresh } from './index.js';
 
 const TEST_DATA_DIR = '/tmp/nanoclaw-test-typing';
