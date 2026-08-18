@@ -20,6 +20,7 @@
 import fs from 'fs';
 
 import { heartbeatPath } from '../../session-manager.js';
+import { readEnvFile } from '../../env.js';
 import type { ReactionOutcome } from '../../channels/adapter.js';
 
 const TYPING_REFRESH_MS = 4000;
@@ -62,8 +63,26 @@ const POST_DELIVERY_PAUSE_MS = 10000;
  */
 const REACTION_INDICATOR_CHANNELS = new Set(['slack']);
 
-/** Held on the triggering message for the duration of a work burst. */
-const INDICATOR_EMOJI = 'hourglass_flowing_sand';
+const INDICATOR_EMOJI_KEY = 'SLACK_TYPING_EMOJI';
+/**
+ * ⏳ — present in every workspace, so a fresh install shows a correct static
+ * indicator with no setup. The animated experience wants a custom emoji
+ * uploaded to the workspace, which the host cannot provision.
+ */
+const DEFAULT_INDICATOR_EMOJI = 'hourglass_flowing_sand';
+
+/**
+ * Emoji held on the triggering message for the duration of a work burst.
+ *
+ * Read once at module load through readEnvFile, so it never enters
+ * process.env and never reaches a child process — the same treatment the
+ * Slack tokens get. Three states: unset → the default above; a name → that
+ * name verbatim; empty (`SLACK_TYPING_EMOJI=` in .env) → the feature is off
+ * and no reaction call is ever made. That last one is the kill switch: turn
+ * it off and restart the host, no redeploy.
+ */
+const INDICATOR_EMOJI =
+  readEnvFile([INDICATOR_EMOJI_KEY], { keepEmpty: true })[INDICATOR_EMOJI_KEY] ?? DEFAULT_INDICATOR_EMOJI;
 
 interface TypingAdapter {
   setTyping?(channelType: string, platformId: string, threadId: string | null, instance?: string): Promise<void>;
@@ -153,7 +172,9 @@ function isHeartbeatFresh(agentGroupId: string, sessionId: string): boolean {
  * NOT on thread shape, because neither Slack code path renders natively.
  */
 function usesReactionIndicator(entry: TypingTarget): boolean {
-  return entry.reactionMessageId !== null && REACTION_INDICATOR_CHANNELS.has(entry.channelType);
+  return (
+    INDICATOR_EMOJI !== '' && entry.reactionMessageId !== null && REACTION_INDICATOR_CHANNELS.has(entry.channelType)
+  );
 }
 
 /** Reference-count key: the reaction's full identity on the platform. */
