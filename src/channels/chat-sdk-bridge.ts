@@ -23,7 +23,7 @@ import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { getAskQuestionRender } from '../db/sessions.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
-import type { ChannelAdapter, ChannelSetup, InboundMessage } from './adapter.js';
+import type { ChannelAdapter, ChannelSetup, InboundMessage, ReactionOutcome } from './adapter.js';
 
 /** Adapter with optional gateway support (e.g., Discord). */
 interface GatewayAdapter extends Adapter {
@@ -137,6 +137,25 @@ export function splitForLimit(text: string, limit: number): string[] {
 export function isFormatError(err: unknown): boolean {
   const m = err instanceof Error ? err.message : String(err);
   return /parse entit|find end of the entity|can't parse|Bad Request:.*entit/i.test(m);
+}
+
+/**
+ * A platform refused a reaction because the app lacks the permission to place
+ * one at all — Slack's `missing_scope` (no `reactions:write`),
+ * `not_allowed_token_type`, or `invalid_auth`. Distinct from benign state
+ * drift (`already_reacted`, `no_reaction`, `message_not_found`), which just
+ * means that one call did not take.
+ *
+ * Duck-typed on message and `name`, the same way isFormatError and
+ * channel-registry's isNetworkError are: `@chat-adapter/shared`'s typed error
+ * classes only exist once a channel skill has installed them, so trunk cannot
+ * `instanceof` them.
+ */
+function isPermissionClassError(err: unknown): boolean {
+  if (err instanceof Error && (err.name === 'PermissionError' || err.name === 'AuthenticationError')) return true;
+  const m = err instanceof Error ? err.message : String(err);
+  const code = typeof (err as { code?: unknown })?.code === 'string' ? (err as { code: string }).code : '';
+  return /missing_scope|not_allowed_token_type|invalid_auth/i.test(`${code} ${m}`);
 }
 
 /**
@@ -656,6 +675,30 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     async setTyping(platformId: string, threadId: string | null) {
       const tid = threadId ?? platformId;
       await adapter.startTyping(tid);
+    },
+
+    async pulseReaction(platformId: string, messageId: string, emoji: string, on: boolean): Promise<ReactionOutcome> {
+      // The chat address IS the thread id here: a reaction is addressed by
+      // channel + message id, so the same call works for a DM and for a
+      // message inside a channel thread. (Contrast deliver(), which needs the
+      // thread id to post INTO the right thread.)
+      //
+      // Never rejects — the working indicator must not be able to fail routing
+      // or delivery. Benign drift (already_reacted / no_reaction /
+      // message_not_found) reports `failed` and self-corrects on the next work
+      // burst; a permission-class refusal reports `unsupported` so the caller
+      // can stop paying for a doomed call every turn.
+      try {
+        if (on) await adapter.addReaction(platformId, messageId, emoji);
+        else await adapter.removeReaction(platformId, messageId, emoji);
+        return 'ok';
+      } catch (err) {
+        if (isPermissionClassError(err)) {
+          log.debug('Reaction refused for permission reasons', { adapter: adapter.name, platformId, err });
+          return 'unsupported';
+        }
+        return 'failed';
+      }
     },
 
     async teardown() {

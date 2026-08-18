@@ -349,3 +349,94 @@ describe('channel + router integration', () => {
     expect((mockAdapter.delivered[0].content as { text: string }).text).toBe('Agent response');
   });
 });
+
+describe('channel registry — pulseReaction instance routing', () => {
+  // The indicator reaction is an instance-addressed call, exactly like
+  // setTyping: two Slack apps in one workspace are two distinct Slack users,
+  // so a reaction placed through the wrong instance shows the wrong bot's
+  // avatar and cannot be removed by the owner.
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  afterEach(async () => {
+    const { teardownChannelAdapters } = await import('./channel-registry.js');
+    await teardownChannelAdapters();
+    vi.resetModules();
+  });
+
+  const mockSetup = () => ({
+    onInbound: () => {},
+    onInboundEvent: () => {},
+    onMetadata: () => {},
+    onAction: () => {},
+  });
+
+  interface PulseCall {
+    platformId: string;
+    messageId: string;
+    emoji: string;
+    on: boolean;
+  }
+
+  /** Mock adapter that records pulseReaction calls. */
+  function reactingAdapter(channelType: string, instance?: string) {
+    const pulses: PulseCall[] = [];
+    const adapter = createMockAdapter(channelType, instance);
+    return Object.assign(adapter, {
+      pulses,
+      async pulseReaction(platformId: string, messageId: string, emoji: string, on: boolean) {
+        pulses.push({ platformId, messageId, emoji, on });
+        return 'ok' as const;
+      },
+    });
+  }
+
+  it('forwards to the named instance, never to a same-channelType sibling', async () => {
+    const reg = await import('./channel-registry.js');
+    const worker = reactingAdapter('slack', 'slack-worker');
+    const tester = reactingAdapter('slack', 'slack-tester');
+    reg.registerChannelAdapter('slack-worker', { factory: () => worker });
+    reg.registerChannelAdapter('slack-tester', { factory: () => tester });
+    await reg.initChannelAdapters(mockSetup);
+
+    const bridge = reg.createChannelDeliveryAdapter();
+    const outcome = await bridge.pulseReaction!(
+      'slack',
+      'slack:C1',
+      'ts-1',
+      'hourglass_flowing_sand',
+      true,
+      'slack-tester',
+    );
+
+    expect(outcome).toBe('ok');
+    expect(tester.pulses).toEqual([
+      { platformId: 'slack:C1', messageId: 'ts-1', emoji: 'hourglass_flowing_sand', on: true },
+    ]);
+    expect(worker.pulses).toHaveLength(0);
+  });
+
+  it('reports failed without throwing when the adapter does not implement pulseReaction', async () => {
+    const reg = await import('./channel-registry.js');
+    // createMockAdapter has no pulseReaction — the shape of a stale adapter
+    // copy installed before this seam existed.
+    reg.registerChannelAdapter('slack', { factory: () => createMockAdapter('slack') });
+    await reg.initChannelAdapters(mockSetup);
+
+    const bridge = reg.createChannelDeliveryAdapter();
+    await expect(bridge.pulseReaction!('slack', 'slack:C1', 'ts-1', 'x', true, 'slack')).resolves.toBe('failed');
+  });
+
+  it('reports failed without throwing when the addressed instance is offline', async () => {
+    // An offline adapter must NOT read as `unsupported`: that would latch the
+    // caller's placeholder fallback for the process lifetime over a transient
+    // outage.
+    const reg = await import('./channel-registry.js');
+    reg.registerChannelAdapter('slack-tester', { factory: () => reactingAdapter('slack', 'slack-tester') });
+    await reg.initChannelAdapters(mockSetup);
+
+    const bridge = reg.createChannelDeliveryAdapter();
+    await expect(bridge.pulseReaction!('slack', 'slack:C1', 'ts-1', 'x', true, 'slack')).resolves.toBe('failed');
+  });
+});
