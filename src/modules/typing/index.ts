@@ -84,6 +84,15 @@ const DEFAULT_INDICATOR_EMOJI = 'hourglass_flowing_sand';
 const INDICATOR_EMOJI =
   readEnvFile([INDICATOR_EMOJI_KEY], { keepEmpty: true })[INDICATOR_EMOJI_KEY] ?? DEFAULT_INDICATOR_EMOJI;
 
+/**
+ * Fallback indicator for an app that cannot place reactions: posted when work
+ * starts, deleted when it ends. Fixed text on purpose — it is a "something is
+ * happening" signal, not a progress surface, and it costs a message plus an
+ * unread badge per turn, which is why it is the fallback and not the primary
+ * path.
+ */
+const PLACEHOLDER_TEXT = '_working…_';
+
 interface TypingAdapter {
   setTyping?(channelType: string, platformId: string, threadId: string | null, instance?: string): Promise<void>;
   pulseReaction?(
@@ -94,6 +103,22 @@ interface TypingAdapter {
     on: boolean,
     instance?: string,
   ): Promise<ReactionOutcome>;
+  deliver?(
+    channelType: string,
+    platformId: string,
+    threadId: string | null,
+    kind: string,
+    content: string,
+    files?: unknown[],
+    instance?: string,
+  ): Promise<string | undefined>;
+  deleteMessage?(
+    channelType: string,
+    platformId: string,
+    threadId: string | null,
+    messageId: string,
+    instance?: string,
+  ): Promise<void>;
 }
 
 interface TypingTarget {
@@ -131,6 +156,39 @@ const typingRefreshers = new Map<string, TypingTarget>();
  * one workspace are two distinct Slack users whose reactions are independent.
  */
 const reactionHolders = new Map<string, number>();
+
+/**
+ * Adapter instances whose app cannot place reactions, latched on the first
+ * permission-class refusal (`missing_scope` and friends). Adding the
+ * `reactions:write` scope requires reinstalling the Slack app, which mints a
+ * new token and therefore needs a host restart anyway — so a process-lifetime
+ * latch costs nothing and saves one doomed API call per turn forever.
+ */
+const reactionUnsupportedInstances = new Set<string>();
+
+/**
+ * In-flight acquire per target, resolving to the placeholder message id when
+ * the fallback path was taken and undefined when the reaction path was.
+ *
+ * Release chains off this rather than reading a flag: acquiring is async (the
+ * decision between reaction and placeholder is only known once the platform
+ * answers), and a burst can end before it resolves. Chaining guarantees the
+ * teardown matches the setup instead of racing it and stranding a message.
+ */
+const indicatorOps = new Map<string, Promise<string | undefined>>();
+
+/**
+ * The full address of one indicator, snapshotted so async teardown is immune
+ * to the entry moving underneath it (agent-shared sessions can be re-triggered
+ * from another chat, or another platform, mid-flight).
+ */
+interface IndicatorTarget {
+  channelType: string;
+  platformId: string;
+  threadId: string | null;
+  instance?: string;
+  messageId: string;
+}
 
 /**
  * Bind the typing module to the channel delivery adapter so it can
@@ -177,25 +235,40 @@ function usesReactionIndicator(entry: TypingTarget): boolean {
   );
 }
 
-/** Reference-count key: the reaction's full identity on the platform. */
-function reactionKey(entry: TypingTarget): string {
-  return `${entry.instance ?? entry.channelType}|${entry.platformId}|${entry.reactionMessageId}`;
+/** Snapshot the entry's indicator address; see IndicatorTarget. */
+function targetOf(entry: TypingTarget): IndicatorTarget {
+  return {
+    channelType: entry.channelType,
+    platformId: entry.platformId,
+    threadId: entry.threadId,
+    instance: entry.instance,
+    messageId: entry.reactionMessageId!,
+  };
+}
+
+/** The registry key an instance-addressed call resolves through. */
+function instanceKey(t: IndicatorTarget): string {
+  return t.instance ?? t.channelType;
+}
+
+/** Reference-count key: the indicator's full identity on the platform. */
+function reactionKey(t: IndicatorTarget): string {
+  return `${instanceKey(t)}|${t.platformId}|${t.messageId}`;
 }
 
 /**
- * Fire one add/remove. Never throws and is never awaited by a caller that can
- * fail: the indicator must not be able to break routing or delivery. A
- * dropped call self-corrects on the next work burst.
+ * Fire one add/remove. Never throws: the indicator must not be able to break
+ * routing or delivery. A dropped call self-corrects on the next work burst.
  */
-async function pulseIndicator(entry: TypingTarget, messageId: string, on: boolean): Promise<ReactionOutcome> {
+async function pulseIndicator(t: IndicatorTarget, on: boolean): Promise<ReactionOutcome> {
   try {
     const outcome = await adapter?.pulseReaction?.(
-      entry.channelType,
-      entry.platformId,
-      messageId,
+      t.channelType,
+      t.platformId,
+      t.messageId,
       INDICATOR_EMOJI,
       on,
-      entry.instance,
+      t.instance,
     );
     return outcome ?? 'failed';
   } catch {
@@ -203,28 +276,78 @@ async function pulseIndicator(entry: TypingTarget, messageId: string, on: boolea
   }
 }
 
-/**
- * Take this session's hold on the indicator, adding the reaction if it is the
- * first. Idempotent: a session that already holds one issues nothing, which is
- * what makes the interval tick a liveness check rather than a reaction driver.
- */
-function showReaction(entry: TypingTarget): void {
-  if (entry.reactionShown || !usesReactionIndicator(entry)) return;
-  const key = reactionKey(entry);
-  const held = reactionHolders.get(key) ?? 0;
-  reactionHolders.set(key, held + 1);
-  entry.reactionShown = true;
-  if (held === 0) void pulseIndicator(entry, entry.reactionMessageId!, true);
+/** Post the fallback placeholder, returning its id — or undefined if it failed. */
+async function postPlaceholder(t: IndicatorTarget): Promise<string | undefined> {
+  try {
+    return (
+      (await adapter?.deliver?.(
+        t.channelType,
+        t.platformId,
+        t.threadId,
+        'chat',
+        JSON.stringify({ text: PLACEHOLDER_TEXT }),
+        undefined,
+        t.instance,
+      )) ?? undefined
+    );
+  } catch {
+    // Best-effort, exactly like the reaction path: no indicator this turn.
+    return undefined;
+  }
+}
+
+/** Remove the fallback placeholder. Never throws. */
+async function deletePlaceholder(t: IndicatorTarget, messageId: string): Promise<void> {
+  try {
+    await adapter?.deleteMessage?.(t.channelType, t.platformId, t.threadId, messageId, t.instance);
+  } catch {
+    // A stranded placeholder is the worst case here, and it is still better
+    // than letting a cleanup failure escape into the refresh loop.
+  }
 }
 
 /**
- * Release this session's hold, removing the reaction when it was the last.
+ * Light the indicator for a target that nobody was holding. Prefers the
+ * reaction; on a permission-class refusal it latches the instance and falls
+ * back to a placeholder message, this turn included.
+ *
+ * Resolves to the placeholder's message id when the fallback was used, so the
+ * matching release knows which teardown to run.
+ */
+async function acquireIndicator(t: IndicatorTarget): Promise<string | undefined> {
+  if (!reactionUnsupportedInstances.has(instanceKey(t))) {
+    const outcome = await pulseIndicator(t, true);
+    if (outcome !== 'unsupported') return undefined;
+    reactionUnsupportedInstances.add(instanceKey(t));
+  }
+  return postPlaceholder(t);
+}
+
+/**
+ * Take this session's hold on the indicator, lighting it if this is the first.
+ * Idempotent: a session that already holds one issues nothing, which is what
+ * makes the interval tick a liveness check rather than a reaction driver.
+ */
+function showReaction(entry: TypingTarget): void {
+  if (entry.reactionShown || !usesReactionIndicator(entry)) return;
+  const t = targetOf(entry);
+  const key = reactionKey(t);
+  const held = reactionHolders.get(key) ?? 0;
+  reactionHolders.set(key, held + 1);
+  entry.reactionShown = true;
+  if (held === 0) indicatorOps.set(key, acquireIndicator(t));
+}
+
+/**
+ * Release this session's hold, taking the indicator down when it was the last.
  * Must run BEFORE any mutation of the entry's address fields — the key it
- * releases is the one it acquired.
+ * releases is the one it acquired, and the snapshot it tears down with is the
+ * address it acquired against.
  */
 function hideReaction(entry: TypingTarget): void {
   if (!entry.reactionShown) return;
-  const key = reactionKey(entry);
+  const t = targetOf(entry);
+  const key = reactionKey(t);
   const remaining = (reactionHolders.get(key) ?? 1) - 1;
   entry.reactionShown = false;
   if (remaining > 0) {
@@ -232,7 +355,13 @@ function hideReaction(entry: TypingTarget): void {
     return;
   }
   reactionHolders.delete(key);
-  void pulseIndicator(entry, entry.reactionMessageId!, false);
+  // Chain off the acquire so teardown matches setup even when the burst ends
+  // before the platform answered.
+  const pending = indicatorOps.get(key) ?? Promise.resolve(undefined);
+  indicatorOps.delete(key);
+  void pending.then((placeholderId) =>
+    placeholderId === undefined ? pulseIndicator(t, false).then(() => {}) : deletePlaceholder(t, placeholderId),
+  );
 }
 
 /**

@@ -424,6 +424,29 @@ describe('channel registry — pulseReaction instance routing', () => {
     expect(worker.pulses).toHaveLength(0);
   });
 
+  it('forwards deleteMessage to the named instance and no-ops when unimplemented', async () => {
+    // The placeholder being deleted was posted by THIS bot identity; no
+    // sibling instance can delete it.
+    const reg = await import('./channel-registry.js');
+    const deletes: Array<{ platformId: string; threadId: string | null; messageId: string }> = [];
+    const tester = Object.assign(createMockAdapter('slack', 'slack-tester'), {
+      async deleteMessage(platformId: string, threadId: string | null, messageId: string) {
+        deletes.push({ platformId, threadId, messageId });
+      },
+    });
+    reg.registerChannelAdapter('slack-tester', { factory: () => tester });
+    // Default instance has no deleteMessage — a stale adapter copy.
+    reg.registerChannelAdapter('slack', { factory: () => createMockAdapter('slack') });
+    await reg.initChannelAdapters(mockSetup);
+
+    const bridge = reg.createChannelDeliveryAdapter();
+    await bridge.deleteMessage!('slack', 'slack:D1', null, 'ph-1', 'slack-tester');
+    expect(deletes).toEqual([{ platformId: 'slack:D1', threadId: null, messageId: 'ph-1' }]);
+
+    await expect(bridge.deleteMessage!('slack', 'slack:D1', null, 'ph-2', 'slack')).resolves.toBeUndefined();
+    expect(deletes).toHaveLength(1);
+  });
+
   it('reports failed without throwing when the adapter does not implement pulseReaction', async () => {
     const reg = await import('./channel-registry.js');
     // createMockAdapter has no pulseReaction — the shape of a stale adapter

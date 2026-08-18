@@ -233,6 +233,19 @@ export interface ChannelAdapter {
    * on its `setTyping` path.
    */
   pulseReaction?(platformId: string, messageId: string, emoji: string, on: boolean): Promise<ReactionOutcome>;
+
+  /**
+   * Delete a message the bot itself posted. Used by the working indicator's
+   * fallback: on an app that cannot place reactions, the indicator is a short
+   * placeholder message posted when work starts and deleted when it ends.
+   * Deleting your own message needs no scope beyond the one required to post
+   * it, which is what makes the fallback work on an app that was never
+   * reinstalled.
+   *
+   * `threadId ?? platformId` addresses the conversation, matching `deliver`,
+   * and `messageId` is the id `deliver` returned.
+   */
+  deleteMessage?(platformId: string, threadId: string | null, messageId: string): Promise<void>;
   syncConversations?(): Promise<ConversationInfo[]>;
   resolveChannelName?(platformId: string): Promise<string | null>;
 

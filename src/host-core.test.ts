@@ -696,7 +696,9 @@ describe('router — channel instances', () => {
 
       // wakeContainer is mocked to resolve undefined, i.e. a transient spawn
       // failure: the router stops the refresher it just started, and the
-      // indicator must come off rather than strand.
+      // indicator must come off rather than strand. The removal chains off
+      // the add so the two cannot race on the platform.
+      await new Promise((r) => setTimeout(r, 0));
       expect(reactions.map((r) => r.on)).toEqual([true, false]);
     } finally {
       setTypingAdapter({});

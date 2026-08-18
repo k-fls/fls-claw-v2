@@ -146,6 +146,18 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
       if (!adapter?.pulseReaction) return 'failed';
       return adapter.pulseReaction(platformId, messageId, emoji, on);
     },
+    async deleteMessage(
+      channelType: string,
+      platformId: string,
+      threadId: string | null,
+      messageId: string,
+      instance?: string,
+    ): Promise<void> {
+      // Exact-key only: the message being deleted was posted by THIS bot
+      // identity, and no other instance can delete it.
+      const adapter = getChannelAdapterExact(instance ?? channelType);
+      await adapter?.deleteMessage?.(platformId, threadId, messageId);
+    },
   };
 }
 

@@ -466,6 +466,9 @@ describe('deliverSessionMessages — Slack working indicator', () => {
 
       insertOutbound('ag-1', session.id, 'out-reply');
       await deliverSessionMessages(session);
+      // The teardown chains off the add so the two cannot race on the
+      // platform, so it lands a microtask later than the delivery call.
+      await new Promise((r) => setTimeout(r, 0));
       expect(reactions).toEqual([{ messageId: 'ts-100', on: false }]);
     } finally {
       stopTypingRefresh(session.id);
