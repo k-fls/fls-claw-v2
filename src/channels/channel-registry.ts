@@ -4,7 +4,14 @@
  * Channels self-register on import. The host calls initChannelAdapters() at startup
  * to instantiate and set up all registered adapters.
  */
-import type { ChannelAdapter, ChannelDefaults, ChannelRegistration, ChannelSetup, OutboundFile } from './adapter.js';
+import type {
+  ChannelAdapter,
+  ChannelDefaults,
+  ChannelRegistration,
+  ChannelSetup,
+  OutboundFile,
+  ReactionOutcome,
+} from './adapter.js';
 import type { ChannelDeliveryAdapter } from '../delivery.js';
 import { log } from '../log.js';
 
@@ -118,6 +125,26 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
     ): Promise<void> {
       const adapter = getChannelAdapterExact(instance ?? channelType);
       await adapter?.setTyping?.(platformId, threadId);
+    },
+    async pulseReaction(
+      channelType: string,
+      platformId: string,
+      messageId: string,
+      emoji: string,
+      on: boolean,
+      instance?: string,
+    ): Promise<ReactionOutcome> {
+      // Exact-key only, for the same reason setTyping is: two adapters of one
+      // platform are two distinct bot users, and a reaction placed by the
+      // wrong one shows the wrong avatar and cannot be removed by the owner.
+      //
+      // An offline adapter, or one that predates this seam, reports `failed`
+      // rather than `unsupported` — `unsupported` latches the caller's
+      // fallback for the process lifetime, which is the wrong response to a
+      // transient outage or a stale skill-installed adapter copy.
+      const adapter = getChannelAdapterExact(instance ?? channelType);
+      if (!adapter?.pulseReaction) return 'failed';
+      return adapter.pulseReaction(platformId, messageId, emoji, on);
     },
   };
 }

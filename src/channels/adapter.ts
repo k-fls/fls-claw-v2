@@ -162,6 +162,22 @@ export interface ChannelDefaults {
   mentions: 'platform' | 'dm-only' | 'never';
 }
 
+/**
+ * Result of a `pulseReaction` call. The call itself never rejects — the
+ * outcome is how a caller tells "the platform refused, permanently" from
+ * "that one didn't take":
+ *
+ * - `ok`          — the add/remove reached the platform.
+ * - `failed`      — benign state drift (already-reacted, no-reaction, message
+ *                   deleted), a transient transport error, or an adapter that
+ *                   is offline or predates this seam. Worth attempting again.
+ * - `unsupported` — the platform refused for a permission/auth reason
+ *                   (Slack `missing_scope`, `not_allowed_token_type`,
+ *                   `invalid_auth`). Retrying costs a doomed API call every
+ *                   turn, so callers latch a fallback instead.
+ */
+export type ReactionOutcome = 'ok' | 'failed' | 'unsupported';
+
 /** The v2 channel adapter contract. */
 export interface ChannelAdapter {
   name: string;
@@ -198,6 +214,25 @@ export interface ChannelAdapter {
 
   // Optional
   setTyping?(platformId: string, threadId: string | null): Promise<void>;
+
+  /**
+   * Add or remove a single reaction on a message. The host's typing module
+   * uses this as a working indicator on platforms whose native typing signal
+   * does not render (Slack: `assistant.threads.setStatus` only shows inside an
+   * assistant thread, so both DMs and ordinary channel threads show nothing).
+   * `on=true` adds the emoji, `on=false` removes it; the caller holds one
+   * reaction for the duration of a work burst rather than toggling it.
+   *
+   * `platformId` is the chat address. There is no thread parameter because a
+   * reaction is addressed by channel + message id on every platform that has
+   * them — thread membership is not part of the address.
+   *
+   * Best-effort and non-throwing: implementations swallow platform errors and
+   * report them through the returned `ReactionOutcome`, so an indicator can
+   * never fail routing or delivery. Adapters that omit this leave the caller
+   * on its `setTyping` path.
+   */
+  pulseReaction?(platformId: string, messageId: string, emoji: string, on: boolean): Promise<ReactionOutcome>;
   syncConversations?(): Promise<ConversationInfo[]>;
   resolveChannelName?(platformId: string): Promise<string | null>;
 

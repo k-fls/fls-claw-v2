@@ -183,9 +183,9 @@ describe('createChatSdkBridge.deliver — format-error fallback (bug #11)', () =
     });
     const bridge = createChatSdkBridge({ adapter: stubAdapter({ postMessage }), supportsThreads: false });
 
-    await expect(
-      bridge.deliver('telegram:42', null, { kind: 'chat-sdk', content: { text: 'hi' } }),
-    ).rejects.toThrow('503');
+    await expect(bridge.deliver('telegram:42', null, { kind: 'chat-sdk', content: { text: 'hi' } })).rejects.toThrow(
+      '503',
+    );
     expect(calls).toHaveLength(1); // no plain-text retry
   });
 });
@@ -555,5 +555,93 @@ describe('createChatSdkBridge.deliver — display cards (send_card)', () => {
     expect(calls).toHaveLength(1);
     const msg = calls[0].message as { markdown?: string };
     expect(msg.markdown).toBe('plain hello');
+  });
+});
+
+describe('createChatSdkBridge.pulseReaction — indicator reaction seam', () => {
+  // The host's typing module drives a single held reaction as Slack's
+  // "working" indicator. Two contracts matter here: the call never rejects
+  // into its caller (routing and delivery must not depend on it), and a
+  // permission-class refusal is distinguishable from benign state drift so
+  // the caller can latch its placeholder fallback instead of retrying
+  // forever.
+  interface ReactionCall {
+    threadId: string;
+    messageId: string;
+    emoji: string;
+  }
+
+  function makeReactionCapture() {
+    const adds: ReactionCall[] = [];
+    const removes: ReactionCall[] = [];
+    const addReaction = async (threadId: string, messageId: string, emoji: string) => {
+      adds.push({ threadId, messageId, emoji });
+    };
+    const removeReaction = async (threadId: string, messageId: string, emoji: string) => {
+      removes.push({ threadId, messageId, emoji });
+    };
+    return { adds, removes, addReaction, removeReaction };
+  }
+
+  function throwingBridge(err: Error) {
+    return createChatSdkBridge({
+      adapter: stubAdapter({
+        addReaction: async () => {
+          throw err;
+        },
+        removeReaction: async () => {
+          throw err;
+        },
+      }),
+      supportsThreads: true,
+    });
+  }
+
+  it('adds when on and removes when off, addressing the chat itself as the thread id', async () => {
+    const { adds, removes, addReaction, removeReaction } = makeReactionCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ addReaction, removeReaction }),
+      supportsThreads: true,
+    });
+
+    expect(await bridge.pulseReaction!('slack:C1', '1700000000.000100', 'hourglass_flowing_sand', true)).toBe('ok');
+    expect(await bridge.pulseReaction!('slack:C1', '1700000000.000100', 'hourglass_flowing_sand', false)).toBe('ok');
+
+    expect(adds).toEqual([{ threadId: 'slack:C1', messageId: '1700000000.000100', emoji: 'hourglass_flowing_sand' }]);
+    expect(removes).toEqual([
+      { threadId: 'slack:C1', messageId: '1700000000.000100', emoji: 'hourglass_flowing_sand' },
+    ]);
+  });
+
+  it('swallows a throwing platform call and resolves rather than rejecting', async () => {
+    const bridge = throwingBridge(new Error('503 Service Unavailable'));
+    await expect(bridge.pulseReaction!('slack:C1', 'ts-1', 'x', true)).resolves.toBe('failed');
+    await expect(bridge.pulseReaction!('slack:C1', 'ts-1', 'x', false)).resolves.toBe('failed');
+  });
+
+  it('classifies permission-class refusals as unsupported', async () => {
+    for (const code of ['missing_scope', 'not_allowed_token_type', 'invalid_auth']) {
+      const bridge = throwingBridge(new Error(`An API error occurred: ${code}`));
+      expect(await bridge.pulseReaction!('slack:C1', 'ts-1', 'x', true)).toBe('unsupported');
+    }
+  });
+
+  it('classifies benign state drift as failed, not unsupported', async () => {
+    for (const code of ['already_reacted', 'no_reaction', 'message_not_found']) {
+      const bridge = throwingBridge(new Error(`An API error occurred: ${code}`));
+      expect(await bridge.pulseReaction!('slack:C1', 'ts-1', 'x', true)).toBe('failed');
+    }
+  });
+
+  it('classifies a typed PermissionError / AuthenticationError as unsupported', async () => {
+    // Duck-typed on `name`, matching isNetworkError in channel-registry.ts —
+    // trunk must not depend on @chat-adapter/shared, which is installed only
+    // alongside a channel skill.
+    for (const name of ['PermissionError', 'AuthenticationError']) {
+      const err = new Error('bot lacks required permissions');
+      err.name = name;
+      const bridge = throwingBridge(err);
+      expect(await bridge.pulseReaction!('slack:C1', 'ts-1', 'x', true)).toBe('unsupported');
+    }
   });
 });

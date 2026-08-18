@@ -33,7 +33,7 @@ import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
-import type { OutboundFile } from './channels/adapter.js';
+import type { OutboundFile, ReactionOutcome } from './channels/adapter.js';
 import type { PendingApproval, Session } from './types.js';
 
 const ACTIVE_POLL_MS = 1000;
@@ -71,6 +71,15 @@ export interface ChannelDeliveryAdapter {
     instance?: string,
   ): Promise<string | undefined>;
   setTyping?(channelType: string, platformId: string, threadId: string | null, instance?: string): Promise<void>;
+  /** Add or remove the working-indicator reaction. See ChannelAdapter.pulseReaction. */
+  pulseReaction?(
+    channelType: string,
+    platformId: string,
+    messageId: string,
+    emoji: string,
+    on: boolean,
+    instance?: string,
+  ): Promise<ReactionOutcome>;
 }
 
 let deliveryAdapter: ChannelDeliveryAdapter | null = null;
