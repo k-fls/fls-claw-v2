@@ -44,43 +44,31 @@ const MAX_DELIVERY_ATTEMPTS = 3;
  * by getDeliveredIds forever — the agent's completed answer is lost with
  * nothing left to resend.
  *
- * The window is sized against channel-registry's ADAPTER_RETRY_INTERVAL_MS
- * (60s), which re-attempts a channel that failed to start: a held row gets on
- * the order of fifteen chances to catch a recovering adapter before it is
- * failed. An operator restart also re-registers, so both recovery routes land
- * inside the window. Because missingAdapterSince is in-memory, a restart resets
- * this clock — the cap bounds one process's wait, not the row's total lifetime,
- * so a crash-looping host retries rows indefinitely rather than failing them.
- * Indefinite retry is the safer direction than silent loss, but it does mean
- * the cap is not a guarantee against a permanently-removed channel.
+ * Sized against channel-registry's ADAPTER_RETRY_INTERVAL_MS (60s), so a held
+ * row gets ~15 chances to catch a recovering adapter. missingAdapterSince is
+ * in-memory, so a restart resets the clock: the cap bounds one process's wait,
+ * not the row's total lifetime, and a crash-looping host retries indefinitely
+ * rather than failing rows — the safer direction, but not a guarantee against
+ * a permanently-removed channel.
  *
- * Accepted cost: a deferred row re-runs all of deliverMessage every poll — a
- * messaging-group lookup (up to twice), two hasTable checks and an
- * agent_destinations SELECT, so roughly five synchronous central-DB queries per
- * row per tick on the thread that also routes inbound traffic. A row carrying
- * attachments additionally re-reads their bytes off disk synchronously, since
- * readOutboxFiles runs just before the adapter call. Judged worth it against
- * losing the reply; revisit with a backoff probe if a busy outage ever makes
- * this path hot.
+ * Accepted cost (decided, do not re-litigate without new information): a
+ * deferred row re-runs deliverMessage every poll — ~5 synchronous central-DB
+ * queries per row per tick, plus a re-read of any attachment bytes — rather
+ * than backing off. Judged worth it against losing the reply.
  */
 export const MISSING_ADAPTER_GRACE_MS = 15 * 60 * 1000;
 
 /** Track delivery attempt counts. Resets on process restart (gives failed messages a fresh chance). */
 const deliveryAttempts = new Map<string, number>();
 
-/**
- * First time each pending row saw a missing adapter, so the grace window is
- * measured from the start of the outage rather than reset by every poll.
- * Written once per outage; released by forgetDeliveryState.
- */
+/** First sighting per row, so the grace window measures the outage rather than
+ *  being reset by every poll. Released by forgetDeliveryState. */
 const missingAdapterSince = new Map<string, number>();
 
 /**
- * Release a row's retry bookkeeping. Both maps are keyed by messages_out id and
- * torn down together, so every path that settles a row's fate — delivered,
- * failed, or resolved out of band — goes through here rather than deleting from
- * each map by hand. A row is only revisited while it is still undelivered, so a
- * missed release would strand its entries for the life of the process.
+ * Single release point for a row's retry bookkeeping — both maps are keyed by
+ * messages_out id and settle together. A row is only revisited while it is still
+ * undelivered, so a missed release strands its entries for the process lifetime.
  */
 function forgetDeliveryState(messageOutId: string): void {
   deliveryAttempts.delete(messageOutId);
@@ -89,9 +77,8 @@ function forgetDeliveryState(messageOutId: string): void {
 
 /**
  * A missing adapter is a host-side outage, not a bad message, so it must not
- * spend the send-error budget (3 attempts ≈ 2s at the active poll rate) — that
- * turns a routine adapter restart into a lost reply. Leaves the row undelivered
- * so a later poll retries it, until the outage outlives the grace window.
+ * spend the send-error budget (~2s) — that turns a routine adapter restart into
+ * a lost reply. Leaves the row undelivered until the outage outlives the window.
  */
 function handleMissingAdapter(
   msg: { id: string; channel_type: string | null },
@@ -382,13 +369,9 @@ async function drainSession(session: Session): Promise<void> {
       // wouldn't see either.
       if (isOutboundPaused(msg.channel_type, msg.platform_id, msg.thread_id)) continue;
       if (isDelivered(inDb, msg.id)) {
-        // Settled out of band mid-batch — the reauth dispatcher's
-        // suppressErrorRows writes `delivered` rows directly, and once written a
-        // row never reaches this loop again. Releasing here covers that case
-        // because it runs synchronously inside this batch. It is not total: a
-        // row settled BETWEEN polls is filtered out by the batch-start
-        // getDeliveredIds above and never reaches this branch, so its map
-        // entries persist until the process exits.
+        // Settled out of band mid-batch (reauth-dispatcher writes `delivered`
+        // rows directly). Partial: a row settled BETWEEN polls is filtered by the
+        // batch-start getDeliveredIds and never reaches here.
         forgetDeliveryState(msg.id);
         continue;
       }

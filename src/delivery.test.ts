@@ -222,11 +222,9 @@ describe('deliverSessionMessages — retry and permanent failure', () => {
 });
 
 /**
- * Read a row's terminal delivery status. `getDeliveredIds` deliberately ignores
- * the status column, so set membership alone cannot tell 'delivered' from
- * 'failed' — and those two are exactly the outcomes the missing-adapter tests
- * below have to distinguish, since recording a never-sent message as
- * 'delivered' is the bug the grace window exists to prevent.
+ * Read a row's terminal status. `getDeliveredIds` ignores the status column, so
+ * set membership alone cannot tell 'delivered' from 'failed' — the exact pair
+ * the tests below must distinguish.
  */
 function deliveryStatus(agentGroupId: string, sessionId: string, msgId: string): string | undefined {
   const db = openInboundDb(agentGroupId, sessionId);

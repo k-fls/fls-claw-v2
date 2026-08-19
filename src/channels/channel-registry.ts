@@ -13,23 +13,14 @@ const SETUP_RETRY_DELAYS_MS = [2000, 5000, 10000];
 /**
  * How often a channel that failed to start is retried.
  *
- * SETUP_RETRY_DELAYS_MS covers a hiccup inside one start attempt (~17s total).
- * This covers the outage that outlives it. `activeAdapters` is otherwise
- * written only by initChannelAdapters, whose sole production caller runs once
- * at boot (src/index.ts) before the delivery polls start — so without this pass
- * an adapter that threw at boot stays dead for the life of the process, and the
- * missing-adapter grace window in delivery.ts can only ever be redeemed by an
- * operator restarting the host.
+ * SETUP_RETRY_DELAYS_MS covers a hiccup inside one start attempt (~17s);
+ * this covers the outage that outlives it. Without it, `activeAdapters` is
+ * written only by initChannelAdapters — one call at boot — so an adapter that
+ * threw is dead for the life of the process.
  *
- * The real incident this addresses: rapid host restarts churned Slack Socket
- * Mode connections, `apps.connections.open` returned a transient `invalid_auth`,
- * `initialize` threw, and the adapter never registered — while the tokens
- * themselves were valid the whole time.
- *
- * A minute is well inside delivery.ts's MISSING_ADAPTER_GRACE_MS, so a channel
- * that recovers gets several attempts before any held row is failed, and slow
- * enough that a channel which is down for real costs one factory call per
- * minute rather than one per delivery poll.
+ * Well inside delivery.ts's MISSING_ADAPTER_GRACE_MS, so a held row gets
+ * several chances to catch a recovering adapter; slow enough that a channel
+ * down for real costs one factory call per minute, not one per delivery poll.
  */
 export const ADAPTER_RETRY_INTERVAL_MS = 60_000;
 
@@ -46,11 +37,8 @@ const registry = new Map<string, ChannelRegistration>();
 const activeAdapters = new Map<string, ChannelAdapter>();
 
 /**
- * Channels whose start attempt threw, held for the periodic retry pass along
- * with the setup callback so a retry repeats exactly what boot did. Entries
- * leave on the first attempt that does not throw — including a factory that
- * returns null, which is a deliberate "no credentials, skip" answer rather than
- * a transient failure and must not be retried forever.
+ * Channels whose start attempt threw. The setup callback is held alongside so a
+ * retry repeats exactly what boot did.
  */
 const pendingRetry = new Map<string, ChannelRegistration>();
 let retrySetupFn: ((adapter: ChannelAdapter) => ChannelSetup) | undefined;
@@ -172,27 +160,17 @@ export function getChannelContainerConfig(name: string): ChannelRegistration['co
 }
 
 /**
- * Best-effort cleanup for an adapter that failed to start.
+ * Best-effort cleanup for an adapter that failed to start. The retry pass builds
+ * a fresh instance from the factory every ADAPTER_RETRY_INTERVAL_MS, so anything
+ * a failed setup() left open leaks once a minute rather than once per process.
+ * It matters because setup() can fail AFTER connecting — chat-sdk-bridge runs
+ * chat.initialize() before binding a gateway adapter's webhook server. What an
+ * adapter allocates is unknowable here (they are skill-installed), so cleanup
+ * belongs at the seam that owns the lifecycle.
  *
- * The failed instance is abandoned here, and the retry pass builds a fresh one
- * from the factory every ADAPTER_RETRY_INTERVAL_MS — so anything setup() had
- * already opened would leak once a minute for as long as the channel stays
- * down, where before the retry pass it leaked once per process. The registry
- * cannot know what a given adapter allocates: adapters are skill-installed from
- * the `channels` branch, so this has to be handled generically at the seam that
- * owns the lifecycle.
- *
- * The concrete case is a setup() that fails AFTER connecting: chat-sdk-bridge
- * runs chat.initialize() before binding a gateway adapter's local webhook
- * server, so a bind failure strands a live platform connection plus its
- * reschedule timer. For Discord that is the exact hazard startGateway's own
- * backoff comment guards against — reconnect storms earn a multi-hour
- * Cloudflare IP block.
- *
- * Swallows its own failure: teardown on a half-built adapter is allowed to
- * throw (chat-sdk-bridge's calls chat.shutdown() unguarded, and `chat` is
- * undefined when setup threw before assigning it). The setup error is the one
- * worth propagating.
+ * Swallows its own failure: teardown on a half-built adapter is allowed to throw
+ * (the bridge calls chat.shutdown() unguarded, and `chat` is undefined when
+ * setup threw before assigning it). The setup error is the one worth reporting.
  */
 async function teardownFailedAdapter(name: string, adapter: ChannelAdapter): Promise<void> {
   try {
@@ -203,12 +181,9 @@ async function teardownFailedAdapter(name: string, adapter: ChannelAdapter): Pro
 }
 
 /**
- * Instantiate, set up and register ONE channel adapter.
- *
- * Returns true when the adapter is live, false when it was deliberately
- * skipped (factory returned null — no credentials). Throws when the attempt
- * failed for a reason that may not still hold a minute from now; the caller
- * decides whether that lands in the retry set.
+ * Instantiate, set up and register ONE channel adapter. True when it is live,
+ * false when deliberately skipped (factory returned null — no credentials).
+ * Throws when the attempt failed; the caller decides whether that is retried.
  */
 async function startAdapter(
   name: string,
@@ -249,8 +224,7 @@ async function startAdapter(
       }
     }
   } catch (err) {
-    // Only ever the instance we just built and failed to register — an adapter
-    // live in activeAdapters is never reached from here.
+    // Only the instance just built — never one live in activeAdapters.
     await teardownFailedAdapter(name, adapter);
     throw err;
   }
@@ -268,24 +242,22 @@ async function startAdapter(
 }
 
 /**
- * Re-attempt every channel still in the retry set. Failures stay in the set and
- * drop to debug after the boot-time error, so a channel that is down for hours
- * does not fill the log with one error per minute — the ERROR from boot is the
- * operator's signal, and recovery gets its own INFO.
+ * Re-attempt every channel still in the retry set. Repeat failures log at debug
+ * so a channel down for hours does not emit one error per minute — the boot-time
+ * ERROR is the operator's signal, and recovery gets its own INFO.
  */
 async function retryFailedAdapters(): Promise<void> {
   const setupFn = retrySetupFn;
   if (!setupFn || retryInFlight) return;
-  // A single pass can take ~17s per channel via SETUP_RETRY_DELAYS_MS, so it can
-  // outlast the interval; overlapping passes would race two factories for the
-  // same activeAdapters key.
+  // A pass can take ~17s per channel via SETUP_RETRY_DELAYS_MS and so outlast
+  // the interval; overlapping passes would race two factories for one key.
   retryInFlight = true;
   try {
     for (const [name, registration] of [...pendingRetry]) {
       try {
         const started = await startAdapter(name, registration, setupFn);
         // Leaves the set either way: a null factory is a config answer, not a
-        // transient failure, and retrying it every minute would never converge.
+        // transient failure, so retrying it every minute would never converge.
         pendingRetry.delete(name);
         if (started) log.info('Channel adapter recovered on retry', { channel: name });
       } catch (err) {
@@ -304,8 +276,7 @@ function scheduleAdapterRetry(): void {
   retryTimer = setInterval(() => {
     void retryFailedAdapters();
   }, ADAPTER_RETRY_INTERVAL_MS);
-  // A channel that never comes back must not keep the host — or a test run —
-  // from exiting.
+  // A channel that never comes back must not keep the host from exiting.
   retryTimer.unref?.();
 }
 
@@ -319,10 +290,9 @@ function stopAdapterRetry(): void {
  * Instantiate and set up all registered channel adapters.
  * Skips adapters that return null (missing credentials).
  *
- * Channels that throw are kept and retried every ADAPTER_RETRY_INTERVAL_MS, so
- * a transient boot failure no longer costs the channel the whole process
- * lifetime. Delivery reads the same activeAdapters map, so a recovered adapter
- * is picked up by the next delivery poll with no further wiring.
+ * Channels that throw are retried every ADAPTER_RETRY_INTERVAL_MS. Delivery
+ * reads the same activeAdapters map, so a recovered adapter needs no further
+ * wiring to be picked up by the next poll.
  */
 export async function initChannelAdapters(setupFn: (adapter: ChannelAdapter) => ChannelSetup): Promise<void> {
   retrySetupFn = setupFn;

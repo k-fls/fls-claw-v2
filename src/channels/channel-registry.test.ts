@@ -147,10 +147,8 @@ describe('channel registry — instance keying', () => {
   });
 
   it('tears down an adapter whose setup failed, so the retry pass cannot leak one per minute', async () => {
-    // Each retry builds a FRESH adapter from the factory. chat-sdk-bridge runs
-    // chat.initialize() before binding a gateway adapter's webhook server, so a
-    // setup that fails after connecting strands a live platform connection —
-    // once per process before the retry pass existed, once a minute after it.
+    // Each retry builds a FRESH adapter, so a setup that fails after connecting
+    // strands one live instance per tick rather than one per process.
     vi.useFakeTimers();
     try {
       const reg = await import('./channel-registry.js');
@@ -192,9 +190,7 @@ describe('channel registry — instance keying', () => {
     adapter.setup = async () => {
       throw new Error('invalid_auth');
     };
-    // A half-built adapter's teardown is allowed to throw — chat-sdk-bridge
-    // calls chat.shutdown() unguarded, and `chat` is undefined when setup threw
-    // before assigning it.
+    // A half-built adapter's teardown is allowed to throw; see the source.
     adapter.teardown = async () => {
       throw new Error('chat is undefined');
     };
@@ -206,10 +202,8 @@ describe('channel registry — instance keying', () => {
   });
 
   it('retries a channel that threw at boot, and registers it once it recovers', async () => {
-    // The real incident: transient `invalid_auth` from Socket Mode connection
-    // churn made setup throw, and nothing re-registered the adapter for the
-    // life of the process — so every reply to that channel had to ride the
-    // delivery grace window out to a host restart.
+    // A transient auth failure at boot used to kill the channel for the life of
+    // the process, leaving every reply to ride the grace window out to a restart.
     vi.useFakeTimers();
     try {
       const reg = await import('./channel-registry.js');
@@ -254,8 +248,7 @@ describe('channel registry — instance keying', () => {
       await vi.advanceTimersByTimeAsync(reg.ADAPTER_RETRY_INTERVAL_MS * 3);
       expect(attempts).toBe(4);
 
-      // Teardown disarms the pass — a channel that never returns must not keep
-      // the host (or this test file) alive.
+      // Teardown disarms the pass, so a dead channel cannot pin the process.
       await reg.teardownChannelAdapters();
       await vi.advanceTimersByTimeAsync(reg.ADAPTER_RETRY_INTERVAL_MS * 3);
       expect(attempts).toBe(4);
