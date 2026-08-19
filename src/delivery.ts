@@ -23,6 +23,7 @@ import {
 } from './db/session-db.js';
 import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
+import { MissingChannelAdapterError } from './channels/channel-registry.js';
 import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import { isOutboundPaused, onAnyInteractionRelease } from './host-interactions.js';
@@ -33,8 +34,107 @@ const ACTIVE_POLL_MS = 1000;
 const SWEEP_POLL_MS = 60_000;
 const MAX_DELIVERY_ATTEMPTS = 3;
 
+/**
+ * How long an outbound row waits out a missing channel adapter before it is
+ * treated as permanently undeliverable.
+ *
+ * MAX_DELIVERY_ATTEMPTS is spaced only by ACTIVE_POLL_MS, so the send-error
+ * budget is spent in ~2s. That is the right shape for a bad message and the
+ * wrong shape for a missing adapter, because a row marked 'failed' is excluded
+ * by getDeliveredIds forever — the agent's completed answer is lost with
+ * nothing left to resend.
+ *
+ * What this window actually waits for is a HOST RESTART, not an adapter coming
+ * back on its own. `activeAdapters` is written only inside initChannelAdapters,
+ * whose sole caller runs once at boot (src/index.ts) before the delivery polls
+ * start, so an adapter that failed to register cannot register later in this
+ * process. Holding the row keeps it deliverable until an operator fixes the
+ * cause and restarts. Because missingAdapterSince is in-memory, that restart
+ * also resets this clock — so the cap bounds one process's wait, not the row's
+ * total lifetime: a crash-looping host retries rows indefinitely rather than
+ * failing them. Indefinite retry is the safer direction than silent loss, but
+ * it does mean the cap is not a guarantee against a permanently-removed channel.
+ *
+ * Accepted cost: a deferred row re-runs all of deliverMessage every poll — a
+ * messaging-group lookup (up to twice), two hasTable checks and an
+ * agent_destinations SELECT, so roughly five synchronous central-DB queries per
+ * row per tick on the thread that also routes inbound traffic. A row carrying
+ * attachments additionally re-reads their bytes off disk synchronously, since
+ * readOutboxFiles runs just before the adapter call. Judged worth it against
+ * losing the reply; revisit with a backoff probe if a busy outage ever makes
+ * this path hot.
+ */
+export const MISSING_ADAPTER_GRACE_MS = 15 * 60 * 1000;
+
 /** Track delivery attempt counts. Resets on process restart (gives failed messages a fresh chance). */
 const deliveryAttempts = new Map<string, number>();
+
+/**
+ * First time each pending row saw a missing adapter, so the grace window is
+ * measured from the start of the outage rather than reset by every poll.
+ * Written once per outage; released by forgetDeliveryState.
+ */
+const missingAdapterSince = new Map<string, number>();
+
+/**
+ * Release a row's retry bookkeeping. Both maps are keyed by messages_out id and
+ * torn down together, so every path that settles a row's fate — delivered,
+ * failed, or resolved out of band — goes through here rather than deleting from
+ * each map by hand. A row is only revisited while it is still undelivered, so a
+ * missed release would strand its entries for the life of the process.
+ */
+function forgetDeliveryState(messageOutId: string): void {
+  deliveryAttempts.delete(messageOutId);
+  missingAdapterSince.delete(messageOutId);
+}
+
+/**
+ * A missing adapter is a host-side outage, not a bad message, so it must not
+ * spend the send-error budget (3 attempts ≈ 2s at the active poll rate) — that
+ * turns a routine adapter restart into a lost reply. Leaves the row undelivered
+ * so a later poll retries it, until the outage outlives the grace window.
+ */
+function handleMissingAdapter(
+  msg: { id: string; channel_type: string | null },
+  session: Session,
+  inDb: Database.Database,
+  err: MissingChannelAdapterError,
+): void {
+  const now = Date.now();
+  const firstSight = !missingAdapterSince.has(msg.id);
+  if (firstSight) missingAdapterSince.set(msg.id, now);
+  const waitedMs = now - (missingAdapterSince.get(msg.id) ?? now);
+
+  if (waitedMs >= MISSING_ADAPTER_GRACE_MS) {
+    log.error('Message delivery failed permanently — channel adapter never registered', {
+      messageId: msg.id,
+      sessionId: session.id,
+      waitedMs,
+      err,
+    });
+    markDeliveryFailed(inDb, msg.id);
+    forgetDeliveryState(msg.id);
+    return;
+  }
+
+  // Warned once per outage per row; later polls stay at debug so a multi-minute
+  // outage doesn't bury the startup error that explains why the adapter is gone.
+  if (firstSight) {
+    log.warn('Message delivery deferred — channel adapter not registered', {
+      messageId: msg.id,
+      sessionId: session.id,
+      channelType: msg.channel_type,
+      graceMs: MISSING_ADAPTER_GRACE_MS,
+      err,
+    });
+  } else {
+    log.debug('Message delivery still deferred — channel adapter not registered', {
+      messageId: msg.id,
+      sessionId: session.id,
+      waitedMs,
+    });
+  }
+}
 
 /**
  * Sessions whose outbound queue is currently being drained.
@@ -282,11 +382,21 @@ async function drainSession(session: Session): Promise<void> {
       // to the container's "Error: …" line) — the batch-start snapshots
       // wouldn't see either.
       if (isOutboundPaused(msg.channel_type, msg.platform_id, msg.thread_id)) continue;
-      if (isDelivered(inDb, msg.id)) continue;
+      if (isDelivered(inDb, msg.id)) {
+        // Settled out of band mid-batch — the reauth dispatcher's
+        // suppressErrorRows writes `delivered` rows directly, and once written a
+        // row never reaches this loop again. Releasing here covers that case
+        // because it runs synchronously inside this batch. It is not total: a
+        // row settled BETWEEN polls is filtered out by the batch-start
+        // getDeliveredIds above and never reaches this branch, so its map
+        // entries persist until the process exits.
+        forgetDeliveryState(msg.id);
+        continue;
+      }
       try {
         const platformMsgId = await deliverMessage(msg, session, inDb);
         markDelivered(inDb, msg.id, platformMsgId ?? null);
-        deliveryAttempts.delete(msg.id);
+        forgetDeliveryState(msg.id);
 
         // Pause the typing indicator after a real user-facing message
         // lands on the user's screen, so the client has time to visually
@@ -298,6 +408,10 @@ async function drainSession(session: Session): Promise<void> {
           pauseTypingRefreshAfterDelivery(session.id);
         }
       } catch (err) {
+        if (err instanceof MissingChannelAdapterError) {
+          handleMissingAdapter(msg, session, inDb, err);
+          continue;
+        }
         const attempts = (deliveryAttempts.get(msg.id) ?? 0) + 1;
         deliveryAttempts.set(msg.id, attempts);
         if (attempts >= MAX_DELIVERY_ATTEMPTS) {
@@ -308,7 +422,9 @@ async function drainSession(session: Session): Promise<void> {
             err,
           });
           markDeliveryFailed(inDb, msg.id);
-          deliveryAttempts.delete(msg.id);
+          // Reachable after an outage: the adapter came back, then the send
+          // itself failed — so the outage timestamp needs releasing too.
+          forgetDeliveryState(msg.id);
         } else {
           log.warn('Message delivery failed, will retry', {
             messageId: msg.id,

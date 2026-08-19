@@ -36,7 +36,8 @@ import {
 } from './db/index.js';
 import { getDeliveredIds } from './db/session-db.js';
 import { resolveSession, outboundDbPath, openInboundDb } from './session-manager.js';
-import { deliverSessionMessages, setDeliveryAdapter } from './delivery.js';
+import { deliverSessionMessages, setDeliveryAdapter, MISSING_ADAPTER_GRACE_MS } from './delivery.js';
+import { MissingChannelAdapterError } from './channels/channel-registry.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -217,6 +218,92 @@ describe('deliverSessionMessages — retry and permanent failure', () => {
     // Attempt 3 — not called, message already delivered
     await deliverSessionMessages(session);
     expect(callCount).toBe(2);
+  });
+});
+
+/**
+ * Read a row's terminal delivery status. `getDeliveredIds` deliberately ignores
+ * the status column, so set membership alone cannot tell 'delivered' from
+ * 'failed' — and those two are exactly the outcomes the missing-adapter tests
+ * below have to distinguish, since recording a never-sent message as
+ * 'delivered' is the bug the grace window exists to prevent.
+ */
+function deliveryStatus(agentGroupId: string, sessionId: string, msgId: string): string | undefined {
+  const db = openInboundDb(agentGroupId, sessionId);
+  try {
+    const row = db.prepare('SELECT status FROM delivered WHERE message_out_id = ?').get(msgId) as
+      | { status: string }
+      | undefined;
+    return row?.status;
+  } finally {
+    db.close();
+  }
+}
+
+describe('deliverSessionMessages — missing channel adapter', () => {
+  // See MISSING_ADAPTER_GRACE_MS's doc comment in delivery.ts for why an outage
+  // gets a grace window instead of the send-error budget.
+  it('does not consume the retry budget while the adapter is missing, and delivers on recovery', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-offline');
+
+    let callCount = 0;
+    let adapterUp = false;
+    setDeliveryAdapter({
+      async deliver() {
+        callCount++;
+        if (!adapterUp) throw new MissingChannelAdapterError('telegram', 'telegram');
+        return 'plat-recovered';
+      },
+    });
+
+    // Six polls — twice the budget a real send error would get.
+    for (let i = 0; i < 6; i++) await deliverSessionMessages(session);
+    expect(callCount).toBe(6);
+
+    const outageDb = openInboundDb('ag-1', session.id);
+    const duringOutage = getDeliveredIds(outageDb);
+    outageDb.close();
+    expect(duringOutage.has('out-offline')).toBe(false);
+
+    // The adapter comes back and the row is still there to send.
+    adapterUp = true;
+    await deliverSessionMessages(session);
+    expect(callCount).toBe(7);
+
+    expect(deliveryStatus('ag-1', session.id, 'out-offline')).toBe('delivered');
+  });
+
+  it('marks failed once the missing-adapter grace period elapses', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-gone');
+
+    setDeliveryAdapter({
+      async deliver() {
+        throw new MissingChannelAdapterError('telegram', 'telegram');
+      },
+    });
+
+    const start = Date.now();
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(start);
+    try {
+      await deliverSessionMessages(session);
+      const pendingDb = openInboundDb('ag-1', session.id);
+      const stillPending = getDeliveredIds(pendingDb);
+      pendingDb.close();
+      expect(stillPending.has('out-gone')).toBe(false);
+
+      // A channel that never comes back must not pin the row forever. Assert the
+      // status, not just presence: 'delivered' here would mean the row was
+      // recorded as sent when nothing was, which is the original defect.
+      nowSpy.mockReturnValue(start + MISSING_ADAPTER_GRACE_MS + 1000);
+      await deliverSessionMessages(session);
+      expect(deliveryStatus('ag-1', session.id, 'out-gone')).toBe('failed');
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 });
 

@@ -203,20 +203,27 @@ describe('channel registry — instance keying', () => {
     // Fallback-capable lookup (channelType-only callers) still resolves.
     expect(reg.getChannelAdapter('slack')).toBe(tester);
 
-    // The delivery bridge dispatches by exact key: a default-instance
-    // message (instance === channelType after backfill) is dropped, not
-    // delivered through the sibling's identity.
+    // The delivery bridge dispatches by exact key: a default-instance message
+    // (instance === channelType after backfill) throws the typed missing-adapter
+    // error rather than delivering through the sibling's identity. See
+    // MissingChannelAdapterError's doc comment for why it throws.
     const bridge = reg.createChannelDeliveryAdapter();
-    const result = await bridge.deliver(
-      'slack',
-      'slack:C1',
-      null,
-      'chat',
-      JSON.stringify({ text: 'to the default bot' }),
-      undefined,
-      'slack',
-    );
-    expect(result).toBeUndefined();
+    let caught: unknown;
+    try {
+      await bridge.deliver(
+        'slack',
+        'slack:C1',
+        null,
+        'chat',
+        JSON.stringify({ text: 'to the default bot' }),
+        undefined,
+        'slack',
+      );
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(reg.MissingChannelAdapterError);
+    expect((caught as InstanceType<typeof reg.MissingChannelAdapterError>).channelType).toBe('slack');
     expect(tester.delivered).toHaveLength(0);
 
     // Sanity: the same bridge DOES deliver when the exact instance is live.
