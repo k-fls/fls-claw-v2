@@ -188,6 +188,33 @@ bash setup/lib/restart.sh
 If you're in the middle of `/setup`, return to the setup flow now. Otherwise wire
 this channel with `/init-first-agent` (or `/manage-channels`).
 
+## Working indicator
+
+While the agent works, NanoClaw holds a single reaction on the message that
+triggered it, and removes it when the reply lands. Slack needs this because
+its native typing signal does not render: `assistant.threads.setStatus` only
+draws inside the app's assistant surface, so DMs and ordinary channel threads
+both show nothing.
+
+**`reactions:write` is what powers it** — it is in the scope list above for
+this reason. Scope changes only take effect after reinstalling the app, which
+mints a new `xoxb-` token to store. Without the scope nothing breaks: the
+first refusal latches that adapter instance and the indicator falls back to
+posting a short placeholder message and deleting it on the same edges, which
+needs no scope beyond the `chat:write` the app already has.
+
+**For a live spinner instead of a static glyph**, upload an animated GIF to the
+workspace as a custom emoji and name it in `.env`:
+
+1. Workspace name → **Customize Workspace** → **Emoji** → **Add Emoji**.
+   `assets/claw-working.gif` is a ready-made one. Slack caps the file at 128 KB
+   but downscales larger canvases, so a 720x720 source is fine.
+2. `SLACK_TYPING_EMOJI=<the name you gave it>` in `.env`, then restart.
+
+Unset leaves the built-in `hourglass_flowing_sand` — correct, just static, and
+present in every workspace with no setup. Setting it empty
+(`SLACK_TYPING_EMOJI=`) turns the indicator off entirely.
+
 ## Channel Info
 
 - **type**: `slack`
