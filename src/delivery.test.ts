@@ -24,6 +24,10 @@ vi.mock('./config.js', async () => {
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-delivery' };
 });
 
+// The typing module reads the indicator emoji from .env at import time; pin it
+// so these arms do not depend on the developer's local file.
+vi.mock('./env.js', () => ({ readEnvFile: () => ({}) }));
+
 const TEST_DIR = '/tmp/nanoclaw-test-delivery';
 
 import {
@@ -37,6 +41,7 @@ import {
 import { getDeliveredIds } from './db/session-db.js';
 import { resolveSession, outboundDbPath, openInboundDb } from './session-manager.js';
 import { deliverSessionMessages, setDeliveryAdapter } from './delivery.js';
+import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -339,5 +344,72 @@ describe('deliverSessionMessages — permission check', () => {
     const delivered = getDeliveredIds(inDb);
     inDb.close();
     expect(delivered.has('out-unauth')).toBe(true);
+  });
+});
+
+describe('deliverSessionMessages — Slack working indicator', () => {
+  /** Insert an outbound row with an explicit kind / channel_type / target. */
+  function insertOutboundAs(
+    agentGroupId: string,
+    sessionId: string,
+    msgId: string,
+    kind: string,
+    channelType: string,
+    platformId: string,
+  ): void {
+    const db = new Database(outboundDbPath(agentGroupId, sessionId));
+    db.prepare(
+      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(msgId, new Date().toISOString(), kind, platformId, channelType, JSON.stringify({ text: 'hello' }));
+    db.close();
+  }
+
+  it('clears the reaction on a user-facing reply but not on internal traffic', async () => {
+    // The indicator must survive system actions and agent-to-agent routing —
+    // the user never sees those, so clearing on them would blink the
+    // indicator off mid-work for no visible reason. Both internal rows here
+    // deliver SUCCESSFULLY; a row that merely failed would skip the clear via
+    // the catch path and prove nothing about the guard.
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+
+    const reactions: Array<{ messageId: string; on: boolean }> = [];
+    setDeliveryAdapter({
+      async deliver() {
+        return 'plat-msg-1';
+      },
+      async pulseReaction(_channelType, _platformId, messageId, _emoji, on) {
+        reactions.push({ messageId, on });
+        return 'ok';
+      },
+    });
+
+    try {
+      startTypingRefresh(session.id, 'ag-1', 'slack', 'slack:D1', null, undefined, 'ts-100');
+      await new Promise((r) => setTimeout(r, 0));
+      expect(reactions).toEqual([{ messageId: 'ts-100', on: true }]);
+      reactions.length = 0;
+
+      insertOutboundAs('ag-1', session.id, 'out-system', 'system', 'telegram', 'telegram:123');
+      // channel_type 'agent' with the source group as target — a self-send,
+      // which the a2a guard allows, so this takes the success path.
+      insertOutboundAs('ag-1', session.id, 'out-a2a', 'chat', 'agent', 'ag-1');
+      await deliverSessionMessages(session);
+
+      const delivered = getDeliveredIds(openInboundDb('ag-1', session.id));
+      expect(delivered.has('out-system')).toBe(true);
+      expect(delivered.has('out-a2a')).toBe(true);
+      expect(reactions).toHaveLength(0);
+
+      insertOutbound('ag-1', session.id, 'out-reply');
+      await deliverSessionMessages(session);
+      // The teardown chains off the add so the two cannot race on the
+      // platform, so it lands a microtask later than the delivery call.
+      await new Promise((r) => setTimeout(r, 0));
+      expect(reactions).toEqual([{ messageId: 'ts-100', on: false }]);
+    } finally {
+      stopTypingRefresh(session.id);
+    }
   });
 });

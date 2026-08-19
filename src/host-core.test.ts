@@ -47,6 +47,9 @@ vi.mock('./config.js', async () => {
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-host' };
 });
 
+// Pin the indicator emoji: the typing module reads .env at import time.
+vi.mock('./env.js', () => ({ readEnvFile: () => ({}) }));
+
 function now() {
   return new Date().toISOString();
 }
@@ -1177,6 +1180,58 @@ describe('router — channel instances', () => {
         priority: 0,
         created_at: now(),
       });
+    }
+  });
+
+  it('reacts to the raw inbound message id at routing time (R1)', async () => {
+    // The indicator has to land on the message the USER sent, seeded in the
+    // same routing pass that starts the refresher. Turn one is the whole
+    // point: there is no agent reply to react to yet, and cold container
+    // spawn is the longest silent wait in the product.
+    const { routeInbound } = await import('./router.js');
+    const { setTypingAdapter } = await import('./modules/typing/index.js');
+
+    const reactions: Array<{ platformId: string; messageId: string; emoji: string; on: boolean; instance?: string }> =
+      [];
+    setTypingAdapter({
+      async setTyping() {},
+      async pulseReaction(_channelType, platformId, messageId, emoji, on, instance) {
+        reactions.push({ platformId, messageId, emoji, on, instance });
+        return 'ok';
+      },
+    });
+
+    try {
+      await routeInbound({
+        channelType: 'slack',
+        instance: 'slack-tester',
+        platformId: 'slack:C1',
+        threadId: null,
+        message: {
+          id: '1700000000.000100',
+          kind: 'chat',
+          content: JSON.stringify({ sender: 'U', text: 'hello' }),
+          timestamp: now(),
+        },
+      });
+
+      // The raw Slack ts, NOT the agent-namespaced id written to messages_in
+      // — reactions.add needs the platform's own timestamp.
+      expect(reactions[0]).toMatchObject({
+        platformId: 'slack:C1',
+        messageId: '1700000000.000100',
+        on: true,
+        instance: 'slack-tester',
+      });
+
+      // wakeContainer is mocked to resolve undefined, i.e. a transient spawn
+      // failure: the router stops the refresher it just started, and the
+      // indicator must come off rather than strand. The removal chains off
+      // the add so the two cannot race on the platform.
+      await new Promise((r) => setTimeout(r, 0));
+      expect(reactions.map((r) => r.on)).toEqual([true, false]);
+    } finally {
+      setTypingAdapter({});
     }
   });
 

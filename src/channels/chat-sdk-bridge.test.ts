@@ -486,3 +486,135 @@ describe('createChatSdkBridge.deliver — display cards (send_card)', () => {
     expect(msg.markdown).toBe('plain hello');
   });
 });
+
+describe('createChatSdkBridge.pulseReaction — indicator reaction seam', () => {
+  // The host's typing module drives a single held reaction as Slack's
+  // "working" indicator. Two contracts matter here: the call never rejects
+  // into its caller (routing and delivery must not depend on it), and a
+  // permission-class refusal is distinguishable from benign state drift so
+  // the caller can latch its placeholder fallback instead of retrying
+  // forever.
+  interface ReactionCall {
+    threadId: string;
+    messageId: string;
+    emoji: string;
+  }
+
+  function makeReactionCapture() {
+    const adds: ReactionCall[] = [];
+    const removes: ReactionCall[] = [];
+    const addReaction = async (threadId: string, messageId: string, emoji: string) => {
+      adds.push({ threadId, messageId, emoji });
+    };
+    const removeReaction = async (threadId: string, messageId: string, emoji: string) => {
+      removes.push({ threadId, messageId, emoji });
+    };
+    return { adds, removes, addReaction, removeReaction };
+  }
+
+  function throwingBridge(err: Error) {
+    return createChatSdkBridge({
+      adapter: stubAdapter({
+        addReaction: async () => {
+          throw err;
+        },
+        removeReaction: async () => {
+          throw err;
+        },
+      }),
+      supportsThreads: true,
+    });
+  }
+
+  it('adds when on and removes when off, addressing the chat itself as the thread id', async () => {
+    const { adds, removes, addReaction, removeReaction } = makeReactionCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ addReaction, removeReaction }),
+      supportsThreads: true,
+    });
+
+    expect(await bridge.pulseReaction!('slack:C1', '1700000000.000100', 'hourglass_flowing_sand', true)).toBe('ok');
+    expect(await bridge.pulseReaction!('slack:C1', '1700000000.000100', 'hourglass_flowing_sand', false)).toBe('ok');
+
+    expect(adds).toEqual([{ threadId: 'slack:C1', messageId: '1700000000.000100', emoji: 'hourglass_flowing_sand' }]);
+    expect(removes).toEqual([
+      { threadId: 'slack:C1', messageId: '1700000000.000100', emoji: 'hourglass_flowing_sand' },
+    ]);
+  });
+
+  it('swallows a throwing platform call and resolves rather than rejecting', async () => {
+    const bridge = throwingBridge(new Error('503 Service Unavailable'));
+    await expect(bridge.pulseReaction!('slack:C1', 'ts-1', 'x', true)).resolves.toBe('failed');
+    await expect(bridge.pulseReaction!('slack:C1', 'ts-1', 'x', false)).resolves.toBe('failed');
+  });
+
+  it('classifies permission-class refusals as unsupported', async () => {
+    for (const code of ['missing_scope', 'not_allowed_token_type', 'invalid_auth']) {
+      const bridge = throwingBridge(new Error(`An API error occurred: ${code}`));
+      expect(await bridge.pulseReaction!('slack:C1', 'ts-1', 'x', true)).toBe('unsupported');
+    }
+  });
+
+  it('classifies benign state drift as failed, not unsupported', async () => {
+    for (const code of ['already_reacted', 'no_reaction', 'message_not_found']) {
+      const bridge = throwingBridge(new Error(`An API error occurred: ${code}`));
+      expect(await bridge.pulseReaction!('slack:C1', 'ts-1', 'x', true)).toBe('failed');
+    }
+  });
+
+  it('does NOT latch on a condition scoped to one conversation', async () => {
+    // The caller latches the whole adapter instance for the process lifetime,
+    // so a channel the bot simply is not in must never read as "this app
+    // cannot place reactions anywhere" — that would disable the indicator
+    // across the entire workspace.
+    for (const code of ['not_in_channel', 'channel_not_found', 'is_archived']) {
+      const bridge = throwingBridge(new Error(`An API error occurred: ${code}`));
+      expect(await bridge.pulseReaction!('slack:C1', 'ts-1', 'x', true)).toBe('failed');
+    }
+
+    // Even when the adapter raises it as a typed PermissionError.
+    const typed = new Error('not_in_channel');
+    typed.name = 'PermissionError';
+    expect(await throwingBridge(typed).pulseReaction!('slack:C1', 'ts-1', 'x', true)).toBe('failed');
+  });
+
+  it('reads a platform error code carried on err.data.error', async () => {
+    // Slack's WebAPI errors surface the code there rather than in the message.
+    const err = Object.assign(new Error('An API error occurred'), { data: { error: 'missing_scope' } });
+    expect(await throwingBridge(err).pulseReaction!('slack:C1', 'ts-1', 'x', true)).toBe('unsupported');
+  });
+
+  it('classifies a typed PermissionError / AuthenticationError as unsupported', async () => {
+    // Duck-typed on `name`, matching isNetworkError in channel-registry.ts —
+    // trunk must not depend on @chat-adapter/shared, which is installed only
+    // alongside a channel skill.
+    for (const name of ['PermissionError', 'AuthenticationError']) {
+      const err = new Error('bot lacks required permissions');
+      err.name = name;
+      const bridge = throwingBridge(err);
+      expect(await bridge.pulseReaction!('slack:C1', 'ts-1', 'x', true)).toBe('unsupported');
+    }
+  });
+});
+
+describe('createChatSdkBridge.deleteMessage', () => {
+  it('addresses the thread when there is one, else the chat — matching deliver', async () => {
+    const calls: Array<{ threadId: string; messageId: string }> = [];
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({
+        deleteMessage: async (threadId: string, messageId: string) => {
+          calls.push({ threadId, messageId });
+        },
+      }),
+      supportsThreads: true,
+    });
+
+    await bridge.deleteMessage!('slack:C1', 'slack:C1:1700.1', 'msg-a');
+    await bridge.deleteMessage!('slack:D1', null, 'msg-b');
+
+    expect(calls).toEqual([
+      { threadId: 'slack:C1:1700.1', messageId: 'msg-a' },
+      { threadId: 'slack:D1', messageId: 'msg-b' },
+    ]);
+  });
+});

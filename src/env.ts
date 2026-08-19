@@ -7,8 +7,12 @@ import { log } from './log.js';
  * Does NOT load anything into process.env — callers decide what to
  * do with the values. This keeps secrets out of the process environment
  * so they don't leak to child processes.
+ *
+ * An empty value is dropped by default — an empty token is not a token. Pass
+ * `keepEmpty` where `KEY=` is meaningful state (off) that must stay distinct
+ * from an absent key (default).
  */
-export function readEnvFile(keys: string[]): Record<string, string> {
+export function readEnvFile(keys: string[], opts?: { keepEmpty?: boolean }): Record<string, string> {
   const envFile = path.join(process.cwd(), '.env');
   let content: string;
   try {
@@ -35,7 +39,7 @@ export function readEnvFile(keys: string[]): Record<string, string> {
     ) {
       value = value.slice(1, -1);
     }
-    if (value) result[key] = value;
+    if (value || opts?.keepEmpty) result[key] = value;
   }
 
   return result;

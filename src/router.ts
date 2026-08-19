@@ -595,6 +595,8 @@ async function deliverToAgent(
     // Typing indicator + wake are only for the engaged branch; accumulated
     // messages sit silently until a real trigger fires.
     // Typing fires via the adapter instance that owns this chat's row.
+    // Raw inbound id, not messageIdForAgent's namespaced one: on Slack that is
+    // the `ts` the indicator needs, and it targets the user's own message.
     startTypingRefresh(
       session.id,
       session.agent_group_id,
@@ -602,6 +604,7 @@ async function deliverToAgent(
       event.platformId,
       event.threadId,
       mg.instance,
+      event.message.id,
     );
     const freshSession = getSession(session.id);
     if (freshSession) {

@@ -23,7 +23,7 @@ import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { getAskQuestionRender } from '../db/sessions.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
-import type { ChannelAdapter, ChannelSetup, InboundMessage } from './adapter.js';
+import type { ChannelAdapter, ChannelSetup, InboundMessage, ReactionOutcome } from './adapter.js';
 
 /** Adapter with optional gateway support (e.g., Discord). */
 interface GatewayAdapter extends Adapter {
@@ -137,6 +137,33 @@ export function splitForLimit(text: string, limit: number): string[] {
 export function isFormatError(err: unknown): boolean {
   const m = err instanceof Error ? err.message : String(err);
   return /parse entit|find end of the entity|can't parse|Bad Request:.*entit/i.test(m);
+}
+
+/**
+ * The token cannot place a reaction ANYWHERE — as opposed to benign drift
+ * (`already_reacted`, `no_reaction`), which means one call did not take.
+ *
+ * Install-wide is the whole point: the caller latches for the process
+ * lifetime, so a condition scoped to ONE conversation must not qualify.
+ * `not_in_channel` would otherwise disable the indicator workspace-wide, and
+ * an adapter may raise it as a typed PermissionError — hence excluded first.
+ *
+ * Duck-typed like isFormatError and isNetworkError: `@chat-adapter/shared`'s
+ * error classes only exist once a channel skill installs them, so trunk cannot
+ * `instanceof` them.
+ */
+function isPermissionClassError(err: unknown): boolean {
+  const e = err as { code?: unknown; data?: { error?: unknown } } | null;
+  const code = typeof e?.code === 'string' ? e.code : '';
+  const platformError = typeof e?.data?.error === 'string' ? e.data.error : '';
+  const message = err instanceof Error ? err.message : String(err);
+  const haystack = `${code} ${platformError} ${message}`;
+
+  // Scoped to one conversation — never latch the whole install for this.
+  if (/not_in_channel|channel_not_found|is_archived|thread_not_found/i.test(haystack)) return false;
+
+  if (/missing_scope|not_allowed_token_type|invalid_auth|token_revoked|account_inactive/i.test(haystack)) return true;
+  return err instanceof Error && (err.name === 'PermissionError' || err.name === 'AuthenticationError');
 }
 
 /**
@@ -656,6 +683,37 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     async setTyping(platformId: string, threadId: string | null) {
       const tid = threadId ?? platformId;
       await adapter.startTyping(tid);
+    },
+
+    async pulseReaction(platformId: string, messageId: string, emoji: string, on: boolean): Promise<ReactionOutcome> {
+      // The chat address IS the thread id here: a reaction is addressed by
+      // channel + message id, so one call covers a DM and an in-thread message.
+      // (Contrast deliver(), which needs the thread id to post INTO a thread.)
+      try {
+        if (on) await adapter.addReaction(platformId, messageId, emoji);
+        else await adapter.removeReaction(platformId, messageId, emoji);
+        return 'ok';
+      } catch (err) {
+        if (isPermissionClassError(err)) {
+          // Warn, not debug: this flips the instance into placeholder mode for
+          // the rest of the process and the fix is a scope change + reinstall.
+          log.warn('Reactions unavailable to this app — falling back to a placeholder message', {
+            adapter: adapter.name,
+            platformId,
+            err,
+          });
+          return 'unsupported';
+        }
+        // A wrong emoji name or bad message id is otherwise indistinguishable
+        // from a healthy install from the outside.
+        log.debug('Reaction call failed', { adapter: adapter.name, platformId, messageId, emoji, on, err });
+        return 'failed';
+      }
+    },
+
+    async deleteMessage(platformId: string, threadId: string | null, messageId: string) {
+      // Same address mapping as deliver(), which posted it.
+      await adapter.deleteMessage(threadId ?? platformId, messageId);
     },
 
     async teardown() {

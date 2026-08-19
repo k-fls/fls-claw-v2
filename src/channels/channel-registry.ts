@@ -4,7 +4,13 @@
  * Channels self-register on import. The host calls initChannelAdapters() at startup
  * to instantiate and set up all registered adapters.
  */
-import type { ChannelAdapter, ChannelRegistration, ChannelSetup, OutboundFile } from './adapter.js';
+import type {
+  ChannelAdapter,
+  ChannelRegistration,
+  ChannelSetup,
+  OutboundFile,
+  ReactionOutcome,
+} from './adapter.js';
 import type { ChannelDeliveryAdapter } from '../delivery.js';
 import { log } from '../log.js';
 
@@ -98,6 +104,33 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
     ): Promise<void> {
       const adapter = getChannelAdapterExact(instance ?? channelType);
       await adapter?.setTyping?.(platformId, threadId);
+    },
+    async pulseReaction(
+      channelType: string,
+      platformId: string,
+      messageId: string,
+      emoji: string,
+      on: boolean,
+      instance?: string,
+    ): Promise<ReactionOutcome> {
+      // Exact-key only: two adapters of one platform are distinct bot users, and
+      // a reaction placed by the wrong one cannot be removed by the owner.
+      // Offline or seam-less adapters report `failed`, never `unsupported` —
+      // latching for the process lifetime is wrong for a transient outage.
+      const adapter = getChannelAdapterExact(instance ?? channelType);
+      if (!adapter?.pulseReaction) return 'failed';
+      return adapter.pulseReaction(platformId, messageId, emoji, on);
+    },
+    async deleteMessage(
+      channelType: string,
+      platformId: string,
+      threadId: string | null,
+      messageId: string,
+      instance?: string,
+    ): Promise<void> {
+      // Exact-key only: only the posting identity can delete its own message.
+      const adapter = getChannelAdapterExact(instance ?? channelType);
+      await adapter?.deleteMessage?.(platformId, threadId, messageId);
     },
   };
 }

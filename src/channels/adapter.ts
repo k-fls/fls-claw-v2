@@ -110,6 +110,17 @@ export interface ConversationInfo {
   isGroup: boolean;
 }
 
+/**
+ * `pulseReaction` never rejects; this is how a caller tells a permanent
+ * refusal from a call that merely did not take.
+ *
+ * - `failed`      — benign drift, transport error, or an adapter that is
+ *                   offline. Worth attempting again.
+ * - `unsupported` — permission/auth refusal. Retrying costs a doomed call
+ *                   every turn, so callers latch a fallback instead.
+ */
+export type ReactionOutcome = 'ok' | 'failed' | 'unsupported';
+
 /** The v2 channel adapter contract. */
 export interface ChannelAdapter {
   name: string;
@@ -146,6 +157,24 @@ export interface ChannelAdapter {
 
   // Optional
   setTyping?(platformId: string, threadId: string | null): Promise<void>;
+
+  /**
+   * Add (`on`) or remove a reaction; used as a working indicator where the
+   * native typing signal does not render. No thread parameter: a reaction is
+   * addressed by channel + message id, so thread membership is irrelevant.
+   *
+   * Non-throwing — implementations swallow platform errors and report them via
+   * `ReactionOutcome`, so an indicator can never fail routing or delivery.
+   */
+  pulseReaction?(platformId: string, messageId: string, emoji: string, on: boolean): Promise<ReactionOutcome>;
+
+  /**
+   * Delete a message the bot posted. Used by the indicator's placeholder
+   * fallback — deleting your own message needs no scope beyond posting it,
+   * which is what makes that fallback work on an app lacking the reaction
+   * scope. Addressed like `deliver`; `messageId` is what `deliver` returned.
+   */
+  deleteMessage?(platformId: string, threadId: string | null, messageId: string): Promise<void>;
   syncConversations?(): Promise<ConversationInfo[]>;
   resolveChannelName?(platformId: string): Promise<string | null>;
 
