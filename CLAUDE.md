@@ -92,6 +92,7 @@ ncl help
 | sessions | list, get | Active sessions (read-only) |
 | user-dms | list | Cold-DM cache (read-only) |
 | dropped-messages | list | Messages from unregistered senders (read-only) |
+| undelivered | list, requeue | Agent replies the delivery poll permanently failed to send. `requeue` makes one eligible again |
 | approvals | list, get | Pending approval requests (read-only) |
 
 Key files: `src/cli/dispatch.ts` (dispatcher + approval handler), `src/cli/crud.ts` (generic CRUD registration), `src/cli/resources/` (per-resource definitions).

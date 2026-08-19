@@ -63,6 +63,14 @@ export function getSessionsByAgentGroup(agentGroupId: string): Session[] {
   return getDb().prepare('SELECT * FROM sessions WHERE agent_group_id = ?').all(agentGroupId) as Session[];
 }
 
+/** Every session regardless of status. Closing a session archives it but does
+ *  not discard its per-session state, so anything auditing that state — the
+ *  undelivered dead-letter scan, for one — must not stop at 'active' or a
+ *  closed session becomes a place losses can hide. */
+export function getAllSessions(): Session[] {
+  return getDb().prepare('SELECT * FROM sessions').all() as Session[];
+}
+
 export function getActiveSessions(): Session[] {
   return getDb().prepare("SELECT * FROM sessions WHERE status = 'active'").all() as Session[];
 }

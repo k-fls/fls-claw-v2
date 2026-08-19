@@ -300,6 +300,47 @@ export function markDeliveryFailed(db: Database.Database, messageOutId: string):
   ).run(messageOutId);
 }
 
+export interface FailedDelivery {
+  message_out_id: string;
+  failed_at: string;
+}
+
+/**
+ * Rows the delivery poll gave up on.
+ *
+ * getDeliveredIds deliberately returns these alongside real deliveries: a
+ * 'failed' row is what stops the poll re-attempting a message that will never
+ * send, so filtering it out there would turn a bad message into a retry storm.
+ * The cost of that choice is that a permanently-failed reply — a complete
+ * answer the user never saw — leaves no trace anywhere an operator looks. This
+ * is the visibility half of the bargain; clearFailedDelivery is the recovery
+ * half.
+ */
+export function getFailedDeliveries(db: Database.Database): FailedDelivery[] {
+  return db
+    .prepare(
+      `SELECT message_out_id, delivered_at AS failed_at
+         FROM delivered
+        WHERE status = 'failed'
+        ORDER BY delivered_at DESC`,
+    )
+    .all() as FailedDelivery[];
+}
+
+/**
+ * Drop a failed row so the next delivery poll re-attempts the message.
+ *
+ * Scoped to status = 'failed' by the WHERE clause, not by a caller-side check:
+ * clearing a genuinely delivered row would make the poll send it to the user a
+ * second time. Returns whether a row was actually cleared, so a caller can tell
+ * "requeued" from "that id was already delivered, or does not exist here".
+ */
+export function clearFailedDelivery(db: Database.Database, messageOutId: string): boolean {
+  return (
+    db.prepare("DELETE FROM delivered WHERE message_out_id = ? AND status = 'failed'").run(messageOutId).changes > 0
+  );
+}
+
 /** Ensure the delivered table has columns added after initial schema. */
 export function migrateDeliveredTable(db: Database.Database): void {
   const cols = new Set(
