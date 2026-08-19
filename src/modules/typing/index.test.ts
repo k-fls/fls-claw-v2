@@ -464,6 +464,25 @@ describe('Slack reaction indicator — hold-one lifecycle', () => {
     expect(reactions.map((r) => r.on)).toEqual([true, false]);
   });
 
+  it('waits for the delivery adapter instead of claiming a hold it cannot honor', async () => {
+    // index.ts starts channel adapters — and so can route inbound — before it
+    // calls setDeliveryAdapter, so a first turn can arrive with nothing behind
+    // the seam. Claiming a hold there would suppress the indicator for the
+    // whole burst and then fire a remove for a reaction never added.
+    setTypingAdapter({});
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, undefined, 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+
+    const { reactions } = captureBoth(); // adapter binds late
+    await vi.advanceTimersByTimeAsync(4_500);
+    expect(reactions).toEqual([expect.objectContaining({ messageId: 'ts-100', on: true })]);
+
+    // And teardown removes exactly what was added — no phantom remove.
+    stopTypingRefresh('sess-1');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reactions.map((r) => r.on)).toEqual([true, false]);
+  });
+
   it('moves to the new message when a fresh turn starts after a reply landed', async () => {
     // Delivery ends a burst: it clears the indicator but leaves the old target
     // id behind. The next inbound is a new turn and must light up on ITS

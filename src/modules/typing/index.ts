@@ -296,6 +296,12 @@ async function releaseIndicator(t: IndicatorTarget, hold: IndicatorHold): Promis
 /** Idempotent — this is what makes the tick a liveness check, not a driver. */
 function showIndicator(entry: TypingTarget): void {
   if (entry.indicatorShown || !usesWorkingIndicator(entry)) return;
+  // Nothing behind the seam yet: index.ts starts channels — and so can route
+  // inbound — before it binds the delivery adapter. Taking a hold here would
+  // claim a reaction nothing placed, suppress the indicator for the rest of
+  // the burst, and fire a bogus remove at teardown. Skipping leaves
+  // indicatorShown false, so the next tick retries once the adapter is bound.
+  if (!adapter?.pulseReaction && !adapter?.deliver) return;
   const t = targetOf(entry);
   const key = indicatorKey(t);
   const held = indicatorHolders.get(key) ?? 0;
