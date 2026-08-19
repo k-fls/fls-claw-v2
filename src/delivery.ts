@@ -44,16 +44,15 @@ const MAX_DELIVERY_ATTEMPTS = 3;
  * by getDeliveredIds forever — the agent's completed answer is lost with
  * nothing left to resend.
  *
- * What this window actually waits for is a HOST RESTART, not an adapter coming
- * back on its own. `activeAdapters` is written only inside initChannelAdapters,
- * whose sole caller runs once at boot (src/index.ts) before the delivery polls
- * start, so an adapter that failed to register cannot register later in this
- * process. Holding the row keeps it deliverable until an operator fixes the
- * cause and restarts. Because missingAdapterSince is in-memory, that restart
- * also resets this clock — so the cap bounds one process's wait, not the row's
- * total lifetime: a crash-looping host retries rows indefinitely rather than
- * failing them. Indefinite retry is the safer direction than silent loss, but
- * it does mean the cap is not a guarantee against a permanently-removed channel.
+ * The window is sized against channel-registry's ADAPTER_RETRY_INTERVAL_MS
+ * (60s), which re-attempts a channel that failed to start: a held row gets on
+ * the order of fifteen chances to catch a recovering adapter before it is
+ * failed. An operator restart also re-registers, so both recovery routes land
+ * inside the window. Because missingAdapterSince is in-memory, a restart resets
+ * this clock — the cap bounds one process's wait, not the row's total lifetime,
+ * so a crash-looping host retries rows indefinitely rather than failing them.
+ * Indefinite retry is the safer direction than silent loss, but it does mean
+ * the cap is not a guarantee against a permanently-removed channel.
  *
  * Accepted cost: a deferred row re-runs all of deliverMessage every poll — a
  * messaging-group lookup (up to twice), two hasTable checks and an
