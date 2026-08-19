@@ -113,14 +113,10 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
       on: boolean,
       instance?: string,
     ): Promise<ReactionOutcome> {
-      // Exact-key only, for the same reason setTyping is: two adapters of one
-      // platform are two distinct bot users, and a reaction placed by the
-      // wrong one shows the wrong avatar and cannot be removed by the owner.
-      //
-      // An offline adapter, or one that predates this seam, reports `failed`
-      // rather than `unsupported` — `unsupported` latches the caller's
-      // fallback for the process lifetime, which is the wrong response to a
-      // transient outage or a stale skill-installed adapter copy.
+      // Exact-key only: two adapters of one platform are distinct bot users, and
+      // a reaction placed by the wrong one cannot be removed by the owner.
+      // Offline or seam-less adapters report `failed`, never `unsupported` —
+      // latching for the process lifetime is wrong for a transient outage.
       const adapter = getChannelAdapterExact(instance ?? channelType);
       if (!adapter?.pulseReaction) return 'failed';
       return adapter.pulseReaction(platformId, messageId, emoji, on);
@@ -132,8 +128,7 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
       messageId: string,
       instance?: string,
     ): Promise<void> {
-      // Exact-key only: the message being deleted was posted by THIS bot
-      // identity, and no other instance can delete it.
+      // Exact-key only: only the posting identity can delete its own message.
       const adapter = getChannelAdapterExact(instance ?? channelType);
       await adapter?.deleteMessage?.(platformId, threadId, messageId);
     },

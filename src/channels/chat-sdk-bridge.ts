@@ -140,23 +140,17 @@ export function isFormatError(err: unknown): boolean {
 }
 
 /**
- * The app cannot place a reaction ANYWHERE with this token — Slack's
- * `missing_scope` (no `reactions:write`), `not_allowed_token_type`,
- * `invalid_auth`, `token_revoked`, `account_inactive`. Distinct from benign
- * state drift (`already_reacted`, `no_reaction`, `message_not_found`), which
- * just means one call did not take.
+ * The token cannot place a reaction ANYWHERE — as opposed to benign drift
+ * (`already_reacted`, `no_reaction`), which means one call did not take.
  *
- * The install-wide reading is the whole point: the caller latches this
- * instance for the process lifetime, so a condition scoped to ONE conversation
- * must not qualify. `not_in_channel` on a single channel would otherwise
- * disable the indicator across the entire workspace — the channel-local codes
- * are excluded first, ahead of the typed-name check, because an adapter may
- * legitimately raise them as a `PermissionError`.
+ * Install-wide is the whole point: the caller latches for the process
+ * lifetime, so a condition scoped to ONE conversation must not qualify.
+ * `not_in_channel` would otherwise disable the indicator workspace-wide, and
+ * an adapter may raise it as a typed PermissionError — hence excluded first.
  *
- * Duck-typed on message, `code`, `data.error`, and `name`, the same way
- * isFormatError and channel-registry's isNetworkError are: the typed error
- * classes in `@chat-adapter/shared` only exist once a channel skill has
- * installed them, so trunk cannot `instanceof` them.
+ * Duck-typed like isFormatError and isNetworkError: `@chat-adapter/shared`'s
+ * error classes only exist once a channel skill installs them, so trunk cannot
+ * `instanceof` them.
  */
 function isPermissionClassError(err: unknown): boolean {
   const e = err as { code?: unknown; data?: { error?: unknown } } | null;
@@ -693,25 +687,16 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
     async pulseReaction(platformId: string, messageId: string, emoji: string, on: boolean): Promise<ReactionOutcome> {
       // The chat address IS the thread id here: a reaction is addressed by
-      // channel + message id, so the same call works for a DM and for a
-      // message inside a channel thread. (Contrast deliver(), which needs the
-      // thread id to post INTO the right thread.)
-      //
-      // Never rejects — the working indicator must not be able to fail routing
-      // or delivery. Benign drift (already_reacted / no_reaction /
-      // message_not_found) reports `failed` and self-corrects on the next work
-      // burst; a permission-class refusal reports `unsupported` so the caller
-      // can stop paying for a doomed call every turn.
+      // channel + message id, so one call covers a DM and an in-thread message.
+      // (Contrast deliver(), which needs the thread id to post INTO a thread.)
       try {
         if (on) await adapter.addReaction(platformId, messageId, emoji);
         else await adapter.removeReaction(platformId, messageId, emoji);
         return 'ok';
       } catch (err) {
         if (isPermissionClassError(err)) {
-          // Warn, not debug: this flips the instance into placeholder-message
-          // mode for the rest of the process, and the operator's fix is a
-          // scope change plus an app reinstall. Invisible at the default log
-          // level, that transition is unexplainable from the outside.
+          // Warn, not debug: this flips the instance into placeholder mode for
+          // the rest of the process and the fix is a scope change + reinstall.
           log.warn('Reactions unavailable to this app — falling back to a placeholder message', {
             adapter: adapter.name,
             platformId,
@@ -719,17 +704,15 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           });
           return 'unsupported';
         }
-        // Everything else degrades invisibly to the user, but a wrong emoji
-        // name (`invalid_name`) or a bad message id looks identical to a
-        // healthy install from the outside — leave a trail to read.
+        // A wrong emoji name or bad message id is otherwise indistinguishable
+        // from a healthy install from the outside.
         log.debug('Reaction call failed', { adapter: adapter.name, platformId, messageId, emoji, on, err });
         return 'failed';
       }
     },
 
     async deleteMessage(platformId: string, threadId: string | null, messageId: string) {
-      // Same address mapping as deliver(), because this deletes something
-      // deliver() posted.
+      // Same address mapping as deliver(), which posted it.
       await adapter.deleteMessage(threadId ?? platformId, messageId);
     },
 

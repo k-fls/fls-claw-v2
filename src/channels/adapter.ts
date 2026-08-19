@@ -111,18 +111,13 @@ export interface ConversationInfo {
 }
 
 /**
- * Result of a `pulseReaction` call. The call itself never rejects — the
- * outcome is how a caller tells "the platform refused, permanently" from
- * "that one didn't take":
+ * `pulseReaction` never rejects; this is how a caller tells a permanent
+ * refusal from a call that merely did not take.
  *
- * - `ok`          — the add/remove reached the platform.
- * - `failed`      — benign state drift (already-reacted, no-reaction, message
- *                   deleted), a transient transport error, or an adapter that
- *                   is offline or predates this seam. Worth attempting again.
- * - `unsupported` — the platform refused for a permission/auth reason
- *                   (Slack `missing_scope`, `not_allowed_token_type`,
- *                   `invalid_auth`). Retrying costs a doomed API call every
- *                   turn, so callers latch a fallback instead.
+ * - `failed`      — benign drift, transport error, or an adapter that is
+ *                   offline. Worth attempting again.
+ * - `unsupported` — permission/auth refusal. Retrying costs a doomed call
+ *                   every turn, so callers latch a fallback instead.
  */
 export type ReactionOutcome = 'ok' | 'failed' | 'unsupported';
 
@@ -164,34 +159,20 @@ export interface ChannelAdapter {
   setTyping?(platformId: string, threadId: string | null): Promise<void>;
 
   /**
-   * Add or remove a single reaction on a message. The host's typing module
-   * uses this as a working indicator on platforms whose native typing signal
-   * does not render (Slack: `assistant.threads.setStatus` only shows inside an
-   * assistant thread, so both DMs and ordinary channel threads show nothing).
-   * `on=true` adds the emoji, `on=false` removes it; the caller holds one
-   * reaction for the duration of a work burst rather than toggling it.
+   * Add (`on`) or remove a reaction; used as a working indicator where the
+   * native typing signal does not render. No thread parameter: a reaction is
+   * addressed by channel + message id, so thread membership is irrelevant.
    *
-   * `platformId` is the chat address. There is no thread parameter because a
-   * reaction is addressed by channel + message id on every platform that has
-   * them — thread membership is not part of the address.
-   *
-   * Best-effort and non-throwing: implementations swallow platform errors and
-   * report them through the returned `ReactionOutcome`, so an indicator can
-   * never fail routing or delivery. Adapters that omit this leave the caller
-   * on its `setTyping` path.
+   * Non-throwing — implementations swallow platform errors and report them via
+   * `ReactionOutcome`, so an indicator can never fail routing or delivery.
    */
   pulseReaction?(platformId: string, messageId: string, emoji: string, on: boolean): Promise<ReactionOutcome>;
 
   /**
-   * Delete a message the bot itself posted. Used by the working indicator's
-   * fallback: on an app that cannot place reactions, the indicator is a short
-   * placeholder message posted when work starts and deleted when it ends.
-   * Deleting your own message needs no scope beyond the one required to post
-   * it, which is what makes the fallback work on an app that was never
-   * reinstalled.
-   *
-   * `threadId ?? platformId` addresses the conversation, matching `deliver`,
-   * and `messageId` is the id `deliver` returned.
+   * Delete a message the bot posted. Used by the indicator's placeholder
+   * fallback — deleting your own message needs no scope beyond posting it,
+   * which is what makes that fallback work on an app lacking the reaction
+   * scope. Addressed like `deliver`; `messageId` is what `deliver` returned.
    */
   deleteMessage?(platformId: string, threadId: string | null, messageId: string): Promise<void>;
   syncConversations?(): Promise<ConversationInfo[]>;
