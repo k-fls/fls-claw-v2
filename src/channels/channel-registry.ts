@@ -172,6 +172,37 @@ export function getChannelContainerConfig(name: string): ChannelRegistration['co
 }
 
 /**
+ * Best-effort cleanup for an adapter that failed to start.
+ *
+ * The failed instance is abandoned here, and the retry pass builds a fresh one
+ * from the factory every ADAPTER_RETRY_INTERVAL_MS — so anything setup() had
+ * already opened would leak once a minute for as long as the channel stays
+ * down, where before the retry pass it leaked once per process. The registry
+ * cannot know what a given adapter allocates: adapters are skill-installed from
+ * the `channels` branch, so this has to be handled generically at the seam that
+ * owns the lifecycle.
+ *
+ * The concrete case is a setup() that fails AFTER connecting: chat-sdk-bridge
+ * runs chat.initialize() before binding a gateway adapter's local webhook
+ * server, so a bind failure strands a live platform connection plus its
+ * reschedule timer. For Discord that is the exact hazard startGateway's own
+ * backoff comment guards against — reconnect storms earn a multi-hour
+ * Cloudflare IP block.
+ *
+ * Swallows its own failure: teardown on a half-built adapter is allowed to
+ * throw (chat-sdk-bridge's calls chat.shutdown() unguarded, and `chat` is
+ * undefined when setup threw before assigning it). The setup error is the one
+ * worth propagating.
+ */
+async function teardownFailedAdapter(name: string, adapter: ChannelAdapter): Promise<void> {
+  try {
+    await adapter.teardown();
+  } catch (err) {
+    log.debug('Teardown after a failed adapter start also failed', { channel: name, err });
+  }
+}
+
+/**
  * Instantiate, set up and register ONE channel adapter.
  *
  * Returns true when the adapter is live, false when it was deliberately
@@ -196,25 +227,32 @@ async function startAdapter(
   // dead until manual restart. Retry only on NetworkError so misconfigs (bad
   // tokens, etc.) still fail fast.
   let attempt = 0;
-  while (true) {
-    try {
-      await adapter.setup(setup);
-      break;
-    } catch (err) {
-      if (isNetworkError(err) && attempt < SETUP_RETRY_DELAYS_MS.length) {
-        const delay = SETUP_RETRY_DELAYS_MS[attempt]!;
-        log.warn('Channel adapter setup failed with network error, retrying', {
-          channel: name,
-          attempt: attempt + 1,
-          delayMs: delay,
-          err: err.message,
-        });
-        await sleep(delay);
-        attempt += 1;
-        continue;
+  try {
+    while (true) {
+      try {
+        await adapter.setup(setup);
+        break;
+      } catch (err) {
+        if (isNetworkError(err) && attempt < SETUP_RETRY_DELAYS_MS.length) {
+          const delay = SETUP_RETRY_DELAYS_MS[attempt]!;
+          log.warn('Channel adapter setup failed with network error, retrying', {
+            channel: name,
+            attempt: attempt + 1,
+            delayMs: delay,
+            err: err.message,
+          });
+          await sleep(delay);
+          attempt += 1;
+          continue;
+        }
+        throw err;
       }
-      throw err;
     }
+  } catch (err) {
+    // Only ever the instance we just built and failed to register — an adapter
+    // live in activeAdapters is never reached from here.
+    await teardownFailedAdapter(name, adapter);
+    throw err;
   }
   // Adapters key by instance (default instance = channelType), so N
   // instances of one platform coexist. Duplicate keys warn instead of

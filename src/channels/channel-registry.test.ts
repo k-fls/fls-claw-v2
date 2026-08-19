@@ -146,6 +146,65 @@ describe('channel registry — instance keying', () => {
     onAction: () => {},
   });
 
+  it('tears down an adapter whose setup failed, so the retry pass cannot leak one per minute', async () => {
+    // Each retry builds a FRESH adapter from the factory. chat-sdk-bridge runs
+    // chat.initialize() before binding a gateway adapter's webhook server, so a
+    // setup that fails after connecting strands a live platform connection —
+    // once per process before the retry pass existed, once a minute after it.
+    vi.useFakeTimers();
+    try {
+      const reg = await import('./channel-registry.js');
+      const builtAdapters: { teardowns: number }[] = [];
+      reg.registerChannelAdapter('slack', {
+        factory: () => {
+          const adapter = createMockAdapter('slack');
+          const record = { teardowns: 0 };
+          builtAdapters.push(record);
+          // Connects, then fails — the shape that leaves something open.
+          adapter.setup = async () => {
+            throw new Error('webhook port already bound');
+          };
+          adapter.teardown = async () => {
+            record.teardowns += 1;
+          };
+          return adapter;
+        },
+      });
+
+      await reg.initChannelAdapters(mockSetup);
+      expect(builtAdapters).toHaveLength(1);
+      expect(builtAdapters[0]!.teardowns).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(reg.ADAPTER_RETRY_INTERVAL_MS * 2);
+
+      // Every abandoned instance got cleaned up, not just the boot-time one.
+      expect(builtAdapters).toHaveLength(3);
+      expect(builtAdapters.every((a) => a.teardowns === 1)).toBe(true);
+      expect(reg.getChannelAdapterExact('slack')).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('still reports the setup failure when teardown of the failed adapter also throws', async () => {
+    const reg = await import('./channel-registry.js');
+    const adapter = createMockAdapter('slack');
+    adapter.setup = async () => {
+      throw new Error('invalid_auth');
+    };
+    // A half-built adapter's teardown is allowed to throw — chat-sdk-bridge
+    // calls chat.shutdown() unguarded, and `chat` is undefined when setup threw
+    // before assigning it.
+    adapter.teardown = async () => {
+      throw new Error('chat is undefined');
+    };
+    reg.registerChannelAdapter('slack', { factory: () => adapter });
+
+    // Boot survives: initChannelAdapters catches, logs, and keeps going.
+    await expect(reg.initChannelAdapters(mockSetup)).resolves.toBeUndefined();
+    expect(reg.getChannelAdapterExact('slack')).toBeUndefined();
+  });
+
   it('retries a channel that threw at boot, and registers it once it recovers', async () => {
     // The real incident: transient `invalid_auth` from Socket Mode connection
     // churn made setup throw, and nothing re-registered the adapter for the
