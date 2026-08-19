@@ -48,50 +48,25 @@ const HEARTBEAT_FRESH_MS = 6000;
 const POST_DELIVERY_PAUSE_MS = 10000;
 
 /**
- * Channels whose native typing signal does not render, so the indicator is a
- * held reaction on the user's own message instead.
- *
- * Slack is the whole set. `assistant.threads.setStatus` — what the adapter's
- * startTyping wraps — only draws inside the app's assistant surface, and the
- * adapter returns early when there is no threadTs at all. Both the DM path and
- * the ordinary channel-thread path therefore produce nothing, which is why
- * this is gated on channel and NOT on thread shape.
- *
- * Deliberately a set here rather than a capability declared on the adapter:
- * Slack installs from the `channels` branch, so an adapter-side declaration
- * would need a coordinated change there before this could ship. See the plan's
- * KTD3.
+ * Channels whose native typing signal does not render, so a held reaction is
+ * used instead. Slack's `setStatus` only draws inside its assistant surface,
+ * so DMs and channel threads are equally blind — hence gated on channel, not
+ * on thread shape.
  */
 const WORKING_INDICATOR_CHANNELS = new Set(['slack']);
 
 const INDICATOR_EMOJI_KEY = 'SLACK_TYPING_EMOJI';
-/**
- * ⏳ — present in every workspace, so a fresh install shows a correct static
- * indicator with no setup. The animated experience wants a custom emoji
- * uploaded to the workspace, which the host cannot provision.
- */
+/** Built-in, so a fresh install gets a correct (static) indicator unconfigured. */
 const DEFAULT_INDICATOR_EMOJI = 'hourglass_flowing_sand';
 
 /**
- * Emoji held on the triggering message for the duration of a work burst.
- *
- * Read once at module load through readEnvFile, so it never enters
- * process.env and never reaches a child process — the same treatment the
- * Slack tokens get. Three states: unset → the default above; a name → that
- * name verbatim; empty (`SLACK_TYPING_EMOJI=` in .env) → the feature is off
- * and no reaction call is ever made. That last one is the kill switch: turn
- * it off and restart the host, no redeploy.
+ * Unset → the default. A name → used verbatim. Empty → the feature is off,
+ * which is the kill switch; `keepEmpty` is what preserves that distinction.
  */
 const INDICATOR_EMOJI =
   readEnvFile([INDICATOR_EMOJI_KEY], { keepEmpty: true })[INDICATOR_EMOJI_KEY] ?? DEFAULT_INDICATOR_EMOJI;
 
-/**
- * Fallback indicator for an app that cannot place reactions: posted when work
- * starts, deleted when it ends. Fixed text on purpose — it is a "something is
- * happening" signal, not a progress surface, and it costs a message plus an
- * unread badge per turn, which is why it is the fallback and not the primary
- * path.
- */
+/** Fallback for an app without the reaction scope; fixed text, not a progress surface. */
 const PLACEHOLDER_TEXT = '_working…_';
 
 interface TypingAdapter {
@@ -132,13 +107,9 @@ interface TypingTarget {
   interval: NodeJS.Timeout;
   startedAt: number;
   pausedUntil: number; // epoch ms; 0 = not paused
-  /**
-   * Platform id of the message that triggered this burst — the message the
-   * indicator reaction sits on. Null when the channel does not use the
-   * reaction path, or when the inbound event carried no usable id.
-   */
+  /** Message the indicator sits on; null when there is no usable target. */
   indicatorMessageId: string | null;
-  /** Whether THIS session currently holds a count on that message. */
+  /** Whether THIS session holds a count on that message. */
   indicatorShown: boolean;
 }
 
@@ -146,52 +117,42 @@ let adapter: TypingAdapter | null = null;
 const typingRefreshers = new Map<string, TypingTarget>();
 
 /**
- * How many sessions currently want the indicator on a given target message,
- * keyed by `instance|chat|message`.
+ * Holders per `instance|chat|message`; add on 0→1, remove on 1→0.
  *
- * One inbound Slack message is evaluated against every agent wired to the
- * messaging group, so N engaging agents means N refreshers aimed at one
- * message. The reaction is added on the 0→1 transition and removed on 1→0;
- * without that, the first agent to finish strips the indicator while the rest
- * are still working. The instance is part of the key because two Slack apps in
- * one workspace are two distinct Slack users whose reactions are independent.
+ * One inbound message fans out to every wired agent, so N agents mean N
+ * refreshers on one message — without counting, the first to finish strips the
+ * indicator from the rest. The instance is in the key because two Slack apps
+ * are two distinct users whose reactions cannot cancel each other.
  */
 const indicatorHolders = new Map<string, number>();
 
 /**
- * Adapter instances whose app cannot place reactions, latched on the first
- * permission-class refusal (`missing_scope` and friends). Adding the
- * `reactions:write` scope requires reinstalling the Slack app, which mints a
- * new token and therefore needs a host restart anyway — so a process-lifetime
- * latch costs nothing and saves one doomed API call per turn forever.
+ * Instances whose app lacks the reaction scope, latched on first refusal.
+ * Process-lifetime is safe: granting the scope needs an app reinstall, whose
+ * new token needs a host restart anyway.
  */
 const reactionUnsupportedInstances = new Set<string>();
 
 /**
- * What an acquire actually did, so the matching release undoes exactly that.
- * A bare message id cannot express this: "no placeholder id" is true both when
- * the reaction path was taken and when the instance latched but the
- * placeholder post failed, and those want opposite teardowns.
+ * What an acquire did, so the release undoes that. A bare message id cannot
+ * express it: "no placeholder id" is true both for the reaction path and for a
+ * latched instance whose placeholder post failed, which want opposite teardowns.
  */
 type IndicatorHold = { kind: 'reaction' } | { kind: 'placeholder'; messageId?: string };
 
 /**
- * Tail of the serialized operation chain per target. `null` means nothing is
- * held right now.
+ * Tail of the per-target operation chain; `null` means nothing is held.
  *
- * Every acquire and release for one key runs through this chain, in order.
- * Both are async and either can still be in flight when the other is
- * requested — a burst can end before its own add lands, and the router can
- * stop and immediately restart a refresher (failed wake, then a sweep retry).
- * Without serialization an older release resolves after a newer acquire and
- * strips an indicator a live holder still wants.
+ * Acquire and release are both async and either can be in flight when the
+ * other is requested (a burst can end before its add lands; the router can
+ * stop and restart a refresher on a failed wake). Unserialized, an older
+ * release resolves after a newer acquire and strips a live indicator.
  */
 const indicatorOps = new Map<string, Promise<IndicatorHold | null>>();
 
 /**
- * The full address of one indicator, snapshotted so async teardown is immune
- * to the entry moving underneath it (agent-shared sessions can be re-triggered
- * from another chat, or another platform, mid-flight).
+ * Snapshotted address, so async teardown is immune to the entry moving
+ * underneath it — agent-shared sessions can be re-triggered from another chat.
  */
 interface IndicatorTarget {
   channelType: string;
@@ -235,22 +196,13 @@ function isHeartbeatFresh(agentGroupId: string, sessionId: string): boolean {
   }
 }
 
-/**
- * True when this session signals work with the held indicator rather than
- * `setTyping`. Gated on the channel and on having a real target message —
- * NOT on thread shape, because neither Slack code path renders natively.
- */
+/** Gated on channel and on having a target — deliberately NOT on thread shape. */
 function usesWorkingIndicator(entry: TypingTarget): boolean {
   return (
     INDICATOR_EMOJI !== '' && entry.indicatorMessageId !== null && WORKING_INDICATOR_CHANNELS.has(entry.channelType)
   );
 }
 
-/**
- * Snapshot the entry's indicator address; see IndicatorTarget. Only called
- * from paths that already established a target: show checks
- * usesWorkingIndicator, and hide runs only for a holder, which implies one.
- */
 function targetOf(entry: TypingTarget): IndicatorTarget {
   return {
     channelType: entry.channelType,
@@ -261,20 +213,15 @@ function targetOf(entry: TypingTarget): IndicatorTarget {
   };
 }
 
-/** The registry key an instance-addressed call resolves through. */
 function instanceKey(t: IndicatorTarget): string {
   return t.instance ?? t.channelType;
 }
 
-/** Reference-count key: the indicator's full identity on the platform. */
 function indicatorKey(t: IndicatorTarget): string {
   return `${instanceKey(t)}|${t.platformId}|${t.messageId}`;
 }
 
-/**
- * Fire one add/remove. Never throws: the indicator must not be able to break
- * routing or delivery. A dropped call self-corrects on the next work burst.
- */
+/** Never throws: an indicator must not be able to break routing or delivery. */
 async function pulseIndicator(t: IndicatorTarget, on: boolean): Promise<ReactionOutcome> {
   try {
     const outcome = await adapter?.pulseReaction?.(
@@ -304,34 +251,26 @@ async function postPlaceholder(t: IndicatorTarget): Promise<string | undefined> 
       t.instance,
     );
   } catch {
-    // Best-effort, exactly like the reaction path: no indicator this turn.
     return undefined;
   }
 }
 
-/** Remove the fallback placeholder. Never throws. */
+/** Never throws; a stranded placeholder beats breaking the refresh loop. */
 async function deletePlaceholder(t: IndicatorTarget, messageId: string): Promise<void> {
   try {
     await adapter?.deleteMessage?.(t.channelType, t.platformId, t.threadId, messageId, t.instance);
   } catch {
-    // A stranded placeholder is the worst case here, and it is still better
-    // than letting a cleanup failure escape into the refresh loop.
+    // swallowed — see above
   }
 }
 
-/**
- * Light the indicator for a target nobody was holding. Prefers the reaction;
- * on a permission-class refusal it latches the instance and falls back to a
- * placeholder message, this turn included.
- */
+/** Reaction first; a permission refusal latches the instance onto the placeholder. */
 async function acquireIndicator(t: IndicatorTarget): Promise<IndicatorHold> {
   if (!reactionUnsupportedInstances.has(instanceKey(t))) {
     const outcome = await pulseIndicator(t, true);
     if (outcome !== 'unsupported') return { kind: 'reaction' };
     reactionUnsupportedInstances.add(instanceKey(t));
   }
-  // Latched: never attempt a reaction on this instance again, including on
-  // the teardown side — that is what the latch promises.
   return { kind: 'placeholder', messageId: await postPlaceholder(t) };
 }
 
@@ -343,10 +282,8 @@ async function releaseIndicator(t: IndicatorTarget, hold: IndicatorHold): Promis
   }
   const outcome = await pulseIndicator(t, false);
   if (outcome === 'ok') return;
-  // The add side degrades invisibly by design, but a failed REMOVE strands a
-  // reaction on the user's message with nothing to ever revisit it — a native
-  // typing indicator would have expired on its own. Best-effort still, but the
-  // operator gets to see it.
+  // A failed remove strands a reaction permanently: nothing revisits that
+  // message, and unlike a native indicator it does not expire.
   log.warn('Working indicator could not be cleared', {
     channelType: t.channelType,
     platformId: t.platformId,
@@ -356,11 +293,7 @@ async function releaseIndicator(t: IndicatorTarget, hold: IndicatorHold): Promis
   });
 }
 
-/**
- * Take this session's hold on the indicator, lighting it if this is the first.
- * Idempotent: a session that already holds one issues nothing, which is what
- * makes the interval tick a liveness check rather than a reaction driver.
- */
+/** Idempotent — this is what makes the tick a liveness check, not a driver. */
 function showIndicator(entry: TypingTarget): void {
   if (entry.indicatorShown || !usesWorkingIndicator(entry)) return;
   const t = targetOf(entry);
@@ -376,12 +309,7 @@ function showIndicator(entry: TypingTarget): void {
   );
 }
 
-/**
- * Release this session's hold, taking the indicator down when it was the last.
- * Must run BEFORE any mutation of the entry's address fields — the key it
- * releases is the one it acquired, and the snapshot it tears down with is the
- * address it acquired against.
- */
+/** Must run BEFORE any mutation of the entry's address: it releases the key it acquired. */
 function hideIndicator(entry: TypingTarget): void {
   if (!entry.indicatorShown) return;
   const t = targetOf(entry);
@@ -393,9 +321,7 @@ function hideIndicator(entry: TypingTarget): void {
     return;
   }
   indicatorHolders.delete(key);
-  // Chain off the acquire so teardown matches setup even when the burst ends
-  // before the platform answered, and so a re-acquire queues behind this
-  // release rather than racing it.
+  // Chained so teardown matches setup, and a re-acquire queues behind it.
   const prior = indicatorOps.get(key) ?? Promise.resolve(null);
   const settled: Promise<IndicatorHold | null> = prior
     .then(async (hold) => {
@@ -404,18 +330,13 @@ function hideIndicator(entry: TypingTarget): void {
     })
     .catch(() => null);
   indicatorOps.set(key, settled);
-  // Drop the entry once the chain goes idle, so a long-lived host does not
-  // accumulate one resolved promise per message it ever reacted to.
+  // Drop once idle so the map does not grow per message ever reacted to.
   void settled.then(() => {
     if (indicatorOps.get(key) === settled) indicatorOps.delete(key);
   });
 }
 
-/**
- * One "still working" signal for an active refresher: hold the reaction on
- * channels that need it, otherwise a normal `setTyping`. Shared by the
- * immediate tick, the interval tick, and the re-trigger so all three agree.
- */
+/** Shared by the immediate tick, the interval tick, and the re-trigger. */
 function fireWorkingSignal(entry: TypingTarget): void {
   if (usesWorkingIndicator(entry)) {
     showIndicator(entry);
@@ -425,13 +346,10 @@ function fireWorkingSignal(entry: TypingTarget): void {
 }
 
 /**
- * @param triggerMessageId Platform id of the inbound message that engaged the
- *   agent — the message the indicator reaction is placed on. Pass the RAW
- *   inbound id, not the agent-namespaced id written to messages_in: on Slack
- *   the raw id is the `ts` that reactions.add needs. Omit (or pass null) when
- *   the event carried none; the router synthesizes an id in that case and a
- *   synthesized id is not a `ts`, so the correct behavior is no indicator
- *   rather than a doomed call. Ignored on channels with a native indicator.
+ * @param triggerMessageId RAW inbound message id, not the agent-namespaced one
+ *   written to messages_in — on Slack the raw id is the `ts` reactions need.
+ *   Absent means no indicator: the router synthesizes an id when the event
+ *   carries none, and a synthesized id is not a `ts`.
  */
 export function startTypingRefresh(
   sessionId: string,
@@ -444,21 +362,10 @@ export function startTypingRefresh(
 ): void {
   const existing = typingRefreshers.get(sessionId);
   if (existing) {
-    // Already refreshing. Reset the grace window — the new message restarts
-    // the container-wake latency budget — and clear any lingering
-    // post-delivery pause: a new inbound means the user expects the signal
-    // to show immediately.
-    //
-    // A re-trigger can arrive from a different chat address (agent-shared
-    // sessions span messaging groups, possibly on different platforms or
-    // instances). The held indicator belongs to the OLD address, so release
-    // it there before the address moves and drop the now-foreign target id —
-    // otherwise a later tick would toggle a Slack ts against Telegram.
-    //
-    // threadId counts as part of the address even though a reaction is
-    // addressed by channel + ts: the fallback placeholder is POSTED into the
-    // thread, so a thread move would delete against the new thread using an
-    // id created in the old one.
+    // A re-trigger can arrive from a different chat (agent-shared sessions span
+    // messaging groups and platforms), so release the held indicator against the
+    // OLD address before moving. threadId counts as address because the fallback
+    // placeholder is posted INTO the thread.
     const addressChanged =
       existing.channelType !== channelType ||
       existing.platformId !== platformId ||
@@ -478,17 +385,12 @@ export function startTypingRefresh(
     existing.platformId = platformId;
     existing.threadId = threadId;
     existing.instance = instance;
-    // Re-seed whenever this session is not currently holding the indicator.
-    //
-    // While it IS held, the target stays put: the indicator is added once and
-    // held for the burst, so a follow-up message mid-burst does not pay a
-    // remove+add to chase itself. But delivery ends a burst too — it clears
-    // the indicator and leaves the old id behind — so without this the next
-    // turn would light up on the PREVIOUS turn's message.
+    // Held means mid-burst, so the target stays put. Not held means the burst
+    // ended — delivery clears the indicator but leaves the id, so re-seeding
+    // here is what stops the next turn lighting up on the previous message.
     if (triggerMessageId && (existing.indicatorMessageId === null || !existing.indicatorShown)) {
       existing.indicatorMessageId = triggerMessageId;
     }
-    // Immediate signal for the new inbound, fired from the now-updated entry.
     fireWorkingSignal(existing);
     return;
   }
@@ -503,10 +405,8 @@ export function startTypingRefresh(
     // expires.
     const now = Date.now();
     if (entry.pausedUntil > now) return;
-    // Past the pause. Clearing it here makes this tick the pause-expiry edge:
-    // delivery took the reaction down, and a still-working agent gets exactly
-    // one add back — a visible quiet-then-working rhythm instead of an
-    // indicator that never goes out.
+    // Clearing here makes this tick the pause-expiry edge: a still-working
+    // agent gets exactly one add back after delivery took the indicator down.
     entry.pausedUntil = 0;
 
     const withinGrace = now - entry.startedAt < TYPING_GRACE_MS;
@@ -516,8 +416,7 @@ export function startTypingRefresh(
     }
 
     // Out of grace AND heartbeat stale — agent is idle, stop refreshing.
-    // A reaction does not expire the way a native indicator does, so it has
-    // to come off before the entry goes.
+    // A reaction does not expire on its own, so take it off before the entry goes.
     hideIndicator(entry);
     clearInterval(entry.interval);
     typingRefreshers.delete(sessionId);
@@ -537,23 +436,17 @@ export function startTypingRefresh(
     indicatorShown: false,
   };
   typingRefreshers.set(sessionId, entry);
-  // Immediate signal, fired from the stored entry so the reaction path and
-  // the setTyping path start from the same state the ticks will read.
+  // Fired from the stored entry so it starts from the state the ticks will read.
   fireWorkingSignal(entry);
 }
 
 /**
- * Pause the typing refresh for POST_DELIVERY_PAUSE_MS, and take the indicator
- * reaction down. Called after a user-facing message is delivered so the
- * client-side indicator has a chance to visually clear before the agent's
- * next SDK event pushes it back on. No-op if no refresh is active for this
- * session.
+ * Pause the refresh for POST_DELIVERY_PAUSE_MS and take the indicator down.
+ * No-op if no refresh is active.
  *
- * The reaction clears here rather than at a separate call site because this
- * IS the delivered-a-reply edge: delivery calls it exactly once per
- * user-facing send, already filtered against system and agent-to-agent
- * traffic. If the agent keeps working, the first tick past the pause puts the
- * reaction back (see the interval).
+ * The indicator clears here rather than at a separate call site because this
+ * IS the delivered-a-reply edge — delivery calls it once per user-facing send,
+ * already filtered against system and agent-to-agent traffic.
  */
 export function pauseTypingRefreshAfterDelivery(sessionId: string): void {
   const entry = typingRefreshers.get(sessionId);
@@ -565,9 +458,8 @@ export function pauseTypingRefreshAfterDelivery(sessionId: string): void {
 export function stopTypingRefresh(sessionId: string): void {
   const entry = typingRefreshers.get(sessionId);
   if (!entry) return;
-  // Unlike a native typing indicator, a reaction stays until removed — so
-  // every exit edge (idle timeout, container exit, failed wake, shutdown)
-  // has to take it off or it strands on the user's message.
+  // A reaction stays until removed, so every exit edge (idle, container exit,
+  // failed wake, shutdown) has to take it off or it strands.
   hideIndicator(entry);
   clearInterval(entry.interval);
   typingRefreshers.delete(sessionId);

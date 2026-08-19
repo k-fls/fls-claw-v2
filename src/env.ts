@@ -8,10 +8,9 @@ import { log } from './log.js';
  * do with the values. This keeps secrets out of the process environment
  * so they don't leak to child processes.
  *
- * An empty value is dropped by default, which is right for a credential —
- * an empty token is not a token. Pass `keepEmpty` for a setting where
- * `KEY=` is a meaningful state ("configured to nothing", i.e. off) that must
- * stay distinguishable from an absent key ("not configured", i.e. default).
+ * An empty value is dropped by default — an empty token is not a token. Pass
+ * `keepEmpty` where `KEY=` is meaningful state (off) that must stay distinct
+ * from an absent key (default).
  */
 export function readEnvFile(keys: string[], opts?: { keepEmpty?: boolean }): Record<string, string> {
   const envFile = path.join(process.cwd(), '.env');
