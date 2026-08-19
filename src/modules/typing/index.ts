@@ -20,6 +20,7 @@
 import fs from 'fs';
 
 import { heartbeatPath } from '../../session-manager.js';
+import { log } from '../../log.js';
 import { readEnvFile } from '../../env.js';
 import type { OutboundFile, ReactionOutcome } from '../../channels/adapter.js';
 
@@ -167,15 +168,25 @@ const indicatorHolders = new Map<string, number>();
 const reactionUnsupportedInstances = new Set<string>();
 
 /**
- * In-flight acquire per target, resolving to the placeholder message id when
- * the fallback path was taken and undefined when the reaction path was.
- *
- * Release chains off this rather than reading a flag: acquiring is async (the
- * decision between reaction and placeholder is only known once the platform
- * answers), and a burst can end before it resolves. Chaining guarantees the
- * teardown matches the setup instead of racing it and stranding a message.
+ * What an acquire actually did, so the matching release undoes exactly that.
+ * A bare message id cannot express this: "no placeholder id" is true both when
+ * the reaction path was taken and when the instance latched but the
+ * placeholder post failed, and those want opposite teardowns.
  */
-const indicatorOps = new Map<string, Promise<string | undefined>>();
+type IndicatorHold = { kind: 'reaction' } | { kind: 'placeholder'; messageId?: string };
+
+/**
+ * Tail of the serialized operation chain per target. `null` means nothing is
+ * held right now.
+ *
+ * Every acquire and release for one key runs through this chain, in order.
+ * Both are async and either can still be in flight when the other is
+ * requested — a burst can end before its own add lands, and the router can
+ * stop and immediately restart a refresher (failed wake, then a sweep retry).
+ * Without serialization an older release resolves after a newer acquire and
+ * strips an indicator a live holder still wants.
+ */
+const indicatorOps = new Map<string, Promise<IndicatorHold | null>>();
 
 /**
  * The full address of one indicator, snapshotted so async teardown is immune
@@ -309,20 +320,40 @@ async function deletePlaceholder(t: IndicatorTarget, messageId: string): Promise
 }
 
 /**
- * Light the indicator for a target that nobody was holding. Prefers the
- * reaction; on a permission-class refusal it latches the instance and falls
- * back to a placeholder message, this turn included.
- *
- * Resolves to the placeholder's message id when the fallback was used, so the
- * matching release knows which teardown to run.
+ * Light the indicator for a target nobody was holding. Prefers the reaction;
+ * on a permission-class refusal it latches the instance and falls back to a
+ * placeholder message, this turn included.
  */
-async function acquireIndicator(t: IndicatorTarget): Promise<string | undefined> {
+async function acquireIndicator(t: IndicatorTarget): Promise<IndicatorHold> {
   if (!reactionUnsupportedInstances.has(instanceKey(t))) {
     const outcome = await pulseIndicator(t, true);
-    if (outcome !== 'unsupported') return undefined;
+    if (outcome !== 'unsupported') return { kind: 'reaction' };
     reactionUnsupportedInstances.add(instanceKey(t));
   }
-  return postPlaceholder(t);
+  // Latched: never attempt a reaction on this instance again, including on
+  // the teardown side — that is what the latch promises.
+  return { kind: 'placeholder', messageId: await postPlaceholder(t) };
+}
+
+/** Undo exactly what the matching acquire did. */
+async function releaseIndicator(t: IndicatorTarget, hold: IndicatorHold): Promise<void> {
+  if (hold.kind === 'placeholder') {
+    if (hold.messageId !== undefined) await deletePlaceholder(t, hold.messageId);
+    return;
+  }
+  const outcome = await pulseIndicator(t, false);
+  if (outcome === 'ok') return;
+  // The add side degrades invisibly by design, but a failed REMOVE strands a
+  // reaction on the user's message with nothing to ever revisit it — a native
+  // typing indicator would have expired on its own. Best-effort still, but the
+  // operator gets to see it.
+  log.warn('Working indicator could not be cleared', {
+    channelType: t.channelType,
+    platformId: t.platformId,
+    messageId: t.messageId,
+    instance: t.instance,
+    outcome,
+  });
 }
 
 /**
@@ -337,7 +368,12 @@ function showIndicator(entry: TypingTarget): void {
   const held = indicatorHolders.get(key) ?? 0;
   indicatorHolders.set(key, held + 1);
   entry.indicatorShown = true;
-  if (held === 0) indicatorOps.set(key, acquireIndicator(t));
+  if (held > 0) return;
+  const prior = indicatorOps.get(key) ?? Promise.resolve(null);
+  indicatorOps.set(
+    key,
+    prior.then(() => acquireIndicator(t)).catch(() => null),
+  );
 }
 
 /**
@@ -358,12 +394,21 @@ function hideIndicator(entry: TypingTarget): void {
   }
   indicatorHolders.delete(key);
   // Chain off the acquire so teardown matches setup even when the burst ends
-  // before the platform answered.
-  const pending = indicatorOps.get(key) ?? Promise.resolve(undefined);
-  indicatorOps.delete(key);
-  void pending.then((placeholderId) =>
-    placeholderId === undefined ? pulseIndicator(t, false).then(() => {}) : deletePlaceholder(t, placeholderId),
-  );
+  // before the platform answered, and so a re-acquire queues behind this
+  // release rather than racing it.
+  const prior = indicatorOps.get(key) ?? Promise.resolve(null);
+  const settled: Promise<IndicatorHold | null> = prior
+    .then(async (hold) => {
+      if (hold) await releaseIndicator(t, hold);
+      return null;
+    })
+    .catch(() => null);
+  indicatorOps.set(key, settled);
+  // Drop the entry once the chain goes idle, so a long-lived host does not
+  // accumulate one resolved promise per message it ever reacted to.
+  void settled.then(() => {
+    if (indicatorOps.get(key) === settled) indicatorOps.delete(key);
+  });
 }
 
 /**
@@ -409,8 +454,16 @@ export function startTypingRefresh(
     // instances). The held indicator belongs to the OLD address, so release
     // it there before the address moves and drop the now-foreign target id —
     // otherwise a later tick would toggle a Slack ts against Telegram.
+    //
+    // threadId counts as part of the address even though a reaction is
+    // addressed by channel + ts: the fallback placeholder is POSTED into the
+    // thread, so a thread move would delete against the new thread using an
+    // id created in the old one.
     const addressChanged =
-      existing.channelType !== channelType || existing.platformId !== platformId || existing.instance !== instance;
+      existing.channelType !== channelType ||
+      existing.platformId !== platformId ||
+      existing.instance !== instance ||
+      existing.threadId !== threadId;
     if (addressChanged) {
       hideIndicator(existing);
       existing.indicatorMessageId = null;
@@ -425,10 +478,14 @@ export function startTypingRefresh(
     existing.platformId = platformId;
     existing.threadId = threadId;
     existing.instance = instance;
-    // Seed a target only if we have none. The reaction is held for the whole
-    // burst (R2), so a follow-up message inside one burst does not pay a
-    // remove+add to move the indicator onto itself.
-    if (existing.indicatorMessageId === null && triggerMessageId) {
+    // Re-seed whenever this session is not currently holding the indicator.
+    //
+    // While it IS held, the target stays put: the indicator is added once and
+    // held for the burst, so a follow-up message mid-burst does not pay a
+    // remove+add to chase itself. But delivery ends a burst too — it clears
+    // the indicator and leaves the old id behind — so without this the next
+    // turn would light up on the PREVIOUS turn's message.
+    if (triggerMessageId && (existing.indicatorMessageId === null || !existing.indicatorShown)) {
       existing.indicatorMessageId = triggerMessageId;
     }
     // Immediate signal for the new inbound, fired from the now-updated entry.
@@ -476,7 +533,7 @@ export function startTypingRefresh(
     interval,
     startedAt,
     pausedUntil: 0,
-    indicatorMessageId: triggerMessageId ?? null,
+    indicatorMessageId: triggerMessageId || null,
     indicatorShown: false,
   };
   typingRefreshers.set(sessionId, entry);

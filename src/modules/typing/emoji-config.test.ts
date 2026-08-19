@@ -27,8 +27,14 @@ type ReactionCall = { channelType: string; messageId: string; emoji: string; on:
  */
 async function loadTyping(env: Record<string, string>) {
   vi.resetModules();
+  // Mirrors readEnvFile's real semantics, including the drop-empty default —
+  // otherwise dropping `{ keepEmpty: true }` from the production call site
+  // would break the kill switch without failing anything here.
   vi.doMock('../../env.js', () => ({
-    readEnvFile: (keys: string[]) => Object.fromEntries(keys.filter((k) => k in env).map((k) => [k, env[k]] as const)),
+    readEnvFile: (keys: string[], opts?: { keepEmpty?: boolean }) =>
+      Object.fromEntries(
+        keys.filter((k) => k in env && (env[k] !== '' || opts?.keepEmpty)).map((k) => [k, env[k]] as const),
+      ),
   }));
   const mod = await import('./index.js');
 
