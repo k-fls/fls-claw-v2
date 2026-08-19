@@ -146,22 +146,36 @@ export function isFormatError(err: unknown): boolean {
 }
 
 /**
- * A platform refused a reaction because the app lacks the permission to place
- * one at all — Slack's `missing_scope` (no `reactions:write`),
- * `not_allowed_token_type`, or `invalid_auth`. Distinct from benign state
- * drift (`already_reacted`, `no_reaction`, `message_not_found`), which just
- * means that one call did not take.
+ * The app cannot place a reaction ANYWHERE with this token — Slack's
+ * `missing_scope` (no `reactions:write`), `not_allowed_token_type`,
+ * `invalid_auth`, `token_revoked`, `account_inactive`. Distinct from benign
+ * state drift (`already_reacted`, `no_reaction`, `message_not_found`), which
+ * just means one call did not take.
  *
- * Duck-typed on message and `name`, the same way isFormatError and
- * channel-registry's isNetworkError are: `@chat-adapter/shared`'s typed error
- * classes only exist once a channel skill has installed them, so trunk cannot
- * `instanceof` them.
+ * The install-wide reading is the whole point: the caller latches this
+ * instance for the process lifetime, so a condition scoped to ONE conversation
+ * must not qualify. `not_in_channel` on a single channel would otherwise
+ * disable the indicator across the entire workspace — the channel-local codes
+ * are excluded first, ahead of the typed-name check, because an adapter may
+ * legitimately raise them as a `PermissionError`.
+ *
+ * Duck-typed on message, `code`, `data.error`, and `name`, the same way
+ * isFormatError and channel-registry's isNetworkError are: the typed error
+ * classes in `@chat-adapter/shared` only exist once a channel skill has
+ * installed them, so trunk cannot `instanceof` them.
  */
 function isPermissionClassError(err: unknown): boolean {
-  if (err instanceof Error && (err.name === 'PermissionError' || err.name === 'AuthenticationError')) return true;
-  const m = err instanceof Error ? err.message : String(err);
-  const code = typeof (err as { code?: unknown })?.code === 'string' ? (err as { code: string }).code : '';
-  return /missing_scope|not_allowed_token_type|invalid_auth/i.test(`${code} ${m}`);
+  const e = err as { code?: unknown; data?: { error?: unknown } } | null;
+  const code = typeof e?.code === 'string' ? e.code : '';
+  const platformError = typeof e?.data?.error === 'string' ? e.data.error : '';
+  const message = err instanceof Error ? err.message : String(err);
+  const haystack = `${code} ${platformError} ${message}`;
+
+  // Scoped to one conversation — never latch the whole install for this.
+  if (/not_in_channel|channel_not_found|is_archived|thread_not_found/i.test(haystack)) return false;
+
+  if (/missing_scope|not_allowed_token_type|invalid_auth|token_revoked|account_inactive/i.test(haystack)) return true;
+  return err instanceof Error && (err.name === 'PermissionError' || err.name === 'AuthenticationError');
 }
 
 /**
@@ -703,9 +717,21 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         return 'ok';
       } catch (err) {
         if (isPermissionClassError(err)) {
-          log.debug('Reaction refused for permission reasons', { adapter: adapter.name, platformId, err });
+          // Warn, not debug: this flips the instance into placeholder-message
+          // mode for the rest of the process, and the operator's fix is a
+          // scope change plus an app reinstall. Invisible at the default log
+          // level, that transition is unexplainable from the outside.
+          log.warn('Reactions unavailable to this app — falling back to a placeholder message', {
+            adapter: adapter.name,
+            platformId,
+            err,
+          });
           return 'unsupported';
         }
+        // Everything else degrades invisibly to the user, but a wrong emoji
+        // name (`invalid_name`) or a bad message id looks identical to a
+        // healthy install from the outside — leave a trail to read.
+        log.debug('Reaction call failed', { adapter: adapter.name, platformId, messageId, emoji, on, err });
         return 'failed';
       }
     },

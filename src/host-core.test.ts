@@ -45,6 +45,9 @@ vi.mock('./config.js', async () => {
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-host' };
 });
 
+// Pin the indicator emoji: the typing module reads .env at import time.
+vi.mock('./env.js', () => ({ readEnvFile: () => ({}) }));
+
 function now() {
   return new Date().toISOString();
 }

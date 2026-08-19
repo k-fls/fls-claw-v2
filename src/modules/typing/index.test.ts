@@ -464,6 +464,67 @@ describe('Slack reaction indicator — hold-one lifecycle', () => {
     expect(reactions.map((r) => r.on)).toEqual([true, false]);
   });
 
+  it('moves to the new message when a fresh turn starts after a reply landed', async () => {
+    // Delivery ends a burst: it clears the indicator but leaves the old target
+    // id behind. The next inbound is a new turn and must light up on ITS
+    // message — otherwise the user sees the indicator appear on something they
+    // sent minutes ago.
+    const { reactions } = captureBoth();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, undefined, 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+    pauseTypingRefreshAfterDelivery('sess-1');
+    await vi.advanceTimersByTimeAsync(0);
+    reactions.length = 0;
+
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, undefined, 'ts-200');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reactions).toEqual([expect.objectContaining({ messageId: 'ts-200', on: true })]);
+
+    stopTypingRefresh('sess-1');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reactions.at(-1)).toMatchObject({ messageId: 'ts-200', on: false });
+  });
+
+  it('serializes a re-acquire behind the release it follows', async () => {
+    // The router can stop a refresher and immediately start it again on the
+    // same message (a failed wake, then the sweep retry). If the release ran
+    // unordered against the new add, it would resolve last and strip an
+    // indicator that a live holder still wants.
+    const { reactions } = captureBoth();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, undefined, 'ts-100');
+    stopTypingRefresh('sess-1');
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, undefined, 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Whatever the interleaving, the last word on this message must be "on".
+    expect(reactions.map((r) => r.on)).toEqual([true, false, true]);
+    expect(reactions.at(-1)).toMatchObject({ messageId: 'ts-100', on: true });
+  });
+
+  it('treats a thread move as an address change', async () => {
+    // A reaction is addressed by channel + ts, but the fallback placeholder is
+    // POSTED into the thread — so a thread move has to release against the old
+    // thread rather than carry the hold across.
+    const { reactions } = captureBoth();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'slack:C1:aaa', undefined, 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+    reactions.length = 0;
+
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'slack:C1:bbb', undefined, 'ts-200');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reactions.map((r) => [r.messageId, r.on])).toEqual([
+      ['ts-100', false],
+      ['ts-200', true],
+    ]);
+  });
+
+  it('ignores an empty inbound message id the same as an absent one', async () => {
+    const { reactions } = captureBoth();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, undefined, '');
+    await vi.advanceTimersByTimeAsync(12_500);
+    expect(reactions).toHaveLength(0);
+  });
+
   it('does not re-add after the pause when the agent has gone quiet', async () => {
     const { reactions } = captureBoth();
     startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, undefined, 'ts-100');
@@ -624,12 +685,59 @@ describe('Slack working indicator — placeholder fallback', () => {
   });
 
   it('issues no delete when the placeholder post itself failed', async () => {
-    const { deleted } = captureFallback({ postFails: true });
+    const { reactions, deleted } = captureFallback({ postFails: true });
     startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'inst-postfail', 'ts-100');
     await vi.advanceTimersByTimeAsync(0);
+    const reactionCallsAfterLatch = reactions.length;
 
     stopTypingRefresh('sess-1');
     await vi.advanceTimersByTimeAsync(0);
     expect(deleted).toHaveLength(0);
+    // And no reaction-removal either: the instance is latched, so the teardown
+    // must not go back to the very API the latch says is unavailable.
+    expect(reactions).toHaveLength(reactionCallsAfterLatch);
+  });
+
+  it('posts fixed placeholder text, not a progress surface', async () => {
+    const { posted } = captureFallback();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'inst-text', 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(posted).toHaveLength(1);
+    expect(JSON.parse(posted[0].content)).toEqual({ text: expect.any(String) });
+    expect(JSON.parse(posted[0].content).text.length).toBeGreaterThan(0);
+  });
+
+  it('survives a rejecting deleteMessage without breaking teardown', async () => {
+    // A stranded placeholder is the worst case here; an escaping rejection
+    // would be worse still.
+    const posted: string[] = [];
+    setTypingAdapter({
+      async setTyping() {},
+      async pulseReaction() {
+        return 'unsupported';
+      },
+      async deliver() {
+        posted.push('placeholder');
+        return 'placeholder-1';
+      },
+      async deleteMessage() {
+        throw new Error('slack rejected the delete');
+      },
+    });
+
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'inst-delfail', 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(posted).toHaveLength(1);
+
+    expect(() => stopTypingRefresh('sess-1')).not.toThrow();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The refresher is gone and the module still works for the next burst.
+    startTypingRefresh('sess-2', 'ag-1', 'slack', 'slack:D2', null, 'inst-delfail', 'ts-200');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(posted).toHaveLength(2);
+    stopTypingRefresh('sess-2');
+    await vi.advanceTimersByTimeAsync(0);
   });
 });

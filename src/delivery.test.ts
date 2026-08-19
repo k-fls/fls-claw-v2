@@ -24,6 +24,10 @@ vi.mock('./config.js', async () => {
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-delivery', GROUPS_DIR: '/tmp/nanoclaw-test-delivery/groups' };
 });
 
+// The typing module reads the indicator emoji from .env at import time; pin it
+// so these arms do not depend on the developer's local file.
+vi.mock('./env.js', () => ({ readEnvFile: () => ({}) }));
+
 const TEST_DIR = '/tmp/nanoclaw-test-delivery';
 
 import {
@@ -423,8 +427,8 @@ describe('deliverSessionMessages — Slack working indicator', () => {
     const db = new Database(outboundDbPath(agentGroupId, sessionId));
     db.prepare(
       `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
-       VALUES (?, datetime('now'), ?, ?, ?, ?)`,
-    ).run(msgId, kind, platformId, channelType, JSON.stringify({ text: 'hello' }));
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(msgId, new Date().toISOString(), kind, platformId, channelType, JSON.stringify({ text: 'hello' }));
     db.close();
   }
 
@@ -450,6 +454,7 @@ describe('deliverSessionMessages — Slack working indicator', () => {
 
     try {
       startTypingRefresh(session.id, 'ag-1', 'slack', 'slack:D1', null, undefined, 'ts-100');
+      await new Promise((r) => setTimeout(r, 0));
       expect(reactions).toEqual([{ messageId: 'ts-100', on: true }]);
       reactions.length = 0;
 

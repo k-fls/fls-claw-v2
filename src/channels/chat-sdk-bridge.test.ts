@@ -633,6 +633,28 @@ describe('createChatSdkBridge.pulseReaction — indicator reaction seam', () => 
     }
   });
 
+  it('does NOT latch on a condition scoped to one conversation', async () => {
+    // The caller latches the whole adapter instance for the process lifetime,
+    // so a channel the bot simply is not in must never read as "this app
+    // cannot place reactions anywhere" — that would disable the indicator
+    // across the entire workspace.
+    for (const code of ['not_in_channel', 'channel_not_found', 'is_archived']) {
+      const bridge = throwingBridge(new Error(`An API error occurred: ${code}`));
+      expect(await bridge.pulseReaction!('slack:C1', 'ts-1', 'x', true)).toBe('failed');
+    }
+
+    // Even when the adapter raises it as a typed PermissionError.
+    const typed = new Error('not_in_channel');
+    typed.name = 'PermissionError';
+    expect(await throwingBridge(typed).pulseReaction!('slack:C1', 'ts-1', 'x', true)).toBe('failed');
+  });
+
+  it('reads a platform error code carried on err.data.error', async () => {
+    // Slack's WebAPI errors surface the code there rather than in the message.
+    const err = Object.assign(new Error('An API error occurred'), { data: { error: 'missing_scope' } });
+    expect(await throwingBridge(err).pulseReaction!('slack:C1', 'ts-1', 'x', true)).toBe('unsupported');
+  });
+
   it('classifies a typed PermissionError / AuthenticationError as unsupported', async () => {
     // Duck-typed on `name`, matching isNetworkError in channel-registry.ts —
     // trunk must not depend on @chat-adapter/shared, which is installed only
