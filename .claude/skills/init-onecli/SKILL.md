@@ -30,19 +30,15 @@ If an Anthropic secret exists, tell the user OneCLI is already configured and wo
 
 If they choose to keep, skip to Phase 5 (Verify). If they choose to reconfigure, continue.
 
-### Check for native credential proxy
+### Check for the MITM credential proxy
 
 ```bash
-grep "credential-proxy" src/index.ts 2>/dev/null
+grep -n "setProxyInstance" src/index.ts 2>/dev/null
 ```
 
-If `startCredentialProxy` is imported, the native credential proxy skill is active. Tell the user: "You're currently using the native credential proxy (`.env`-based). This skill will switch you to OneCLI's Agent Vault, which adds per-agent policies and rate limits. Your `.env` credentials will be migrated to the vault."
+If that matches, this install's credential path is the host-side MITM credential proxy, and OneCLI is not an alternative to it. The proxy starts unconditionally at boot, owns container egress, and keeps real secrets on the host — containers only ever hold substitutes. `buildContainerArgs` skips the OneCLI gateway entirely whenever the proxy is live, so installing OneCLI here changes nothing except adding a vault nothing reads.
 
-Use AskUserQuestion:
-1. **Continue** — description: "Switch to OneCLI Agent Vault."
-2. **Cancel** — description: "Keep the native credential proxy."
-
-If they cancel, stop.
+Tell the user that and stop. Register credentials with the proxy instead — see [docs/mitm-proxy.md](../../../docs/mitm-proxy.md). Do not offer to switch the proxy off.
 
 ### Check the codebase expects OneCLI
 
