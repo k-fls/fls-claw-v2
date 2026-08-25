@@ -14,13 +14,7 @@ vi.mock('../../config.js', async () => {
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-typing' };
 });
 
-import {
-  noteAgentMessageDelivered,
-  pauseTypingRefreshAfterDelivery,
-  setTypingAdapter,
-  startTypingRefresh,
-  stopTypingRefresh,
-} from './index.js';
+import { pauseTypingRefreshAfterDelivery, setTypingAdapter, startTypingRefresh, stopTypingRefresh } from './index.js';
 
 type Call = { channelType: string; platformId: string; threadId: string | null; instance?: string };
 type ReactionCall = {
@@ -42,8 +36,8 @@ function captureAdapter() {
   return calls;
 }
 
-/** Capture both signals so reaction pseudo-typing can be asserted against
- *  setTyping (the two paths are mutually exclusive per tick). */
+/** Capture both signals so the working indicator can be asserted against
+ *  setTyping (the two paths are mutually exclusive). */
 function captureBoth() {
   const typing: Call[] = [];
   const reactions: ReactionCall[] = [];
@@ -152,103 +146,176 @@ describe('startTypingRefresh — instance forwarding', () => {
   });
 });
 
-describe('reaction pseudo-typing (Slack non-thread)', () => {
-  it('before any agent message, ticks still use setTyping (nothing to react to)', async () => {
+/**
+ * The working indicator: a single reaction HELD for the length of a work
+ * burst, on the user's triggering message.
+ *
+ * The three properties that matter, and that a toggle-on-every-tick design
+ * does not have: it is up on turn one (before any agent output exists), it
+ * costs two API calls per turn rather than one per tick, and every edge that
+ * ends the work — reply delivered, session stopped, agent gone quiet — takes
+ * it back down. A reaction does not expire on its own, so a missed edge is a
+ * permanently stranded indicator.
+ */
+describe('working indicator (Slack)', () => {
+  afterEach(() => {
+    stopTypingRefresh('sess-2');
+  });
+
+  it('is up on turn one, on the user message, before any agent reply exists', async () => {
     const { typing, reactions } = captureBoth();
-    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null);
-    await vi.advanceTimersByTimeAsync(4_500);
-    expect(reactions).toHaveLength(0);
-    expect(typing.length).toBeGreaterThanOrEqual(2); // immediate + interval
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null, undefined, 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(reactions).toEqual([expect.objectContaining({ messageId: 'ts-100', on: true })]);
+    expect(reactions[0].channelType).toBe('slack');
+    expect(reactions[0].platformId).toBe('slack:C1');
+    expect(typing).toHaveLength(0); // never both
   });
 
-  it('after a delivered agent message, interval ticks toggle the ⏳ instead of setTyping', async () => {
+  it('is HELD, not toggled — many ticks produce exactly one add', async () => {
+    const { reactions } = captureBoth();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null, undefined, 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Three interval ticks, all inside the 15s grace window.
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(reactions.filter((r) => r.on)).toHaveLength(1);
+    expect(reactions.filter((r) => !r.on)).toHaveLength(0);
+  });
+
+  it('covers channel threads too — setStatus does not render there either', async () => {
     const { typing, reactions } = captureBoth();
-    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null);
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'T1', undefined, 'ts-100');
     await vi.advanceTimersByTimeAsync(0);
-    noteAgentMessageDelivered('sess-1', 'msg-100');
-    typing.length = 0;
-    reactions.length = 0;
 
-    await vi.advanceTimersByTimeAsync(4_500); // first tick → add
-    expect(reactions.at(-1)).toMatchObject({
-      channelType: 'slack',
-      platformId: 'slack:C1',
-      messageId: 'msg-100',
-      emoji: 'hourglass_flowing_sand',
-      on: true,
-    });
-
-    await vi.advanceTimersByTimeAsync(4_000); // second tick → remove
-    expect(reactions.at(-1)).toMatchObject({ messageId: 'msg-100', on: false });
-    expect(typing).toHaveLength(0); // never setTyping while reacting
+    expect(reactions).toEqual([expect.objectContaining({ messageId: 'ts-100', on: true })]);
+    expect(typing).toHaveLength(0);
   });
 
-  it('a newer delivered message clears the ⏳ off the previous one before retargeting', async () => {
+  it('comes down when the reply is delivered', async () => {
     const { reactions } = captureBoth();
-    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null);
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null, undefined, 'ts-100');
     await vi.advanceTimersByTimeAsync(0);
-    noteAgentMessageDelivered('sess-1', 'msg-100');
-    await vi.advanceTimersByTimeAsync(4_500); // reaction now ON for msg-100
-    expect(reactions.at(-1)).toMatchObject({ messageId: 'msg-100', on: true });
-    reactions.length = 0;
-
-    noteAgentMessageDelivered('sess-1', 'msg-200');
-    // The move removes ⏳ from the old message immediately…
-    expect(reactions).toEqual([expect.objectContaining({ messageId: 'msg-100', on: false })]);
-    reactions.length = 0;
-
-    // …and the next tick toggles the NEW message on.
-    await vi.advanceTimersByTimeAsync(4_000);
-    expect(reactions.at(-1)).toMatchObject({ messageId: 'msg-200', on: true });
-  });
-
-  it('post-delivery pause clears the ⏳', async () => {
-    const { reactions } = captureBoth();
-    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null);
-    await vi.advanceTimersByTimeAsync(0);
-    noteAgentMessageDelivered('sess-1', 'msg-100');
-    await vi.advanceTimersByTimeAsync(4_500); // ⏳ ON
     reactions.length = 0;
 
     pauseTypingRefreshAfterDelivery('sess-1');
-    expect(reactions).toEqual([expect.objectContaining({ messageId: 'msg-100', on: false })]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reactions).toEqual([expect.objectContaining({ messageId: 'ts-100', on: false })]);
   });
 
-  it('stopTypingRefresh removes a lingering ⏳', async () => {
+  it('comes down when the session stops', async () => {
     const { reactions } = captureBoth();
-    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null);
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null, undefined, 'ts-100');
     await vi.advanceTimersByTimeAsync(0);
-    noteAgentMessageDelivered('sess-1', 'msg-100');
-    await vi.advanceTimersByTimeAsync(4_500); // ⏳ ON
     reactions.length = 0;
 
     stopTypingRefresh('sess-1');
-    expect(reactions).toEqual([expect.objectContaining({ messageId: 'msg-100', on: false })]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reactions).toEqual([expect.objectContaining({ messageId: 'ts-100', on: false })]);
   });
 
-  it('threaded Slack keeps native setTyping — no reaction fallback', async () => {
-    const { typing, reactions } = captureBoth();
-    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'T1');
+  it('comes down when the agent goes quiet — no heartbeat past the grace window', async () => {
+    const { reactions } = captureBoth();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null, undefined, 'ts-100');
     await vi.advanceTimersByTimeAsync(0);
-    noteAgentMessageDelivered('sess-1', 'msg-100');
-    typing.length = 0;
     reactions.length = 0;
 
-    await vi.advanceTimersByTimeAsync(4_500);
-    expect(reactions).toHaveLength(0);
-    expect(typing.length).toBeGreaterThanOrEqual(1);
+    // No heartbeat file is ever written (DATA_DIR is mocked to an empty dir),
+    // so once the 15s grace expires the agent counts as gone.
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(reactions).toEqual([expect.objectContaining({ messageId: 'ts-100', on: false })]);
   });
 
-  it('non-thread on a channel with native typing (telegram) does not use reactions', async () => {
-    const { typing, reactions } = captureBoth();
-    startTypingRefresh('sess-1', 'ag-1', 'telegram', 'tg:1', null);
+  it('fan-out: N agents on one message means one add and one remove, not N', async () => {
+    const { reactions } = captureBoth();
+    // Same inbound message evaluated against two wired agent groups.
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null, undefined, 'ts-100');
+    startTypingRefresh('sess-2', 'ag-2', 'slack', 'slack:C1', null, undefined, 'ts-100');
     await vi.advanceTimersByTimeAsync(0);
-    noteAgentMessageDelivered('sess-1', 'msg-100');
-    typing.length = 0;
+    expect(reactions.filter((r) => r.on)).toHaveLength(1);
+
+    // The first agent finishing must NOT strip the indicator off the second.
+    reactions.length = 0;
+    pauseTypingRefreshAfterDelivery('sess-1');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reactions).toHaveLength(0);
+
+    // Only the last holder releasing takes it down.
+    pauseTypingRefreshAfterDelivery('sess-2');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reactions).toEqual([expect.objectContaining({ messageId: 'ts-100', on: false })]);
+  });
+
+  it('the next turn re-seeds onto the new message', async () => {
+    const { reactions } = captureBoth();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null, undefined, 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+    pauseTypingRefreshAfterDelivery('sess-1'); // burst ends
+    await vi.advanceTimersByTimeAsync(0);
     reactions.length = 0;
 
-    await vi.advanceTimersByTimeAsync(4_500);
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null, undefined, 'ts-200');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reactions).toEqual([expect.objectContaining({ messageId: 'ts-200', on: true })]);
+  });
+
+  it('mid-burst re-trigger keeps the indicator on the message that opened it', async () => {
+    const { reactions } = captureBoth();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null, undefined, 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+    reactions.length = 0;
+
+    // A second message arrives while the agent is still working on the first.
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null, undefined, 'ts-200');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reactions).toHaveLength(0); // still held on ts-100, no churn
+  });
+
+  it('a re-trigger from a different chat releases against the OLD address', async () => {
+    const { reactions } = captureBoth();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null, 'slack-a', 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+    reactions.length = 0;
+
+    // agent-shared sessions span messaging groups and instances.
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C2', null, 'slack-b', 'ts-999');
+    await vi.advanceTimersByTimeAsync(0);
+
+    const off = reactions.find((r) => !r.on);
+    expect(off).toMatchObject({ platformId: 'slack:C1', messageId: 'ts-100', instance: 'slack-a' });
+    const on = reactions.find((r) => r.on);
+    expect(on).toMatchObject({ platformId: 'slack:C2', messageId: 'ts-999', instance: 'slack-b' });
+  });
+
+  it('no trigger message id means no indicator — falls back to setTyping', async () => {
+    const { typing, reactions } = captureBoth();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null);
+    await vi.advanceTimersByTimeAsync(0);
     expect(reactions).toHaveLength(0);
-    expect(typing.length).toBeGreaterThanOrEqual(1);
+    expect(typing).toHaveLength(1);
+  });
+
+  it('channels with a working native indicator are untouched', async () => {
+    const { typing, reactions } = captureBoth();
+    startTypingRefresh('sess-1', 'ag-1', 'telegram', 'tg:1', null, undefined, 'mid-1');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reactions).toHaveLength(0);
+    expect(typing).toHaveLength(1);
+  });
+
+  it('an adapter without the reaction seam falls back rather than faking a hold', async () => {
+    // index.ts can route inbound before delivery binds the adapter; taking a
+    // hold then would fire a bogus remove at teardown.
+    const typing: Call[] = [];
+    setTypingAdapter({
+      async setTyping(channelType, platformId, threadId, instance) {
+        typing.push({ channelType, platformId, threadId, instance });
+      },
+    });
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null, undefined, 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(typing).toHaveLength(0); // indicator path chosen, but nothing behind it
+    expect(() => stopTypingRefresh('sess-1')).not.toThrow();
   });
 });

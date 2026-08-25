@@ -128,6 +128,23 @@ export function splitForLimit(text: string, limit: number): string[] {
   return chunks;
 }
 
+/**
+ * A reaction call that changed nothing because the platform was already in the
+ * requested state, or the message is gone. Not a failure — the caller's held
+ * state is the intended one, and it is unchanged.
+ *
+ * Duck-typed on the wire codes rather than on an error class: the
+ * `@chat-adapter/*` error types only exist once a channel skill installs them,
+ * so this module cannot `instanceof` them.
+ */
+export function isBenignReactionDrift(err: unknown): boolean {
+  const e = err as { code?: unknown; data?: { error?: unknown } } | null;
+  const code = typeof e?.code === 'string' ? e.code : '';
+  const platformError = typeof e?.data?.error === 'string' ? e.data.error : '';
+  const message = err instanceof Error ? err.message : String(err);
+  return /already_reacted|no_reaction|message_not_found/i.test(`${code} ${platformError} ${message}`);
+}
+
 export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
   const { adapter } = config;
   // The instance name becomes a webhook route segment (the route regex is
@@ -547,17 +564,21 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     },
 
     async pulseReaction(platformId: string, messageId: string, emoji: string, on: boolean) {
-      // Only used in the non-threaded case, so the chat address IS the thread
-      // id (same `threadId ?? platformId` mapping deliver() uses). Best-effort:
-      // a reaction that's already present/absent, or a message the user
-      // deleted, throws on Slack (already_reacted / no_reaction /
-      // message_not_found) — swallow it. The typing module owns the intended
-      // on/off state, so a dropped toggle just self-corrects on the next tick.
+      // The chat address IS the thread id here: a reaction is addressed by
+      // channel + message id, so one call covers a DM and an in-thread message.
+      // (Contrast deliver(), which needs the thread id to post INTO a thread.)
       try {
         if (on) await adapter.addReaction(platformId, messageId, emoji);
         else await adapter.removeReaction(platformId, messageId, emoji);
-      } catch {
-        // swallow — see above
+      } catch (err) {
+        // Benign state drift — the reaction is already present/absent, or the
+        // user deleted the message. The intended state is what the caller
+        // holds, so a no-op call that "fails" here changed nothing. Swallow.
+        if (isBenignReactionDrift(err)) return;
+        // Anything else (overwhelmingly: no `reactions:write` scope) is a real
+        // misconfiguration. Rethrow so the caller can say so once, out loud —
+        // silently swallowing it is what makes a missing scope undebuggable.
+        throw err;
       }
     },
 
