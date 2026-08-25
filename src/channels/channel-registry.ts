@@ -10,6 +10,20 @@ import { log } from '../log.js';
 
 const SETUP_RETRY_DELAYS_MS = [2000, 5000, 10000];
 
+/**
+ * How often a channel that failed to start is retried.
+ *
+ * SETUP_RETRY_DELAYS_MS covers a hiccup inside one start attempt (~17s);
+ * this covers the outage that outlives it. Without it, `activeAdapters` is
+ * written only by initChannelAdapters — one call at boot — so an adapter that
+ * threw is dead for the life of the process.
+ *
+ * Well inside delivery.ts's MISSING_ADAPTER_GRACE_MS, so a held row gets
+ * several chances to catch a recovering adapter; slow enough that a channel
+ * down for real costs one factory call per minute, not one per delivery poll.
+ */
+export const ADAPTER_RETRY_INTERVAL_MS = 60_000;
+
 /** Duck-type check — adapters that throw an Error with `name === 'NetworkError'`
  * (Chat SDK's `@chat-adapter/shared.NetworkError` and similar) get a retry on
  * setup. Avoids depending on `@chat-adapter/shared` at trunk level. */
@@ -21,6 +35,15 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 
 const registry = new Map<string, ChannelRegistration>();
 const activeAdapters = new Map<string, ChannelAdapter>();
+
+/**
+ * Channels whose start attempt threw. The setup callback is held alongside so a
+ * retry repeats exactly what boot did.
+ */
+const pendingRetry = new Map<string, ChannelRegistration>();
+let retrySetupFn: ((adapter: ChannelAdapter) => ChannelSetup) | undefined;
+let retryTimer: ReturnType<typeof setInterval> | undefined;
+let retryInFlight = false;
 
 /** Register a channel adapter factory. Called by channel modules on import. */
 export function registerChannelAdapter(name: string, registration: ChannelRegistration): void {
@@ -229,62 +252,158 @@ export function getChannelContainerConfig(name: string): ChannelRegistration['co
 }
 
 /**
+ * Best-effort cleanup for an adapter that failed to start. The retry pass builds
+ * a fresh instance from the factory every ADAPTER_RETRY_INTERVAL_MS, so anything
+ * a failed setup() left open leaks once a minute rather than once per process.
+ * It matters because setup() can fail AFTER connecting — chat-sdk-bridge runs
+ * chat.initialize() before binding a gateway adapter's webhook server. What an
+ * adapter allocates is unknowable here (they are skill-installed), so cleanup
+ * belongs at the seam that owns the lifecycle.
+ *
+ * Swallows its own failure: teardown on a half-built adapter is allowed to throw
+ * (the bridge calls chat.shutdown() unguarded, and `chat` is undefined when
+ * setup threw before assigning it). The setup error is the one worth reporting.
+ */
+async function teardownFailedAdapter(name: string, adapter: ChannelAdapter): Promise<void> {
+  try {
+    await adapter.teardown();
+  } catch (err) {
+    log.debug('Teardown after a failed adapter start also failed', { channel: name, err });
+  }
+}
+
+/**
+ * Instantiate, set up and register ONE channel adapter. True when it is live,
+ * false when deliberately skipped (factory returned null — no credentials).
+ * Throws when the attempt failed; the caller decides whether that is retried.
+ */
+async function startAdapter(
+  name: string,
+  registration: ChannelRegistration,
+  setupFn: (adapter: ChannelAdapter) => ChannelSetup,
+): Promise<boolean> {
+  const adapter = await registration.factory();
+  if (!adapter) {
+    log.warn('Channel credentials missing, skipping', { channel: name });
+    return false;
+  }
+
+  const setup = setupFn(adapter);
+  // Transient network failures during adapter init (e.g. Telegram deleteWebhook
+  // hitting a DNS hiccup at boot) would otherwise leave the channel permanently
+  // dead until manual restart. Retry only on NetworkError so misconfigs (bad
+  // tokens, etc.) still fail fast.
+  let attempt = 0;
+  try {
+    while (true) {
+      try {
+        await adapter.setup(setup);
+        break;
+      } catch (err) {
+        if (isNetworkError(err) && attempt < SETUP_RETRY_DELAYS_MS.length) {
+          const delay = SETUP_RETRY_DELAYS_MS[attempt]!;
+          log.warn('Channel adapter setup failed with network error, retrying', {
+            channel: name,
+            attempt: attempt + 1,
+            delayMs: delay,
+            err: err.message,
+          });
+          await sleep(delay);
+          attempt += 1;
+          continue;
+        }
+        throw err;
+      }
+    }
+  } catch (err) {
+    // Only the instance just built — never one live in activeAdapters.
+    await teardownFailedAdapter(name, adapter);
+    throw err;
+  }
+  // Adapters key by instance (default instance = channelType), so N
+  // instances of one platform coexist. Duplicate keys warn instead of
+  // throwing — boot stays resilient, matching the historical silent
+  // last-write-wins, but now visibly.
+  const key = adapter.instance ?? adapter.channelType;
+  if (activeAdapters.has(key)) {
+    log.warn('Duplicate adapter instance key — overwriting previous adapter', { key, channel: name });
+  }
+  activeAdapters.set(key, adapter);
+  log.info('Channel adapter started', { channel: name, type: adapter.channelType, instance: key });
+  return true;
+}
+
+/**
+ * Re-attempt every channel still in the retry set. Repeat failures log at debug
+ * so a channel down for hours does not emit one error per minute — the boot-time
+ * ERROR is the operator's signal, and recovery gets its own INFO.
+ */
+async function retryFailedAdapters(): Promise<void> {
+  const setupFn = retrySetupFn;
+  if (!setupFn || retryInFlight) return;
+  // A pass can take ~17s per channel via SETUP_RETRY_DELAYS_MS and so outlast
+  // the interval; overlapping passes would race two factories for one key.
+  retryInFlight = true;
+  try {
+    for (const [name, registration] of [...pendingRetry]) {
+      try {
+        const started = await startAdapter(name, registration, setupFn);
+        // Leaves the set either way: a null factory is a config answer, not a
+        // transient failure, so retrying it every minute would never converge.
+        pendingRetry.delete(name);
+        if (started) log.info('Channel adapter recovered on retry', { channel: name });
+      } catch (err) {
+        log.debug('Channel adapter retry failed, will try again', { channel: name, err });
+      }
+    }
+  } finally {
+    retryInFlight = false;
+  }
+  if (pendingRetry.size === 0) stopAdapterRetry();
+}
+
+/** Arm the retry pass. No-op when nothing is pending or it is already armed. */
+function scheduleAdapterRetry(): void {
+  if (retryTimer || pendingRetry.size === 0) return;
+  retryTimer = setInterval(() => {
+    void retryFailedAdapters();
+  }, ADAPTER_RETRY_INTERVAL_MS);
+  // A channel that never comes back must not keep the host from exiting.
+  retryTimer.unref?.();
+}
+
+function stopAdapterRetry(): void {
+  if (!retryTimer) return;
+  clearInterval(retryTimer);
+  retryTimer = undefined;
+}
+
+/**
  * Instantiate and set up all registered channel adapters.
  * Skips adapters that return null (missing credentials).
+ *
+ * Channels that throw are retried every ADAPTER_RETRY_INTERVAL_MS. Delivery
+ * reads the same activeAdapters map, so a recovered adapter needs no further
+ * wiring to be picked up by the next poll.
  */
 export async function initChannelAdapters(setupFn: (adapter: ChannelAdapter) => ChannelSetup): Promise<void> {
+  retrySetupFn = setupFn;
   for (const [name, registration] of registry) {
     try {
-      const adapter = await registration.factory();
-      if (!adapter) {
-        log.warn('Channel credentials missing, skipping', { channel: name });
-        continue;
-      }
-
-      const setup = setupFn(adapter);
-      // Transient network failures during adapter init (e.g. Telegram deleteWebhook
-      // hitting a DNS hiccup at boot) would otherwise leave the channel permanently
-      // dead until manual restart. Retry only on NetworkError so misconfigs (bad
-      // tokens, etc.) still fail fast.
-      let attempt = 0;
-      while (true) {
-        try {
-          await adapter.setup(setup);
-          break;
-        } catch (err) {
-          if (isNetworkError(err) && attempt < SETUP_RETRY_DELAYS_MS.length) {
-            const delay = SETUP_RETRY_DELAYS_MS[attempt]!;
-            log.warn('Channel adapter setup failed with network error, retrying', {
-              channel: name,
-              attempt: attempt + 1,
-              delayMs: delay,
-              err: err.message,
-            });
-            await sleep(delay);
-            attempt += 1;
-            continue;
-          }
-          throw err;
-        }
-      }
-      // Adapters key by instance (default instance = channelType), so N
-      // instances of one platform coexist. Duplicate keys warn instead of
-      // throwing — boot stays resilient, matching the historical silent
-      // last-write-wins, but now visibly.
-      const key = adapter.instance ?? adapter.channelType;
-      if (activeAdapters.has(key)) {
-        log.warn('Duplicate adapter instance key — overwriting previous adapter', { key, channel: name });
-      }
-      activeAdapters.set(key, adapter);
-      log.info('Channel adapter started', { channel: name, type: adapter.channelType, instance: key });
+      await startAdapter(name, registration, setupFn);
     } catch (err) {
       log.error('Failed to start channel adapter', { channel: name, err });
+      pendingRetry.set(name, registration);
     }
   }
+  scheduleAdapterRetry();
 }
 
 /** Tear down all active adapters. */
 export async function teardownChannelAdapters(): Promise<void> {
+  stopAdapterRetry();
+  pendingRetry.clear();
+  retrySetupFn = undefined;
   for (const [name, adapter] of activeAdapters) {
     try {
       await adapter.teardown();

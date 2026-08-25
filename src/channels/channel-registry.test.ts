@@ -146,6 +146,140 @@ describe('channel registry — instance keying', () => {
     onAction: () => {},
   });
 
+  it('tears down an adapter whose setup failed, so the retry pass cannot leak one per minute', async () => {
+    // Each retry builds a FRESH adapter, so a setup that fails after connecting
+    // strands one live instance per tick rather than one per process.
+    vi.useFakeTimers();
+    try {
+      const reg = await import('./channel-registry.js');
+      const builtAdapters: { teardowns: number }[] = [];
+      reg.registerChannelAdapter('slack', {
+        factory: () => {
+          const adapter = createMockAdapter('slack');
+          const record = { teardowns: 0 };
+          builtAdapters.push(record);
+          // Connects, then fails — the shape that leaves something open.
+          adapter.setup = async () => {
+            throw new Error('webhook port already bound');
+          };
+          adapter.teardown = async () => {
+            record.teardowns += 1;
+          };
+          return adapter;
+        },
+      });
+
+      await reg.initChannelAdapters(mockSetup);
+      expect(builtAdapters).toHaveLength(1);
+      expect(builtAdapters[0]!.teardowns).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(reg.ADAPTER_RETRY_INTERVAL_MS * 2);
+
+      // Every abandoned instance got cleaned up, not just the boot-time one.
+      expect(builtAdapters).toHaveLength(3);
+      expect(builtAdapters.every((a) => a.teardowns === 1)).toBe(true);
+      expect(reg.getChannelAdapterExact('slack')).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('still reports the setup failure when teardown of the failed adapter also throws', async () => {
+    const reg = await import('./channel-registry.js');
+    const adapter = createMockAdapter('slack');
+    adapter.setup = async () => {
+      throw new Error('invalid_auth');
+    };
+    // A half-built adapter's teardown is allowed to throw; see the source.
+    adapter.teardown = async () => {
+      throw new Error('chat is undefined');
+    };
+    reg.registerChannelAdapter('slack', { factory: () => adapter });
+
+    // Boot survives: initChannelAdapters catches, logs, and keeps going.
+    await expect(reg.initChannelAdapters(mockSetup)).resolves.toBeUndefined();
+    expect(reg.getChannelAdapterExact('slack')).toBeUndefined();
+  });
+
+  it('retries a channel that threw at boot, and registers it once it recovers', async () => {
+    // A transient auth failure at boot used to kill the channel for the life of
+    // the process, leaving every reply to ride the grace window out to a restart.
+    vi.useFakeTimers();
+    try {
+      const reg = await import('./channel-registry.js');
+      const slack = createMockAdapter('slack');
+      let attempts = 0;
+      reg.registerChannelAdapter('slack', {
+        factory: () => {
+          attempts += 1;
+          if (attempts === 1) throw new Error('invalid_auth');
+          return slack;
+        },
+      });
+
+      await reg.initChannelAdapters(mockSetup);
+      // Boot failed: the delivery bridge sees no adapter.
+      expect(reg.getChannelAdapterExact('slack')).toBeUndefined();
+
+      await vi.advanceTimersByTimeAsync(reg.ADAPTER_RETRY_INTERVAL_MS);
+
+      expect(attempts).toBe(2);
+      expect(reg.getChannelAdapterExact('slack')).toBe(slack);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps retrying while a channel stays down, and stops once nothing is pending', async () => {
+    vi.useFakeTimers();
+    try {
+      const reg = await import('./channel-registry.js');
+      let attempts = 0;
+      reg.registerChannelAdapter('slack', {
+        factory: () => {
+          attempts += 1;
+          throw new Error('still down');
+        },
+      });
+
+      await reg.initChannelAdapters(mockSetup);
+      expect(attempts).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(reg.ADAPTER_RETRY_INTERVAL_MS * 3);
+      expect(attempts).toBe(4);
+
+      // Teardown disarms the pass, so a dead channel cannot pin the process.
+      await reg.teardownChannelAdapters();
+      await vi.advanceTimersByTimeAsync(reg.ADAPTER_RETRY_INTERVAL_MS * 3);
+      expect(attempts).toBe(4);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not retry a channel whose factory returned null — that is a config answer, not an outage', async () => {
+    vi.useFakeTimers();
+    try {
+      const reg = await import('./channel-registry.js');
+      let attempts = 0;
+      reg.registerChannelAdapter('slack', {
+        factory: () => {
+          attempts += 1;
+          return null;
+        },
+      });
+
+      await reg.initChannelAdapters(mockSetup);
+      await vi.advanceTimersByTimeAsync(reg.ADAPTER_RETRY_INTERVAL_MS * 5);
+
+      // Missing credentials do not resolve themselves on a timer; retrying
+      // would never converge.
+      expect(attempts).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('keys two same-channelType adapters by instance — both resolvable', async () => {
     const reg = await import('./channel-registry.js');
     const worker = createMockAdapter('slack', 'slack-worker');
