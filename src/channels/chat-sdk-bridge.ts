@@ -564,9 +564,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     },
 
     async pulseReaction(platformId: string, messageId: string, emoji: string, on: boolean) {
-      // The chat address IS the thread id here: a reaction is addressed by
-      // channel + message id, so one call covers a DM and an in-thread message.
-      // (Contrast deliver(), which needs the thread id to post INTO a thread.)
+      // Only reached for non-threaded chats, so the chat address IS the thread
+      // id (the same `threadId ?? platformId` mapping deliver() uses). A
+      // reaction is addressed by channel + message id regardless, so no thread
+      // argument is needed either way.
       try {
         if (on) await adapter.addReaction(platformId, messageId, emoji);
         else await adapter.removeReaction(platformId, messageId, emoji);

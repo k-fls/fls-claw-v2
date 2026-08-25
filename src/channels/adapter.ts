@@ -150,8 +150,8 @@ export interface ChannelAdapter {
   /**
    * Add (`on=true`) or remove a single reaction on a message — a stand-in
    * working indicator for platforms whose native typing signal does not render
-   * (Slack's `assistant.threads.setStatus` only draws inside the app's
-   * assistant surface, so DMs and channel threads are both blind).
+   * in a non-threaded chat (Slack's `assistant.threads.setStatus` shows nothing
+   * in a plain DM). Threaded conversations keep `setTyping`.
    *
    * No thread parameter: a reaction is addressed by channel + message id, so
    * thread membership is irrelevant — `platformId` is the chat address.

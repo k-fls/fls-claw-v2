@@ -184,13 +184,30 @@ describe('working indicator (Slack)', () => {
     expect(reactions.filter((r) => !r.on)).toHaveLength(0);
   });
 
-  it('covers channel threads too — setStatus does not render there either', async () => {
+  it('stays out of threads — the native indicator works there', async () => {
     const { typing, reactions } = captureBoth();
     startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'T1', undefined, 'ts-100');
     await vi.advanceTimersByTimeAsync(0);
 
+    expect(reactions).toHaveLength(0);
+    expect(typing).toEqual([expect.objectContaining({ threadId: 'T1' })]);
+  });
+
+  it('a session moving from a DM into a thread releases its hold rather than stranding it', async () => {
+    // agent-shared sessions span messaging groups, so the same session can be
+    // re-triggered in a thread. The indicator does not apply there, so nothing
+    // would ever reach a release edge — the hold has to come off on the move.
+    const { typing, reactions } = captureBoth();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null, undefined, 'ts-100');
+    await vi.advanceTimersByTimeAsync(0);
     expect(reactions).toEqual([expect.objectContaining({ messageId: 'ts-100', on: true })]);
-    expect(typing).toHaveLength(0);
+    reactions.length = 0;
+    typing.length = 0;
+
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'T1', undefined, 'ts-200');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reactions).toEqual([expect.objectContaining({ messageId: 'ts-100', on: false })]);
+    expect(typing).toEqual([expect.objectContaining({ threadId: 'T1' })]);
   });
 
   it('comes down when the reply is delivered', async () => {

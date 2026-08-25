@@ -47,10 +47,11 @@ const HEARTBEAT_FRESH_MS = 6000;
 const POST_DELIVERY_PAUSE_MS = 10000;
 
 /**
- * Channels whose native typing signal does not render, so a reaction stands in
- * for it. Slack's `assistant.threads.setStatus` only draws inside the app's
- * assistant surface — a DM and an ordinary channel thread are equally blind —
- * so this is gated on channel, NOT on thread shape.
+ * Channels whose native typing signal does not render in a NON-threaded chat,
+ * so a reaction stands in for it there. Slack's `assistant.threads.setStatus`
+ * draws in a thread but shows nothing in a plain DM or a top-level channel
+ * message, which is why this is gated on thread shape as well as channel:
+ * inside a thread the native indicator works and the reaction would be noise.
  */
 const WORKING_INDICATOR_CHANNELS = new Set(['slack']);
 
@@ -163,10 +164,15 @@ function isHeartbeatFresh(agentGroupId: string, sessionId: string): boolean {
   }
 }
 
-/** Gated on channel and on having a message to mark — deliberately NOT on thread shape. */
+/**
+ * Non-threaded chat, on a channel whose native indicator does not render there,
+ * with a message to mark. Inside a thread `setTyping` works, so the indicator
+ * stays out of the way.
+ */
 function usesWorkingIndicator(entry: TypingTarget): boolean {
   return (
     INDICATOR_EMOJI !== INDICATOR_OFF &&
+    entry.threadId === null &&
     entry.indicatorMessageId !== null &&
     WORKING_INDICATOR_CHANNELS.has(entry.channelType)
   );
@@ -296,8 +302,16 @@ export function startTypingRefresh(
     // A re-trigger can arrive from a different chat (agent-shared sessions span
     // messaging groups and platforms), so release the held indicator against the
     // OLD address before anything moves.
+    //
+    // threadId counts as address even though the reaction is not addressed by
+    // thread: it decides WHETHER the indicator applies. A session that moves
+    // from a DM into a thread stops using the indicator, so a hold taken in the
+    // DM would never reach a release edge and would strand.
     const addressChanged =
-      existing.channelType !== channelType || existing.platformId !== platformId || existing.instance !== instance;
+      existing.channelType !== channelType ||
+      existing.platformId !== platformId ||
+      existing.instance !== instance ||
+      existing.threadId !== threadId;
     if (addressChanged) {
       hideIndicator(existing);
       existing.indicatorMessageId = null;
