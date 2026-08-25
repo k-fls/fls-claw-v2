@@ -20,7 +20,6 @@
 import fs from 'fs';
 
 import { heartbeatPath } from '../../session-manager.js';
-import { readEnvFile } from '../../env.js';
 import { log } from '../../log.js';
 
 const TYPING_REFRESH_MS = 4000;
@@ -55,13 +54,8 @@ const POST_DELIVERY_PAUSE_MS = 10000;
  */
 const WORKING_INDICATOR_CHANNELS = new Set(['slack']);
 
-const INDICATOR_EMOJI_KEY = 'SLACK_TYPING_EMOJI';
-/** Present in every workspace, so a fresh install gets a correct indicator unconfigured. */
-const DEFAULT_INDICATOR_EMOJI = 'hourglass_flowing_sand';
-/** Opt-out for an app that will not be granted `reactions:write`. */
-const INDICATOR_OFF = 'none';
-
-const INDICATOR_EMOJI = readEnvFile([INDICATOR_EMOJI_KEY])[INDICATOR_EMOJI_KEY] ?? DEFAULT_INDICATOR_EMOJI;
+/** ⏳ — built in to every Slack workspace, so it needs no setup and cannot be misconfigured. */
+const INDICATOR_EMOJI = 'hourglass_flowing_sand';
 
 interface TypingAdapter {
   setTyping?(channelType: string, platformId: string, threadId: string | null, instance?: string): Promise<void>;
@@ -171,10 +165,7 @@ function isHeartbeatFresh(agentGroupId: string, sessionId: string): boolean {
  */
 function usesWorkingIndicator(entry: TypingTarget): boolean {
   return (
-    INDICATOR_EMOJI !== INDICATOR_OFF &&
-    entry.threadId === null &&
-    entry.indicatorMessageId !== null &&
-    WORKING_INDICATOR_CHANNELS.has(entry.channelType)
+    entry.threadId === null && entry.indicatorMessageId !== null && WORKING_INDICATOR_CHANNELS.has(entry.channelType)
   );
 }
 

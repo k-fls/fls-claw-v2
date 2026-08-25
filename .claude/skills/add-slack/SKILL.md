@@ -80,8 +80,6 @@ End-to-end message delivery against a real Slack workspace is verified manually 
 > warning per instance and moves on. Adding
 > the scope requires a **reinstall**, which mints a new `xoxb-` token: copy it
 > into `SLACK_BOT_TOKEN` and restart the host.
->
-> To turn the indicator off instead, set `SLACK_TYPING_EMOJI=none` in `.env`.
 
 ### Enable DMs
 
