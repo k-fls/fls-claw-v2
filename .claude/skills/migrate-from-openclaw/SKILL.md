@@ -390,10 +390,11 @@ If OneCLI isn't installed yet, defer this: tell the user that during `/setup`
 (or `/init-onecli`) they'll register the Anthropic credential, and note the
 discovered profile in `migration-state.md` so it isn't lost.
 
-> If the user explicitly wants `.env`-based credentials instead of the OneCLI
-> vault, that's the `/use-native-credential-proxy` opt-out — the one place
-> credentials are read from `.env` and injected into container requests without
-> OneCLI. Only go there if the user asks for it.
+> If the user asks for `.env`-based credentials instead, there is no such path
+> on this edition. The MITM credential proxy is the credential path and is not
+> optional: real secrets stay on the host and containers only ever hold
+> substitutes. Register the credential with the proxy instead — see
+> [docs/mitm-proxy.md](../../../docs/mitm-proxy.md).
 
 ## Phase 5: Scheduled Tasks
 

@@ -1013,11 +1013,13 @@ async function buildContainerArgs(
   // the throw, leaves the inbound message pending, and the next sweep tick
   // retries.
   //
-  // Skipped entirely when the native MITM credential proxy is the egress owner
-  // (it already injected HTTP_PROXY + CA via the lifecycle observer) — applying
-  // the gateway would fight the proxy for HTTPS_PROXY.
+  // Skipped entirely when the MITM credential proxy is the egress owner (it
+  // already injected HTTP_PROXY + CA via the lifecycle observer) — applying the
+  // gateway would fight the proxy for HTTPS_PROXY. The proxy starts
+  // unconditionally at boot, so in practice this is the only branch taken; it
+  // is a boot-order guard, not an opt-out.
   if (hasProxyInstance()) {
-    log.info('Native credential proxy active — skipping OneCLI gateway', { containerName });
+    log.info('MITM credential proxy active — skipping OneCLI gateway', { containerName });
   } else {
     if (agentIdentifier) {
       await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });

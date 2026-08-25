@@ -126,7 +126,7 @@ async function main(): Promise<void> {
   initSnapshot();
   cleanupOrphans();
 
-  // Native credential proxy. Order matters: init the token engine, register the
+  // MITM credential proxy. Order matters: init the token engine, register the
   // Claude provider (its substitution facet reads the engine), then start the
   // proxy (whose rebuildIndex picks up the registered provider's swap rules),
   // publish the instance (the lifecycle observer then routes every container's
