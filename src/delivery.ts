@@ -23,11 +23,7 @@ import {
 import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
-import {
-  noteAgentMessageDelivered,
-  pauseTypingRefreshAfterDelivery,
-  setTypingAdapter,
-} from './modules/typing/index.js';
+import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { Session } from './types.js';
 
@@ -215,11 +211,6 @@ async function drainSession(session: Session): Promise<void> {
         // agent-to-agent routing) — the user doesn't see those and
         // shouldn't get a gap in their typing indicator for them.
         if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
-          // Retarget reaction pseudo-typing (Slack non-thread) onto the
-          // just-delivered message — clears the ⏳ off the previous one —
-          // then pause so the indicator visibly goes quiet before the next
-          // heartbeat tick resumes it.
-          noteAgentMessageDelivered(session.id, platformMsgId ?? null);
           pauseTypingRefreshAfterDelivery(session.id);
         }
       } catch (err) {
