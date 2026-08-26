@@ -680,12 +680,31 @@ export function plansEquivalent(a: PropagationPlan, b: PropagationPlan): boolean
  * moving under us for not-yet-processed branches (§8 plan-equivalence).
  */
 export function plansDiffer(prev: PropagationPlan, cur: PropagationPlan, exclude: Set<string>): string[] {
+  return planDrift(prev, cur, exclude).map((d) => d.branch);
+}
+
+/**
+ * The drift WITH ITS EVIDENCE: what the written plan said for the branch and
+ * what the live derivation says now.
+ *
+ * A halt that names branches and nothing else is an accusation nobody can
+ * check: the reader cannot tell a parent's merge moving a head from somebody
+ * pushing to the branch, and those want opposite responses. The signature is
+ * the whole comparison the guard makes, so recording both sides costs nothing
+ * and makes the halt answerable from the journal alone.
+ */
+export function planDrift(
+  prev: PropagationPlan,
+  cur: PropagationPlan,
+  exclude: Set<string>,
+): Array<{ branch: string; before: string; after: string }> {
   const prevSig = new Map(prev.branches.map((bp) => [bp.branch, branchSignature(bp)]));
-  const drifted: string[] = [];
+  const drifted: Array<{ branch: string; before: string; after: string }> = [];
   for (const bp of cur.branches) {
     if (exclude.has(bp.branch)) continue;
     const before = prevSig.get(bp.branch);
-    if (before !== undefined && before !== branchSignature(bp)) drifted.push(bp.branch);
+    const after = branchSignature(bp);
+    if (before !== undefined && before !== after) drifted.push({ branch: bp.branch, before, after });
   }
   return drifted;
 }

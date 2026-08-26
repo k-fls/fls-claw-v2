@@ -154,6 +154,7 @@ import {
   derivePlan,
   effectiveCut,
   findLeaves,
+  planDrift,
   plansDiffer,
   shortestUnskipChain,
   transitiveAncestors,
@@ -3004,20 +3005,26 @@ export async function cmdRun(cli: Cli): Promise<number> {
     // can also arrive mid-pass — a verify gate hold is journaled long after
     // `start` wrote the plan — and reading that as "git moved under us" halts a
     // pass for doing exactly what the block is supposed to make it do.
-    // Narrow on purpose: only a branch that now derives TOWARD the block —
-    // deferring or skipping rather than merging — is excused. A descendant that
-    // still derives a merge or a case has changed for some other reason, and
-    // that is exactly what the halt exists to catch; excusing the whole subtree
-    // would blind the guard across most of a tree with a held branch near its
-    // root.
+    // WHAT MOVED THIS PASS EXCUSES EVERYTHING UNDER IT. A branch derives against
+    // its parents, so the moment a parent merges, takes a case, or is cut, every
+    // descendant's eligible line is a different line than the one `start` wrote
+    // down — fewer heads, a different verdict, sometimes its own conflict where
+    // the parent stopped. None of that is "git moved under us".
+    //
+    // The verdict is deliberately NOT part of the test: a descendant of a gated
+    // parent commonly derives a merge or a case on what remains rather than
+    // pointing at the block, and demanding otherwise halts the pass for doing
+    // exactly what the block makes it do.
+    //
+    // The guard still bites where it matters: a branch with NO blocked and NO
+    // moved ancestor that derives differently really did have git move under
+    // it, and that is the case this exists to catch.
     const ancestorsOf = transitiveAncestors(Object.fromEntries(directParentEdges(cli)));
-    const derivesTowardBlock = new Map(
-      plan.branches.map((b) => [b.branch, b.parents.every((p) => p.verdict === 'defer' || p.verdict === 'skip' || p.verdict === 'up-to-date')]),
-    );
+    const blockedOrMoved = new Set([...driverTouched, ...blockedForRecipe(cli, journal), ...blockedSet]);
     const belowBlocked = new Set(
       [...prev.branches, ...plan.branches]
         .map((b) => b.branch)
-        .filter((b) => (ancestorsOf[b] ?? []).some((a) => blockedSet.has(a)) && derivesTowardBlock.get(b) === true),
+        .filter((b) => (ancestorsOf[b] ?? []).some((a) => blockedOrMoved.has(a))),
     );
     const exclude = new Set([
       ...arrived,
@@ -3028,12 +3035,23 @@ export async function cmdRun(cli: Cli): Promise<number> {
       ...syncedBranches,
       ...driverTouched,
     ]);
-    const drift = plansDiffer(prev, plan, exclude);
+    const driftRows = planDrift(prev, plan, exclude);
+    const drift = driftRows.map((d) => d.branch);
     if (drift.length) {
       // §14: DriverHalt reasons surface under the machine-readable id
       // scheme in CLI output; the human text stays in `detail`/the journal.
       const detail = `git moved under us — plan drift for not-yet-processed branch(es): ${drift.join(', ')}`;
-      appendJournal(dir, { action: 'halt', reason: 'plan-drift', id: 'ERR24_PLAN_DRIFT', branches: drift });
+      // The halt carries WHAT CHANGED, not just who: the signature the plan
+      // recorded and the one the live derivation produced. Without both a reader
+      // cannot tell a parent's merge moving a head from somebody pushing to the
+      // branch, and those want opposite responses.
+      appendJournal(dir, {
+        action: 'halt',
+        reason: 'plan-drift',
+        id: 'ERR24_PLAN_DRIFT',
+        branches: drift,
+        drift: driftRows,
+      });
       console.error(`HALT [ERR24_PLAN_DRIFT]: ${detail}`);
       emit(cli, { ok: false, issues: [{ id: 'ERR24_PLAN_DRIFT', detail }] });
       return 1;
