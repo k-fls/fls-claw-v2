@@ -30,9 +30,20 @@ export interface HostRpcRequest {
 }
 
 /**
- * Handler for a registered prefix. Always invoked with a resolved
- * `scope` — the server returns 403 before reaching here if the caller
- * IP can't be mapped to a container.
+ * Handler for a **session-bound** prefix (the default, `registerHostRpc`).
+ * Always invoked with a resolved `scope` AND a non-null `sessionId`: the
+ * server returns 403 before reaching here if the caller IP can't be mapped
+ * to a container (no scope) or to a session (no sessionId).
+ *
+ * ⚠️ The non-null `sessionId` third parameter is load-bearing for downstream
+ * branches. Handlers there (e.g. sync-action wakeups, and other session-scoped
+ * RPCs added on feature branches) consume it directly as a `string` and would
+ * break if it were widened to `string | null`. Endpoints that legitimately
+ * have no session — those called by session-less containers such as the auth
+ * container (which allocates its IP via `allocateContainerIP(scope)` with no
+ * session) — must register via `registerScopedHostRpc` and use
+ * `ScopedHostRpcHandler` instead, NOT relax this type. See `server.test.ts`
+ * ("session-bound handler always receives a non-null sessionId").
  *
  * The return value becomes the body of `{ ok: true, result }`.
  * Throwing produces a 500 with `{ ok: false, error }`.
@@ -45,3 +56,11 @@ export type HostRpcHandler = (
   scope: ContainerScope,
   sessionId: string,
 ) => Promise<unknown> | unknown;
+
+/**
+ * Handler for a **scope-only** prefix (`registerScopedHostRpc`). Invoked with
+ * a resolved `scope` but no session — for endpoints reachable by session-less
+ * callers (e.g. the auth container's `/auth/*` flow). The gate still requires
+ * a known scope (403 otherwise); it just does not require a session.
+ */
+export type ScopedHostRpcHandler = (req: HostRpcRequest, scope: ContainerScope) => Promise<unknown> | unknown;
