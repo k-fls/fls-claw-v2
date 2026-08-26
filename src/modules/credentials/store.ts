@@ -2,7 +2,7 @@
  * Per-scope plaintext credential store (C7s).
  *
  * Each (CredentialScope, providerId) pair is one plaintext JSON file at
- *   ${XDG_CONFIG_HOME:-~/.config}/nanoclaw/credentials/{scope}/{providerId}.json
+ *   ${XDG_CONFIG_HOME:-~/.config}/nanoclaw/credentials/{scope}/{providerId}.keys.json
  *
  * The file shape is a `Record<string, unknown>` whose top-level keys are
  * credential entry names (plus a reserved `v` version marker that the
@@ -54,9 +54,16 @@ export function scopeDir(scope: CredentialScope): string {
   return path.join(credentialsDir(), scope);
 }
 
-/** Per-(scope, providerId) keys file path. Pure path computation. */
+/**
+ * Per-(scope, providerId) keys file path. Pure path computation.
+ *
+ * Name is `<providerId>.keys.json` — the same scheme v1 used
+ * (`credentials/{scope}/{providerId}.keys.json`) and the counterpart to the
+ * refs file `<providerId>.refs.json` (mitm-proxy/token-substitute). A v1 store
+ * migrated in as-is is read directly; no rename needed.
+ */
 export function keysFilePath(scope: CredentialScope, providerId: string): string {
-  return path.join(scopeDir(scope), `${providerId}.json`);
+  return path.join(scopeDir(scope), `${providerId}.keys.json`);
 }
 
 // ── Read / write ────────────────────────────────────────────────────────────
@@ -200,7 +207,9 @@ export function listProviderIds(scope: CredentialScope): string[] {
   const out: string[] = [];
   for (const e of entries) {
     if (!e.isFile()) continue;
-    const m = /^(.+)\.json$/.exec(e.name);
+    // Keys files only: `<providerId>.keys.json`. Skip the refs sidecar
+    // (`<providerId>.refs.json`) and anything else in the scope dir.
+    const m = /^(.+)\.keys\.json$/.exec(e.name);
     if (m) out.push(m[1]);
   }
   return out;

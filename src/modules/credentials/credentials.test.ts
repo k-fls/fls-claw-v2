@@ -281,6 +281,37 @@ describe('store', () => {
     expect(fs.existsSync(keysFilePath(scope, 'oauth'))).toBe(false);
     expect(() => deleteKeysFile(scope, 'oauth')).not.toThrow();
   });
+
+  it('keys file is named `<providerId>.keys.json` (v1 scheme, refs-file counterpart)', () => {
+    const scope = asCredentialScope('group-name');
+    writeKeysFile(scope, 'claude', { api_key: { value: 'enc:x' } });
+    const file = keysFilePath(scope, 'claude');
+    expect(path.basename(file)).toBe('claude.keys.json');
+    expect(fs.existsSync(file)).toBe(true);
+  });
+
+  it('reads a credential store migrated in under the v1 `<prov>.keys.json` name', () => {
+    // A v1 store copied in as-is has `claude.keys.json` (not `claude.json`).
+    // The store must read it directly — no rename/migration step.
+    const scope = asCredentialScope('group-v1');
+    const dir = path.join(credentialsDir(), scope as unknown as string);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'claude.keys.json'), JSON.stringify({ api_key: { value: 'enc:x' }, v: 1 }));
+
+    expect(readKeysFile(scope, 'claude')).toEqual({ api_key: { value: 'enc:x' }, v: 1 });
+    expect(listProviderIds(scope)).toEqual(['claude']);
+  });
+
+  it('listProviderIds counts keys files only, ignoring the `<prov>.refs.json` sidecar', () => {
+    const scope = asCredentialScope('group-refs');
+    const dir = path.join(credentialsDir(), scope as unknown as string);
+    fs.mkdirSync(dir, { recursive: true });
+    // A refs sidecar present without a keys file must NOT register a provider.
+    fs.writeFileSync(path.join(dir, 'github.refs.json'), JSON.stringify({ subs: {} }));
+    writeKeysFile(scope, 'github', { oauth: { value: 'enc:x' } });
+
+    expect(listProviderIds(scope)).toEqual(['github']);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -381,6 +412,31 @@ describe('manifest pipeline', () => {
 
     expect(fs.existsSync(path.join(credentialsDir(), 'grantor', 'manifests'))).toBe(false);
     expect(fs.existsSync(path.join(TMP_GROUPS, 'grantee-a', 'credentials', 'granted', 'grantor'))).toBe(false);
+  });
+
+  it('mirrors the source manifest into the scope OWN group folder (container visibility)', async () => {
+    registerCredentialProvider(makeProvider('github'));
+    const scope = asCredentialScope('grantor');
+    // The own group folder must exist for the mirror to fire (else it is a
+    // no-op — non-group scopes like 'default' must not spawn a group dir).
+    fs.mkdirSync(path.join(TMP_GROUPS, 'grantor'), { recursive: true });
+
+    writeKeysFile(scope, 'github', { api: { value: 't' } });
+
+    const ownPath = path.join(TMP_GROUPS, 'grantor', 'credentials', 'manifests', 'github.jsonl');
+    expect(fs.readFileSync(ownPath, 'utf-8').trim()).toBe(JSON.stringify({ provider: 'github', name: 'api' }));
+
+    // Deleting the keys file removes the own mirror too.
+    deleteKeysFile(scope, 'github');
+    await new Promise((r) => setImmediate(r));
+    expect(fs.existsSync(ownPath)).toBe(false);
+  });
+
+  it('does not create a group folder when mirroring a scope that has none', () => {
+    registerCredentialProvider(makeProvider('github'));
+    // No groups/no-group-scope dir created beforehand.
+    writeKeysFile(asCredentialScope('no-group-scope'), 'github', { api: { value: 't' } });
+    expect(fs.existsSync(path.join(TMP_GROUPS, 'no-group-scope'))).toBe(false);
   });
 
   it('distributeAllManifests copies every existing manifest to a new grantee', async () => {

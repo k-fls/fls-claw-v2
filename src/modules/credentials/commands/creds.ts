@@ -19,12 +19,15 @@
  * Registered with `scope: 'agent'` so the handler can resolve the current
  * agent group via `ctx.agentGroupId`.
  */
-import { getAgentGroup, getAgentGroupByFolder } from '../../../db/agent-groups.js';
-import type { HostCommandContext } from '../../../command-gate.js';
+import { getAgentGroup, getAgentGroupByFolder, getAllAgentGroups } from '../../../db/agent-groups.js';
+import { getMessagingGroup, getMessagingGroupAgents } from '../../../db/messaging-groups.js';
+import { isAdmin, type HostCommandContext } from '../../../command-gate.js';
+import type { AgentGroup } from '../../../types.js';
 import { pastePgp } from '../../interactions/index.js';
 
 import {
   addGrantee,
+  canAccess,
   clearBorrowSource,
   getBorrowSource,
   isGrantee,
@@ -33,7 +36,15 @@ import {
   setBorrowSource,
 } from '../grants.js';
 import { planCredentialImport, type ImportToken } from '../import-resolver.js';
-import { buildPgpEncryptUrl, ensureGpgKey, exportPublicKey, gpgHomeForScope, isGpgAvailable } from '../gpg.js';
+import {
+  buildPgpEncryptUrl,
+  ensureGpgKey,
+  exportPublicKey,
+  gpgHomeForScope,
+  isGpgAvailable,
+  normalizeArmoredBlock,
+} from '../gpg.js';
+import { gpgDecryptAt } from '../../crypto/gpg.js';
 import { distributeAllManifests, revokeGranteeManifests } from '../manifest.js';
 import { getAllCredentialProviders, getCredentialProvider } from '../providers/registry.js';
 import { getOrCreateResolverForAgentGroup } from '../resolver.js';
@@ -60,9 +71,11 @@ const USAGE = [
   '`/creds set-key <provider> [id] [expiry=<ts>]` — store a key (GPG-encrypted paste)',
   '`/creds import [provider]` — bulk import `[provider:]id=value` lines (GPG-encrypted paste)',
   '`/creds delete <provider>` — delete a provider’s stored credentials',
-  '`/creds list` — list providers with stored credentials',
+  '`/creds list [borrow|shadow]` — stored credentials (or borrowable / shadowed ones)',
   '`/creds status` — credential + sharing summary',
   '`/creds gpg` — print this group’s GPG public key for encrypting secrets',
+  '*Owner (cross-group):*',
+  '`/creds <set-key|import|delete|list|status|gpg> <group|id|channel>@<provider>` — run a credential op for another group',
 ].join('\n');
 
 export const CREDS_HELP =
@@ -87,6 +100,13 @@ export function handleCredsCommand(ctx: HostCommandContext): void {
 
   if (!sub) return replyStatus(ctx, selfFolder);
 
+  // System-owner cross-group form: `/creds <cred-op> <group|id|channel>@<provider>`.
+  // An '@' in the first arg (never present in the self-form) signals it; routed
+  // to another group's scope, owner/global-admin only. Credential ops only.
+  if (CROSS_GROUP_OPS.has(sub) && (ctx.args[1] ?? '').includes('@')) {
+    return handleCrossGroupCreds(ctx, sub);
+  }
+
   switch (sub) {
     // ── Sharing (C7s) ────────────────────────────────────────────────────────
     case 'share':
@@ -99,13 +119,13 @@ export function handleCredsCommand(ctx: HostCommandContext): void {
       return replyStopBorrowing(ctx, selfFolder);
     // ── Credential-setting (C7o) ───────────────────────────────────────────────
     case 'set-key':
-      return replySetKey(ctx, scope);
+      return replySetKey(ctx, scope, selfFolder);
     case 'import':
-      return replyImport(ctx, scope);
+      return replyImport(ctx, scope, selfFolder);
     case 'delete':
       return replyDelete(ctx, scope, target);
     case 'list':
-      return replyList(ctx, scope);
+      return replyList(ctx, scope, selfFolder);
     case 'status':
       return replyCredentialStatus(ctx, selfFolder, scope);
     // ── Public key export (C7g) ─────────────────────────────────────────────────
@@ -113,6 +133,130 @@ export function handleCredsCommand(ctx: HostCommandContext): void {
       return replyGpg(ctx, scope);
     default:
       ctx.replyText(USAGE);
+  }
+}
+
+// ── Cross-group form (system-owner) ───────────────────────────────────────────
+
+/** Credential ops that support the `<target>@<provider>` cross-group form. */
+const CROSS_GROUP_OPS = new Set(['set-key', 'import', 'delete', 'list', 'status', 'gpg']);
+
+/**
+ * Fan-out guard. `/creds` is `scope: 'agent'`, so the router dispatches it once
+ * per engaging agent in the channel. A cross-group op targets a single other
+ * group and must run once per typed message — this in-flight set (keyed by the
+ * message's op/target/args) lets the first dispatch through and no-ops the rest.
+ * Self-clears after the fan-out burst.
+ */
+const crossInFlight = new Set<string>();
+const CROSS_DEDUP_TTL_MS = 10_000;
+
+/** Test hook — clear the cross-group fan-out guard between cases. */
+export function _resetCredsCrossInFlightForTests(): void {
+  crossInFlight.clear();
+}
+
+type ResolvedTarget =
+  | { kind: 'group'; group: AgentGroup }
+  | { kind: 'ambiguous'; groups: AgentGroup[] }
+  | { kind: 'none' };
+
+/**
+ * Resolve a cross-group target spec to a single agent group, by priority:
+ * agent-group id → folder → display name → messaging-group (channel) id. The
+ * first tier that matches wins; a tier with >1 match is reported ambiguous.
+ */
+function resolveTargetGroup(spec: string): ResolvedTarget {
+  const byId = getAgentGroup(spec);
+  if (byId) return { kind: 'group', group: byId };
+
+  const byFolder = getAgentGroupByFolder(spec);
+  if (byFolder) return { kind: 'group', group: byFolder };
+
+  const byName = getAllAgentGroups().filter((g) => g.name === spec);
+  if (byName.length === 1) return { kind: 'group', group: byName[0] };
+  if (byName.length > 1) return { kind: 'ambiguous', groups: byName };
+
+  const mg = getMessagingGroup(spec);
+  if (mg) {
+    const groups = getMessagingGroupAgents(mg.id)
+      .map((a) => getAgentGroup(a.agent_group_id))
+      .filter((g): g is AgentGroup => g !== undefined);
+    if (groups.length === 1) return { kind: 'group', group: groups[0] };
+    if (groups.length > 1) return { kind: 'ambiguous', groups };
+  }
+
+  return { kind: 'none' };
+}
+
+/** Clone ctx with rewritten args and a target-prefixed replyText. */
+function forTarget(ctx: HostCommandContext, args: string[], targetFolder: string): HostCommandContext {
+  return {
+    ...ctx,
+    args,
+    argsRaw: args.slice(1).join(' '),
+    replyText: (t: string) => ctx.replyText(`[→ ${targetFolder}] ${t}`),
+  };
+}
+
+/**
+ * Handle `/creds <op> <target>@<provider>` for a system owner: resolve the
+ * target group, then run the same credential op against its scope.
+ */
+function handleCrossGroupCreds(ctx: HostCommandContext, sub: string): void {
+  // Owner / global admin only — a scoped admin can't reach into other groups.
+  if (!isAdmin(ctx.userId)) {
+    ctx.replyText('Cross-group `/creds` (targeting another group) requires an owner or global admin.');
+    return;
+  }
+
+  const rawArg = ctx.args[1];
+  const at = rawArg.lastIndexOf('@');
+  const targetSpec = rawArg.slice(0, at);
+  const provider = rawArg.slice(at + 1); // may be '' (e.g. list/status/gpg, or bulk import)
+  if (!targetSpec) {
+    ctx.replyText('Usage: `/creds <op> <group|id|channel>@<provider>`');
+    return;
+  }
+
+  const resolved = resolveTargetGroup(targetSpec);
+  if (resolved.kind === 'none') {
+    ctx.replyText(`No agent group matches "${targetSpec}" (tried id, folder, name, channel).`);
+    return;
+  }
+  if (resolved.kind === 'ambiguous') {
+    const list = resolved.groups.map((g) => `  • ${g.folder} (id: ${g.id})`).join('\n');
+    ctx.replyText(`"${targetSpec}" matches multiple groups — retry with a folder or id:\n${list}`);
+    return;
+  }
+
+  const targetFolder = resolved.group.folder;
+  const targetScope = asCredentialScope(targetFolder);
+
+  // Fan-out guard: run once per typed message even if several agents engaged.
+  const dedupKey = `${ctx.messagingGroupId}::${sub}::${targetFolder}::${provider}::${ctx.args.slice(2).join(' ')}`;
+  if (crossInFlight.has(dedupKey)) return;
+  crossInFlight.add(dedupKey);
+  setTimeout(() => crossInFlight.delete(dedupKey), CROSS_DEDUP_TTL_MS);
+
+  const rest = ctx.args.slice(2);
+  switch (sub) {
+    case 'set-key':
+      return replySetKey(forTarget(ctx, ['set-key', provider, ...rest], targetFolder), targetScope, targetFolder);
+    case 'import':
+      return replyImport(
+        forTarget(ctx, provider ? ['import', provider, ...rest] : ['import', ...rest], targetFolder),
+        targetScope,
+        targetFolder,
+      );
+    case 'delete':
+      return replyDelete(forTarget(ctx, ['delete', provider, ...rest], targetFolder), targetScope, provider);
+    case 'list':
+      return replyList(forTarget(ctx, ['list', ...rest], targetFolder), targetScope, targetFolder);
+    case 'status':
+      return replyCredentialStatus(forTarget(ctx, ['status', ...rest], targetFolder), targetFolder, targetScope);
+    case 'gpg':
+      return replyGpg(forTarget(ctx, ['gpg', ...rest], targetFolder), targetScope);
   }
 }
 
@@ -230,6 +374,21 @@ function replyStopBorrowing(ctx: HostCommandContext, selfFolder: string): void {
 
 // ── Credential-setting subcommands (C7o) ──────────────────────────────────────
 
+/**
+ * Leading warning shown when this group currently *borrows* credentials:
+ * setting/importing its own key here mints an own credential that shadows the
+ * borrowed one. Empty when the group isn't borrowing. `subject` names the
+ * action (e.g. "Setting a `github` key here").
+ */
+function borrowShadowNotice(borrowSource: string | null | undefined, subject: string): string {
+  if (!borrowSource) return '';
+  return (
+    `⚠️ This group is *borrowing* credentials from *${borrowSource}*. ` +
+    `${subject} creates this group's own credential and will *shadow* the borrowed one — ` +
+    `this group will stop using *${borrowSource}*'s.\n\n`
+  );
+}
+
 /** Validate a provider id against the registry. Returns a user-facing error or null. */
 function unknownProviderError(providerId: string, scope: CredentialScope): string | null {
   // Scope-aware: recognizes per-group `.auth-discovery/` providers (scope tier)
@@ -240,13 +399,38 @@ function unknownProviderError(providerId: string, scope: CredentialScope): strin
   return `Unknown provider: *${providerId}* (${known.length} providers registered). Check the provider id.`;
 }
 
+/** Matches a complete inline PGP block anywhere in a command tail. */
+const INLINE_PGP_RE = /-----BEGIN PGP MESSAGE-----[\s\S]*?-----END PGP MESSAGE-----/;
+
+/** Extract a complete inline PGP block from a command's raw args, if present. */
+function extractInlineBlock(argsRaw: string): string | null {
+  return argsRaw.match(INLINE_PGP_RE)?.[0] ?? null;
+}
+
+/**
+ * Decrypt an inline PGP block against the scope's GPG home. Returns the
+ * cleartext or `{ error }` on failure.
+ *
+ * Note: unlike the interactive `pastePgp` flow, an inline block travels in the
+ * command message itself, so its (still-encrypted) ciphertext is persisted in
+ * `messages_in` like any other command. This matches v1 behavior.
+ */
+function decryptInlineBlock(block: string, scope: CredentialScope): { text: string } | { error: string } {
+  try {
+    return { text: gpgDecryptAt(gpgHomeForScope(scope), normalizeArmoredBlock(block)) };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 /**
  * `/creds set-key <provider> [id] [expiry=<ts>]` — store one credential via a
  * GPG-encrypted paste. The decrypted value never travels through chat in
- * cleartext. Launches the paste interaction and returns immediately (the
- * router must not block on the multi-turn flow).
+ * cleartext. Accepts the block inline in the command tail (v1 form); otherwise
+ * launches the paste interaction and returns immediately (the router must not
+ * block on the multi-turn flow).
  */
-function replySetKey(ctx: HostCommandContext, scope: CredentialScope): void {
+function replySetKey(ctx: HostCommandContext, scope: CredentialScope, selfFolder: string): void {
   if (!isGpgAvailable()) {
     ctx.replyText('GPG is not available on the host. Install gnupg first.');
     return;
@@ -262,10 +446,14 @@ function replySetKey(ctx: HostCommandContext, scope: CredentialScope): void {
     return;
   }
 
+  const block = extractInlineBlock(ctx.argsRaw);
+
   // Tokens after the provider: optional credential id + optional expiry=<ts>.
+  // Stop at an inline block — its tokens are payload, not a credential id.
   let credentialId: string | undefined;
   let expiresTs = 0;
   for (const tok of ctx.args.slice(2)) {
+    if (tok.startsWith('-----')) break;
     if (tok.startsWith('expiry=')) {
       const v = parseInt(tok.slice(7), 10);
       if (!Number.isNaN(v)) expiresTs = v;
@@ -276,10 +464,36 @@ function replySetKey(ctx: HostCommandContext, scope: CredentialScope): void {
   const credId = credentialId ?? DEFAULT_CREDENTIAL_ID;
 
   ensureGpgKey(scope);
+
+  // v1-style inline block on the command line — store directly, no prompt.
+  if (block) {
+    const inline = decryptInlineBlock(block, scope);
+    if ('error' in inline) {
+      ctx.replyText(
+        `PGP decrypt failed: ${inline.error}. Re-send with a valid block, ` +
+          `or run \`/creds set-key ${providerId}\` to paste it interactively.`,
+      );
+      return;
+    }
+    const value = inline.text.trim();
+    if (!value) {
+      ctx.replyText('The decrypted value is empty.');
+      return;
+    }
+    getOrCreateResolverForAgentGroup(scope).store(scope, providerId, credId, {
+      value,
+      updated_ts: Date.now(),
+      expires_ts: expiresTs,
+    });
+    ctx.replyText(`Key stored for *${providerId}* (*${credId}*).`);
+    return;
+  }
+
   void pastePgp({
     ctx,
     prompt:
-      `Storing a *${providerId}* credential (*${credId}*), **GPG-encrypted** — never pasted in cleartext.\n\n` +
+      borrowShadowNotice(getBorrowSource(selfFolder), `Setting a *${providerId}* key here`) +
+      `Storing a *${providerId}* credential (*${credId}*) for *${selfFolder}*, **GPG-encrypted** — never pasted in cleartext.\n\n` +
       `1. Encrypt the secret for this group here: ${buildPgpEncryptUrl(scope)}\n` +
       '2. Paste the resulting `-----BEGIN PGP MESSAGE-----` block back here.\n\n' +
       'Or reply `cancel`.',
@@ -311,12 +525,16 @@ function replySetKey(ctx: HostCommandContext, scope: CredentialScope): void {
  * stored under its binding's credentialPath (composite slices joined), not
  * the literal name.
  */
-function replyImport(ctx: HostCommandContext, scope: CredentialScope): void {
+function replyImport(ctx: HostCommandContext, scope: CredentialScope, selfFolder: string): void {
   if (!isGpgAvailable()) {
     ctx.replyText('GPG is not available on the host. Install gnupg first.');
     return;
   }
-  const defaultProviderId = ctx.args[1] ?? null;
+  const block = extractInlineBlock(ctx.argsRaw);
+  // A leading arg that isn't part of an inline block is the default provider;
+  // guard so `import <block>` (no provider) doesn't read the block as one.
+  const arg1 = ctx.args[1];
+  const defaultProviderId = arg1 && !arg1.startsWith('-----') ? arg1 : null;
   if (defaultProviderId) {
     const provErr = unknownProviderError(defaultProviderId, scope);
     if (provErr) {
@@ -326,26 +544,11 @@ function replyImport(ctx: HostCommandContext, scope: CredentialScope): void {
   }
 
   ensureGpgKey(scope);
-  void pastePgp({
-    ctx,
-    prompt:
-      'Bulk credential import, **GPG-encrypted** — never pasted in cleartext.\n\n' +
-      `1. Encrypt your ${defaultProviderId ? `\`KEY=value\` lines for *${defaultProviderId}*` : '`[provider:]KEY=value` lines'} ` +
-      `here: ${buildPgpEncryptUrl(scope)}\n` +
-      '2. Paste the resulting `-----BEGIN PGP MESSAGE-----` block back here.\n\n' +
-      (defaultProviderId ? '' : 'Un-prefixed `ALL_CAPS` env-var names auto-resolve to their provider. ') +
-      '(Lines starting with `#` are ignored.) Or reply `cancel`.',
-    gpgHome: gpgHomeForScope(scope),
-    validate: (plaintext) =>
-      tokenizeImportLines(plaintext).tokens.length > 0
-        ? null
-        : 'No valid `KEY=value` lines found in the decrypted message.',
-  }).then((r) => {
-    if (r.reason !== 'submitted' || !r.text) {
-      ctx.replyText(r.reason === 'cancelled' ? 'Cancelled — nothing imported.' : 'Timed out — nothing imported.');
-      return;
-    }
-    const { tokens, warnings: lineWarnings } = tokenizeImportLines(r.text);
+
+  // Process decrypted `[provider:]KEY=value` lines — shared by the inline and
+  // interactive paths.
+  const finishImport = (text: string): void => {
+    const { tokens, warnings: lineWarnings } = tokenizeImportLines(text);
     const resolver = getOrCreateResolverForAgentGroup(scope);
     const now = Date.now();
     const perProvider = new Map<string, number>();
@@ -376,12 +579,13 @@ function replyImport(ctx: HostCommandContext, scope: CredentialScope): void {
     const warnings = [...lineWarnings];
     for (const t of tokens) {
       if (defaultProviderId !== null && t.prefix !== null && t.prefix !== defaultProviderId) {
-        warnings.push(`ignored (${t.prefix} ≠ ${defaultProviderId}): ${t.key}=${t.value}`);
+        // Never echo the value — these warnings are rendered back into chat.
+        warnings.push(`ignored (${t.prefix} ≠ ${defaultProviderId}): ${t.key} (line ${t.line})`);
         continue;
       }
       const providerId = t.prefix ?? defaultProviderId;
       if (!providerId) {
-        warnings.push(`no provider: ${t.key}=${t.value}`);
+        warnings.push(`no provider: ${t.key} (line ${t.line})`);
         continue;
       }
       if (unknownProviderError(providerId, scope)) {
@@ -392,6 +596,50 @@ function replyImport(ctx: HostCommandContext, scope: CredentialScope): void {
       perProvider.set(providerId, (perProvider.get(providerId) ?? 0) + 1);
     }
     ctx.replyText(renderImportSummary(perProvider, [...unknown], warnings, {}));
+  };
+
+  // v1-style inline block on the command line — import directly, no prompt.
+  if (block) {
+    const inline = decryptInlineBlock(block, scope);
+    if ('error' in inline) {
+      ctx.replyText(
+        `PGP decrypt failed: ${inline.error}. Re-send with a valid block, ` +
+          `or run \`/creds import${defaultProviderId ? ` ${defaultProviderId}` : ''}\` to paste it interactively.`,
+      );
+      return;
+    }
+    if (tokenizeImportLines(inline.text).tokens.length === 0) {
+      ctx.replyText('No valid `KEY=value` lines found in the decrypted message.');
+      return;
+    }
+    finishImport(inline.text);
+    return;
+  }
+
+  void pastePgp({
+    ctx,
+    prompt:
+      borrowShadowNotice(
+        getBorrowSource(selfFolder),
+        defaultProviderId ? `Importing *${defaultProviderId}* credentials here` : 'Importing credentials here',
+      ) +
+      `Bulk credential import for *${selfFolder}*, **GPG-encrypted** — never pasted in cleartext.\n\n` +
+      `1. Encrypt your ${defaultProviderId ? `\`KEY=value\` lines for *${defaultProviderId}*` : '`[provider:]KEY=value` lines'} ` +
+      `here: ${buildPgpEncryptUrl(scope)}\n` +
+      '2. Paste the resulting `-----BEGIN PGP MESSAGE-----` block back here.\n\n' +
+      (defaultProviderId ? '' : 'Un-prefixed `ALL_CAPS` env-var names auto-resolve to their provider. ') +
+      '(Lines starting with `#` are ignored.) Or reply `cancel`.',
+    gpgHome: gpgHomeForScope(scope),
+    validate: (plaintext) =>
+      tokenizeImportLines(plaintext).tokens.length > 0
+        ? null
+        : 'No valid `KEY=value` lines found in the decrypted message.',
+  }).then((r) => {
+    if (r.reason !== 'submitted' || !r.text) {
+      ctx.replyText(r.reason === 'cancelled' ? 'Cancelled — nothing imported.' : 'Timed out — nothing imported.');
+      return;
+    }
+    finishImport(r.text);
   });
 }
 
@@ -404,7 +652,12 @@ function replyImport(ctx: HostCommandContext, scope: CredentialScope): void {
 function tokenizeImportLines(plaintext: string): { tokens: ImportToken[]; warnings: string[] } {
   const tokens: ImportToken[] = [];
   const warnings: string[] = [];
+  // 1-based line number in the original paste — count every raw line, including
+  // the blank / `#` lines we skip, so the number a warning cites matches what
+  // the operator sees in their editor.
+  let lineNo = 0;
   for (const raw of plaintext.split('\n')) {
+    lineNo += 1;
     const line = raw.trim();
     if (!line || line.startsWith('#')) continue;
 
@@ -419,10 +672,17 @@ function tokenizeImportLines(plaintext: string): { tokens: ImportToken[]; warnin
     const value = restEq >= 0 ? rest.slice(restEq + 1).trim() : '';
 
     if (!key || !value) {
-      warnings.push(`malformed: ${line}`);
+      // Don't echo the raw line — a bare token or `=secret` could be the
+      // value itself. Report the key when we parsed one; otherwise stay
+      // content-free. (Warnings are rendered back into chat.)
+      warnings.push(
+        key
+          ? `malformed (no value): ${key} (line ${lineNo})`
+          : `malformed: line ${lineNo} (expected KEY=value)`,
+      );
       continue;
     }
-    tokens.push({ prefix, key, value });
+    tokens.push({ prefix, key, value, line: lineNo });
   }
   return { tokens, warnings };
 }
@@ -467,8 +727,23 @@ function replyDelete(ctx: HostCommandContext, scope: CredentialScope, providerId
   ctx.replyText(`Deleted *${providerId}* credentials (${count} entr${count !== 1 ? 'ies' : 'y'} removed).`);
 }
 
-/** `/creds list` — providers with stored credentials + their entry ids. */
-function replyList(ctx: HostCommandContext, scope: CredentialScope): void {
+/**
+ * `/creds list [borrow|shadow]`:
+ *   - (no arg) providers with credentials stored in this group's own scope.
+ *   - `borrow` providers this group can borrow from its grantor (marking any
+ *     that are shadowed by an own credential).
+ *   - `shadow` providers where this group's own credential shadows one it could
+ *     otherwise borrow from the grantor.
+ */
+function replyList(ctx: HostCommandContext, scope: CredentialScope, selfFolder: string): void {
+  const mode = (ctx.args[1] ?? '').toLowerCase();
+  if (mode === 'borrow') return replyListBorrowable(ctx, scope, selfFolder);
+  if (mode === 'shadow') return replyListShadowed(ctx, scope, selfFolder);
+  if (mode) {
+    ctx.replyText('Usage: /creds list [borrow|shadow]');
+    return;
+  }
+
   const providers = listProviderIds(scope);
   if (providers.length === 0) {
     ctx.replyText('No credentials stored for this group.');
@@ -479,6 +754,63 @@ function replyList(ctx: HostCommandContext, scope: CredentialScope): void {
     const ids = listEntries(scope, p).sort();
     lines.push(`*${p}*: ${ids.length > 0 ? ids.join(', ') : '(empty)'}`);
   }
+  ctx.replyText(lines.join('\n'));
+}
+
+/**
+ * Resolve the group's *active* borrow source — the grantor it borrows from AND
+ * that has granted it access (`canAccess`). Null when not borrowing or the grant
+ * isn't active. Mirrors the runtime resolver's borrow gate.
+ */
+function activeBorrowSource(selfFolder: string): string | null {
+  const source = getBorrowSource(selfFolder);
+  if (!source || !canAccess(selfFolder, source)) return null;
+  return source;
+}
+
+/** `/creds list borrow` — providers available from the active borrow source. */
+function replyListBorrowable(ctx: HostCommandContext, scope: CredentialScope, selfFolder: string): void {
+  const source = getBorrowSource(selfFolder);
+  if (!source) {
+    ctx.replyText('Not borrowing from any group. Use `/creds borrow <group>` to borrow credentials.');
+    return;
+  }
+  if (!canAccess(selfFolder, source)) {
+    ctx.replyText(
+      `Borrowing from *${source}* is not active yet — the source must run \`/creds share ${selfFolder}\` to grant access.`,
+    );
+    return;
+  }
+  const borrowable = listProviderIds(asCredentialScope(source)).sort();
+  if (borrowable.length === 0) {
+    ctx.replyText(`*${source}* has no stored credentials to borrow.`);
+    return;
+  }
+  const own = new Set(listProviderIds(scope));
+  const lines: string[] = [`*Borrowable credentials* (from *${source}*)`, ''];
+  for (const p of borrowable) {
+    lines.push(own.has(p) ? `*${p}* — shadowed by your own credential` : `*${p}* — in use (borrowed)`);
+  }
+  ctx.replyText(lines.join('\n'));
+}
+
+/** `/creds list shadow` — own credentials that shadow a borrowable grantor one. */
+function replyListShadowed(ctx: HostCommandContext, scope: CredentialScope, selfFolder: string): void {
+  const source = activeBorrowSource(selfFolder);
+  if (!source) {
+    ctx.replyText('No shadowed credentials — this group is not actively borrowing from any source.');
+    return;
+  }
+  const own = new Set(listProviderIds(scope));
+  const shadowed = listProviderIds(asCredentialScope(source))
+    .filter((p) => own.has(p))
+    .sort();
+  if (shadowed.length === 0) {
+    ctx.replyText(`No shadowed credentials — none of your own credentials override one borrowed from *${source}*.`);
+    return;
+  }
+  const lines: string[] = [`*Shadowed credentials* — your own overrides the one borrowed from *${source}*:`, ''];
+  for (const p of shadowed) lines.push(`*${p}*`);
   ctx.replyText(lines.join('\n'));
 }
 

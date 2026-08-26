@@ -135,9 +135,9 @@ describe('createChatSdkBridge.deliver — format-error fallback (bug #11)', () =
     });
     const bridge = createChatSdkBridge({ adapter: stubAdapter({ postMessage }), supportsThreads: false });
 
-    await expect(
-      bridge.deliver('telegram:42', null, { kind: 'chat-sdk', content: { text: 'hi' } }),
-    ).rejects.toThrow('503');
+    await expect(bridge.deliver('telegram:42', null, { kind: 'chat-sdk', content: { text: 'hi' } })).rejects.toThrow(
+      '503',
+    );
     expect(calls).toHaveLength(1); // no plain-text retry
   });
 });
