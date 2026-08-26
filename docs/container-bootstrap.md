@@ -92,7 +92,7 @@ both are called explicitly from `src/index.ts` at boot.
 `network.ts` owns the `nanoclaw` Docker bridge network (created once at host
 startup via `ensureContainerNetwork()`) and a monotonic-counter IP allocator
 inside its `/16` subnet. The subnet defaults to `172.29.0.0/16` and is
-overridable via `NANOCLAW_SUBNET` (must be `X.Y.0.0/16`). The pool skips the
+overridable via `CLAW_SUBNET` (must be `X.Y.0.0/16`). The pool skips the
 network and gateway addresses. Inter-container communication is disabled on
 the bridge (`com.docker.network.bridge.enable_icc=false`). Apple Container
 has a different networking model and no `docker network create` analog;
