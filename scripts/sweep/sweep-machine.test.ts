@@ -1181,6 +1181,64 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     expect(res.instruction).toContain('next-case');
   });
 
+  /**
+   * A runner whose answer depends on WHICH TREE it is asked about: at `tipSha`
+   * only `owned` fails, everywhere else both files do. That is the shape the
+   * ownership probe exists to detect — the raw log names more files than the
+   * owner is responsible for.
+   */
+  function ownershipRunner(wtPath: string, tipSha: string, owned: string, other: string): ChecksRunner {
+    return async (commands, baseDir) => {
+      const names = commands.map((c) => c.cmd);
+      const at =
+        baseDir && baseDir !== wtPath
+          ? execFileSync('git', ['-C', baseDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+          : '';
+      const files = at === tipSha ? [owned] : [owned, other];
+      return {
+        ok: false,
+        failedNames: names,
+        output: names.map((n) => `$ ${n}\n${files.map((f) => `${f}(1,1): error TS2345: boom\n`).join('')}`).join(''),
+      };
+    };
+  }
+
+  it('a minted gate-fix case carries only the files its owner was PROVEN to own', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    seedPriorFailure(dir, caseId, 'typecheck', ['tsc --noEmit']);
+    const wtPath = join(dir, caseId, 'worktree');
+    // The branch tip the merge was attempted from — the clean prefix's parent,
+    // and the commit `locateOwner` probes.
+    const tipSha = execFileSync('git', ['-C', wtPath, 'rev-parse', 'HEAD^'], { encoding: 'utf8' }).trim();
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+        neverInvoked,
+        ownershipRunner(wtPath, tipSha, 'src/util.ts', 'src/unrelated.ts'),
+        fakeInstall,
+      ),
+    ).toBe(1);
+    const journal = readJournal(dir);
+    expect(journal.find((e) => e.action === 'not-my-bug')!.verdict).toBe('pre-existing');
+    // The probe proved the owner owns ONE of the two files in the log.
+    const owner = journal.find((e) => e.action === 'not-my-bug-owner')!;
+    expect(owner.owner).toBe('branch');
+    expect(owner.files).toEqual(['src/util.ts']);
+    // So the case is scoped to that file. Re-deriving the list by re-parsing the
+    // raw log would hand this owner `src/unrelated.ts` too — a file the probe
+    // showed it does not own, which nobody on this branch can fix and which the
+    // checks gate would then demand green.
+    const gateFix = journal.find((e) => e.action === 'gate-fix')!;
+    expect(gateFix.files).toEqual(['src/util.ts']);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { gateFix: { files: string[] } };
+    expect(res.gateFix.files).toEqual(['src/util.ts']);
+  });
+
   it('REFUSED -> the gate names which failures are the agent’s own', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();

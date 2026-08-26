@@ -1440,6 +1440,16 @@ never ours to fix — as the one exclusion for all of them.
 - Failing files are GROUPED PER ATTRIBUTED BRANCH — one case each, shallowest
   first, because a judged trunk fix plus its reopen can moot a descendant's case
   before it is worked.
+- **A PROVEN subset overrides the re-parse.** Blame reads the RAW failing log,
+  which names every file the run complained about. Where the caller has already
+  PROVED which of them fail at a specific owner's ref — the `--not-my-bug`
+  ownership probe — it passes that subset (`ownedFiles`) and the case is scoped to
+  it. Blame still runs (its candidates and reason are the record), but its file
+  list does not decide the scope. Without this the case carries files the probe
+  showed the owner does NOT own, plus paths the adjudication already excluded as
+  the agent's own work: the agent is handed a case whose scope its owner never
+  touched, and the checks gate demands all of it green. Callers with no probe —
+  the finish-path blame — have nothing proven and keep the parsed list.
 
 ### 9.2 Cut-point exceptions
 

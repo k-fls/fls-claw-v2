@@ -8890,6 +8890,11 @@ async function adjudicateNotMyBug(p: {
 
     const gate = await materializeGateFixCases(cli, dir, ctx.chain, gateOutput, failedCommands, null, {
       rootBranch: ownerBranch,
+      // The PROVEN subset. `locateOwner` ran the failing commands at this owner's
+      // ref and reported which files fail THERE; the raw log carries more than
+      // that, and a case scoped from the log would name files this owner does not
+      // own — including ones the adjudication dropped as the agent's own work.
+      ownedFiles: owner.files,
       ...(rootedBelowTip ? { rootAt } : {}),
       // REPRODUCTION CHARACTER, carried to the briefing. The bisect had to fall
       // back to the FULL failing command because the narrowed probe did not
@@ -10318,6 +10323,16 @@ async function materializeGateFixCases(
      * fix is then BEHIND the tip — the PR text carries the rebase note.
      */
     rootAt?: string;
+    /**
+     * The files an ownership probe PROVED belong to `rootBranch`. When the caller
+     * has that proof it decides the case's scope, because the re-parse below
+     * cannot: it reads the RAW failing log, which names every file the run
+     * complained about — including files the probe showed this owner does NOT own
+     * and paths the adjudication already excluded as the agent's own work. A case
+     * carrying those hands its owner work it never touched. Callers with no probe
+     * (the finish-path blame) omit it and get the parsed set.
+     */
+    ownedFiles?: string[];
   } = {},
 ): Promise<{ served: boolean; cases: GateFixCaseSummary[]; reason: string; detail: string; gated: string[] }> {
   const journal = readJournal(dir);
@@ -10361,7 +10376,10 @@ async function materializeGateFixCases(
     accused,
     cutPoints.duplicates,
   );
-  const files = a.files;
+  // PROOF BEATS RE-PARSING. `attributeFailure` still runs — its candidates and
+  // reason are the blame record — but where the caller proved the owner's subset,
+  // that subset is the case's file list.
+  const files = opts.ownedFiles ? [...opts.ownedFiles] : a.files;
   const commandNames = failedCommands.map((c) => c.cmd);
   // NO FILES, NO CASE. `cmdVerify`'s ROLLBACK arm (an offender isolated, rolled
   // back, HELD(gate), and the re-verify STILL red) journals no attributionFailed
