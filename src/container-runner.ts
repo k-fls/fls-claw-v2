@@ -3,9 +3,10 @@
  * Spawns agent containers with session folder + agent group folder mounts.
  * The container runs the v2 agent-runner which polls the session DB.
  */
-import { ChildProcess, execSync, spawn } from 'child_process';
+import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { promisify } from 'util';
 
 import { OneCLI } from '@onecli-sh/sdk';
 
@@ -116,7 +117,7 @@ async function spawnContainer(session: Session): Promise<void> {
     return;
   }
 
-  // Refresh the destination map and default reply routing so any admin
+  // Refresh the destination map and current-thread routing so any admin
   // changes take effect on wake. Destinations come from the agent-to-agent
   // module — skip when the module isn't installed (table absent).
   if (hasTable(getDb(), 'agent_destinations')) {
@@ -320,12 +321,6 @@ export function buildMounts(
     mounts.push({ hostPath: fragmentsDir, containerPath: '/workspace/agent/.claude-fragments', readonly: true });
   }
 
-  // Global memory directory — always read-only.
-  const globalDir = path.join(GROUPS_DIR, 'global');
-  if (fs.existsSync(globalDir)) {
-    mounts.push({ hostPath: globalDir, containerPath: '/workspace/global', readonly: true });
-  }
-
   // Shared CLAUDE.md — read-only, imported by the composed entry point via
   // the `.claude-shared.md` symlink inside the group dir.
   const sharedClaudeMd = path.join(process.cwd(), 'container', 'CLAUDE.md');
@@ -394,15 +389,26 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
   // Create symlinks for desired skills (container path targets)
   for (const skill of desired) {
     const linkPath = path.join(skillsDir, skill);
-    let exists = false;
+    let entry: fs.Stats | undefined;
     try {
-      fs.lstatSync(linkPath);
-      exists = true;
+      entry = fs.lstatSync(linkPath);
     } catch {
       /* missing */
     }
-    if (!exists) {
+    if (!entry) {
       fs.symlinkSync(`/app/skills/${skill}`, linkPath);
+    } else if (!entry.isSymbolicLink()) {
+      // A real entry here is either a template overlay (intentional; see
+      // src/group-skills.ts) or a stale pre-refactor skill copy that shadows
+      // the shared skill (#3001). No marker distinguishes them yet, so
+      // surface the skip instead of staying silent.
+      log.warn(
+        'Shared skill not symlinked: real entry occupies the path (template overlay or stale pre-refactor copy)',
+        {
+          skill,
+          path: linkPath,
+        },
+      );
     }
   }
 }
@@ -510,6 +516,8 @@ async function buildContainerArgs(
   return args;
 }
 
+const execAsync = promisify(exec);
+
 /** Build a per-agent-group Docker image with custom packages. */
 export async function buildAgentGroupImage(agentGroupId: string): Promise<void> {
   const agentGroup = getAgentGroup(agentGroupId);
@@ -545,9 +553,12 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
   const tmpDockerfile = path.join(DATA_DIR, `Dockerfile.${agentGroupId}`);
   fs.writeFileSync(tmpDockerfile, dockerfile);
   try {
-    execSync(`${CONTAINER_RUNTIME_BIN} build -t ${imageTag} -f ${tmpDockerfile} .`, {
+    // Awaited async exec so the single-threaded host stays responsive during
+    // the build (can take minutes) instead of blocking on execSync. exec buffers
+    // stdout/stderr (matching the old stdio: 'pipe') and rejects on a non-zero
+    // exit, so error propagation is unchanged.
+    await execAsync(`${CONTAINER_RUNTIME_BIN} build -t ${imageTag} -f ${tmpDockerfile} .`, {
       cwd: DATA_DIR,
-      stdio: 'pipe',
       timeout: 900_000,
     });
   } finally {
