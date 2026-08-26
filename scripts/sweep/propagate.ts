@@ -2920,7 +2920,145 @@ export async function cmdPlan(cli: Cli): Promise<number> {
   return 0;
 }
 
-export async function cmdRun(cli: Cli): Promise<number> {
+/**
+ * The verdict of the LANDING GATE on one branch (DRIVER.md §7.6).
+ *
+ * `skipped` is "no verdict was owed": nothing landed, the tree was already
+ * measured this pass, or no checks are configured. `unmeasured` is "a verdict
+ * was owed and could not be taken" — no environment, so the tree was never
+ * run — and it is never read as green.
+ */
+type LandingVerdict =
+  | { kind: 'skipped' }
+  | { kind: 'green' }
+  | { kind: 'unmeasured' }
+  | { kind: 'red'; output: string; failed: VerifyCommand[]; failedNames: string[] };
+
+/** The GREEN trees this pass has already measured → the branch it measured them on. */
+function greenTrees(journal: JournalEntry[]): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const e of journal) {
+    if (e.action === 'landing-check' && e.ok === true && typeof e.tree === 'string' && typeof e.branch === 'string') {
+      if (!out.has(e.tree)) out.set(e.tree, e.branch);
+    }
+  }
+  return out;
+}
+
+/**
+ * THE LANDING GATE — content that propagates arrives green, or it does not
+ * arrive.
+ *
+ * A merge the driver commits contributes its content to every descendant and is
+ * pushed to origin. The other checks gates cannot speak for it: `report-case`
+ * measures a CASE's tree, the `start` probe measures a PROPOSAL, and finish's
+ * integration verify EXCLUDES every branch with a block above it — so without
+ * this, a branch that merges cleanly hands content down on no evidence, and a
+ * cut branch's prefix, pushed at its cut point, ships measured by nothing.
+ * Naming that in the result is not measuring it. So the gate runs where the
+ * prefix LANDS, on the branch's own tip, with the same checks config and the
+ * same typecheck-THEN-test ordering `report-case` uses; there is one notion of
+ * green in this driver, not two.
+ *
+ * WHAT IT DOES NOT RUN, and why each is safe:
+ *  - No checks configured — the same deliberate skip every other gate takes.
+ *  - The tree did not MOVE (forced no-op merges, a merge that adds no content):
+ *    nothing arrived, so nothing propagates that was not already there, and
+ *    what was already there is finish's integration verify to judge.
+ *  - The TREE was already measured green this pass, on any branch: a checks run
+ *    is a function of the tree it runs on (dependencies included — they install
+ *    from that tree's own manifests), so a second run answers the same question
+ *    at full price.
+ * Each skip is journaled, so "did this branch arrive green" stays a journal
+ * read rather than a re-probe.
+ */
+async function landingCheck(
+  cli: Cli,
+  dir: string,
+  branch: string,
+  treeBefore: string,
+  runChecks: ChecksRunner,
+  runInstall?: InstallRunner,
+): Promise<LandingVerdict> {
+  // The pass's PINNED checks file first: a sweep pass gates on what `start`
+  // opened it with, not on what a later command was handed.
+  const checks = loadChecksConfig(readMachineState(dir)?.checksFile ?? cli.checksFile);
+  if (!checks || checks.typecheck.length + checks.test.length === 0) return { kind: 'skipped' };
+  const sha = await revParse(cli.repo, branch);
+  const tree = await treeOf(cli.repo, sha);
+  if (tree === treeBefore) {
+    appendJournal(dir, { action: 'landing-check', branch, sha, tree, ran: false, reason: 'no-op' });
+    return { kind: 'skipped' };
+  }
+  const already = greenTrees(readJournal(dir)).get(tree);
+  if (already) {
+    appendJournal(dir, { action: 'landing-check', branch, sha, tree, ok: true, measuredOn: already });
+    return { kind: 'skipped' };
+  }
+  const wt = await addTempWorktree(cli.repo, sha);
+  try {
+    // Dependencies come from THIS tree's manifests: a branch that declares its
+    // own package must not be measured against the clone's node_modules, and an
+    // environment that will not install yields no verdict at all.
+    if (!(await installDeps(cli, wt.path, runInstall))) {
+      appendJournal(dir, {
+        action: 'landing-check',
+        branch,
+        sha,
+        tree,
+        ran: false,
+        reason: 'deps-unusable',
+        id: 'WARN13_DEPS_UNUSABLE',
+      });
+      console.error(`run [WARN13_DEPS_UNUSABLE]: ${branch} dependencies would not install — landing NOT checked`);
+      return { kind: 'unmeasured' };
+    }
+    // Typecheck FIRST: it is the cheap check and its diagnostics are what make a
+    // failure readable; a red typecheck short-circuits the tests.
+    for (const [phase, commands] of [
+      ['typecheck', checks.typecheck],
+      ['test', checks.test],
+    ] as const) {
+      if (commands.length === 0) continue;
+      const r = await runChecks(commands, wt.path);
+      if (r.environmentFault) {
+        appendJournal(dir, {
+          action: 'landing-check',
+          branch,
+          sha,
+          tree,
+          ran: false,
+          reason: 'environment-fault',
+          id: 'WARN14_ENVIRONMENT_FAULT',
+          detail: r.environmentFault.detail,
+          phase,
+        });
+        console.error(`run [WARN14_ENVIRONMENT_FAULT]: ${branch} — ${r.environmentFault.detail}`);
+        return { kind: 'unmeasured' };
+      }
+      if (!r.ok) {
+        appendJournal(dir, { action: 'landing-check', branch, sha, tree, ok: false, phase, failed: r.failedNames });
+        return {
+          kind: 'red',
+          output: r.output,
+          failed: commands.filter((c) => r.failedNames.includes(c.cmd)),
+          failedNames: r.failedNames,
+        };
+      }
+    }
+    appendJournal(dir, { action: 'landing-check', branch, sha, tree, ok: true });
+    return { kind: 'green' };
+  } finally {
+    await wt.remove();
+  }
+}
+
+export async function cmdRun(
+  cli: Cli,
+  /** The landing gate's checks runner — injected so a pass under test spawns nothing. */
+  runChecks: ChecksRunner = defaultChecksRunner,
+  runInstall?: InstallRunner,
+): Promise<number> {
   const ctx = await passContext(cli); // attaches to the open pass
   const { chain, dir } = ctx;
 
@@ -3199,6 +3337,9 @@ export async function cmdRun(cli: Cli): Promise<number> {
       // The tip the plan was DERIVED AT. Step verification must judge the step
       // against THIS tip, not a fresh read — see the note at the verify call.
       const tipAtDerive = await revParse(cli.repo, snap.branch);
+      // The tree the branch carried BEFORE this pass's merges landed on it —
+      // the landing gate's no-op test (§7.6) compares against it.
+      const treeAtDerive = await treeOf(cli.repo, tipAtDerive);
       const bp = await deriveLive();
       // The effective cut is INHERITED: this branch cannot hand its descendants
       // what it could not take itself, so it closes their window at the same
@@ -3478,6 +3619,39 @@ export async function cmdRun(cli: Cli): Promise<number> {
         mergeFailed.push(bp.branch);
         issues.push({ id: 'ERR21_MERGE_FAILED', detail: e.message });
         console.error(`MERGE FAILED [ERR21_MERGE_FAILED] (branch halted, siblings continue): ${e.message}`);
+      }
+
+      // THE LANDING GATE (§7.6). Whatever this branch just took is now its tip:
+      // its descendants take it below, `finish` pushes it to origin, and a cut
+      // branch's prefix is pushed and then left OUT of the integration recipe.
+      // Measure it here, once, before any of that happens.
+      const landing = await landingCheck(cli, dir, bp.branch, treeAtDerive, runChecks, runInstall);
+      if (landing.kind === 'red') {
+        // A RED LANDING IS A FIX-SHAPED PROBLEM, so it takes the fix-shaped
+        // answer: a gate-fix case on the branch that now carries the defect.
+        // REOPEN BEFORE MINTING, branch and subtree together. The reopen
+        // supersedes this branch's own undispositioned case — a conflict case on
+        // a red tree is unjudgeable, its checks fail on a defect the fix already
+        // describes — and it supersedes the descendants' cases for the same
+        // reason; minting after the reopen keeps the fix itself out of the
+        // supersede.
+        reopen(dir, [bp.branch, ...transitiveDescendants(planEdgesOf(dir), bp.branch)]);
+        const gate = await materializeGateFixCases(cli, dir, ctx.chain, landing.output, landing.failed, null, {
+          rootBranch: bp.branch,
+        });
+        gated = true;
+        issues.push({
+          id: 'WARN09_GATE_FIX_SERVED',
+          detail:
+            `${bp.branch} landed RED (${landing.failedNames.join(', ')}) — ` +
+            (gate.cases.length ? `gate fix served: ${gate.cases.map((c) => c.caseId).join(', ')}` : gate.reason),
+        });
+        console.error(`run [WARN09_GATE_FIX_SERVED]: ${bp.branch} landed red — ${gate.reason}`);
+        // NOTHING ELSE MERGES THIS CALL. The branch is not `arrived`, so the
+        // next run re-derives it; the branches below it would be merging the
+        // red content this gate just refused, and the ones beside it wait one
+        // call for a pass that cannot complete until the fix lands anyway.
+        break;
       }
       appendJournal(dir, { action: 'arrived', branch: bp.branch });
       arrived.add(bp.branch);
@@ -8137,6 +8311,14 @@ export async function firstRedParticipant(
     if (e.action === 'branch-check' && typeof e.branch === 'string' && typeof e.sha === 'string') {
       checked.set(`${e.branch}@${e.sha}`, e.ok === true);
     }
+    // A GREEN LANDING SUBSUMES THIS CHECK. The landing gate (§7.6) ran the
+    // typechecks AND the tests on that exact tip, so re-typechecking it here
+    // pays full price for an answer already in the journal. Only a green
+    // counts: a red landing blocks its branch through its gate-fix case, and
+    // an unmeasured one carries no `ok` at all.
+    if (e.action === 'landing-check' && e.ok === true && typeof e.branch === 'string' && typeof e.sha === 'string') {
+      checked.set(`${e.branch}@${e.sha}`, true);
+    }
   }
   let wt: { path: string; remove: () => Promise<void> } | null = null;
   try {
@@ -8274,7 +8456,7 @@ export async function cmdSweepNextCase(
   progress(`planning (${planBranches} branches)`);
   progress('executing merges');
   const journalLenBefore = readJournal(dir).length;
-  const runRc = await cmdRun({ ...cli, cmd: 'run', execute: true, internal: true });
+  const runRc = await cmdRun({ ...cli, cmd: 'run', execute: true, internal: true }, runChecks, runInstall);
   if (runRc !== 0) {
     // A per-branch/whole-run halt (ERR2x) — surface it; the agent reports it.
     // cmdRun's own emit is suppressed (internal), so next-case emits the single

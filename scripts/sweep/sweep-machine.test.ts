@@ -5042,6 +5042,242 @@ describe('next-case — a participating branch that is RED before any merge', ()
   });
 });
 
+/**
+ * THE LANDING GATE. Checks used to run in exactly three places — the
+ * `report-case` gate on a case's tree, the proposal probe at `start`, and
+ * finish's integration verify — and a clean merge triggered none of them. So a
+ * branch that merged cleanly handed its content to every descendant on no
+ * evidence, and a CUT branch, which is pushed at its cut point and then left OUT
+ * of the verify recipe, shipped a prefix to origin that nothing in the pass had
+ * measured. Naming that in the result is not measuring it.
+ *
+ * The rule these pin: content that propagates arrives green, or it does not
+ * arrive.
+ */
+describe('run — the landing gate', () => {
+  /** Every command list handed over, plus a red-when predicate on the tree. */
+  function tracingRunner(redWhen?: (cwd: string) => boolean): {
+    fn: ChecksRunner;
+    ran: Array<{ cmds: string[]; cwd: string }>;
+  } {
+    const ran: Array<{ cmds: string[]; cwd: string }> = [];
+    const fn: ChecksRunner = async (commands, cwd) => {
+      const cmds = commands.map((c) => c.cmd);
+      ran.push({ cmds, cwd });
+      const red = redWhen ? redWhen(cwd) : false;
+      return {
+        ok: !red,
+        failedNames: red ? cmds : [],
+        output: red ? `$ ${cmds[0]}\nsrc/x.ts(1,1): error TS2345: the landed tree is broken.\n` : '',
+      };
+    };
+    return { fn, ran };
+  }
+  /** Typecheck AND tests, so a landing run is told apart from the typecheck-only pre-merge one. */
+  function checksJson(ws: string): string {
+    const f = join(ws, 'checks.json');
+    writeFileSync(
+      f,
+      JSON.stringify({
+        typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }],
+        test: [{ cmd: 'vitest run', cwd: '.' }],
+      }),
+    );
+    return f;
+  }
+  const landingRuns = (ran: Array<{ cmds: string[] }>): number =>
+    ran.filter((r) => r.cmds.includes('vitest run')).length;
+
+  it('a clean merge that lands GREEN carries its evidence: branch, tree, verdict', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: own file', { 'src/mp.ts': 'mp\n' });
+    repo.checkout('main');
+    repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+    cleanups.push(() => repo.destroy());
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    const t = tracingRunner();
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksJson(ws) }))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn)).toBe(0);
+
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'merge' && e.branch === 'main_patched')).toBe(true);
+    const row = journal.find((e) => e.action === 'landing-check' && e.branch === 'main_patched');
+    expect(row).toBeTruthy();
+    expect(row!.ok).toBe(true);
+    // WHICH TREE, not just which branch: "is this red inherited" is answered by
+    // comparing trees in the journal, with nothing re-probed.
+    expect(row!.sha).toBe(repo.sha('main_patched'));
+    expect(row!.tree).toBe(repo.git('rev-parse', 'main_patched^{tree}'));
+    // One notion of green: the same typecheck-THEN-test ordering report-case runs.
+    expect(landingRuns(t.ran)).toBe(1);
+  });
+
+  it('a landing whose tree is RED reaches no child, and the journal names the failing commands', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: own file', { 'src/mp.ts': 'mp\n' });
+    repo.checkout('module/cg', { create: true, at: 'main_patched' });
+    repo.commit('cg work', { 'src/cg.ts': 'cg\n' });
+    repo.checkout('main');
+    repo.commit('U0: upstream breaks the build', { 'BROKEN.marker': 'x\n' });
+    cleanups.push(() => repo.destroy());
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'], owned: ['src/cg.ts'] }]);
+    const dir = dirOf(repo, ws);
+    const cgBefore = repo.sha('module/cg');
+    // The red is created BY THE MERGE: neither side carries it alone, so
+    // upstream is green, both branches are green before the merge, and
+    // main_patched is red the moment the two trees meet.
+    const t = tracingRunner(
+      (cwd) => existsSync(join(cwd, 'BROKEN.marker')) && existsSync(join(cwd, 'src/mp.ts')),
+    );
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksJson(ws) }))).toBe(0);
+    const out = join(ws, 'nc.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), t.fn)).toBe(0);
+
+    const journal = readJournal(dir);
+    // THE POINT, asserted first: the child never took it.
+    expect(repo.sha('module/cg')).toBe(cgBefore);
+    expect(journal.some((e) => e.action === 'merge' && e.branch === 'module/cg')).toBe(false);
+    const row = journal.find((e) => e.action === 'landing-check' && e.branch === 'main_patched');
+    expect(row!.ok).toBe(false);
+    expect(row!.failed).toEqual(['tsc --noEmit']);
+    expect(row!.phase).toBe('typecheck');
+    // And the red is served as what it is — a fix on the branch now carrying it.
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; caseId?: string; branch?: string };
+    expect(res.status).toBe('case-ready');
+    expect(res.caseId).toContain('gate-fix-main_patched');
+    expect(res.branch).toBe('main_patched');
+  });
+
+  it('a merge that lands no new tree is not measured', async () => {
+    // The leaf un-skip forces EMPTY merges up the cheapest parent chain: the
+    // tips move, the trees do not, so there is nothing new to measure.
+    const repo = initFixtureRepo();
+    repo.commit('base: f', { 'src/f.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: f = fork', { 'src/f.ts': 'fork\n' });
+    repo.checkout('feat/a', { create: true, at: 'main_patched' });
+    repo.commit('feat/a: own', { 'src/a.ts': 'a\n' });
+    repo.checkout('feat/b', { create: true, at: 'feat/a' });
+    repo.commit('feat/b: own', { 'src/b.ts': 'b\n' });
+    repo.checkout('main');
+    repo.commit('U0: f = up1', { 'src/f.ts': 'up1\n' });
+    cleanups.push(() => repo.destroy());
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'a', branch: 'feat/a', parents: ['main_patched'] },
+      { id: 'b', branch: 'feat/b', parents: ['feat/a'] },
+    ]);
+    const dir = dirOf(repo, ws);
+    const t = tracingRunner();
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksJson(ws) }))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn)).toBe(0);
+
+    const journal = readJournal(dir);
+    expect(
+      journal
+        .filter((e) => e.action === 'merge' && e.forced === true)
+        .map((e) => e.branch)
+        .sort(),
+    ).toEqual(['feat/a', 'feat/b']);
+    for (const b of ['feat/a', 'feat/b']) {
+      const row = journal.find((e) => e.action === 'landing-check' && e.branch === b);
+      expect(row!.ran).toBe(false);
+      expect(row!.reason).toBe('no-op');
+      expect(row!.ok).toBeUndefined();
+    }
+    expect(landingRuns(t.ran)).toBe(0);
+  });
+
+  it('a landed tree already measured this pass is not measured a second time', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: own file', { 'src/mp.ts': 'mp\n' });
+    // No own commits: whatever main_patched lands, this branch lands the SAME tree.
+    repo.checkout('module/cg', { create: true, at: 'main_patched' });
+    repo.checkout('main');
+    repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+    cleanups.push(() => repo.destroy());
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'], owned: ['src/cg.ts'] }]);
+    const dir = dirOf(repo, ws);
+    const t = tracingRunner();
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksJson(ws) }))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn)).toBe(0);
+
+    const journal = readJournal(dir);
+    const mp = journal.find((e) => e.action === 'landing-check' && e.branch === 'main_patched');
+    const cg = journal.find((e) => e.action === 'landing-check' && e.branch === 'module/cg');
+    expect(mp!.ok).toBe(true);
+    expect(cg!.ok).toBe(true);
+    expect(cg!.tree).toBe(mp!.tree);
+    // The verdict is COPIED, and the journal says where it was measured — a
+    // checks run is a function of the tree, so a second run buys nothing.
+    expect(cg!.measuredOn).toBe('main_patched');
+    expect(landingRuns(t.ran)).toBe(1);
+  });
+
+  it("a cut branch's clean prefix is measured, though the verify recipe leaves it out", async () => {
+    // feat/c = feat/a + feat/b. feat/a is blocked at h1, so feat/c takes the h0
+    // prefix through feat/b and DEFERS the rest: no case, no PR, and excluded
+    // from the recipe — but pushed at that cut point.
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.checkout('feat/a', { create: true, at: 'main_patched' });
+    repo.checkout('feat/b', { create: true, at: 'main_patched' });
+    repo.checkout('feat/c', { create: true, at: 'main_patched' });
+    repo.commit('c: x = cfork', { 'src/x.ts': 'cfork\n' });
+    repo.checkout('main');
+    const u0 = repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+    const u1 = repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' });
+    repo.checkout('feat/a');
+    repo.git('merge', '--no-edit', '-m', 'a merges U0', u0);
+    repo.checkout('feat/b');
+    repo.git('merge', '--no-edit', '-m', 'b merges U0', u0);
+    repo.git('merge', '--no-edit', '-m', 'b merges U1', u1);
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'a', branch: 'feat/a', parents: ['main_patched'] },
+      { id: 'b', branch: 'feat/b', parents: ['main_patched'] },
+      { id: 'c', branch: 'feat/c', parents: ['feat/a', 'feat/b'] },
+    ]);
+    const dir = dirOf(repo, ws);
+    const t = tracingRunner();
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksJson(ws) }))).toBe(0);
+    appendJournal(dir, {
+      action: 'origin-blocked',
+      branch: 'feat/a',
+      caseId: 'origin:fix/sweep/feat__a--main_patched-h1-deadbeef',
+      fixBranch: 'fix/sweep/feat__a--main_patched-h1-deadbeef',
+      headSha: u1,
+      prNumber: 12,
+    });
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn)).toBe(0);
+
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'defer' && e.branch === 'feat/c')).toBe(true);
+    expect(journal.some((e) => e.action === 'case' && e.branch === 'feat/c')).toBe(false);
+    const row = journal.find((e) => e.action === 'landing-check' && e.branch === 'feat/c');
+    expect(row!.ok).toBe(true);
+    expect(row!.tree).toBe(repo.git('rev-parse', 'feat/c^{tree}'));
+  });
+});
+
 describe('sweep finish — gate-fix on an unattributable red', () => {
   // Serving hazard: `crashHeal` must not journal `resolved` for every
   // gate-fix case on the next command. Its heuristic is "the ref already

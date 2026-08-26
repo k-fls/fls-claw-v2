@@ -642,7 +642,10 @@ way has a block above it, so the integration recipe leaves it out by the same
 rule that cut it (§10.2 step 1) — the exclusion needs no rule of its own. It is
 still PUSHED at its cut point: the prefix below the cut is a complete position,
 and leaving it unpushed diverges the branch from the PR base its own held case is
-opened against. Not built, still landed, and the result says which (§10.7).
+opened against. Not built, still landed, and the result says which (§10.7) — but
+never unmeasured: the prefix goes through the landing gate (§7.6) like any other
+merge, so what ships at a cut point is green even though no integration build
+covered it.
 
 DEFERRED is a PURE HEIGHT-MIN over the branch's BLOCKED DIRECT PARENTS
 (`deferred.ts`). When branch X hits its own conflict at height `conflictHeight`
@@ -876,6 +879,16 @@ Deterministic and internal, with no `claude -p`: it drives the plan/run machiner
 internally, and serves the topmost undispositioned case in DAG order with its
 prepared worktree and materials. The agent never sees the DAG.
 
+It checks the branches TWICE, at the two moments a defect can enter. BEFORE any
+merge, a typecheck-only pass over the participating branches catches a branch
+that was already red (memoised per branch and tip sha as `branch-check`); a red
+one merges nothing and is served its own gate fix. AFTER each prefix lands, the
+landing gate (§7.6) runs the full checks on the branch tip, because a merge can
+create a red that neither side carried. The two share one memo: a green
+`landing-check` at a tip subsumes the pre-merge typecheck of that same tip, so it
+is never paid twice. An open gate-fix case suppresses the pre-merge pass and all
+merging until it lands.
+
 Returns one of:
 
 - `status: "case-ready"` with `worktree`, `branch`, `caseId`, `conflictedPaths`,
@@ -1038,9 +1051,14 @@ journaled subcommands; the journal (`journal.jsonl`) is append-only.
 
 ## 7. The quality gates
 
-All four gates live at `report-case` (§6.4). They run in this order: checks →
+Four gates live at `report-case` (§6.4). They run in this order: checks →
 (optional `--not-my-bug` adjudication) → report-attempt → cold read; the scope
 guard is computed before them and consumed by the cold read.
+
+A fifth, the LANDING GATE (§7.6), runs inside `run`, on the branch itself,
+whenever a prefix lands on it. It is the SAME checks gate — same config, same
+typecheck-then-test ordering — pointed at a branch tip instead of a case
+worktree, because a merge propagates content whether or not a case was involved.
 
 ### 7.1 The checks gate
 
@@ -1356,6 +1374,60 @@ verdict's content is journaled on the `resolved` entry for the audit trail.
   itself lands at `report-pr`); `held` → freeze HELD ACTIVE → "provide PR
   description". Confirm + scope exceeded → HELD ACTIVE (§7.4).
 
+### 7.6 The landing gate
+
+CONTENT THAT PROPAGATES ARRIVES GREEN, OR IT DOES NOT ARRIVE. `run` measures a
+branch's tip immediately after its parent loop, before the branch is marked
+arrived and before anything below it is derived, because from that moment on the
+tip is what every descendant takes and what `finish` pushes to origin.
+
+No other gate can speak for that content. `report-case` measures a CASE's tree,
+the `start` probe measures a PROPOSAL, and the integration verify EXCLUDES every
+branch with a block above it (§10.2 step 1) — so without this gate a branch that
+merges cleanly hands its content to its children with no check anywhere in the
+pass, and a CUT branch, pushed at its cut point, ships a prefix to origin that
+nothing measured. `pushedUnbuilt` names it; naming is not measuring.
+
+The gate is `checks.typecheck` THEN `checks.test` from the pass's pinned checks
+file, run in a temp worktree at the branch tip with dependencies installed from
+THAT tree's manifests (§7.2) — one notion of green in this driver, not two. A
+missing or empty checks file skips it, exactly as every other gate skips.
+
+**A RED landing is a fix-shaped problem, so it takes the fix-shaped answer.** The
+branch and its transitive descendants are REOPENED — which supersedes the
+branch's own undispositioned case, since a conflict case on a red tree is
+unjudgeable, and the descendants' cases for the same reason — and then a gate-fix
+case is minted on the branch (§9), rooted there because that is the branch now
+carrying the defect. Reopen strictly BEFORE the mint, or the mint supersedes
+itself. `run` then STOPS: the branch does not arrive, so the next run re-derives
+it, and no other branch merges while a red is outstanding — the branches below it
+would be taking the content this gate just refused, and the pass cannot complete
+until the fix lands in any case. The result carries `WARN09_GATE_FIX_SERVED` and
+`gated`, and `next-case` serves the fix on the same call.
+
+**What it does not run, and why each is safe.**
+
+- The tree did not MOVE — the forced empty merges of a leaf un-skip (§4.5), or a
+  branch that gated with no clean prefix. Nothing arrived, so nothing propagates
+  that was not already there, and content inherited from before the pass is
+  finish's integration verify to judge (§10.2).
+- The TREE was already measured green this pass, on any branch. A checks run is a
+  function of the tree it runs on — dependencies included, since they install
+  from that tree's own manifests — so a second run answers the same question at
+  full price.
+- No environment: a tree whose dependencies will not install, or a command that
+  never spawned, yields NO verdict (`WARN13_DEPS_UNUSABLE` /
+  `WARN14_ENVIRONMENT_FAULT`). An unmeasured tree is never read as green, and it
+  is journaled rather than passed over in silence.
+
+**The evidence is the journal.** Every landing writes one `landing-check` row —
+`branch`, `sha`, `tree`, and either the verdict (`ok`, plus `phase` and `failed`
+on a red) or why no run was owed (`ran: false` with `reason`, or `ok` copied with
+`measuredOn` naming the branch the tree was measured on). So "did this branch
+arrive green, and on which tree" is a JOURNAL READ: the question of whether a red
+is inherited from a parent is answered by comparing rows, with nothing re-probed
+and no parent head examined.
+
 ## 8. Tiers and enforcement
 
 ### 8.1 The ladder
@@ -1442,6 +1514,11 @@ served on that branch: a worktree AT THE BLAMED BRANCH'S TIP (or at the bisect's
 root, §7.3), no merge, nothing pending, no conflict markers, the failing build as
 materials. The case's `parent` is the sentinel `(gate-fix)`, its conflicted-path
 set is the failing files, and its height is derived like any other.
+
+Four things mint one: finish's integration verify (§10.2), a `--not-my-bug`
+adjudication (§7.2), the pre-merge branch check (§6.2), and the landing gate
+(§7.6). The last two are rooted on the branch that is RED rather than blamed from
+a build log — there is nothing to blame, the branch itself is the answer.
 
 ### 9.1 Blame is git history, not the registry
 
@@ -1747,7 +1824,8 @@ Blockedness never withholds a push: a branch merged to its cut point holds a
 complete prefix, and its held PR is opened against ORIGIN's copy of that prefix,
 so withholding it would base the PR on a commit the branch no longer sits on
 (ERR14) and repeat the work every pass. What no integration build covered is
-REPORTED — `coverage` and `pushedUnbuilt` (§10.7) — never held back. The gate on
+REPORTED — `coverage` and `pushedUnbuilt` (§10.7) — never held back, and never
+unmeasured either: it passed the landing gate (§7.6) when it landed. The gate on
 pushing is a green verify for the pass (§9), not membership of the recipe.
 A branch that has no local ref by push time is journaled `push-withheld` and
 named in the result rather than dropped in silence.
@@ -1953,11 +2031,11 @@ escalation's publish issues are written to `publish-<case>.json` and quoted into
 | `WARN06_RESOLUTION_TREE_MISSING` | publish | the recorded marker-clean resolution tree is gone from the object store; the pristine draft ships instead |
 | `WARN07_RESOLUTION_TIP_MOVED` | publish | the branch tip moved and the frozen resolution no longer re-merges cleanly; the pristine draft ships instead |
 | `WARN08_CUT_POINT_EXCEPTION_STALE` | gate-fix minting | an owner-approved exception the repo now contradicts; journaled, never applied |
-| `WARN09_GATE_FIX_SERVED` | `report-case`, `finish` | gate-fix cases were materialized — or none could be served because every candidate was already gated or attempted |
+| `WARN09_GATE_FIX_SERVED` | `report-case`, `run`, `finish` | gate-fix cases were materialized — or none could be served because every candidate was already gated or attempted; from `run` it is a branch that landed a red prefix (§7.6) |
 | `WARN11_PRE_MERGE_CHECK_SKIPPED` | `next-case` | a checks file was configured but unreadable, or its typecheck list is empty, so branches merged unverified |
 | `WARN12_SCOPE_WIDENED` | `report-case` | the `--not-my-bug` ownership probe returned `interaction`; the edit scope now includes the failing files |
-| `WARN13_DEPS_UNUSABLE` | `next-case` | a branch's dependencies would not install, so it could not be checked or blamed |
-| `WARN14_ENVIRONMENT_FAULT` | `report-case`, `start` | the failing output classifies as an environment fault, on the adjudication path or the ordinary checks path — or a proposal's checks command never ran, so its ref is left alone |
+| `WARN13_DEPS_UNUSABLE` | `next-case`, `run` | a branch's dependencies would not install, so it could not be checked or blamed; at `run` a landing is left unmeasured rather than assumed green (§7.6) |
+| `WARN14_ENVIRONMENT_FAULT` | `report-case`, `start`, `run` | the failing output classifies as an environment fault, on the adjudication path or the ordinary checks path — or a proposal's checks command never ran, so its ref is left alone; at `run` a landing gate command that never spawned leaves the tree unmeasured, never red (§7.6) |
 | `WARN15_UPSTREAM_RED` | gate-fix minting | blame landed on upstream `main`; the mint is refused (journal + stderr) |
 | `WARN16_ESCALATION_BASE_BEHIND` | publish | a red-finish held escalation could not be transplanted onto origin's tip, so a wider-diff draft ships |
 | `WARN17_VERIFY_FLAKY` | verify, `start` | a command failed and then passed on the same tree: in verify nothing is blamed or rolled back; on a proposal's checks nothing is deleted |
@@ -2082,6 +2160,10 @@ The authoritative CI verification commands (`config.ts VERIFY_COMMANDS`):
   re-verification rejecting a forged head/parent/height; watermark pinning (the
   chain is never re-read mid-pass); tier floors; idempotent re-run after partial
   execution.
+- **The landing gate** (§7.6): a clean merge that lands green journals its
+  branch, tree and verdict; a landing whose tree is red reaches no child and is
+  journaled with the failing commands; an empty forced merge and a tree already
+  measured this pass run nothing; and a cut branch's clean prefix is measured.
 - **Remote branches and candidates**: fixtures fake `origin` via
   `refs/remotes/origin/*`, exercising all four sync states end to end
   (materialize / fast-forward / ahead-no-op / diverged-halt with siblings
