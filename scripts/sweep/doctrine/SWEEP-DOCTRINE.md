@@ -253,8 +253,9 @@ without your resolution, and the result names the outcome:
   covers it.
 - "These are yours" — the named failures appear only with your resolution. Fix them.
 - Pre-existing, owned by a branch: your merge is aborted, a gate-fix case is prepared
-  on the branch that owns the failure, and your resolution is preserved at
-  `refs/sweep/abandoned/<caseId>`. Run `next-case`. If no case could be prepared, the
+  on the branch that owns the failure, and your resolution is DISCARDED — it was never
+  published, so nothing carries it forward, and the conflict is re-derived from scratch
+  when the case is served again. Run `next-case`. If no case could be prepared, the
   instruction says exactly what to relay instead.
 - Pre-existing, owned by the merge itself (both sides green alone): your scope is
   widened to the failing files — fix the failure there and re-run `report-case`.

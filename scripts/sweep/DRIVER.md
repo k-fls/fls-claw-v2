@@ -886,8 +886,19 @@ Returns one of:
 - `status: "finalize"` — no case is open, run `finish` (carrying `activeGates`
   when branches are gated, and `heldAwaitingPublish` when a branch is still red
   but its fix is held and unpublished, which `finish` must publish);
+- `status: "looping"` — the serve bound is exceeded: the case is refused with
+  `ERR44_CASE_LOOPING` and no materials are prepared;
 - `status: "stopped"` — a red branch with nothing servable and nothing to
   publish.
+
+**The serve bound.** `case-served` is journaled only for serves that HAPPEN — the
+row is appended AFTER the limit check, so a refusal never inflates the count it is
+computed from. The refusal itself withdraws INVESTIGATION and nothing else: it
+writes `phase: case-ready` with the refused case as `currentCase` BEFORE returning,
+because the instruction it gives is `report-case --tier held` and `report-case`
+hard-requires that phase. Refusing from any other phase would hand the agent an
+instruction the driver rejects, leave the case in `openCases`, and halt `finish`
+with `ERR34_CASES_REMAIN` — a pass with no legal move.
 
 **Gate-fix cases** use the same `case-ready` shape with a DIFFERENT briefing,
 because there is no merge: it states up front that nothing is pending and there
@@ -1540,10 +1551,12 @@ no service-priority rule is needed.
 **The reopen is journaled BEFORE the gate-fix case.** When the owner is this same
 branch, the reverse order supersedes the gate fix the instant it is created and
 the pass loops through a full re-adjudication every round instead of serving it.
-The agent's resolution is PINNED at `refs/sweep/abandoned/<caseId>` first: the
-reopen rebuilds the worktree from the automerge tree, nothing else references that
-tree (the driver commits by plumbing, so rerere never recorded this resolution),
-and the ref is named in the instruction.
+The agent's resolution is DISCARDED and the loss journaled (`not-my-bug-discarded`,
+plus an observation): the reopen rebuilds the worktree from the automerge tree and
+nothing else references the resolved tree (the driver commits by plumbing, so rerere
+never recorded it). No local ref is written to hold it — a local ref never leaves
+this clone, so it is not a delivery channel, and the only thing that carries work out
+of a pass is a PR. The doctrine tells the agent the same thing.
 
 **Re-verification** of a gate fix cannot go through the conflict path — there is
 no conflict to re-derive, so every gate fix would die `ERR02_CASE_STALE` and the

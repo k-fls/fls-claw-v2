@@ -6273,10 +6273,78 @@ describe('next-case — the serve bound (a case handed out and never concluded)'
     const r5 = JSON.parse(readFileSync(out5, 'utf8')) as { issues?: Array<{ id: string }> };
     expect(r5.issues!.map((i) => i.id)).toContain('ERR44_CASE_LOOPING');
 
-    // Every serve is on the record — `case` rows never showed this.
+    // Every serve that HAPPENED is on the record — `case` rows never showed this
+    // — and only those. The refused fifth call handed nothing out, so counting it
+    // would make the journal over-report how many times the case was worked.
     const journal = readJournal(dir);
-    expect(journal.filter((e) => e.action === 'case-served').length).toBe(5);
+    expect(journal.filter((e) => e.action === 'case-served').length).toBe(4);
     expect(journal.some((e) => e.action === 'case-serve-limit')).toBe(true);
+  });
+
+  it('a REFUSED serve does not count as a serve', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    for (const n of [1, 2, 3, 4]) {
+      expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: join(ws, `n${n}.json`) }), greenPreMerge)).toBe(0);
+    }
+    const caseId = currentCaseId(dir);
+    // Two refusals. Each is a hand-out that did NOT happen, so neither may join
+    // the count the limit is computed from: journaling above the check makes the
+    // refusal count itself and the recorded serve total climb without the case
+    // ever being worked again.
+    for (const n of [5, 6]) {
+      expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: join(ws, `n${n}.json`) }), greenPreMerge)).toBe(1);
+    }
+    const served = readJournal(dir).filter((e) => e.action === 'case-served' && e.caseId === caseId);
+    expect(served.length).toBe(4);
+    expect(served.map((e) => e.serves)).toEqual([1, 2, 3, 4]);
+    // …and the refusal keeps reporting the same next-serve number rather than a
+    // total that grew because it was refused.
+    const r6 = JSON.parse(readFileSync(join(ws, 'n6.json'), 'utf8')) as { serves: number };
+    expect(r6.serves).toBe(5);
+  });
+
+  it('a refusal leaves the case CONCLUDABLE — the phase permits the `--tier held` it asks for', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    for (const n of [1, 2, 3, 4]) {
+      expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: join(ws, `n${n}.json`) }), greenPreMerge)).toBe(0);
+    }
+    const caseId = currentCaseId(dir);
+    // `next-case` is entered at `open` whenever the previous command returned the
+    // machine there while leaving this case undispositioned: `report-pr`'s judged,
+    // held and gate-fix arms all reopen and drop to `open`, as does `report-case`'s
+    // held-duplicate consolidation and the `--not-my-bug` arm that mints nothing.
+    // The refused serve must be servable from THERE, not only from the phase the
+    // previous serve happened to leave behind.
+    const stFile = join(dir, 'machine-state.json');
+    writeFileSync(stFile, JSON.stringify({ ...JSON.parse(readFileSync(stFile, 'utf8')), phase: 'open', currentCase: null }));
+    const out5 = join(ws, 'n5.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: out5 }), greenPreMerge)).toBe(1);
+    const r5 = JSON.parse(readFileSync(out5, 'utf8')) as { issues: Array<{ detail: string }> };
+    expect(r5.issues[0].detail).toContain('--tier held');
+    // The refusal withdraws INVESTIGATION, not the ability to conclude, so it
+    // leaves the phase `report-case` hard-requires — with the refused case as the
+    // current one.
+    expect(machineState(dir).phase).toBe('case-ready');
+    expect(machineState(dir).currentCase!.caseId).toBe(caseId);
+    // The instructed command is therefore ACCEPTED: `2` here is "no case is ready
+    // — run next-case first", and next-case is exactly what was just refused.
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true, out: join(ws, 'rc.json') }),
+        neverInvoked,
+      ),
+    ).toBe(0);
+    // Concluded: the case is out of `openCases`, so `finish` is not stuck on
+    // ERR34_CASES_REMAIN over a case the driver itself refused to serve.
+    expect(openCases(readJournal(dir)).map((c) => c.caseId)).not.toContain(caseId);
   });
 
   it('an ordinary first serve carries no warning and no loop block', async () => {

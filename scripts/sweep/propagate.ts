@@ -8389,25 +8389,36 @@ export async function cmdSweepNextCase(
   progress(
     `case ready: ${jc.branch} — ${caseFile.conflictedPaths.join(', ')}${isReissue ? ' (REISSUE — revise the published resolution)' : ''}`,
   );
-  // Every case carries the fixed checks-contract line (typechecks now;
   // SERVE BOUND. Every serve is journaled, so "handed out N times, concluded
   // zero times" is answerable: `case` rows come from `run`,
   // `report` and the gate-fix reopen, never from here, so without this row a
   // re-serve would leave no trace at all.
   const servedBefore = readJournal(dir).filter((e) => e.action === 'case-served' && e.caseId === jc.caseId).length;
   const serves = servedBefore + 1;
-  appendJournal(dir, { action: 'case-served', caseId: jc.caseId, branch: jc.branch, serves });
   if (serves > CASE_SERVE_LIMIT) {
     const detail =
       `case '${jc.caseId}' has been served ${serves} times and never concluded — no resolution, no ` +
       `\`report-case\`, no escalation. Reading it again will not change that. Run ` +
       `\`report-case --tier held\` and write what you found: an unfixable case with a diagnosis is a ` +
       `valid outcome, an unanswered one is not.`;
+    // THE REFUSAL WITHDRAWS INVESTIGATION, NOT THE ABILITY TO CONCLUDE. The
+    // instruction it carries is `report-case --tier held`, and `report-case`
+    // hard-requires phase `case-ready` with a current case. Leaving the phase
+    // as it was hands the agent an instruction this same driver rejects: the
+    // case stays open, `finish` halts on ERR34_CASES_REMAIN, and the pass has
+    // no legal move left. So the phase the instruction needs is written first.
+    st = { ...st, phase: 'case-ready', currentCase: { caseId: jc.caseId, branch: jc.branch } };
+    writeMachineState(dir, st);
     appendJournal(dir, { action: 'case-serve-limit', id: 'ERR44_CASE_LOOPING', caseId: jc.caseId, branch: jc.branch, serves, detail });
     console.error(`next-case [ERR44_CASE_LOOPING]: ${detail}`);
     result(cli, { ok: false, status: 'looping', caseId: jc.caseId, serves, issues: [{ id: 'ERR44_CASE_LOOPING', detail }] });
     return 1;
   }
+  // A REFUSED SERVE IS NOT A SERVE. Recorded above the check, the refusal counts
+  // itself: the journal then answers "how many times was this case handed out"
+  // with a number that includes every time the driver declined to hand it out,
+  // and that number grows on each further call.
+  appendJournal(dir, { action: 'case-served', caseId: jc.caseId, branch: jc.branch, serves });
   const loopWarning =
     serves >= CASE_SERVE_WARN
       ? `WARN46_CASE_LOOPING: this case has now been served ${serves} times with no conclusion. If you are ` +
@@ -8415,7 +8426,8 @@ export async function cmdSweepNextCase(
         `and write the diagnosis. The next serve is refused.`
       : null;
 
-  // tests are report-case's job) — served in both the materials and the result.
+  // Every case carries the fixed checks-contract line (typechecks now; tests are
+  // report-case's job) — served in both the materials and the result.
   const materials =
     (isGateFix
       ? gateFixCaseMaterials(dir, jc, caseRow!)
@@ -8865,16 +8877,14 @@ async function adjudicateNotMyBug(p: {
         : [ownerBranch, ...transitiveDescendants(planEdgesOf(dir), ownerBranch)];
     reopen(dir, [...new Set([branch, ...rc.descendants, ...ownerSubtree])]);
 
-    // PRESERVE THE AGENT'S WORK. Reopening re-derives the branch, and the next
-    // `createCaseWorktree` wipes and rebuilds this worktree from the automerge
-    // tree — so the resolution the agent already got right is otherwise lost to
-    // `git gc` (nothing else references the tree; the driver commits by plumbing,
-    // so rerere never recorded this resolution). Pin it under a ref instead: the
-    // owner and the next attempt can both recover it by name.
-    // The resolution is DISCARDED, not pinned. It was never pushed, and a local
-    // ref is not a delivery channel: it never leaves this clone and dies with it.
-    // Anything that must survive a pass is a PR. Recording the loss is enough —
-    // the next attempt re-derives the case from the automerge tree anyway.
+    // THE AGENT'S RESOLUTION IS DISCARDED, and the loss is RECORDED. Reopening
+    // re-derives the branch and the next `createCaseWorktree` rebuilds this
+    // worktree from the automerge tree, so the resolved tree goes to `git gc`.
+    // Pinning it under a local ref would not save it in any sense that matters:
+    // a local ref never leaves this clone and dies with it, so it is not a
+    // delivery channel. Anything that must survive a pass is a PR. The journal
+    // row is the whole mechanism — the next attempt re-derives the case from the
+    // automerge tree regardless.
     appendJournal(dir, { action: 'not-my-bug-discarded', caseId, tree: p.resolvedTree });
     appendObservation(cli.workspace, { kind: 'not-my-bug-resolution-discarded', caseId, branch: rc.branch });
 
