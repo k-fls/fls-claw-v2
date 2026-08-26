@@ -26,6 +26,7 @@ import {
   classifyFailure,
   findIntroducingCommit,
   locateOwner,
+  partitionOwners,
   type History,
   type ProbeResult,
   type ProbeTarget,
@@ -225,6 +226,74 @@ describe('locateOwner', () => {
     const { probe } = scriptedProbe([{ usable: false }]);
     const o = await locateOwner([POLL_LOOP], 'branchtip0000', 'parenthead000', probe);
     expect(o.owner).toBe('unknown');
+  });
+});
+
+describe('partitionOwners', () => {
+  /** A probe keyed on the TREE it is asked about, intersected with the ask. */
+  function treeProbe(byTree: Record<string, string[]>): {
+    probe: SubsetProbe;
+    calls: Array<{ target: string; files: string[] }>;
+  } {
+    const calls: Array<{ target: string; files: string[] }> = [];
+    const probe: SubsetProbe = async (target: ProbeTarget, files: string[]) => {
+      const sha = target.kind === 'worktree' ? 'worktree' : target.sha;
+      calls.push({ target: sha, files });
+      const red = byTree[sha] ?? [];
+      return { usable: true, counts: new Map(files.filter((f) => red.includes(f)).map((f) => [f, 1])), output: '' };
+    };
+    return { probe, calls };
+  }
+
+  it('a SINGLE owner costs exactly one locate round', async () => {
+    const { probe, calls } = treeProbe({ tip: ['a.ts', 'b.ts'] });
+    const p = await partitionOwners(['a.ts', 'b.ts'], 'tip', 'parent', probe);
+    expect(p.rounds).toBe(1);
+    expect(p.groups).toEqual([{ owner: 'branch', ref: 'tip', files: ['a.ts', 'b.ts'], detail: expect.any(String) }]);
+    expect(p.remainder).toBeNull();
+    // One red at the tip settles the WHOLE set, so nothing is left to re-ask
+    // about: the ordinary single-owner failure pays nothing for partitioning.
+    expect(calls).toHaveLength(1);
+  });
+
+  it('splits a failure across BOTH sides and names what neither side owns', async () => {
+    const { probe } = treeProbe({ tip: ['a.ts'], parent: ['a.ts', 'b.ts'] });
+    const p = await partitionOwners(['a.ts', 'b.ts', 'c.ts'], 'tip', 'parent', probe);
+    // One verdict describes a SUBSET. Taken as the whole story, `b.ts` is either
+    // charged to the branch — which is green in it — or dropped, and `c.ts` with it.
+    expect(p.groups).toEqual([
+      { owner: 'branch', ref: 'tip', files: ['a.ts'], detail: expect.any(String) },
+      { owner: 'parent', ref: 'parent', files: ['b.ts'], detail: expect.any(String) },
+    ]);
+    expect(p.remainder!.kind).toBe('interaction');
+    expect(p.remainder!.files).toEqual(['c.ts']);
+    expect(p.rounds).toBe(3);
+  });
+
+  it('merges a same-owner re-hit instead of grouping one ref twice', async () => {
+    // The tip reports `a.ts` first and `b.ts` on the re-ask. Two groups on one ref
+    // become two competing gate fixes on one branch for one defect.
+    let seen = 0;
+    const probe: SubsetProbe = async (target: ProbeTarget, files: string[]) => {
+      const sha = target.kind === 'worktree' ? 'worktree' : target.sha;
+      const red = sha === 'tip' ? (seen++ === 0 ? ['a.ts'] : ['b.ts']) : [];
+      return { usable: true, counts: new Map(files.filter((f) => red.includes(f)).map((f) => [f, 1])), output: '' };
+    };
+    const p = await partitionOwners(['a.ts', 'b.ts'], 'tip', 'parent', probe);
+    expect(p.groups).toHaveLength(1);
+    expect(p.groups[0].files).toEqual(['a.ts', 'b.ts']);
+    expect(p.rounds).toBe(2);
+  });
+
+  it('an unbuildable side leaves the rest UNKNOWN rather than unaccounted for', async () => {
+    const { probe } = treeProbe({ tip: ['a.ts'] });
+    const unusable: SubsetProbe = async (target, files) => {
+      if (target.kind === 'commit' && target.sha === 'tip' && files.includes('a.ts')) return probe(target, files);
+      return { usable: false, counts: new Map(), output: '' };
+    };
+    const p = await partitionOwners(['a.ts', 'b.ts'], 'tip', 'parent', unusable);
+    expect(p.groups.map((g) => g.files)).toEqual([['a.ts']]);
+    expect(p.remainder).toEqual({ kind: 'unknown', files: ['b.ts'], detail: expect.any(String) });
   });
 });
 

@@ -522,6 +522,96 @@ export async function locateOwner(
   };
 }
 
+/** One PROVEN owner and the files it owns. */
+export interface OwnerGroup {
+  /** Which side of the merge owns them. */
+  owner: Extract<OwnerKind, 'branch' | 'parent'>;
+  /** The commit a fix for these files must be rooted on. */
+  ref: string;
+  files: string[];
+  detail: string;
+}
+
+/** The files no owner could be proven for — named, never folded into a group. */
+export interface OwnerRemainder {
+  kind: Extract<OwnerKind, 'interaction' | 'unknown'>;
+  files: string[];
+  detail: string;
+}
+
+export interface OwnerPartition {
+  /** One entry per proven owner, in the order they were located. */
+  groups: OwnerGroup[];
+  /** What no owner could be proven for, or null when every file found one. */
+  remainder: OwnerRemainder | null;
+  probes: number;
+  /** How many `locateOwner` calls this cost. A single owner costs exactly one. */
+  rounds: number;
+}
+
+/**
+ * Partition a proven pre-existing failure across EVERY owner it spans.
+ *
+ * `locateOwner` reports the SUBSET of the files it was given that fails at the
+ * side it names — so one verdict is an answer about part of the set, never the
+ * whole story. Treating it as the whole story has two failure modes and no third
+ * outcome: the other owners' files are folded into the named owner's case, which
+ * hands that owner a defect it did not introduce and cannot judge, or they are
+ * dropped, which leaves the build red with nothing minted for them.
+ *
+ * So the remainder is re-asked until nothing is left. TERMINATION IS STRUCTURAL:
+ * a `branch`/`parent` verdict always carries a NON-EMPTY subset of what it was
+ * asked about, so the set strictly shrinks; `interaction` and `unknown` describe
+ * everything they were asked about and consume the rest. A single owner therefore
+ * costs exactly ONE round — its verdict covers the whole set, leaving no
+ * remainder to ask about — so the common case pays nothing for this.
+ *
+ * Same-owner re-hits are MERGED. A tip that reported one file red can report a
+ * second on the re-ask; minting twice would put two competing gate fixes on one
+ * ref for one defect.
+ */
+export async function partitionOwners(
+  files: string[],
+  branchTip: string,
+  parentHead: string,
+  probe: SubsetProbe,
+  opts: {
+    hasAnyFile?: (sha: string, files: string[]) => Promise<boolean>;
+  } = {},
+): Promise<OwnerPartition> {
+  const groups: OwnerGroup[] = [];
+  let remainder: OwnerRemainder | null = null;
+  let rest = [...files];
+  let probes = 0;
+  let rounds = 0;
+  while (rest.length > 0) {
+    const v = await locateOwner(rest, branchTip, parentHead, probe, opts);
+    probes += v.probes;
+    rounds++;
+    if (v.owner === 'interaction' || v.owner === 'unknown') {
+      remainder = { kind: v.owner, files: rest, detail: v.detail };
+      break;
+    }
+    const owned = rest.filter((f) => v.files.includes(f));
+    if (owned.length === 0) {
+      // The shrink invariant did not hold, so the next round would ask the same
+      // question and get the same answer forever. Naming the rest is the only
+      // answer that both terminates and stays honest about what is unplaced.
+      remainder = {
+        kind: 'unknown',
+        files: rest,
+        detail: `${v.detail}, but the verdict named none of ${rest.join(', ')} — ownership undetermined for those`,
+      };
+      break;
+    }
+    const hit = groups.find((g) => g.owner === v.owner);
+    if (hit) hit.files = [...hit.files, ...owned.filter((f) => !hit.files.includes(f))];
+    else groups.push({ owner: v.owner, ref: v.ref!, files: owned, detail: v.detail });
+    rest = rest.filter((f) => !owned.includes(f));
+  }
+  return { groups, remainder, probes, rounds };
+}
+
 /**
  * How far back to look for a green anchor, in first-parent steps. Exponential
  * because there is no anchor to start from: `branch-check` only ever typechecks,

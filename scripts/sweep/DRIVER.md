@@ -1147,17 +1147,45 @@ or the toolchain backstop below).
 **Ownership.** The prefix proves the failure is not the agent's; it cannot say
 whose, because it is a synthetic commit no branch points at. So the driver probes
 the branch's PRE-MERGE TIP (the prefix's only parent), then the PARENT HEAD.
-Branch red → gate fix on the BRANCH. Branch green + parent red → gate fix on the
-PARENT, else the same red is fixed once per descendant. BOTH green → an
-INTERACTION owned by this merge: no gate fix, and the case's edit scope is WIDENED
-to the failing files (journaled `scope-widened`, read back by the scope guard,
-exempted from its `conflict-hunks` marker check since a widened file has none, and
-carried into the COLD-READ REQUEST so the reviewer judges the extra edits as the
-fix rather than as a scope violation) — the one sanctioned "let the agent edit
+Branch red → the BRANCH owns those files. Branch green + parent red → the PARENT
+owns them, else the same red is fixed once per descendant. BOTH green → an
+INTERACTION owned by this merge. A probe that will not build on either side yields
+`unknown`; a file absent from a tree counts as green there without a probe.
+
+**A verdict describes a SUBSET, so the failing set is PARTITIONED**
+(`partitionOwners`). Each probe round reports which of the files it was asked
+about fail at the side it names; the remainder is re-asked until every file sits
+in an owner group `{owner, ref, files}` or in a NAMED `interaction`/`unknown`
+remainder. Reading one verdict as the whole story has only two outcomes and both
+are wrong: the other owners' files are folded into the named owner's case — that
+owner is handed a defect it did not introduce and cannot judge — or they are
+dropped and the build stays red with nothing minted for them. TERMINATION IS
+STRUCTURAL: a branch/parent verdict always carries a non-empty subset so the set
+strictly shrinks, and `interaction`/`unknown` consume whatever is left. A SINGLE
+owner therefore costs exactly ONE round — its verdict covers the whole set — so
+the ordinary failure pays nothing for this. Same-owner re-hits MERGE into one
+group; two groups on one ref would become two competing gate fixes on one branch
+for one defect.
+
+**One gate fix per proven owner**, each scoped by its own proven subset (`ownedFiles`,
+§9.1), rooted by its own bisect, with its own rebase and duplicate notes. Owners are
+ordered SHALLOWEST FIRST (parent before branch) in the journal, the mints and the
+result, because `next-case` serves in DAG order and the result must name the case the
+next command will hand over.
+
+**The remainder is reported, never folded.** With owners present, an
+`interaction`/`unknown` remainder cannot be scope-widened — the case it would widen
+is being aborted — so it is journaled (`not-my-bug-owner` with that kind, plus
+`not-my-bug-partition`), carried in the result as `uncovered`, and named in the
+instruction as files NOT COVERED BY ANY GATE FIX. With NO owner found at all, the
+whole set is the remainder and the two non-gate-fix answers apply as before:
+`unknown` falls through to the ordinary checks failure, and `interaction` WIDENS the
+case's edit scope to the failing files (journaled `scope-widened`, read back by the
+scope guard, exempted from its `conflict-hunks` marker check since a widened file has
+none, and carried into the COLD-READ REQUEST so the reviewer judges the extra edits
+as the fix rather than as a scope violation) — the one sanctioned "let the agent edit
 non-conflicted files and let the cold read accept it", surfaced as
-`WARN12_SCOPE_WIDENED`. A probe that will not build on either side yields
-`unknown` and falls through to the ordinary checks failure; a file absent from a
-tree counts as green there without a probe.
+`WARN12_SCOPE_WIDENED`.
 
 **Toolchain backstop.** Identical failures on both trees are the NORMAL shape of a
 confirmed pre-existing defect, so identity alone proves nothing. The backstop
@@ -1194,11 +1222,15 @@ dependency links, which are removed and reinstalled), so untracked build output
 from one probe cannot decide the next.
 
 Every stage emits `SWEEP-STEP:` progress and journals (`not-my-bug`,
-`not-my-bug-owner`, `not-my-bug-bisect` with the probe log, plus
-`not-my-bug-environment`, `not-my-bug-premature`, `not-my-bug-discarded`,
-`scope-widened`, `gate-fix-root-clamped`). The result carries a `notMyBug` block
-plus `introducedBy`. The proceed arm carries `WARN09_GATE_FIX_SERVED` — never an
-`ERR` id.
+`not-my-bug-owner` — one row per owner group AND one for the remainder —
+`not-my-bug-partition` with the round and probe counts, `not-my-bug-bisect` with the
+probe log, plus `not-my-bug-environment`, `not-my-bug-premature`,
+`not-my-bug-discarded`, `scope-widened`, `gate-fix-root-clamped`). The result carries
+a `notMyBug` block (with `owners`), `gateFixes` (every minted case, each with its own
+`introducedBy`/`rebaseNote`/`duplicates`) and `uncovered` when there is a remainder;
+`gateFix` and the top-level `introducedBy`/`rebaseNote`/`duplicates` describe the
+FIRST case, which is the one `next-case` serves first. The proceed arm carries
+`WARN09_GATE_FIX_SERVED` — never an `ERR` id.
 
 ### 7.3 The bisect
 
@@ -1547,8 +1579,8 @@ upstream commit.
 
 When a `--not-my-bug` adjudication routes to a gate fix, the case being worked is
 ABORTED: a `reopened` row over `[branch, ...descendants]` — the SAME scope every
-other blocking path uses, widened to the owner's whole subtree when ownership
-routed to the parent. The case's merge was never made (it exists only as the clean
+other blocking path uses, widened to the UNION of every proven owner's whole subtree
+when ownership routed to the parent. The case's merge was never made (it exists only as the clean
 prefix), so the reopen supersedes the undispositioned case, the machine returns to
 `open`, and `next-case` serves the gate fix. DESCENDANTS ARE INCLUDED because a
 branch just proven RED is blocked and their open cases were derived against it:
@@ -1558,9 +1590,10 @@ full adjudication, each hitting the anti-loop and falling back to held — junk 
 PRs for one defect. Superseding them means the gate fix is the only case left, so
 no service-priority rule is needed.
 
-**The reopen is journaled BEFORE the gate-fix case.** When the owner is this same
-branch, the reverse order supersedes the gate fix the instant it is created and
-the pass loops through a full re-adjudication every round instead of serving it.
+**ALL reopens are journaled BEFORE ALL gate-fix mints.** When an owner is a branch
+a fix was already minted on, the reverse order supersedes that fix the instant it is
+created and the pass loops through a full re-adjudication every round instead of
+serving it. With several owners this is one reopen over the union, then the mints.
 The agent's resolution is DISCARDED and the loss journaled (`not-my-bug-discarded`,
 plus an observation): the reopen rebuilds the worktree from the automerge tree and
 nothing else references the resolved tree (the driver commits by plumbing, so rerere

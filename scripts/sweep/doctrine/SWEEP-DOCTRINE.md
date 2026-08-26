@@ -252,13 +252,18 @@ without your resolution, and the result names the outcome:
 - A failure inside your own conflicted files is yours by definition; the flag never
   covers it.
 - "These are yours" — the named failures appear only with your resolution. Fix them.
-- Pre-existing, owned by a branch: your merge is aborted, a gate-fix case is prepared
-  on the branch that owns the failure, and your resolution is DISCARDED — it was never
-  published, so nothing carries it forward, and the conflict is re-derived from scratch
-  when the case is served again. Run `next-case`. If no case could be prepared, the
-  instruction says exactly what to relay instead.
-- Pre-existing, owned by the merge itself (both sides green alone): your scope is
-  widened to the failing files — fix the failure there and re-run `report-case`.
+- Pre-existing, owned by a branch: your merge is aborted, ONE gate-fix case is prepared
+  per branch proven to own part of the failure (they are listed in `gateFixes`,
+  shallowest first, each scoped to that branch's own files), and your resolution is
+  DISCARDED — it was never published, so nothing carries it forward, and the conflict is
+  re-derived from scratch when the case is served again. Run `next-case`. If no case
+  could be prepared, the instruction says exactly what to relay instead.
+- Failing files that NO gate fix covers are named in `uncovered` and in the
+  instruction. Report them to the owner as they are given: they stay red, and no case
+  exists for them.
+- Pre-existing, owned by the merge itself (both sides green alone) and nothing else
+  owns any of it: your scope is widened to the failing files — fix the failure there
+  and re-run `report-case`.
 - Flaky — the failure did not reproduce on either tree: the case is held with your
   resolution kept; write the text naming the instability.
 - Undecidable: the comparison could not be made; you are back to the ordinary answer —

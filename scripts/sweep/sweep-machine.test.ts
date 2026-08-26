@@ -1239,6 +1239,136 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     expect(res.gateFix.files).toEqual(['src/util.ts']);
   });
 
+  /**
+   * A feature branch UNDER the trunk, conflicting with what the trunk brings
+   * down. The case therefore lands on `module/cg` with parent `main_patched`, so
+   * BOTH possible owners are branches the sweep may mint on — a case whose parent
+   * is upstream `main` cannot show a two-owner split, because upstream is outside
+   * the mandate and no case is ever minted there.
+   */
+  function twoOwnerFixture(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base: files', { 'src/x.ts': 'orig\n', 'src/a.ts': 'a\n', 'src/b.ts': 'b\n', 'src/c.ts': 'c\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.checkout('module/cg', { create: true, at: 'main_patched' });
+    repo.commit('cg: x = cg', { 'src/x.ts': 'cg\n' });
+    repo.checkout('main');
+    repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' });
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+
+  /**
+   * Drive the two-owner adjudication: `src/a.ts` fails at the BRANCH tip,
+   * `src/b.ts` only at the PARENT head, `src/c.ts` at neither (so the merge made
+   * it — nobody upstream owns it). Every other tree, the case worktree and the
+   * clean prefix included, fails all three: that is what proves the whole set
+   * pre-existing.
+   */
+  async function adjudicateTwoOwners(
+    repo: FixtureRepo,
+    ws: string,
+    inv: string,
+  ): Promise<{ dir: string; caseId: string; out: string; code: number }> {
+    const checks = checksFile(ws);
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
+    const dir = dirOf(repo, ws);
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    seedPriorFailure(dir, caseId, 'typecheck', ['tsc --noEmit']);
+    const wtPath = join(dir, caseId, 'worktree');
+    const tipSha = execFileSync('git', ['-C', wtPath, 'rev-parse', 'HEAD^'], { encoding: 'utf8' }).trim();
+    const parentHead = (JSON.parse(readFileSync(join(dir, caseId, 'case.json'), 'utf8')) as { head: { sha: string } }).head.sha;
+    const fn: ChecksRunner = async (commands, baseDir) => {
+      const names = commands.map((c) => c.cmd);
+      const at =
+        baseDir && baseDir !== wtPath
+          ? execFileSync('git', ['-C', baseDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+          : '';
+      const files = at === tipSha ? ['src/a.ts'] : at === parentHead ? ['src/a.ts', 'src/b.ts'] : ['src/a.ts', 'src/b.ts', 'src/c.ts'];
+      return {
+        ok: false,
+        failedNames: names,
+        output: names.map((n) => `$ ${n}\n${files.map((f) => `${f}(1,1): error TS2345: boom\n`).join('')}`).join(''),
+      };
+    };
+    const out = join(ws, 'rc.json');
+    const code = await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+      neverInvoked,
+      fn,
+      fakeInstall,
+    );
+    return { dir, caseId, out, code };
+  }
+
+  it('a failure spanning TWO owners mints one correctly-scoped case per owner', async () => {
+    const repo = twoOwnerFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    const { dir, code, out } = await adjudicateTwoOwners(repo, ws, inv);
+    expect(code).toBe(1);
+    const journal = readJournal(dir);
+    expect(journal.find((e) => e.action === 'not-my-bug')!.verdict).toBe('pre-existing');
+    // Two proven owners, each carrying only its own files. One `locateOwner`
+    // verdict describes a SUBSET, so reading the first as the whole story either
+    // folds `src/b.ts` into module/cg's case — asking a branch to fix a defect
+    // that is not on it — or drops it, leaving the build red with nothing minted.
+    const gateFixes = journal.filter((e) => e.action === 'gate-fix');
+    expect(gateFixes.map((e) => e.branch).sort()).toEqual(['main_patched', 'module/cg']);
+    expect(gateFixes.find((e) => e.branch === 'module/cg')!.files).toEqual(['src/a.ts']);
+    expect(gateFixes.find((e) => e.branch === 'main_patched')!.files).toEqual(['src/b.ts']);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      status: string;
+      gateFix: { branch: string; files: string[] };
+      gateFixes: Array<{ branch: string; files: string[] }>;
+      notMyBug: { owners: Array<{ owner: string; branch: string; files: string[] }> };
+    };
+    expect(res.status).toBe('gate-fix-required');
+    expect(res.gateFixes.map((g) => [g.branch, g.files])).toEqual([
+      ['main_patched', ['src/b.ts']],
+      ['module/cg', ['src/a.ts']],
+    ]);
+    // SHALLOWEST OWNER FIRST, so the case `gateFix` names is the one `next-case`
+    // will actually serve first in DAG order.
+    expect(res.gateFix.branch).toBe('main_patched');
+    expect(res.notMyBug.owners.map((o) => o.owner)).toEqual(['parent', 'branch']);
+    // Every reopen precedes every mint: a gate fix journaled before its branch's
+    // `reopened` row would be superseded the instant it was created.
+    const firstMint = journal.findIndex((e) => e.action === 'gate-fix');
+    const lastReopen = journal.map((e) => e.action).lastIndexOf('reopened');
+    expect(lastReopen).toBeLessThan(firstMint);
+    for (const gf of gateFixes) expect(supersededCaseIds(journal).has(gf.caseId as string)).toBe(false);
+  });
+
+  it('files no owner could be proven for are NAMED, never folded into a case', async () => {
+    const repo = twoOwnerFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    const { dir, out } = await adjudicateTwoOwners(repo, ws, inv);
+    const journal = readJournal(dir);
+    // `src/c.ts` is green on both sides in isolation: the merge made it, and the
+    // merge is being aborted, so no gate fix can cover it. It must therefore
+    // appear as itself — folded into an owner's case it would be a
+    // misattribution, dropped it would be a red build nobody was told about.
+    for (const e of journal.filter((e) => e.action === 'gate-fix')) {
+      expect(e.files).not.toContain('src/c.ts');
+    }
+    const remainder = journal.find((e) => e.action === 'not-my-bug-owner' && e.owner === 'interaction')!;
+    expect(remainder.files).toEqual(['src/c.ts']);
+    const partition = journal.find((e) => e.action === 'not-my-bug-partition')!;
+    expect((partition.remainder as { kind: string; files: string[] }).files).toEqual(['src/c.ts']);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      uncovered: { kind: string; files: string[] };
+      instruction: string;
+    };
+    expect(res.uncovered).toEqual({ kind: 'interaction', files: ['src/c.ts'], detail: expect.any(String) });
+    // The agent relays the instruction, so the remainder has to be IN it.
+    expect(res.instruction).toContain('NOT COVERED BY ANY GATE FIX');
+    expect(res.instruction).toContain('src/c.ts');
+  });
+
   it('REFUSED -> the gate names which failures are the agent’s own', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
