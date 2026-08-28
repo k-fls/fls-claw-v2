@@ -1174,6 +1174,89 @@ function withheldPushRows(journal: JournalEntry[]): Array<{ branch: string; reas
     .map((branch) => ({ branch, reason: stated.get(branch) || 'the push stage did not reach this branch' }));
 }
 
+/**
+ * ONE FAILING FILE SET THE PASS PROVED PRE-EXISTING AND ATTRIBUTED TO NOBODY
+ * (§10.7 `uncoveredRemainders`).
+ */
+export interface UncoveredRemainder {
+  /** The files still failing with no case behind them. */
+  files: string[];
+  /** The case whose adjudication produced them. */
+  caseId: string;
+  /** The branch that case was merging INTO, and the parent it was merging FROM. */
+  branch: string;
+  parent: string;
+  /**
+   * `interaction` — green on each side alone, red only merged: this merge owns
+   * it and nobody upstream does. `unknown` — a probe would not build, so no
+   * owner could be proven either way.
+   */
+  reason: 'interaction' | 'unknown';
+  /** The adjudication's own per-side words for it. */
+  detail: string;
+}
+
+/**
+ * THE FAILURES THIS PASS PROVED REAL AND MINTED NOTHING FOR.
+ *
+ * `--not-my-bug` partitions a confirmed pre-existing failure across its owners.
+ * Every file that reaches a proven owner gets a gate-fix case; the rest are the
+ * REMAINDER, and a remainder has no case, no pull request and no branch to land
+ * on. It is nonetheless red, and it stays red after the pass.
+ *
+ * The mid-pass `report-case` result names it, but that result is gone by the
+ * time the agent reports, and the agent assembles its report from the FINISH
+ * result alone. A fact carried only mid-pass is a fact reconstructed from
+ * memory, which is how a remainder turns into a claim about branch tips nobody
+ * measured. So the finish result carries it too, derived from the journal —
+ * the same journal, no new state, and nothing that outlives the pass.
+ *
+ * COVERED LATER IS NOT UNCOVERED. A remainder the pass went on to deal with —
+ * scope-widened and fixed, or re-adjudicated onto an owner that did get a case
+ * — is not reported, per file, so a partially covered set reports only the part
+ * still standing. What counts as cover, all of it strictly after the remainder
+ * was journaled:
+ *
+ *  - a `gate-fix` mint naming the file: an owner was proven after all;
+ *  - a proven-owner (`branch`/`parent`) row naming it: same answer, stated by
+ *    the adjudication itself;
+ *  - a `resolved` row for the case that carried it, or for its branch: that
+ *    case passed the checks gate on a tree containing this merge, so the file
+ *    is green there.
+ */
+export function uncoveredRemainders(
+  journal: JournalEntry[],
+  cases: Map<string, { branch: string; parent: string }>,
+): UncoveredRemainder[] {
+  const filesOf = (e: JournalEntry): string[] => (Array.isArray(e.files) ? (e.files as string[]) : []);
+  const out: UncoveredRemainder[] = [];
+  journal.forEach((e, i) => {
+    if (e.action !== 'not-my-bug-owner') return;
+    if (e.owner !== 'interaction' && e.owner !== 'unknown') return;
+    const caseId = String(e.caseId ?? '');
+    const covered = new Set<string>();
+    for (const later of journal.slice(i + 1)) {
+      if (later.action === 'gate-fix') for (const f of filesOf(later)) covered.add(f);
+      else if (later.action === 'not-my-bug-owner' && (later.owner === 'branch' || later.owner === 'parent'))
+        for (const f of filesOf(later)) covered.add(f);
+      else if (later.action === 'resolved' && (later.caseId === caseId || later.branch === e.branch))
+        for (const f of filesOf(e)) covered.add(f);
+    }
+    const files = filesOf(e).filter((f) => !covered.has(f));
+    if (files.length === 0) return;
+    const c = cases.get(caseId);
+    out.push({
+      files,
+      caseId,
+      branch: c?.branch ?? String(e.branch ?? ''),
+      parent: c?.parent ?? '',
+      reason: e.owner as 'interaction' | 'unknown',
+      detail: String(e.detail ?? ''),
+    });
+  });
+  return out;
+}
+
 // --------------------------------------------------------------------------
 // Journaled ref mutations (reuse merge.ts's commit-tree + update-ref technique).
 // --------------------------------------------------------------------------
@@ -12093,6 +12176,12 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     .map((e) => e.branch as string)
     .filter((b, i, all) => all.indexOf(b) === i && !coverage.built.includes(b));
   const withheldPushes = withheldPushRows(journalFinal);
+  // FAILURES THE PASS PROVED AND COVERED WITH NOTHING. An adjudication that
+  // partitions a pre-existing red can leave files no branch owns; no case is
+  // minted for them and they are still red when the pass ends. The mid-pass
+  // result that named them is gone, and the report is assembled from THIS
+  // object, so a remainder missing here is a remainder recalled from memory.
+  const uncoveredRemaindersNow = uncoveredRemainders(journalFinal, journaledCases(journalFinal));
   const resolvedRows = journalFinal.filter((e) => e.action === 'resolved');
   const publishedRows = journalFinal.filter((e) => e.action === 'pr-published');
   const failedByCategory = { diverged: 0, transient: 0, auth: 0, rejected: 0 };
@@ -12155,6 +12244,16 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
         `${pushedUnbuilt.length ? ` Pushed with no build behind it: ${pushedUnbuilt.join(', ')}.` : ''}` +
         `${withheldPushes.length ? ` Merged locally and NOT pushed: ${withheldPushes.map((w) => `${w.branch} (${w.reason})`).join('; ')}.` : ''}`
       : '';
+  // The remainder cue. Without it the agent reports the pass as though every
+  // failure it saw ended in a case, and the files nobody owns go unmentioned.
+  const uncoveredCue = uncoveredRemaindersNow.length
+    ? ` STILL RED, NO CASE: ${uncoveredRemaindersNow
+        .map(
+          (u) =>
+            `${u.files.join(', ')} (${u.reason}, from ${u.caseId} merging ${u.parent} into ${u.branch}) — ${u.detail}`,
+        )
+        .join('; ')}. Report these to the owner exactly as written; nothing this pass fixes them.`
+    : '';
   const stats = {
     branchesInScope: passOrder(dir).length,
     cleanMerges: journalFinal.filter((e) => e.action === 'merge').length,
@@ -12202,6 +12301,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
       coverage,
       pushedUnbuilt,
       withheldPushes,
+      uncoveredRemainders: uncoveredRemaindersNow,
       stats,
       instruction:
         `REPORT to the owner FACTUALLY: which branches LANDED (${branches.filter((b) => b.landed).map((b) => b.branch).join(', ') || 'none'}) ` +
@@ -12210,7 +12310,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
         `${pushBlockingIssues.length ? ` Blocking push-phase issues: ${pushBlockingIssues.map((i) => i.id).join(', ')}.` : ''} ` +
         `${needsOwner.length ? `OWNER ACTION REQUIRED (do NOT just re-run for these): ${needsOwner.map((n) => `${n.branch} (${n.category})`).join('; ')} — never force-resolve. ` : 'DIVERGED branches need the owner (never force-resolve); '}` +
         `${systemicOutage ? `Network outage: ${heldPublishesSkipped} held publish(es) were skipped, not attempted. ` : ''}` +
-        `${ownerPrCue}${coverageCue}` +
+        `${ownerPrCue}${coverageCue}${uncoveredCue}` +
         ` then re-run \`finish\` — landed branches skip, transient failures retry.`,
     });
     return 1;
@@ -12227,10 +12327,11 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     coverage,
     pushedUnbuilt,
     withheldPushes,
+    uncoveredRemainders: uncoveredRemaindersNow,
     stats,
     instruction:
       `REPORT to the owner: every PR in pullRequests (number, title, status), the landed branches (branches list), and the stats summary.` +
-      `${ownerPrCue}${coverageCue} Then ` +
+      `${ownerPrCue}${coverageCue}${uncoveredCue} Then ` +
       (upstreamAdvanced ? 'run `sweep start` again (upstream advanced past the pinned watermark)' : 'stop — the sweep is done'),
   });
   return 0;

@@ -2024,6 +2024,20 @@ a cut point is in it, and an empty list is the ordinary case worth stating.
 pass that merges locally and ships nothing must say so in the result; reporting
 it in a log line only is how a stalled estate looks like a healthy one.
 
+`uncoveredRemainders` names every failure the pass PROVED pre-existing and
+attributed to no owner branch — the `interaction`/`unknown` remainders of
+`--not-my-bug` (§7.2) — one entry per remainder with `files`, the `caseId` it
+arose in, that case's `branch` and `parent`, the `reason` (`interaction`: this
+merge owns it, nobody upstream does; `unknown`: a probe would not build, so no
+owner could be proven) and the adjudication's own `detail`. Derived from the
+journal: the remainder rows, minus, per file, anything a LATER row shows covered
+— a `gate-fix` mint naming it, a proven-owner row naming it, or a `resolved` row
+for that case or its branch. No case was minted for what is left and it is still
+red when the pass ends. The mid-pass `report-case` result names it too, but the
+agent assembles its report from the FINISH result and states no fact it cannot
+point to there, so a remainder carried only mid-pass is a remainder the agent has
+to recall — and it will recall it wrong. The `instruction` carries the same list.
+
 `pullRequests` lists every PR the pass touched — each with number, url, title, live
 status, a landed/failureCategory annotation, and a `kind` of
 `review-open-at-start`, `reopened`, `recovered-publish`, `approved-landing`,
@@ -2038,7 +2052,7 @@ status, a landed/failureCategory annotation, and a `kind` of
 `heldPublishFailures`, `upstreamAdvanced` and `watermark12`.
 
 The `instruction` tells the agent to report landed-vs-conflicted branches, the PR
-list and the stats to the owner.
+list, the stats and any uncovered remainders to the owner.
 
 ## 11. Result ids by emitter
 

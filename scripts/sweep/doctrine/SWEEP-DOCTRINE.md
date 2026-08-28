@@ -363,14 +363,24 @@ result gives, and say plainly that they need fixing or closing. The driver will 
 rewrite somebody else's pull request, so this list is the only notice they get, and it
 is repeated every pass until they merge or pass.
 
+`uncoveredRemainders`, when the result carries it, lists failures the pass proved real
+and made no case for: each entry gives the files, the case they came out of, the branch
+and parent of that merge, and the reason. Relay every entry with the reason and detail
+the result gives, and say that nothing in this pass fixes them and they are still red.
+Say nothing further about them — not where they exist, not which tips carry them, not
+who should fix them. Those are the facts the entry does not carry, and it is the only
+account of the remainder there is.
+
 Its answers:
 
 - `"complete"` — report to the owner every entry in `pullRequests` (number, title,
-  status), which branches landed, and the `stats` summary. Then, if the result says
+  status), which branches landed, the `stats` summary, and every entry in
+  `uncoveredRemainders`. Then, if the result says
   upstream advanced past the pass's pin, run `start` again; otherwise stop — the sweep
   is done.
 - `"partial"` — some pushes or publishes failed. Report factually: which branches
-  landed, which failed and with what category, and every pull request. Entries under
+  landed, which failed and with what category, every pull request, and every entry in
+  `uncoveredRemainders`. Entries under
   `needsOwner` require the owner to act — do not simply re-run for those. Then re-run
   `finish`: landed branches skip, transient failures retry.
 - `"gate-fix-required"` — verification was red and gate-fix cases were prepared; run

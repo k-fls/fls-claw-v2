@@ -1520,6 +1520,176 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     expect(res.instruction).toContain('src/c.ts');
   });
 
+  /**
+   * Drive an adjudication whose WHOLE failing set is an INTERACTION: `src/c.ts`
+   * is green at the branch tip and at the parent head and red only once the two
+   * are merged. No owner is provable, so nothing is minted and the case's edit
+   * scope is widened onto it. `fixed()` flips the suite green, standing in for
+   * the agent taking the widening up.
+   */
+  async function adjudicateInteractionOnly(
+    repo: FixtureRepo,
+    ws: string,
+    inv: string,
+  ): Promise<{ dir: string; caseId: string; out: string; code: number; fn: ChecksRunner; fixed: () => void }> {
+    // The configured commands are green shell no-ops: the CASE suite is the
+    // injected runner below, while finish's integration verify runs these for
+    // real against a trunk the held branch is cut out of.
+    const checks = checksFile(ws, { typecheck: ['true'], test: ['true'] });
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
+    const dir = dirOf(repo, ws);
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    seedPriorFailure(dir, caseId, 'typecheck', ['true']);
+    const wtPath = join(dir, caseId, 'worktree');
+    const tipSha = execFileSync('git', ['-C', wtPath, 'rev-parse', 'HEAD^'], { encoding: 'utf8' }).trim();
+    const parentHead = (JSON.parse(readFileSync(join(dir, caseId, 'case.json'), 'utf8')) as { head: { sha: string } })
+      .head.sha;
+    let red = true;
+    const fn: ChecksRunner = async (commands, baseDir) => {
+      const names = commands.map((c) => c.cmd);
+      const at =
+        baseDir && baseDir !== wtPath
+          ? execFileSync('git', ['-C', baseDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+          : '';
+      // Each side alone passes; the merged tree and its clean prefix fail.
+      if (!red || at === tipSha || at === parentHead) return { ok: true, failedNames: [], output: '' };
+      return {
+        ok: false,
+        failedNames: names,
+        output: names.map((n) => `$ ${n}\nsrc/c.ts(1,1): error TS2345: boom\n`).join(''),
+      };
+    };
+    const out = join(ws, 'rc.json');
+    const code = await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+      neverInvoked,
+      fn,
+      fakeInstall,
+    );
+    return { dir, caseId, out, code, fn, fixed: () => (red = false) };
+  }
+
+  it('a remainder nobody owns is carried on the FINISH result, not only mid-pass', async () => {
+    // The agent assembles its end-of-pass report from the finish result alone,
+    // so a failure the pass proved real and minted nothing for has to be IN that
+    // object. Held with the red unfixed, `src/c.ts` is exactly that: still red,
+    // no case, no owner — and the only place the owner can hear about it.
+    const repo = twoOwnerFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    repo.git('push', 'origin', 'module/cg'); // the held PR is based on it
+    const { dir, caseId, out, code, fn } = await adjudicateInteractionOnly(repo, ws, inv);
+    expect(code).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; widenedPaths: string[] };
+    expect(res.status).toBe('scope-widened');
+    expect(res.widenedPaths).toEqual(['src/c.ts']);
+    expect(readJournal(dir).some((e) => e.action === 'gate-fix')).toBe(false);
+
+    // The agent gives up on the widened file and hands the case over as HELD;
+    // src/c.ts is still red when the pass ends.
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true }),
+        confirm,
+        fn,
+        fakeInstall,
+      ),
+    ).toBe(0);
+    writePr(dir, caseId, 'held x', 'Decision needed: resolution of src/x.ts — study before merge.');
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge); // finalize
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const fin = join(ws, 'finish.json');
+    await cmdSweepFinish(
+      baseCli(repo, ws, inv, {
+        cmd: 'sweep-finish',
+        execute: true,
+        tokenFile,
+        out: fin,
+      }),
+      fakeGithub().factory,
+    );
+    const f = JSON.parse(readFileSync(fin, 'utf8')) as {
+      uncoveredRemainders: Array<{
+        files: string[];
+        caseId: string;
+        branch: string;
+        parent: string;
+        reason: string;
+        detail: string;
+      }>;
+      instruction: string;
+    };
+    expect(f.uncoveredRemainders).toEqual([
+      {
+        files: ['src/c.ts'],
+        caseId,
+        branch: 'module/cg',
+        parent: 'main_patched',
+        reason: 'interaction',
+        detail: expect.any(String),
+      },
+    ]);
+    // The adjudication's own words travel with it, so the agent never has to
+    // reconstruct why the file is red from memory.
+    expect(f.uncoveredRemainders[0].detail).toContain('nobody upstream owns this');
+    // The agent relays the instruction, so the remainder has to be IN it.
+    expect(f.instruction).toContain('STILL RED, NO CASE');
+    expect(f.instruction).toContain('src/c.ts');
+  });
+
+  it('a remainder the pass went on to COVER is not reported as uncovered', async () => {
+    // Scope-widened and then fixed: `src/c.ts` is green in the tree that landed.
+    // Reporting it anyway would send the owner after a failure that no longer
+    // exists — the same defect in the other direction.
+    const repo = twoOwnerFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    repo.git('push', 'origin', 'module/cg'); // the judged record PR is based on it
+    const { dir, caseId, fn, fixed } = await adjudicateInteractionOnly(repo, ws, inv);
+    expect(readJournal(dir).some((e) => e.action === 'scope-widened')).toBe(true);
+
+    fixed();
+    resolveWorktree(dir, caseId, { 'src/c.ts': 'FIXED\n' });
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true }),
+        confirm,
+        fn,
+        fakeInstall,
+      ),
+    ).toBe(0);
+    writePr(dir, caseId, 'fix: merge interaction', 'Resolution of src/x.ts; the merge itself broke src/c.ts, fixed here.');
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
+    expect(readJournal(dir).some((e) => e.action === 'resolved' && e.caseId === caseId)).toBe(true);
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge); // finalize
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const fin = join(ws, 'finish.json');
+    await cmdSweepFinish(
+      baseCli(repo, ws, inv, {
+        cmd: 'sweep-finish',
+        execute: true,
+        tokenFile,
+        out: fin,
+      }),
+      fakeGithub().factory,
+    );
+    const f = JSON.parse(readFileSync(fin, 'utf8')) as {
+      uncoveredRemainders: unknown[];
+      instruction: string;
+    };
+    expect(f.uncoveredRemainders).toEqual([]);
+    expect(f.instruction).not.toContain('STILL RED, NO CASE');
+  });
+
   it('REFUSED -> the gate names which failures are the agent’s own', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();
