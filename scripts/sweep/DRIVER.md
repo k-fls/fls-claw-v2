@@ -885,7 +885,12 @@ prepared worktree and materials. The agent never sees the DAG.
 It checks the branches TWICE, at the two moments a defect can enter. BEFORE any
 merge, a typecheck-only pass over the participating branches catches a branch
 that was already red (memoised per branch and tip sha as `branch-check`); a red
-one merges nothing and is served its own gate fix. AFTER each prefix lands, the
+one merges nothing and is served its own gate fix. That red blocks every merge in
+the pass and mints a case, so it is CONFIRMED on the identical tree first (§7.6),
+and one that does not reproduce is neither red nor green: it is journaled
+`unstable` with `WARN21_CHECKS_FLAKY`, the scan carries on, and the landing gate —
+which measures the tree that actually results, tests included — is what decides.
+AFTER each prefix lands, the
 landing gate (§7.6) runs the full checks on the branch tip, because a merge can
 create a red that neither side carried. The two share one memo: a green
 `landing-check` at a tip subsumes the pre-merge typecheck of that same tip, so it
@@ -899,6 +904,11 @@ Returns one of:
   reissue, `activeGates` when any branch is gated, and a loop warning when the
   same case has been served repeatedly (`WARN46_CASE_LOOPING`, then
   `ERR48_CASE_LOOPING` when the next serve is refused);
+- `status: "stopped"` with `WARN21_CHECKS_FLAKY` — a landing measured UNSTABLE:
+  nothing was blamed and no case was minted, so there is nothing to serve, and the
+  branch is unverified with its merges landed locally only. `resumable` on the
+  first such measurement of a tree (re-run once; the tree is re-measured), and a
+  report-and-stop on the second;
 - `status: "finalize"` — no case is open, run `finish` (carrying `activeGates`
   when branches are gated, and `heldAwaitingPublish` when a branch is still red
   but its fix is held and unpublished, which `finish` must publish);
@@ -1234,7 +1244,22 @@ the branch's PRE-MERGE TIP (the prefix's only parent), then the PARENT HEAD.
 Branch red → the BRANCH owns those files. Branch green + parent red → the PARENT
 owns them, else the same red is fixed once per descendant. BOTH green → an
 INTERACTION owned by this merge. A probe that will not build on either side yields
-`unknown`; a file absent from a tree counts as green there without a probe. The
+`unknown`; a file absent from a tree counts as green there without a probe.
+
+**NEITHER ANSWER IS BELIEVED ON ONE RUN.** A green must repeat before ownership
+moves onward — a lucky pass at the branch tip would promote the claim to the
+parent, or to `interaction`, which widens the agent's edit scope onto a file
+nobody has a defect in. A RED must repeat because it ACCUSES: "already red at the
+branch tip" roots a gate fix there, opens a held PR against that branch and
+states a reproduction, and these probes run in a container that is installing
+worktrees and running other suites while they measure. The files that failed in
+BOTH runs are the ones the side is answerable for; a side that answers red and
+green about the same file, in either order, is `flaky` — no owner, no mint,
+`WARN21_CHECKS_FLAKY`, and the case goes to the owner HELD with the resolution
+kept and the instability named. Where the pass has ALREADY re-run these commands
+on that tree and seen the red repeat (§7.6's `red-confirm` rows), the confirming
+probe is skipped: the answer is journaled, and buying it again costs another full
+run. The
 interaction verdict states PER SIDE which of the two it was and against which
 ref ("absent at the branch tip `<sha12>` (cannot fail there); probed green twice
 at the parent head `<sha12>`"): a probed green and a vacuous one are different
@@ -1267,7 +1292,10 @@ is being aborted — so it is journaled (`not-my-bug-owner` with that kind, plus
 `not-my-bug-partition`), carried in the result as `uncovered`, and named in the
 instruction as files NOT COVERED BY ANY GATE FIX. With NO owner found at all, the
 whole set is the remainder and the two non-gate-fix answers apply as before:
-`unknown` falls through to the ordinary checks failure, and `interaction` WIDENS the
+`unknown` falls through to the ordinary checks failure, a `flaky` remainder ends the
+case HELD with the resolution kept (`WARN21_CHECKS_FLAKY` — an unstable side names
+no owner, so there is nothing for the agent to fix and nobody to bill), and
+`interaction` WIDENS the
 case's edit scope to the failing files (journaled `scope-widened`, read back by the
 scope guard, exempted from its `conflict-hunks` marker check since a widened file has
 none, and carried into the COLD-READ REQUEST so the reviewer judges the extra edits
@@ -1463,6 +1491,32 @@ file, run in a temp worktree at the branch tip with dependencies installed from
 THAT tree's manifests (§7.2) — one notion of green in this driver, not two. A
 missing or empty checks file skips it, exactly as every other gate skips.
 
+**A RED IS RE-RUN BEFORE IT IS BELIEVED.** What follows a red landing is a reopen
+of the branch and its whole subtree, a gate-fix case minted on it and a held PR
+naming it — and the gate measures in a container that is installing worktrees,
+merging and running other suites at the same time, which is where the driver's own
+`REPRODUCTION: FULL SUITE ONLY` class comes back red once and green on repeat. So
+the FAILING COMMANDS (only those — the greens are not in question) run again on
+the identical tree, in the same worktree with the same dependencies, before any of
+that happens. The outcome is journaled as a `red-confirm` row carrying the tree,
+the commands and `reproduced`, and every other accusing path reads that row rather
+than paying for the same suite again: blame refuses to mint on an observation the
+journal does not record as confirmed, and the ownership probe (§7.2) skips its own
+confirming run for a tree already confirmed here. A re-run that cannot be taken at
+all (a command that never spawned) leaves the tree UNMEASURED, never red.
+
+**A CHANGED VERDICT ACCUSES NOBODY — and is not a green either.** The two runs
+disagree about one tree, so the only established fact is that the check is
+unstable: nothing is minted, no branch is blamed, and the finding reported is the
+INSTABILITY (`WARN21_CHECKS_FLAKY`). But content that propagates arrives green or
+does not arrive, and a flaky measurement is not a green one — so the branch does
+NOT arrive, nothing below it takes its tip, the pass cannot seal, and the tree
+stays OWED a verdict: a later call re-measures it instead of passing it over as a
+no-op merge. `next-case` answers `stopped` with the id rather than `finalize`, and
+its instruction is bounded — re-run once, because a stable answer (green or red)
+completes the pass; on a second unstable measurement of the same tree, report to
+the owner and stop. Nothing here is the agent's to fix: no branch was blamed.
+
 **A RED landing is a fix-shaped problem, so it takes the fix-shaped answer.** The
 branch and its transitive descendants are REOPENED — which supersedes the
 branch's own undispositioned case, since a conflict case on a red tree is
@@ -1491,8 +1545,9 @@ until the fix lands in any case. The result carries `WARN09_GATE_FIX_SERVED` and
   is journaled rather than passed over in silence.
 
 **The evidence is the journal.** Every landing writes one `landing-check` row —
-`branch`, `sha`, `tree`, and either the verdict (`ok`, plus `phase` and `failed`
-on a red) or why no run was owed (`ran: false` with `reason`, or `ok` copied with
+`branch`, `sha`, `tree`, and either the verdict (`ok`, plus `phase` and `failed` on
+a red, `confirmed` on one that reproduced, `unstable` + `flaky` on one that did
+not) or why no run was owed (`ran: false` with `reason`, or `ok` copied with
 `measuredOn` naming the branch the tree was measured on). So "did this branch
 arrive green, and on which tree" is a JOURNAL READ: the question of whether a red
 is inherited from a parent is answered by comparing rows, with nothing re-probed
@@ -1591,6 +1646,19 @@ adjudication (§7.2), the pre-merge branch check (§6.2), and the landing gate
 a build log — there is nothing to blame, the branch itself is the answer.
 
 ### 9.1 Blame is git history, not the registry
+
+**A single red observation may not found a case**, and blame is where that is
+enforced, because `materializeGateFixCases` is the one place a case is created.
+Blame itself never measures — it reads git history over a failing log somebody
+else produced — so a caller that measured once would hand it an accusation and get
+back a case, a held PR and a named culprit. A caller that can say WHICH TREE and
+WHICH COMMANDS its red came from passes `redOn`, and the mint proceeds only if the
+pass has journaled a `red-confirm` for that pair with `reproduced: true`; a red
+that changed its answer, or was never re-run, mints nothing and is journaled
+`gate-fix-refused` with `WARN21_CHECKS_FLAKY`. Nothing is re-run here — the
+confirmation is paid where the tree was standing with its dependencies installed
+(§7.6), and this is a journal read. The integration verify passes no `redOn`: its
+own determinism probe already re-runs the failing commands before attribution.
 
 Which branch a fix belongs on is decided by AUTHORSHIP ON THE FIRST-PARENT LINE:
 
@@ -2128,7 +2196,7 @@ escalation's publish issues are written to `publish-<case>.json` and quoted into
 | `WARN18_BASE_GATED` | `finish` | the verify base carries an open gate-fix ref; verify is skipped and nothing can land |
 | `WARN19_GATE_COVERS_OTHER_DEFECT` | gate-fix minting | an active gate ref on the branch has a different failing-file digest |
 | `WARN20_ANCESTOR_GATED` | gate-fix minting | the branch descends from an ancestor that took a gate fix this pass and is still red |
-| `WARN21_CHECKS_FLAKY` | `report-case` | a check passed after a prior failure on the same case and kind, then failed again on the confirming re-run |
+| `WARN21_CHECKS_FLAKY` | `report-case`, `run`, `next-case`, gate-fix minting | a check gave BOTH answers on the same tree: passed after a prior failure and failed again on the confirming re-run, or failed and then passed on the confirming re-run of an accusing path (landing gate, pre-merge check, ownership probe). Nothing is minted and no branch is blamed |
 | `WARN46_CASE_LOOPING` | `next-case` | the serve count reached the warning threshold (3); emitted as the LOOP WARNING section of the case materials, not as an issue |
 
 **Reserved numbers — never reassign**: ERR03, ERR04, ERR09, ERR10, ERR19, ERR26,

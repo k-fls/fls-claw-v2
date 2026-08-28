@@ -80,7 +80,14 @@ pass, or abort it and lose its local merges — and wait for the answer. Never c
   branch, report the halt to the owner and stop.
 - `"looping"` — the same case has been served five times without a conclusion and is
   now refused. Run `report-case --tier held` and write the diagnosis you already have.
-- `"stopped"` — follow the instruction, which says what to report; then stop.
+- `"stopped"` — follow the instruction, which says what to report; then stop. One
+  shape of it is not a defect at all: `WARN21_CHECKS_FLAKY` means a branch's checks
+  failed and then PASSED on the identical tree, so no branch was blamed and no case
+  was minted, and that branch is unverified. There is nothing to fix and nothing to
+  chase in the code. The instruction says which of two moves applies: re-run
+  `next-case` once so the tree is measured again from scratch, or — when the same
+  tree has already measured unstable once before — report the instability to the
+  owner, naming the branch and the check, and stop.
 - `"complete"` — the pass is already finished; nothing runs but a new `start`.
 
 ## 4. The case you are handed
@@ -240,9 +247,10 @@ your work. Failures come back as follows.
 - `ERR36_TYPECHECK_FAILED` or `ERR40_TESTS_FAILED`, with the path to the output: read
   it, fix the pending files, run `report-case` again. A failed check is not a failed
   attempt and costs you nothing.
-- A check that passed and then failed on an immediate re-run of the same tree is
-  non-deterministic (`WARN21_CHECKS_FLAKY`): do not chase a green run; claim
-  `--tier held` and name the unstable check in the text.
+- A check that gives BOTH answers on the same tree, with nothing changed between the
+  runs, is non-deterministic (`WARN21_CHECKS_FLAKY`) and settles nothing in either
+  direction: do not chase a green run, and never treat the red as somebody's defect.
+  Claim `--tier held` and name the unstable check in the text.
 - An environment fault (`WARN14_ENVIRONMENT_FAULT` — missing binaries, unresolvable
   modules, broken bindings) is not a code defect and not counted against you: report it
   to the owner and stop until told otherwise.
@@ -276,8 +284,10 @@ without your resolution, and the result names the outcome:
 - Pre-existing, owned by the merge itself (both sides green alone) and nothing else
   owns any of it: your scope is widened to the failing files — fix the failure there
   and re-run `report-case`.
-- Flaky — the failure did not reproduce on either tree: the case is held with your
-  resolution kept; write the text naming the instability.
+- Flaky — the failure did not reproduce on either tree, or the tip that would have
+  been blamed for it answered red once and green once on the same tree
+  (`WARN21_CHECKS_FLAKY`): no branch is named and no fix case is minted, the case is
+  held with your resolution kept, and you write the text naming the instability.
 - Undecidable: the comparison could not be made; you are back to the ordinary answer —
   fix the pending files, or claim `held`.
 - Environment fault: report and stop, as above.

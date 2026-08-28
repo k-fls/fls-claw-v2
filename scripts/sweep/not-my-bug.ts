@@ -459,7 +459,9 @@ export type OwnerKind =
   /** Green on both sides in isolation — the MERGE produced it. Nobody upstream owns it. */
   | 'interaction'
   /** A probe was unusable; ownership undetermined. */
-  | 'unknown';
+  | 'unknown'
+  /** A side answered red and then green on the identical tree: nobody may be blamed. */
+  | 'flaky';
 
 export interface OwnershipResult {
   owner: OwnerKind;
@@ -495,32 +497,63 @@ export async function locateOwner(
      * arrived with the merge, so the branch tip predates it.
      */
     hasAnyFile?: (sha: string, files: string[]) => Promise<boolean>;
+    /**
+     * Has this pass ALREADY re-run these checks on this commit's tree and seen
+     * the same red twice? Then the confirming probe below is skipped: the answer
+     * is journaled and re-running buys the same fact at full price.
+     */
+    confirmedRed?: (sha: string) => Promise<boolean>;
   } = {},
 ): Promise<OwnershipResult> {
   let probes = 0;
   /**
-   * One side's answer. Rule 2 applies here too: a RED is conclusive on sight (a
-   * tip that has no part of this merge cannot have been reddened by it), but a
-   * GREEN must be seen twice before it is allowed to push ownership onward —
-   * otherwise a single flaky pass at the branch tip promotes the claim to the
-   * parent, or worse, to `interaction`, which widens the agent's edit scope and
-   * tells it to fix a file nobody has a defect in.
+   * One side's answer, and NEITHER answer is believed on one run.
+   *
+   * A GREEN must be seen twice before it pushes ownership onward — otherwise a
+   * single flaky pass at the branch tip promotes the claim to the parent, or
+   * worse, to `interaction`, which widens the agent's edit scope and tells it to
+   * fix a file nobody has a defect in.
+   *
+   * A RED must be seen twice because it ACCUSES. "Already red at the branch tip"
+   * roots a gate-fix case there, opens a held PR against it and states a
+   * reproduction — and these probes run in a container that is installing
+   * worktrees and running other suites, where an order- or load-dependent test
+   * comes back red once and green on repeat. The file that failed twice is the
+   * one the branch is answerable for; a file that failed once and passed once is
+   * evidence of an unstable check, not of an owner.
    */
-  const sideFailures = async (sha: string): Promise<{ failing: string[] | null; absent: boolean }> => {
-    if (opts.hasAnyFile && !(await opts.hasAnyFile(sha, files))) return { failing: [], absent: true };
+  type SideAnswer =
+    | { kind: 'unusable' }
+    | { kind: 'absent' }
+    | { kind: 'red'; files: string[] }
+    | { kind: 'green' }
+    | { kind: 'unstable'; files: string[] };
+  const sideFailures = async (sha: string): Promise<SideAnswer> => {
+    if (opts.hasAnyFile && !(await opts.hasAnyFile(sha, files))) return { kind: 'absent' };
     const first = await probe({ kind: 'commit', sha }, files);
     probes++;
-    if (!first.usable) return { failing: null, absent: false };
+    if (!first.usable) return { kind: 'unusable' };
     const failing = files.filter((f) => (first.counts.get(f) ?? 0) > 0);
-    if (failing.length > 0) return { failing, absent: false };
+    if (failing.length > 0) {
+      if (opts.confirmedRed && (await opts.confirmedRed(sha))) return { kind: 'red', files: failing };
+      const again = await probe({ kind: 'commit', sha }, files);
+      probes++;
+      if (!again.usable) return { kind: 'unusable' };
+      const stable = failing.filter((f) => (again.counts.get(f) ?? 0) > 0);
+      return stable.length > 0 ? { kind: 'red', files: stable } : { kind: 'unstable', files: failing };
+    }
     const second = await probe({ kind: 'commit', sha }, files);
     probes++;
-    if (!second.usable) return { failing: null, absent: false };
-    return { failing: files.filter((f) => (second.counts.get(f) ?? 0) > 0), absent: false };
+    if (!second.usable) return { kind: 'unusable' };
+    const twice = files.filter((f) => (second.counts.get(f) ?? 0) > 0);
+    // GREEN THEN RED IS THE SAME DISAGREEMENT AS RED THEN GREEN. The side is not
+    // green — so ownership does not move onward — and it is not red either: one
+    // of the two runs would be the sole basis for rooting a fix here.
+    return twice.length > 0 ? { kind: 'unstable', files: twice } : { kind: 'green' };
   };
 
   const bt = await sideFailures(branchTip);
-  if (bt.failing === null) {
+  if (bt.kind === 'unusable') {
     return {
       owner: 'unknown',
       ref: null,
@@ -529,17 +562,28 @@ export async function locateOwner(
       detail: `the branch tip ${branchTip.slice(0, 12)} could not be built — ownership undetermined`,
     };
   }
-  if (bt.failing.length > 0) {
+  if (bt.kind === 'unstable') {
+    return {
+      owner: 'flaky',
+      ref: null,
+      files: bt.files,
+      probes,
+      detail:
+        `${bt.files.join(', ')} failed and then PASSED at the branch tip ${branchTip.slice(0, 12)} with nothing ` +
+        `changed between the runs — the check is unstable there, so no branch owns this and no fix is minted`,
+    };
+  }
+  if (bt.kind === 'red') {
     return {
       owner: 'branch',
       ref: branchTip,
-      files: bt.failing,
+      files: bt.files,
       probes,
-      detail: `already red at the branch tip ${branchTip.slice(0, 12)} — the branch owns this`,
+      detail: `red TWICE at the branch tip ${branchTip.slice(0, 12)} — the branch owns this`,
     };
   }
   const ph = await sideFailures(parentHead);
-  if (ph.failing === null) {
+  if (ph.kind === 'unusable') {
     return {
       owner: 'unknown',
       ref: null,
@@ -548,15 +592,26 @@ export async function locateOwner(
       detail: `the parent head ${parentHead.slice(0, 12)} could not be built — ownership undetermined`,
     };
   }
-  if (ph.failing.length > 0) {
+  if (ph.kind === 'unstable') {
+    return {
+      owner: 'flaky',
+      ref: null,
+      files: ph.files,
+      probes,
+      detail:
+        `${ph.files.join(', ')} failed and then PASSED at the parent head ${parentHead.slice(0, 12)} with nothing ` +
+        `changed between the runs — the check is unstable there, so no branch owns this and no fix is minted`,
+    };
+  }
+  if (ph.kind === 'red') {
     return {
       owner: 'parent',
       ref: parentHead,
-      files: ph.failing,
+      files: ph.files,
       probes,
       // Rooting here is what stops the same red being fixed once per descendant:
       // the parent propagates to all of them, a fix on this branch to none.
-      detail: `green at the branch tip but red at the parent head ${parentHead.slice(0, 12)} — the incoming side owns this`,
+      detail: `green at the branch tip but red TWICE at the parent head ${parentHead.slice(0, 12)} — the incoming side owns this`,
     };
   }
   // PER SIDE, WHICH KIND OF GREEN AND AGAINST WHICH REF. A side is green because
@@ -575,7 +630,7 @@ export async function locateOwner(
     detail:
       'red once merged and on neither side alone — nobody upstream owns this; ' +
       'it is this merge’s own defect and belongs in this case ' +
-      `(${side('the branch tip', branchTip, bt.absent)}; ${side('the parent head', parentHead, ph.absent)})`,
+      `(${side('the branch tip', branchTip, bt.kind === 'absent')}; ${side('the parent head', parentHead, ph.kind === 'absent')})`,
   };
 }
 
@@ -591,7 +646,7 @@ export interface OwnerGroup {
 
 /** The files no owner could be proven for — named, never folded into a group. */
 export interface OwnerRemainder {
-  kind: Extract<OwnerKind, 'interaction' | 'unknown'>;
+  kind: Extract<OwnerKind, 'interaction' | 'unknown' | 'flaky'>;
   files: string[];
   detail: string;
 }
@@ -634,6 +689,7 @@ export async function partitionOwners(
   probe: SubsetProbe,
   opts: {
     hasAnyFile?: (sha: string, files: string[]) => Promise<boolean>;
+    confirmedRed?: (sha: string) => Promise<boolean>;
   } = {},
 ): Promise<OwnerPartition> {
   const groups: OwnerGroup[] = [];
@@ -647,6 +703,15 @@ export async function partitionOwners(
     rounds++;
     if (v.owner === 'interaction' || v.owner === 'unknown') {
       remainder = { kind: v.owner, files: rest, detail: v.detail };
+      break;
+    }
+    // AN UNSTABLE SIDE STOPS THE PARTITION, and it stops it with the files it
+    // was asked about — not just the ones that flickered. The rounds share one
+    // pair of tips: a side that answers red and then green about one file is a
+    // side no verdict may be read off, so re-asking it about the rest would
+    // mint on exactly the observation this refuses.
+    if (v.owner === 'flaky') {
+      remainder = { kind: 'flaky', files: rest, detail: v.detail };
       break;
     }
     const owned = rest.filter((f) => v.files.includes(f));

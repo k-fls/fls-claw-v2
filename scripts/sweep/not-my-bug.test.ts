@@ -183,16 +183,43 @@ describe('classifyFailure', () => {
 });
 
 describe('locateOwner', () => {
-  it('roots on the BRANCH when its own tip is already red', async () => {
-    const { probe } = scriptedProbe([{ failing: { [POLL_LOOP]: 1 } }]);
+  it('roots on the BRANCH when its own tip is red TWICE', async () => {
+    const { probe, calls } = scriptedProbe([{ failing: { [POLL_LOOP]: 1 } }]);
     const o = await locateOwner([POLL_LOOP], 'branchtip0000', 'parenthead000', probe);
     expect(o.owner).toBe('branch');
     expect(o.ref).toBe('branchtip0000');
+    // A red here ACCUSES — it roots a gate fix on the branch and opens a PR
+    // against it — so it is re-run on the identical tree before it is believed.
+    expect(calls).toHaveLength(2);
   });
 
-  it('roots on the PARENT when the branch is green and the incoming head is red', async () => {
-    // Green must be seen TWICE per side before ownership moves on (rule 2).
-    const { probe } = scriptedProbe([{ failing: {} }, { failing: {} }, { failing: { [POLL_LOOP]: 1 } }]);
+  it('a red that does not reproduce at the branch tip blames NOBODY', async () => {
+    const { probe } = scriptedProbe([{ failing: { [POLL_LOOP]: 1 } }, { failing: {} }]);
+    const o = await locateOwner([POLL_LOOP], 'branchtip0000', 'parenthead000', probe);
+    expect(o.owner).toBe('flaky');
+    expect(o.ref).toBeNull();
+    expect(o.detail).toContain('unstable');
+  });
+
+  it('skips the confirming probe when the pass already confirmed that tree', async () => {
+    const { probe, calls } = scriptedProbe([{ failing: { [POLL_LOOP]: 1 } }]);
+    const o = await locateOwner([POLL_LOOP], 'branchtip0000', 'parenthead000', probe, {
+      confirmedRed: async (sha) => sha === 'branchtip0000',
+    });
+    expect(o.owner).toBe('branch');
+    // Paid once per (tree, commands) — the landing gate already re-ran these.
+    expect(calls).toHaveLength(1);
+  });
+
+  it('roots on the PARENT when the branch is green twice and the incoming head is red twice', async () => {
+    // Neither answer is believed on one run: two greens to move ownership on,
+    // two reds to accuse the side it lands on.
+    const { probe } = scriptedProbe([
+      { failing: {} },
+      { failing: {} },
+      { failing: { [POLL_LOOP]: 1 } },
+      { failing: { [POLL_LOOP]: 1 } },
+    ]);
     const o = await locateOwner([POLL_LOOP], 'branchtip0000', 'parenthead000', probe);
     expect(o.owner).toBe('parent');
     expect(o.ref).toBe('parenthead000');
@@ -201,7 +228,9 @@ describe('locateOwner', () => {
   it('a single flaky green at the branch tip does NOT move ownership onward', async () => {
     const { probe } = scriptedProbe([{ failing: {} }, { failing: { [POLL_LOOP]: 1 } }]);
     const o = await locateOwner([POLL_LOOP], 'branchtip0000', 'parenthead000', probe);
-    expect(o.owner).toBe('branch');
+    // Ownership stays put — and the branch is not accused either: one green and
+    // one red on the same tree is a disagreement, not a verdict about a side.
+    expect(o.owner).toBe('flaky');
   });
 
   it('calls it an INTERACTION when both sides are green in isolation', async () => {
@@ -233,7 +262,7 @@ describe('locateOwner', () => {
   });
 
   it('does not probe a tip that does not CONTAIN the files — absence is the answer', async () => {
-    const { probe, calls } = scriptedProbe([{ failing: { [POLL_LOOP]: 1 } }]);
+    const { probe, calls } = scriptedProbe([{ failing: { [POLL_LOOP]: 1 } }, { failing: { [POLL_LOOP]: 1 } }]);
     const o = await locateOwner([POLL_LOOP], 'branchtip0000', 'parenthead000', probe, {
       hasAnyFile: async (sha) => sha !== 'branchtip0000',
     });
@@ -272,9 +301,10 @@ describe('partitionOwners', () => {
     expect(p.rounds).toBe(1);
     expect(p.groups).toEqual([{ owner: 'branch', ref: 'tip', files: ['a.ts', 'b.ts'], detail: expect.any(String) }]);
     expect(p.remainder).toBeNull();
-    // One red at the tip settles the WHOLE set, so nothing is left to re-ask
+    // One VERDICT at the tip settles the WHOLE set, so nothing is left to re-ask
     // about: the ordinary single-owner failure pays nothing for partitioning.
-    expect(calls).toHaveLength(1);
+    // The two calls are the one accusation and its confirming re-run.
+    expect(calls).toHaveLength(2);
   });
 
   it('splits a failure across BOTH sides and names what neither side owns', async () => {
@@ -294,10 +324,11 @@ describe('partitionOwners', () => {
   it('merges a same-owner re-hit instead of grouping one ref twice', async () => {
     // The tip reports `a.ts` first and `b.ts` on the re-ask. Two groups on one ref
     // become two competing gate fixes on one branch for one defect.
+    // Each answer is given TWICE, since a red is only believed when it repeats.
     let seen = 0;
     const probe: SubsetProbe = async (target: ProbeTarget, files: string[]) => {
       const sha = target.kind === 'worktree' ? 'worktree' : target.sha;
-      const red = sha === 'tip' ? (seen++ === 0 ? ['a.ts'] : ['b.ts']) : [];
+      const red = sha === 'tip' ? (seen++ < 2 ? ['a.ts'] : ['b.ts']) : [];
       return { usable: true, counts: new Map(files.filter((f) => red.includes(f)).map((f) => [f, 1])), output: '' };
     };
     const p = await partitionOwners(['a.ts', 'b.ts'], 'tip', 'parent', probe);

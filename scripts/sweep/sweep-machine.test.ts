@@ -5489,6 +5489,116 @@ describe('run — the landing gate', () => {
     expect(landingRuns(t.ran)).toBe(1);
   });
 
+  /**
+   * A runner whose TEST list is red on a tree the first time it is asked and,
+   * unless `stable()` says otherwise, green on the confirming re-run — the
+   * order-dependent shape the landing gate must not found a case on.
+   */
+  function unstableRunner(
+    redTree: (cwd: string) => boolean,
+    stable: () => boolean = () => false,
+  ): { fn: ChecksRunner; ran: Array<{ cmds: string[]; cwd: string }> } {
+    const ran: Array<{ cmds: string[]; cwd: string }> = [];
+    const seen = new Map<string, number>();
+    const fn: ChecksRunner = async (commands, cwd) => {
+      const cmds = commands.map((c) => c.cmd);
+      ran.push({ cmds, cwd });
+      if (!cmds.includes('vitest run') || !redTree(cwd)) return { ok: true, failedNames: [], output: '' };
+      const nth = (seen.get(cwd) ?? 0) + 1;
+      seen.set(cwd, nth);
+      if (nth > 1 && !stable()) return { ok: true, failedNames: [], output: '' };
+      return {
+        ok: false,
+        failedNames: ['vitest run'],
+        output: '$ vitest run\nsrc/mp.ts(1,1): error TS2345: the landed tree is broken.\n',
+      };
+    };
+    return { fn, ran };
+  }
+
+  /** main_patched merges an upstream commit that only breaks in combination with its own. */
+  function flakyLandingRepo(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: own file', { 'src/mp.ts': 'mp\n' });
+    repo.checkout('module/cg', { create: true, at: 'main_patched' });
+    repo.commit('cg work', { 'src/cg.ts': 'cg\n' });
+    repo.checkout('main');
+    repo.commit('U0: upstream breaks the build', { 'BROKEN.marker': 'x\n' });
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+  const landedRed = (cwd: string): boolean =>
+    existsSync(join(cwd, 'BROKEN.marker')) && existsSync(join(cwd, 'src/mp.ts'));
+
+  it('a landing whose red does NOT reproduce on the same tree mints nothing and blames nobody', async () => {
+    const repo = flakyLandingRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'], owned: ['src/cg.ts'] }]);
+    const dir = dirOf(repo, ws);
+    const cgBefore = repo.sha('module/cg');
+    const t = unstableRunner(landedRed);
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksJson(ws) }))).toBe(0);
+    const out = join(ws, 'nc.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), t.fn)).toBe(1);
+
+    const journal = readJournal(dir);
+    // THE POINT: one red observation founded nothing.
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    expect(journal.some((e) => e.action === 'case')).toBe(false);
+    // The re-run happened, on the same tree, over the failing command alone.
+    const confirm = journal.find((e) => e.action === 'red-confirm');
+    expect(confirm!.reproduced).toBe(false);
+    expect(confirm!.commands).toEqual(['vitest run']);
+    expect(confirm!.flaky).toEqual(['vitest run']);
+    const row = journal.find((e) => e.action === 'landing-check' && e.unstable === true);
+    expect(row!.branch).toBe('main_patched');
+    expect(row!.ok).toBe(false);
+    expect(row!.id).toBe('WARN21_CHECKS_FLAKY');
+    // ...and the content did not travel: no child merged it, the branch never
+    // arrived, and the pass cannot seal on a tree nothing saw green.
+    expect(repo.sha('module/cg')).toBe(cgBefore);
+    expect(journal.some((e) => e.action === 'arrived' && e.branch === 'main_patched')).toBe(false);
+    expect(journal.some((e) => e.action === 'pass-complete')).toBe(false);
+    // The agent is told what happened and given a legal move — never `finalize`.
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      status: string;
+      resumable?: boolean;
+      issues?: Array<{ id: string; detail: string }>;
+    };
+    expect(res.status).toBe('stopped');
+    expect(res.issues![0].id).toBe('WARN21_CHECKS_FLAKY');
+    expect(res.resumable).toBe(true);
+  });
+
+  it('an unstable tree is still OWED a verdict: the next call re-measures it, and a red that repeats mints', async () => {
+    const repo = flakyLandingRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'], owned: ['src/cg.ts'] }]);
+    const dir = dirOf(repo, ws);
+    let stable = false;
+    const t = unstableRunner(landedRed, () => stable);
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksJson(ws) }))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn)).toBe(1);
+    expect(readJournal(dir).some((e) => e.action === 'gate-fix')).toBe(false);
+
+    // Nothing new merges on the second call — the merge already landed — so the
+    // no-op skip would pass the tree over as if it had been checked.
+    stable = true;
+    const out = join(ws, 'nc2.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), t.fn)).toBe(0);
+
+    const journal = readJournal(dir);
+    expect(journal.filter((e) => e.action === 'landing-check' && e.ran === false && e.reason === 'no-op').map((e) => `${e.branch}@${e.tree}`)).toEqual([]);
+    expect(journal.some((e) => e.action === 'gate-fix' && e.branch === 'main_patched')).toBe(true);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; branch?: string };
+    expect(res.status).toBe('case-ready');
+    expect(res.branch).toBe('main_patched');
+  });
+
   it('a landing whose tree is RED reaches no child, and the journal names the failing commands', async () => {
     const repo = initFixtureRepo();
     repo.commit('base: x', { 'src/x.ts': 'orig\n' });
@@ -5522,6 +5632,16 @@ describe('run — the landing gate', () => {
     expect(row!.ok).toBe(false);
     expect(row!.failed).toEqual(['tsc --noEmit']);
     expect(row!.phase).toBe('typecheck');
+    // The red was CONFIRMED on the identical tree before it was acted on: the
+    // re-run covers the failing command only, and it reproduced.
+    const confirm = journal.find((e) => e.action === 'red-confirm' && e.branch === 'main_patched');
+    expect(confirm!.reproduced).toBe(true);
+    expect(confirm!.commands).toEqual(['tsc --noEmit']);
+    expect(row!.confirmed).toBe(true);
+    // PAID ONCE. Every confirming re-run journals a row, so one row for the whole
+    // pass is the claim: the landing gate paid for it and blame — which minted
+    // the case off the same observation — read it rather than re-running it.
+    expect(journal.filter((e) => e.action === 'red-confirm')).toHaveLength(1);
     // And the red is served as what it is — a fix on the branch now carrying it.
     const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; caseId?: string; branch?: string };
     expect(res.status).toBe('case-ready');

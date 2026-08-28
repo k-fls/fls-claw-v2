@@ -3157,13 +3157,15 @@ export async function cmdPlan(cli: Cli): Promise<number> {
  * `skipped` is "no verdict was owed": nothing landed, the tree was already
  * measured this pass, or no checks are configured. `unmeasured` is "a verdict
  * was owed and could not be taken" — no environment, so the tree was never
- * run — and it is never read as green.
+ * run — and it is never read as green. `flaky` is "the verdict changed on the
+ * identical tree": no green, no accusation, and the tree is still owed one.
  */
 type LandingVerdict =
   | { kind: 'skipped' }
   | { kind: 'green' }
   | { kind: 'unmeasured' }
-  | { kind: 'red'; output: string; failed: VerifyCommand[]; failedNames: string[] };
+  | { kind: 'red'; output: string; failed: VerifyCommand[]; failedNames: string[]; tree: string }
+  | { kind: 'flaky'; tree: string; failedNames: string[]; flaky: string[]; detail: string };
 
 /** The GREEN trees this pass has already measured → the branch it measured them on. */
 function greenTrees(journal: JournalEntry[]): Map<string, string> {
@@ -3174,6 +3176,109 @@ function greenTrees(journal: JournalEntry[]): Map<string, string> {
     }
   }
   return out;
+}
+
+/** Trees whose landing verdict CHANGED on the identical tree — measured, and still unanswered. */
+function unstableTrees(journal: JournalEntry[]): Set<string> {
+  return new Set(
+    journal.filter((e) => e.action === 'landing-check' && e.unstable === true && typeof e.tree === 'string').map((e) => e.tree as string),
+  );
+}
+
+/**
+ * What a red is CONFIRMED under: the TREE it was seen on and the COMMANDS that
+ * failed on it. Both halves are load-bearing — a checks run is a function of the
+ * tree, and a confirmation of `tsc` says nothing about `bun test`.
+ */
+function redKey(tree: string, commands: string[]): string {
+  return `${tree} :: ${[...commands].sort().join(' | ')}`;
+}
+
+/**
+ * The reds this pass has already RE-RUN, and what the re-run said.
+ *
+ * A confirmed red is a settled fact about a tree, so every later path that would
+ * accuse on the same (tree, commands) reads it here instead of paying for the
+ * same suite again. An UNSTABLE one is not settled and is deliberately not
+ * reusable as a measurement: it records that the driver may not mint on that
+ * observation, never that the tree is red.
+ */
+function redConfirmations(journal: JournalEntry[]): Map<string, boolean> {
+  const out = new Map<string, boolean>();
+  for (const e of journal) {
+    if (e.action !== 'red-confirm' || typeof e.tree !== 'string' || !Array.isArray(e.commands)) continue;
+    // LAST WRITE WINS. An unstable tree is re-measured on a later call, and that
+    // run is the current fact about it: reading the first row instead would pin
+    // the pass to the contradicted observation and refuse every later mint.
+    out.set(redKey(e.tree, (e.commands as unknown[]).map(String)), e.reproduced === true);
+  }
+  return out;
+}
+
+/** What a second run of the failing commands, on the identical tree, said. */
+interface RedConfirmation {
+  /** Every command that failed failed AGAIN — the observation may found a case. */
+  reproduced: boolean;
+  /** Commands that failed and then PASSED with nothing changed between. */
+  flaky: string[];
+  /** The re-run itself could not be taken, so there is no second observation at all. */
+  unmeasurable?: { detail: string };
+  detail: string;
+}
+
+/**
+ * A SINGLE RED OBSERVATION MAY NOT FOUND A CASE — re-run it on the identical
+ * tree first.
+ *
+ * The driver's probes run in a container that is simultaneously installing
+ * worktrees, merging and running other suites, so its own
+ * `REPRODUCTION: FULL SUITE ONLY` class — order-, load- and timing-dependent,
+ * the shape where an orphaned poller outlives the test that spawned it — comes
+ * back red here and green on a quiet machine. Acting on the first sample mints a
+ * case against an innocent branch, opens a held PR for it, and reports a
+ * reproduction at a commit that is green on repeat. Identical input, different
+ * verdict: the only thing that can be concluded is that the check is unstable.
+ *
+ * PAID ONCE, NOT ONCE PER PATH. The landing gate, blame and the ownership probe
+ * can all reach the same (tree, commands); the first to re-run journals the
+ * answer and the rest read it. Greens are never re-run — only a red that is
+ * about to accuse somebody.
+ *
+ * ONLY THE FAILING COMMANDS ARE RE-RUN. They are the whole of the accusation,
+ * and re-running the green ones would pay for the part of the suite that is not
+ * in question.
+ */
+async function confirmRed(
+  dir: string,
+  args: {
+    branch: string;
+    sha: string;
+    tree: string;
+    phase: string;
+    failedNames: string[];
+    /** Re-run the FAILED commands on the identical tree. */
+    rerun: () => Promise<ChecksRunResult>;
+  },
+): Promise<RedConfirmation> {
+  const { branch, sha, tree, phase, failedNames } = args;
+  const row = { action: 'red-confirm', branch, sha, tree, phase, commands: failedNames };
+  if (redConfirmations(readJournal(dir)).get(redKey(tree, failedNames)) === true) {
+    appendJournal(dir, { ...row, ran: false, reason: 'confirmed-this-pass', reproduced: true });
+    return { reproduced: true, flaky: [], detail: `${failedNames.join(', ')} were already confirmed red on this tree` };
+  }
+  const again = await args.rerun();
+  if (again.environmentFault) {
+    const detail = `the confirming re-run could not be taken: ${again.environmentFault.detail}`;
+    appendJournal(dir, { ...row, ran: true, reproduced: false, unmeasurable: true, detail });
+    return { reproduced: false, flaky: [], unmeasurable: { detail }, detail };
+  }
+  const flaky = failedNames.filter((c) => !again.failedNames.includes(c));
+  const detail = flaky.length
+    ? `${flaky.join(', ')} FAILED and then PASSED on an immediate re-run of the same tree ${tree.slice(0, 12)} — ` +
+      `nothing changed between the two runs, so the failure is non-deterministic and belongs to no branch`
+    : `${failedNames.join(', ')} failed again on a re-run of the same tree ${tree.slice(0, 12)}`;
+  appendJournal(dir, { ...row, ran: true, reproduced: flaky.length === 0, ...(flaky.length ? { flaky } : {}), detail });
+  return { reproduced: flaky.length === 0, flaky, detail };
 }
 
 /**
@@ -3217,7 +3322,12 @@ async function landingCheck(
   if (!checks || checks.typecheck.length + checks.test.length === 0) return { kind: 'skipped' };
   const sha = await revParse(cli.repo, branch);
   const tree = await treeOf(cli.repo, sha);
-  if (tree === treeBefore) {
+  // A tree this pass recorded UNSTABLE is still OWED a verdict. It was never
+  // green, nothing was minted on it and the branch did not arrive — so a later
+  // call, which lands nothing new because the merge already happened, must
+  // MEASURE it instead of passing it over as a no-op. Skipping it there is how
+  // an unstable tree walks into the pass as though it had been checked.
+  if (tree === treeBefore && !unstableTrees(readJournal(dir)).has(tree)) {
     appendJournal(dir, { action: 'landing-check', branch, sha, tree, ran: false, reason: 'no-op' });
     return { kind: 'skipped' };
   }
@@ -3276,13 +3386,66 @@ async function landingCheck(
         return { kind: 'unmeasured' };
       }
       if (!r.ok) {
-        appendJournal(dir, { action: 'landing-check', branch, sha, tree, ok: false, phase, failed: r.failedNames });
-        return {
-          kind: 'red',
-          output: r.output,
-          failed: commands.filter((c) => r.failedNames.includes(c.cmd)),
+        // ONE RED IS AN OBSERVATION, NOT A VERDICT. What follows a red landing is
+        // a reopen of the branch AND its subtree, a gate-fix case minted on it
+        // and a held PR accusing it — all of it founded on this one run, in a
+        // container that is installing worktrees and running other suites at the
+        // same time. So the failing commands run AGAIN on the identical tree
+        // before any of that happens.
+        const failed = commands.filter((c) => r.failedNames.includes(c.cmd));
+        const confirm = await confirmRed(dir, {
+          branch,
+          sha,
+          tree,
+          phase,
           failedNames: r.failedNames,
-        };
+          rerun: () => runChecks(failed, wt.path),
+        });
+        if (confirm.unmeasurable) {
+          // The second run never happened, so there is no second observation and
+          // the first one stands alone — which is exactly what may not found a
+          // case. No verdict, and no verdict is never green.
+          appendJournal(dir, {
+            action: 'landing-check',
+            branch,
+            sha,
+            tree,
+            ran: false,
+            reason: 'environment-fault',
+            id: 'WARN14_ENVIRONMENT_FAULT',
+            detail: confirm.unmeasurable.detail,
+            phase,
+          });
+          console.error(`run [WARN14_ENVIRONMENT_FAULT]: ${branch} — ${confirm.unmeasurable.detail}`);
+          return { kind: 'unmeasured' };
+        }
+        if (!confirm.reproduced) {
+          appendJournal(dir, {
+            action: 'landing-check',
+            branch,
+            sha,
+            tree,
+            ok: false,
+            unstable: true,
+            id: 'WARN21_CHECKS_FLAKY',
+            phase,
+            failed: r.failedNames,
+            flaky: confirm.flaky,
+            detail: confirm.detail,
+          });
+          return { kind: 'flaky', tree, failedNames: r.failedNames, flaky: confirm.flaky, detail: confirm.detail };
+        }
+        appendJournal(dir, {
+          action: 'landing-check',
+          branch,
+          sha,
+          tree,
+          ok: false,
+          confirmed: true,
+          phase,
+          failed: r.failedNames,
+        });
+        return { kind: 'red', output: r.output, failed, failedNames: r.failedNames, tree };
       }
     }
     appendJournal(dir, { action: 'landing-check', branch, sha, tree, ok: true });
@@ -3471,6 +3634,8 @@ export async function cmdRun(
   }
 
   let gated = false;
+  /** A landing whose red did not reproduce: nothing minted, and the branch unverified. */
+  let unstableLanding: { branch: string; tree: string; flaky: string[]; detail: string } | null = null;
   const diverged: string[] = [];
   const mergeFailed: string[] = [];
   /** §14: this run's per-branch halts under the ERR2x id scheme (CLI output). */
@@ -3878,6 +4043,23 @@ export async function cmdRun(
       // branch's prefix is pushed and then left OUT of the integration recipe.
       // Measure it here, once, before any of that happens.
       const landing = await landingCheck(cli, dir, bp.branch, treeAtDerive, runChecks, runInstall);
+      if (landing.kind === 'flaky') {
+        // A CHANGED VERDICT ACCUSES NOBODY, and it is not a green either.
+        //
+        // Nothing is minted and no branch is blamed: the two runs disagree about
+        // one tree, so the only fact established is that the check is unstable.
+        // But the content is then UNVERIFIED, and content that propagates arrives
+        // green or does not arrive — so the branch does not arrive, nothing below
+        // it takes its tip, and the pass cannot seal. The tree stays owed a
+        // verdict, so a later call re-measures it rather than skipping it as a
+        // no-op; a stable answer completes the pass, another unstable one is the
+        // owner's to hear about.
+        unstableLanding = { branch: bp.branch, tree: landing.tree, flaky: landing.flaky, detail: landing.detail };
+        gated = true;
+        issues.push({ id: 'WARN21_CHECKS_FLAKY', detail: `${bp.branch}: ${landing.detail}` });
+        console.error(`run [WARN21_CHECKS_FLAKY]: ${bp.branch} — ${landing.detail}`);
+        break;
+      }
       if (landing.kind === 'red') {
         // A RED LANDING IS A FIX-SHAPED PROBLEM, so it takes the fix-shaped
         // answer: a gate-fix case on the branch that now carries the defect.
@@ -3890,6 +4072,10 @@ export async function cmdRun(
         reopen(dir, [bp.branch, ...transitiveDescendants(planEdgesOf(dir), bp.branch)]);
         const gate = await materializeGateFixCases(cli, dir, ctx.chain, landing.output, landing.failed, null, {
           rootBranch: bp.branch,
+          // The observation this case rests on. Blame does not re-measure it —
+          // the gate above already re-ran it — but it refuses to mint on one
+          // that the journal does not record as confirmed.
+          redOn: { tree: landing.tree, commands: landing.failedNames },
         });
         gated = true;
         issues.push({
@@ -3928,7 +4114,11 @@ export async function cmdRun(
   let sealed = false;
   let missing: string | null = null;
   if (gated || openCases(readJournal(dir)).length > 0) {
-    missing = 'open cases remain';
+    // An unstable landing gates the pass with NO case to serve — saying "open
+    // cases remain" would send the reader looking for one that does not exist.
+    missing = unstableLanding
+      ? `${unstableLanding.branch} landed an UNSTABLE tree — unverified, nothing minted`
+      : 'open cases remain';
   } else {
     const after = readJournal(dir);
     if (canComplete(after)) {
@@ -3942,7 +4132,17 @@ export async function cmdRun(
   if (mergeFailed.length)
     console.error(`merge-failed branches halted this pass (journaled): ${mergeFailed.join(', ')}`);
   console.error(sealed ? 'run complete — pass sealed (pass-complete)' : `run complete — ${missing}`);
-  emit(cli, { watermark12: plan.watermark12, gated, sealed, missing, passDir: dir, diverged, mergeFailed, issues });
+  emit(cli, {
+    watermark12: plan.watermark12,
+    gated,
+    sealed,
+    missing,
+    passDir: dir,
+    diverged,
+    mergeFailed,
+    ...(unstableLanding ? { unstableLanding } : {}),
+    issues,
+  });
   return 0;
 }
 
@@ -8571,7 +8771,7 @@ export async function firstRedParticipant(
   checksFile: string | undefined,
   runChecks: ChecksRunner,
   runInstall?: InstallRunner,
-): Promise<{ branch: string; sha: string; output: string; failed: VerifyCommand[]; failedNames: string[] } | null> {
+): Promise<{ branch: string; sha: string; output: string; failed: VerifyCommand[]; failedNames: string[]; tree: string } | null> {
   // An ABSENT checks file is a deliberate skip (a repo without one skips the
   // gate). A CONFIGURED one that will not load is a silently disabled gate —
   // the ERR43 failure shape — so say so instead of returning null indistinguishably.
@@ -8643,11 +8843,44 @@ export async function firstRedParticipant(
         console.error(`next-case [WARN13_DEPS_UNUSABLE]: ${branch} dependencies would not install — branch NOT checked`);
         continue;
       }
-      const r = await runChecks(checks.typecheck, wt.path);
+      const wtPath = wt.path;
+      const r = await runChecks(checks.typecheck, wtPath);
       appendJournal(dir, { action: 'branch-check', branch, sha, ok: r.ok, ...(r.ok ? {} : { failed: r.failedNames }) });
       if (!r.ok) {
         const failed = checks.typecheck.filter((c) => r.failedNames.includes(c.cmd));
-        return { branch, sha, output: r.output, failed, failedNames: r.failedNames };
+        // ONE RED IS AN OBSERVATION, NOT A VERDICT — and this red blocks every
+        // merge in the pass and mints a case on the branch, so it is re-run on
+        // the identical tree first.
+        const tree = await treeOf(cli.repo, sha);
+        const confirm = await confirmRed(dir, {
+          branch,
+          sha,
+          tree,
+          phase: 'typecheck',
+          failedNames: r.failedNames,
+          rerun: () => runChecks(failed, wtPath),
+        });
+        if (!confirm.reproduced) {
+          // NOT RED, AND NOT GREEN — so this check has no verdict to give and
+          // says nothing. The pass keeps going and the LANDING GATE decides:
+          // it measures the tree that actually results, typecheck AND tests,
+          // with the same confirming re-run. Stopping the pass here instead
+          // would block every merge on a measurement that contradicted itself.
+          appendJournal(dir, {
+            action: 'branch-check',
+            branch,
+            sha,
+            tree,
+            ok: false,
+            unstable: true,
+            id: 'WARN21_CHECKS_FLAKY',
+            failed: r.failedNames,
+            detail: confirm.detail,
+          });
+          console.error(`next-case [WARN21_CHECKS_FLAKY]: ${branch} — ${confirm.detail}`);
+          continue;
+        }
+        return { branch, sha, output: r.output, failed, failedNames: r.failedNames, tree };
       }
     }
   } finally {
@@ -8730,6 +8963,9 @@ export async function cmdSweepNextCase(
     // per round-trip.
     const gate = await materializeGateFixCases(cli, dir, ctx.chain, redBranch.output, redBranch.failed, null, {
       rootBranch: redBranch.branch,
+      // The observation the case rests on — confirmed above, and re-read here so
+      // no path reaches a mint on a single red run.
+      redOn: { tree: redBranch.tree, commands: redBranch.failedNames },
     });
     redGate = { reason: gate.reason, gated: gate.gated };
     progress(`${redBranch.branch} is RED before any merge (${redBranch.failedNames.join(', ')}) — merging nothing`);
@@ -8803,6 +9039,52 @@ export async function cmdSweepNextCase(
       : '';
 
   const open = openCases(journal);
+  // AN UNSTABLE LANDING IS THE PASS'S ANSWER, never a silent `finalize`. The
+  // landing gate saw a red, re-ran it on the identical tree and got a different
+  // answer: nobody is blamed and nothing is minted, so there is no case to
+  // serve — and "no case is open, run `finish`" would read as "all done" while a
+  // branch sits unverified with its merges already landed locally.
+  // The branch's LATEST landing verdict, never any earlier one: a tree measured
+  // unstable and then measured again — the next call re-measures it, since it is
+  // still owed a verdict — must be reported as whatever the LAST run said, or
+  // the pass answers "unstable" forever on a row that has been superseded.
+  const lastLanding = new Map<string, JournalEntry>();
+  for (const e of journal) if (e.action === 'landing-check' && typeof e.branch === 'string') lastLanding.set(e.branch, e);
+  const unstable = [...lastLanding.values()].reverse().find((e) => e.unstable === true);
+  if (open.length === 0 && !redBranch && unstable) {
+    st = { ...st, phase: 'open', currentCase: null };
+    writeMachineState(dir, st);
+    const seen = journal.filter((e) => e.action === 'landing-check' && e.unstable === true && e.tree === unstable.tree).length;
+    const detail = `${unstable.branch}: ${String(unstable.detail ?? 'the landing checks changed their answer on the identical tree')}`;
+    console.error(`next-case [WARN21_CHECKS_FLAKY]: ${detail}`);
+    // A fix already written and HELD but unpublished must still reach the owner:
+    // `finish` is what opens its PR, and stopping here would strand it in the
+    // pass directory — the same ending the red-branch path guards against.
+    const heldUnpublished = [...journaledCases(journal).values()].filter(
+      (jc) =>
+        lastDisposition(journal, jc.caseId)?.action === 'held' &&
+        !journal.some((e) => e.action === 'pr-published' && e.caseId === jc.caseId),
+    );
+    result(cli, {
+      ok: false,
+      status: 'stopped',
+      issues: [{ id: 'WARN21_CHECKS_FLAKY', detail }],
+      ...(heldUnpublished.length ? { heldAwaitingPublish: heldUnpublished.map((jc) => ({ caseId: jc.caseId, branch: jc.branch })) } : {}),
+      ...(seen < 2 ? { resumable: true } : {}),
+      instruction: heldUnpublished.length
+        ? `run \`finish\` — it publishes the ${heldUnpublished.length} held fix(es) already written. Then REPORT to the ` +
+          `owner that ${unstable.branch} landed an UNSTABLE tree (${detail}): nothing was blamed, no case was minted, ` +
+          `and that branch is unverified.`
+        : seen < 2
+          ? `RE-RUN \`next-case\` ONCE: the tree is re-measured from scratch, and a stable answer — green or red — ` +
+            `completes the pass. Do NOT edit code: no branch was blamed and there is nothing to fix. If the same ` +
+            `tree comes back UNSTABLE again, REPORT AND STOP.`
+        : `REPORT to the owner and STOP: the same tree measured UNSTABLE ${seen} times on ${unstable.branch} ` +
+          `(${detail}). The suite is unstable under load on that branch; nothing was merged onward, nothing was ` +
+          `blamed and no case was minted. Do not re-run and do not edit code.`,
+    });
+    return 1;
+  }
   if (open.length === 0 && redBranch) {
     // Red, and nothing left to SERVE for it. Two very different endings:
     //
@@ -9157,6 +9439,14 @@ async function adjudicateNotMyBug(p: {
         }
         return false;
       },
+      // PAID ONCE PER (TREE, COMMANDS), not once per path. The landing gate
+      // re-runs the same commands on the same trees; where it already confirmed
+      // this one, the confirming probe here would buy a journaled fact at the
+      // price of another full run of the failing commands.
+      confirmedRed: async (sha) => {
+        const tree = await treeOf(cli.repo, sha).catch(() => '');
+        return tree !== '' && redConfirmations(readJournal(dir)).get(redKey(tree, failedCommands.map((c) => c.cmd))) === true;
+      },
     });
     /** The branch a group's fix has to land on. */
     const branchOf = (g: OwnerGroup): string => (g.owner === 'branch' ? branch : rc.parent);
@@ -9215,6 +9505,37 @@ async function adjudicateNotMyBug(p: {
       const rest = partition.remainder!;
       if (rest.kind === 'unknown') {
         return { handled: false, note: `${verdict.detail}; but ${rest.detail}` };
+      }
+      if (rest.kind === 'flaky') {
+        // A SIDE THAT CHANGED ITS ANSWER NAMES NO OWNER. The failure is real on
+        // the merged tree and it is not the agent's — the adjudication proved
+        // that — but the tip that would be blamed for it is red once and green
+        // once on the identical tree, so there is no branch to root a fix on and
+        // nothing for the agent to fix. Same ending as an unstable adjudication:
+        // the case goes to the owner with its resolution INTACT and the
+        // instability named. Over-blocking, visibly, with an artifact.
+        await freezeHeld(cli, dir, rc, [`ownership probe unstable (${rest.files.join(', ')}) -> HELD (resolution kept)`], {
+          resolvedTree: p.resolvedTree,
+          escalation: { tag: ESCALATE_FLAKY, feedback: rest.detail.slice(0, COLDREAD_FEEDBACK_CAP) },
+        });
+        reopen(dir, [rc.branch, ...rc.descendants]);
+        const stFlaky = readMachineState(dir);
+        writeMachineState(dir, { ...stFlaky!, phase: 'awaiting-pr', currentCase: { caseId, branch, tier: 'held' } });
+        progress(`not-my-bug: held (ownership probe unstable) — ${branch}`);
+        console.error(`report-case [WARN21_CHECKS_FLAKY]: ${rest.detail}`);
+        result(cli, {
+          instruction: prHandoff(
+            dir,
+            caseId,
+            `provide PR description — your resolution stands and NO branch was blamed: the check that would have ` +
+              `named an owner (${rest.files.join(', ')}) is UNSTABLE — red once and green once on the same tree. ` +
+              `Say that plainly and name it.`,
+          ),
+          tier: 'held',
+          notMyBug: { verdict: verdict.verdict, files: rest.files, owner: rest.kind, probes: verdict.probes + partition.probes, detail: rest.detail },
+          issues: [{ id: 'WARN21_CHECKS_FLAKY', detail: rest.detail }],
+        });
+        return { handled: true, code: 0 };
       }
       // Neither side is red alone: this merge produced it, so it belongs to THIS
       // case. Widen the edit scope to the failing files (the scope guard reads
@@ -9493,7 +9814,15 @@ async function adjudicateNotMyBug(p: {
       writeMachineState(dir, { ...stNow!, phase: 'open', currentCase: null });
       result(cli, {
         status: 'stopped',
-        issues: [{ id: 'WARN09_GATE_FIX_SERVED', detail: minted.map((m) => m.gate.detail).join(' | ') }],
+        issues: [
+        { id: 'WARN09_GATE_FIX_SERVED', detail: minted.map((m) => m.gate.detail).join(' | ') },
+        // The files the probe could not settle travel with their OWN id: they
+        // are not part of any gate fix, and an unstable check is a finding in
+        // its own right rather than a footnote on someone else's case.
+        ...(partition.remainder?.kind === 'flaky'
+          ? [{ id: 'WARN21_CHECKS_FLAKY', detail: partition.remainder.detail }]
+          : []),
+      ],
         notMyBug: {
           verdict: verdict.verdict,
           files: verdict.files,
@@ -9528,7 +9857,15 @@ async function adjudicateNotMyBug(p: {
       status: 'gate-fix-required',
       // A PROCEED arm must never carry an ERR id — the agent obeys the id's
       // doctrine row, and an ERR row says "stop and report". WARN advises.
-      issues: [{ id: 'WARN09_GATE_FIX_SERVED', detail: minted.map((m) => m.gate.detail).join(' | ') }],
+      issues: [
+        { id: 'WARN09_GATE_FIX_SERVED', detail: minted.map((m) => m.gate.detail).join(' | ') },
+        // The files the probe could not settle travel with their OWN id: they
+        // are not part of any gate fix, and an unstable check is a finding in
+        // its own right rather than a footnote on someone else's case.
+        ...(partition.remainder?.kind === 'flaky'
+          ? [{ id: 'WARN21_CHECKS_FLAKY', detail: partition.remainder.detail }]
+          : []),
+      ],
       notMyBug: {
         verdict: verdict.verdict,
         files: verdict.files,
@@ -11036,11 +11373,50 @@ async function materializeGateFixCases(
      * (the finish-path blame) omit it and get the parsed set.
      */
     ownedFiles?: string[];
+    /**
+     * The OBSERVATION this case would rest on: the tree it was seen on and the
+     * commands that failed there.
+     *
+     * Blame never measures — it reads git history over a failing log someone
+     * else produced — so a single red run reaches it as an established fact and
+     * comes out the other side as a case, a held PR and a named culprit. When a
+     * caller can say which tree and which commands its red came from, this is
+     * checked against the confirmations the pass has journaled: a red that was
+     * re-run and reproduced mints, and one that changed its answer (or was never
+     * re-run at all) mints nothing. Callers that measure twice on their own —
+     * the integration verify, whose determinism probe runs before attribution —
+     * pass nothing and are unaffected.
+     */
+    redOn?: { tree: string; commands: string[] };
   } = {},
 ): Promise<{ served: boolean; cases: GateFixCaseSummary[]; reason: string; detail: string; gated: string[] }> {
   const journal = readJournal(dir);
   const { features } = loadRegistry({ inventoryDir: cli.inventory, scopeFile: cli.scopeFile, routingFile: cli.routingFile });
   const none = { served: false as const, cases: [] as GateFixCaseSummary[], reason: '', detail: '', gated: [] as string[] };
+  // A SINGLE RED OBSERVATION MAY NOT FOUND A CASE — enforced at the one place a
+  // case is created, so no caller can reach a mint with an unconfirmed red.
+  // Nothing is re-run here: the confirmation belongs where the tree was standing
+  // and its worktree still had its dependencies, and this is a journal read.
+  if (opts.redOn) {
+    const confirmed = redConfirmations(journal).get(redKey(opts.redOn.tree, opts.redOn.commands));
+    if (confirmed !== true) {
+      const detail =
+        `${opts.redOn.commands.join(', ')} on tree ${opts.redOn.tree.slice(0, 12)} ` +
+        (confirmed === false
+          ? 'failed and then PASSED on a re-run of the identical tree'
+          : 'was never re-run on the identical tree') +
+        ' — one observation cannot found a case, so nothing is blamed and nothing is minted';
+      appendJournal(dir, {
+        action: 'gate-fix-refused',
+        id: 'WARN21_CHECKS_FLAKY',
+        tree: opts.redOn.tree,
+        commands: opts.redOn.commands,
+        reason: detail,
+      });
+      console.error(`gate-fix [WARN21_CHECKS_FLAKY]: ${detail}`);
+      return { ...none, reason: detail, detail };
+    }
+  }
   // CUT-POINT EXCEPTIONS (cut-points.ts). A MALFORMED file is LOUD and stops
   // this command — the ERR43_CHECKS_MALFORMED contract. Blaming with the
   // exceptions silently dropped is not "blame without them": it is blame that
