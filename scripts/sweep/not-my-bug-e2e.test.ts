@@ -92,6 +92,10 @@ describe('the not-my-bug deadlock, end to end (real checks, real commits)', () =
     const ws = tmp('nmb-ws-');
     const inv = branchlessInventory();
     const cli = (over: Partial<Cli> = {}): Cli => ({
+      // The gate-fix worktree and the case worktree are built deep inside
+      // `run`; without this seam they spawn a real pnpm, fail, and the driver
+      // (correctly) refuses to serve a case into a tree with no environment.
+      installRunner: fakeInstall,
       cmd: 'plan',
       repo: repo.dir,
       workspace: ws,
@@ -249,6 +253,10 @@ describe('the not-my-bug deadlock, end to end (real checks, real commits)', () =
     const ws = tmp('nmb-ws-');
     const inv = branchlessInventory();
     const cli = (over: Partial<Cli> = {}): Cli => ({
+      // The gate-fix worktree and the case worktree are built deep inside
+      // `run`; without this seam they spawn a real pnpm, fail, and the driver
+      // (correctly) refuses to serve a case into a tree with no environment.
+      installRunner: fakeInstall,
       cmd: 'plan',
       repo: repo.dir,
       workspace: ws,

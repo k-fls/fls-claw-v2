@@ -67,6 +67,9 @@ export const HALT_IDS: Record<string, string> = {
   'protected-ref': 'ERR23_PROTECTED_REF',
   'plan-drift': 'ERR24_PLAN_DRIFT',
   'bad-case-id': 'ERR25_BAD_CASE_ID',
+  // The pass cannot build an environment from committed, valid manifests. No
+  // tree can be checked, so no case can be served and no verdict is admissible.
+  'environment-unusable': 'ERR47_ENVIRONMENT_UNUSABLE',
 };
 
 export function haltIdFor(reason: string): string | null {

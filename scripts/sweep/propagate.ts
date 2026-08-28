@@ -1657,6 +1657,18 @@ const COLDREAD_REJECT_LIMIT = 2;
 /** Bound on the cold reviewer's 1-2 line `feedback`. */
 const COLDREAD_FEEDBACK_CAP = 400;
 
+/**
+ * DEPENDENCIES WOULD NOT INSTALL WHERE THE MANIFESTS ARE COMMITTED AND VALID.
+ *
+ * Every install the driver runs on a committed tree reads manifests git is
+ * holding, so a failure there is the machine — no network, no permissions, no
+ * package manager — and nothing in the fork can fix it. It is terminal for the
+ * pass: a tree with no environment yields check results that are not evidence
+ * about the code, so the driver refuses to serve or judge work in it and hands
+ * the machine to the owner.
+ */
+const ERR_ENVIRONMENT_UNUSABLE = 'ERR47_ENVIRONMENT_UNUSABLE';
+
 /** PR-description warning prefixes for HELD escalations (owner-facing). */
 const ESCALATE_REJECTED_2X = '[AUTO-ESCALATED: cold read rejected 2x]';
 const ESCALATE_SCOPE = '[AUTO-ESCALATED: scope exceeded]';
@@ -2635,13 +2647,39 @@ const defaultInstallRunner: InstallRunner = async (dir) => {
 };
 
 /**
- * Prepare a case's resolution worktree. Returns FALSE when it could not be
- * built: the whole body is best-effort (a container-uid-owned tree is not
- * removable from the host), but a failure must never be reported as a normal
- * return — a caller that resets a worktree to the pristine conflict would then
- * tell the agent "the worktree is now pristine" and freeze a draft PR over a
- * tree that still holds the agent's discarded edits. The claim has to follow
- * the outcome.
+ * What a case-worktree preparation produced.
+ *
+ * A failure must never be reported as a normal return — a caller that resets a
+ * worktree to the pristine conflict would then tell the agent "the worktree is
+ * now pristine" and freeze a draft PR over a tree that still holds the agent's
+ * discarded edits. The claim has to follow the outcome.
+ */
+export interface WorktreePrep {
+  /** The worktree exists at the case path with its pending conflict in it. */
+  ok: boolean;
+  /**
+   * The dependency install failed. Everything installed here comes from
+   * COMMITTED, parseable manifests (the clean prefix), so the failure is about
+   * the MACHINE and never about the conflict or a resolution. A case served
+   * into a tree with no environment produces check results that are not
+   * evidence about the code, so a caller that would SERVE this case must
+   * refuse instead.
+   */
+  environment: boolean;
+}
+
+/**
+ * Prepare a case's resolution worktree. The body is best-effort against a tree
+ * the host may not be able to remove (container uid), so a build failure
+ * answers `{ok: false}` rather than throwing; a dependency-install failure
+ * additionally answers `environment: true`, which is a different thing to do
+ * something about.
+ *
+ * `install: false` is for the callers that RESET a worktree to the pristine
+ * conflict on their way to freezing a held draft: they run no checks and hand
+ * the tree back to nobody, so they need no environment — and paying for one
+ * would let a broken machine turn a legal freeze into a case that cannot be
+ * concluded at all.
  */
 export async function createCaseWorktree(
   cli: Cli,
@@ -2651,7 +2689,8 @@ export async function createCaseWorktree(
   contentSource?: string,
   /** Injectable so tests never spawn a real pnpm/bun. */
   runInstall?: InstallRunner,
-): Promise<boolean> {
+  opts: { install?: boolean } = {},
+): Promise<WorktreePrep> {
   const wtPath = join(dir, caseFile.id, 'worktree');
   try {
     const prefixTree = await cleanPrefixTree(cli.repo, caseFile.automergeTree, baseTip, caseFile.conflictedPaths);
@@ -2689,7 +2728,22 @@ export async function createCaseWorktree(
     // the conflict. The manifests the checks must run against are the RESOLVED
     // ones, which do not exist yet at this point: the gate re-installs in this
     // same worktree at `report-case` (§7.1), after the agent has resolved them.
-    const depsOk = await installDeps(cli, wtPath, runInstall);
+    if ((opts.install ?? true) && !(await installDeps(cli, wtPath, runInstall))) {
+      const detail =
+        `dependencies would not install into the case worktree at ${wtPath}, from the base commit's own ` +
+        `committed manifests — the environment is broken, not the tree`;
+      appendJournal(dir, {
+        action: 'environment-unusable',
+        id: ERR_ENVIRONMENT_UNUSABLE,
+        caseId: caseFile.id,
+        branch: caseFile.branch,
+        phase: 'case-worktree',
+        path: wtPath,
+        detail,
+      });
+      console.error(`[${ERR_ENVIRONMENT_UNUSABLE}]: ${detail}`);
+      return { ok: false, environment: true };
+    }
     // Materialize the conflicted paths as PENDING working-tree changes: write the
     // automerge (marker) blob to disk without staging, or delete the file when the
     // automerge tree dropped it (delete/modify conflict), so `git status` = exactly
@@ -2712,24 +2766,23 @@ export async function createCaseWorktree(
     // shared .git so rerere-enabled operations in the case worktree see the
     // recorded resolutions. Best-effort, like the worktree itself.
     const seeded = await installRrCache(cli.repo, join(cli.workspace, RR_CACHE_DIRNAME));
-    const linkedDeps = depsOk ? WORKTREE_DEP_LINKS : [];
     appendJournal(dir, {
       action: 'case-worktree',
       caseId: caseFile.id,
       path: wtPath,
       rerereSeeded: seeded,
-      linkedDeps,
+      installed: opts.install ?? true,
       pendingPaths: [...caseFile.conflictedPaths, ...(caseFile.carriedPaths ?? [])],
       ...(contentSource ? { contentSource } : {}),
     });
-    return true;
+    return { ok: true, environment: false };
   } catch (e) {
     appendJournal(dir, {
       action: 'warning',
       caseId: caseFile.id,
       message: `case worktree creation failed: ${e instanceof Error ? e.message : String(e)}`,
     });
-    return false;
+    return { ok: false, environment: false };
   }
 }
 
@@ -3507,6 +3560,20 @@ export async function cmdRun(
           reproduction: live.reproduction,
           deferredCheck: { firstConflictHeight: live.head.height, transitiveAncestors: bp.ancestors },
         };
+        // THE WORKTREE IS BUILT BEFORE THE CASE EXISTS. A case whose environment
+        // could not be built must not be journaled at all: journaling it first
+        // leaves it in `openCases` with nothing able to check it, `finish`
+        // refuses on ERR34_CASES_REMAIN, and the pass has no legal move. The
+        // install here reads the base commit's own committed manifests, so its
+        // failure is the machine — halt the run and hand it to the owner.
+        const prep = await createCaseWorktree(cli, dir, caseFile, nowTip, undefined, runInstall); // agent resolves here
+        if (prep.environment) {
+          throw new DriverHalt(
+            'environment-unusable',
+            `the case worktree for ${caseFile.id} (${bp.branch}) has no dependencies — they would not install from ` +
+              `the branch's own committed manifests, so nothing in this pass can be checked. No case was opened.`,
+          );
+        }
         const caseDir = join(dir, caseFile.id);
         writeJsonFile(join(caseDir, 'case.json'), caseFile);
         const diffText = await conflictHunks(cli.repo, caseFile.automergeTree, caseFile.conflictedPaths);
@@ -3526,7 +3593,6 @@ export async function cmdRun(
           run: caseFile.run, // the stacked run
           conflictedPaths: caseFile.conflictedPaths,
         });
-        await createCaseWorktree(cli, dir, caseFile, nowTip); // agent resolves here
         return true;
       };
 
@@ -7035,6 +7101,28 @@ async function materializeReissueCase(
     reproduction: { command: `git merge-tree --write-tree --name-only ${tip} ${conflictHead}` },
     deferredCheck: { firstConflictHeight: height, transitiveAncestors: args.ancestors },
   };
+  // Same rule as `run`'s emission: no environment, no case. `start` does NOT
+  // halt for it — a half-opened pass would leave the next `start` refusing on
+  // ERR30_PASS_OPEN — it simply does not serve this reissue. The branch stays
+  // blocked by its own open PR either way, so nothing is lost but the revision,
+  // and the next pass re-derives it from the same PR.
+  const prep = await createCaseWorktree(cli, dir, caseFile, tip, args.refSha); // pending files = the CURRENT ref head (prior resolution / owner edit)
+  if (prep.environment) {
+    appendJournal(dir, {
+      action: 'reissue-skipped',
+      id: 'ERR47_ENVIRONMENT_UNUSABLE',
+      ref: args.ref,
+      branch: args.branch,
+      caseId: cid,
+      detail:
+        `dependencies would not install for the reissue worktree of '${args.ref}' — the revision is NOT served ` +
+        `this pass; the pull request and its review are untouched`,
+    });
+    console.error(
+      `sweep start [ERR47_ENVIRONMENT_UNUSABLE]: '${args.ref}' reissue NOT served — the case worktree has no dependencies`,
+    );
+    return;
+  }
   writeJsonFile(join(dir, cid, 'case.json'), caseFile);
   writeJsonFile(join(dir, cid, 'dialog.json'), args.dialog);
   appendJournal(dir, {
@@ -7056,7 +7144,6 @@ async function materializeReissueCase(
     addressedReviewId: args.latestReview.id,
     markerId: args.markerId,
   });
-  await createCaseWorktree(cli, dir, caseFile, tip, args.refSha); // pending files = the CURRENT ref head (prior resolution / owner edit)
   console.error(
     `sweep start: REISSUE ${cid} — PR #${args.pr.number} carries review ${args.latestReview.id} (${args.latestReview.state}) beyond the sweep-addressed marker; serving a revision case this pass`,
   );
@@ -8474,6 +8561,13 @@ export async function cmdSweepNextCase(
     // cmdRun's own emit is suppressed (internal), so next-case emits the single
     // result itself: the halt is journaled — point the agent at it.
     console.error('next-case: `run` halted — see the journal');
+    // THE HALT'S OWN ID TRAVELS WITH IT. `cmdRun` journals the id it halted on
+    // and its emit is suppressed here, so without this the agent is handed
+    // "run halted" and nothing to look the reason up under — and a halt that is
+    // NOT self-healing (a broken environment) reads exactly like one that is.
+    const haltRow = [...readJournal(dir).slice(journalLenBefore)]
+      .reverse()
+      .find((e) => e.action === 'halt' && typeof e.id === 'string');
     // RESUMABLE BY CONSTRUCTION — say so, because the agent cannot tell a
     // self-healing halt from a terminal one and will otherwise stop on both.
     // `cmdRun` is idempotent: it re-derives from git every call, so a halt whose
@@ -8482,6 +8576,7 @@ export async function cmdSweepNextCase(
     // servable case sitting ready.
     result(cli, {
       status: 'run-halted',
+      ...(haltRow ? { issues: [{ id: String(haltRow.id), detail: String(haltRow.message ?? haltRow.reason ?? '') }] } : {}),
       instruction:
         'run halted — RE-RUN `next-case` ONCE first: `run` re-derives from git every call, so a halt caused by a ' +
         'mid-run ref movement clears on the retry. If it halts AGAIN on the SAME branch, that is a real driver ' +
@@ -9573,7 +9668,10 @@ export async function cmdSweepReportCase(
     // be a plain false statement — and the draft PR would be built from a tree
     // nobody reset. Stop instead; the case stays case-ready and can be retried
     // from a context that can write the worktree.
-    if (!(await createCaseWorktree(cli, dir, caseFile, await revParse(cli.repo, rc.branch)))) {
+    // NO INSTALL: this reset ends the case. It freezes a held draft, runs no
+    // checks and hands the tree to nobody, so an environment it will never use
+    // must not be able to turn a legal freeze into a case that cannot conclude.
+    if (!(await createCaseWorktree(cli, dir, caseFile, await revParse(cli.repo, rc.branch), undefined, undefined, { install: false })).ok) {
       const detail =
         `could not reset the worktree at ${wtPath} to the pristine conflict (see the journaled warning) — ` +
         `the tree still holds edits, so no pristine-conflict PR can be frozen from it; clear the worktree ` +
@@ -9875,7 +9973,8 @@ export async function cmdSweepReportCase(
         // Conflict case at the LIMIT: reset to pristine (the failing resolution
         // is NOT published) and freeze a HELD DRAFT, escalated. A failed reset
         // must not be announced as pristine — same rule as branch 4.
-        if (!(await createCaseWorktree(cli, dir, caseFile, await revParse(cli.repo, rc.branch)))) {
+        // No install — the same rule as branch 4: this reset ends the case.
+        if (!(await createCaseWorktree(cli, dir, caseFile, await revParse(cli.repo, rc.branch), undefined, undefined, { install: false })).ok) {
           const detail =
             `checks (${kind}) failed ${n}x and the worktree at ${wtPath} could not be reset to the pristine ` +
             `conflict (see the journaled warning) — nothing was frozen; clear the worktree (in-container) and re-run report-case`;
@@ -10785,6 +10884,8 @@ async function materializeGateFixCases(
   const cases: GateFixCaseSummary[] = [];
   const looping: string[] = [];
   const gated: string[] = [];
+  /** Branches whose fix worktree has no environment — the machine, not the branch. */
+  const envBlocked: string[] = [];
   // A GATE HOLD ALREADY TAKEN THIS PASS BLOCKS EVERYTHING BENEATH IT.
   //
   // A gate fix means the branch is RED. Every descendant merges that branch, so
@@ -10952,7 +11053,24 @@ async function materializeGateFixCases(
     // The head's HEIGHT (see `gateFixHeadHeight`): the tip's coverage on this
     // pass's pinned chain — never a `-1` placeholder.
     const head = { sha: tip, height: await gateFixHeadHeight(cli, chain, tip) };
-    await createGateFixWorktree(cli, dir, caseId, tip);
+    // NO ENVIRONMENT, NO CASE. A gate fix exists to turn a failing check green;
+    // minted into a tree whose dependencies would not install, its gate can
+    // never answer, and it would sit in `openCases` blocking `finish`.
+    if ((await createGateFixWorktree(cli, dir, caseId, tip)).environment) {
+      envBlocked.push(g.branch);
+      appendJournal(dir, {
+        action: 'gate-fix-skipped',
+        id: ERR_ENVIRONMENT_UNUSABLE,
+        owner: g.branch,
+        skipped: g.branch,
+        skippedFiles: g.files,
+        detail:
+          `dependencies would not install into the fix worktree for ${g.branch} at ${tip.slice(0, 12)}, from its ` +
+          `own committed manifests — no case was minted, because its checks gate could never answer`,
+      });
+      console.error(`gate-fix [${ERR_ENVIRONMENT_UNUSABLE}]: ${g.branch} fix worktree has no dependencies — not minting`);
+      continue;
+    }
     const caseFile: CaseFile = {
       schemaVersion: 1,
       id: caseId,
@@ -11023,6 +11141,17 @@ async function materializeGateFixCases(
         detail: `verify RED, but every blamed branch (${who}) already has a gate fix on origin awaiting the owner — nothing to serve`,
       };
     }
+    // A THIRD reason, and it means neither of the other two: the build is red
+    // and the branch that owns it cannot even be given an environment. Nothing
+    // is wrong with the branch and nothing more is worth attempting here.
+    if (envBlocked.length > 0) {
+      const who = envBlocked.join(', ');
+      return {
+        ...none,
+        reason: `dependencies would not install for ${who} — no fix case can be checked, so none was minted`,
+        detail: `verify RED, but ${who} has no working environment: the machine has to be fixed before any fix can be judged`,
+      };
+    }
     const who = looping.join(', ');
     return {
       ...none,
@@ -11047,14 +11176,19 @@ async function materializeGateFixCases(
  * A gate-fix worktree: the branch tip, CLEAN. No clean-prefix commit, no pending
  * conflict blobs — there is no merge here. The dep links + per-worktree excludes
  * are installed exactly as for a conflict case so the checks gate can run.
+ *
+ * The tip is committed, so its manifests are valid: an install failure here is
+ * the machine, and the caller must not mint a case into a tree where the only
+ * thing the case exists to do — turn a failing check green — cannot be measured.
  */
-async function createGateFixWorktree(cli: Cli, dir: string, caseId: string, tip: string): Promise<void> {
+async function createGateFixWorktree(cli: Cli, dir: string, caseId: string, tip: string): Promise<WorktreePrep> {
   const wtPath = caseWorktreePath(dir, caseId);
   await git(cli.repo, ['worktree', 'remove', '--force', wtPath], { allowCodes: [1, 128] });
   await git(cli.repo, ['worktree', 'prune'], { allowCodes: [1, 128] });
   rmSync(wtPath, { recursive: true, force: true });
   await git(cli.repo, ['worktree', 'add', '--detach', wtPath, tip]);
-  await installDeps(cli, wtPath);
+  if (!(await installDeps(cli, wtPath))) return { ok: false, environment: true };
+  return { ok: true, environment: false };
 }
 
 /** One related PR in a finished pass's owner-facing summary. */

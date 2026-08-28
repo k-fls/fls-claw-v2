@@ -49,6 +49,7 @@ import {
   readJournal,
   type Cli,
   type ColdReadInvoker,
+  type InstallRunner,
   type JournalEntry,
 } from './propagate.js';
 
@@ -94,8 +95,19 @@ function branchlessInventory(): string {
   return writeInventory([{ id: 'planned.seed' }]);
 }
 
+/**
+ * No network install. A fixture repo has no real dependency graph, and a tree
+ * with no environment is one the driver REFUSES to serve a case into — so a
+ * fixture that walks the case loop carries this seam or it tests the refusal.
+ */
+const fakeInstall: InstallRunner = async (dir) => {
+  mkdirSync(join(dir, 'node_modules'), { recursive: true });
+  return true;
+};
+
 function baseCli(repo: FixtureRepo, ws: string, inv: string, over: Partial<Cli> = {}): Cli {
   return {
+    installRunner: fakeInstall,
     cmd: 'plan',
     repo: repo.dir,
     workspace: ws,

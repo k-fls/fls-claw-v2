@@ -111,8 +111,20 @@ function writeRouting(mode: string): string {
   return f;
 }
 
+/**
+ * No network install. A fixture repo has no real dependency graph, and a tree
+ * with no environment is one the driver now REFUSES to serve a case into — so
+ * every fixture that walks the case loop must carry this seam or it is testing
+ * the refusal instead of the thing it names.
+ */
+const fakeInstall: InstallRunner = async (dir) => {
+  mkdirSync(join(dir, 'node_modules'), { recursive: true });
+  return true;
+};
+
 function baseCli(repo: FixtureRepo, ws: string, inv: string | null, over: Partial<Cli> = {}): Cli {
   return {
+    installRunner: fakeInstall,
     cmd: 'plan',
     repo: repo.dir,
     workspace: ws,
@@ -180,6 +192,39 @@ function editCase(dir: string, caseId: string, mut: (c: Record<string, unknown>)
 const confirm: ColdReadInvoker = async () => ({
   verdict: 'confirm',
   notes: 'behaviour preserved; every hunk explained',
+});
+
+/**
+ * A CASE IS NEVER SERVED INTO A TREE WITH NO ENVIRONMENT.
+ *
+ * The prep install reads the base commit's own committed manifests, so its
+ * failure is the machine. Serving anyway gives the agent a session in a tree
+ * where every check is an inadmissible observation, and journaling the case
+ * first leaves it in `openCases` with `finish` refusing on ERR34_CASES_REMAIN
+ * and no legal move left in the pass.
+ */
+describe('a case is not opened into a tree whose dependencies would not install', () => {
+  it('halts the run with ERR47_ENVIRONMENT_UNUSABLE and journals no case at all', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { cmd: 'sweep-start' }))).toBe(0);
+    const out = join(ws, 'nc.json');
+    const rc = await cmdSweepNextCase(
+      baseCli(repo, ws, inv, { cmd: 'next-case', execute: true, out, installRunner: async () => false }),
+    );
+    expect(rc).not.toBe(0);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'environment-unusable')).toBe(true);
+    expect(journal.some((e) => e.action === 'halt' && e.id === 'ERR47_ENVIRONMENT_UNUSABLE')).toBe(true);
+    // Nothing for the agent to work, and nothing for `finish` to refuse over.
+    expect(journal.some((e) => e.action === 'case')).toBe(false);
+    expect(openCases(journal)).toHaveLength(0);
+    // The id reaches the agent, or it has nothing to look the refusal up under.
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues?: Array<{ id: string }> };
+    expect((res.issues ?? []).map((i) => i.id)).toContain('ERR47_ENVIRONMENT_UNUSABLE');
+  });
 });
 
 describe('report-case — case re-verification rejects forged pointers (§7, FIX A)', () => {

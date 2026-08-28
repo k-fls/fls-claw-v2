@@ -963,6 +963,16 @@ Two more things are installed into every case worktree:
   run against are the RESOLVED ones, which do not exist at prep time; the gate
   installs again in the same worktree at `report-case` (§7.1).
 
+  A prep install that FAILS is therefore about the machine, and the case is not
+  opened: `run` halts on `ERR47_ENVIRONMENT_UNUSABLE` BEFORE journaling the
+  `case` row, `start` skips serving a reissue and leaves its pull request
+  untouched, and gate-fix minting skips the branch. Journaling the case first
+  and refusing afterwards would leave it in `openCases` with nothing able to
+  check it, `finish` refusing on `ERR34_CASES_REMAIN`, and no legal move left.
+  The two resets to the PRISTINE conflict (§6.4 branch 4 and the checks-limit
+  freeze) install NOTHING: they end the case, run no checks and hand the tree to
+  nobody, so a broken machine cannot turn a legal freeze into a stuck case.
+
 Materials (`<caseDir>/materials.md`, plus `pr/materials.md` and a per-case
 `pr/TEMPLATE.md`) are driver-authored facts only: the reading contract, the
 conflicted paths, branch/parent/head/run/pending-above, the standing records
@@ -2033,6 +2043,7 @@ escalation's publish issues are written to `publish-<case>.json` and quoted into
 | `ERR43_CHECKS_MALFORMED` | `start`, `report-case`, `finish` | the checks file exists but does not parse (absent is a deliberate, silent skip) |
 | `ERR48_CASE_LOOPING` | `next-case` | the case has been served more than `CASE_SERVE_LIMIT` (4) times with no conclusion; the next serve is refused |
 | `ERR44_WORKTREE_RESET_FAILED` | `report-case` | the reset to the pristine conflict failed, before a held-pristine freeze or a checks-limit freeze |
+| `ERR47_ENVIRONMENT_UNUSABLE` | `run` (halt), `start`, gate-fix minting, `report-case` | dependencies would not install from committed, valid manifests; no case is served or judged in a tree with no environment |
 | `ERR45_CUT_POINTS_MALFORMED` | gate-fix minting (`next-case`, `report-case`, `finish`) | the cut-point exceptions file exists but cannot be read or parsed; the detail travels on the `WARN09` result |
 | `WARN01_TEMPLATE_TEXT` | `report-pr`, publish | the body names no conflicted file, or carries a stock-template or foreign-template phrase |
 | `WARN02_NO_DECISION_LINE` | `report-pr`, publish | the first body line carries no ask or decision |
