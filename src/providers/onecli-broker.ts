@@ -174,7 +174,7 @@ function parseProxyAddress(raw: string): ForwardConfig {
  *   2. `ensureAgent` (provision the per-group OneCLI agent — kept from the v2
  *      wiring; `applyContainerConfig` is NOT called, the MITM proxy owns
  *      egress);
- *   3. `getContainerConfig(agentId)` and read the **per-agent** egress proxy
+ *   3. `getContainerConfig({ agent: agentId })` and read the **per-agent** egress proxy
  *      address from its env (the gateway may hand a different address per
  *      agent, §8). CA is ignored (§3a).
  *
@@ -187,7 +187,7 @@ function makeOneCliResolver(onecli: OneCLI): ForwardConfigResolver {
     const group = getAgentGroupByFolder(folder);
     const agentId = resolveAgentIdentifier(folder, group?.id ?? folder);
     await onecli.ensureAgent({ name: group?.name ?? folder, identifier: agentId });
-    const cfg = await onecli.getContainerConfig(agentId);
+    const cfg = await onecli.getContainerConfig({ agent: agentId });
     const env = cfg.env as Record<string, string>;
     const proxyUrl = env.HTTPS_PROXY ?? env.HTTP_PROXY ?? env.https_proxy ?? env.http_proxy;
     if (!proxyUrl) {
