@@ -1234,7 +1234,11 @@ the branch's PRE-MERGE TIP (the prefix's only parent), then the PARENT HEAD.
 Branch red → the BRANCH owns those files. Branch green + parent red → the PARENT
 owns them, else the same red is fixed once per descendant. BOTH green → an
 INTERACTION owned by this merge. A probe that will not build on either side yields
-`unknown`; a file absent from a tree counts as green there without a probe.
+`unknown`; a file absent from a tree counts as green there without a probe. The
+interaction verdict states PER SIDE which of the two it was and against which
+ref ("absent at the branch tip `<sha12>` (cannot fail there); probed green twice
+at the parent head `<sha12>`"): a probed green and a vacuous one are different
+facts, and one string spanning both is relayed as a claim about both tips.
 
 **A verdict describes a SUBSET, so the failing set is PARTITIONED**
 (`partitionOwners`). Each probe round reports which of the files it was asked

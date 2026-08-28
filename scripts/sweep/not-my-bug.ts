@@ -559,15 +559,23 @@ export async function locateOwner(
       detail: `green at the branch tip but red at the parent head ${parentHead.slice(0, 12)} — the incoming side owns this`,
     };
   }
-  const absent = [bt.absent ? 'the branch tip' : '', ph.absent ? 'the parent head' : ''].filter(Boolean).join(' and ');
+  // PER SIDE, WHICH KIND OF GREEN AND AGAINST WHICH REF. A side is green because
+  // it was PROBED and passed, or because the files are not there to fail at all.
+  // Those are different facts, and one string spanning both is read as a claim
+  // about both tips — including the claim that the file exists at neither.
+  const side = (label: string, sha: string, absent: boolean): string =>
+    absent
+      ? `absent at ${label} ${sha.slice(0, 12)} (cannot fail there)`
+      : `probed green twice at ${label} ${sha.slice(0, 12)}`;
   return {
     owner: 'interaction',
     ref: null,
     files,
     probes,
     detail:
-      'green on BOTH sides in isolation and red once merged — nobody upstream owns this; ' +
-      `it is this merge’s own defect and belongs in this case${absent ? ` (the files do not exist at ${absent})` : ''}`,
+      'red once merged and on neither side alone — nobody upstream owns this; ' +
+      'it is this merge’s own defect and belongs in this case ' +
+      `(${side('the branch tip', branchTip, bt.absent)}; ${side('the parent head', parentHead, ph.absent)})`,
   };
 }
 

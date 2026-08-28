@@ -1635,9 +1635,11 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
         detail: expect.any(String),
       },
     ]);
-    // The adjudication's own words travel with it, so the agent never has to
-    // reconstruct why the file is red from memory.
+    // The adjudication's own words travel with it, per side, so the agent never
+    // has to reconstruct why the file is red from memory.
     expect(f.uncoveredRemainders[0].detail).toContain('nobody upstream owns this');
+    expect(f.uncoveredRemainders[0].detail).toContain('probed green twice at the branch tip');
+    expect(f.uncoveredRemainders[0].detail).toContain('probed green twice at the parent head');
     // The agent relays the instruction, so the remainder has to be IN it.
     expect(f.instruction).toContain('STILL RED, NO CASE');
     expect(f.instruction).toContain('src/c.ts');

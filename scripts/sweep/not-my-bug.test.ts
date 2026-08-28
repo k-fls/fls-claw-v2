@@ -211,6 +211,27 @@ describe('locateOwner', () => {
     expect(o.ref).toBeNull();
   });
 
+  it('says PER SIDE which kind of green it was, and against which ref', async () => {
+    // A probed green and a vacuous one are different facts. Undifferentiated,
+    // the sentence reads as a claim about both tips — the file exists at
+    // neither — and a reader relaying it states something nothing measured.
+    const { probe } = scriptedProbe([{ failing: {} }]);
+    const o = await locateOwner([POLL_LOOP], 'branchtip0000', 'parenthead000', probe, {
+      hasAnyFile: async (sha) => sha !== 'parenthead000',
+    });
+    expect(o.owner).toBe('interaction');
+    expect(o.detail).toContain('probed green twice at the branch tip branchtip000');
+    expect(o.detail).toContain('absent at the parent head parenthead00 (cannot fail there)');
+  });
+
+  it('a side that WAS probed is never described as absent', async () => {
+    const { probe } = scriptedProbe([{ failing: {} }]);
+    const o = await locateOwner([POLL_LOOP], 'branchtip0000', 'parenthead000', probe);
+    expect(o.detail).toContain('probed green twice at the branch tip branchtip000');
+    expect(o.detail).toContain('probed green twice at the parent head parenthead00');
+    expect(o.detail).not.toContain('absent');
+  });
+
   it('does not probe a tip that does not CONTAIN the files — absence is the answer', async () => {
     const { probe, calls } = scriptedProbe([{ failing: { [POLL_LOOP]: 1 } }]);
     const o = await locateOwner([POLL_LOOP], 'branchtip0000', 'parenthead000', probe, {
