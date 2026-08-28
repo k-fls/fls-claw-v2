@@ -36,8 +36,8 @@ import {
 } from './db/index.js';
 import { getDeliveredIds } from './db/session-db.js';
 import { resolveSession, resolveTaskSession, outboundDbPath, openInboundDb } from './session-manager.js';
-import { deliverSessionMessages, setDeliveryAdapter } from './delivery.js';
-import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
+import { deliverSessionMessages, setDeliveryAdapter, MISSING_ADAPTER_GRACE_MS } from './delivery.js';
+import { createChannelDeliveryAdapter, MissingChannelAdapterError } from './channels/channel-registry.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -197,7 +197,7 @@ describe('deliverSessionMessages — retry and permanent failure', () => {
     // Regression: the real bridge used to return undefined when the exact
     // adapter lookup missed, and drainSession marked the row delivered with
     // platform_message_id=NULL even though no send happened. The bridge must
-    // throw so the row takes the normal retry → failed path. Uses the REAL
+    // throw so the row is held for the outage and then fails. Uses the REAL
     // createChannelDeliveryAdapter with an empty registry — the state after
     // an adapter factory returns null (missing credentials) at startup.
     seedAgentAndChannel();
@@ -206,18 +206,32 @@ describe('deliverSessionMessages — retry and permanent failure', () => {
 
     setDeliveryAdapter(createChannelDeliveryAdapter());
 
-    // Attempt 1 — must NOT be acknowledged as delivered
-    await deliverSessionMessages(session);
-    let inDb = openInboundDb('ag-1', session.id);
-    expect(getDeliveredIds(inDb).has('out-offline')).toBe(false);
-    inDb.close();
+    const start = Date.now();
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(start);
+    try {
+      // Attempt 1 — must NOT be acknowledged as delivered
+      await deliverSessionMessages(session);
+      let pendingDb = openInboundDb('ag-1', session.id);
+      expect(getDeliveredIds(pendingDb).has('out-offline')).toBe(false);
+      pendingDb.close();
 
-    // Attempts 2 and 3 — exhausts MAX_DELIVERY_ATTEMPTS
-    await deliverSessionMessages(session);
-    await deliverSessionMessages(session);
+      // A missing adapter is a host-side outage, so it no longer spends the
+      // send-error budget: three polls leave the row deliverable.
+      await deliverSessionMessages(session);
+      await deliverSessionMessages(session);
+      pendingDb = openInboundDb('ag-1', session.id);
+      expect(getDeliveredIds(pendingDb).has('out-offline')).toBe(false);
+      pendingDb.close();
+
+      // It settles when the outage outlives MISSING_ADAPTER_GRACE_MS.
+      nowSpy.mockReturnValue(start + MISSING_ADAPTER_GRACE_MS + 1000);
+      await deliverSessionMessages(session);
+    } finally {
+      nowSpy.mockRestore();
+    }
 
     // The row must end as status='failed', never 'delivered'
-    inDb = openInboundDb('ag-1', session.id);
+    const inDb = openInboundDb('ag-1', session.id);
     const row = inDb
       .prepare('SELECT status, platform_message_id FROM delivered WHERE message_out_id = ?')
       .get('out-offline') as { status: string; platform_message_id: string | null } | undefined;
@@ -252,6 +266,90 @@ describe('deliverSessionMessages — retry and permanent failure', () => {
     // Attempt 3 — not called, message already delivered
     await deliverSessionMessages(session);
     expect(callCount).toBe(2);
+  });
+});
+
+/**
+ * Read a row's terminal status. `getDeliveredIds` ignores the status column, so
+ * set membership alone cannot tell 'delivered' from 'failed' — the exact pair
+ * the tests below must distinguish.
+ */
+function deliveryStatus(agentGroupId: string, sessionId: string, msgId: string): string | undefined {
+  const db = openInboundDb(agentGroupId, sessionId);
+  try {
+    const row = db.prepare('SELECT status FROM delivered WHERE message_out_id = ?').get(msgId) as
+      | { status: string }
+      | undefined;
+    return row?.status;
+  } finally {
+    db.close();
+  }
+}
+
+describe('deliverSessionMessages — missing channel adapter', () => {
+  // See MISSING_ADAPTER_GRACE_MS's doc comment in delivery.ts for why an outage
+  // gets a grace window instead of the send-error budget.
+  it('does not consume the retry budget while the adapter is missing, and delivers on recovery', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-outage');
+
+    let callCount = 0;
+    let adapterUp = false;
+    setDeliveryAdapter({
+      async deliver() {
+        callCount++;
+        if (!adapterUp) throw new MissingChannelAdapterError('telegram', 'telegram');
+        return 'plat-recovered';
+      },
+    });
+
+    // Six polls — twice the budget a real send error would get.
+    for (let i = 0; i < 6; i++) await deliverSessionMessages(session);
+    expect(callCount).toBe(6);
+
+    const outageDb = openInboundDb('ag-1', session.id);
+    const duringOutage = getDeliveredIds(outageDb);
+    outageDb.close();
+    expect(duringOutage.has('out-outage')).toBe(false);
+
+    // The adapter comes back and the row is still there to send.
+    adapterUp = true;
+    await deliverSessionMessages(session);
+    expect(callCount).toBe(7);
+
+    expect(deliveryStatus('ag-1', session.id, 'out-outage')).toBe('delivered');
+  });
+
+  it('marks failed once the missing-adapter grace period elapses', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-gone');
+
+    setDeliveryAdapter({
+      async deliver() {
+        throw new MissingChannelAdapterError('telegram', 'telegram');
+      },
+    });
+
+    const start = Date.now();
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(start);
+    try {
+      await deliverSessionMessages(session);
+      const pendingDb = openInboundDb('ag-1', session.id);
+      const stillPending = getDeliveredIds(pendingDb);
+      pendingDb.close();
+      expect(stillPending.has('out-gone')).toBe(false);
+
+      // A channel that never comes back must not pin the row forever. Assert the
+      // status, not just presence: 'delivered' here would mean the row was
+      // recorded as sent when nothing was, which is the original defect.
+      nowSpy.mockReturnValue(start + MISSING_ADAPTER_GRACE_MS + 1000);
+      await deliverSessionMessages(session);
+      expect(deliveryStatus('ag-1', session.id, 'out-gone')).toBe('failed');
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 });
 
