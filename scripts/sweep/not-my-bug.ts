@@ -86,6 +86,55 @@ const ENV_FAULT_PATTERNS: RegExp[] = [
 /** A frame pointing INTO the dependency trees rather than at repo sources. */
 const ENV_FAULT_FRAME = /(?:^|[\s(])(?:[\w./@-]*\/)?(?:node_modules|deps-pool)\//m;
 
+/**
+ * WHOSE FAULT A DEPENDENCY INSTALL IS, when it runs on manifests the RESOLUTION
+ * wrote.
+ *
+ * At the checks gate the manifests in the worktree are the agent's, so an
+ * install failure there is one of two things and they have opposite
+ * dispositions: a manifest or lockfile the resolution left in a state the
+ * package manager will not accept — the agent's to fix, and it can — or a
+ * machine with no network, no permissions or no package manager, which no code
+ * change reaches.
+ *
+ * The package manager says which, in its own words: a parse error or a
+ * lockfile-out-of-date code names the FILES, while a DNS, permission or
+ * spawn failure names the MACHINE.
+ */
+const RESOLUTION_INSTALL_PATTERNS: RegExp[] = [
+  // The manifest is not JSON / YAML the tool can read.
+  /EJSONPARSE|JSON\.parse|is not valid JSON|Unexpected token .* in JSON|Failed to parse .*package\.json/i,
+  /YAMLException|could not parse .*(?:pnpm-lock|bun\.lock)/i,
+  // The lockfile no longer agrees with the manifest, under --frozen-lockfile.
+  /ERR_PNPM_OUTDATED_LOCKFILE|ERR_PNPM_LOCKFILE_MISSING_DEPENDENCY|ERR_PNPM_NO_LOCKFILE/i,
+  /lockfile (?:is )?(?:out of date|outdated|had changes)|frozen-lockfile/i,
+  // A dependency spec the resolver cannot make sense of at all.
+  /ERR_PNPM_SPEC_NOT_SUPPORTED_BY_ANY_RESOLVER|Invalid (?:package|version) (?:name|specifier)/i,
+];
+
+/** The machine, not the files. */
+const MACHINE_INSTALL_PATTERNS: RegExp[] = [
+  /\bENOTFOUND\b|\bEAI_AGAIN\b|\bECONNREFUSED\b|\bECONNRESET\b|\bETIMEDOUT\b|\bERR_SOCKET_TIMEOUT\b/i,
+  /\bEACCES\b|\bEPERM\b|\bEROFS\b|\bENOSPC\b/i,
+  /\bcommand not found\b|\bnot found: (?:pnpm|bun|node|corepack)\b|\bspawn \S+ ENOENT\b/i,
+  /ERR_PNPM_META_FETCH_FAIL|ERR_PNPM_FETCH_\d+|request to https?:\/\/\S+ failed/i,
+  /getaddrinfo|socket hang up|proxy/i,
+];
+
+/**
+ * `resolution` when the output names the FILES, `environment` otherwise.
+ *
+ * A resolution verdict has to be EARNED, because getting it wrong sends the
+ * agent to edit manifests over a dead network and it will loop until the serve
+ * limit refuses it. An environment verdict costs one owner report on a pass
+ * that could not have verified anything anyway, so an unrecognised failure is
+ * the machine's.
+ */
+export function classifyInstallFailure(output: string): 'resolution' | 'environment' {
+  if (MACHINE_INSTALL_PATTERNS.some((re) => re.test(output))) return 'environment';
+  return RESOLUTION_INSTALL_PATTERNS.some((re) => re.test(output)) ? 'resolution' : 'environment';
+}
+
 export interface EnvFaultVerdict {
   isEnvironment: boolean;
   /** The matched signature, for the journal and the agent's report. */

@@ -103,6 +103,7 @@ import { ROOT_BRANCH, TRUNK_BRANCH } from './hierarchy.js';
 import {
   classifyEnvironmentFault,
   classifyFailure,
+  classifyInstallFailure,
   findIntroducingCommit,
   partitionOwners,
   type BisectOutcome,
@@ -591,6 +592,23 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
         headSha: jc?.head.sha ?? null,
         carriedOver: false,
         fixBranch: null, // no PR until `finish` publishes
+        prNumber: null,
+        markerId: null,
+      });
+    } else if (e.action === 'env-blocked') {
+      // The same block a HELD freeze puts on the branch, and for the same
+      // reason: an unjudgeable case is an unresolved one. Its window is trimmed
+      // at the conflict head (or wholly, for a gate fix — a branch under repair
+      // proposes a fix to its own content), so nothing below it takes content
+      // this pass could not verify.
+      const jc = typeof e.caseId === 'string' ? cases.get(e.caseId) : undefined;
+      put({
+        branch: e.branch,
+        caseId: typeof e.caseId === 'string' ? e.caseId : 'env-blocked',
+        kind: e.gateFix === true ? 'fix' : 'merge',
+        headSha: jc?.head.sha ?? (typeof e.headSha === 'string' ? e.headSha : null),
+        carriedOver: false,
+        fixBranch: null, // there is no proposal: nothing was verified
         prNumber: null,
         markerId: null,
       });
@@ -1668,6 +1686,17 @@ const COLDREAD_FEEDBACK_CAP = 400;
  * the machine to the owner.
  */
 const ERR_ENVIRONMENT_UNUSABLE = 'ERR47_ENVIRONMENT_UNUSABLE';
+
+/**
+ * THE RESOLUTION'S MANIFESTS DO NOT INSTALL.
+ *
+ * At the checks gate the manifests in the worktree are the AGENT'S: a
+ * `package.json` left unparseable, or a lockfile the resolution's dependency
+ * change no longer matches under `--frozen-lockfile`. This is work the agent
+ * can do, so it is handed back with what to fix — not reported to the owner as
+ * a broken machine, and not counted as a failing check, because no check ran.
+ */
+const ERR_MANIFEST_UNINSTALLABLE = 'ERR49_MANIFEST_UNINSTALLABLE';
 
 /** PR-description warning prefixes for HELD escalations (owner-facing). */
 const ESCALATE_REJECTED_2X = '[AUTO-ESCALATED: cold read rejected 2x]';
@@ -4586,7 +4615,19 @@ function lastDisposition(journal: JournalEntry[], caseId: string): JournalEntry 
     // openCases (so `finish` completes) and never publish a PR of its own. It is
     // NOT `held`, so the finish held-publish phase (which filters action==='held')
     // correctly skips it.
-    if ((e.action === 'held' || e.action === 'resolved' || e.action === 'held-duplicate') && e.caseId === caseId)
+    // `env-blocked` IS a terminal disposition: the environment made the case
+    // unjudgeable, so there is nothing left to serve, resolve or publish. It
+    // must drain from openCases — otherwise `finish` refuses on ERR34 forever
+    // and the pass has no legal move — and it is NOT `held`, so the finish
+    // held-publish phase (which filters action==='held') correctly skips it:
+    // nothing about the tree was verified, so nothing about it is proposed.
+    if (
+      (e.action === 'held' ||
+        e.action === 'resolved' ||
+        e.action === 'held-duplicate' ||
+        e.action === 'env-blocked') &&
+      e.caseId === caseId
+    )
       last = e;
   }
   return last;
@@ -9784,19 +9825,57 @@ export async function cmdSweepReportCase(
       const gateInstall = await installDeps(cli, wtPath, runInstall);
       if (!gateInstall.ok) {
         const f = gateInstall.failure;
+        const what = `\`${f.command}\` (in ${f.cwd}) failed with: ${f.output.slice(-600)}`;
+        // WHOSE FAULT IT IS DECIDES WHAT HAPPENS NEXT, and the two answers are
+        // opposites: one is work the agent can do, the other is a machine no
+        // code change reaches.
+        if (classifyInstallFailure(f.output) === 'resolution') {
+          const detail =
+            `the dependencies of YOUR RESOLUTION do not install: ${what} The checks did not run, so this is not ` +
+            `a failing check and nothing was counted against the case.`;
+          appendJournal(dir, {
+            action: 'install-refused',
+            id: ERR_MANIFEST_UNINSTALLABLE,
+            caseId,
+            branch: rc.branch,
+            install: f,
+            detail,
+          });
+          console.error(`report-case [${ERR_MANIFEST_UNINSTALLABLE}]: ${detail}`);
+          result(cli, {
+            tier: claimed,
+            issues: [...issues, { id: ERR_MANIFEST_UNINSTALLABLE, detail }],
+            instruction:
+              `FIX AND RETRY: the manifests in your worktree do not install. ${what} Make \`package.json\` and its ` +
+              `lockfile agree — usually by putting back a dependency edit the resolution dropped, or by not making ` +
+              `one at all. If the resolution genuinely CHANGES the dependencies, say so with \`--tier held\` and ` +
+              `name the change: regenerating a lockfile is not yours to decide. Then re-run report-case.`,
+          });
+          return 1;
+        }
+        // THE MACHINE. Terminal for the pass: nothing else in it can be checked
+        // either. The case is DISPOSED so it does not sit in `openCases` with
+        // `finish` refusing on ERR34 and no legal move left, and the branch +
+        // its descendants are reopened against the block the disposition puts
+        // on it — exactly what a HELD freeze does — so nothing below builds on
+        // a merge that never happened.
         const detail =
-          `dependencies would not install into the case worktree at ${wtPath} — the checks were NOT run and ` +
-          `nothing was counted against this case. \`${f.command}\` (in ${f.cwd}) failed with: ${f.output.slice(-600)}`;
+          `dependencies would not install into the case worktree at ${wtPath}, and the failure names the machine ` +
+          `rather than the manifests: ${what} The checks did not run. Nothing was counted against this case, and ` +
+          `no code change can fix this.`;
         appendJournal(dir, {
-          action: 'environment-unusable',
+          action: 'env-blocked',
           id: ERR_ENVIRONMENT_UNUSABLE,
           caseId,
           branch: rc.branch,
+          headSha: rc.head.sha,
+          gateFix: isGateFixCase,
           phase: 'checks-gate',
-          path: wtPath,
           install: f,
           detail,
         });
+        reopen(dir, reopenTargets);
+        writeMachineState(dir, { ...st, phase: 'open', currentCase: null });
         console.error(`report-case [${ERR_ENVIRONMENT_UNUSABLE}]: ${detail}`);
         result(cli, {
           ok: false,
@@ -9805,7 +9884,9 @@ export async function cmdSweepReportCase(
           tier: claimed,
           issues: [...issues, { id: ERR_ENVIRONMENT_UNUSABLE, detail }],
           instruction:
-            `REPORT to the owner: ${detail} Your resolution is untouched. Do NOT re-run until the owner says so.`,
+            `REPORT to the owner: ${detail} This case is closed as unjudgeable and ${rc.branch} is blocked for the ` +
+            `rest of the pass. Do NOT edit code and do NOT re-run report-case. Run \`finish\`, which will report ` +
+            `it under needsOwner, and stop.`,
         });
         return 1;
       }
@@ -11928,7 +12009,11 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   // sealed — the machine state stays `finishing` so a re-run finish retries
   // exactly the failed pushes/publishes (landed branches skip as up-to-date;
   // verify re-gates). Only a fully-landed finish completes the pass.
-  const anyFailures = pushFailures.length > 0 || publishFailures.length > 0;
+  // A CASE THE ENVIRONMENT MADE UNJUDGEABLE IS A FAILED PASS, not a complete
+  // one. It reached no verdict and its branch is blocked, so sealing the pass
+  // `complete` would say the sweep finished what it started.
+  const envBlockedCases = readJournal(dir).filter((e) => e.action === 'env-blocked');
+  const anyFailures = pushFailures.length > 0 || publishFailures.length > 0 || envBlockedCases.length > 0;
   if (!anyFailures) {
     if (!readJournal(dir).some((e) => e.action === 'pass-complete')) {
       appendJournal(dir, { action: 'pass-complete', watermark: ctx.watermark });
@@ -12004,13 +12089,24 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   // blocking non-push issues (ERR16/ERR17/token/API) from THIS run's push
   // phase — surfaced as their own SWEEP-RESULT fields, not merely categories,
   // so an autonomous re-run loop can stop re-trying what only the owner can fix.
-  const needsOwner = pushDelta
-    .filter((e) => e.action === 'push-escalated')
-    .map((e) => ({
+  const needsOwner = [
+    ...pushDelta
+      .filter((e) => e.action === 'push-escalated')
+      .map((e) => ({
+        branch: String(e.branch),
+        category: String(e.category ?? 'diverged'),
+        detail: String(e.detail ?? ''),
+      })),
+    // A broken machine is exactly this list's subject: only the owner can fix
+    // it, and re-running finish will not. Naming it here rather than letting
+    // the pass end on a bare ERR34 is the difference between "the owner has to
+    // repair the environment" and "cases remain, try again".
+    ...envBlockedCases.map((e) => ({
       branch: String(e.branch),
-      category: String(e.category ?? 'diverged'),
+      category: 'environment',
       detail: String(e.detail ?? ''),
-    }));
+    })),
+  ];
   const pushBlockingIssues = pushDelta
     .filter((e) => e.action === 'push-issue')
     .map((e) => ({ id: String(e.id), detail: String(e.detail) }));

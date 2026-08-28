@@ -108,8 +108,11 @@ values (§2.2).
   per held case / origin ref.
 - **DEFERRED** — computed, sticky (§5.2).
 - Within a pass the view is derived from the journal (`origin-blocked` / `held` /
-  `defer` rows, cleared by an `unfrozen` row); across passes it is derived from
-  ORIGIN (§5.1). It is never read from a local store.
+  `env-blocked` / `defer` rows, cleared by an `unfrozen` row); across passes it is
+  derived from ORIGIN (§5.1). It is never read from a local store. An
+  `env-blocked` row blocks like a `held` one and proposes nothing: no fix ref, no
+  PR — a case the environment made unjudgeable reached no verdict to publish, so
+  the block lasts the pass and nothing carries across (§7.1).
 
 The predicate the run and verify stages use is PR_ID only: a DEFERRED branch
 keeps its clean prefix and stays publishable, while a PR_ID branch is skipped
@@ -1101,6 +1104,28 @@ answers about a tree that no longer exists. The cost is one install per
 not run and no `checks-fail` is journaled: nothing is counted against a case
 whose gate never answered.
 
+WHOSE FAULT that install failure is decides what happens, and the two answers
+are opposites (`classifyInstallFailure`, `not-my-bug.ts`):
+
+- THE RESOLUTION'S — a manifest that no longer parses, or a lockfile that no
+  longer matches it under `--frozen-lockfile`. `ERR49_MANIFEST_UNINSTALLABLE`,
+  the case stays `case-ready`, and the agent is told what to make agree. It is
+  NOT `WARN14_ENVIRONMENT_FAULT` and it is NOT a checks failure. Who owns
+  regenerating a lockfile when a resolution legitimately changes dependencies is
+  NOT decided here: the agent is told to claim `--tier held` and name the change.
+- THE MACHINE'S — DNS, permissions, a package manager that will not spawn.
+  `ERR47_ENVIRONMENT_UNUSABLE`, and TERMINAL for the pass: nothing else in it can
+  be checked either. The case is DISPOSED (`env-blocked`) so it drains from
+  `openCases` instead of leaving `finish` refusing on ERR34 with no legal move,
+  the branch takes the same block a HELD freeze would put on it, and the branch
+  plus its descendants are reopened so their windows are trimmed at it. `finish`
+  reports the branch under `needsOwner` and the pass ends `partial`.
+
+An UNRECOGNISED install failure is the machine's. A wrong "resolution" verdict
+sends the agent to edit manifests over a dead network until the serve limit
+refuses it; a wrong "environment" verdict costs one owner report on a pass that
+could not have verified anything anyway.
+
 A failure writes `<caseDir>/typecheck-output.txt` or `test-output.txt`, journals
 `checks-fail`, and returns `ERR36_TYPECHECK_FAILED` / `ERR40_TESTS_FAILED` with
 "read the output, fix the pending files, re-run report-case". The phase stays
@@ -2059,7 +2084,8 @@ escalation's publish issues are written to `publish-<case>.json` and quoted into
 | `ERR43_CHECKS_MALFORMED` | `start`, `report-case`, `finish` | the checks file exists but does not parse (absent is a deliberate, silent skip) |
 | `ERR48_CASE_LOOPING` | `next-case` | the case has been served more than `CASE_SERVE_LIMIT` (4) times with no conclusion; the next serve is refused |
 | `ERR44_WORKTREE_RESET_FAILED` | `report-case` | the reset to the pristine conflict failed, before a held-pristine freeze or a checks-limit freeze |
-| `ERR47_ENVIRONMENT_UNUSABLE` | `run` (halt), `start`, gate-fix minting, `report-case` | dependencies would not install from committed, valid manifests; no case is served or judged in a tree with no environment |
+| `ERR47_ENVIRONMENT_UNUSABLE` | `run` (halt), `start`, gate-fix minting, `report-case` | dependencies would not install and the failure names the machine; no case is served or judged in a tree with no environment, and at the gate the case is disposed `env-blocked` and reported under `needsOwner` at finish |
+| `ERR49_MANIFEST_UNINSTALLABLE` | `report-case` | the checks gate could not install the RESOLUTION'S manifests (unparseable manifest / lockfile mismatch); no check ran, the case stays case-ready |
 | `ERR45_CUT_POINTS_MALFORMED` | gate-fix minting (`next-case`, `report-case`, `finish`) | the cut-point exceptions file exists but cannot be read or parsed; the detail travels on the `WARN09` result |
 | `WARN01_TEMPLATE_TEXT` | `report-pr`, publish | the body names no conflicted file, or carries a stock-template or foreign-template phrase |
 | `WARN02_NO_DECISION_LINE` | `report-pr`, publish | the first body line carries no ask or decision |

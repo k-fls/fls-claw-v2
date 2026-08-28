@@ -803,6 +803,122 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     expect(order.slice(1)).toEqual(['checks', 'checks']); // typecheck, then tests
   });
 
+  /**
+   * THE MANIFESTS AT THE GATE ARE THE AGENT'S. An install that fails on THEM is
+   * work the agent can do, and it is not a failing check: no check ran. Calling
+   * it an environment fault would stop the pass over a file the agent could fix
+   * in a line, and counting it against `CHECKS_FAIL_LIMIT` would spend the
+   * case's attempts on a gate that never answered.
+   */
+  it('a resolution whose manifests do not install is the AGENT\'S, and costs no check', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    const r = runner([]); // green if it ran — it must not run
+    const badManifest: InstallRunner = async () => ({
+      ok: false,
+      failure: {
+        command: 'pnpm install --frozen-lockfile',
+        cwd: '.',
+        output: 'EJSONPARSE  package.json: Unexpected token "<" in JSON at position 0',
+      },
+    });
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        neverInvoked, // the gate never answered, so the reviewer is never paid for
+        r.fn,
+        badManifest,
+      ),
+    ).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string; issues: Array<{ id: string }> };
+    const ids = res.issues.map((i) => i.id);
+    expect(ids).toContain('ERR49_MANIFEST_UNINSTALLABLE');
+    expect(ids).not.toContain('WARN14_ENVIRONMENT_FAULT');
+    expect(res.instruction).toContain('re-run report-case');
+    expect(r.ran).toHaveLength(0); // no check ran
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'checks-fail')).toBe(false);
+    // The case is still the agent's to finish, from the phase report-case needs.
+    expect(openCases(journal).map((c) => c.caseId)).toContain(caseId);
+    expect(machineState(dir).phase).toBe('case-ready');
+  });
+
+  /**
+   * AN INSTALL THAT FAILS ON THE MACHINE IS TERMINAL, and terminal has to mean
+   * DISPOSED. Refusing and leaving the case open puts it back in `openCases`
+   * with `finish` answering ERR34_CASES_REMAIN forever and no legal move left
+   * anywhere in the pass.
+   */
+  it('an install that fails on the MACHINE closes the case, trims what is below it, and finish hands it to the owner', async () => {
+    const repo = conflictFixture();
+    // A descendant, so "trimmed" is something the result can be asked about.
+    repo.checkout('module/dep', { create: true, at: 'main_patched' });
+    repo.commit('dep: its own edit', { 'src/dep.ts': 'dep\n' });
+    repo.checkout('main');
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'dep', branch: 'module/dep', parents: ['main_patched'] }]);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    repo.git('push', 'origin', 'module/dep');
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    const r = runner([]);
+    const deadNetwork: InstallRunner = async () => ({
+      ok: false,
+      failure: {
+        command: 'pnpm install --frozen-lockfile',
+        cwd: '.',
+        output: 'WARN GET https://registry.npmjs.org/yaml error (ENOTFOUND).\nERR_PNPM_META_FETCH_FAIL',
+      },
+    });
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        neverInvoked,
+        r.fn,
+        deadNetwork,
+      ),
+    ).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string }> };
+    expect(res.issues.map((i) => i.id)).toContain('ERR47_ENVIRONMENT_UNUSABLE');
+    expect(r.ran).toHaveLength(0);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'checks-fail')).toBe(false);
+    expect(journal.some((e) => e.action === 'env-blocked' && e.caseId === caseId)).toBe(true);
+    // DISPOSED — and reopened exactly as a held freeze reopens.
+    expect(openCases(journal).map((c) => c.caseId)).not.toContain(caseId);
+    const reopened = journal.filter((e) => e.action === 'reopened').map((e) => e.branch);
+    expect(reopened).toContain('main_patched');
+    expect(reopened).toContain('module/dep');
+
+    const cmds = join(ws, 'cmds.json');
+    writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }]));
+    const finOut = join(ws, 'fin.json');
+    await cmdSweepFinish(
+      baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, tokenFile, commandsFile: cmds, out: finOut }),
+      fakeGithub().factory,
+    );
+    const fin = JSON.parse(readFileSync(finOut, 'utf8')) as {
+      issues?: Array<{ id: string }>;
+      needsOwner?: Array<{ branch: string; category: string }>;
+      coverage?: { excluded: Array<{ branch: string }> };
+    };
+    // NOT a bare "cases remain": the owner is named a machine to repair.
+    expect((fin.issues ?? []).map((i) => i.id)).not.toContain('ERR34_CASES_REMAIN');
+    expect((fin.needsOwner ?? []).map((n) => `${n.branch}:${n.category}`)).toContain('main_patched:environment');
+    // The block is real: the branch and everything under it are out of the build.
+    const excluded = (fin.coverage?.excluded ?? []).map((x) => x.branch);
+    expect(excluded).toContain('main_patched');
+    expect(excluded).toContain('module/dep');
+  });
+
   it('typecheck RED -> ERR36 (fix + re-run), tests never run, NO cold read, NO report-attempt, still case-ready', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();

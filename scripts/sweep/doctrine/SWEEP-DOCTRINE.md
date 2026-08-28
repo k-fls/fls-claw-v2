@@ -221,10 +221,22 @@ something you reasoned about.
 
 ## 8. The checks gate
 
-`report-case` on a resolved case snapshots the worktree, then runs the project's
-typecheck and then its tests inside it, before anything else looks at your work.
-Failures come back as follows.
+`report-case` on a resolved case snapshots the worktree, installs its
+dependencies from the manifests YOUR RESOLUTION left there, then runs the
+project's typecheck and then its tests inside it, before anything else looks at
+your work. Failures come back as follows.
 
+- `ERR49_MANIFEST_UNINSTALLABLE` — the install itself failed on the manifests, so
+  no check ran and nothing was counted against the case. This is yours: make
+  `package.json` and its lockfile agree again, usually by restoring a dependency
+  edit the resolution dropped, then run `report-case` again. If the resolution
+  genuinely CHANGES the dependencies, do not regenerate a lockfile — claim
+  `--tier held`, name the change, and let the owner decide.
+- `ERR47_ENVIRONMENT_UNUSABLE` — the install failed on the MACHINE (no network, no
+  permissions, no package manager), not on the files. No code change reaches it.
+  The case is closed as unjudgeable and its branch is blocked for the rest of the
+  pass; do not edit anything and do not re-run `report-case`. Run `finish` — it
+  reports the branch under `needsOwner` — and stop.
 - `ERR36_TYPECHECK_FAILED` or `ERR40_TESTS_FAILED`, with the path to the output: read
   it, fix the pending files, run `report-case` again. A failed check is not a failed
   attempt and costs you nothing.
