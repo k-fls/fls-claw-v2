@@ -768,6 +768,41 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     return { dir, caseId };
   }
 
+  /**
+   * THE GATE MEASURES THE TREE IT IS JUDGING, ENVIRONMENT INCLUDED.
+   *
+   * The prep install ran on the clean prefix, where a conflicted `package.json`
+   * was still the base commit's. By report-case the agent has resolved it, so a
+   * dependency the resolution adds or drops exists only here — and a gate run
+   * against the prep environment answers about a tree that no longer exists.
+   */
+  it('installs into the case worktree BEFORE the gate runs', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    const order: string[] = [];
+    const install: InstallRunner = async (wt) => {
+      order.push(`install ${wt}`);
+      return { ok: true };
+    };
+    const runChecks: ChecksRunner = async () => {
+      order.push('checks');
+      return { ok: true, failedNames: [], output: '' };
+    };
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true }),
+        confirm,
+        runChecks,
+        install,
+      ),
+    ).toBe(0);
+    expect(order[0]).toBe(`install ${join(dir, caseId, 'worktree')}`);
+    expect(order.slice(1)).toEqual(['checks', 'checks']); // typecheck, then tests
+  });
+
   it('typecheck RED -> ERR36 (fix + re-run), tests never run, NO cold read, NO report-attempt, still case-ready', async () => {
     const repo = conflictFixture();
     const ws = mkWorkspace();

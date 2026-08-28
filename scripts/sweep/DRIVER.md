@@ -1092,6 +1092,15 @@ worktree, because a merge propagates content whether or not a case was involved.
 pinned `checks.json` (host + runner lists; a missing file or an empty list skips
 that gate silently, a malformed file is `ERR43_CHECKS_MALFORMED`, §6.1).
 
+DEPENDENCIES ARE INSTALLED FIRST, into that same worktree. The prep install
+(§6.3) ran on the clean prefix, where a conflicted manifest was still the base
+commit's; by now the agent has resolved it, so a dependency the resolution adds,
+drops or moves exists only here — and a gate run against the prep environment
+answers about a tree that no longer exists. The cost is one install per
+`report-case` INVOCATION, and a case can have many. When it FAILS the checks do
+not run and no `checks-fail` is journaled: nothing is counted against a case
+whose gate never answered.
+
 A failure writes `<caseDir>/typecheck-output.txt` or `test-output.txt`, journals
 `checks-fail`, and returns `ERR36_TYPECHECK_FAILED` / `ERR40_TESTS_FAILED` with
 "read the output, fix the pending files, re-run report-case". The phase stays

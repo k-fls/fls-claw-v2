@@ -9767,6 +9767,49 @@ export async function cmdSweepReportCase(
   }
   const checks = loadChecksConfig(checksFile);
   if (checks) {
+    // THE ENVIRONMENT THE CHECKS RUN IN COMES FROM THE RESOLVED MANIFESTS.
+    //
+    // The prep install ran on the clean prefix, where a conflicted
+    // `package.json` was still the base commit's. By now the agent has resolved
+    // it, so a dependency the resolution adds, drops or moves exists only here
+    // — and a gate run against the prep environment is a statement about a tree
+    // that no longer exists. This is the install that decides the verdict.
+    //
+    // It costs one install per `report-case` INVOCATION, and a case can have
+    // many. That is the price of the gate measuring the tree it is judging.
+    //
+    // A failure here is not automatically the machine: the manifests it reads
+    // are the AGENT'S now. `classifyInstallFailure` says whose it is.
+    if (checks.typecheck.length + checks.test.length > 0) {
+      const gateInstall = await installDeps(cli, wtPath, runInstall);
+      if (!gateInstall.ok) {
+        const f = gateInstall.failure;
+        const detail =
+          `dependencies would not install into the case worktree at ${wtPath} — the checks were NOT run and ` +
+          `nothing was counted against this case. \`${f.command}\` (in ${f.cwd}) failed with: ${f.output.slice(-600)}`;
+        appendJournal(dir, {
+          action: 'environment-unusable',
+          id: ERR_ENVIRONMENT_UNUSABLE,
+          caseId,
+          branch: rc.branch,
+          phase: 'checks-gate',
+          path: wtPath,
+          install: f,
+          detail,
+        });
+        console.error(`report-case [${ERR_ENVIRONMENT_UNUSABLE}]: ${detail}`);
+        result(cli, {
+          ok: false,
+          status: 'stopped',
+          stoppedAt: 'checks-install',
+          tier: claimed,
+          issues: [...issues, { id: ERR_ENVIRONMENT_UNUSABLE, detail }],
+          instruction:
+            `REPORT to the owner: ${detail} Your resolution is untouched. Do NOT re-run until the owner says so.`,
+        });
+        return 1;
+      }
+    }
     for (const kind of ['typecheck', 'test'] as const) {
       const list = checks[kind];
       if (list.length === 0) continue;
