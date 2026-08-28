@@ -1558,6 +1558,55 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     expect(res.instruction).toContain('src/util.ts');
   });
 
+  /**
+   * THE PROBE COMPARES TREES, NOT ENVIRONMENTS.
+   *
+   * Every COMMIT target the probe measures is installed into first. Taking the
+   * case worktree as it stands puts a dependency-full baseline against a
+   * dependency-less case tree, and every environment red in the case tree then
+   * reads as "caused by the case" — a whole suite blamed on a resolution that
+   * touched three files.
+   */
+  it('the probe measures the case worktree with dependencies, like every other target', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    seedPriorFailure(dir, caseId, 'typecheck', ['tsc --noEmit']);
+    const wtPath = join(dir, caseId, 'worktree');
+    const installedIn: string[] = [];
+    const install: InstallRunner = async (d) => {
+      installedIn.push(d);
+      mkdirSync(join(d, 'node_modules'), { recursive: true });
+      return { ok: true };
+    };
+    const checkedIn: string[] = [];
+    const fn: ChecksRunner = async (commands, baseDir) => {
+      checkedIn.push(baseDir);
+      if (baseDir !== wtPath) return { ok: true, failedNames: [], output: '' };
+      return {
+        ok: false,
+        failedNames: ['tsc --noEmit'],
+        output: '$ tsc --noEmit\nsrc/util.ts(1,1): error TS2345: boom\n',
+      };
+    };
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true }),
+        neverInvoked,
+        fn,
+        install,
+      ),
+    ).toBe(1);
+    // The probe re-runs the case worktree as its third target. No tree is ever
+    // measured without an environment...
+    for (const d of checkedIn) expect(installedIn).toContain(d);
+    // ...and the case worktree gets one of its own: the gate's, then the probe's.
+    expect(installedIn.filter((d) => d === wtPath)).toHaveLength(2);
+    expect(checkedIn).toContain(wtPath);
+  });
+
   it('minting a gate fix SUPERSEDES the descendants’ open cases, so only the fix is left to serve', async () => {
     // Open cases ahead of the gate fix, each merging from a branch that carries
     // the red commit, would each fail the

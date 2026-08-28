@@ -2209,6 +2209,8 @@ function makeSubsetProbe(
 ): { probe: SubsetProbe; runs: ProbeRun[]; dispose: () => Promise<void> } {
   const runs: ProbeRun[] = [];
   let wt: { path: string; remove: () => Promise<void> } | null = null;
+  /** The case worktree is installed ONCE: unlike a commit target, it never changes here. */
+  let caseWorktreeInstalled = false;
   const probe: SubsetProbe = async (target, files) => {
     const cmds = opts.narrow ? subsetCommands(commands, files) : commands;
     const empty = { usable: false, counts: new Map<string, number>(), output: '' };
@@ -2218,6 +2220,19 @@ function makeSubsetProbe(
     }
     let baseDir: string;
     if (target.kind === 'worktree') {
+      // BOTH SIDES OF THE COMPARISON ARE THE SAME KIND OF TREE. Every commit
+      // target below is installed before it is measured; taking the case
+      // worktree as it stands measures a dependency-FULL baseline against a
+      // dependency-LESS case tree, and every environment red in the case tree
+      // then reads as "caused by the case" — which is a whole suite blamed on a
+      // resolution that touched three files.
+      if (!caseWorktreeInstalled) {
+        if (!(await installDeps(cli, caseWorktree, runInstall)).ok) {
+          runs.push({ target: 'worktree', files, usable: false, failing: [] });
+          return empty;
+        }
+        caseWorktreeInstalled = true;
+      }
       baseDir = caseWorktree;
     } else {
       try {

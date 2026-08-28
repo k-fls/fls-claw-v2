@@ -1213,6 +1213,12 @@ adjudicate at all. The claim decides nothing by itself: the driver adjudicates i
   damaging error is the false REFUSE, so every refusing observation is re-run —
   a second baseline probe over the still-uncovered files, then a re-run of the
   resolved tree itself.
+- **EVERY TARGET IS INSTALLED, THE CASE WORKTREE INCLUDED.** A commit target gets
+  its dependencies from its own tree's manifests; the case worktree gets its own
+  install too (once — unlike a commit target it does not change between probes).
+  Measuring a dependency-full baseline against a dependency-less case tree makes
+  every environment red in the case tree read as `caused-by-case`, which is a
+  whole suite blamed on a resolution that touched three files.
 
 Verdicts: `pre-existing` → the ownership probe below; `caused-by-case` (still
 uncovered after both baseline probes and still failing on the worktree re-run) →
