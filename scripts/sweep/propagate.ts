@@ -2206,7 +2206,7 @@ function makeSubsetProbe(
           });
           for (const rel of WORKTREE_DEP_LINKS) rmSync(join(wt.path, rel), { recursive: true, force: true });
         }
-        if (!(await installDeps(cli, wt.path, runInstall))) {
+        if (!(await installDeps(cli, wt.path, runInstall)).ok) {
           runs.push({ target: target.sha.slice(0, 12), files, usable: false, failing: [] });
           return empty;
         }
@@ -2601,27 +2601,53 @@ async function excludeInWorktree(repo: string, wtPath: string, patterns: string[
  * only), and without the exclude they land in the resolved tree, the merge and
  * the PR.
  */
-async function installDeps(cli: Cli, wtPath: string, runInstall?: InstallRunner): Promise<boolean> {
+async function installDeps(cli: Cli, wtPath: string, runInstall?: InstallRunner): Promise<InstallResult> {
   await excludeInWorktree(cli.repo, wtPath, WORKTREE_DEP_LINKS);
   return (runInstall ?? cli.installRunner ?? defaultInstallRunner)(wtPath);
+}
+
+/**
+ * How many characters of a failed install's output are kept.
+ *
+ * Enough for the package manager's error code and the sentence after it, which
+ * is the whole of what anything downstream reads; a failing install can print
+ * megabytes of resolution trace, and a journal is not a log file.
+ */
+const INSTALL_OUTPUT_TAIL = 2000;
+
+/**
+ * WHAT AN INSTALL FAILURE WAS.
+ *
+ * A bare "it failed" cannot be acted on: a manifest the resolution wrote badly
+ * and a machine with no network are the same fact at that grain, and they have
+ * opposite dispositions — one is the agent's to fix, the other is the owner's.
+ * The package manager says which in its own output, so the output travels.
+ */
+export interface InstallFailure {
+  /** The command as it was run. */
+  command: string;
+  /** Where it ran, relative to the worktree root (`.` at the root). */
+  cwd: string;
+  /** The tail of what it printed, bounded by `INSTALL_OUTPUT_TAIL`. */
+  output: string;
 }
 
 /**
  * Runs the installs for a prepared worktree. Injectable so tests never spawn a
  * real pnpm/bun.
  *
- * Returns FALSE for any failure. There is no fallback: a tree whose dependencies
- * could not be installed has NO valid environment, and a check run in it is an
- * inadmissible observation — not evidence about the code. Falling back to the
- * clone's `node_modules` is exactly how an environment gap becomes a `TS2307`
- * blamed on a branch.
+ * There is no fallback: a tree whose dependencies could not be installed has NO
+ * valid environment, and a check run in it is an inadmissible observation — not
+ * evidence about the code. Falling back to the clone's `node_modules` is exactly
+ * how an environment gap becomes a `TS2307` blamed on a branch.
  */
-export type InstallRunner = (worktree: string) => Promise<boolean>;
+export type InstallResult = { ok: true } | { ok: false; failure: InstallFailure };
+export type InstallRunner = (worktree: string) => Promise<InstallResult>;
 
 const defaultInstallRunner: InstallRunner = async (dir) => {
-  const run = async (cmd: string, cwd: string): Promise<boolean> => {
+  const run = async (command: string, cwd: string, rel: string): Promise<InstallResult> => {
     try {
-      await promisify(execFile)('bash', ['-c', cmd], {
+      await promisify(execFile)('bash', ['-c', command], {
         cwd,
         maxBuffer: 64 * 1024 * 1024,
         // corepack needs a writable HOME (it resolves the repo's
@@ -2631,19 +2657,29 @@ const defaultInstallRunner: InstallRunner = async (dir) => {
         // `EACCES … /.cache/node/corepack`.
         env: { ...process.env, HOME: process.env.HOME || tmpdir() },
       });
-      return true;
-    } catch {
-      return false;
+      return { ok: true };
+    } catch (e) {
+      // stderr AND stdout: pnpm prints its error code on stderr, bun and the
+      // native build steps print theirs on stdout, and a spawn failure that
+      // never reached a shell has neither — only the error's own message. All
+      // three are the same question ("what happened"), so all three are kept.
+      const err = e as { stderr?: string; stdout?: string; message?: string };
+      const text = `${err.stderr ?? ''}${err.stdout ?? ''}` || err.message || String(e);
+      return { ok: false, failure: { command, cwd: rel, output: text.slice(-INSTALL_OUTPUT_TAIL) } };
     }
   };
   // NO `--ignore-scripts`: it skips the NATIVE BUILD, so `better-sqlite3` never
   // compiles its addon and every suite that opens a database fails at require
   // time. These are the fork's own lockfiles; the flag is untrusted-code defence
   // that buys nothing here and breaks the tree it is meant to protect.
-  if (!(await run('pnpm install --frozen-lockfile', dir))) return false;
+  const root = await run('pnpm install --frozen-lockfile', dir, '.');
+  if (!root.ok) return root;
   const ar = join(dir, 'container', 'agent-runner');
-  if (existsSync(join(ar, 'package.json')) && !(await run('bun install --frozen-lockfile', ar))) return false;
-  return true;
+  if (existsSync(join(ar, 'package.json'))) {
+    const runner = await run('bun install --frozen-lockfile', ar, 'container/agent-runner');
+    if (!runner.ok) return runner;
+  }
+  return { ok: true };
 };
 
 /**
@@ -2658,14 +2694,14 @@ export interface WorktreePrep {
   /** The worktree exists at the case path with its pending conflict in it. */
   ok: boolean;
   /**
-   * The dependency install failed. Everything installed here comes from
-   * COMMITTED, parseable manifests (the clean prefix), so the failure is about
-   * the MACHINE and never about the conflict or a resolution. A case served
-   * into a tree with no environment produces check results that are not
-   * evidence about the code, so a caller that would SERVE this case must
-   * refuse instead.
+   * The dependency install failed, and WHAT failed. Everything installed here
+   * comes from COMMITTED, parseable manifests (the clean prefix), so the
+   * failure is about the MACHINE and never about the conflict or a resolution.
+   * A case served into a tree with no environment produces check results that
+   * are not evidence about the code, so a caller that would SERVE this case
+   * must refuse instead.
    */
-  environment: boolean;
+  environment: InstallFailure | null;
 }
 
 /**
@@ -2728,10 +2764,12 @@ export async function createCaseWorktree(
     // the conflict. The manifests the checks must run against are the RESOLVED
     // ones, which do not exist yet at this point: the gate re-installs in this
     // same worktree at `report-case` (§7.1), after the agent has resolved them.
-    if ((opts.install ?? true) && !(await installDeps(cli, wtPath, runInstall))) {
+    const install = (opts.install ?? true) ? await installDeps(cli, wtPath, runInstall) : ({ ok: true } as InstallResult);
+    if (!install.ok) {
       const detail =
         `dependencies would not install into the case worktree at ${wtPath}, from the base commit's own ` +
-        `committed manifests — the environment is broken, not the tree`;
+        `committed manifests — the environment is broken, not the tree: \`${install.failure.command}\` ` +
+        `(in ${install.failure.cwd}) failed with: ${install.failure.output.slice(-400)}`;
       appendJournal(dir, {
         action: 'environment-unusable',
         id: ERR_ENVIRONMENT_UNUSABLE,
@@ -2739,10 +2777,11 @@ export async function createCaseWorktree(
         branch: caseFile.branch,
         phase: 'case-worktree',
         path: wtPath,
+        install: install.failure,
         detail,
       });
       console.error(`[${ERR_ENVIRONMENT_UNUSABLE}]: ${detail}`);
-      return { ok: false, environment: true };
+      return { ok: false, environment: install.failure };
     }
     // Materialize the conflicted paths as PENDING working-tree changes: write the
     // automerge (marker) blob to disk without staging, or delete the file when the
@@ -2775,14 +2814,14 @@ export async function createCaseWorktree(
       pendingPaths: [...caseFile.conflictedPaths, ...(caseFile.carriedPaths ?? [])],
       ...(contentSource ? { contentSource } : {}),
     });
-    return { ok: true, environment: false };
+    return { ok: true, environment: null };
   } catch (e) {
     appendJournal(dir, {
       action: 'warning',
       caseId: caseFile.id,
       message: `case worktree creation failed: ${e instanceof Error ? e.message : String(e)}`,
     });
-    return { ok: false, environment: false };
+    return { ok: false, environment: null };
   }
 }
 
@@ -3065,7 +3104,8 @@ async function landingCheck(
     // Dependencies come from THIS tree's manifests: a branch that declares its
     // own package must not be measured against the clone's node_modules, and an
     // environment that will not install yields no verdict at all.
-    if (!(await installDeps(cli, wt.path, runInstall))) {
+    const install = await installDeps(cli, wt.path, runInstall);
+    if (!install.ok) {
       appendJournal(dir, {
         action: 'landing-check',
         branch,
@@ -3074,8 +3114,15 @@ async function landingCheck(
         ran: false,
         reason: 'deps-unusable',
         id: 'WARN13_DEPS_UNUSABLE',
+        // WHAT failed, not merely THAT it did: a manifest the tree carries and a
+        // machine with no network are the same row without it, and they are not
+        // the same problem.
+        install: install.failure,
       });
-      console.error(`run [WARN13_DEPS_UNUSABLE]: ${branch} dependencies would not install — landing NOT checked`);
+      console.error(
+        `run [WARN13_DEPS_UNUSABLE]: ${branch} dependencies would not install — landing NOT checked: ` +
+          `\`${install.failure.command}\` failed with: ${install.failure.output.slice(-400)}`,
+      );
       return { kind: 'unmeasured' };
     }
     // Typecheck FIRST: it is the cheap check and its diagnostics are what make a
@@ -5827,7 +5874,7 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     // manifests are the MERGED ones and nothing else can describe them.
     // (Linking the clone's trees instead would be the same environment gap.)
     prepareWorktree: async (wtPath: string) => {
-      const ok = await installDeps(cli, wtPath);
+      const ok = (await installDeps(cli, wtPath)).ok;
       return ok ? WORKTREE_DEP_LINKS : [];
     },
   };
@@ -7310,7 +7357,7 @@ async function mergedChecksGreen(
   const probe = await deterministicCommit(cli.repo, mergedTree, parents, 'sweep: checks probe on the merged tree');
   const wt = await addTempWorktree(cli.repo, probe);
   try {
-    if (!(await installDeps(cli, wt.path))) return green;
+    if (!(await installDeps(cli, wt.path)).ok) return green;
     const first = await runChecks(checks.typecheck, wt.path);
     if (first.environmentFault) {
       return { green: false, undecided: { id: 'WARN14_ENVIRONMENT_FAULT', detail: first.environmentFault.detail } };
@@ -8439,11 +8486,21 @@ export async function firstRedParticipant(
         await git(cli.repo, ['reset', '--hard', sha], { cwd: wt.path });
         for (const rel of WORKTREE_DEP_LINKS) rmSync(join(wt.path, rel), { recursive: true, force: true });
       }
-      if (!(await installDeps(cli, wt.path, runInstall))) {
+      const install = await installDeps(cli, wt.path, runInstall);
+      if (!install.ok) {
         // No valid environment ⇒ no verdict. Memoising this as a pass would skip
         // the branch's only typecheck for the whole pass (a bogus GREEN is the
         // durable one — it ships), and as a failure it would blame the branch.
-        appendJournal(dir, { action: 'warning', id: 'WARN13_DEPS_UNUSABLE', branch, sha, message: `dependencies would not install for ${branch}@${sha.slice(0, 12)} — not checked` });
+        appendJournal(dir, {
+          action: 'warning',
+          id: 'WARN13_DEPS_UNUSABLE',
+          branch,
+          sha,
+          install: install.failure,
+          message:
+            `dependencies would not install for ${branch}@${sha.slice(0, 12)} — not checked: ` +
+            `\`${install.failure.command}\` failed with: ${install.failure.output.slice(-400)}`,
+        });
         console.error(`next-case [WARN13_DEPS_UNUSABLE]: ${branch} dependencies would not install — branch NOT checked`);
         continue;
       }
@@ -11056,7 +11113,8 @@ async function materializeGateFixCases(
     // NO ENVIRONMENT, NO CASE. A gate fix exists to turn a failing check green;
     // minted into a tree whose dependencies would not install, its gate can
     // never answer, and it would sit in `openCases` blocking `finish`.
-    if ((await createGateFixWorktree(cli, dir, caseId, tip)).environment) {
+    const gateFixPrep = await createGateFixWorktree(cli, dir, caseId, tip);
+    if (gateFixPrep.environment) {
       envBlocked.push(g.branch);
       appendJournal(dir, {
         action: 'gate-fix-skipped',
@@ -11064,9 +11122,11 @@ async function materializeGateFixCases(
         owner: g.branch,
         skipped: g.branch,
         skippedFiles: g.files,
+        install: gateFixPrep.environment,
         detail:
           `dependencies would not install into the fix worktree for ${g.branch} at ${tip.slice(0, 12)}, from its ` +
-          `own committed manifests — no case was minted, because its checks gate could never answer`,
+          `own committed manifests — no case was minted, because its checks gate could never answer: ` +
+          `\`${gateFixPrep.environment.command}\` failed with: ${gateFixPrep.environment.output.slice(-400)}`,
       });
       console.error(`gate-fix [${ERR_ENVIRONMENT_UNUSABLE}]: ${g.branch} fix worktree has no dependencies — not minting`);
       continue;
@@ -11187,8 +11247,9 @@ async function createGateFixWorktree(cli: Cli, dir: string, caseId: string, tip:
   await git(cli.repo, ['worktree', 'prune'], { allowCodes: [1, 128] });
   rmSync(wtPath, { recursive: true, force: true });
   await git(cli.repo, ['worktree', 'add', '--detach', wtPath, tip]);
-  if (!(await installDeps(cli, wtPath))) return { ok: false, environment: true };
-  return { ok: true, environment: false };
+  const install = await installDeps(cli, wtPath);
+  if (!install.ok) return { ok: false, environment: install.failure };
+  return { ok: true, environment: null };
 }
 
 /** One related PR in a finished pass's owner-facing summary. */

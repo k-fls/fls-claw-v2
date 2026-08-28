@@ -185,7 +185,7 @@ const fakeInstall: InstallRunner = async (wt) => {
     mkdirSync(join(wt, rel), { recursive: true });
     writeFileSync(join(wt, rel, 'tsc'), '#!/bin/sh\nexit 0\n');
   }
-  return true;
+  return { ok: true };
 };
 
 const confirm: ColdReadInvoker = async () => ({

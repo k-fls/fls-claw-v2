@@ -102,7 +102,7 @@ function branchlessInventory(): string {
  */
 const fakeInstall: InstallRunner = async (dir) => {
   mkdirSync(join(dir, 'node_modules'), { recursive: true });
-  return true;
+  return { ok: true };
 };
 
 function baseCli(repo: FixtureRepo, ws: string, inv: string, over: Partial<Cli> = {}): Cli {

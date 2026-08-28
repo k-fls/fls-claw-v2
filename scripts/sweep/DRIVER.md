@@ -973,6 +973,13 @@ Two more things are installed into every case worktree:
   freeze) install NOTHING: they end the case, run no checks and hand the tree to
   nobody, so a broken machine cannot turn a legal freeze into a stuck case.
 
+  Every install failure carries WHAT failed — the command, the directory it ran
+  in relative to the worktree root, and a bounded tail of what it printed — and
+  every row that records one carries it too (`environment-unusable`,
+  `gate-fix-skipped`, `landing-check`, the `WARN13_DEPS_UNUSABLE` warning).
+  Without it a manifest fault and a machine fault are the same row, and they
+  have opposite dispositions.
+
 Materials (`<caseDir>/materials.md`, plus `pr/materials.md` and a per-case
 `pr/TEMPLATE.md`) are driver-authored facts only: the reading contract, the
 conflicted paths, branch/parent/head/run/pending-above, the standing records

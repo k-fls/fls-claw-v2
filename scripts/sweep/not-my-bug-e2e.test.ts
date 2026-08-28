@@ -52,7 +52,7 @@ const confirm: ColdReadInvoker = async () => ({ verdict: 'confirm', notes: 'both
 /** No network install; the fixture's trees declare manifests, so a pool must exist. */
 const fakeInstall: InstallRunner = async (dir) => {
   mkdirSync(join(dir, 'node_modules'), { recursive: true });
-  return true;
+  return { ok: true };
 };
 
 function tmp(prefix: string): string {

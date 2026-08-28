@@ -23,6 +23,7 @@ import {
   failureSummary,
   firstRedParticipant,
   guardRef,
+  type InstallResult,
   type InstallRunner,
 } from './propagate.js';
 import {
@@ -117,9 +118,15 @@ function writeRouting(mode: string): string {
  * every fixture that walks the case loop must carry this seam or it is testing
  * the refusal instead of the thing it names.
  */
+/** A failure with no manifest in it: the machine, never the tree. */
+const envInstallFailure: InstallResult = {
+  ok: false,
+  failure: { command: 'pnpm install --frozen-lockfile', cwd: '.', output: 'ENOTFOUND registry.npmjs.org' },
+};
+
 const fakeInstall: InstallRunner = async (dir) => {
   mkdirSync(join(dir, 'node_modules'), { recursive: true });
-  return true;
+  return { ok: true };
 };
 
 function baseCli(repo: FixtureRepo, ws: string, inv: string | null, over: Partial<Cli> = {}): Cli {
@@ -212,7 +219,7 @@ describe('a case is not opened into a tree whose dependencies would not install'
     expect(await cmdSweepStart(baseCli(repo, ws, inv, { cmd: 'sweep-start' }))).toBe(0);
     const out = join(ws, 'nc.json');
     const rc = await cmdSweepNextCase(
-      baseCli(repo, ws, inv, { cmd: 'next-case', execute: true, out, installRunner: async () => false }),
+      baseCli(repo, ws, inv, { cmd: 'next-case', execute: true, out, installRunner: async () => envInstallFailure }),
     );
     expect(rc).not.toBe(0);
     const journal = readJournal(dir);
@@ -224,6 +231,49 @@ describe('a case is not opened into a tree whose dependencies would not install'
     // The id reaches the agent, or it has nothing to look the refusal up under.
     const res = JSON.parse(readFileSync(out, 'utf8')) as { issues?: Array<{ id: string }> };
     expect((res.issues ?? []).map((i) => i.id)).toContain('ERR47_ENVIRONMENT_UNUSABLE');
+  });
+
+  /**
+   * "IT FAILED" IS NOT AN ANSWER. A manifest a resolution wrote badly and a
+   * machine with no network are the same fact at that grain, and they have
+   * opposite dispositions — one is the agent's to fix, the other is the
+   * owner's. Nothing downstream can tell them apart without the command that
+   * failed and what it printed, so the journal carries both.
+   */
+  it('journals the failing command and a bounded tail of its output', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { cmd: 'sweep-start' }))).toBe(0);
+    await cmdSweepNextCase(
+      baseCli(repo, ws, inv, { cmd: 'next-case', execute: true, installRunner: async () => envInstallFailure }),
+    );
+    const row = readJournal(dir).find((e) => e.action === 'environment-unusable')!;
+    expect(row.install).toEqual(envInstallFailure.ok ? undefined : envInstallFailure.failure);
+    expect(String(row.detail)).toContain('ENOTFOUND');
+  });
+
+  /**
+   * The REAL runner, not a stub: a fixture tree carries no lockfile, so
+   * `pnpm install --frozen-lockfile` fails in it, and what it says has to
+   * survive the trip into the journal.
+   */
+  it('the real installer reports which command failed and what it printed', async () => {
+    const { repo } = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { cmd: 'sweep-start' }))).toBe(0);
+    // No `installRunner`: the driver spawns its own package manager.
+    await cmdSweepNextCase({ ...baseCli(repo, ws, inv, { cmd: 'next-case', execute: true }), installRunner: undefined });
+    const row = readJournal(dir).find((e) => e.action === 'environment-unusable');
+    expect(row).toBeTruthy();
+    const install = row!.install as { command: string; cwd: string; output: string };
+    expect(install.command).toBe('pnpm install --frozen-lockfile');
+    expect(install.cwd).toBe('.');
+    expect(install.output.length).toBeGreaterThan(0);
+    expect(install.output.length).toBeLessThanOrEqual(2000);
   });
 });
 
@@ -3340,7 +3390,7 @@ describe('dependencies are installed INTO the worktree, from ITS OWN manifests',
     const install: InstallRunner = async (wt) => {
       seen.push(readFileSync(join(wt, 'package.json'), 'utf8'));
       mkdirSync(join(wt, 'node_modules'), { recursive: true });
-      return true;
+      return { ok: true };
     };
     const cli = { repo: repo.dir, workspace: ws, upstream: 'main', execute: true, cmd: 'plan' } as Cli;
     const dir = join(ws, 'p');
@@ -3396,7 +3446,7 @@ describe('dependencies are installed INTO the worktree, from ITS OWN manifests',
     const install: InstallRunner = async (wt) => {
       seen.push(readFileSync(join(wt, 'package.json'), 'utf8'));
       mkdirSync(join(wt, 'node_modules'), { recursive: true });
-      return true;
+      return { ok: true };
     };
     const cli = { repo: repo.dir, workspace: ws, upstream: 'main', execute: true, cmd: 'plan' } as Cli;
     const dir = join(ws, 'p');
@@ -3451,7 +3501,7 @@ describe('dependencies are installed INTO the worktree, from ITS OWN manifests',
         ranChecks++;
         return { ok: false, failedNames: ['tsc'], output: 'boom' };
       },
-      async () => false, // the install fails
+      async () => envInstallFailure, // the install fails
     );
     // No branch is accused, and the checks never ran in an environment we do not
     // trust. A bogus GREEN here is the durable one — `branch-check` memoises it
