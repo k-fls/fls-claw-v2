@@ -35,6 +35,7 @@ import {
   type HostInteractionContext,
   type InteractionOrigin,
 } from '../../../host-interactions.js';
+import { deliverDirect } from '../../../delivery.js';
 import { log } from '../../../log.js';
 import { lookupContainerSession } from '../../container-bootstrap/index.js';
 import { openInboundDb } from '../../../session-manager.js';
@@ -187,21 +188,27 @@ export const oauthInteractive: OAuthEvents = {
       if (sourceIP) endAuthEpisodeByContainerIP(sourceIP);
       return;
     }
-    try {
-      resolved.origin.writeReply(
-        shadowWarning(providerId, borrowedFrom) +
-          `🔐 *${providerId}* wants to authorize.\n\n` +
-          `Open ${verificationUri} and enter this code:\n\n\`${userCode}\`\n\n` +
-          'Once you approve in the browser, the agent will pick up the credential automatically.',
-      );
-      log.info('oauth.device-code: relayed', { providerId, recipient: resolved.recipient, via: resolved.via });
-      // eslint-disable-next-line no-catch-all/no-catch-all -- delivery failure must end the episode, whatever its cause
-    } catch (err) {
-      // Best-effort delivery that silently drops would leave the user waiting
-      // out the auth container's lifetime cap with no explanation.
-      log.warn('oauth.device-code: could not deliver the code — ending the episode', { providerId, sourceIP, err });
-      if (sourceIP) endAuthEpisodeByContainerIP(sourceIP);
-    }
+    // Addressed through `deliverDirect` rather than `origin.writeReply` because
+    // only the former reports the outcome: a silent drop would leave the user
+    // waiting out the auth container's lifetime cap with no explanation.
+    const { channelType, platformId, threadId } = resolved.origin.replyAddr;
+    deliverDirect(
+      channelType,
+      platformId,
+      threadId,
+      shadowWarning(providerId, borrowedFrom) +
+        `🔐 *${providerId}* wants to authorize.\n\n` +
+        `Open ${verificationUri} and enter this code:\n\n\`${userCode}\`\n\n` +
+        'Once you approve in the browser, the agent will pick up the credential automatically.',
+      (delivered, err) => {
+        if (delivered) {
+          log.info('oauth.device-code: relayed', { providerId, recipient: resolved.recipient, via: resolved.via });
+          return;
+        }
+        log.warn('oauth.device-code: could not deliver the code — ending the episode', { providerId, sourceIP, err });
+        if (sourceIP) endAuthEpisodeByContainerIP(sourceIP);
+      },
+    );
   },
 
   beginAuthorizeStub({ sourceIP, providerId, authUrl, deliverCallback, borrowedFrom }) {

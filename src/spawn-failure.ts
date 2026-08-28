@@ -21,6 +21,32 @@
  * and the next inbound triggers a fresh spawn attempt.
  */
 
+/**
+ * Node errno codes for infrastructure problems a later spawn can succeed
+ * through. A contribution callback does real I/O (the default `claude`
+ * provider writes its substitute file on every OAuth-mode spawn), so these
+ * reach the contribution seam and must stay retryable.
+ */
+const TRANSIENT_ERROR_CODES = new Set([
+  'EAGAIN',
+  'EBUSY',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EHOSTUNREACH',
+  'EMFILE',
+  'ENETUNREACH',
+  'ENFILE',
+  'ENOSPC',
+  'ETIMEDOUT',
+  'SQLITE_BUSY',
+]);
+
+/** True when `err` carries an errno code that a later spawn attempt may clear. */
+export function isTransientSpawnError(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null | undefined)?.code;
+  return typeof code === 'string' && TRANSIENT_ERROR_CODES.has(code);
+}
+
 export class FatalSpawnError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);

@@ -3,9 +3,9 @@
  *
  * One provider name can carry two contribution sources — its credential
  * provider's AGENT_RUNTIME extension and its entry in the provider-container
- * registry. They must merge: preferring the runtime extension used to make the
- * registry entry unreachable, while the agent-surfaces capability was still
- * read from that same unreachable entry.
+ * registry. Both must always be applied: the agent-surfaces capability is read
+ * from the registry entry, so a provider served only its runtime extension
+ * gets neither its own surfaces nor the defaults.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -87,6 +87,17 @@ describe('resolveProviderContribution source merge', () => {
     expect(contribution.mounts).toEqual([registryMount]);
   });
 
+  // The runtime source's env values are the per-group credential substitutes the
+  // proxy matches on, so a registry entry must never shadow one.
+  it('keeps the runtime value when both sources set the same env key', () => {
+    registerRuntime(() => ({ env: { SHARED: 'runtime-substitute' } }));
+    registerProviderContainerConfig(PROVIDER, () => ({ env: { SHARED: 'registry-placeholder', OTHER: '1' } }));
+
+    const { contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
+
+    expect(contribution.env).toEqual({ SHARED: 'runtime-substitute', OTHER: '1' });
+  });
+
   it('contributes nothing for a provider that registers neither', () => {
     const { contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
 
@@ -113,6 +124,19 @@ describe('resolveProviderContribution failure handling', () => {
     });
 
     expect(() => resolveProviderContribution(session, agentGroup, containerConfig)).toThrow(FatalSpawnError);
+  });
+
+  // A contribution does real I/O — the default provider writes its substitute
+  // file on every OAuth-mode spawn — so an errno the next attempt may clear has
+  // to stay retryable. Wrapping it would poison the session until the user sends
+  // another message.
+  it('leaves a transient errno retryable instead of poisoning the spawn', () => {
+    registerRuntime(() => {
+      throw Object.assign(new Error('too many open files'), { code: 'EMFILE' });
+    });
+
+    expect(() => resolveProviderContribution(session, agentGroup, containerConfig)).toThrow('too many open files');
+    expect(() => resolveProviderContribution(session, agentGroup, containerConfig)).not.toThrow(FatalSpawnError);
   });
 
   it('names the failing source and preserves the cause', () => {

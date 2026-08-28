@@ -10,7 +10,7 @@ import path from 'path';
 import { OneCLI } from '@onecli-sh/sdk';
 
 import { type AgentGroupContribution, invokeAgentGroupContributions } from './agent-group-contributions.js';
-import { FatalSpawnError, isSpawnPoisoned, markSpawnPoisoned } from './spawn-failure.js';
+import { FatalSpawnError, isSpawnPoisoned, isTransientSpawnError, markSpawnPoisoned } from './spawn-failure.js';
 import { mergeContributions, type ContainerContributionResult } from './modules/credentials/providers/contributions.js';
 import {
   CONTAINER_CPU_LIMIT,
@@ -646,66 +646,82 @@ export function resolveProviderContribution(
     runtime: getCredentialProvider(provider)?.getExtension?.(AGENT_RUNTIME),
   };
 
-  // Both sources contribute, and one provider name may carry both: the
-  // credential provider's AGENT_RUNTIME extension (base env, mitm credential
-  // substitutes, runtime-updater's CLI-version mount, …) and its entry in the
-  // provider-container registry (its own mounts and env). Merging rather than
-  // preferring one is load-bearing — a provider that declares a runtime
-  // extension used to make its registry entry unreachable, while the
-  // agent-surfaces capability was still read from that same unreachable entry,
-  // so the group got neither its provider's surfaces nor the defaults.
+  // One provider name may carry both contribution sources: the credential
+  // provider's AGENT_RUNTIME extension (base env, mitm credential substitutes,
+  // runtime-updater's CLI-version mount, …) and its entry in the
+  // provider-container registry (its own mounts and env). Both must always be
+  // applied — `providerProvidesAgentSurfaces` reads the registry entry, so a
+  // provider served only its runtime extension gets neither its own surfaces
+  // nor the defaults.
+  //
+  // Runtime env wins a key collision: its values are the per-group credential
+  // substitutes the proxy matches on, and a registry entry must not shadow one.
   //
   // The split of the merged result into the spawn-facing env/mounts and the
   // host-only `cliVersion` (in-use bookkeeping) lives here and nowhere else.
   const parts: ContainerContributionResult[] = [];
+  let runtimePart: ContainerContributionResult | null = null;
+  let registryPart: ContainerContributionResult | null = null;
 
   if (input.runtime) {
     const runtime = input.runtime;
-    parts.push(
-      // A throwing contribution is deterministic — retrying cannot fix it — so
-      // it must fail the spawn fatally. Left unwrapped it reads as a transient
-      // error, and host-sweep re-wakes the session every 60s forever without
-      // incrementing the attempt count. Same shape as the agent-group and
-      // bootstrap contribution seams.
-      fatalOnThrow(`Provider runtime contribution for "${provider}"`, () =>
-        runtime.containerContribution({
-          agentGroupId: input.agentGroupId,
-          groupScope: input.groupScope,
-          sessionDir: input.sessionDir,
-          hostEnv: input.hostEnv,
-          runtimeConfig: runtime.parseRuntimeConfig(input.runtimeConfig),
-          agentProvider: input.agentProvider,
-          providerVersion: input.providerVersion,
-        }),
-      ),
+    // A deterministic contribution failure must fail the spawn fatally:
+    // unwrapped it reads as transient, and host-sweep then re-wakes the
+    // session every 60s without incrementing the attempt count. Same shape as
+    // the agent-group and bootstrap contribution seams.
+    runtimePart = fatalOnThrow(`Provider runtime contribution for "${provider}"`, () =>
+      runtime.containerContribution({
+        agentGroupId: input.agentGroupId,
+        groupScope: input.groupScope,
+        sessionDir: input.sessionDir,
+        hostEnv: input.hostEnv,
+        runtimeConfig: runtime.parseRuntimeConfig(input.runtimeConfig),
+        agentProvider: input.agentProvider,
+        providerVersion: input.providerVersion,
+      }),
     );
+    parts.push(runtimePart);
   }
 
   const fn = getProviderContainerConfig(provider);
   if (fn) {
-    parts.push(
-      fatalOnThrow(`Provider container config for "${provider}"`, () =>
-        fn({
-          sessionDir: sessionDir(agentGroup.id, session.id),
-          agentGroupId: agentGroup.id,
-          groupDir: path.resolve(GROUPS_DIR, agentGroup.folder),
-          selectedSkills: selectedSkillNames(containerConfig),
-          hostEnv: process.env,
-        }),
-      ),
+    registryPart = fatalOnThrow(`Provider container config for "${provider}"`, () =>
+      fn({
+        sessionDir: sessionDir(agentGroup.id, session.id),
+        agentGroupId: agentGroup.id,
+        groupDir: path.resolve(GROUPS_DIR, agentGroup.folder),
+        selectedSkills: selectedSkillNames(containerConfig),
+        hostEnv: process.env,
+      }),
     );
+    parts.push(registryPart);
   }
 
   const { env, mounts, cliVersion } = mergeContributions(parts);
+
+  if (env && runtimePart?.env && registryPart?.env) {
+    const runtimeEnv = runtimePart.env;
+    const shadowed = Object.keys(runtimeEnv).filter((key) => key in registryPart.env!);
+    if (shadowed.length > 0) {
+      log.warn('Provider contribution env collision — runtime value kept', { provider, keys: shadowed });
+      Object.assign(env, runtimeEnv);
+    }
+  }
+
   return { provider, contribution: { env, mounts }, cliVersion: cliVersion ?? null };
 }
 
-/** Run a contribution callback, turning any throw into a fatal spawn failure. */
+/**
+ * Run a contribution callback. A deterministic failure becomes fatal so the
+ * spawn stops retrying; an errno the next attempt may clear propagates
+ * unchanged and stays retryable.
+ */
 function fatalOnThrow<T>(what: string, run: () => T): T {
   try {
     return run();
-    // eslint-disable-next-line no-catch-all/no-catch-all -- any throw here is a deterministic spawn failure
+    // eslint-disable-next-line no-catch-all/no-catch-all -- classified below, then re-thrown either way
   } catch (err) {
+    if (isTransientSpawnError(err)) throw err;
     throw new FatalSpawnError(`${what} failed: ${(err as Error).message ?? String(err)}`, { cause: err });
   }
 }
