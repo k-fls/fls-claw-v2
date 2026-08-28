@@ -11,6 +11,7 @@ import { OneCLI } from '@onecli-sh/sdk';
 
 import { type AgentGroupContribution, invokeAgentGroupContributions } from './agent-group-contributions.js';
 import { FatalSpawnError, isSpawnPoisoned, markSpawnPoisoned } from './spawn-failure.js';
+import { mergeContributions, type ContainerContributionResult } from './modules/credentials/providers/contributions.js';
 import {
   CONTAINER_CPU_LIMIT,
   CONTAINER_IMAGE,
@@ -626,7 +627,8 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
  * Pure so the precedence can be unit-tested without a DB or filesystem.
  */
 
-function resolveProviderContribution(
+/** Exported for tests; the spawn path is its only production caller. */
+export function resolveProviderContribution(
   session: Session,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
@@ -644,39 +646,78 @@ function resolveProviderContribution(
     runtime: getCredentialProvider(provider)?.getExtension?.(AGENT_RUNTIME),
   };
 
-  // The container shape comes from the provider's AGENT_RUNTIME extension, whose
-  // `containerContribution` merges a set of contributor calls (base env, mitm
-  // credential substitutes, runtime-updater's CLI-version mount, …). Capability
-  // layers add a call to that merge, so this resolver stays agnostic. Here we
-  // split the spawn-facing env/mounts from the host-only `cliVersion` (in-use
-  // bookkeeping) — the one place that split lives.
+  // Both sources contribute, and one provider name may carry both: the
+  // credential provider's AGENT_RUNTIME extension (base env, mitm credential
+  // substitutes, runtime-updater's CLI-version mount, …) and its entry in the
+  // provider-container registry (its own mounts and env). Merging rather than
+  // preferring one is load-bearing — a provider that declares a runtime
+  // extension used to make its registry entry unreachable, while the
+  // agent-surfaces capability was still read from that same unreachable entry,
+  // so the group got neither its provider's surfaces nor the defaults.
+  //
+  // The split of the merged result into the spawn-facing env/mounts and the
+  // host-only `cliVersion` (in-use bookkeeping) lives here and nowhere else.
+  const parts: ContainerContributionResult[] = [];
+
   if (input.runtime) {
-    const { env, mounts, cliVersion } = input.runtime.containerContribution({
-      agentGroupId: input.agentGroupId,
-      groupScope: input.groupScope,
-      sessionDir: input.sessionDir,
-      hostEnv: input.hostEnv,
-      runtimeConfig: input.runtime.parseRuntimeConfig(input.runtimeConfig),
-      agentProvider: input.agentProvider,
-      providerVersion: input.providerVersion,
-    });
-    return { provider, contribution: { env, mounts }, cliVersion: cliVersion ?? null };
+    const runtime = input.runtime;
+    parts.push(
+      // A throwing contribution is deterministic — retrying cannot fix it — so
+      // it must fail the spawn fatally. Left unwrapped it reads as a transient
+      // error, and host-sweep re-wakes the session every 60s forever without
+      // incrementing the attempt count. Same shape as the agent-group and
+      // bootstrap contribution seams.
+      fatalOnThrow(`Provider runtime contribution for "${provider}"`, () =>
+        runtime.containerContribution({
+          agentGroupId: input.agentGroupId,
+          groupScope: input.groupScope,
+          sessionDir: input.sessionDir,
+          hostEnv: input.hostEnv,
+          runtimeConfig: runtime.parseRuntimeConfig(input.runtimeConfig),
+          agentProvider: input.agentProvider,
+          providerVersion: input.providerVersion,
+        }),
+      ),
+    );
   }
 
-  // Legacy fallback: out-of-tree providers that register only a single
-  // host-config fn in the provider-container registry (no AGENT_RUNTIME ext).
   const fn = getProviderContainerConfig(provider);
-  const contribution = fn
-    ? fn({
-        sessionDir: sessionDir(agentGroup.id, session.id),
-        agentGroupId: agentGroup.id,
-        groupDir: path.resolve(GROUPS_DIR, agentGroup.folder),
-        selectedSkills: selectedSkillNames(containerConfig),
-        hostEnv: process.env,
-      })
-    : {};
-  return { provider, contribution, cliVersion: null };
+  if (fn) {
+    parts.push(
+      fatalOnThrow(`Provider container config for "${provider}"`, () =>
+        fn({
+          sessionDir: sessionDir(agentGroup.id, session.id),
+          agentGroupId: agentGroup.id,
+          groupDir: path.resolve(GROUPS_DIR, agentGroup.folder),
+          selectedSkills: selectedSkillNames(containerConfig),
+          hostEnv: process.env,
+        }),
+      ),
+    );
+  }
+
+  const { env, mounts, cliVersion } = mergeContributions(parts);
+  return { provider, contribution: { env, mounts }, cliVersion: cliVersion ?? null };
 }
+
+/** Run a contribution callback, turning any throw into a fatal spawn failure. */
+function fatalOnThrow<T>(what: string, run: () => T): T {
+  try {
+    return run();
+    // eslint-disable-next-line no-catch-all/no-catch-all -- any throw here is a deterministic spawn failure
+  } catch (err) {
+    throw new FatalSpawnError(`${what} failed: ${(err as Error).message ?? String(err)}`, { cause: err });
+  }
+}
+
+/** Neutral element for the optional `spawnPre` parameter. */
+const EMPTY_SPAWN_PRE: MergedSpawnPre = {
+  mounts: [],
+  env: {},
+  args: [],
+  needsRootEntrypoint: false,
+  cleanups: [],
+};
 
 export function buildMounts(
   agentGroup: AgentGroup,
@@ -684,13 +725,16 @@ export function buildMounts(
   containerConfig: import('./container-config.js').ContainerConfig,
   provider: string,
   providerContribution: ProviderContainerContribution,
-  groupContribution: AgentGroupContribution,
-  spawnPre: MergedSpawnPre,
+  // Fork-added, and optional so the upstream signature still type-checks: the
+  // Codex payload ships a host-contribution test written against upstream's
+  // five-parameter `buildMounts`, and the payload must install unmodified.
+  groupContribution: AgentGroupContribution = {},
+  spawnPre: MergedSpawnPre = EMPTY_SPAWN_PRE,
 ): VolumeMount[] {
-  // Per-group filesystem state lives forever after first creation. Init is
-  // idempotent: it only writes paths that don't already exist, so this call
-  // is a no-op for groups that have spawned before.
-  initGroupFilesystem(agentGroup);
+  // The group filesystem is scaffolded by the spawn path, which knows the
+  // resolved provider. Scaffolding again here would do it provider-blind and
+  // write Claude surfaces into the group directory of a provider that owns its
+  // own — the surfaces this function then declines to mount.
 
   // Default agent surfaces (composed project doc, skill links, provider state
   // dir) apply unless the provider's registration declares it provides its

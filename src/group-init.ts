@@ -37,8 +37,9 @@ const DEFAULT_SETTINGS_JSON =
  * every step is gated on the target not already existing, so re-running on
  * an already-initialized group is a no-op.
  *
- * Called once per group lifetime at creation, or defensively from
- * `buildMounts()` for groups that pre-date this code path.
+ * Called once per group lifetime at creation, and again on every spawn — with
+ * the resolved provider, so a provider that owns its agent surfaces does not
+ * get the default ones written into its group directory.
  *
  * Source code and skills are shared RO mounts — not copied per-group.
  * Skill symlinks are synced at spawn time by container-runner.ts.

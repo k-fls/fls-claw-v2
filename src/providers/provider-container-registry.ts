@@ -106,3 +106,12 @@ export function providerProvidesAgentSurfaces(name: string | null | undefined): 
 export function listProviderContainerConfigNames(): string[] {
   return [...registry.keys()];
 }
+
+/**
+ * Test-only. The registry is module-global and refuses a duplicate id, so
+ * without a reset each scenario would need its own provider name registered at
+ * module scope.
+ */
+export function resetProviderContainerConfigsForTest(): void {
+  registry.clear();
+}
