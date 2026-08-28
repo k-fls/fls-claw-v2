@@ -84,4 +84,18 @@ describe('groups CLI create provisions a container_configs row (#4)', () => {
     );
     expect(resp.ok).toBe(false);
   });
+
+  // `name` is declared `required: true` in the column spec and printed as
+  // "required" by `ncl groups help`, but the custom create handler used to
+  // fall back to `folder` — silently creating a group whose display name was
+  // the slug. Kept as its own case (rather than folded into the block above)
+  // so the coverage survives a merge that rewrites that block's args.
+  it('errors when --name is missing and writes no group row', async () => {
+    const resp = await dispatch(
+      { id: 'req-create-noname', command: 'groups-create', args: { folder: 'orphan' } },
+      { caller: 'host' },
+    );
+    expect(resp.ok).toBe(false);
+    expect(count('SELECT COUNT(*) AS c FROM agent_groups WHERE folder = ?', 'orphan')).toBe(0);
+  });
 });
