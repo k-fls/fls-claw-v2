@@ -3321,6 +3321,68 @@ describe('dependencies are installed INTO the worktree, from ITS OWN manifests',
     expect(seen[0]).toContain('yaml');
   });
 
+  /**
+   * A CONFLICTED MANIFEST IS STILL A MANIFEST WHEN THE ENVIRONMENT IS BUILT.
+   * The worktree is created as the clean prefix and the conflict is written
+   * into it afterwards, so the install must run while `package.json` is the
+   * base commit's own valid blob. Installing after the marker blobs land means
+   * `pnpm install` reads a file that is not JSON, dies, never reaches the
+   * `bun install` behind its short-circuit, and hands the agent a session-long
+   * worktree with no `node_modules` in it at all.
+   */
+  it('installs BEFORE the conflict is written, so a conflicted package.json still yields an environment', async () => {
+    const repo = initFixtureRepo();
+    cleanups.push(() => repo.destroy());
+    repo.commit('base manifests', {
+      'package.json': JSON.stringify({ name: 'x', dependencies: { a: '1' } }),
+    });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('fork edits the manifest', {
+      'package.json': JSON.stringify({ name: 'x', dependencies: { a: '1', fork: '1' } }),
+    });
+    // The automerge tree of a conflicting merge: `package.json` carries markers.
+    const markerManifest = '<<<<<<< ours\n{"name":"x"}\n=======\n{"name":"y"}\n>>>>>>> theirs\n';
+    repo.checkout('automerge', { create: true, at: 'main_patched' });
+    const automergeTree = repo.git('rev-parse', `${repo.commit('automerge', { 'package.json': markerManifest })}^{tree}`);
+    repo.checkout('main_patched');
+
+    const ws = mkWorkspace();
+    const seen: string[] = [];
+    const install: InstallRunner = async (wt) => {
+      seen.push(readFileSync(join(wt, 'package.json'), 'utf8'));
+      mkdirSync(join(wt, 'node_modules'), { recursive: true });
+      return true;
+    };
+    const cli = { repo: repo.dir, workspace: ws, upstream: 'main', execute: true, cmd: 'plan' } as Cli;
+    const dir = join(ws, 'p');
+    mkdirSync(dir, { recursive: true });
+    const caseFile = {
+      schemaVersion: 1,
+      id: 'main_patched--main-h0',
+      branch: 'main_patched',
+      parent: 'main',
+      head: { sha: repo.sha('main'), height: 0 },
+      run: [{ sha: repo.sha('main'), height: 0 }],
+      tierFloor: 'clean',
+      conflictedPaths: ['package.json'],
+      automergeTree,
+      reproduction: { command: '' },
+      deferredCheck: { firstConflictHeight: 0, transitiveAncestors: [] },
+    } as unknown as Parameters<typeof createCaseWorktree>[2];
+    mkdirSync(join(dir, caseFile.id), { recursive: true });
+    await createCaseWorktree(cli, dir, caseFile, repo.sha('main_patched'), undefined, install);
+
+    // The installer saw a PARSEABLE manifest — the base commit's own blob.
+    expect(seen).toHaveLength(1);
+    expect(() => JSON.parse(seen[0]) as unknown).not.toThrow();
+    expect(seen[0]).toContain('fork');
+    // And the conflict is still what the agent is handed, in a tree that HAS an
+    // environment: both facts, or the ordering has merely traded one for the other.
+    const wt = join(dir, caseFile.id, 'worktree');
+    expect(readFileSync(join(wt, 'package.json'), 'utf8')).toContain('<<<<<<<');
+    expect(existsSync(join(wt, 'node_modules'))).toBe(true);
+  });
+
   it('a tree whose dependencies will not install yields NO verdict — never a green, never a blame', async () => {
     const repo = repoWithManifests();
     const ws = mkWorkspace();

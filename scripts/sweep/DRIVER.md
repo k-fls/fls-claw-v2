@@ -948,11 +948,20 @@ Two more things are installed into every case worktree:
 
 - the workspace `rr-cache` into the shared `.git` (§12.3), so rerere replays are
   visible inside the worktree;
-- DEPENDENCIES, installed from the manifests THAT WORKTREE carries — which are the
-  MERGED ones. Keying installation on the pre-merge branch tip is what makes a
-  dependency the merge introduced look like an unresolvable-module error in the
-  agent's code. `node_modules` and `container/agent-runner/node_modules` are the
-  linked paths.
+- DEPENDENCIES, installed from the manifests THAT WORKTREE carries — never from
+  the pre-merge branch tip, which is what makes a dependency the merge introduced
+  look like an unresolvable-module error in the agent's code. `node_modules` and
+  `container/agent-runner/node_modules` are the linked paths.
+
+  The install runs BEFORE the conflict is written into the worktree. At that
+  point the tree is the clean prefix, so every manifest in it is the base
+  commit's own valid blob; installing after the marker blobs land means a
+  conflicted `package.json` is not JSON, the install dies on it, the second
+  install behind its short-circuit never runs, and the agent works its whole
+  session in a tree with no `node_modules` — where every missing-types error
+  belongs to the environment and not to the code. The manifests the CHECKS must
+  run against are the RESOLVED ones, which do not exist at prep time; the gate
+  installs again in the same worktree at `report-case` (§7.1).
 
 Materials (`<caseDir>/materials.md`, plus `pr/materials.md` and a per-case
 `pr/TEMPLATE.md`) are driver-authored facts only: the reading contract, the

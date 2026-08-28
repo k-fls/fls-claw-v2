@@ -2674,6 +2674,22 @@ export async function createCaseWorktree(
     await git(cli.repo, ['worktree', 'prune'], { allowCodes: [1, 128] });
     rmSync(wtPath, { recursive: true, force: true });
     await git(cli.repo, ['worktree', 'add', '--detach', wtPath, prefixCommit]);
+    // INSTALL BEFORE THE CONFLICT IS WRITTEN. The worktree currently holds the
+    // CLEAN-PREFIX tree, so every manifest in it is the base commit's own valid
+    // blob. The loop below writes conflict-marker blobs into the conflicted
+    // paths — and when `package.json` is one of them the manifest stops being
+    // JSON, `pnpm install` dies on it, the `bun install` for
+    // `container/agent-runner` never runs behind the short-circuit, and the
+    // agent works a whole session in a tree with no `node_modules` at all: the
+    // typecheck then cannot resolve `@types/bun` and reports a missing-types
+    // error that belongs to the environment, not to the code.
+    //
+    // So the environment is built from the manifests that are PARSEABLE by
+    // construction, and a failure here is about the machine rather than about
+    // the conflict. The manifests the checks must run against are the RESOLVED
+    // ones, which do not exist yet at this point: the gate re-installs in this
+    // same worktree at `report-case` (§7.1), after the agent has resolved them.
+    const depsOk = await installDeps(cli, wtPath, runInstall);
     // Materialize the conflicted paths as PENDING working-tree changes: write the
     // automerge (marker) blob to disk without staging, or delete the file when the
     // automerge tree dropped it (delete/modify conflict), so `git status` = exactly
@@ -2696,10 +2712,6 @@ export async function createCaseWorktree(
     // shared .git so rerere-enabled operations in the case worktree see the
     // recorded resolutions. Best-effort, like the worktree itself.
     const seeded = await installRrCache(cli.repo, join(cli.workspace, RR_CACHE_DIRNAME));
-    // Installed from the WORKTREE's own manifests — which are the MERGED ones.
-    // Keying this on the pre-merge branch tip would make a dependency the merge
-    // introduced look like `TS2307` in the agent's code.
-    const depsOk = await installDeps(cli, wtPath, runInstall);
     const linkedDeps = depsOk ? WORKTREE_DEP_LINKS : [];
     appendJournal(dir, {
       action: 'case-worktree',
