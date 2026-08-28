@@ -42,6 +42,7 @@ import {
   type ContainerScope,
   type LaunchMode,
 } from './modules/container-bootstrap/index.js';
+import { bindAuthEpisodeContainerIP } from './modules/credentials/auth-bridge.js';
 import { hostRpcPort } from './modules/host-rpc/index.js';
 import { buildMitmProxyContribution } from './modules/mitm-proxy/index.js';
 import type { VolumeMount } from './providers/provider-container-registry.js';
@@ -154,6 +155,11 @@ export interface SpawnAuthContainerOptions {
  */
 export async function spawnAuthContainer(opts: SpawnAuthContainerOptions): Promise<void> {
   const allocated = allocateContainerIP(opts.scope);
+  // An auth container is deliberately session-less, so an interactive OAuth
+  // handler cannot resolve its user the way it does for a session container.
+  // Bind its IP to the episode instead — the episode already holds the origin
+  // of whoever accepted this sign-in.
+  bindAuthEpisodeContainerIP(opts.nonce, allocated.ip);
   const stamp = Date.now();
   const containerName = `nanoclaw-auth-${opts.folder}-${stamp}`;
   const workDir = path.join(DATA_DIR, 'auth-spawns', `${opts.folder}-${stamp}`);

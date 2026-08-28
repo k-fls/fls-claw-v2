@@ -39,6 +39,7 @@ import { log } from '../../../log.js';
 import { lookupContainerSession } from '../../container-bootstrap/index.js';
 import { openInboundDb } from '../../../session-manager.js';
 
+import { authEpisodeOriginByContainerIP, endAuthEpisodeByContainerIP } from '../../credentials/auth-bridge.js';
 import type { AuthCodeDeliver, OAuthEvents } from './handler-context.js';
 
 /** Time budget for the `docker exec … curl` callback delivery. */
@@ -72,6 +73,30 @@ function resolveContainerOrigin(sourceIP: string | undefined): { origin: Interac
     inDb.close();
   }
   return origin ? { origin, sessionId } : null;
+}
+
+/**
+ * Origin for a device-code relay. A session container resolves through its
+ * session as usual; an auth container has none by design, so it falls back to
+ * the sign-in episode its IP is bound to.
+ *
+ * The fallback is keyed on the container's IP — the episode's own identity —
+ * never on its scope. `startAuthEpisode` replaces the episode for a scope, so a
+ * scope-keyed lookup would hand a still-polling container's code to whoever
+ * opened the second episode.
+ *
+ * Device-code only. The authorize-stub path additionally needs a session id to
+ * deliver the captured code back into the container, so it keeps the
+ * session-only resolution.
+ */
+function resolveDeviceCodeOrigin(
+  sourceIP: string | undefined,
+): { origin: InteractionOrigin; recipient: string; via: 'session' | 'episode' } | null {
+  const session = resolveContainerOrigin(sourceIP);
+  if (session) return { origin: session.origin, recipient: session.sessionId, via: 'session' };
+  if (!sourceIP) return null;
+  const episodeOrigin = authEpisodeOriginByContainerIP(sourceIP);
+  return episodeOrigin ? { origin: episodeOrigin, recipient: sourceIP, via: 'episode' } : null;
 }
 
 /**
@@ -154,17 +179,29 @@ export function shadowWarning(providerId: string, borrowedFrom?: string): string
 
 export const oauthInteractive: OAuthEvents = {
   notifyDeviceCode({ sourceIP, providerId, userCode, verificationUri, borrowedFrom }) {
-    const resolved = resolveContainerOrigin(sourceIP);
+    const resolved = resolveDeviceCodeOrigin(sourceIP);
     if (!resolved) {
-      log.info('oauth.device-code: no identifiable user to notify', { sourceIP, providerId });
+      // Warning, not info: this is "the code never reached anyone", which is
+      // indistinguishable from "the user ignored it" unless it is logged loudly.
+      log.warn('oauth.device-code: no identifiable user to notify — code not relayed', { sourceIP, providerId });
+      if (sourceIP) endAuthEpisodeByContainerIP(sourceIP);
       return;
     }
-    resolved.origin.writeReply(
-      shadowWarning(providerId, borrowedFrom) +
-        `🔐 *${providerId}* wants to authorize.\n\n` +
-        `Open ${verificationUri} and enter this code:\n\n\`${userCode}\`\n\n` +
-        'Once you approve in the browser, the agent will pick up the credential automatically.',
-    );
+    try {
+      resolved.origin.writeReply(
+        shadowWarning(providerId, borrowedFrom) +
+          `🔐 *${providerId}* wants to authorize.\n\n` +
+          `Open ${verificationUri} and enter this code:\n\n\`${userCode}\`\n\n` +
+          'Once you approve in the browser, the agent will pick up the credential automatically.',
+      );
+      log.info('oauth.device-code: relayed', { providerId, recipient: resolved.recipient, via: resolved.via });
+      // eslint-disable-next-line no-catch-all/no-catch-all -- delivery failure must end the episode, whatever its cause
+    } catch (err) {
+      // Best-effort delivery that silently drops would leave the user waiting
+      // out the auth container's lifetime cap with no explanation.
+      log.warn('oauth.device-code: could not deliver the code — ending the episode', { providerId, sourceIP, err });
+      if (sourceIP) endAuthEpisodeByContainerIP(sourceIP);
+    }
   },
 
   beginAuthorizeStub({ sourceIP, providerId, authUrl, deliverCallback, borrowedFrom }) {

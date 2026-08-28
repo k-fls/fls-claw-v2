@@ -63,6 +63,8 @@ interface AuthEpisode {
   code: Deferred<AuthCodeResult>;
   /** Guard so a re-POSTed /auth/url opens the user prompt only once. */
   urlPrompted: boolean;
+  /** Set once the episode's auth container has an allocated IP. */
+  containerIP?: string;
 }
 
 /** Returned to the provider so it can tear the episode down when its auth container exits. */
@@ -74,6 +76,46 @@ export interface AuthEpisodeHandle {
 }
 
 const episodes = new Map<string, AuthEpisode>();
+
+/**
+ * Auth-container IP → episode, so a request from a container that has no
+ * session still resolves to the user who accepted that sign-in.
+ *
+ * Deliberately not keyed by scope. `startAuthEpisode` replaces the episode for
+ * a scope, but the replaced episode's container can still be polling — a
+ * scope-keyed lookup would hand that container's device code to whoever opened
+ * the second episode.
+ */
+const episodesByContainerIP = new Map<string, AuthEpisode>();
+
+/**
+ * Bind a spawned auth container's IP to its episode, identified by the nonce
+ * both were created with. No-op when the nonce matches no live episode.
+ */
+export function bindAuthEpisodeContainerIP(nonce: string, ip: string): void {
+  const episode = [...episodes.values()].find((e) => e.nonce === nonce);
+  if (!episode) {
+    log.warn('auth-bridge: no live episode for nonce — container IP not bound', { ip });
+    return;
+  }
+  episode.containerIP = ip;
+  episodesByContainerIP.set(ip, episode);
+}
+
+/**
+ * The origin that accepted the sign-in whose auth container holds `ip`, or null.
+ * Read-only: this resolves a recipient, it never authorizes anything. The
+ * bridge's own nonce gate is unchanged.
+ */
+export function authEpisodeOriginByContainerIP(ip: string): InteractionOrigin | null {
+  return episodesByContainerIP.get(ip)?.origin ?? null;
+}
+
+/** End the episode whose auth container holds `ip`. Idempotent. */
+export function endAuthEpisodeByContainerIP(ip: string): void {
+  const episode = episodesByContainerIP.get(ip);
+  if (episode) endEpisode(episode.scopeFolder, episode);
+}
 
 /**
  * Open an auth episode for a group scope. The provider passes the `nonce` it
@@ -89,6 +131,7 @@ export function startAuthEpisode(args: {
   const existing = episodes.get(scopeFolder);
   if (existing) {
     log.warn('auth-bridge: replacing in-flight auth episode', { scopeFolder });
+    if (existing.containerIP) episodesByContainerIP.delete(existing.containerIP);
     existing.code.resolve({ cancelled: true });
   }
   const episode: AuthEpisode = { scopeFolder, nonce, origin, code: deferred<AuthCodeResult>(), urlPrompted: false };
@@ -105,6 +148,7 @@ export function startAuthEpisode(args: {
 function endEpisode(scopeFolder: string, episode: AuthEpisode): void {
   if (episodes.get(scopeFolder) !== episode) return; // already replaced / ended
   episodes.delete(scopeFolder);
+  if (episode.containerIP) episodesByContainerIP.delete(episode.containerIP);
   episode.code.resolve({ cancelled: true }); // idempotent if already resolved
   log.info('auth-bridge: episode ended', { scopeFolder });
 }
@@ -195,4 +239,5 @@ registerScopedHostRpc('/auth', handleAuthRpc);
 export function _resetAuthBridgeForTests(): void {
   for (const ep of episodes.values()) ep.code.resolve({ cancelled: true });
   episodes.clear();
+  episodesByContainerIP.clear();
 }

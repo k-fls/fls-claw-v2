@@ -167,6 +167,17 @@ export function oauthSubstitutesFor(provider: OAuthProvider): SubstitutesSpec {
     inFlightRefresh: new Map(),
     redirectRefreshBreaker: new Map(),
     isGlobalProvider: (id) => hasProxyInstance() && getProxy().isGlobalProvider(id),
+    // Accessors, not copies. A programmatic provider registers before
+    // `initOAuthModule` assigns these, so a value captured here would be
+    // permanently undefined and the provider could never reach a user. The
+    // handlers read them through `ctx` at request time, by which point init
+    // has run.
+    get oauthEvents() {
+      return moduleOAuthEvents;
+    },
+    get deliverCallback() {
+      return moduleDeliverCallback;
+    },
   };
   return toSubstitutingProvider(provider, ctx).substitutes;
 }
