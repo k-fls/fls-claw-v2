@@ -5818,6 +5818,29 @@ export async function publishGateFixTwins(
       // is satisfied by whatever is there, including an amended head an owner
       // pushed, so it would authorise exactly the overwrite it looks like it
       // prevents. Nothing is written and the next pass re-derives from origin.
+      // THE ORIGINAL STILL HAS TO CARRY THE COMMIT. Between the plan and this
+      // write an owner can amend the ref the fix came from, and publishing the
+      // planned sha then offers a commit its own original no longer has —
+      // presenting a review that happened as a review of something else. The
+      // plan is re-derived from origin next pass, where the amended head is
+      // simply the new fact.
+      const originalNow = await revParse(cli.repo, `origin/${twin.originalRef}`).catch(() => '');
+      if (originalNow !== twin.sha) {
+        const reason =
+          `'${twin.originalRef}' is ${originalNow ? `on origin at ${originalNow.slice(0, 12)}` : 'gone from origin'}, ` +
+          `not at ${twin.sha.slice(0, 12)} — the fix this twin would offer is not the one that ref carries`;
+        appendJournal(dir, {
+          action: 'gate-fix-twin-failed',
+          twinRef: twin.twinRef,
+          originalRef: twin.originalRef,
+          sha: twin.sha,
+          at: originalNow,
+          reason,
+        });
+        console.error(`finish: twin '${twin.twinRef}' not published — ${reason}`);
+        failedRefs.push(twin.twinRef);
+        continue;
+      }
       const onOrigin = await revParse(cli.repo, `origin/${twin.twinRef}`).catch(() => '');
       if (onOrigin && onOrigin !== twin.sha) {
         const reason =

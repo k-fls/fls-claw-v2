@@ -8993,6 +8993,59 @@ describe('gate-fix twins — the same commit, offered at the ceiling', () => {
   });
 
   /**
+   * THE ORIGINAL STILL HAS TO CARRY THE COMMIT. An owner who amends the ref the
+   * fix came from between the plan and the publish leaves the twin offering a
+   * commit its own original no longer has — a review that happened, presented as
+   * a review of something else.
+   */
+  it('a twin whose original moved under it is not published', async () => {
+    const repo = twinFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    repo.attachBareOrigin();
+    for (const b of ['main', 'main_patched', 'module/cg']) repo.git('push', 'origin', b);
+    const originalRef = gateFixRefName('module/cg', ['src/shared.ts']);
+    const twinRef = gateFixRefName('main_patched', ['src/shared.ts']);
+    const H = pushDriverFix(repo, originalRef, repo.sha('main_patched'), { 'src/shared.ts': 'ok\n' });
+    // The plan is made against `H`; the owner then AMENDS the original — a
+    // rewrite, which is why it needs a force-push to land.
+    repo.checkout('tmp/amend', { create: true, at: 'main_patched' });
+    repo.commit('their own fix', { 'src/shared.ts': 'their own fix\n' });
+    const amended = repo.sha('HEAD');
+    repo.checkout('main');
+    repo.git('branch', '-D', 'tmp/amend');
+    repo.git('push', '--force', 'origin', `${amended}:refs/heads/${originalRef}`);
+    expect(amended).not.toBe(H);
+    const tokenFile = join(ws, 'token.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = twinGithub([{ head: originalRef, base: 'module/cg' }]);
+    const dir = join(ws, 'twin-plan');
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(
+      join(dir, 'journal.jsonl'),
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        action: 'gate-fix-twin',
+        originalRef,
+        twinRef,
+        sha: H,
+        ceiling: 'main_patched',
+        files: ['src/shared.ts'],
+        digest: 'x',
+        detail: 'planned',
+      }) + '\n',
+    );
+    repo.git('fetch', 'origin', '--force');
+    const out = await publishGateFixTwins(baseCli(repo, ws, inv, { tokenFile }), dir, gh.factory);
+    expect(out).toEqual({ published: 0, failed: 1, failedRefs: [twinRef] });
+    expect(gh.created).toHaveLength(0);
+    expect(repo.git('for-each-ref', '--format=%(objectname)', `refs/remotes/origin/${twinRef}`)).toBe('');
+    const row = readJournal(dir).find((e) => e.action === 'gate-fix-twin-failed')!;
+    expect(row.reason).toContain('is not the one that ref carries');
+    expect(row.at).toBe(amended);
+  });
+
+  /**
    * A REF THAT MOVED IS SOMEBODY'S WORK. A lease does not help — it is satisfied
    * by whatever is there, including an amended head an owner pushed — so the head
    * is left exactly where it is and the failure is reported instead.
