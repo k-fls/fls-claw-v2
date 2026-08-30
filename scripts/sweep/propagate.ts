@@ -13887,7 +13887,13 @@ async function materializeGateFixCases(
     // agent's session to arrive at the commit that exists — and then asks the
     // owner to review the same change twice. The commit is published at the
     // ceiling instead, unchanged, and no case is served for it.
-    if (opts.attributedCeiling === true) {
+    // THE FINISH MINT IS A CEILING MINT TOO. Attribution IS the ceiling on that
+    // path — the journal check above waives the branch match for exactly that
+    // reason — and the twin's two conditions are facts about the commit that
+    // hold identically wherever the question is asked. The shape this covers is
+    // a red first seen at finish, with a twinnable original from an earlier pass
+    // already on origin.
+    if (opts.attributedCeiling === true || opts.confirmAtRoot !== undefined) {
       const twin = await twinnableGateFix(cli, g.branch, tip, g.files);
       if (twin) {
         twinned.push(twin);

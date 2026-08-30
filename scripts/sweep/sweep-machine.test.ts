@@ -9071,6 +9071,76 @@ describe('gate-fix twins — the same commit, offered at the ceiling', () => {
   });
 
   /**
+   * THE FINISH MINT IS A CEILING MINT TOO. Attribution IS the ceiling on that
+   * path, and the twin's two conditions are facts about the commit — so a red
+   * first seen at finish, whose fix an earlier pass already wrote at a commit
+   * this branch contains, is answered the same way: the commit is offered here,
+   * and no agent is asked to derive it again.
+   */
+  it('the finish mint twins to an existing fix instead of serving a case', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: y', { 'src/y.ts': 'fork\n' });
+    repo.checkout('module/cg', { create: true, at: 'main_patched' });
+    repo.commit('cg: own x', { 'src/x.ts': 'cg\n' });
+    repo.checkout('module/sib', { create: true, at: 'main_patched' });
+    repo.checkout('main');
+    repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+    cleanups.push(() => repo.destroy());
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] },
+      { id: 'sib', branch: 'module/sib' },
+    ]);
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    for (const b of ['main', 'main_patched', 'module/cg', 'module/sib']) repo.git('push', 'origin', b);
+    // An earlier pass's fix for the same failing set, on a SIBLING — its own
+    // branch is gated by it, `module/cg` is not — rooted at a commit `module/cg`
+    // contains, so its diff here is the fix and nothing else.
+    const originalRef = gateFixRefName('module/sib', ['src/x.ts']);
+    const twinRef = gateFixRefName('module/cg', ['src/x.ts']);
+    const H = pushDriverFix(repo, originalRef, repo.sha('main_patched'), { 'src/x.ts': 'fixed\n' });
+    const tokenFile = join(ws, 'token.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = twinGithub([{ head: originalRef, base: 'module/sib' }]);
+    // A verify that fails naming `src/x.ts` — the shape finish blames by
+    // elimination and would otherwise mint a case on `module/cg` for.
+    const cmds = join(ws, 'cmds.json');
+    writeFileSync(cmds, JSON.stringify([{ cmd: 'sh -c \'echo "src/x.ts(3,4): error TS2345: boom"; exit 1\'' }]));
+    const cli = (over: Partial<Cli> = {}): Cli => baseCli(repo, ws, inv, { tokenFile, ...over });
+    expect(await cmdSweepStart(cli(), gh.factory, greenPreMerge)).toBe(0);
+    await cmdSweepNextCase(cli(), greenPreMerge);
+    const out = join(ws, 'f.json');
+    expect(
+      await cmdSweepFinish(cli({ cmd: 'sweep-finish', execute: true, commandsFile: cmds, out }), gh.factory),
+    ).toBe(1);
+
+    const journal = readJournal(dir);
+    // NO CASE for a fix that is already written.
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    const twin = journal.find((e) => e.action === 'gate-fix-twin')!;
+    expect(twin.originalRef).toBe(originalRef);
+    expect(twin.twinRef).toBe(twinRef);
+    expect(twin.ceiling).toBe('module/cg');
+    // It leaves through the failing-tests stop — the arm that publishes what is
+    // written and reports the red — and the twin goes out with it.
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      stoppedAt: string;
+      issues: Array<{ id: string }>;
+      twins?: { published: number; failed: number };
+      instruction: string;
+    };
+    expect(res.stoppedAt).toBe('finish-tests');
+    expect(res.issues.map((i) => i.id)).toContain('ERR40_TESTS_FAILED');
+    expect(res.twins).toEqual({ published: 1, failed: 0 });
+    repo.git('fetch', 'origin');
+    expect(repo.git('for-each-ref', '--format=%(objectname)', `refs/remotes/origin/${twinRef}`)).toBe(H);
+    expect(gh.created.filter((c) => c.head === twinRef)).toHaveLength(1);
+  });
+
+  /**
    * A finish that crashed between the mint and the publish leaves the plan in the
    * pass and NOTHING on origin's side half-done — so the whole phase re-runs, and
    * every step of it has to find its own "already done" record on GitHub. The

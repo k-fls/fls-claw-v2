@@ -2112,6 +2112,10 @@ the mint returns `twinned to <ref>`, which the agent relays. The evidence travel
 with the unchanged commit, so it covers both levels equally, and each target's own
 landing gate (§7.6) re-proves it where it lands.
 
+The question is asked wherever a case would be minted at a ceiling — the
+adjudication's lift, the landing gate, the pre-merge check, and the integration
+verify, where attribution IS the ceiling.
+
 **TWO CONDITIONS, both about the commit rather than the pull request.** The ref
 must be the DRIVER'S, by the same first-parent identity walk the proposal
 disposition applies (§5.6) — a head somebody else pushed is not the driver's to
