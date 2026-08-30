@@ -1331,12 +1331,17 @@ the ceiling is a CONFIRMATION there. Per (ceiling, files):
   was MEASURED. A file NOBODY authored has the trunk as its ceiling (§9.1) and takes
   the arms above. Blame that cannot be trusted at all — a malformed cut-point
   exceptions file (§9.2) — lifts nothing.
-- **RED WHERE THE CONTENT IS NOT** is a red about the machine. The same command
-  confirmed red at a commit that does not carry a failing file (`git cat-file -e`
-  answers absence from git, not from a probe) cannot be about that file, so nobody is
-  minted and the refusal carries the coordinate: `WARN14_ENVIRONMENT_FAULT`, "affects
-  everything below `<ceiling>`; also red at `<sha12>` which does not carry the
-  content".
+- **RED WHERE THE CONTENT IS NOT** is REPORTED, and it decides nothing. The same
+  command confirmed red at a commit that does not carry a failing file (`git cat-file
+  -e` answers absence from git, not from a probe) cannot be about that file, so it says
+  the machine may be part of the story: the row is journaled `environment-noted` and
+  the coordinate — "affects everything below `<ceiling>`; also red at `<sha12>` which
+  does not carry the content" — is appended to the case briefing and the PR text. It
+  never lifts blame and it never refuses a confirmed floor mint: its key is the
+  COMMAND, and one command carries many failures, so a branch that forked before the
+  failing file existed and is red on its own unrelated defect matches it exactly.
+  Genuine environment faults are refused ahead of all of this by the fault-signature
+  classifier below, which ends the case `stopped` with the resolution untouched.
 
 A red measured on UPSTREAM `main` is not lifted at all. It is the shallowest level
 there is, so nothing can be lifted from it, and a "ceiling" below it would move an
@@ -1347,8 +1352,13 @@ not have. It reaches the mintability check as it stands and is refused there
 Every (floor → target) decision is journaled `gate-fix-ceiling` with the floor and its
 ref, the ceiling and its ref, the files, the `decided` arm and its detail — the
 evidence trail for how a case ended up where it did. Targets are MERGED BY BRANCH: two
-floors lifted to one branch are one defect and one case, and a lift carries the ref
-with it, because the confirmation that licensed it was taken at the ceiling's tip.
+floors lifted to one branch are one defect and one case, and a lift leads the ref list,
+because the confirmation that licensed it was taken at the ceiling's tip. A merged
+target keeps EVERY ref it was assembled from, and the mintability check accepts it at
+any one of them (`gate-fix-red-ref` records which): the floors were measured at
+different commits, so their subtrees differ, and keying the union at one of them finds
+no record for the others' commands — refusing a target whose other half is solidly
+confirmed. The ref that answers is the one `redOn` and the bisect window follow.
 
 **One gate fix per MINTABLE TARGET**, each scoped by the proven subset that reached it
 (`ownedFiles`, §9.1), rooted by its own bisect, with its own rebase and duplicate
@@ -1427,7 +1437,8 @@ from one probe cannot decide the next.
 Every stage emits `SWEEP-STEP:` progress and journals (`not-my-bug`,
 `not-my-bug-owner` — one row per owner group AND one for the remainder —
 `not-my-bug-partition` with the round and probe counts, `gate-fix-ceiling` with the
-floor → target decision, `not-my-bug-bisect` with the
+floor → target decision, `gate-fix-red-ref` with the ref that licensed a merged
+target, `not-my-bug-bisect` with the
 probe log, plus `not-my-bug-environment`, `not-my-bug-premature`,
 `not-my-bug-discarded`, `scope-widened`, `gate-fix-root-clamped`). The result carries
 a `notMyBug` block (with `owners`), `gateFixes` (every minted case, each with its own

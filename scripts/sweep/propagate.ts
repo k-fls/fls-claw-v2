@@ -4577,7 +4577,7 @@ export async function cmdRun(
           dir,
           [...new Set([bp.branch, lift.branch, ...transitiveDescendants(planEdgesOf(dir), lift.branch)])],
         );
-        const gate = await materializeGateFixCases(cli, dir, ctx.chain, landing.output, landing.failed, null, {
+        const gate = await materializeGateFixCases(cli, dir, ctx.chain, withCeilingNote(landing.output, lift), landing.failed, null, {
           rootBranch: lift.branch,
           // The observation this case rests on. Blame does not re-measure it —
           // the gate above already re-ran it, and a lift is licensed by a
@@ -9517,7 +9517,7 @@ export async function cmdSweepNextCase(
     );
     const gate = lift.refused
       ? { reason: lift.refused.detail, gated: [] as string[], cases: [] as GateFixCaseSummary[] }
-      : await materializeGateFixCases(cli, dir, ctx.chain, redBranch.output, redBranch.failed, null, {
+      : await materializeGateFixCases(cli, dir, ctx.chain, withCeilingNote(redBranch.output, lift), redBranch.failed, null, {
           rootBranch: lift.branch,
           // The observation the case rests on — confirmed above, and re-read here
           // so no path reaches a mint on a single red run.
@@ -10237,6 +10237,16 @@ async function adjudicateNotMyBug(p: {
       branch: string;
       /** The commit the case is rooted at and the red observation is keyed to. */
       ref: string;
+      /**
+       * EVERY commit this target was assembled from, `ref` first.
+       *
+       * A target is the union of the floors that route to one branch, and those
+       * floors were measured at DIFFERENT commits — a parent floor at the case's
+       * merge point, a lift at the branch tip that has since moved past it. Their
+       * subtrees differ, so a single key would find no record for one half and
+       * refuse the whole target, including the half that was solidly confirmed.
+       */
+      refs: string[];
       files: string[];
       detail: string;
       /** `branch` is the proven CEILING for `files` — see `redObservationUsable`. */
@@ -10290,15 +10300,19 @@ async function adjudicateNotMyBug(p: {
     const addTarget = (t: MintTarget): void => {
       const seen = targets.find((x) => x.branch === t.branch);
       if (!seen) {
-        targets.push({ ...t });
+        targets.push({ ...t, files: [...t.files], refs: [...new Set(t.refs)] });
         return;
       }
       seen.files = [...new Set([...seen.files, ...t.files])];
+      seen.refs = [...new Set([...seen.refs, ...t.refs])];
       if (t.attributedCeiling && !seen.attributedCeiling) {
         seen.ref = t.ref;
         seen.attributedCeiling = true;
+        // The ATTRIBUTED ref leads: it is the one a lift's confirmation was taken
+        // at, so it is the first the mintability check should try.
+        seen.refs = [t.ref, ...seen.refs.filter((r) => r !== t.ref)];
       }
-      seen.detail = `${seen.detail}; ${t.detail}`;
+      seen.detail = boundedDetail(`${seen.detail}; ${t.detail}`);
     };
 
     for (const floor of floors) {
@@ -10308,7 +10322,7 @@ async function adjudicateNotMyBug(p: {
       // branch and manufacture work for a defect that branch does not have. It
       // goes to the preflight as it stands and is refused there, loudly.
       if (floor.branch === ROOT_BRANCH) {
-        addTarget({ ...floor, attributedCeiling: false });
+        addTarget({ ...floor, refs: [floor.ref], attributedCeiling: false });
         continue;
       }
       const ceil = await ceilingFor(cli, dir, floor.files);
@@ -10335,14 +10349,37 @@ async function adjudicateNotMyBug(p: {
             detail,
           });
         };
+        // RED WHERE THE CONTENT IS NOT, carried as a NOTE. The same command is
+        // confirmed red at a commit that does not carry the failing content, and
+        // content cannot break a tree it is absent from — so that red says
+        // something about the machine. What it does NOT establish is that THIS
+        // red is the same failure: the key is the command, and one command
+        // carries many failures. A branch that forked before the failing file
+        // existed and is red on its own unrelated defect matches it exactly.
+        //
+        // So the coordinate is REPORTED and blame is never pushed up on it, but
+        // it does not refuse a floor mint that is confirmed: refusing on this
+        // would tell an agent that no code change can fix a defect that a code
+        // change fixes. Genuine environment faults are refused by
+        // `classifyEnvironmentFault`, which keys on the fault's own signature.
+        const absent = await redWhereContentIsAbsent(cli, readJournal(dir), b.files, failedCommands);
+        const coordinate = absent
+          ? `${b.files.join(', ')} affects everything below ${b.ceiling ?? floor.branch}; also red at ` +
+            `${absent.sha.slice(0, 12)} which does not carry the content (${absent.file} is not there)`
+          : null;
+        if (coordinate) note('environment-noted', coordinate, b.ceiling, null);
+        /** The floor's own account, this decision's, and the coordinate where there is one. */
+        const detailOf = (decision: string): string =>
+          boundedDetail([floor.detail, decision, ...(coordinate ? [coordinate] : [])].join('; '));
         const stayOnFloor = (decided: string, detail: string, ceiling: string | null, ceilingRef: string | null): void => {
           note(decided, detail, ceiling, ceilingRef);
           addTarget({
             owner: floor.owner,
             branch: floor.branch,
             ref: floor.ref,
+            refs: [floor.ref],
             files: b.files,
-            detail: `${floor.detail}; ${detail}`,
+            detail: detailOf(detail),
             attributedCeiling: false,
           });
         };
@@ -10352,18 +10389,24 @@ async function adjudicateNotMyBug(p: {
             owner: floor.owner,
             branch: ceiling,
             ref: ceilingRef,
+            refs: [ceilingRef],
             files: b.files,
-            detail: `${floor.detail}; ${detail}`,
+            detail: detailOf(detail),
             attributedCeiling: true,
           });
         };
-        const refuse = (decided: string, detail: string, id: string, ceiling: string | null): void => {
+        const refuse = async (decided: string, detail: string, id: string, ceiling: string | null): Promise<void> => {
           note(decided, detail, ceiling, null);
+          // The SUBTREES the commands run in at the ref this row is about — the
+          // same evidence every other refusal row carries, and what tells a
+          // reader which object the finding is keyed to.
+          const observed = await checkVerdictKeys(cli.repo, floor.ref, failedCommands).catch(() => []);
           refusedOwners.push({
             target: {
               owner: floor.owner,
               branch: floor.branch,
               ref: floor.ref,
+              refs: [floor.ref],
               files: b.files,
               detail,
               attributedCeiling: false,
@@ -10371,27 +10414,9 @@ async function adjudicateNotMyBug(p: {
             ownerBranch: floor.branch,
             id,
             detail,
+            subtrees: observed.map((v) => ({ cmd: v.cmd, ...(v.cwd ? { cwd: v.cwd } : {}), subtree: v.subtree })),
           });
         };
-
-        // RED ABOVE THE CEILING. The same command is confirmed red at a commit
-        // that does not carry the failing content — and content cannot break a
-        // tree it is absent from. So the red is about the machine, not about
-        // anybody's code, and the coordinate that proves it travels in the
-        // refusal: without it "environment fault" is a claim the reader cannot
-        // check.
-        const absent = await redWhereContentIsAbsent(cli, readJournal(dir), b.files, failedCommands);
-        if (absent) {
-          refuse(
-            'refused-environment',
-            `${b.files.join(', ')} affects everything below ${b.ceiling ?? floor.branch}; also red at ` +
-              `${absent.sha.slice(0, 12)} which does not carry the content (${absent.file} is not there) — ` +
-              `the failure is not about the content, so no branch may be handed it`,
-            'WARN14_ENVIRONMENT_FAULT',
-            b.ceiling,
-          );
-          continue;
-        }
         if (b.ceiling === null) {
           stayOnFloor(
             'no-lift-tie',
@@ -10466,7 +10491,7 @@ async function adjudicateNotMyBug(p: {
           // there is no verdict to lift and no verdict to fall back to either:
           // the floor's own red is the same failure, and it has just been shown
           // to be unstable where the content lives.
-          refuse(
+          await refuse(
             'refused-unstable',
             `${b.ceiling} authored ${b.files.join(', ')} and its tip is UNSTABLE on the failing command(s) — ` +
               `red once and green once with nothing changed between, so the failure belongs to no branch`,
@@ -10527,10 +10552,31 @@ async function adjudicateNotMyBug(p: {
         });
         continue;
       }
-      const red = await redObservationUsable(readJournal(dir), cli.repo, ownerBranch, target.ref, failedCommands, {
-        attributedCeiling: target.attributedCeiling,
-      });
-      if (!red.usable) {
+      // ANY CONSTITUENT REF LICENSES THE TARGET. The refs a target was assembled
+      // from were measured at different commits, so their subtrees differ, and a
+      // check keyed at one of them finds no record for the others' commands —
+      // which would refuse a target whose other half is solidly confirmed. The
+      // first ref that answers is the one the case rests on, so `redOn` and the
+      // bisect window follow it.
+      const usableAt = (ref: string): Promise<RedObservationVerdict> =>
+        redObservationUsable(readJournal(dir), cli.repo, ownerBranch, ref, failedCommands, {
+          attributedCeiling: target.attributedCeiling,
+        });
+      // The PRIMARY ref is tried first and its verdict is the one REPORTED: it is
+      // where the case would have been rooted, so its reasons are the ones that
+      // say why it could not be.
+      const red = await usableAt(target.ref);
+      let licensed: string | null = red.usable ? target.ref : null;
+      if (licensed === null) {
+        for (const ref of target.refs) {
+          if (ref === target.ref) continue;
+          if ((await usableAt(ref)).usable) {
+            licensed = ref;
+            break;
+          }
+        }
+      }
+      if (licensed === null && !red.usable) {
         refusedOwners.push({
           target,
           ownerBranch,
@@ -10540,6 +10586,17 @@ async function adjudicateNotMyBug(p: {
         });
         continue;
       }
+      if (licensed !== null && (licensed !== target.ref || target.refs.length > 1)) {
+        appendJournal(dir, {
+          action: 'gate-fix-red-ref',
+          caseId,
+          branch: ownerBranch,
+          ref: licensed,
+          refs: target.refs,
+          commands: failedCommands.map((c) => c.cmd),
+        });
+      }
+      if (licensed !== null) target.ref = licensed;
       mintableGroups.push(target);
     }
     // A REFUSAL IS A ROW, AND THE ROW CARRIES THE CASE IT CAME FROM. Without the
@@ -12430,6 +12487,20 @@ async function gateFixRefs(repo: string, branchSlug: string): Promise<string[]> 
     .map((r) => r.replace(/^origin\//, ''));
 }
 
+/**
+ * Bound on a case's assembled `detail`.
+ *
+ * A target's account is CONCATENATED — one sentence per floor that routes to it,
+ * plus the ceiling decision and any coordinate — and it is carried into the case
+ * briefing, the PR text and the result instruction, all of which a human reads.
+ * Unbounded, a wide failure turns each of them into a paragraph nobody finishes.
+ */
+const CEILING_DETAIL_CAP = 1200;
+
+function boundedDetail(detail: string): string {
+  return detail.length <= CEILING_DETAIL_CAP ? detail : `${detail.slice(0, CEILING_DETAIL_CAP)}…`;
+}
+
 /** The CEILING for a failing set: per file, the shallowest branch that AUTHORED it. */
 export interface CeilingBlame {
   /** Per-file blame, input order — the record of how each ceiling was decided. */
@@ -12567,13 +12638,17 @@ async function confirmRedAt(
 
 /**
  * A CONFIRMED RED FOR THE SAME COMMAND, AT A COMMIT THAT DOES NOT CARRY THE
- * CONTENT — the coordinate that says the failure is not about the content at all.
+ * CONTENT — a coordinate worth REPORTING, and never on its own a verdict.
  *
- * Content cannot break a commit it is absent from. So a red for the same command
- * both below the ceiling and at a tree without the failing file is a statement
- * about the machine, not about anybody's code, and minting on it would hand an
- * owner a defect that is not in their branch. The refusal names the coordinate,
- * because "environment fault" without one cannot be checked by the reader.
+ * Content cannot break a commit it is absent from, so that red is not about that
+ * content. What the match does NOT establish is that it is about the SAME
+ * FAILURE: the key here is the command, and one command carries many failures. A
+ * branch that forked before the failing file existed and is red on its own
+ * unrelated defect matches every part of this test. So the coordinate travels
+ * with the case — it says the machine may be part of the story, and the reader
+ * can check it, which is why the sha and the file travel with it — and blame is
+ * never pushed above the floor on it. Refusing a confirmed floor mint on it
+ * would tell an agent that no code change can fix a defect a code change fixes.
  *
  * Absence is answered from git (`cat-file -e`), not from a probe: a runner asked
  * for a path it cannot find exits non-zero with nothing parseable, which is the
@@ -12621,8 +12696,25 @@ interface LiftDecision {
   attributedCeiling: boolean;
   /** Set instead of a mint: the table refused, and this is what to report. */
   refused?: { id: string; detail: string };
+  /**
+   * A confirmed red for the same command at a commit that does not carry the
+   * failing content. It is REPORTED with the case — it says something about the
+   * machine — and it decides nothing, because the key is the command and one
+   * command carries many failures.
+   */
+  coordinate?: string;
   decided: string;
   detail: string;
+}
+
+/**
+ * The failing log a gate-fix case is briefed with, plus what the ceiling step
+ * found. A coordinate that lives only in the journal is one the agent working
+ * the case never sees, and it is the sentence that tells the owner the machine
+ * may be part of the story.
+ */
+function withCeilingNote(output: string, lift: LiftDecision): string {
+  return lift.coordinate ? `${output}\n\n--- ceiling ---\n${lift.coordinate}\n` : output;
 }
 
 /**
@@ -12712,18 +12804,19 @@ async function liftGateFixTarget(
       null,
     );
   }
+  // RED WHERE THE CONTENT IS NOT, carried as a NOTE — see the same scan in the
+  // adjudication. It travels with the case and decides nothing: the key is the
+  // command, and a branch that forked before the failing file existed and is red
+  // on its own unrelated defect matches it exactly. Refusing on it would tell an
+  // agent that no code change can fix a defect a code change fixes.
   const absent = await redWhereContentIsAbsent(cli, readJournal(dir), files, commands);
-  if (absent) {
-    const detail =
-      `${files.join(', ')} affects everything below ${ceiling}; also red at ${absent.sha.slice(0, 12)} which does ` +
-      `not carry the content (${absent.file} is not there) — the failure is not about the content, so no branch ` +
-      `may be handed it`;
-    return journalRow(
-      { ...onFloor('refused-environment', detail), refused: { id: 'WARN14_ENVIRONMENT_FAULT', detail } },
-      ceiling,
-      null,
-    );
-  }
+  const coordinate = absent
+    ? `${files.join(', ')} affects everything below ${ceiling}; also red at ${absent.sha.slice(0, 12)} which does ` +
+      `not carry the content (${absent.file} is not there)`
+    : undefined;
+  if (coordinate) journalRow({ ...onFloor('environment-noted', coordinate), coordinate }, ceiling, null);
+  /** Everything decided from here carries the coordinate, where there is one. */
+  const withNote = (d: LiftDecision): LiftDecision => (coordinate ? { ...d, coordinate } : d);
   const known = redConfirmations(readJournal(dir));
   const keys = await checkVerdictKeys(cli.repo, ceilingTip, commands).catch(() => []);
   const lifted = (decided: string, detail: string): LiftDecision => ({
@@ -12735,11 +12828,11 @@ async function liftGateFixTarget(
   });
   if (keys.length > 0 && keys.every((k) => known.get(checkKey(k.subtree, k.cmd))?.reproduced === true)) {
     return journalRow(
-      lifted(
+      withNote(lifted(
         'lift-shared',
         `${ceiling} authored ${files.join(', ')} and every failing command is already confirmed red on the ` +
           `subtrees its tip carries — the fix goes there, where it reaches every red beneath it`,
-      ),
+      )),
       ceiling,
       ceilingTip,
     );
@@ -12748,22 +12841,22 @@ async function liftGateFixTarget(
   const at = await confirmRedAt(cli, dir, ceiling, ceilingTip, commands, runChecks, runInstall);
   if (at === 'red') {
     return journalRow(
-      lifted(
+      withNote(lifted(
         'lift-measured',
         `${ceiling} authored ${files.join(', ')} and its tip is CONFIRMED RED on the failing command(s) — the ` +
           `fix goes there, where it reaches every red beneath it`,
-      ),
+      )),
       ceiling,
       ceilingTip,
     );
   }
   if (at === 'green') {
     return journalRow(
-      onFloor(
+      withNote(onFloor(
         'no-lift-green',
         `${ceiling} authored ${files.join(', ')} but its tip is GREEN — the red is BELOW the author, so blame ` +
           `stays on ${floorBranch}`,
-      ),
+      )),
       ceiling,
       ceilingTip,
     );
@@ -12773,7 +12866,7 @@ async function liftGateFixTarget(
       `${ceiling} authored ${files.join(', ')} and its tip is UNSTABLE on the failing command(s) — red once and ` +
       `green once with nothing changed between, so the failure belongs to no branch`;
     return journalRow(
-      { ...onFloor('refused-unstable', detail), refused: { id: 'WARN21_CHECKS_FLAKY', detail } },
+      withNote({ ...onFloor('refused-unstable', detail), refused: { id: 'WARN21_CHECKS_FLAKY', detail } }),
       ceiling,
       ceilingTip,
     );
@@ -12781,9 +12874,11 @@ async function liftGateFixTarget(
   // A SECOND OBSERVATION THAT COULD NOT BE TAKEN MAY NOT LIFT BLAME, and it may
   // not BLOCK a floor mint that is already confirmed either.
   return journalRow(
-    onFloor(
-      'no-lift-unmeasurable',
-      `the ceiling ${ceiling} could not be measured for ${files.join(', ')} — blame stays on ${floorBranch}`,
+    withNote(
+      onFloor(
+        'no-lift-unmeasurable',
+        `the ceiling ${ceiling} could not be measured for ${files.join(', ')} — blame stays on ${floorBranch}`,
+      ),
     ),
     ceiling,
     ceilingTip,

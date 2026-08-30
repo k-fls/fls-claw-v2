@@ -1407,6 +1407,13 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     // module/cg AUTHORED `src/a.ts`, so it is the ceiling for it as well as the
     // floor: blame that could be lifted higher would be, and the two-owner split
     // this fixture is about needs each owner to be where its own file was written.
+    //
+    // WHAT THE TESTS BELOW PIN IS THE PARTITION, not the ceiling: that ONE
+    // `locateOwner` verdict describes a SUBSET, so a failure spanning two owners
+    // yields two correctly-scoped cases rather than one case carrying somebody
+    // else's file. With both owners also being their own ceiling, a ceiling split
+    // cannot stand in for a partition that lumped — `partitionOwners` has its own
+    // unit pins, and this is the end-to-end one.
     repo.commit('cg: a', { 'src/a.ts': 'a-cg\n' });
     repo.checkout('main');
     repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' });
@@ -1763,13 +1770,18 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
   });
 
   /**
-   * A RED WHERE THE CONTENT IS NOT IS A RED ABOUT THE MACHINE. The same command
-   * is confirmed red at a commit that does not carry the failing file, and
-   * content cannot break a tree it is absent from — so the failure is not about
-   * anybody's code and no branch may be handed it. The refusal carries the
-   * coordinate, because that is what makes it checkable.
+   * A RED WHERE THE CONTENT IS NOT IS REPORTED, AND IT DECIDES NOTHING.
+   *
+   * The same command is confirmed red at a commit that does not carry the failing
+   * file, and content cannot break a tree it is absent from — so the machine may
+   * be part of the story, and the coordinate travels with the case so the owner
+   * can check it. What the match does NOT establish is that it is the SAME
+   * failure: it is keyed on the COMMAND, and one command carries many failures.
+   * A branch that forked before the failing file existed and is red on its own
+   * unrelated defect matches every part of it. So the decision is taken exactly
+   * as if the scan had not fired, and a confirmed red still gets its case.
    */
-  it('a confirmed red where the failing file is ABSENT refuses the mint and names the coordinate', async () => {
+  it('a confirmed red where the failing file is ABSENT is NOTED, and the mint proceeds', async () => {
     const repo = inheritedRedFixture();
     const ws = mkWorkspace();
     const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
@@ -1794,22 +1806,154 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
         r.fn,
         fakeInstall,
       ),
-    ).toBe(0);
+    ).toBe(1);
     const journal = readJournal(dir);
-    expect(journal.find((e) => e.action === 'gate-fix-ceiling')!.decided).toBe('refused-environment');
-    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
-    expect(journal.some((e) => e.action === 'not-my-bug-discarded')).toBe(false);
-    const refusal = journal.find((e) => e.action === 'gate-fix-refused')!;
-    expect(refusal.id).toBe('WARN14_ENVIRONMENT_FAULT');
-    expect(refusal.caseId).toBe(caseId);
-    expect(refusal.reason).toContain('affects everything below main_patched');
-    expect(refusal.reason).toContain(`also red at ${absentAt.slice(0, 12)}`);
-    expect(refusal.reason).toContain('does not carry the content');
-    const held = journal.find((e) => e.action === 'held' && e.caseId === caseId)!;
-    expect((held.resolution as { markerClean: boolean }).markerClean).toBe(true);
-    const res = JSON.parse(readFileSync(out, 'utf8')) as { tier: string; issues: Array<{ id: string }> };
-    expect(res.tier).toBe('held');
-    expect(res.issues.map((i) => i.id)).toEqual(['WARN14_ENVIRONMENT_FAULT']);
+    const rows = journal.filter((e) => e.action === 'gate-fix-ceiling');
+    // The coordinate is a ROW OF ITS OWN, and the decision is a second row taken
+    // as though the first had not happened.
+    const noted = rows.find((e) => e.decided === 'environment-noted')!;
+    expect(noted.detail).toContain('affects everything below main_patched');
+    expect(noted.detail).toContain(`also red at ${absentAt.slice(0, 12)}`);
+    expect(noted.detail).toContain('does not carry the content');
+    expect(rows.map((e) => e.decided)).toEqual(['environment-noted', 'lift-measured']);
+    // NOTHING IS REFUSED ON IT. A refusal here would tell the agent that no code
+    // change can fix a defect that a code change fixes.
+    expect(journal.some((e) => e.action === 'gate-fix-refused' && e.id === 'WARN14_ENVIRONMENT_FAULT')).toBe(false);
+    const gateFixes = journal.filter((e) => e.action === 'gate-fix');
+    expect(gateFixes.map((e) => e.branch)).toEqual(['main_patched']);
+    // And it REACHES the agent: a coordinate that lives only in the journal is
+    // one the case never sees.
+    const briefing = readFileSync(join(dir, gateFixes[0].caseId as string, 'gate-fix-output.txt'), 'utf8');
+    expect(briefing).toContain('does not carry the content');
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; instruction: string };
+    expect(res.status).toBe('gate-fix-required');
+    expect(res.instruction).toContain('does not carry the content');
+    expect(caseId).toBeTruthy();
+  });
+
+  /**
+   * The trunk resolves a conflict at height 0 and then merges height 1, so it has
+   * a commit AT each height; `module/cg` conflicts at height 0 and stops there.
+   * Its case's merge point is therefore one commit BELOW the trunk tip — the
+   * routine shape once a parent has moved on past the point a child stopped at.
+   * `src/p.ts` and `src/s.ts` are both the trunk's own files.
+   */
+  function mergePointBehindTipFixture(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: x = fork', { 'src/x.ts': 'fork\n' });
+    repo.commit('mp: trunk files', { 'src/p.ts': 'p\n', 'src/s.ts': 's\n' });
+    repo.checkout('module/cg', { create: true, at: 'main_patched' });
+    repo.commit('cg: x = cg', { 'src/x.ts': 'cg\n' });
+    repo.checkout('main');
+    // TWO conflicting heads, so the trunk takes them as two cases and carries a
+    // commit at each height — a child that stops at the first has a merge point
+    // one commit below the trunk tip.
+    repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' });
+    repo.commit('U2: x = up2', { 'src/x.ts': 'up2\n' });
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+
+  /**
+   * ONE TARGET, TWO MEASUREMENTS, TWO COMMITS — and either of them licenses it.
+   *
+   * A parent floor confirmed at the case's merge point and a lift confirmed at
+   * the branch tip route to the SAME branch, so they are one defect and one case.
+   * Their subtrees differ, so a check keyed at one of them finds no record for the
+   * other's commands: keying only at the tip refuses a target whose other half was
+   * solidly confirmed, and the agent is told nobody can be handed a defect the
+   * pass measured twice.
+   */
+  it('a target assembled from two commits is minted when EITHER of them confirms it', async () => {
+    const repo = mergePointBehindTipFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    const cmds = ['tsc --noEmit', 'tsc --build'];
+    const green: ChecksRunner = async () => ({ ok: true, failedNames: [], output: '' });
+    // ONE HEAD PER CASE. Without the cap a case stacks the whole run, the trunk
+    // lands both heights in one commit, and no child can stop below its tip.
+    const routing = join(ws, 'routing.yaml');
+    writeFileSync(routing, 'stack_cap: 1\n');
+    const cli = (over: Partial<Cli> = {}): Cli => baseCli(repo, ws, inv, { routingFile: routing, ...over });
+    await cmdSweepStart(cli({ checksFile: checksFile(ws, { typecheck: cmds }) }));
+    // The trunk's own conflicts, one per height, resolved mechanically so they land
+    // with no PR. The height-0 commit is the head `module/cg` will stop at.
+    const dir = dirOf(repo, ws);
+    const trunkCases: string[] = [];
+    for (const resolution of ['R1\n', 'R2\n']) {
+      await cmdSweepNextCase(cli(), green);
+      const id = currentCaseId(dir);
+      trunkCases.push(id);
+      resolveWorktree(dir, id, { 'src/x.ts': resolution });
+      expect(
+        await cmdSweepReportCase(
+          cli({ cmd: 'report-case', tier: 'mechanical', execute: true }),
+          confirm,
+          green,
+          fakeInstall,
+        ),
+      ).toBe(0);
+    }
+    // Now `module/cg` gets its case, at the height it conflicts on.
+    await cmdSweepNextCase(cli(), green);
+    const caseId = currentCaseId(dir);
+    expect(trunkCases).not.toContain(caseId);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    seedPriorFailure(dir, caseId, 'typecheck', cmds);
+    const wtPath = join(dir, caseId, 'worktree');
+    const branchTip = execFileSync('git', ['-C', wtPath, 'rev-parse', 'HEAD^'], { encoding: 'utf8' }).trim();
+    const mergePoint = (JSON.parse(readFileSync(join(dir, caseId, 'case.json'), 'utf8')) as { head: { sha: string } })
+      .head.sha;
+    const trunkTip = repo.sha('main_patched');
+    // The premise: the trunk moved on past the point this case stopped at.
+    expect(mergePoint).not.toBe(trunkTip);
+
+    // `src/s.ts` fails at the branch tip (its floor), `src/p.ts` only at the merge
+    // point (the parent's). At the TRUNK TIP only the first command fails — so the
+    // lift is confirmed there for that command and for no other.
+    const fn: ChecksRunner = async (commands, baseDir) => {
+      const at = baseDir ? shaAt(baseDir) : '';
+      const names = commands.map((c) => c.cmd).filter((n) => at !== trunkTip || n === cmds[0]);
+      if (names.length === 0) return { ok: true, failedNames: [], output: '' };
+      const files = at === branchTip || at === trunkTip ? ['src/s.ts'] : ['src/p.ts', 'src/s.ts'];
+      return {
+        ok: false,
+        failedNames: names,
+        output: names.map((n) => `$ ${n}\n${files.map((f) => `${f}(1,1): error TS2345: boom\n`).join('')}`).join(''),
+      };
+    };
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        cli({ cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+        neverInvoked,
+        fn,
+        fakeInstall,
+      ),
+    ).toBe(1);
+    const journal = readJournal(dir);
+    // Two floors, one target: the parent's own file stays where it was measured,
+    // and the branch's inherited file is lifted to the same branch.
+    expect(
+      journal
+        .filter((e) => e.action === 'gate-fix-ceiling')
+        .map((e) => e.decided)
+        .sort(),
+    ).toEqual(['lift-measured', 'no-lift-same']);
+    const gateFixes = journal.filter((e) => e.action === 'gate-fix');
+    expect(gateFixes.map((e) => e.branch)).toEqual(['main_patched']);
+    expect((gateFixes[0].files as string[]).sort()).toEqual(['src/p.ts', 'src/s.ts']);
+    // The MERGE POINT is what licensed it — the tip carries a confirmation for one
+    // command only — and the row says so, because a reader cannot otherwise tell
+    // which observation the case rests on.
+    const licensed = journal.find((e) => e.action === 'gate-fix-red-ref')!;
+    expect(licensed.ref).toBe(mergePoint);
+    expect(licensed.refs).toEqual([trunkTip, mergePoint]);
+    expect(journal.some((e) => e.action === 'gate-fix-refused' && e.id === 'WARN22_RED_UNCONFIRMED')).toBe(false);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string };
+    expect(res.status).toBe('gate-fix-required');
   });
 
   /**
