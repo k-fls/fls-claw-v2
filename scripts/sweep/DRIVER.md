@@ -1286,17 +1286,31 @@ the ordinary failure pays nothing for this. Same-owner re-hits MERGE into one
 group; two groups on one ref would become two competing gate fixes on one branch
 for one defect.
 
-**One gate fix per proven owner**, each scoped by its own proven subset (`ownedFiles`,
-§9.1), rooted by its own bisect, with its own rebase and duplicate notes. Owners are
-ordered SHALLOWEST FIRST (parent before branch) in the journal, the mints and the
-result, because `next-case` serves in DAG order and the result must name the case the
-next command will hand over.
+**One gate fix per MINTABLE proven owner**, each scoped by its own proven subset
+(`ownedFiles`, §9.1), rooted by its own bisect, with its own rebase and duplicate
+notes. Owners are ordered SHALLOWEST FIRST (parent before branch) in the journal, the
+mints and the result, because `next-case` serves in DAG order and the result must name
+the case the next command will hand over.
+
+**PROVEN IS NOT MINTABLE, and the difference is settled BEFORE the merge is aborted**
+(§9.5). A proven owner may still be one no case can be rooted on: it is upstream
+`main` (`WARN15_UPSTREAM_RED`), its proven file set is empty, or the red was never
+confirmed where the case would be rooted (`WARN21_CHECKS_FLAKY` /
+`WARN22_RED_UNCONFIRMED`, §7.6). Each of those is a pure journal-and-git question, so
+all of them are asked before the bisect and before the reopen. Refused owners are
+journaled `gate-fix-refused` with the `caseId` and their files are reported as
+uncovered. When NO owner is mintable the case ends HELD with the resolution KEPT and
+the refusal named — never aborted, because there is no case for the abort to make
+room for.
 
 **The remainder is reported, never folded.** With owners present, an
 `interaction`/`unknown` remainder cannot be scope-widened — the case it would widen
 is being aborted — so it is journaled (`not-my-bug-owner` with that kind, plus
 `not-my-bug-partition`), carried in the result as `uncovered`, and named in the
-instruction as files NOT COVERED BY ANY GATE FIX. With NO owner found at all, the
+instruction as files NOT COVERED BY ANY GATE FIX. A REFUSED OWNER'S files travel in
+the same `uncovered` block: they were proven to belong to a branch and no case was
+minted for them either, so from the owner's side they are in exactly a remainder's
+position — still red, nothing prepared. With NO owner found at all, the
 whole set is the remainder and the two non-gate-fix answers apply as before:
 `unknown` falls through to the ordinary checks failure, a `flaky` remainder ends the
 case HELD with the resolution kept (`WARN21_CHECKS_FLAKY` — an unstable side names
@@ -1630,7 +1644,8 @@ Escalation prefixes are prepended to the PR description, with the reviewer
 feedback when there is one: `[AUTO-ESCALATED: scope exceeded]`,
 `[AUTO-ESCALATED: cold read rejected 2x]`,
 `[AUTO-ESCALATED: resolution did not converge]`,
-`[AUTO-ESCALATED: checks failing]`, `[AUTO-ESCALATED: check unstable]`.
+`[AUTO-ESCALATED: checks failing]`, `[AUTO-ESCALATED: check unstable]`,
+`[AUTO-ESCALATED: red owned by no branch]`.
 
 The report-attempt is recorded AFTER the checks gate, so `RESOLVE_COLDREAD_CAP`
 counts only trees that actually reached the reviewer. A resolution whose tree keeps
@@ -1834,8 +1849,8 @@ upstream commit.
 
 ### 9.5 The abort/reopen protocol and re-verification
 
-When a `--not-my-bug` adjudication routes to a gate fix, the case being worked is
-ABORTED: a `reopened` row over `[branch, ...descendants]` — the SAME scope every
+When a `--not-my-bug` adjudication MINTS AT LEAST ONE gate fix, the case being worked
+is ABORTED: a `reopened` row over `[branch, ...descendants]` — the SAME scope every
 other blocking path uses, widened to the UNION of every proven owner's whole subtree
 when ownership routed to the parent. The case's merge was never made (it exists only as the clean
 prefix), so the reopen supersedes the undispositioned case, the machine returns to
@@ -1857,6 +1872,24 @@ nothing else references the resolved tree (the driver commits by plumbing, so re
 never recorded it). No local ref is written to hold it — a local ref never leaves
 this clone, so it is not a delivery channel, and the only thing that carries work out
 of a pass is a PR. The doctrine tells the agent the same thing.
+
+**MINTABILITY IS DECIDED BEFORE ANYTHING IS DESTROYED.** Every refusal that is a
+pure function of the journal and git is taken for EVERY proven owner first — before
+the bisect, the reopen and the discard: the mandate boundary (`main`), an empty
+proven file set, and whether the red may found a case on the branch it would be
+rooted on (`redObservationUsable`; the same question `materializeGateFixCases` asks
+as its backstop, which is unchanged). Owners that pass it MINT. The rest are
+journaled `gate-fix-refused` — carrying the `caseId`, so the row can be read beside
+the adjudication that produced it — their files join `uncovered` and the
+instruction, and their ids ride on the result.
+
+With NO mintable owner there is no gate fix for an abort to clear the way for, so
+NOTHING is aborted: the case is frozen HELD with the resolution KEPT
+(`[AUTO-ESCALATED: red owned by no branch]`), the branch and its descendants are
+reopened, the machine goes to `awaiting-pr`, and the agent writes a PR saying its
+resolution stands, the red is pre-existing, and no branch can be handed a fix.
+Discarding there buys no case and costs the whole resolution — which the next round
+re-derives, re-works and refuses again, every pass.
 
 **Re-verification** of a gate fix cannot go through the conflict path — there is
 no conflict to re-derive, so every gate fix would die `ERR02_CASE_STALE` and the

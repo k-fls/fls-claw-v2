@@ -9558,6 +9558,13 @@ export async function cmdSweepNextCase(
 const ESCALATE_FLAKY = '[AUTO-ESCALATED: check unstable]';
 
 /**
+ * PR-description prefix for a hold caused by a red that is REAL, PRE-EXISTING
+ * and mintable on no branch — the owner is being told about a defect nobody can
+ * be handed, not about an unstable check.
+ */
+const ESCALATE_UNMINTABLE = '[AUTO-ESCALATED: red owned by no branch]';
+
+/**
  * What the gate should do with the claim. `handled` means this function already
  * emitted the result and the command is over; otherwise the gate falls through
  * to its normal ERR36/ERR40 answer, enriched with `note`/`yours`.
@@ -9804,6 +9811,7 @@ async function adjudicateNotMyBug(p: {
     // Reporting any other order would make the case this result NAMES a different
     // one from the case the next command hands over.
     const ownerGroups = [...partition.groups].sort((x, y) => (x.owner === y.owner ? 0 : x.owner === 'parent' ? -1 : 1));
+    const owners = ownerGroups.map((g) => ({ owner: g.owner, branch: branchOf(g), ref: g.ref, files: g.files }));
     for (const g of ownerGroups) {
       appendJournal(dir, {
         action: 'not-my-bug-owner',
@@ -9905,6 +9913,142 @@ async function adjudicateNotMyBug(p: {
       return { handled: true, code: 1 };
     }
 
+    // DECIDE BEFORE DESTROYING. Everything below the reopen is irreversible for
+    // the agent's work: the reopen re-derives the branch, the next
+    // `createCaseWorktree` rebuilds the worktree from the automerge tree, and
+    // the resolved tree goes to `git gc`. A mint that then REFUSES leaves the
+    // pass with the work gone and the case re-served — which is the same case,
+    // the same adjudication and the same refusal, every round.
+    //
+    // So every refusal that is a pure FUNCTION of the journal and git is taken
+    // here, first: the mandate boundary, an empty file set, and whether the red
+    // may found a case on the branch it would be rooted on. Each is the same
+    // question `materializeGateFixCases` asks — that backstop is unchanged and
+    // still refuses whatever reaches it — asked before anything is spent.
+    /** A located owner that CANNOT be handed a fix, and why it cannot. */
+    interface RefusedOwner {
+      group: OwnerGroup;
+      ownerBranch: string;
+      /** The finding's id, where the refusal has one the agent must report. */
+      id?: string;
+      detail: string;
+      subtrees?: Array<{ cmd: string; cwd?: string; subtree: string }>;
+    }
+    const mintableGroups: OwnerGroup[] = [];
+    const refusedOwners: RefusedOwner[] = [];
+    for (const group of ownerGroups) {
+      const ownerBranch = branchOf(group);
+      // MANDATE BOUNDARY. `main` is UPSTREAM — never ours to fix, and a fix
+      // committed there could not be pushed anywhere the fork controls. The red
+      // is real and urgent (the fork is about to merge a broken upstream commit)
+      // so it is REPORTED; what the driver must not do is manufacture work.
+      if (ownerBranch === ROOT_BRANCH) {
+        refusedOwners.push({
+          group,
+          ownerBranch,
+          id: 'WARN15_UPSTREAM_RED',
+          detail:
+            `the failure is on UPSTREAM ${ROOT_BRANCH} (${group.files.join(', ')}) — outside this sweep's mandate, ` +
+            `so no case may be minted there`,
+        });
+        continue;
+      }
+      // A case needs at least one named file: an agent handed a fix with nothing
+      // in it cannot work it, and the empty case pre-empts the honest stop.
+      if (group.files.length === 0) {
+        refusedOwners.push({
+          group,
+          ownerBranch,
+          detail: 'the ownership probe named no file for this owner — there is nothing to hand an agent',
+        });
+        continue;
+      }
+      const red = await redObservationUsable(readJournal(dir), cli.repo, ownerBranch, group.ref, failedCommands);
+      if (!red.usable) {
+        refusedOwners.push({
+          group,
+          ownerBranch,
+          id: red.id,
+          detail: redRefusalDetail(red.reasons),
+          subtrees: red.observed.map((v) => ({ cmd: v.cmd, ...(v.cwd ? { cwd: v.cwd } : {}), subtree: v.subtree })),
+        });
+        continue;
+      }
+      mintableGroups.push(group);
+    }
+    // A REFUSAL IS A ROW, AND THE ROW CARRIES THE CASE IT CAME FROM. Without the
+    // case id a reader cannot tell which adjudication produced it, and `finish`
+    // cannot report it beside the case whose failure it describes.
+    for (const r of refusedOwners) {
+      appendJournal(dir, {
+        action: 'gate-fix-refused',
+        ...(r.id ? { id: r.id } : {}),
+        caseId,
+        branch: r.ownerBranch,
+        at: r.group.ref,
+        files: r.group.files,
+        ...(r.subtrees ? { subtrees: r.subtrees } : {}),
+        commands: failedCommands.map((c) => c.cmd),
+        reason: r.detail,
+      });
+      console.error(`report-case [${r.id ?? 'gate-fix-refused'}]: ${r.ownerBranch} — ${r.detail}`);
+    }
+    /** What no gate fix will cover: the partition's remainder plus every refusal. */
+    const refusedFiles = [...new Set(refusedOwners.flatMap((r) => r.group.files))];
+    const refusedDetail = refusedOwners
+      .map((r) => `${r.ownerBranch} [${r.group.files.join(', ')}]: ${r.detail}`)
+      .join('; ');
+    const refusedIssues = refusedOwners
+      .filter((r) => typeof r.id === 'string')
+      .map((r) => ({ id: r.id!, detail: `${r.ownerBranch}: ${r.detail}` }));
+
+    if (mintableGroups.length === 0) {
+      // EVERY OWNER WAS PROVEN AND NONE MAY BE HANDED THE FIX. The failure is
+      // real, it is pre-existing, and there is no branch to root a case on — so
+      // there is nothing for the agent to fix and nothing to gain by taking its
+      // resolution away from it. The case goes to the owner with its resolution
+      // INTACT and the refusal named, exactly as an unstable side does.
+      // Over-blocking, visibly, with an artifact — the safe direction.
+      await freezeHeld(
+        cli,
+        dir,
+        rc,
+        [`pre-existing red no branch can be handed (${refusedFiles.join(', ')}) -> HELD (resolution kept)`],
+        {
+          resolvedTree: p.resolvedTree,
+          escalation: { tag: ESCALATE_UNMINTABLE, feedback: refusedDetail.slice(0, COLDREAD_FEEDBACK_CAP) },
+        },
+      );
+      // THE BRANCH ONLY, AND ITS DESCENDANTS. No owner's subtree is reopened:
+      // no gate fix is being minted on one, so there is nothing above this case
+      // for a reopen to clear the way for.
+      reopen(dir, [rc.branch, ...rc.descendants]);
+      const stUnmintable = readMachineState(dir);
+      writeMachineState(dir, { ...stUnmintable!, phase: 'awaiting-pr', currentCase: { caseId, branch, tier: 'held' } });
+      progress(`not-my-bug: held (no branch can be handed the fix) — ${branch}`);
+      console.error(`report-case [not-my-bug]: no mintable owner — ${refusedDetail}`);
+      result(cli, {
+        instruction: prHandoff(
+          dir,
+          caseId,
+          `provide PR description — your resolution stands and NO branch was blamed: the failure ` +
+            `(${refusedFiles.join(', ')}) is PRE-EXISTING and no branch can be handed a fix for it — ` +
+            `${refusedDetail}. Say that plainly and name it.`,
+        ),
+        tier: 'held',
+        notMyBug: {
+          verdict: verdict.verdict,
+          files: refusedFiles,
+          owners,
+          probes: verdict.probes + partition.probes,
+          detail: refusedDetail,
+        },
+        uncovered: { kind: 'unmintable-red', files: refusedFiles, detail: refusedDetail },
+        issues: refusedIssues,
+      });
+      return { handled: true, code: 0 };
+    }
+
     // ONE GATE FIX PER PROVEN OWNER, and everything that goes into one is
     // PER-OWNER: the search for the introducing commit, the root and its floor,
     // the rebase note and the duplicate check each describe ONE branch's defect,
@@ -9923,7 +10067,7 @@ async function adjudicateNotMyBug(p: {
       gateOutput: string;
     }
     const plans: OwnerPlan[] = [];
-    for (const group of ownerGroups) {
+    for (const group of mintableGroups) {
       // The owner is a BRANCH (this one, or the parent it is merging from). Name
       // the commit that introduced it before minting the case: a gate fix whose
       // briefing is "this branch is red, here is a log" costs the agent an
@@ -10143,12 +10287,26 @@ async function adjudicateNotMyBug(p: {
     }
     const cases = minted.flatMap((m) => m.gate.cases.map((c) => ({ ...c, plan: m.plan })));
     const probeTotal = verdict.probes + partition.probes + plans.reduce((n, pl) => n + pl.bisect.probes, 0);
-    const owners = ownerGroups.map((g) => ({ owner: g.owner, branch: branchOf(g), ref: g.ref, files: g.files }));
     // WHAT NO GATE FIX COVERS, said in the words the agent will relay. A remainder
     // folded silently into another owner's case is a misattribution; a remainder
     // dropped is a red build nobody was told about. Named here, it is neither.
-    const uncoveredNote = partition.remainder
-      ? `NOT COVERED BY ANY GATE FIX: ${partition.remainder.files.join(', ')} — ${partition.remainder.detail}. ` +
+    //
+    // A REFUSED OWNER BELONGS IN THE SAME SENTENCE. Its files were proven to
+    // belong to a branch and no case was minted for them either, so from the
+    // owner's side they are in exactly the position of a remainder: still red,
+    // nothing prepared. Reporting only the remainder would leave them unsaid.
+    const uncovered =
+      partition.remainder || refusedFiles.length > 0
+        ? {
+            kind: partition.remainder ? partition.remainder.kind : 'unmintable-red',
+            files: [...(partition.remainder?.files ?? []), ...refusedFiles],
+            detail: [...(partition.remainder ? [partition.remainder.detail] : []), refusedDetail]
+              .filter(Boolean)
+              .join('; '),
+          }
+        : null;
+    const uncoveredNote = uncovered
+      ? `NOT COVERED BY ANY GATE FIX: ${uncovered.files.join(', ')} — ${uncovered.detail}. ` +
         `No case was minted for those files and they stay red; report them to the owner.`
       : '';
     const unmintedNote = minted
@@ -10180,6 +10338,7 @@ async function adjudicateNotMyBug(p: {
         ...(partition.remainder?.kind === 'flaky'
           ? [{ id: 'WARN21_CHECKS_FLAKY', detail: partition.remainder.detail }]
           : []),
+        ...refusedIssues,
       ],
         notMyBug: {
           verdict: verdict.verdict,
@@ -10190,9 +10349,7 @@ async function adjudicateNotMyBug(p: {
           probes: probeTotal,
           detail: verdict.detail,
         },
-        ...(partition.remainder
-          ? { uncovered: { kind: partition.remainder.kind, files: partition.remainder.files, detail: partition.remainder.detail } }
-          : {}),
+        ...(uncovered ? { uncovered } : {}),
         instruction:
           `REPORT to the owner: ${verdict.detail}. ${plans.map((pl) => `${pl.ownerBranch} owns [${pl.group.files.join(', ')}]`).join('; ')}. ` +
           `But ${why} — no new case could be prepared. ` +
@@ -10223,6 +10380,7 @@ async function adjudicateNotMyBug(p: {
         ...(partition.remainder?.kind === 'flaky'
           ? [{ id: 'WARN21_CHECKS_FLAKY', detail: partition.remainder.detail }]
           : []),
+        ...refusedIssues,
       ],
       notMyBug: {
         verdict: verdict.verdict,
@@ -10233,9 +10391,7 @@ async function adjudicateNotMyBug(p: {
         probes: probeTotal,
         detail: verdict.detail,
       },
-      ...(partition.remainder
-        ? { uncovered: { kind: partition.remainder.kind, files: partition.remainder.files, detail: partition.remainder.detail } }
-        : {}),
+      ...(uncovered ? { uncovered } : {}),
       introducedBy: first.plan.introduced,
       ...(first.plan.rebaseNote ? { rebaseNote: first.plan.rebaseNote } : {}),
       ...(first.plan.dupes.length ? { duplicates: first.plan.dupes } : {}),

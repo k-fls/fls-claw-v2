@@ -278,12 +278,17 @@ without your resolution, and the result names the outcome:
 - A failure inside your own conflicted files is yours by definition; the flag never
   covers it.
 - "These are yours" — the named failures appear only with your resolution. Fix them.
-- Pre-existing, owned by a branch: your merge is aborted, ONE gate-fix case is prepared
-  per branch proven to own part of the failure (they are listed in `gateFixes`,
-  shallowest first, each scoped to that branch's own files), and your resolution is
-  DISCARDED — it was never published, so nothing carries it forward, and the conflict is
-  re-derived from scratch when the case is served again. Run `next-case`. If no case
-  could be prepared, the instruction says exactly what to relay instead.
+- Pre-existing, owned by a branch that CAN be handed the fix: your merge is aborted, ONE
+  gate-fix case is prepared per such branch (they are listed in `gateFixes`, shallowest
+  first, each scoped to that branch's own files), and your resolution is DISCARDED — it
+  was never published, so nothing carries it forward, and the conflict is re-derived from
+  scratch when the case is served again. Run `next-case`.
+- Pre-existing, and NO branch can be handed the fix — the owner is upstream
+  (`WARN15_UPSTREAM_RED`), or the red was never confirmed where a case would be rooted
+  (`WARN22_RED_UNCONFIRMED` / `WARN21_CHECKS_FLAKY`): nothing is minted and nothing is
+  aborted. The case is held WITH YOUR RESOLUTION KEPT and you write the text: your
+  resolution stands, the red is pre-existing, no branch can be handed a fix for it, and
+  that is what the owner must be told. Never re-run hoping for a case.
 - Failing files that NO gate fix covers are named in `uncovered` and in the
   instruction. Report them to the owner as they are given: they stay red, and no case
   exists for them.

@@ -1421,6 +1421,8 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     repo: FixtureRepo,
     ws: string,
     inv: string,
+    /** Journal rows the adjudication must READ — seeded once the pass dir exists. */
+    seed?: (a: { dir: string; tipSha: string; parentHead: string }) => void,
   ): Promise<{ dir: string; caseId: string; out: string; code: number }> {
     const checks = checksFile(ws);
     await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
@@ -1445,6 +1447,7 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
         output: names.map((n) => `$ ${n}\n${files.map((f) => `${f}(1,1): error TS2345: boom\n`).join('')}`).join(''),
       };
     };
+    seed?.({ dir, tipSha, parentHead });
     const out = join(ws, 'rc.json');
     const code = await cmdSweepReportCase(
       baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
@@ -1519,6 +1522,145 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     // The agent relays the instruction, so the remainder has to be IN it.
     expect(res.instruction).toContain('NOT COVERED BY ANY GATE FIX');
     expect(res.instruction).toContain('src/c.ts');
+  });
+
+  /**
+   * A runner GREEN at ONE tree and red at every other — the shape that carries
+   * ownership past the branch tip and onto the parent head.
+   */
+  function parentOwnedRunner(wtPath: string, tipSha: string, file: string): ChecksRunner {
+    return async (commands, baseDir) => {
+      const names = commands.map((c) => c.cmd);
+      const at =
+        baseDir && baseDir !== wtPath
+          ? execFileSync('git', ['-C', baseDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+          : '';
+      if (at === tipSha) return { ok: true, failedNames: [], output: '' };
+      return {
+        ok: false,
+        failedNames: names,
+        output: names.map((n) => `$ ${n}\n${file}(1,1): error TS2345: boom\n`).join(''),
+      };
+    };
+  }
+
+  /**
+   * THE OWNER IS UPSTREAM, so no case may be minted anywhere — and a case that
+   * mints nothing has nothing to abort FOR. Destroying the resolution here buys
+   * no gate fix and costs the whole case, which is then re-derived, re-worked and
+   * refused again on the next round.
+   */
+  it('an owner that is UPSTREAM mints nothing and the resolution is KEPT', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    seedPriorFailure(dir, caseId, 'typecheck', ['tsc --noEmit']);
+    const wtPath = join(dir, caseId, 'worktree');
+    const tipSha = execFileSync('git', ['-C', wtPath, 'rev-parse', 'HEAD^'], { encoding: 'utf8' }).trim();
+    const out = join(ws, 'rc.json');
+    // The HELD arm exits 0: the case is finished and waiting for its PR text.
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+        neverInvoked,
+        parentOwnedRunner(wtPath, tipSha, 'src/util.ts'),
+        fakeInstall,
+      ),
+    ).toBe(0);
+    const journal = readJournal(dir);
+    expect(journal.find((e) => e.action === 'not-my-bug')!.verdict).toBe('pre-existing');
+    expect(journal.find((e) => e.action === 'not-my-bug-owner')!.owner).toBe('parent');
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    const refusal = journal.find((e) => e.action === 'gate-fix-refused')!;
+    expect(refusal.id).toBe('WARN15_UPSTREAM_RED');
+    expect(refusal.branch).toBe('main');
+    expect(refusal.caseId).toBe(caseId);
+    expect(refusal.files).toEqual(['src/util.ts']);
+    // NOTHING WAS DESTROYED: no discard row, and the held row ships the agent's
+    // own tree.
+    expect(journal.some((e) => e.action === 'not-my-bug-discarded')).toBe(false);
+    const held = journal.find((e) => e.action === 'held' && e.caseId === caseId)!;
+    const resolution = held.resolution as { tree: string; markerClean: boolean };
+    expect(resolution.markerClean).toBe(true);
+    expect(repo.git('show', `${resolution.tree}:src/x.ts`)).toContain('RESOLVED');
+    expect(machineState(dir).phase).toBe('awaiting-pr');
+    expect(machineState(dir).currentCase).toMatchObject({ caseId, tier: 'held' });
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      tier: string;
+      issues: Array<{ id: string }>;
+      uncovered: { kind: string; files: string[] };
+      instruction: string;
+    };
+    expect(res.tier).toBe('held');
+    expect(res.issues.map((i) => i.id)).toEqual(['WARN15_UPSTREAM_RED']);
+    expect(res.uncovered).toEqual({ kind: 'unmintable-red', files: ['src/util.ts'], detail: expect.any(String) });
+    expect(res.instruction).toContain('your resolution stands');
+  });
+
+  /**
+   * ONE MINTABLE OWNER IS ENOUGH TO ABORT, and the refused one still has to be
+   * SAID. The mintable owner gets its case and the merge goes, exactly as before;
+   * the owner nobody may be handed a fix for joins the files no gate fix covers,
+   * rather than vanishing between a proven-owner row and a mint that never
+   * happened.
+   */
+  it('one mintable owner and one refused: the mint happens, the refusal is reported', async () => {
+    const repo = twoOwnerFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    const { dir, caseId, out, code } = await adjudicateTwoOwners(repo, ws, inv, ({ dir, parentHead }) => {
+      // The parent head's red was confirmed on a DIFFERENT branch carrying the
+      // identical subtree. That verdict holds — the same bytes cannot disagree —
+      // but it names no culprit, so `main_patched` may not be handed the fix.
+      appendJournal(dir, {
+        action: 'red-confirm',
+        branch: 'module/elsewhere',
+        sha: parentHead,
+        phase: 'test',
+        cmd: 'tsc --noEmit',
+        cwd: '.',
+        subtree: repo.git('rev-parse', `${parentHead}^{tree}`),
+        commands: ['tsc --noEmit'],
+        ran: true,
+        reproduced: true,
+      });
+    });
+    expect(code).toBe(1);
+    const journal = readJournal(dir);
+    // One case, on the owner whose red WAS confirmed where the case is rooted.
+    const gateFixes = journal.filter((e) => e.action === 'gate-fix');
+    expect(gateFixes.map((e) => e.branch)).toEqual(['module/cg']);
+    expect(gateFixes[0].files).toEqual(['src/a.ts']);
+    const refusal = journal.find((e) => e.action === 'gate-fix-refused')!;
+    expect(refusal.id).toBe('WARN22_RED_UNCONFIRMED');
+    expect(refusal.branch).toBe('main_patched');
+    expect(refusal.caseId).toBe(caseId);
+    expect(refusal.files).toEqual(['src/b.ts']);
+    // A mintable owner exists, so the merge IS aborted and the resolution goes.
+    expect(journal.some((e) => e.action === 'not-my-bug-discarded')).toBe(true);
+    expect(supersededCaseIds(journal).has(caseId)).toBe(true);
+    // ORDER IS LOAD-BEARING: every reopen still precedes every mint, or the fix
+    // is superseded the instant it is created.
+    const firstMint = journal.findIndex((e) => e.action === 'gate-fix');
+    const lastReopen = journal.map((e) => e.action).lastIndexOf('reopened');
+    expect(lastReopen).toBeLessThan(firstMint);
+    expect(supersededCaseIds(journal).has(gateFixes[0].caseId as string)).toBe(false);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      status: string;
+      issues: Array<{ id: string }>;
+      uncovered: { files: string[]; detail: string };
+      instruction: string;
+    };
+    expect(res.status).toBe('gate-fix-required');
+    // The refused files are NOT covered by any gate fix, so they travel with the
+    // interaction remainder — and the refusal keeps its own id.
+    expect(res.uncovered.files.sort()).toEqual(['src/b.ts', 'src/c.ts']);
+    expect(res.issues.map((i) => i.id)).toContain('WARN22_RED_UNCONFIRMED');
+    expect(res.instruction).toContain('src/b.ts');
+    // A PROCEED arm carries WARN ids only.
+    expect(res.issues.every((i) => i.id.startsWith('WARN'))).toBe(true);
   });
 
   /**

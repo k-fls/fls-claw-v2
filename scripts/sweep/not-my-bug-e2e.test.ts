@@ -307,8 +307,13 @@ describe('the not-my-bug deadlock, end to end (real checks, real commits)', () =
    * runs in a subtree that is BYTE-IDENTICAL on the accused branch and on the
    * branch the red was actually seen on. One verdict covers both — and it
    * accuses neither.
+   *
+   * AND THE AGENT'S WORK SURVIVES IT. No branch can be handed this fix, so there
+   * is no gate fix for the abort to clear the way for: destroying the resolution
+   * would buy nothing and cost the whole case, which is then re-served, re-worked
+   * and refused again on the next round.
    */
-  it('a red seen on another branch carrying the identical subtree blames nobody here', async () => {
+  it('a red seen on another branch blames nobody here, and the resolution is KEPT', async () => {
     const { repo, failingTest, conflictedPath } = makeNotMyBugIncidentFixture();
     cleanups.push(() => repo.destroy());
     const ws = tmp('nmb-ws-');
@@ -357,6 +362,8 @@ describe('the not-my-bug deadlock, end to end (real checks, real commits)', () =
       reproduced: true,
     });
 
+    // The HELD arm exits 0: the case is finished, and what it is waiting for is
+    // the PR text — not another edit.
     expect(
       await cmdSweepReportCase(
         cli({ cmd: 'report-case', tier: 'judged', notMyBug: true, out }),
@@ -364,23 +371,51 @@ describe('the not-my-bug deadlock, end to end (real checks, real commits)', () =
         undefined,
         fakeInstall,
       ),
-    ).toBe(1);
-    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; instruction: string };
+    ).toBe(0);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      tier: string;
+      instruction: string;
+      issues: Array<{ id: string }>;
+      uncovered: { kind: string; files: string[] };
+    };
     const journal = readJournal(dir);
     // THE POINT: no case is minted on a branch this pass never confirmed a red
     // on. The failure is real and it is reported — it is simply nobody's to fix.
     expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
     expect(journal.some((e) => e.action === 'case' && e.gateFix === true)).toBe(false);
-    expect(res.status).toBe('stopped');
     const refusal = journal.find((e) => e.action === 'gate-fix-refused')!;
     expect(refusal.branch).toBe('main_patched');
     expect(refusal.id).toBe('WARN22_RED_UNCONFIRMED');
     expect(refusal.reason).toContain('module/agent-group-contributions');
     expect(refusal.reason).toContain('identical subtree');
+    // The refusal names the case it came from, so a reader — and `finish` — can
+    // put it beside the adjudication that produced it.
+    expect(refusal.caseId).toBe(served.caseId);
     // And the subtree the refusal is about is the one the command runs in — not
     // the whole tree, which the two branches do not share.
     expect((refusal.subtrees as Array<{ subtree: string }>)[0].subtree).toBe(runnerSubtree);
     expect(runnerSubtree).not.toBe(repo.git('rev-parse', 'main_patched^{tree}'));
     expect(failingTest).toContain('container/agent-runner');
+
+    // THE RESOLUTION SURVIVES. Nothing was minted, so nothing needed the merge
+    // aborted: no discard row, no reopen of an owner's subtree, and the held row
+    // carries the agent's own tree for the publish to ship.
+    expect(journal.some((e) => e.action === 'not-my-bug-discarded')).toBe(false);
+    const held = journal.find((e) => e.action === 'held' && e.caseId === served.caseId)!;
+    const resolution = held.resolution as { tree: string; markerClean: boolean };
+    expect(resolution).toBeTruthy();
+    expect(resolution.markerClean).toBe(true);
+    expect(repo.git('show', `${resolution.tree}:${conflictedPath}`)).toContain('fork+upstream');
+    // The case is finished and waiting for its PR text, not open for re-serving.
+    const st = JSON.parse(readFileSync(join(dir, 'machine-state.json'), 'utf8')) as {
+      phase: string;
+      currentCase: { caseId: string; tier: string };
+    };
+    expect(st.phase).toBe('awaiting-pr');
+    expect(st.currentCase).toMatchObject({ caseId: served.caseId, tier: 'held' });
+    expect(res.tier).toBe('held');
+    expect(res.issues.map((i) => i.id)).toEqual(['WARN22_RED_UNCONFIRMED']);
+    expect(res.uncovered.files).toEqual([failingTest]);
+    expect(res.instruction).toContain('your resolution stands');
   });
 });
