@@ -2107,7 +2107,7 @@ function gateFixCaseId(branch: string, files: string[]): string {
  * cannot be recovered by diffing the ref. Digest equality is the strongest
  * sound cross-pass signal and stays.
  */
-async function duplicateGateFixes(
+export async function duplicateGateFixes(
   cli: Cli,
   dir: string,
   branch: string,
@@ -2147,7 +2147,14 @@ async function duplicateGateFixes(
   return { duplicates: [...new Set(out)], twins: [...new Set(twins)] };
 }
 
-/** The fix ref a case id lands on — the ONE naming scheme (`fixBranchName`). */
+/**
+ * The fix ref a gate-fix case lands on.
+ *
+ * `fixBranchName` is the SOURCE OF TRUTH for the scheme — it is what `publish`
+ * pushes under — and this restates its gate-fix arm for callers that have a
+ * branch and a file set but no case. The two must agree; a change to either is a
+ * change to both.
+ */
 export function gateFixRefName(branch: string, files: string[]): string {
   return `fix/sweep/${slug(branch)}--${gateFixCaseId(branch, files)}`;
 }
@@ -5663,7 +5670,7 @@ export async function publishGateFixTwins(
   cli: Cli,
   dir: string,
   makeTransport?: (token: string) => GithubTransport,
-): Promise<{ published: number; failed: number }> {
+): Promise<TwinReport> {
   const plans = new Map<string, GateFixTwin>();
   for (const e of readJournal(dir)) {
     if (e.action !== 'gate-fix-twin' || typeof e.twinRef !== 'string') continue;
@@ -5677,7 +5684,7 @@ export async function publishGateFixTwins(
       detail: String(e.detail ?? ''),
     });
   }
-  if (plans.size === 0) return { published: 0, failed: 0 };
+  if (plans.size === 0) return { published: 0, failed: 0, failedRefs: [] };
   const token = resolveGithubToken(cli);
   const slugParts = token ? await originSlug(cli) : null;
   if (!token || !slugParts) {
@@ -5686,18 +5693,40 @@ export async function publishGateFixTwins(
       reason: 'no GitHub token or origin slug — the twin refs are not published this pass',
       twins: [...plans.keys()],
     });
-    return { published: 0, failed: plans.size };
+    return { published: 0, failed: plans.size, failedRefs: [...plans.keys()] };
   }
   const transport = (makeTransport ?? realGithubTransport)(token);
   let published = 0;
-  let failed = 0;
+  const failedRefs: string[] = [];
   for (const twin of plans.values()) {
     try {
-      // (1) THE REF, at the sha the original already carries. A ref that is
-      // already there at that sha is this step, done.
+      // (1) THE REF, at the sha the original already carries. A ref already there
+      // at that sha is this step, done.
+      //
+      // A REF AT A DIFFERENT SHA IS SOMEBODY'S WORK, and moving it is the one
+      // destructive act the driver may never perform. A lease does not help: it
+      // is satisfied by whatever is there, including an amended head an owner
+      // pushed, so it would authorise exactly the overwrite it looks like it
+      // prevents. Nothing is written and the next pass re-derives from origin.
       const onOrigin = await revParse(cli.repo, `origin/${twin.twinRef}`).catch(() => '');
-      if (onOrigin !== twin.sha) {
-        await gitPush(cli.repo, twin.sha, twin.twinRef, onOrigin ? { forceWithLease: onOrigin } : {});
+      if (onOrigin && onOrigin !== twin.sha) {
+        const reason =
+          `'${twin.twinRef}' is on origin at ${onOrigin.slice(0, 12)}, not at ${twin.sha.slice(0, 12)} — the head ` +
+          `moved and it is not the driver's to overwrite; the fix still stands on ${twin.originalRef}`;
+        appendJournal(dir, {
+          action: 'gate-fix-twin-failed',
+          twinRef: twin.twinRef,
+          originalRef: twin.originalRef,
+          sha: twin.sha,
+          at: onOrigin,
+          reason,
+        });
+        console.error(`finish: twin '${twin.twinRef}' not published — ${reason}`);
+        failedRefs.push(twin.twinRef);
+        continue;
+      }
+      if (!onOrigin) {
+        await gitPush(cli.repo, twin.sha, twin.twinRef);
         appendJournal(dir, { action: 'push', branch: twin.twinRef, to: twin.sha, kind: 'twin-head' });
       }
       // (2) THE PULL REQUEST, based on the ceiling. The driver writes this body:
@@ -5720,7 +5749,13 @@ export async function publishGateFixTwins(
           body,
           head: twin.twinRef,
           base: twin.ceiling,
-          draft: true,
+          // ACTIVE, NOT DRAFT. This is the pull request the owner is meant to
+          // merge: a complete answer, already proven by the checks gate at the
+          // tree it runs on, offered at the level where the fix belongs. Draft is
+          // the marker for an exhibit and for a told-once courtesy — using it
+          // here would take the defect out of every "awaiting review" view (both
+          // its PRs would be drafts) and charge the owner an un-draft to merge.
+          draft: false,
         });
       }
       // (3) THE ORIGINAL, told once. The draft flag is the "already said" marker
@@ -5772,10 +5807,43 @@ export async function publishGateFixTwins(
         reason: e instanceof Error ? e.message : String(e),
       });
       console.error(`finish: twin '${twin.twinRef}' not published — ${e instanceof Error ? e.message : String(e)}`);
-      failed++;
+      failedRefs.push(twin.twinRef);
     }
   }
-  return { published, failed };
+  return { published, failed: failedRefs.length, failedRefs };
+}
+
+/**
+ * What a finish exit says about the twins it published on its way out.
+ *
+ * NEVER HALTING IS NOT THE SAME AS NEVER SAYING. A twin that could not be
+ * published leaves the ceiling red with its fix sitting on somebody else's ref —
+ * true, harmless, and invisible unless the report carries it, exactly like an
+ * unmintable red.
+ */
+interface TwinReport {
+  published: number;
+  failed: number;
+  failedRefs: string[];
+}
+
+/** The sentence a finish arm adds when it published (or could not publish) twins. */
+function twinCue(t: TwinReport): string {
+  if (t.published === 0 && t.failed === 0) return '';
+  if (t.failed === 0) {
+    return ` ${t.published} twin PR(s) were published — the same commit offered where the fix belongs; name them.`;
+  }
+  return (
+    ` ${t.published} twin PR(s) published and ${t.failed} NOT (${t.failedRefs.join(', ')}) — the fix still stands ` +
+    `on its original ref and the next pass retries; report the ones that failed.`
+  );
+}
+
+/** The result fields a twin-publishing arm carries, or nothing when it published none. */
+function twinFields(t: TwinReport): Record<string, unknown> {
+  return t.published === 0 && t.failed === 0
+    ? {}
+    : { twins: { published: t.published, failed: t.failed, ...(t.failedRefs.length ? { failedRefs: t.failedRefs } : {}) } };
 }
 
 async function escalateHeldCases(
@@ -8517,6 +8585,13 @@ async function deriveOriginMergeStatus(
       continue;
     }
     const originTarget = `origin/${target}`;
+    // CONTAINMENT IS DECIDED BEFORE DISPOSITION, and it must stay that way. A
+    // head its target already contains has an EMPTY first-parent walk, which
+    // `driverShaped` reads as "not ours" — so a contained ref that reached the
+    // disposition would be classified owner-shaped, left alone, and would block
+    // its branch forever. This split is what stops that, and it is the whole of
+    // how a TWIN cleans up: merging either side puts the shared commit in both
+    // targets, and each ref is deleted here on the pass that finds it contained.
     if ((await refExists(cli.repo, originTarget)) && (await isAncestor(cli.repo, r.sha, originTarget))) {
       merged.push({ ...r, branch: target });
     } else {
@@ -14083,7 +14158,14 @@ export async function cmdSweepFinish(
   const gatedRefs = await activeGateFixRefs(cli.repo);
   const baseGate = gatedRefs.find((r) => r.startsWith(`fix/sweep/${slug(verifyBase)}--gate-fix-`));
   if (baseGate) {
+    // TWINS LEAVE BY THIS DOOR TOO. A twin exists BECAUSE the ceiling is red on a
+    // real command and its fix is unmerged — which is precisely the state every
+    // red exit reports — so a publish phase reachable only on green would never
+    // run in any pass that plans one. It is the same publish class these arms
+    // already deem safe on red: a `fix/sweep` ref and a review PR, never a target
+    // push.
     const { escalated, total } = await escalateHeldCases(cli, dir, makeTransport, 'finish-base-gated');
+    const twins = await publishGateFixTwins(cli, dir, makeTransport);
     const detail =
       `the base '${verifyBase}' has an OPEN gate-fix PR (${baseGate}) — its defect is still present, so a full ` +
       `verify would be red no matter which branches are in the recipe, and any branch it accused would be ` +
@@ -14103,12 +14185,13 @@ export async function cmdSweepFinish(
       stoppedAt: 'base-gated',
       heldPublished: escalated,
       withheldPushes: gatedWithheld,
+      ...twinFields(twins),
       issues: [{ id: 'WARN18_BASE_GATED', detail }],
       instruction:
         `REPORT to the owner: the base '${verifyBase}' is waiting on its own gate-fix PR (${baseGate}); nothing ` +
         `can be verified or landed until that is merged. ${escalated} held PR(s) are published and named above. ` +
         `${gatedWithheld.length ? `Merged locally and NOT pushed: ${gatedWithheld.map((w) => w.branch).join(', ')}. ` : ''}` +
-        `Do NOT re-run finish until the owner merges it.`,
+        `Do NOT re-run finish until the owner merges it.${twinCue(twins)}`,
     });
     return 1;
   }
@@ -14186,6 +14269,7 @@ export async function cmdSweepFinish(
         // is listed in `gateFixes` (and journaled) so nothing is invisible.
         const first = gate.cases[0];
         const branches = gate.cases.map((c) => c.branch).join(', ');
+        const twins = await publishGateFixTwins(cli, dir, makeTransport);
         progress(`verify: RED (unattributed) — ${gate.cases.length} gate-fix case(s) prepared on ${branches}`);
         console.error(`finish: gate-fix case${gate.cases.length > 1 ? 's' : ''} prepared on ${branches}`);
         // PROCEED arm — same rule as the base-red arm in `cmdSweepStart`: cases
@@ -14200,7 +14284,10 @@ export async function cmdSweepFinish(
           issues: [{ id: 'WARN09_GATE_FIX_SERVED', detail: gate.detail }],
           gateFix: { caseId: first.caseId, branch: first.branch, files: first.files, reason: gate.reason },
           gateFixes: gate.cases.map((c) => ({ caseId: c.caseId, branch: c.branch, files: c.files })),
-          instruction: `${gate.cases.length} GATE-FIX case(s) have been prepared (shallowest branch first: ${branches}) — run \`next-case\``,
+          ...twinFields(twins),
+          instruction:
+            `${gate.cases.length} GATE-FIX case(s) have been prepared (shallowest branch first: ${branches}) — ` +
+            `run \`next-case\`.${twinCue(twins)}`,
         });
         return 1;
       }
@@ -14212,6 +14299,7 @@ export async function cmdSweepFinish(
       // fixed. No ERR id: this is a WAIT, not a fault.
       if (gate.gated.length > 0) {
         const who = gate.gated.join(', ');
+        const twins = await publishGateFixTwins(cli, dir, makeTransport);
         progress(`verify: RED — ${who} gated on an open gate-fix PR; nothing to serve`);
         console.error(`finish: RED but gated — ${who} awaiting the owner`);
         finishResult({
@@ -14219,10 +14307,11 @@ export async function cmdSweepFinish(
           status: 'stopped',
           stoppedAt: 'verify',
           gatedBranches: gate.gated,
+          ...twinFields(twins),
           instruction:
             `REPORT to the owner: the build is RED and the fix is ALREADY WRITTEN — ${who} has an open gate-fix PR ` +
             `waiting to be merged. Nothing can land until it is. Do NOT re-fix it and do NOT open another PR; ` +
-            `re-run \`start\` after the owner merges.`,
+            `re-run \`start\` after the owner merges.${twinCue(twins)}`,
         });
         return 1;
       }
@@ -14248,6 +14337,7 @@ export async function cmdSweepFinish(
         // refuses. So the red gate keeps doing its job (nothing lands) while the
         // escalation actually reaches a human.
         const { escalated, total: heldTotal } = await escalateHeldCases(cli, dir, makeTransport, 'finish-tests-red');
+        const twins = await publishGateFixTwins(cli, dir, makeTransport);
         const heldPending = { length: heldTotal };
         progress(
           `verify: RED — ${failedTests.join(', ')} — no branch lands; ${escalated}/${heldPending.length} held PR(s) published for the owner`,
@@ -14259,11 +14349,12 @@ export async function cmdSweepFinish(
           stoppedAt: 'finish-tests',
           failedTests,
           heldPublished: escalated,
+          ...twinFields(twins),
           issues: [{ id: 'ERR40_TESTS_FAILED', detail: `checks failed at finish — ${failedTests.join(', ')}` }],
           instruction:
             `REPORT to the owner: checks failed at finish — ${failedTests.join(', ')}; ${gate.reason}. NOTHING was ` +
             `merged or pushed to any branch. ${escalated} held review PR(s) WERE published — the fix is written and ` +
-            `waiting for the owner to merge; name them and stop.`,
+            `waiting for the owner to merge; name them and stop.${twinCue(twins)}`,
         });
         return 1;
       }
@@ -14281,6 +14372,7 @@ export async function cmdSweepFinish(
       makeTransport,
       'finish-verify-halt',
     );
+    const haltTwins = await publishGateFixTwins(cli, dir, makeTransport);
     const detail =
       (conflictRow
         ? `${conflictRow.detail as string}. It was rolled back and HELD(gate) — a MERGE CONFLICT in the ` +
@@ -14294,7 +14386,8 @@ export async function cmdSweepFinish(
         : verifyRc !== 0
           ? 'verify RED (no clean attribution) — investigate, fix, then re-run `finish` from the verify phase'
           : 'verify RED — offender rolled back + HELD(gate); re-run `finish` (the frozen offender drops out of the publishable set)') +
-      (haltHeld > 0 ? ` — ${haltEscalated}/${haltHeld} held PR(s) published for the owner` : '');
+      (haltHeld > 0 ? ` — ${haltEscalated}/${haltHeld} held PR(s) published for the owner` : '') +
+      twinCue(haltTwins);
     progress(
       conflictRow
         ? `verify: MERGE CONFLICT ${offender} — rolled back`
@@ -14305,6 +14398,7 @@ export async function cmdSweepFinish(
       ok: false,
       issues: [{ id: 'ERR18_VERIFY_PENDING', detail }],
       halted: 'verify',
+      ...twinFields(haltTwins),
       // The report is assembled from THIS object, so what the failure WAS has to
       // be in it — a reader that only sees `halted: "verify"` writes "the tests
       // failed" over a conflict.

@@ -2094,16 +2094,33 @@ is planned: the ref only reaches origin at `finish`, and a ceiling whose fix is
 written but unpublished is exactly as red, and as unmintable, as one holding a
 case.
 
-**PUBLISHED AT FINISH, IDEMPOTENT AGAINST GITHUB.** The ref is pushed at the
-original's sha, a pull request is opened against the ceiling carrying
-`sweep-twin-of: <originalRef>`, and the ORIGINAL is converted to a draft once and
-told once, with `sweep-twin: <twinRef>` in a comment and in its machine block —
-the same convert-once/comment-once discipline an owner's PR gets (§5.6). Each of
-those has its own "already done" record ON GITHUB: the ref at that sha, an open PR
-on the head, the draft flag, the marker comment. Nothing crosses the pass in the
-journal, so a finish that died mid-phase re-runs the whole of it and writes one of
-each. A twin that cannot be published is not a halt — the fix still stands on its
-original ref and the next pass finds the same two facts.
+**PUBLISHED AT FINISH, ON EVERY EXIT THAT REACHES IT.** The ref is pushed at the
+original's sha, a pull request is opened against the ceiling — ACTIVE, not a
+draft: it is the one the owner is meant to merge, complete and already proven by
+the checks gate at the tree it runs on — carrying `sweep-twin-of: <originalRef>`.
+The ORIGINAL is converted to a draft once and told once, with
+`sweep-twin: <twinRef>` in a comment and in its machine block, the same
+convert-once/comment-once discipline an owner's PR gets (§5.6).
+
+A TWIN IS PLANNED PRECISELY WHEN FINISH IS RED — it exists because the ceiling is
+red on a real command and its fix is unmerged — so a publish phase reachable only
+on a green verify would never run in any pass that plans one. The red exits
+publish twins too (base-gated, a served gate fix, an all-gated red, the failing-
+tests stop and the verify halt), beside the held escalations those arms already
+publish on red: it is the same class of write, a `fix/sweep` ref and a review PR,
+never a target push. Each arm reports what it published, and names what it could
+not.
+
+**IDEMPOTENT AGAINST GITHUB, NEVER AGAINST THE JOURNAL.** Each step has its own
+"already done" record on origin: the ref at that sha, an open PR on the head, the
+draft flag, the marker comment. Nothing crosses the pass in the journal, so a
+finish that died mid-phase re-runs the whole of it and writes one of each. A ref
+that is on origin at a DIFFERENT sha is somebody's work: the head is left where it
+is and the failure is reported, because a lease is satisfied by whatever is there
+— including an amended head an owner pushed — so it would authorise exactly the
+overwrite it looks like it prevents. A twin that cannot be published is not a halt
+— the fix still stands on its original ref and the next pass finds the same two
+facts.
 
 **BOTH SIDES CLEAN UP BY THEMSELVES.** Merging either ref puts the commit in that
 target; propagation carries it to the other. `start` classifies a fix ref whose
@@ -2113,7 +2130,9 @@ neither needs a rule of its own.
 
 **ONE COMMIT IS NOT TWO DEFECTS.** Two refs that resolve to the same sha are named
 as twins in the duplicate report and left out of its count: asking the owner to
-reconcile a pull request with itself is worse than saying nothing.
+reconcile a pull request with itself is worse than saying nothing. Both sides are
+visible from any THIRD branch; from either side's own branch its ref is skipped as
+its own open fix, and that branch is gated anyway.
 
 ## 10. Publication and finish
 

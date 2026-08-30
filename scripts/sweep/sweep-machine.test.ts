@@ -40,6 +40,7 @@ import {
   passDir,
   appendJournal,
   gateFixCaseMaterialsForTest,
+  duplicateGateFixes,
   gateFixRefName,
   publishGateFixTwins,
   journaledCases,
@@ -8653,16 +8654,18 @@ describe('gate-fix twins — the same commit, offered at the ceiling', () => {
     inv: string,
     gh: ReturnType<typeof twinGithub>,
     tokenFile: string,
+    /** The command finish's OWN verify runs for real — `false` makes that pass red. */
+    verifyCmd = 'true',
   ): Promise<{ dir: string }> {
     const cli = (over: Partial<Cli> = {}): Cli => baseCli(repo, ws, inv, { tokenFile, ...over });
-    await cmdSweepStart(cli({ checksFile: checksFileFor(ws) }), gh.factory, greenPreMerge);
+    await cmdSweepStart(cli({ checksFile: checksFileFor(ws, verifyCmd) }), gh.factory, greenPreMerge);
     const dir = dirOf(repo, ws);
     await cmdSweepNextCase(cli(), greenPreMerge);
     const caseId = currentCaseId(dir);
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
     appendFileSync(
       join(dir, 'journal.jsonl'),
-      JSON.stringify({ ts: new Date().toISOString(), action: 'checks-fail', caseId, kind: 'typecheck', failed: ['true'] }) + '\n',
+      JSON.stringify({ ts: new Date().toISOString(), action: 'checks-fail', caseId, kind: 'typecheck', failed: [verifyCmd] }) + '\n',
     );
     const r: ChecksRunner = async (commands) => {
       const names = commands.map((c) => c.cmd);
@@ -8708,9 +8711,9 @@ describe('gate-fix twins — the same commit, offered at the ceiling', () => {
    * gate — finish's own verify then runs for real and is green, which is what
    * carries the pass into its publish phase.
    */
-  function checksFileFor(ws: string): string {
+  function checksFileFor(ws: string, cmd = 'true'): string {
     const f = join(ws, 'checks.json');
-    writeFileSync(f, JSON.stringify({ typecheck: [{ cmd: 'true', cwd: '.' }], test: [] }));
+    writeFileSync(f, JSON.stringify({ typecheck: [{ cmd, cwd: '.' }], test: [] }));
     return f;
   }
 
@@ -8750,6 +8753,10 @@ describe('gate-fix twins — the same commit, offered at the ceiling', () => {
     const twinPr = gh.created.find((c) => c.head === twinRef)!;
     expect(twinPr.base).toBe('main_patched');
     expect(twinPr.body).toContain(`<!-- sweep-twin-of: ${originalRef} -->`);
+    // ACTIVE, NOT DRAFT: this is the pull request the owner is meant to merge, so
+    // it belongs in an "awaiting review" view. Drafting both sides would hide the
+    // defect entirely and charge an un-draft to land the fix.
+    expect([...gh.prs.values()].find((p) => p.head === twinRef)!.draft).toBe(false);
     // The original is drafted once, told once, and carries the pointer forward.
     const original = [...gh.prs.values()].find((p) => p.head === originalRef)!;
     expect(original.draft).toBe(true);
@@ -8758,6 +8765,127 @@ describe('gate-fix twins — the same commit, offered at the ceiling', () => {
     expect((gh.comments.get(original.number) ?? []).filter((c) => c.includes(marker))).toHaveLength(1);
     expect(original.body).toContain(marker);
     expect(journal.some((e) => e.action === 'gate-fix-twin-published' && e.twinRef === twinRef)).toBe(true);
+  });
+
+  /**
+   * A TWIN IS PLANNED PRECISELY WHEN FINISH IS RED. It exists because the ceiling
+   * is red on a real command and its fix is unmerged — which is the state every
+   * red exit reports — so a publish phase reachable only on a green verify would
+   * never run in any pass that plans one. The red exits publish it too: same
+   * class as the held escalations they already publish on red, a `fix/sweep` ref
+   * and a review PR, never a target push.
+   */
+  it('a twin is published out of a RED finish, where every pass that plans one ends', async () => {
+    const repo = twinFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'cg', branch: 'module/cg', parents: ['main_patched'] },
+      { id: 'other', branch: 'module/other', parents: ['main_patched'] },
+    ]);
+    repo.attachBareOrigin();
+    for (const b of ['main', 'main_patched', 'module/cg', 'module/other']) repo.git('push', 'origin', b);
+    const originalRef = gateFixRefName('module/cg', ['src/shared.ts']);
+    const twinRef = gateFixRefName('main_patched', ['src/shared.ts']);
+    const H = pushDriverFix(repo, originalRef, repo.sha('main_patched'), { 'src/shared.ts': 'ok\n' });
+    const tokenFile = join(ws, 'token.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = twinGithub([{ head: originalRef, base: 'module/cg' }]);
+    // `false` fails and names nothing, so the verify is RED and blames nobody —
+    // the arm that publishes the held escalations and stops.
+    const { dir } = await twinPass(repo, ws, inv, gh, tokenFile, 'false');
+
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'gate-fix-twin')).toBe(true);
+    expect(journal.some((e) => e.action === 'finish-tests-failed')).toBe(true);
+    // THE POINT: the twin is ON ORIGIN, and its PR exists, out of a red finish.
+    expect(repo.git('for-each-ref', '--format=%(objectname)', `refs/remotes/origin/${twinRef}`)).toBe(H);
+    expect(gh.created.filter((c) => c.head === twinRef)).toHaveLength(1);
+    expect(journal.some((e) => e.action === 'gate-fix-twin-published' && e.twinRef === twinRef)).toBe(true);
+    // And the report says so, rather than leaving the owner to find it.
+    const res = JSON.parse(readFileSync(join(ws, 'f.json'), 'utf8')) as {
+      twins?: { published: number; failed: number };
+      instruction: string;
+    };
+    expect(res.twins).toEqual({ published: 1, failed: 0 });
+    expect(res.instruction).toContain('twin PR(s) were published');
+  });
+
+  /**
+   * A REF THAT MOVED IS SOMEBODY'S WORK. A lease does not help — it is satisfied
+   * by whatever is there, including an amended head an owner pushed — so the head
+   * is left exactly where it is and the failure is reported instead.
+   */
+  it('a twin ref whose head somebody moved is never overwritten', async () => {
+    const repo = twinFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    repo.attachBareOrigin();
+    for (const b of ['main', 'main_patched', 'module/cg']) repo.git('push', 'origin', b);
+    const originalRef = gateFixRefName('module/cg', ['src/shared.ts']);
+    const twinRef = gateFixRefName('main_patched', ['src/shared.ts']);
+    const H = pushDriverFix(repo, originalRef, repo.sha('main_patched'), { 'src/shared.ts': 'ok\n' });
+    // The owner amended the twin's head: a different commit sits on the ref.
+    const theirs = pushDriverFix(repo, twinRef, repo.sha('main_patched'), { 'src/shared.ts': 'their edit\n' });
+    expect(theirs).not.toBe(H);
+    const tokenFile = join(ws, 'token.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = twinGithub([{ head: originalRef, base: 'module/cg' }]);
+    const dir = join(ws, 'twin-plan');
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(
+      join(dir, 'journal.jsonl'),
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        action: 'gate-fix-twin',
+        originalRef,
+        twinRef,
+        sha: H,
+        ceiling: 'main_patched',
+        files: ['src/shared.ts'],
+        digest: 'x',
+        detail: 'planned',
+      }) + '\n',
+    );
+    repo.git('fetch', 'origin');
+    const out = await publishGateFixTwins(baseCli(repo, ws, inv, { tokenFile }), dir, gh.factory);
+    expect(out).toEqual({ published: 0, failed: 1, failedRefs: [twinRef] });
+    // Their commit is untouched, nothing was created, and the refusal is a row.
+    repo.git('fetch', 'origin');
+    expect(repo.git('rev-parse', `refs/remotes/origin/${twinRef}`)).toBe(theirs);
+    expect(gh.created).toHaveLength(0);
+    const row = readJournal(dir).find((e) => e.action === 'gate-fix-twin-failed')!;
+    expect(row.reason).toContain("not the driver's to overwrite");
+    expect(row.at).toBe(theirs);
+  });
+
+  /**
+   * TWO REFS AT ONE SHA ARE ONE PIECE OF WORK. Seen from a THIRD branch — the
+   * only place both are visible, since a branch's own ref is skipped — they are
+   * named as twins and kept out of the duplicate count: asking the owner to
+   * reconcile a pull request with itself is worse than saying nothing.
+   */
+  it('a sibling sees two refs at one sha as twins, not as duplicates', async () => {
+    const repo = twinFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    repo.attachBareOrigin();
+    for (const b of ['main', 'main_patched', 'module/cg']) repo.git('push', 'origin', b);
+    const originalRef = gateFixRefName('module/cg', ['src/shared.ts']);
+    const twinRef = gateFixRefName('main_patched', ['src/shared.ts']);
+    const other = gateFixRefName('module/other', ['src/shared.ts']);
+    const H = pushDriverFix(repo, originalRef, repo.sha('main_patched'), { 'src/shared.ts': 'ok\n' });
+    repo.git('push', 'origin', `${H}:refs/heads/${twinRef}`);
+    const elsewhere = pushDriverFix(repo, other, repo.sha('main_patched'), { 'src/shared.ts': 'a different fix\n' });
+    expect(elsewhere).not.toBe(H);
+    repo.git('fetch', 'origin');
+    const dir = join(ws, 'dup');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'journal.jsonl'), '');
+    const seen = await duplicateGateFixes(baseCli(repo, ws, inv), dir, 'module/third', ['src/shared.ts']);
+    // The pair at one sha is labelled and uncounted; a genuinely separate fix on
+    // a third ref is still the duplicate it is.
+    expect(seen.twins.sort()).toEqual([`${originalRef} (twin of ${twinRef})`, `${twinRef} (twin of ${originalRef})`].sort());
+    expect(seen.duplicates).toEqual([`${other} (open on origin)`]);
   });
 
   /**
