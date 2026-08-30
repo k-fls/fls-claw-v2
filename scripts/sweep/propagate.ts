@@ -3293,8 +3293,58 @@ interface RedConfirmation {
 }
 
 /**
+ * A CONFIRMING RE-RUN MUST VARY SOMETHING, so it is taken in a SECOND,
+ * INDEPENDENTLY PREPARED WORKTREE at the same commit.
+ *
+ * Two runs back to back in one worktree can only detect randomness: they share
+ * the moment, the machine's load, the filesystem and the installed dependency
+ * tree, so a failure that depends on any of those reproduces exactly and the
+ * probe stamps it confirmed. What the driver CAN vary, and does here, is the
+ * environment: a fresh checkout at the same sha, its own dependency install from
+ * that tree's manifests, and the elapsed time that preparation takes — during
+ * which the driver does nothing else, since it runs one command at a time.
+ *
+ * WHAT IT DOES NOT CLAIM, and must not: the container is shared with whatever
+ * else is running in it, so this cannot isolate LOAD. `loadIsolated: false` is
+ * journaled with the variation, and a reader must not read a confirmation as
+ * "reproduced independently of load" — only as "reproduced in a second
+ * environment, prepared separately, N ms later".
+ *
+ * A re-run that cannot be PREPARED (the worktree or its install fails) yields no
+ * second observation at all, which is exactly what may not found a case.
+ */
+async function variedRerun(
+  cli: Cli,
+  sha: string,
+  commands: VerifyCommand[],
+  runChecks: ChecksRunner,
+  runInstall?: InstallRunner,
+): Promise<RerunOutcome> {
+  const wt = await addTempWorktree(cli.repo, sha);
+  try {
+    const install = await installDeps(cli, wt.path, runInstall);
+    if (!install.ok) {
+      return {
+        unprepared:
+          `a second, independently prepared worktree could not be built at ${sha.slice(0, 12)}: ` +
+          `\`${install.failure.command}\` failed with: ${install.failure.output.slice(-200)}`,
+      };
+    }
+    const startedAt = Date.now();
+    return { result: await runChecks(commands, wt.path), startedAt, worktree: wt.path };
+  } finally {
+    await wt.remove();
+  }
+}
+
+/** What a confirming re-run produced, or why it could not be taken at all. */
+type RerunOutcome =
+  | { result: ChecksRunResult; startedAt: number; worktree: string }
+  | { unprepared: string };
+
+/**
  * A SINGLE RED OBSERVATION MAY NOT FOUND A CASE — re-run it on the identical
- * subtree first.
+ * subtree, in a separately prepared environment, first.
  *
  * The driver's probes run in a container that is simultaneously installing
  * worktrees, merging and running other suites, so its own
@@ -3323,11 +3373,12 @@ async function confirmRed(
     phase: string;
     /** The commands that failed, WITH the subtree each of them ran in. */
     failed: CheckVerdict[];
-    /** Re-run the FAILED commands on the identical tree. */
-    rerun: (commands: CheckVerdict[]) => Promise<ChecksRunResult>;
+    /** Re-run the FAILED commands on the identical tree, in a fresh environment. */
+    rerun: (commands: CheckVerdict[]) => Promise<RerunOutcome>;
   },
 ): Promise<RedConfirmation> {
   const { branch, sha, phase, failed } = args;
+  const observedAt = Date.now();
   const known = redConfirmations(readJournal(dir));
   const journalOne = (v: CheckVerdict, rest: Record<string, unknown>): void =>
     appendJournal(dir, {
@@ -3352,30 +3403,49 @@ async function confirmRed(
     const names = settled.map((v) => v.cmd);
     return { reproduced: true, flaky: [], detail: `${names.join(', ')} were already confirmed red on this subtree` };
   }
-  const again = await args.rerun(owed);
+  const rerun = await args.rerun(owed);
+  if ('unprepared' in rerun) {
+    const detail = `the confirming re-run could not be taken: ${rerun.unprepared}`;
+    for (const v of owed) journalOne(v, { ran: false, reproduced: false, unmeasurable: true, detail });
+    return { reproduced: false, flaky: [], unmeasurable: { detail }, detail };
+  }
+  const again = rerun.result;
   if (again.environmentFault) {
     const detail = `the confirming re-run could not be taken: ${again.environmentFault.detail}`;
     for (const v of owed) journalOne(v, { ran: true, reproduced: false, unmeasurable: true, detail });
     return { reproduced: false, flaky: [], unmeasurable: { detail }, detail };
   }
+  // WHAT WAS VARIED, stated in the row rather than implied by it. A reader
+  // deciding whether to believe a confirmation needs to know which of the two
+  // runs' conditions differed — and which did not.
+  const variation = {
+    freshWorktree: rerun.worktree,
+    freshInstall: true,
+    separatedMs: Math.max(0, rerun.startedAt - observedAt),
+    /** The container is shared; nothing here can quiet it. */
+    loadIsolated: false,
+  };
   const flaky = owed.filter((v) => !again.failedNames.includes(v.cmd));
   for (const v of owed) {
     const changed = flaky.includes(v);
     journalOne(v, {
       ran: true,
+      variation,
       reproduced: !changed,
       ...(changed ? { flaky: [v.cmd] } : {}),
       detail: changed
-        ? `${v.cmd} FAILED and then PASSED on a re-run of the identical subtree ${v.subtree.slice(0, 12)} — ` +
-          `nothing changed between the two runs, so the failure is non-deterministic and belongs to no branch`
-        : `${v.cmd} failed again on a re-run of the identical subtree ${v.subtree.slice(0, 12)}`,
+        ? `${v.cmd} FAILED and then PASSED on the identical subtree ${v.subtree.slice(0, 12)} — the code did not ` +
+          `change between the two runs, so the failure is non-deterministic and belongs to no branch`
+        : `${v.cmd} failed again on the identical subtree ${v.subtree.slice(0, 12)}, in a worktree checked out and ` +
+          `installed afresh ${variation.separatedMs}ms after the first run (the container's other work is NOT quiet)`,
     });
   }
   const names = flaky.map((v) => v.cmd);
   const detail = names.length
-    ? `${names.join(', ')} FAILED and then PASSED on a re-run of the identical subtree — nothing changed between ` +
+    ? `${names.join(', ')} FAILED and then PASSED on the identical subtree — the code did not change between ` +
       `the two runs, so the failure is non-deterministic and belongs to no branch`
-    : `${failed.map((v) => v.cmd).join(', ')} failed again on a re-run of the identical subtree`;
+    : `${failed.map((v) => v.cmd).join(', ')} failed again on the identical subtree, in a separately prepared ` +
+      `worktree ${variation.separatedMs}ms later`;
   return { reproduced: names.length === 0, flaky: names, detail };
 }
 
@@ -3543,7 +3613,11 @@ async function landingCheck(
           sha,
           phase,
           failed: failedKeys,
-          rerun: (again) => runChecks(failed.filter((c) => again.some((k) => k.cmd === c.cmd)), wt.path),
+          // NOT IN THIS WORKTREE. The standing one is where the red was just
+          // seen; a second run in it repeats the same moment on the same
+          // installed tree, which detects randomness and nothing else.
+          rerun: (again) =>
+            variedRerun(cli, sha, failed.filter((c) => again.some((k) => k.cmd === c.cmd)), runChecks, runInstall),
         });
         if (confirm.unmeasurable) {
           // The second run never happened, so there is no second observation and
@@ -9031,7 +9105,8 @@ export async function firstRedParticipant(
           sha,
           phase: 'typecheck',
           failed: keys.filter((k) => r.failedNames.includes(k.cmd)),
-          rerun: (again) => runChecks(failed.filter((c) => again.some((k) => k.cmd === c.cmd)), wtPath),
+          rerun: (again) =>
+            variedRerun(cli, sha, failed.filter((c) => again.some((k) => k.cmd === c.cmd)), runChecks, runInstall),
         });
         if (!confirm.reproduced) {
           // NOT RED, AND NOT GREEN — so this check has no verdict to give and
@@ -9623,26 +9698,27 @@ async function adjudicateNotMyBug(p: {
         const keys = await checkVerdictKeys(cli.repo, sha, failedCommands).catch(() => []);
         return keys.length > 0 && keys.every((k) => known.get(checkKey(k.subtree, k.cmd))?.reproduced === true);
       },
-      // A RED THIS PROBE MEASURED ITSELF, at this ref, is a confirmation like any
-      // other and is journaled as one: the mint below reads it, and no other path
-      // pays for the same subtree again.
+      // A RED THIS PROBE MEASURED ITSELF IS STILL ONE OBSERVATION. Its two runs
+      // share a worktree and a moment — that is what makes them comparable for
+      // the FILE-level partition, and what makes them useless as a determinism
+      // check. So the accusation is confirmed the way every other accusation is:
+      // one varied re-run, in a separately prepared worktree, journaled where the
+      // mint below can read it.
       measuredRed: async (sha) => {
-        const branchHere = sha === branchTip ? branch : rc.parent;
-        for (const k of await checkVerdictKeys(cli.repo, sha, failedCommands)) {
-          appendJournal(dir, {
-            action: 'red-confirm',
-            branch: branchHere,
-            sha,
-            phase: 'ownership',
-            cmd: k.cmd,
-            ...(k.cwd ? { cwd: k.cwd } : {}),
-            subtree: k.subtree,
-            commands: [k.cmd],
-            ran: true,
-            reproduced: true,
-            detail: `${k.cmd} failed twice at ${branchHere} ${sha.slice(0, 12)} on subtree ${k.subtree.slice(0, 12)}`,
-          });
-        }
+        await confirmRed(dir, {
+          branch: sha === branchTip ? branch : rc.parent,
+          sha,
+          phase: 'ownership',
+          failed: await checkVerdictKeys(cli.repo, sha, failedCommands),
+          rerun: (again) =>
+            variedRerun(
+              cli,
+              sha,
+              failedCommands.filter((c) => again.some((k) => k.cmd === c.cmd)),
+              p.runChecks,
+              p.runInstall,
+            ),
+        });
       },
     });
     /** The branch a group's fix has to land on. */

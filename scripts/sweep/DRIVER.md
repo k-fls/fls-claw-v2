@@ -1261,8 +1261,11 @@ on the SUBTREES this commit carries and seen the red repeat (§7.6's `red-confir
 rows), the confirming probe is skipped: the answer is journaled, and buying it
 again costs another full run — and it would not buy a SECOND observation anyway,
 since the same bytes asked again at another ref are the first measurement
-restated. A red the probe measures itself, twice, at one ref is journaled as a
-`red-confirm` of its own, so the mint below can read it. The
+restated. A red the probe measures itself is still ONE observation — its two runs share a
+worktree and a moment, which is what makes them comparable for the FILE-level
+partition and useless as a determinism check — so the accusation is confirmed the
+way every other accusation is: one varied re-run (§7.6), journaled as a
+`red-confirm` the mint can read. The
 interaction verdict states PER SIDE which of the two it was and against which
 ref ("absent at the branch tip `<sha12>` (cannot fail there); probed green twice
 at the parent head `<sha12>`"): a probed green and a vacuous one are different
@@ -1500,14 +1503,34 @@ naming it — and the gate measures in a container that is installing worktrees,
 merging and running other suites at the same time, which is where the driver's own
 `REPRODUCTION: FULL SUITE ONLY` class comes back red once and green on repeat. So
 the FAILING COMMANDS (only those — the greens are not in question) run again on
-the identical tree, in the same worktree with the same dependencies, before any of
-that happens. The outcome is journaled as one `red-confirm` row PER COMMAND,
+the identical tree before any of that happens — and NOT in the worktree the red
+was just seen in.
+
+**A DETERMINISM PROBE MUST VARY SOMETHING.** Two runs back to back in one worktree
+share the moment, the machine's load, the filesystem and the installed dependency
+tree: whatever depends on any of those reproduces exactly, and the probe stamps
+`reproduced` on a failure it never tested for determinism. What the driver CAN
+vary, and does, is the ENVIRONMENT — the confirming run is taken in a SECOND
+worktree, checked out at the same commit and installed from that tree's own
+manifests, separated from the first observation by the time that preparation
+takes, during which the driver does nothing else (it runs one command at a time).
+The row states exactly that and no more: `variation.freshWorktree` (the path),
+`freshInstall`, `separatedMs`, and `loadIsolated: false`. That last field is the
+honesty: the container is shared with whatever else is running in it, so a
+confirmation means "reproduced in a second environment, prepared separately, N ms
+later" — never "reproduced independently of load". Cost: one checkout and one
+dependency install per confirmed red, paid once per (subtree, command) for the
+whole pass.
+
+The outcome is journaled as one `red-confirm` row PER COMMAND,
 carrying the `subtree` that command ran in, the branch it was measured on and
 `reproduced`, and every other accusing path reads those rows rather than paying
 for the same suite again: blame refuses to mint on an observation the journal does
 not record as confirmed, and the ownership probe (§7.2) skips its own confirming
 run for a subtree already confirmed here. A re-run that cannot be taken at
-all (a command that never spawned) leaves the tree UNMEASURED, never red.
+all — a command that never spawned, or a second worktree that will not check out
+or install — leaves the tree UNMEASURED, never red: there is no second
+observation, and one observation may not found a case.
 
 **A CHANGED VERDICT ACCUSES NOBODY — and is not a green either.** The two runs
 disagree about one tree, so the only established fact is that the check is
@@ -1675,8 +1698,8 @@ branches: no branch introduced the failure and none of them can be handed the fi
 The red still blocks every branch carrying it (content arrives green or it does
 not arrive) and it is REPORTED; what the driver refuses to do is invent an owner
 for it. Nothing is re-run here — the
-confirmation is paid where the tree was standing with its dependencies installed
-(§7.6), and this is a journal read. The integration verify passes no `redOn`: its
+confirmation is paid by the gate that saw the red, in a separately prepared
+worktree (§7.6), and this is a journal read. The integration verify passes no `redOn`: its
 own determinism probe already re-runs the failing commands before attribution.
 
 Which branch a fix belongs on is decided by AUTHORSHIP ON THE FIRST-PARENT LINE:

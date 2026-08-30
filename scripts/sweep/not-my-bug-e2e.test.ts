@@ -303,9 +303,10 @@ describe('the not-my-bug deadlock, end to end (real checks, real commits)', () =
   });
 
   /**
-   * D-075's incident, as a repo: the failing command runs in a subtree that is
-   * BYTE-IDENTICAL on the accused branch and on the branch the red was actually
-   * seen on. One verdict covers both — and it accuses neither.
+   * The shape that mints on an innocent branch, as a repo: the failing command
+   * runs in a subtree that is BYTE-IDENTICAL on the accused branch and on the
+   * branch the red was actually seen on. One verdict covers both — and it
+   * accuses neither.
    */
   it('a red seen on another branch carrying the identical subtree blames nobody here', async () => {
     const { repo, failingTest, conflictedPath } = makeNotMyBugIncidentFixture();

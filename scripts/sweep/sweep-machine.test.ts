@@ -5505,8 +5505,12 @@ describe('run — the landing gate', () => {
       const cmds = commands.map((c) => c.cmd);
       ran.push({ cmds, cwd });
       if (!cmds.includes('vitest run') || !redTree(cwd)) return { ok: true, failedNames: [], output: '' };
-      const nth = (seen.get(cwd) ?? 0) + 1;
-      seen.set(cwd, nth);
+      // KEYED ON THE COMMIT, NOT THE PATH. The confirming re-run is taken in a
+      // worktree checked out afresh, so a path-keyed harness would call it a
+      // first run and hand the driver two independent reds it never observed.
+      const at = execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' }).trim();
+      const nth = (seen.get(at) ?? 0) + 1;
+      seen.set(at, nth);
       if (nth > 1 && !stable()) return { ok: true, failedNames: [], output: '' };
       return {
         ok: false,
@@ -5772,9 +5776,9 @@ describe('run — the landing gate', () => {
 });
 
 /**
- * D-075's first rule, as tests: a check's verdict is a fact about the SUBTREE
- * its `cwd` names, so branches carrying the identical subtree share one verdict
- * and branches that do not are each measured.
+ * A check's verdict is a fact about the SUBTREE its `cwd` names, so branches
+ * carrying the identical subtree share one verdict and branches that do not are
+ * each measured — and a confirming re-run is taken somewhere else.
  */
 describe('run — a verdict belongs to the subtree the check ran in', () => {
   /** A runner that records the commands AND the worktree each run was taken in. */
@@ -5908,13 +5912,14 @@ describe('run — a verdict belongs to the subtree the check ran in', () => {
     );
     // `vitest run` is red the first time it is asked on a tree and green after —
     // the load-dependent shape. It never earns a confirmation.
-    const seen = new Set<string>();
-    const t = subtreeRunner((cmd, wt) => {
-      if (cmd !== 'vitest run') return false;
-      const first = !seen.has(wt);
-      seen.add(wt);
-      return first;
-    });
+    // Red the FIRST time the command is asked in this pass and green after — the
+    // load-window shape. Counted per command, never per worktree: the confirming
+    // re-run is deliberately taken somewhere else.
+    // Red on every ODD ask and green on the even one that follows, so each call's
+    // observation is contradicted by its own confirming re-run: the load window
+    // opens, is measured, and has closed by the time the second run is prepared.
+    let asked = 0;
+    const t = subtreeRunner((cmd) => cmd === 'vitest run' && ++asked % 2 === 1);
 
     expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: f }))).toBe(0);
     expect(await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn)).toBe(1);
@@ -5954,6 +5959,78 @@ describe('run — a verdict belongs to the subtree the check ran in', () => {
     const fresh = journal.filter((e) => e.action === 'red-confirm' && e.cmd === 'vitest run' && e.subtree === landed.tree);
     expect(fresh.length).toBeGreaterThan(0);
     expect(fresh.every((e) => e.reproduced === false)).toBe(true);
+  });
+
+  it('the confirming re-run is prepared afresh, and the journal states what was varied', async () => {
+    const repo = runnerRepo(false);
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    // Deterministically red: the question here is HOW the second observation was
+    // taken, not what it said.
+    const t = subtreeRunner((cmd) => cmd === 'bun test');
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: cwdChecks(ws) }))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn)).toBe(0);
+
+    const bunRuns = t.ran.filter((r) => r.cmds.includes('bun test'));
+    expect(bunRuns).toHaveLength(2);
+    // THE POINT: not the same worktree twice. The first run's environment is the
+    // one the red was seen in; the second is checked out and installed again.
+    expect(bunRuns[1].cwd).not.toBe(bunRuns[0].cwd);
+
+    const confirm = readJournal(dir).find((e) => e.action === 'red-confirm')!;
+    expect(confirm.reproduced).toBe(true);
+    const variation = confirm.variation as {
+      freshWorktree: string;
+      freshInstall: boolean;
+      separatedMs: number;
+      loadIsolated: boolean;
+    };
+    expect(variation.freshWorktree).toBe(bunRuns[1].cwd);
+    expect(variation.freshInstall).toBe(true);
+    expect(typeof variation.separatedMs).toBe('number');
+    // WHAT IT DOES NOT CLAIM. The container is shared, so the driver cannot say
+    // the second run was quiet — only that it was prepared separately.
+    expect(variation.loadIsolated).toBe(false);
+  });
+
+  it('a red whose re-run cannot be PREPARED founds no case: there is no second observation', async () => {
+    const repo = runnerRepo(false);
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    // The environment goes away between the two observations: the fresh worktree
+    // for the confirming run cannot be installed.
+    let broken = false;
+    const install: InstallRunner = async (wt) => {
+      if (broken) return { ok: false, failure: { command: 'pnpm install', cwd: '.', output: 'no network' } };
+      mkdirSync(join(wt, 'node_modules'), { recursive: true });
+      return { ok: true };
+    };
+    const t = subtreeRunner((cmd) => {
+      if (cmd !== 'bun test') return false;
+      broken = true;
+      return true;
+    });
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: cwdChecks(ws), installRunner: install }))).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv, { installRunner: install }), t.fn);
+
+    const journal = readJournal(dir);
+    // No second observation, so the first one stands alone — and one observation
+    // may not found a case. The branch is not green either: it did not arrive.
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    const confirm = journal.find((e) => e.action === 'red-confirm')!;
+    expect(confirm.ran).toBe(false);
+    expect(confirm.unmeasurable).toBe(true);
+    expect(confirm.reproduced).toBe(false);
+    // The landing carries no verdict at all — an unmeasured tree, said out loud,
+    // rather than a red one attributed to the branch that happened to be under it.
+    const row = journal.find((e) => e.action === 'landing-check' && e.reason === 'environment-fault')!;
+    expect(row.branch).toBe('main_patched');
+    expect(row.id).toBe('WARN14_ENVIRONMENT_FAULT');
+    expect(row.ok).toBeUndefined();
   });
 });
 
