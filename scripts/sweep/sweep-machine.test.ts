@@ -5952,14 +5952,19 @@ describe('run — the landing gate', () => {
     cleanups.push(() => repo.destroy());
     const ws = mkWorkspace();
     const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'], owned: ['src/cg.ts'] }]);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    repo.git('push', 'origin', 'module/cg');
     const dir = dirOf(repo, ws);
     const cgBefore = repo.sha('module/cg');
     const checks = join(ws, 'checks.json');
     writeFileSync(
       checks,
+      // Commands that are GREEN when actually spawned: the landing gate's runner
+      // is injected below, but finish's integration verify runs them for real.
       JSON.stringify({
-        typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }],
-        test: [{ cmd: 'vitest run', cwd: 'container/agent-runner' }],
+        typecheck: [{ cmd: 'true', cwd: '.' }],
+        test: [{ cmd: 'echo runner', cwd: 'container/agent-runner' }],
       }),
     );
     // Only the subtree-scoped test command is red; the typecheck is green, so the
@@ -5967,12 +5972,12 @@ describe('run — the landing gate', () => {
     let runs = 0;
     const fn: ChecksRunner = async (commands) => {
       const cmds = commands.map((c) => c.cmd);
-      if (!cmds.includes('vitest run')) return { ok: true, failedNames: [], output: '' };
+      if (!cmds.includes('echo runner')) return { ok: true, failedNames: [], output: '' };
       runs++;
       return {
         ok: false,
-        failedNames: ['vitest run'],
-        output: '$ vitest run\ncontainer/agent-runner/poll-loop.test.ts(1,1): error TS2345: boom\n',
+        failedNames: ['echo runner'],
+        output: '$ echo runner\ncontainer/agent-runner/poll-loop.test.ts(1,1): error TS2345: boom\n',
       };
     };
 
@@ -5985,10 +5990,10 @@ describe('run — the landing gate', () => {
       branch: 'module/elsewhere',
       sha: repo.sha('main_patched'),
       phase: 'test',
-      cmd: 'vitest run',
+      cmd: 'echo runner',
       cwd: 'container/agent-runner',
       subtree: runnerSubtree,
-      commands: ['vitest run'],
+      commands: ['echo runner'],
       ran: true,
       reproduced: true,
     });
@@ -6024,6 +6029,32 @@ describe('run — the landing gate', () => {
     expect(second.some((e) => e.action === 'arrived' && e.branch === 'main_patched')).toBe(false);
     expect(second.filter((e) => e.action === 'gate-fix-refused')).toHaveLength(2);
     expect(repo.sha('module/cg')).toBe(cgBefore);
+
+    // AND THE OWNER HEARS ABOUT IT. The pass's report is assembled from the
+    // finish result alone, so a red with no case, no PR and no branch to name is
+    // the one finding that disappears without this.
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const cmds = join(ws, 'cmds.json');
+    writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }]));
+    const finOut = join(ws, 'fin.json');
+    await cmdSweepFinish(
+      baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, tokenFile, commandsFile: cmds, out: finOut }),
+      fakeGithub().factory,
+    );
+    const fin = JSON.parse(readFileSync(finOut, 'utf8')) as {
+      needsOwner?: Array<{ branch: string; category: string; id?: string; detail: string }>;
+      unmintableReds?: Array<{ branch: string; files: string[]; id: string }>;
+      instruction: string;
+    };
+    // ONE entry, not one per measurement: the same branch and the same files were
+    // refused on both calls.
+    expect(fin.unmintableReds).toEqual([
+      { branch: 'main_patched', files: [], id: 'WARN22_RED_UNCONFIRMED', detail: expect.any(String) },
+    ]);
+    expect((fin.needsOwner ?? []).map((n) => `${n.branch}:${n.category}`)).toContain('main_patched:unmintable-red');
+    expect(fin.instruction).toContain('RED, NO BRANCH TO FIX IT');
+    expect(fin.instruction).toContain('WARN22_RED_UNCONFIRMED');
   });
 
   it('a merge that lands no new tree is not measured', async () => {

@@ -396,13 +396,17 @@ Its answers:
 
 - `"complete"` — report to the owner every entry in `pullRequests` (number, title,
   status), which branches landed, the `stats` summary, and every entry in
-  `uncoveredRemainders`. Then, if the result says
+  `uncoveredRemainders` and `unmintableReds`. Entries under `needsOwner` require the
+  owner to act even on a complete pass — name them, and do not re-run for them.
+  Then, if the result says
   upstream advanced past the pass's pin, run `start` again; otherwise stop — the sweep
   is done.
 - `"partial"` — some pushes or publishes failed. Report factually: which branches
   landed, which failed and with what category, every pull request, and every entry in
-  `uncoveredRemainders`. Entries under
-  `needsOwner` require the owner to act — do not simply re-run for those. Then re-run
+  `uncoveredRemainders` and `unmintableReds`. Entries under
+  `needsOwner` require the owner to act — do not simply re-run for those. A
+  `unmintable-red` entry is a real failure with no branch to fix it: report it
+  verbatim and never go looking for the branch that caused it. Then re-run
   `finish`: landed branches skip, transient failures retry.
 - `"gate-fix-required"` — verification was red and gate-fix cases were prepared; run
   `next-case` and work them.

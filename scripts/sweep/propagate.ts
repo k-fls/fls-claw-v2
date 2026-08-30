@@ -1257,6 +1257,58 @@ export function uncoveredRemainders(
   return out;
 }
 
+/** A red this pass proved and could hand to no branch (§10.7 `needsOwner`). */
+export interface UnmintableRed {
+  /** The branch no case could be rooted on. */
+  branch: string;
+  /** The failing files, where the refusal named them. */
+  files: string[];
+  id: string;
+  detail: string;
+}
+
+/**
+ * THE REDS THIS PASS PROVED AND COULD HAND TO NOBODY.
+ *
+ * A refusal is journaled `gate-fix-refused` wherever it is taken — the mint, the
+ * `--not-my-bug` preflight, the landing gate — and nothing read those rows. So a
+ * red that blocked a branch, minted no case and opened no PR left the pass
+ * entirely: the mid-pass result that named it is gone by the time the agent
+ * reports, and the report is assembled from the FINISH result alone.
+ *
+ * It is owner-shaped work, not driver-shaped: only the owner can decide what to
+ * do about a failure no branch introduced. So it travels under `needsOwner`,
+ * where an autonomous re-run loop already knows to stop rather than retry.
+ *
+ * COVERED LATER IS NOT UNCOVERED, on the same terms as a remainder: a refusal the
+ * pass went on to mint a case for — a re-measurement that confirmed the red where
+ * it belonged — is not reported, and neither is one whose branch was later
+ * measured GREEN. Both are strictly after the refusal.
+ */
+export function unmintableReds(journal: JournalEntry[]): UnmintableRed[] {
+  const out: UnmintableRed[] = [];
+  const seen = new Set<string>();
+  journal.forEach((e, i) => {
+    if (e.action !== 'gate-fix-refused') return;
+    const branch = String(e.branch ?? '');
+    const files = Array.isArray(e.files) ? (e.files as string[]) : [];
+    const key = `${branch} :: ${files.join(', ')}`;
+    if (seen.has(key)) return;
+    for (const later of journal.slice(i + 1)) {
+      if (later.action === 'gate-fix' && later.branch === branch) return;
+      if (later.action === 'landing-check' && later.branch === branch && later.ok === true) return;
+    }
+    seen.add(key);
+    out.push({
+      branch,
+      files,
+      id: typeof e.id === 'string' ? e.id : 'WARN22_RED_UNCONFIRMED',
+      detail: String(e.reason ?? ''),
+    });
+  });
+  return out;
+}
+
 // --------------------------------------------------------------------------
 // Journaled ref mutations (reuse merge.ts's commit-tree + update-ref technique).
 // --------------------------------------------------------------------------
@@ -13241,6 +13293,11 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   // result that named them is gone, and the report is assembled from THIS
   // object, so a remainder missing here is a remainder recalled from memory.
   const uncoveredRemaindersNow = uncoveredRemainders(journalFinal, journaledCases(journalFinal));
+  // REDS THIS PASS PROVED AND COULD HAND TO NOBODY. Journaled wherever the
+  // refusal was taken and, until now, read nowhere: a failure that blocked a
+  // branch, minted no case and opened no PR left the pass without a trace in the
+  // one object the agent's report is assembled from.
+  const unmintableRedsNow = unmintableReds(journalFinal);
   const resolvedRows = journalFinal.filter((e) => e.action === 'resolved');
   const publishedRows = journalFinal.filter((e) => e.action === 'pr-published');
   const failedByCategory = { diverged: 0, transient: 0, auth: 0, rejected: 0 };
@@ -13268,6 +13325,16 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
       branch: String(e.branch),
       category: 'environment',
       detail: String(e.detail ?? ''),
+    })),
+    // A RED NO BRANCH COULD BE HANDED is this list's subject too: nothing the
+    // driver can do reaches it, re-running finish will not change it, and the
+    // only thing left is to tell the owner. Reported here, it survives the pass;
+    // reported only mid-pass, it is recalled from memory or not at all.
+    ...unmintableRedsNow.map((u) => ({
+      branch: u.branch,
+      category: 'unmintable-red',
+      id: u.id,
+      detail: `${u.files.length ? `${u.files.join(', ')}: ` : ''}${u.detail}`,
     })),
   ];
   const pushBlockingIssues = pushDelta
@@ -13311,6 +13378,14 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
           (u) =>
             `${u.files.join(', ')} (${u.reason}, from ${u.caseId} merging ${u.parent} into ${u.branch}) — ${u.detail}`,
         )
+        .join('; ')}. Report these to the owner exactly as written; nothing this pass fixes them.`
+    : '';
+  // The refusal cue. A red nobody can be handed is the pass's least reportable
+  // finding — no case, no PR, no branch to name — so it is the one most easily
+  // dropped from the report, and the owner is the only one who can act on it.
+  const unmintableCue = unmintableRedsNow.length
+    ? ` RED, NO BRANCH TO FIX IT: ${unmintableRedsNow
+        .map((u) => `${u.branch}${u.files.length ? ` [${u.files.join(', ')}]` : ''} (${u.id}) — ${u.detail}`)
         .join('; ')}. Report these to the owner exactly as written; nothing this pass fixes them.`
     : '';
   const stats = {
@@ -13361,6 +13436,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
       pushedUnbuilt,
       withheldPushes,
       uncoveredRemainders: uncoveredRemaindersNow,
+      unmintableReds: unmintableRedsNow,
       stats,
       instruction:
         `REPORT to the owner FACTUALLY: which branches LANDED (${branches.filter((b) => b.landed).map((b) => b.branch).join(', ') || 'none'}) ` +
@@ -13369,7 +13445,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
         `${pushBlockingIssues.length ? ` Blocking push-phase issues: ${pushBlockingIssues.map((i) => i.id).join(', ')}.` : ''} ` +
         `${needsOwner.length ? `OWNER ACTION REQUIRED (do NOT just re-run for these): ${needsOwner.map((n) => `${n.branch} (${n.category})`).join('; ')} — never force-resolve. ` : 'DIVERGED branches need the owner (never force-resolve); '}` +
         `${systemicOutage ? `Network outage: ${heldPublishesSkipped} held publish(es) were skipped, not attempted. ` : ''}` +
-        `${ownerPrCue}${coverageCue}${uncoveredCue}` +
+        `${ownerPrCue}${coverageCue}${uncoveredCue}${unmintableCue}` +
         ` then re-run \`finish\` — landed branches skip, transient failures retry.`,
     });
     return 1;
@@ -13382,15 +13458,21 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     upstreamAdvanced,
     pullRequests: annotated,
     branches,
+    // OWNER-ACTION-REQUIRED SURVIVES A CLEAN FINISH. Every push and publish can
+    // succeed and still leave a red no branch can be handed a fix for: the pass
+    // did everything available to it, and the one thing left is the owner's.
+    // Omitting the list on a complete result would say the opposite.
+    ...(needsOwner.length ? { needsOwner } : {}),
     ...(ownerPrs.length ? { ownerPullRequests: ownerPrs } : {}),
     coverage,
     pushedUnbuilt,
     withheldPushes,
     uncoveredRemainders: uncoveredRemaindersNow,
+    unmintableReds: unmintableRedsNow,
     stats,
     instruction:
       `REPORT to the owner: every PR in pullRequests (number, title, status), the landed branches (branches list), and the stats summary.` +
-      `${ownerPrCue}${coverageCue}${uncoveredCue} Then ` +
+      `${ownerPrCue}${coverageCue}${uncoveredCue}${unmintableCue} Then ` +
       (upstreamAdvanced ? 'run `sweep start` again (upstream advanced past the pinned watermark)' : 'stop — the sweep is done'),
   });
   return 0;

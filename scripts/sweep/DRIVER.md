@@ -2179,7 +2179,16 @@ become gate-fix cases (§9) or stop the pass.
 `finish` emits one `SWEEP-RESULT` carrying the pass summary: `ok`, `status`
 (`complete` | `partial`), `next`, `upstreamAdvanced`, `branches` (per-branch landed
 vs failed), `failedPushes` / `failedPublishes`, and on a partial result
-`needsOwner`, `blockingIssues`, and the systemic-outage fields.
+`blockingIssues` and the systemic-outage fields. `needsOwner` rides on BOTH: every
+push and publish can succeed and still leave work only the owner can do.
+
+`unmintableReds` lists every red this pass PROVED and could hand to no branch —
+upstream, or a verdict a sibling carrying the identical subtree already owns
+(`gate-fix-refused` rows, deduped by branch and files, dropped where a later mint
+or a later green landing covered them). No case was created for these and no PR
+carries them, so this list and the `RED, NO BRANCH TO FIX IT` cue are the only
+account of them there will be; they also appear under `needsOwner` with category
+`unmintable-red`, because retrying reaches nothing and only the owner can act.
 
 `ownerPullRequests` lists every OWNER-shaped PR that no longer merges or no
 longer passes (§5.6), drafted by us or not, every pass — the one-time draft
