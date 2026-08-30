@@ -287,6 +287,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // New turn: clear the "delivered via send_message" flag so a send from a
     // prior batch can't suppress this turn's re-wrap nudge.
     resetSentUserMsgThisTurn();
+    // The stop signal is otherwise only checked between loop iterations — but
+    // abort almost always fires while processQuery is awaiting an open stream
+    // (streams are kept open for follow-up pushes and never force-ended). An
+    // abandoned processQuery keeps its 500ms follow-up poller alive forever
+    // and steals pending messages from whatever DB is current (in tests: the
+    // next test's in-memory DB). Aborting the query ends its event stream,
+    // which runs processQuery's finally and clears the interval.
+    const abortQuery = () => query.abort();
+    config.signal?.addEventListener('abort', abortQuery, { once: true });
     try {
       const result = await processQuery(
         query,
@@ -329,6 +338,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // followed by a "Completed" line that reads like success.
       log(`Errored batch will be acked completed — ${processingIds.length} message(s), no redelivery`);
     } finally {
+      config.signal?.removeEventListener('abort', abortQuery);
       clearCurrentInReplyTo();
     }
 
