@@ -10204,6 +10204,35 @@ async function adjudicateNotMyBug(p: {
     const refusedIssues = refusedOwners
       .filter((r) => typeof r.id === 'string')
       .map((r) => ({ id: r.id!, detail: `${r.ownerBranch}: ${r.detail}` }));
+    // WHAT NO GATE FIX WILL COVER, in one block, whichever way this ends. A
+    // remainder folded silently into another owner's case is a misattribution; a
+    // remainder dropped is a red build nobody was told about.
+    //
+    // A REFUSED OWNER BELONGS IN THE SAME SENTENCE. Its files were proven to
+    // belong to a branch and no case was minted for them either, so from the
+    // owner's side they are in exactly the position of a remainder: still red,
+    // nothing prepared. Reporting only the remainder would leave them unsaid.
+    const uncovered =
+      partition.remainder || refusedFiles.length > 0
+        ? {
+            kind: partition.remainder ? partition.remainder.kind : 'unmintable-red',
+            files: [...(partition.remainder?.files ?? []), ...refusedFiles],
+            detail: [...(partition.remainder ? [partition.remainder.detail] : []), refusedDetail]
+              .filter(Boolean)
+              .join('; '),
+          }
+        : null;
+    const uncoveredNote = uncovered
+      ? `NOT COVERED BY ANY GATE FIX: ${uncovered.files.join(', ')} — ${uncovered.detail}. ` +
+        `No case was minted for those files and they stay red; report them to the owner.`
+      : '';
+    /** The remainder's own finding, where it has one — never a footnote on a case. */
+    const remainderIssues =
+      partition.remainder?.kind === 'flaky'
+        ? [{ id: 'WARN21_CHECKS_FLAKY', detail: partition.remainder.detail }]
+        : partition.remainder?.kind === 'shared'
+          ? [{ id: 'WARN22_RED_UNCONFIRMED', detail: partition.remainder.detail }]
+          : [];
 
     if (mintableGroups.length === 0) {
       // EVERY OWNER WAS PROVEN AND NONE MAY BE HANDED THE FIX. The failure is
@@ -10241,13 +10270,13 @@ async function adjudicateNotMyBug(p: {
         tier: 'held',
         notMyBug: {
           verdict: verdict.verdict,
-          files: refusedFiles,
+          files: uncovered!.files,
           owners,
           probes: verdict.probes + partition.probes,
-          detail: refusedDetail,
+          detail: uncovered!.detail,
         },
-        uncovered: { kind: 'unmintable-red', files: refusedFiles, detail: refusedDetail },
-        issues: refusedIssues,
+        uncovered: uncovered!,
+        issues: [...refusedIssues, ...remainderIssues],
       });
       return { handled: true, code: 0 };
     }
@@ -10490,28 +10519,6 @@ async function adjudicateNotMyBug(p: {
     }
     const cases = minted.flatMap((m) => m.gate.cases.map((c) => ({ ...c, plan: m.plan })));
     const probeTotal = verdict.probes + partition.probes + plans.reduce((n, pl) => n + pl.bisect.probes, 0);
-    // WHAT NO GATE FIX COVERS, said in the words the agent will relay. A remainder
-    // folded silently into another owner's case is a misattribution; a remainder
-    // dropped is a red build nobody was told about. Named here, it is neither.
-    //
-    // A REFUSED OWNER BELONGS IN THE SAME SENTENCE. Its files were proven to
-    // belong to a branch and no case was minted for them either, so from the
-    // owner's side they are in exactly the position of a remainder: still red,
-    // nothing prepared. Reporting only the remainder would leave them unsaid.
-    const uncovered =
-      partition.remainder || refusedFiles.length > 0
-        ? {
-            kind: partition.remainder ? partition.remainder.kind : 'unmintable-red',
-            files: [...(partition.remainder?.files ?? []), ...refusedFiles],
-            detail: [...(partition.remainder ? [partition.remainder.detail] : []), refusedDetail]
-              .filter(Boolean)
-              .join('; '),
-          }
-        : null;
-    const uncoveredNote = uncovered
-      ? `NOT COVERED BY ANY GATE FIX: ${uncovered.files.join(', ')} — ${uncovered.detail}. ` +
-        `No case was minted for those files and they stay red; report them to the owner.`
-      : '';
     const unmintedNote = minted
       .filter((m) => !m.gate.served)
       .map((m) => `No case on ${m.plan.ownerBranch} for [${m.plan.group.files.join(', ')}] — ${m.gate.reason}.`)
@@ -10538,12 +10545,7 @@ async function adjudicateNotMyBug(p: {
         // The files the probe could not settle travel with their OWN id: they
         // are not part of any gate fix, and an unstable check is a finding in
         // its own right rather than a footnote on someone else's case.
-        ...(partition.remainder?.kind === 'flaky'
-          ? [{ id: 'WARN21_CHECKS_FLAKY', detail: partition.remainder.detail }]
-          : []),
-        ...(partition.remainder?.kind === 'shared'
-          ? [{ id: 'WARN22_RED_UNCONFIRMED', detail: partition.remainder.detail }]
-          : []),
+        ...remainderIssues,
         ...refusedIssues,
       ],
         notMyBug: {
@@ -10583,12 +10585,7 @@ async function adjudicateNotMyBug(p: {
         // The files the probe could not settle travel with their OWN id: they
         // are not part of any gate fix, and an unstable check is a finding in
         // its own right rather than a footnote on someone else's case.
-        ...(partition.remainder?.kind === 'flaky'
-          ? [{ id: 'WARN21_CHECKS_FLAKY', detail: partition.remainder.detail }]
-          : []),
-        ...(partition.remainder?.kind === 'shared'
-          ? [{ id: 'WARN22_RED_UNCONFIRMED', detail: partition.remainder.detail }]
-          : []),
+        ...remainderIssues,
         ...refusedIssues,
       ],
       notMyBug: {
