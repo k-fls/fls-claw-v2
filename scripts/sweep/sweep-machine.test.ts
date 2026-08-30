@@ -40,6 +40,8 @@ import {
   passDir,
   appendJournal,
   gateFixCaseMaterialsForTest,
+  gateFixRefName,
+  publishGateFixTwins,
   journaledCases,
   readJournal,
   reportDriverHalt,
@@ -8509,5 +8511,334 @@ describe('DriverHalt reporting', () => {
     expect(res.issues).toBeUndefined();
     expect(res.instruction).toContain('REPORT to the owner');
     expect(res.instruction).toContain('outside scope');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Twins — one commit, published at two levels (DRIVER.md §9.6).
+// ---------------------------------------------------------------------------
+
+describe('gate-fix twins — the same commit, offered at the ceiling', () => {
+  /**
+   * `module/cg` carries an open fix on origin for a file the TRUNK wrote;
+   * `module/other` conflicts with what the trunk brings down, so its
+   * adjudication is where the ceiling is asked about the same defect.
+   */
+  function twinFixture(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: shared', { 'src/shared.ts': 'broken\n' });
+    repo.checkout('module/cg', { create: true, at: 'main_patched' });
+    repo.checkout('module/other', { create: true, at: 'main_patched' });
+    repo.commit('other: x = other', { 'src/x.ts': 'other\n' });
+    repo.checkout('main');
+    repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' });
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+
+  /**
+   * The driver's own fix commit, as origin already carries it: the SAME identity
+   * `driverShaped` recognises, rooted at a commit the trunk contains — which is
+   * where the mint's root floor puts a gate fix in the first place.
+   */
+  function pushDriverFix(repo: FixtureRepo, ref: string, at: string, files: Record<string, string>): string {
+    repo.checkout('tmp/fix', { create: true, at });
+    repo.commit('fix(sweep): the shared defect', files);
+    const tree = repo.git('rev-parse', 'HEAD^{tree}');
+    repo.checkout('main');
+    repo.git('branch', '-D', 'tmp/fix');
+    const sha = execFileSync('git', ['-C', repo.dir, 'commit-tree', tree, '-p', at, '-m', 'fix(sweep): the shared defect'], {
+      encoding: 'utf8',
+      env: { ...process.env, ...DRIVER_COMMIT_ENV, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+    }).trim();
+    repo.git('push', 'origin', `${sha}:refs/heads/${ref}`);
+    return sha;
+  }
+
+  /** A GitHub that REMEMBERS: PRs by head, their draft flag, their body, their comments. */
+  function twinGithub(existing: Array<{ head: string; base: string; body?: string; draft?: boolean }>): {
+    prs: Map<number, { number: number; head: string; base: string; draft: boolean; body: string }>;
+    comments: Map<number, string[]>;
+    created: Array<{ head: string; base: string; body: string; title: string }>;
+    draftFlips: number[];
+    factory: (token: string) => GithubTransport;
+  } {
+    const prs = new Map<number, { number: number; head: string; base: string; draft: boolean; body: string }>();
+    const comments = new Map<number, string[]>();
+    const created: Array<{ head: string; base: string; body: string; title: string }> = [];
+    const draftFlips: number[] = [];
+    let next = 100;
+    for (const e of existing) {
+      const n = next++;
+      prs.set(n, { number: n, head: e.head, base: e.base, draft: e.draft ?? false, body: e.body ?? 'agent prose' });
+      comments.set(n, []);
+    }
+    const byHead = (path: string): { number: number; head: string; base: string; draft: boolean; body: string } | null => {
+      const m = /head=([^&]+)/.exec(path);
+      const head = m ? decodeURIComponent(m[1]).replace(/^[^:]*:/, '') : '';
+      return [...prs.values()].find((p) => p.head === head) ?? null;
+    };
+    const asApi = (p: { number: number; draft: boolean; body: string }): Record<string, unknown> => ({
+      number: p.number,
+      html_url: `https://github.com/k-fls/fixture/pull/${p.number}`,
+      node_id: `PR_${p.number}`,
+      state: 'open',
+      merged: false,
+      draft: p.draft,
+      title: 't',
+      body: p.body,
+    });
+    const factory = (_t: string): GithubTransport => ({
+      async request(method, path, body) {
+        if (method === 'GET' && path.includes('/pulls?head=')) {
+          const pr = byHead(path);
+          return { status: 200, body: pr ? [asApi(pr)] : [] };
+        }
+        if (method === 'POST' && path.endsWith('/pulls')) {
+          const b = body as { head: string; base: string; body: string; title: string; draft?: boolean };
+          const n = next++;
+          prs.set(n, { number: n, head: b.head, base: b.base, draft: b.draft === true, body: b.body });
+          comments.set(n, []);
+          created.push({ head: b.head, base: b.base, body: b.body, title: b.title });
+          return { status: 201, body: asApi(prs.get(n)!) };
+        }
+        const num = Number(/\/(?:pulls|issues)\/(\d+)/.exec(path)?.[1] ?? 0);
+        if (method === 'GET' && /\/pulls\/\d+\/reviews/.test(path)) return { status: 200, body: [] };
+        if (method === 'GET' && /\/pulls\/\d+\/comments/.test(path)) return { status: 200, body: [] };
+        if (method === 'GET' && /\/issues\/\d+\/comments/.test(path)) {
+          return { status: 200, body: (comments.get(num) ?? []).map((c, i) => ({ id: i + 1, body: c, user: { login: 'sweep' } })) };
+        }
+        if (method === 'POST' && /\/issues\/\d+\/comments/.test(path)) {
+          comments.set(num, [...(comments.get(num) ?? []), String((body as { body: string }).body)]);
+          return { status: 201, body: {} };
+        }
+        if (method === 'GET' && /\/pulls\/\d+$/.test(path)) {
+          const pr = prs.get(num);
+          return pr ? { status: 200, body: asApi(pr) } : { status: 404, body: null };
+        }
+        if (method === 'PATCH' && /\/pulls\/\d+$/.test(path)) {
+          const pr = prs.get(num);
+          if (pr && typeof (body as { body?: string }).body === 'string') pr.body = (body as { body: string }).body;
+          return { status: 200, body: {} };
+        }
+        if (method === 'POST' && path === '/graphql') {
+          const q = String((body as { query?: string }).query ?? '');
+          const id = String(((body as { variables?: { pullRequestId?: string } }).variables ?? {}).pullRequestId ?? '');
+          const n = Number(id.replace('PR_', ''));
+          if (q.includes('convertPullRequestToDraft')) {
+            const pr = prs.get(n);
+            if (pr) pr.draft = true;
+            draftFlips.push(n);
+          }
+          return { status: 200, body: { data: { node: { id } } } };
+        }
+        return { status: 404, body: null };
+      },
+    });
+    return { prs, comments, created, draftFlips, factory };
+  }
+
+  /** Verify commands that always pass — finish reaches its publish phase. */
+  function greenCommands(ws: string): string {
+    const f = join(ws, 'cmds.json');
+    writeFileSync(f, JSON.stringify([{ cmd: 'true' }]));
+    return f;
+  }
+
+  async function twinPass(
+    repo: FixtureRepo,
+    ws: string,
+    inv: string,
+    gh: ReturnType<typeof twinGithub>,
+    tokenFile: string,
+  ): Promise<{ dir: string }> {
+    const cli = (over: Partial<Cli> = {}): Cli => baseCli(repo, ws, inv, { tokenFile, ...over });
+    await cmdSweepStart(cli({ checksFile: checksFileFor(ws) }), gh.factory, greenPreMerge);
+    const dir = dirOf(repo, ws);
+    await cmdSweepNextCase(cli(), greenPreMerge);
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    appendFileSync(
+      join(dir, 'journal.jsonl'),
+      JSON.stringify({ ts: new Date().toISOString(), action: 'checks-fail', caseId, kind: 'typecheck', failed: ['true'] }) + '\n',
+    );
+    const r: ChecksRunner = async (commands) => {
+      const names = commands.map((c) => c.cmd);
+      return {
+        ok: false,
+        failedNames: names,
+        output: names.map((n) => `$ ${n}\nsrc/shared.ts(1,1): error TS2345: boom\n`).join(''),
+      };
+    };
+    await cmdSweepReportCase(
+      cli({ cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out: join(ws, 'rc.json') }),
+      neverInvoked,
+      r,
+      fakeInstall,
+    );
+    // The adjudication aborted the merge, so the conflict is still there: work it
+    // the ordinary way, or the integration rebuild is a conflict and finish never
+    // reaches its publish phase.
+    if (readJournal(dir).some((e) => e.action === 'reopened')) {
+      await cmdSweepNextCase(cli(), greenPreMerge);
+      const again = machineState(dir).currentCase?.caseId;
+      if (again) {
+        resolveWorktree(dir, again, { 'src/x.ts': 'RESOLVED\n' });
+        await cmdSweepReportCase(
+          cli({ cmd: 'report-case', tier: 'mechanical', execute: true }),
+          confirm,
+          greenPreMerge,
+          fakeInstall,
+        );
+      }
+    }
+    await cmdSweepFinish(
+      cli({ cmd: 'sweep-finish', execute: true, commandsFile: greenCommands(ws), out: join(ws, 'f.json') }),
+      gh.factory,
+    );
+    repo.git('fetch', 'origin');
+    return { dir };
+  }
+
+  /**
+   * The pass's pinned checks contract. The command is a real program that PASSES,
+   * so the only red in the pass is the one the injected runner reports at the case
+   * gate — finish's own verify then runs for real and is green, which is what
+   * carries the pass into its publish phase.
+   */
+  function checksFileFor(ws: string): string {
+    const f = join(ws, 'checks.json');
+    writeFileSync(f, JSON.stringify({ typecheck: [{ cmd: 'true', cwd: '.' }], test: [] }));
+    return f;
+  }
+
+  it('a fix that already exists is TWINNED to the ceiling instead of derived again', async () => {
+    const repo = twinFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'cg', branch: 'module/cg', parents: ['main_patched'] },
+      { id: 'other', branch: 'module/other', parents: ['main_patched'] },
+    ]);
+    repo.attachBareOrigin();
+    for (const b of ['main', 'main_patched', 'module/cg', 'module/other']) repo.git('push', 'origin', b);
+    const originalRef = gateFixRefName('module/cg', ['src/shared.ts']);
+    const twinRef = gateFixRefName('main_patched', ['src/shared.ts']);
+    const H = pushDriverFix(repo, originalRef, repo.sha('main_patched'), { 'src/shared.ts': 'ok\n' });
+    const tokenFile = join(ws, 'token.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = twinGithub([{ head: originalRef, base: 'module/cg' }]);
+    const { dir } = await twinPass(repo, ws, inv, gh, tokenFile);
+
+    const journal = readJournal(dir);
+    // NO CASE for a fix that is already written — and the row says where it went.
+    const twin = journal.find((e) => e.action === 'gate-fix-twin')!;
+    expect(twin.originalRef).toBe(originalRef);
+    expect(twin.twinRef).toBe(twinRef);
+    expect(twin.sha).toBe(H);
+    expect(twin.ceiling).toBe('main_patched');
+    expect(journal.some((e) => e.action === 'gate-fix' && e.branch === 'main_patched')).toBe(false);
+    // The agent is told, in the words the mint used.
+    const rc = JSON.parse(readFileSync(join(ws, 'rc.json'), 'utf8')) as { instruction: string };
+    expect(rc.instruction).toContain(`twinned to ${twinRef}`);
+
+    // ORIGIN CARRIES THE SAME COMMIT UNDER BOTH NAMES — nothing was rebased.
+    expect(repo.git('rev-parse', `refs/remotes/origin/${twinRef}`)).toBe(H);
+    expect(repo.git('rev-parse', `refs/remotes/origin/${originalRef}`)).toBe(H);
+    // The twin PR is based on the CEILING and points back at the original.
+    const twinPr = gh.created.find((c) => c.head === twinRef)!;
+    expect(twinPr.base).toBe('main_patched');
+    expect(twinPr.body).toContain(`<!-- sweep-twin-of: ${originalRef} -->`);
+    // The original is drafted once, told once, and carries the pointer forward.
+    const original = [...gh.prs.values()].find((p) => p.head === originalRef)!;
+    expect(original.draft).toBe(true);
+    expect(gh.draftFlips).toEqual([original.number]);
+    const marker = `<!-- sweep-twin: ${twinRef} -->`;
+    expect((gh.comments.get(original.number) ?? []).filter((c) => c.includes(marker))).toHaveLength(1);
+    expect(original.body).toContain(marker);
+    expect(journal.some((e) => e.action === 'gate-fix-twin-published' && e.twinRef === twinRef)).toBe(true);
+  });
+
+  /**
+   * A finish that crashed between the mint and the publish leaves the plan in the
+   * pass and NOTHING on origin's side half-done — so the whole phase re-runs, and
+   * every step of it has to find its own "already done" record on GitHub. The
+   * journal cannot answer that: the pass dir is disposable.
+   */
+  it('a re-run publish phase writes exactly one of everything', async () => {
+    const repo = twinFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'cg', branch: 'module/cg', parents: ['main_patched'] },
+      { id: 'other', branch: 'module/other', parents: ['main_patched'] },
+    ]);
+    repo.attachBareOrigin();
+    for (const b of ['main', 'main_patched', 'module/cg', 'module/other']) repo.git('push', 'origin', b);
+    const originalRef = gateFixRefName('module/cg', ['src/shared.ts']);
+    const twinRef = gateFixRefName('main_patched', ['src/shared.ts']);
+    const H = pushDriverFix(repo, originalRef, repo.sha('main_patched'), { 'src/shared.ts': 'ok\n' });
+    const tokenFile = join(ws, 'token.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = twinGithub([{ head: originalRef, base: 'module/cg' }]);
+    const { dir } = await twinPass(repo, ws, inv, gh, tokenFile);
+
+    // THE PHASE, AGAIN, with its plan still in the pass — a finish that died
+    // between the mint and the publish re-runs exactly this. Nothing in the
+    // journal may answer "already done": the pass dir is disposable, so every
+    // guard reads origin and GitHub.
+    const again = await publishGateFixTwins(baseCli(repo, ws, inv, { tokenFile }), dir, gh.factory);
+    expect(again.failed).toBe(0);
+    repo.git('fetch', 'origin');
+
+    // ONE ref, ONE twin PR, ONE draft flip, ONE comment — every "already done"
+    // record read back off GitHub, because the pass dir does not cross passes.
+    expect(repo.git('rev-parse', `refs/remotes/origin/${twinRef}`)).toBe(H);
+    expect(gh.created.filter((c) => c.head === twinRef)).toHaveLength(1);
+    const original = [...gh.prs.values()].find((p) => p.head === originalRef)!;
+    expect(gh.draftFlips).toEqual([original.number]);
+    const marker = `<!-- sweep-twin: ${twinRef} -->`;
+    expect((gh.comments.get(original.number) ?? []).filter((c) => c.includes(marker))).toHaveLength(1);
+    expect(original.body.split(marker)).toHaveLength(2);
+  });
+
+  it('the original ref is deleted, and its branch unblocked, once the twin lands and propagates', async () => {
+    const repo = twinFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'cg', branch: 'module/cg', parents: ['main_patched'] },
+      { id: 'other', branch: 'module/other', parents: ['main_patched'] },
+    ]);
+    const bare = repo.attachBareOrigin();
+    for (const b of ['main', 'main_patched', 'module/cg', 'module/other']) repo.git('push', 'origin', b);
+    const originalRef = gateFixRefName('module/cg', ['src/shared.ts']);
+    const H = pushDriverFix(repo, originalRef, repo.sha('main_patched'), { 'src/shared.ts': 'ok\n' });
+    expect(bare).toBeTruthy();
+    // The twin merges at the ceiling and propagates down — the ordinary sweep.
+    repo.checkout('main_patched');
+    repo.git('merge', '--no-ff', '-m', 'Merge the twin into main_patched', H);
+    repo.checkout('module/cg');
+    repo.git('merge', '--no-ff', '-m', 'Merge main_patched into module/cg (propagation)', 'main_patched');
+    repo.checkout('main');
+    repo.git('push', 'origin', 'main_patched');
+    repo.git('push', 'origin', 'module/cg');
+    const tokenFile = join(ws, 'token.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = twinGithub([{ head: originalRef, base: 'module/cg' }]);
+    expect(
+      await cmdSweepStart(
+        baseCli(repo, ws, inv, { tokenFile, out: join(ws, 'start.json') }),
+        gh.factory,
+        greenPreMerge,
+      ),
+    ).toBe(0);
+    const dir = dirOf(repo, ws);
+    const journal = readJournal(dir);
+    // THE COMMIT IS IN THE BRANCH, so the ref has nothing left to propose: it is
+    // deleted, GitHub closes its PR, and the branch derives freely again.
+    const resolved = journal.find((e) => e.action === 'origin-ref-resolved' && e.ref === originalRef)!;
+    expect(resolved).toBeTruthy();
+    expect(resolved.deleteFailed).toBeUndefined();
+    expect(journal.some((e) => e.action === 'origin-blocked' && e.branch === 'module/cg')).toBe(false);
   });
 });

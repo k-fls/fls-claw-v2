@@ -1441,7 +1441,8 @@ Every stage emits `SWEEP-STEP:` progress and journals (`not-my-bug`,
 `not-my-bug-owner` — one row per owner group AND one for the remainder —
 `not-my-bug-partition` with the round and probe counts, `gate-fix-ceiling` with the
 floor → target decision, `gate-fix-red-ref` with the ref that licensed a merged
-target, `not-my-bug-bisect` with the
+target, `gate-fix-twin` where an existing fix is offered at the ceiling instead of
+a case, `not-my-bug-bisect` with the
 probe log, plus `not-my-bug-environment`, `not-my-bug-premature`,
 `not-my-bug-discarded`, `scope-widened`, `gate-fix-root-clamped`). The result carries
 a `notMyBug` block (with `owners`), `gateFixes` (every minted case, each with its own
@@ -2059,6 +2060,60 @@ standing in as "the tree the agent started from" for the empty check, the scope
 guard and the cold-read diff. An UNCHANGED tree is `ERR32_UNRESOLVED` on ANY
 claim, `held` included ("nothing was fixed") — the pristine-conflict branch would
 otherwise describe an exhibit that never existed.
+
+### 9.6 Twins — one commit, offered at two levels
+
+A FIX PROVEN BY THE CHECKS GATE IS PROVEN AT THE TREE IT RAN ON, so it is never
+RELOCATED to reach a second level. Retargeting a pull request's base leaves the
+head branching from the descendant and the diff swallows everything that
+descendant carries; rebasing the head presents a fix as proven where it was never
+run; and either one, under a submitted review, changes the diff the reviewer read.
+
+So the commit does not move. When a ceiling mint (§7.2) is about to serve a case
+for a defect an open fix ref already answers, the SAME commit is published again
+under a second ref named for the ceiling, at the SAME sha, and no case is served:
+the mint returns `twinned to <ref>`, which the agent relays. The evidence travels
+with the unchanged commit, so it covers both levels equally, and each target's own
+landing gate (§7.6) re-proves it where it lands.
+
+**TWO CONDITIONS, both about the commit rather than the pull request.** The ref
+must be the DRIVER'S, by the same first-parent identity walk the proposal
+disposition applies (§5.6) — a head somebody else pushed is not the driver's to
+re-publish anywhere. And the commit's PARENT must be contained in the ceiling tip,
+so the diff AT THE CEILING is the fix and nothing else; without that the twin's
+diff carries every commit the lower branch has and the ceiling does not. Ceiling
+minting produces that shape by construction: a gate fix roots at or above the
+trunk head (§7.3).
+
+**THE NAMING CONVENTION IS THE MECHANISM.** A twin is published under the standard
+scheme (`fix/sweep/<slug(ceiling)>--gate-fix-<slug(ceiling)>-<digest>`), so it is
+an ordinary gate fix to the active-gate check, the duplicate scan, the
+merged/unmerged split at `start` and the disposition — none of which needs to know
+what a twin is. Within the pass the ceiling is gate-held from the moment the twin
+is planned: the ref only reaches origin at `finish`, and a ceiling whose fix is
+written but unpublished is exactly as red, and as unmintable, as one holding a
+case.
+
+**PUBLISHED AT FINISH, IDEMPOTENT AGAINST GITHUB.** The ref is pushed at the
+original's sha, a pull request is opened against the ceiling carrying
+`sweep-twin-of: <originalRef>`, and the ORIGINAL is converted to a draft once and
+told once, with `sweep-twin: <twinRef>` in a comment and in its machine block —
+the same convert-once/comment-once discipline an owner's PR gets (§5.6). Each of
+those has its own "already done" record ON GITHUB: the ref at that sha, an open PR
+on the head, the draft flag, the marker comment. Nothing crosses the pass in the
+journal, so a finish that died mid-phase re-runs the whole of it and writes one of
+each. A twin that cannot be published is not a halt — the fix still stands on its
+original ref and the next pass finds the same two facts.
+
+**BOTH SIDES CLEAN UP BY THEMSELVES.** Merging either ref puts the commit in that
+target; propagation carries it to the other. `start` classifies a fix ref whose
+head is contained in its target as merged and DELETES it, which closes its pull
+request — so the twin resolves the ceiling, propagation resolves the original, and
+neither needs a rule of its own.
+
+**ONE COMMIT IS NOT TWO DEFECTS.** Two refs that resolve to the same sha are named
+as twins in the duplicate report and left out of its count: asking the owner to
+reconcile a pull request with itself is worse than saying nothing.
 
 ## 10. Publication and finish
 

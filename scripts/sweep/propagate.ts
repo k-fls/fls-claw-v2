@@ -124,6 +124,10 @@ import {
   advisoryTextIssues,
   checkBaseHeight,
   convertPullRequestToDraft,
+  hasMachineLine,
+  renderSweepTwin,
+  renderSweepTwinOf,
+  withMachineLine,
   classifyComments,
   classifyReviewTrigger,
   createPullRequest,
@@ -2103,7 +2107,12 @@ function gateFixCaseId(branch: string, files: string[]): string {
  * cannot be recovered by diffing the ref. Digest equality is the strongest
  * sound cross-pass signal and stays.
  */
-async function duplicateGateFixes(cli: Cli, dir: string, branch: string, files: string[]): Promise<string[]> {
+async function duplicateGateFixes(
+  cli: Cli,
+  dir: string,
+  branch: string,
+  files: string[],
+): Promise<{ duplicates: string[]; twins: string[] }> {
   const digest = gateFixFilesDigest(files);
   const want = new Set(files);
   const out: string[] = [];
@@ -2115,12 +2124,99 @@ async function duplicateGateFixes(cli: Cli, dir: string, branch: string, files: 
     const scope = shared.length === theirs.length && shared.length === want.size ? 'same files' : `shares ${shared.join(', ')}`;
     out.push(`${String(e.caseId)} (this pass, on ${String(e.branch)} — ${scope})`);
   }
+  // ONE COMMIT IS NOT TWO DEFECTS. A twin publishes the SAME sha under a second
+  // name so one fix can be reviewed at two levels, so two refs that resolve to
+  // one commit are one piece of work and reporting them as duplicates would ask
+  // the owner to reconcile a PR with itself. They are named instead — the owner
+  // still has to know both exist — and left out of the count.
+  const twins: string[] = [];
+  const bySha = new Map<string, string[]>();
+  const matched: Array<{ ref: string; sha: string }> = [];
   for (const ref of await activeGateFixRefs(cli.repo)) {
     if (!ref.endsWith(`-${digest}`)) continue;
     if (ref.includes(`/${slug(branch)}--`)) continue; // this branch's own open fix
-    out.push(`${ref} (open on origin)`);
+    const sha = await revParse(cli.repo, `origin/${ref}`).catch(() => '');
+    matched.push({ ref, sha });
+    if (sha) bySha.set(sha, [...(bySha.get(sha) ?? []), ref]);
   }
-  return [...new Set(out)];
+  for (const { ref, sha } of matched) {
+    const sharing = sha ? (bySha.get(sha) ?? []).filter((r) => r !== ref) : [];
+    if (sharing.length > 0) twins.push(`${ref} (twin of ${sharing.join(', ')})`);
+    else out.push(`${ref} (open on origin)`);
+  }
+  return { duplicates: [...new Set(out)], twins: [...new Set(twins)] };
+}
+
+/** The fix ref a case id lands on — the ONE naming scheme (`fixBranchName`). */
+export function gateFixRefName(branch: string, files: string[]): string {
+  return `fix/sweep/${slug(branch)}--${gateFixCaseId(branch, files)}`;
+}
+
+/** An existing fix this ceiling can adopt as it stands, and the ref it gets there. */
+interface GateFixTwin {
+  /** The fix ref that already exists on origin, one level down. */
+  originalRef: string;
+  /** The second name for the SAME commit, at the ceiling. */
+  twinRef: string;
+  /** The commit both refs point at. */
+  sha: string;
+  ceiling: string;
+  files: string[];
+  digest: string;
+  detail: string;
+}
+
+/**
+ * A FIX PROVEN BY THE CHECKS GATE IS PROVEN AT THE TREE IT RAN ON, so it is
+ * never RELOCATED to reach a second level.
+ *
+ * Retargeting the pull request's base leaves the head branching from the
+ * descendant, and the diff then swallows everything that descendant carries.
+ * Rebasing the head presents a fix as proven where it was never run. Either one,
+ * under a submitted review, changes the diff the reviewer read. So the commit
+ * does not move: it is PUBLISHED AGAIN, under a second ref named for the
+ * ceiling, at the SAME sha. The evidence travels with the unchanged commit, so
+ * it covers both levels equally, and each target's own landing gate re-proves it
+ * where it lands.
+ *
+ * TWO CONDITIONS, and both are about the commit rather than about the PR:
+ *  - the ref is the DRIVER'S, by the same first-parent identity walk the
+ *    proposal disposition applies (proposal.ts) — a head somebody else pushed to
+ *    is not the driver's to re-publish anywhere;
+ *  - the commit's PARENT is contained in the ceiling tip, so the diff AT THE
+ *    CEILING is the fix and nothing else. Without it the twin's diff would carry
+ *    every commit the lower branch has that the ceiling does not.
+ */
+async function twinnableGateFix(
+  cli: Cli,
+  ceiling: string,
+  ceilingTip: string,
+  files: string[],
+): Promise<GateFixTwin | null> {
+  const digest = gateFixFilesDigest(files);
+  const twinRef = gateFixRefName(ceiling, files);
+  for (const ref of await activeGateFixRefs(cli.repo)) {
+    if (!ref.endsWith(`-${digest}`)) continue;
+    if (ref === twinRef || ref.includes(`/${slug(ceiling)}--`)) continue; // the ceiling's own
+    const sha = await revParse(cli.repo, `origin/${ref}`).catch(() => '');
+    if (!sha) continue;
+    const parent = await revParse(cli.repo, `${sha}^`).catch(() => '');
+    if (!parent) continue;
+    if (!(await driverShaped(cli.repo, sha, parent))) continue;
+    if (!(await isAncestor(cli.repo, parent, ceilingTip))) continue;
+    return {
+      originalRef: ref,
+      twinRef,
+      sha,
+      ceiling,
+      files: [...files],
+      digest,
+      detail:
+        `${ref} already carries this fix at ${sha.slice(0, 12)}, and its parent is contained in ${ceiling} — ` +
+        `the same commit is published as ${twinRef} for review at ${ceiling} rather than re-derived there`,
+    };
+  }
+  return null;
 }
 
 /** The gate-fix id form (N5). Charset-safe by construction — no `/`, no `.`. */
@@ -5547,6 +5643,141 @@ async function transplantOntoOrigin(
  * `internal: true` silences, so a bare exit code says nothing — the `out` file
  * is what keeps a refusal from journaling an unactionable "publish-failed".
  */
+/**
+ * PUBLISH THE TWINS: the same commit, under a second name, offered at the level
+ * that also needs it.
+ *
+ * Nothing is rebased and no base is retargeted, so the diff every reviewer has
+ * already read is the diff that stays. What this writes is a second ref at the
+ * SAME sha, a pull request against the ceiling, and — on the original — a draft
+ * flag plus one comment saying where the twin is, because a PR whose commit is
+ * being reviewed somewhere else and whose reader is not told is a request for
+ * two reviews of one change.
+ *
+ * EVERY STEP IS IDEMPOTENT AGAINST GITHUB, never against the journal: the pass
+ * dir is disposable and a crashed finish re-runs this whole phase. The ref at
+ * the right sha, an open PR on the head, the draft flag, and the marker comment
+ * are each their own "already done" record, read back from origin.
+ */
+export async function publishGateFixTwins(
+  cli: Cli,
+  dir: string,
+  makeTransport?: (token: string) => GithubTransport,
+): Promise<{ published: number; failed: number }> {
+  const plans = new Map<string, GateFixTwin>();
+  for (const e of readJournal(dir)) {
+    if (e.action !== 'gate-fix-twin' || typeof e.twinRef !== 'string') continue;
+    plans.set(e.twinRef as string, {
+      originalRef: String(e.originalRef ?? ''),
+      twinRef: String(e.twinRef),
+      sha: String(e.sha ?? ''),
+      ceiling: String(e.ceiling ?? ''),
+      files: Array.isArray(e.files) ? (e.files as string[]) : [],
+      digest: String(e.digest ?? ''),
+      detail: String(e.detail ?? ''),
+    });
+  }
+  if (plans.size === 0) return { published: 0, failed: 0 };
+  const token = resolveGithubToken(cli);
+  const slugParts = token ? await originSlug(cli) : null;
+  if (!token || !slugParts) {
+    appendJournal(dir, {
+      action: 'gate-fix-twin-failed',
+      reason: 'no GitHub token or origin slug — the twin refs are not published this pass',
+      twins: [...plans.keys()],
+    });
+    return { published: 0, failed: plans.size };
+  }
+  const transport = (makeTransport ?? realGithubTransport)(token);
+  let published = 0;
+  let failed = 0;
+  for (const twin of plans.values()) {
+    try {
+      // (1) THE REF, at the sha the original already carries. A ref that is
+      // already there at that sha is this step, done.
+      const onOrigin = await revParse(cli.repo, `origin/${twin.twinRef}`).catch(() => '');
+      if (onOrigin !== twin.sha) {
+        await gitPush(cli.repo, twin.sha, twin.twinRef, onOrigin ? { forceWithLease: onOrigin } : {});
+        appendJournal(dir, { action: 'push', branch: twin.twinRef, to: twin.sha, kind: 'twin-head' });
+      }
+      // (2) THE PULL REQUEST, based on the ceiling. The driver writes this body:
+      // it is not a case's prose — there is no agent behind it — it is a pointer
+      // to the review that already exists, and the machine line is what a reader
+      // (and the next pass) follows back.
+      let pr = await getOpenPrByHead(transport, slugParts, twin.twinRef);
+      if (!pr) {
+        const body = withMachineLine(
+          `The fix on \`${twin.originalRef}\` is needed at \`${twin.ceiling}\` as well, and it is the SAME ` +
+            `commit — \`${twin.sha.slice(0, 12)}\` — offered here rather than rebased or re-derived, so the ` +
+            `change reviewed there is exactly the change proposed here.\n\n` +
+            `Files: ${twin.files.map((f) => `\`${f}\``).join(', ')}\n\n` +
+            `Merging either one is enough for the level it targets; \`${twin.ceiling}\` is where it reaches ` +
+            `every branch beneath it.`,
+          renderSweepTwinOf(twin.originalRef),
+        );
+        pr = await createPullRequest(transport, slugParts, {
+          title: `fix(sweep): ${twin.files.join(', ')} — the ${twin.originalRef} fix, offered at ${twin.ceiling}`,
+          body,
+          head: twin.twinRef,
+          base: twin.ceiling,
+          draft: true,
+        });
+      }
+      // (3) THE ORIGINAL, told once. The draft flag is the "already said" marker
+      // for the flip, and the marker comment is its own record for the comment —
+      // the same convert-once/comment-once discipline an owner's PR gets.
+      let originalNumber: number | null = null;
+      const original = await getOpenPrByHead(transport, slugParts, twin.originalRef);
+      if (original) {
+        originalNumber = original.number;
+        const live = await getPullRequest(transport, slugParts, original.number);
+        if (!live.draft) await convertPullRequestToDraft(transport, slugParts, original.number);
+        const marker = renderSweepTwin(twin.twinRef);
+        const comments = await listIssueComments(transport, slugParts, original.number);
+        if (!comments.some((c) => hasMachineLine(c.body, marker))) {
+          await ghExpect(transport, 'POST', `/repos/${slugParts.owner}/${slugParts.repo}/issues/${original.number}/comments`, {
+            body:
+              `Sweep note (driver-posted): this fix is also needed on \`${twin.ceiling}\`, where it reaches every ` +
+              `branch beneath it. The SAME commit is proposed there as \`${twin.twinRef}\` — nothing here was ` +
+              `rebased and this base was not retargeted, so the diff you reviewed is unchanged. This pull request ` +
+              `is a draft while the ceiling one is open; merging that one resolves this branch too.\n\n${marker}`,
+          });
+        }
+        const withTwin = withMachineLine(live.body, marker);
+        if (withTwin !== live.body) {
+          await ghExpect(transport, 'PATCH', `/repos/${slugParts.owner}/${slugParts.repo}/pulls/${original.number}`, {
+            body: withTwin,
+          });
+        }
+      }
+      appendJournal(dir, {
+        action: 'gate-fix-twin-published',
+        twinRef: twin.twinRef,
+        originalRef: twin.originalRef,
+        sha: twin.sha,
+        ceiling: twin.ceiling,
+        number: pr?.number ?? null,
+        url: pr?.url ?? '',
+        originalNumber,
+      });
+      published++;
+    } catch (e) {
+      // A TWIN THAT COULD NOT BE PUBLISHED IS NOT A HALT. The fix still exists on
+      // its original ref and the ceiling is still red; the next pass finds the
+      // same two facts and tries again.
+      appendJournal(dir, {
+        action: 'gate-fix-twin-failed',
+        twinRef: twin.twinRef,
+        originalRef: twin.originalRef,
+        reason: e instanceof Error ? e.message : String(e),
+      });
+      console.error(`finish: twin '${twin.twinRef}' not published — ${e instanceof Error ? e.message : String(e)}`);
+      failed++;
+    }
+  }
+  return { published, failed };
+}
+
 async function escalateHeldCases(
   cli: Cli,
   dir: string,
@@ -10848,8 +11079,10 @@ async function adjudicateNotMyBug(p: {
       // Asked for EVERY owner BEFORE any of them mints, so the sibling cases this
       // same adjudication is about to create cannot be reported as duplicates of
       // each other: the partition made their file sets disjoint, so they are not.
-      const dupes = await duplicateGateFixes(cli, dir, ownerBranch, target.files);
-      const dupNote = dupes.length > 0 ? `[POSSIBLE DUPLICATE: ${dupes.join('; ')}]` : '';
+      const { duplicates: dupes, twins } = await duplicateGateFixes(cli, dir, ownerBranch, target.files);
+      const dupNote =
+        (dupes.length > 0 ? `[POSSIBLE DUPLICATE: ${dupes.join('; ')}]` : '') +
+        (twins.length > 0 ? `${dupes.length > 0 ? ' ' : ''}[SAME COMMIT, PUBLISHED AT TWO LEVELS: ${twins.join('; ')}]` : '');
       if (dupes.length > 0) {
         // Journaled, not only briefed: the overlap is a fact about the pass, and a
         // reader of the journal must not have to reconstruct it from PR prose.
@@ -12486,6 +12719,16 @@ async function activeGateFixRefs(repo: string): Promise<string[]> {
   return gateFixRefs(repo, '*');
 }
 
+/**
+ * Every open gate fix on origin for a branch slug, by NAME.
+ *
+ * A TWIN NEEDS NOTHING HERE. It is published under the standard scheme, named
+ * for the branch it is offered at (`gateFixRefName`), so it is already an
+ * ordinary gate fix to this glob, to the active-gate check, to the duplicate
+ * scan and to the merged/unmerged split at `start`. The naming convention IS
+ * the mechanism; a special case for twins here would be a second answer to a
+ * question this pattern already answers.
+ */
 async function gateFixRefs(repo: string, branchSlug: string): Promise<string[]> {
   const pattern = `refs/remotes/origin/fix/sweep/${branchSlug}--gate-fix-*`;
   const res = await git(repo, ['for-each-ref', '--format=%(refname:short)', pattern], { allowCodes: [1] });
@@ -13164,6 +13407,8 @@ async function materializeGateFixCases(
   const droppedGreen: Array<{ branch: string; detail: string }> = [];
   /** Branches whose own tip gave no verdict to accuse them with. */
   const unconfirmed: Array<{ branch: string; detail: string }> = [];
+  /** Ceilings served by an existing fix rather than by a case of their own. */
+  const twinned: GateFixTwin[] = [];
   // A GATE HOLD ALREADY TAKEN THIS PASS BLOCKS EVERYTHING BENEATH IT.
   //
   // A gate fix means the branch is RED. Every descendant merges that branch, so
@@ -13186,8 +13431,8 @@ async function materializeGateFixCases(
   const gateFixCaseIds = new Set(
     journal.filter((e) => e.action === 'gate-fix' && typeof e.caseId === 'string').map((e) => e.caseId as string),
   );
-  const gateHeldThisPass = new Set(
-    journal
+  const gateHeldThisPass = new Set([
+    ...journal
       .filter(
         (e) =>
           e.action === 'held' &&
@@ -13195,7 +13440,12 @@ async function materializeGateFixCases(
           (e.reason === 'gate' || (typeof e.caseId === 'string' && gateFixCaseIds.has(e.caseId))),
       )
       .map((e) => e.branch as string),
-  );
+    // A TWINNED CEILING IS GATE-HELD TOO. The twin ref reaches origin at
+    // `finish`, so the ref-derived gate cannot see it for the rest of this pass —
+    // and a ceiling whose fix is written but unpublished is exactly as red, and
+    // exactly as unmintable, as one holding a case.
+    ...journal.filter((e) => e.action === 'gate-fix-twin' && typeof e.ceiling === 'string').map((e) => e.ceiling as string),
+  ]);
   // Which FILES each gate-held branch's fix covers, read off the `gate-fix` row
   // that minted it. Needed by the located-owner rule below: a located owner is
   // only trustworthy for files the gated ancestor's own fix does not already
@@ -13401,6 +13651,30 @@ async function materializeGateFixCases(
         }
       }
     }
+    // THE FIX IS ALREADY WRITTEN, ONE LEVEL DOWN. A ceiling mint asks an agent to
+    // derive a fix for a defect an open PR already answers, at a commit this
+    // ceiling contains. Serving that case spends a case, a worktree and an
+    // agent's session to arrive at the commit that exists — and then asks the
+    // owner to review the same change twice. The commit is published at the
+    // ceiling instead, unchanged, and no case is served for it.
+    if (opts.attributedCeiling === true) {
+      const twin = await twinnableGateFix(cli, g.branch, tip, g.files);
+      if (twin) {
+        twinned.push(twin);
+        appendJournal(dir, {
+          action: 'gate-fix-twin',
+          originalRef: twin.originalRef,
+          twinRef: twin.twinRef,
+          sha: twin.sha,
+          ceiling: twin.ceiling,
+          files: twin.files,
+          digest: twin.digest,
+          detail: twin.detail,
+        });
+        console.error(`gate-fix: ${twin.detail}`);
+        continue;
+      }
+    }
     // NO ENVIRONMENT, NO CASE. A gate fix exists to turn a failing check green;
     // minted into a tree whose dependencies would not install, its gate can
     // never answer, and it would sit in `openCases` blocking `finish`.
@@ -13483,6 +13757,18 @@ async function materializeGateFixCases(
     // the agent. GATED: the fix already exists and is waiting on the OWNER —
     // there is nothing for the agent to do and nothing is wrong. LOOPING: a fix
     // was attempted THIS pass and the build is still red — that is a dead end.
+    // TWINNED: the fix exists, and this pass publishes it where it is also
+    // needed. Nothing is wrong and there is nothing for the agent to derive —
+    // which is a different sentence from every refusal, and the one the agent
+    // relays.
+    if (twinned.length > 0) {
+      const who = twinned.map((t) => t.twinRef).join(', ');
+      return {
+        ...none,
+        reason: `twinned to ${who}`,
+        detail: twinned.map((t) => t.detail).join('; '),
+      };
+    }
     if (gated.length > 0) {
       const who = gated.join(', ');
       return {
@@ -14186,6 +14472,13 @@ export async function cmdSweepFinish(
       heldN++;
     }
     progress(`held PRs (${heldN})`);
+    // TWINS TRAVEL WITH THE HELD PUBLISHES, and under the same outage guard: a
+    // twin's first step is a `git push`, so attempting one over a transport that
+    // has already failed every push this run buys a timeout and nothing else.
+    const twins = await publishGateFixTwins(cli, dir, makeTransport);
+    if (twins.published + twins.failed > 0) {
+      progress(`twin PRs (${twins.published}${twins.failed ? `, ${twins.failed} failed` : ''})`);
+    }
   }
   writeMachineState(dir, { ...st, finishStep: 'report' });
 

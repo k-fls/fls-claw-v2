@@ -178,6 +178,48 @@ export function renderMachineBlock(pendingCount: number, watermark12: string): s
  * Body with the machine block set: replaces an existing delimited block, else
  * appends one below the (agent-written) body. Idempotent on the same block.
  */
+/**
+ * A TWIN'S POINTER, on its own line inside the machine block.
+ *
+ * The two sides of a twin are one commit under two names, and neither PR says so
+ * on its own: a reader of either one has to be told where the other is, or the
+ * same change reads as two pieces of work. The line is a comment so it never
+ * appears in the rendered body, and it is matched as a WHOLE LINE so a
+ * quote-reply that embeds it stays somebody's prose.
+ */
+export const SWEEP_TWIN_LINE_RE = /^<!--\s*sweep-twin:\s*(\S+)\s*-->$/;
+export const SWEEP_TWIN_OF_LINE_RE = /^<!--\s*sweep-twin-of:\s*(\S+)\s*-->$/;
+
+export function renderSweepTwin(twinRef: string): string {
+  return `<!-- sweep-twin: ${twinRef} -->`;
+}
+
+export function renderSweepTwinOf(originalRef: string): string {
+  return `<!-- sweep-twin-of: ${originalRef} -->`;
+}
+
+/** Whether a body (or comment) already carries this marker as its own line. */
+export function hasMachineLine(text: string, line: string): boolean {
+  return text.split('\n').some((l) => l.trim() === line);
+}
+
+/**
+ * Body with `line` present inside the machine block — added to the existing
+ * block where there is one, else in a fresh block below the prose. Idempotent:
+ * a body that already carries the line is returned unchanged, so a republish
+ * and a re-run leave one copy.
+ */
+export function withMachineLine(body: string, line: string): string {
+  if (hasMachineLine(body, line)) return body;
+  const begin = body.indexOf(MACHINE_BLOCK_BEGIN);
+  const end = body.indexOf(MACHINE_BLOCK_END);
+  if (begin >= 0 && end > begin) {
+    const block = body.slice(begin, end).trimEnd();
+    return withMachineBlock(body, `${block}\n${line}\n${MACHINE_BLOCK_END}`);
+  }
+  return withMachineBlock(body, [MACHINE_BLOCK_BEGIN, line, MACHINE_BLOCK_END].join('\n'));
+}
+
 export function withMachineBlock(body: string, block: string): string {
   const begin = body.indexOf(MACHINE_BLOCK_BEGIN);
   const end = body.indexOf(MACHINE_BLOCK_END);
@@ -747,7 +789,7 @@ export async function getPullRequest(
   transport: GithubTransport,
   slug: { owner: string; repo: string },
   prNumber: number,
-): Promise<{ number: number; url: string; state: string; merged: boolean; draft: boolean; title: string }> {
+): Promise<{ number: number; url: string; state: string; merged: boolean; draft: boolean; title: string; body: string }> {
   const pr = await ghExpect(transport, 'GET', `/repos/${slug.owner}/${slug.repo}/pulls/${prNumber}`);
   return {
     number: Number(pr.number ?? prNumber),
@@ -756,6 +798,10 @@ export async function getPullRequest(
     merged: pr.merged === true,
     draft: pr.draft === true,
     title: String(pr.title ?? ''),
+    // The BODY, because a caller that has to add a driver-maintained line to it
+    // must start from what is there — a machine block written from scratch over
+    // an agent's prose would delete the prose.
+    body: typeof pr.body === 'string' ? pr.body : '',
   };
 }
 
