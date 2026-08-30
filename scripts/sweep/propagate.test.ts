@@ -40,12 +40,14 @@ import {
   coldReadWithRetry,
   conflictHunks,
   openCases,
+  owedRedTrees,
   passDir,
   publishableRecipe,
   readJournal,
   recipeCoverage,
   recipeMember,
   supersededCaseIds,
+  unmintableReds,
   type Cli,
   type ColdReadInvoker,
   type ExclusionReason,
@@ -3513,3 +3515,75 @@ describe('dependencies are installed INTO the worktree, from ITS OWN manifests',
   });
 });
 
+describe('a red is answered only by work done AFTER it, on ITS files', () => {
+  const row = (e: Record<string, unknown>): JournalEntry => ({ ts: '', ...e }) as JournalEntry;
+
+  /**
+   * A branch can fail twice in one pass. The first failure gets a case; the
+   * second, measured later, gets nothing. Exempting the second red because the
+   * branch "took a gate fix" reads an answer to the first question as an answer
+   * to the second: the tree stops being owed a verdict, the next call sees a
+   * merge that landed nothing new, and the branch arrives `no-op -> arrived` on
+   * a measurement nobody took.
+   */
+  it('a gate fix minted BEFORE the red does not settle it', () => {
+    const journal = [
+      row({ action: 'gate-fix', branch: 'main_patched', files: ['src/a.ts'] }),
+      row({ action: 'case', branch: 'main_patched', gateFix: true }),
+      row({ action: 'landing-check', tree: 'T1', branch: 'main_patched', ok: false, confirmed: true }),
+    ];
+    expect([...owedRedTrees(journal)]).toEqual(['T1']);
+  });
+
+  it('a gate fix minted AFTER the red settles it', () => {
+    const journal = [
+      row({ action: 'landing-check', tree: 'T1', branch: 'main_patched', ok: false, confirmed: true }),
+      row({ action: 'gate-fix', branch: 'main_patched', files: ['src/a.ts'] }),
+    ];
+    expect([...owedRedTrees(journal)]).toEqual([]);
+  });
+
+  /**
+   * The finish report is the only place a refusal reaches the owner. Suppressing
+   * it because SOME later case touched the same branch drops the finding in
+   * exactly the case it exists for — two independent reds, one of them ownerless.
+   */
+  it('a later mint on OTHER files does not cover the refusal', () => {
+    const journal = [
+      row({ action: 'gate-fix-refused', branch: 'main_patched', files: ['src/x.ts'], id: 'WARN15_UPSTREAM_OWNER', reason: 'r' }),
+      row({ action: 'gate-fix', branch: 'main_patched', files: ['src/a.ts'] }),
+    ];
+    expect(unmintableReds(journal).map((u) => u.files)).toEqual([['src/x.ts']]);
+  });
+
+  it('a later mint COVERING the refusal, and a later GREEN branch, both cover it', () => {
+    const covered = [
+      row({ action: 'gate-fix-refused', branch: 'main_patched', files: ['src/x.ts'], reason: 'r' }),
+      row({ action: 'gate-fix', branch: 'main_patched', files: ['src/x.ts', 'src/a.ts'] }),
+    ];
+    expect(unmintableReds(covered)).toEqual([]);
+    const green = [
+      row({ action: 'gate-fix-refused', branch: 'main_patched', files: ['src/x.ts'], reason: 'r' }),
+      row({ action: 'landing-check', branch: 'main_patched', tree: 'T1', ok: true }),
+    ];
+    expect(unmintableReds(green)).toEqual([]);
+  });
+
+  /** A landing refusal names no files — its subject is the whole tree. */
+  it('a refusal that named no files is covered by any later mint on the branch', () => {
+    const journal = [
+      row({ action: 'gate-fix-refused', branch: 'main_patched', files: [], reason: 'r' }),
+      row({ action: 'gate-fix', branch: 'main_patched', files: ['src/a.ts'] }),
+    ];
+    expect(unmintableReds(journal)).toEqual([]);
+  });
+
+  it('work on ANOTHER branch covers nothing', () => {
+    const journal = [
+      row({ action: 'gate-fix-refused', branch: 'main_patched', files: ['src/x.ts'], reason: 'r' }),
+      row({ action: 'gate-fix', branch: 'module/cg', files: ['src/x.ts'] }),
+      row({ action: 'landing-check', branch: 'module/cg', tree: 'T2', ok: true }),
+    ];
+    expect(unmintableReds(journal).map((u) => u.branch)).toEqual(['main_patched']);
+  });
+});

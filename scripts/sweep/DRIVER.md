@@ -1600,8 +1600,9 @@ and no case is created: the refusal is journaled `gate-fix-refused` with its id
 tree stays OWED a verdict — a later call re-measures it rather than passing it over
 as a no-op merge, exactly as an unstable tree does. Without that, the next call
 sees a tree that has not moved, skips it as `no-op`, marks the branch `arrived` and
-hands its content down measured by nothing. A tree whose branch DID take a gate fix
-is not owed: the fix is what moves it.
+hands its content down measured by nothing. A tree whose branch took a gate fix
+AFTER the red is not owed: that fix is what moves it. A fix minted BEFORE it
+answers a different failure on the same branch and leaves the tree owed.
 
 **What it does not run, and why each is safe.**
 
@@ -2184,8 +2185,10 @@ push and publish can succeed and still leave work only the owner can do.
 
 `unmintableReds` lists every red this pass PROVED and could hand to no branch —
 upstream, or a verdict a sibling carrying the identical subtree already owns
-(`gate-fix-refused` rows, deduped by branch and files, dropped where a later mint
-or a later green landing covered them). No case was created for these and no PR
+(`gate-fix-refused` rows, deduped by branch and files, dropped where a later green
+landing on the branch, or a later mint whose files CONTAIN the refusal's, covered
+them — a mint on other files of the same branch answers a different red and covers
+nothing; a refusal that named no files is covered by any later mint on it). No case was created for these and no PR
 carries them, so this list and the `RED, NO BRANCH TO FIX IT` cue are the only
 account of them there will be; they also appear under `needsOwner` with category
 `unmintable-red`, because retrying reaches nothing and only the owner can act.

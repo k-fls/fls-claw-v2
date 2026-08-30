@@ -1284,6 +1284,12 @@ export interface UnmintableRed {
  * pass went on to mint a case for — a re-measurement that confirmed the red where
  * it belonged — is not reported, and neither is one whose branch was later
  * measured GREEN. Both are strictly after the refusal.
+ *
+ * Coverage is by FILE, not by branch: a branch can carry two independent reds, and
+ * minting a case for one says nothing about the other. Only a mint whose files
+ * contain the refusal's answers it. A refusal that named no files — a landing
+ * refusal, whose subject is the whole tree — is answered by any later mint on the
+ * branch, since there is nothing narrower to compare.
  */
 export function unmintableReds(journal: JournalEntry[]): UnmintableRed[] {
   const out: UnmintableRed[] = [];
@@ -1295,8 +1301,12 @@ export function unmintableReds(journal: JournalEntry[]): UnmintableRed[] {
     const key = `${branch} :: ${files.join(', ')}`;
     if (seen.has(key)) return;
     for (const later of journal.slice(i + 1)) {
-      if (later.action === 'gate-fix' && later.branch === branch) return;
-      if (later.action === 'landing-check' && later.branch === branch && later.ok === true) return;
+      if (later.branch !== branch) continue;
+      if (later.action === 'gate-fix') {
+        const mintedFiles = Array.isArray(later.files) ? (later.files as string[]) : [];
+        if (files.length === 0 || files.every((f) => mintedFiles.includes(f))) return;
+      }
+      if (later.action === 'landing-check' && later.ok === true) return;
     }
     seen.add(key);
     out.push({
@@ -3307,28 +3317,39 @@ function unstableTrees(journal: JournalEntry[]): Set<string> {
  * content down measured by nothing, which is the one thing the landing gate
  * exists to prevent. So the tree stays OWED a verdict and is measured again.
  *
- * A tree whose branch DID take a gate fix is not owed: the fix is what moves it,
- * and re-running the suite for a red the pass has already acted on buys a known
- * answer at full price.
+ * A tree whose branch took a gate fix AFTER the red is not owed: that fix is what
+ * moves it, and re-running the suite for a red the pass has already acted on buys
+ * a known answer at full price. A fix minted BEFORE the red answers some other
+ * failure on the same branch and is no answer to this one.
  */
-function owedRedTrees(journal: JournalEntry[]): Set<string> {
+export function owedRedTrees(journal: JournalEntry[]): Set<string> {
   /** The last landing-check that produced a VERDICT for each tree; skips carry none. */
-  const last = new Map<string, { ok: boolean; confirmed: boolean; branch: string }>();
-  for (const e of journal) {
-    if (e.action !== 'landing-check' || typeof e.tree !== 'string' || typeof e.ok !== 'boolean') continue;
+  const last = new Map<string, { ok: boolean; confirmed: boolean; branch: string; at: number }>();
+  journal.forEach((e, i) => {
+    if (e.action !== 'landing-check' || typeof e.tree !== 'string' || typeof e.ok !== 'boolean') return;
     last.set(e.tree, {
       ok: e.ok,
       confirmed: e.confirmed === true,
       branch: typeof e.branch === 'string' ? e.branch : '',
+      at: i,
     });
-  }
-  const minted = new Set(
-    journal
-      .filter((e) => (e.action === 'gate-fix' || (e.action === 'case' && e.gateFix === true)) && typeof e.branch === 'string')
-      .map((e) => e.branch as string),
-  );
+  });
+  /** Where in the pass each branch's gate fixes were minted. */
+  const mintedAt = new Map<string, number[]>();
+  journal.forEach((e, i) => {
+    if (e.action !== 'gate-fix' && !(e.action === 'case' && e.gateFix === true)) return;
+    if (typeof e.branch !== 'string') return;
+    mintedAt.set(e.branch, [...(mintedAt.get(e.branch) ?? []), i]);
+  });
   const out = new Set<string>();
-  for (const [tree, v] of last) if (!v.ok && v.confirmed && !minted.has(v.branch)) out.add(tree);
+  for (const [tree, v] of last) {
+    if (v.ok || !v.confirmed) continue;
+    // POSITIONAL, not merely per-branch: an exemption earned earlier in the pass
+    // would let a LATER refused red skip its re-measurement and arrive `no-op ->
+    // arrived` unmeasured — the exact hole this set exists to close.
+    if ((mintedAt.get(v.branch) ?? []).some((at) => at > v.at)) continue;
+    out.add(tree);
+  }
   return out;
 }
 
