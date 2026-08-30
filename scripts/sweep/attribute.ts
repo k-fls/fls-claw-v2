@@ -598,7 +598,7 @@ export interface Attribution {
 }
 
 /** Blame one file: shallowest candidate wins, no candidate -> trunk, tie -> refuse. */
-function blameFile(file: string, candidates: BranchCandidate[]): FileBlame {
+export function blameFile(file: string, candidates: BranchCandidate[]): FileBlame {
   if (candidates.length === 0) {
     // Nobody authored it on their own line: inherited from upstream, or broken by
     // the trunk's own merge of upstream. Either way the trunk is where a fix

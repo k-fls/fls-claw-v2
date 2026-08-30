@@ -383,6 +383,15 @@ describe('the not-my-bug deadlock, end to end (real checks, real commits)', () =
     // on. The failure is real and it is reported — it is simply nobody's to fix.
     expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
     expect(journal.some((e) => e.action === 'case' && e.gateFix === true)).toBe(false);
+    // THE RESIDUAL ARM. The shared red is a FLOOR, so the ceiling is asked before
+    // anything ends — and the branch that wrote the failing file IS this branch,
+    // so there is nowhere above it for the fix to go. Blame stays where it was
+    // measured, where nothing can be minted on it.
+    const ceiling = journal.find((e) => e.action === 'gate-fix-ceiling')!;
+    expect(ceiling.decided).toBe('no-lift-same');
+    expect(ceiling.floor).toBe('main_patched');
+    expect(ceiling.ceiling).toBe('main_patched');
+    expect(ceiling.files).toEqual([failingTest]);
     const refusal = journal.find((e) => e.action === 'gate-fix-refused')!;
     expect(refusal.branch).toBe('main_patched');
     expect(refusal.id).toBe('WARN22_RED_UNCONFIRMED');

@@ -1299,22 +1299,74 @@ the ordinary failure pays nothing for this. Same-owner re-hits MERGE into one
 group; two groups on one ref would become two competing gate fixes on one branch
 for one defect.
 
-**One gate fix per MINTABLE proven owner**, each scoped by its own proven subset
+**THE FLOOR IS WHERE THE RED WAS MEASURED; THE CEILING IS WHERE THE FIX GOES.** A
+branch that is red on content it INHERITED is a true observation and a false
+accusation: minting there gives every sibling carrying the same bytes its own case
+for one defect, and each of those fixes reaches only its own branch. So every proven
+owner — and a `shared` remainder, which is a FLOOR too, since two branches red on one
+failure is already a measurement, indirect because neither of them is attributed — is
+carried up to the shallowest branch that AUTHORED its failing files (`ceilingFor`,
+over §9.1's authorship count), and the case is minted THERE, where one fix reaches
+every red beneath it.
+
+**AUTHORSHIP ONLY BOUNDS THE LIFT.** It answers "who wrote these bytes", never "what
+changed between green and red", and the file it is asked about is the one that
+REPORTED the failure, not necessarily the one that caused it. What licenses a mint at
+the ceiling is a CONFIRMATION there. Per (ceiling, files):
+
+- ceiling == the measured floor → mint on the floor; nothing is run.
+- ceiling differs, and every failing command is already confirmed red on the subtrees
+  the ceiling's tip carries — on ANY branch — → mint on the CEILING; nothing is run.
+  Identical bytes cannot disagree, and authorship is exactly what distinguishes
+  branches that share them.
+- ceiling differs and nothing is confirmed there → MEASURE it: one fresh worktree at
+  the ceiling's tip, dependencies from that tree's manifests, the failing commands,
+  and a confirming re-run (§7.6). RED → mint on the ceiling. GREEN → the red is BELOW
+  the author, so blame stays on the floor, and the green is journaled as a
+  `branch-check` row the rest of the pass inherits. UNSTABLE → nobody is minted: the
+  failure belongs to no branch, and the case ends HELD with the resolution kept.
+  UNMEASURABLE → blame stays on the floor: a second observation that could not be
+  taken may not LIFT blame, and may not BLOCK a floor mint that is already confirmed.
+- A TIE at the shallowest authoring depth names no ceiling, so blame stays where it
+  was MEASURED. A file NOBODY authored has the trunk as its ceiling (§9.1) and takes
+  the arms above. Blame that cannot be trusted at all — a malformed cut-point
+  exceptions file (§9.2) — lifts nothing.
+- **RED WHERE THE CONTENT IS NOT** is a red about the machine. The same command
+  confirmed red at a commit that does not carry a failing file (`git cat-file -e`
+  answers absence from git, not from a probe) cannot be about that file, so nobody is
+  minted and the refusal carries the coordinate: `WARN14_ENVIRONMENT_FAULT`, "affects
+  everything below `<ceiling>`; also red at `<sha12>` which does not carry the
+  content".
+
+A red measured on UPSTREAM `main` is not lifted at all. It is the shallowest level
+there is, so nothing can be lifted from it, and a "ceiling" below it would move an
+upstream defect onto a fork branch and manufacture work for a defect that branch does
+not have. It reaches the mintability check as it stands and is refused there
+(`WARN15_UPSTREAM_RED`).
+
+Every (floor → target) decision is journaled `gate-fix-ceiling` with the floor and its
+ref, the ceiling and its ref, the files, the `decided` arm and its detail — the
+evidence trail for how a case ended up where it did. Targets are MERGED BY BRANCH: two
+floors lifted to one branch are one defect and one case, and a lift carries the ref
+with it, because the confirmation that licensed it was taken at the ceiling's tip.
+
+**One gate fix per MINTABLE TARGET**, each scoped by the proven subset that reached it
 (`ownedFiles`, §9.1), rooted by its own bisect, with its own rebase and duplicate
-notes. Owners are ordered SHALLOWEST FIRST (parent before branch) in the journal, the
+notes. Targets are ordered SHALLOWEST FIRST (parent before branch) in the journal, the
 mints and the result, because `next-case` serves in DAG order and the result must name
 the case the next command will hand over.
 
 **PROVEN IS NOT MINTABLE, and the difference is settled BEFORE the merge is aborted**
-(§9.5). A proven owner may still be one no case can be rooted on: it is upstream
-`main` (`WARN15_UPSTREAM_RED`), its proven file set is empty, or the red was never
-confirmed where the case would be rooted (`WARN21_CHECKS_FLAKY` /
-`WARN22_RED_UNCONFIRMED`, §7.6). Each of those is a pure journal-and-git question, so
-all of them are asked before the bisect and before the reopen. Refused owners are
-journaled `gate-fix-refused` with the `caseId` and their files are reported as
-uncovered. When NO owner is mintable the case ends HELD with the resolution KEPT and
-the refusal named — never aborted, because there is no case for the abort to make
-room for.
+(§9.5). A target may still be one no case can be rooted on: it is upstream `main`
+(`WARN15_UPSTREAM_RED`), its file set is empty, or the red was never confirmed where
+the case would be rooted (`WARN21_CHECKS_FLAKY` / `WARN22_RED_UNCONFIRMED`, §7.6).
+Each of those is a pure journal-and-git question, so all of them are asked before the
+bisect and before the reopen. A target reached by a LIFT carries its proof with it:
+the branch match is waived for it, because authorship — not the run — is what names
+that level as the one that wrote the failing content. Refused targets are journaled
+`gate-fix-refused` with the `caseId` and their files are reported as uncovered. When
+NO target is mintable the case ends HELD with the resolution KEPT and the refusal
+named — never aborted, because there is no case for the abort to make room for.
 
 **The remainder is reported, never folded.** With owners present, an
 `interaction`/`unknown` remainder cannot be scope-widened — the case it would widen
@@ -1323,14 +1375,14 @@ is being aborted — so it is journaled (`not-my-bug-owner` with that kind, plus
 instruction as files NOT COVERED BY ANY GATE FIX. A REFUSED OWNER'S files travel in
 the same `uncovered` block: they were proven to belong to a branch and no case was
 minted for them either, so from the owner's side they are in exactly a remainder's
-position — still red, nothing prepared. With NO owner found at all, the
-whole set is the remainder and the two non-gate-fix answers apply as before:
+position — still red, nothing prepared. With NO owner and no `shared` floor found at
+all, the whole set is the remainder and the two non-gate-fix answers apply:
 `unknown` falls through to the ordinary checks failure; a `flaky` remainder ends the
 case HELD with the resolution kept (`WARN21_CHECKS_FLAKY` — an unstable side names
-no owner, so there is nothing for the agent to fix and nobody to bill) and a
-`shared` one ends it the same way (`WARN22_RED_UNCONFIRMED` — the red is real and
-belongs to no branch), both journaling `gate-fix-refused` with the `caseId`; and
-`interaction` WIDENS the
+no owner, so there is nothing for the agent to fix and nobody to bill), as does a
+`shared` one that names no commit for the ceiling step to measure
+(`WARN22_RED_UNCONFIRMED` — the red is real and belongs to no branch), both journaling
+`gate-fix-refused` with the `caseId`; and `interaction` WIDENS the
 case's edit scope to the failing files (journaled `scope-widened`, read back by the
 scope guard, exempted from its `conflict-hunks` marker check since a widened file has
 none, and carried into the COLD-READ REQUEST so the reviewer judges the extra edits
@@ -1374,7 +1426,8 @@ from one probe cannot decide the next.
 
 Every stage emits `SWEEP-STEP:` progress and journals (`not-my-bug`,
 `not-my-bug-owner` — one row per owner group AND one for the remainder —
-`not-my-bug-partition` with the round and probe counts, `not-my-bug-bisect` with the
+`not-my-bug-partition` with the round and probe counts, `gate-fix-ceiling` with the
+floor → target decision, `not-my-bug-bisect` with the
 probe log, plus `not-my-bug-environment`, `not-my-bug-premature`,
 `not-my-bug-discarded`, `scope-widened`, `gate-fix-root-clamped`). The result carries
 a `notMyBug` block (with `owners`), `gateFixes` (every minted case, each with its own
@@ -1385,8 +1438,9 @@ FIRST case, which is the one `next-case` serves first. The proceed arm carries
 
 ### 7.3 The bisect
 
-Before minting a branch/parent gate fix the driver searches for the commit that
-introduced the failure, so the briefing names a commit instead of a log.
+Before minting a gate fix the driver searches its TARGET branch (§7.2's ceiling) for
+the commit that introduced the failure, so the briefing names a commit instead of a
+log.
 
 - **Determinism at the tip first**: a coin flip converges on a random commit and
   reads as an answer, so the tip must fail twice; if the NARROWED command stops
@@ -1403,8 +1457,8 @@ introduced the failure, so the briefing names a commit instead of a log.
   is a green BOUNDARY, which is what lets the search name the commit that ADDED a
   failing test.
 - **The bisect never gates the case.** Whether a gate fix is warranted was settled
-  by the verdict and the ownership probe; naming the commit only improves the
-  briefing. Every outcome mints the case, with the status in the text.
+  by the verdict, the ownership probe and the ceiling; naming the commit only improves
+  the briefing. Every outcome mints the case, with the status in the text.
 - **The SEARCH is floored at the current trunk head** — bounded rather than having
   its answer clamped, so no probe is spent on a commit whose answer would be
   refused. Below that line history is shared and already integrated: a fix rooted
@@ -1525,6 +1579,14 @@ The gate is `checks.typecheck` THEN `checks.test` from the pass's pinned checks
 file, run in a temp worktree at the branch tip with dependencies installed from
 THAT tree's manifests (§7.2) — one notion of green in this driver, not two. A
 missing or empty checks file skips it, exactly as every other gate skips.
+
+**A RED LANDING IS BLAMED AT ITS CEILING.** Before the reopen and the mint, the
+failing files are carried up to the branch that AUTHORED them (§7.2's table, applied
+to the whole parsed set: one case has one root, so a set authored at several levels,
+or carrying a tie, stays on the branch that landed it). Where blame lifts, the case is
+rooted on the ceiling and the reopen covers the ceiling's subtree — which contains the
+landing branch. The landing branch's own confirmation carries to a ceiling whose tip
+holds the identical subtree, so the ordinary inherited red costs nothing to lift.
 
 **A RED IS RE-RUN BEFORE IT IS BELIEVED.** What follows a red landing is a reopen
 of the branch and its whole subtree, a gate-fix case minted on it and a held PR
@@ -1725,8 +1787,10 @@ set is the failing files, and its height is derived like any other.
 
 Four things mint one: finish's integration verify (§10.2), a `--not-my-bug`
 adjudication (§7.2), the pre-merge branch check (§6.2), and the landing gate
-(§7.6). The last two are rooted on the branch that is RED rather than blamed from
-a build log — there is nothing to blame, the branch itself is the answer.
+(§7.6). The last two start from the branch that is RED rather than from a blame of
+a build log — that branch is the measurement — and then ask §7.2's ceiling question
+about it, because a branch that is red on content it did not write is not where the
+fix belongs.
 
 ### 9.1 Blame is git history, not the registry
 
@@ -1745,14 +1809,17 @@ check that gave both answers, `WARN22_RED_UNCONFIRMED` for one nobody confirmed
 here. The ownership probe (§7.2) asks the SAME question before it proves an owner,
 so a `--not-my-bug` adjudication never aborts a merge for a case this then refuses.
 
-**A shared verdict blocks; it does not accuse.** Two branches whose relevant
-subtree is the same object cannot disagree about a command that runs there, so one
-measurement answers for both — that is the saving. But a gate-fix case says "this
-branch is red", and where the bytes are identical nothing distinguishes the
-branches: no branch introduced the failure and none of them can be handed the fix.
-The red still blocks every branch carrying it (content arrives green or it does
-not arrive) and it is REPORTED; what the driver refuses to do is invent an owner
-for it. Nothing is re-run here — the
+**A shared verdict blocks; it does not accuse — until authorship distinguishes the
+branches.** Two branches whose relevant subtree is the same object cannot disagree
+about a command that runs there, so one measurement answers for both — that is the
+saving. But a gate-fix case says "this branch is red", and where the bytes are
+identical the RUN distinguishes nothing: no branch is named by it and none of them
+can be handed the fix on its strength alone. What does distinguish them is who WROTE
+the failing content, so a caller that has proven one of them to be the CEILING for
+those files (§7.2) carries the verdict there, and the mint proceeds; every caller
+without that proof gets the branch match unchanged. Absent both, the red still blocks
+every branch carrying it (content arrives green or it does not arrive) and it is
+REPORTED; what the driver refuses to do is invent an owner for it. Nothing is re-run here — the
 confirmation is paid by the gate that saw the red, in a separately prepared
 worktree (§7.6), and this is a journal read. The integration verify passes no `redOn`: its
 own determinism probe already re-runs the failing commands before attribution.
@@ -1781,6 +1848,10 @@ never ours to fix — as the one exclusion for all of them.
   tied branches, instead of being broken by spelling — the fix for that is the
   missing inventory edge, not a tiebreak here. A branch whose ref (or `main`) does
   not resolve is SKIPPED, never counted with the exclusion silently dropped.
+- The same count answers the CEILING question (§7.2): the shallowest author is the
+  highest level a measured red may be blamed on, because above it the content is not
+  there to be wrong. Blame is an upper BOUND there, never a locator — a measurement
+  at that level is what turns the bound into a case.
 - Failing files are GROUPED PER ATTRIBUTED BRANCH — one case each, shallowest
   first, because a judged trunk fix plus its reopen can moot a descendant's case
   before it is worked.

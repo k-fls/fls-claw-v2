@@ -1404,6 +1404,10 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     repo.checkout('main_patched', { create: true, at: 'main' });
     repo.checkout('module/cg', { create: true, at: 'main_patched' });
     repo.commit('cg: x = cg', { 'src/x.ts': 'cg\n' });
+    // module/cg AUTHORED `src/a.ts`, so it is the ceiling for it as well as the
+    // floor: blame that could be lifted higher would be, and the two-owner split
+    // this fixture is about needs each owner to be where its own file was written.
+    repo.commit('cg: a', { 'src/a.ts': 'a-cg\n' });
     repo.checkout('main');
     repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' });
     cleanups.push(() => repo.destroy());
@@ -1519,6 +1523,293 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     // The agent relays the instruction, so the remainder has to be IN it.
     expect(res.instruction).toContain('NOT COVERED BY ANY GATE FIX');
     expect(res.instruction).toContain('src/c.ts');
+  });
+
+  // ---- the ceiling: where an INHERITED red's fix goes -----------------------
+  //
+  // A branch that is red on content it did not write is a true observation and a
+  // false accusation. Blame is lifted to the shallowest branch that AUTHORED the
+  // failing files, so ONE case covers every red beneath it instead of one case
+  // per branch that inherited the defect. Authorship only BOUNDS the lift; a
+  // measurement at that level is what licenses it.
+
+  /**
+   * `module/cg` sits under the trunk and conflicts on `src/x.ts` with what the
+   * trunk brings down, so the case lands there. `src/shared.ts` is the TRUNK's
+   * own file — the module branch inherited it and never touched it.
+   */
+  function inheritedRedFixture(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: shared', { 'src/shared.ts': 'broken\n' });
+    repo.checkout('module/cg', { create: true, at: 'main_patched' });
+    repo.commit('cg: x = cg', { 'src/x.ts': 'cg\n' });
+    repo.checkout('main');
+    repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' });
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+
+  /** Drive the pass to a resolved case on `module/cg`, red on the trunk's file. */
+  async function inheritedCase(
+    repo: FixtureRepo,
+    ws: string,
+    inv: string,
+  ): Promise<{ dir: string; caseId: string; tipSha: string; ceilingTip: string }> {
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksFile(ws) }));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
+    const dir = dirOf(repo, ws);
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    seedPriorFailure(dir, caseId, 'typecheck', ['tsc --noEmit']);
+    const wtPath = join(dir, caseId, 'worktree');
+    const tipSha = execFileSync('git', ['-C', wtPath, 'rev-parse', 'HEAD^'], { encoding: 'utf8' }).trim();
+    return { dir, caseId, tipSha, ceilingTip: repo.sha('main_patched') };
+  }
+
+  /** The sha a checks run was taken at, or '' where the directory is not a worktree. */
+  function shaAt(baseDir: string): string {
+    try {
+      return execFileSync('git', ['-C', baseDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Red everywhere, naming `file`; counts the runs the CEILING STEP takes.
+   *
+   * The step is over the moment its row is journaled, and the bisect probes the
+   * same tip afterwards — so the row is what separates the two, not the commit.
+   */
+  function ceilingCountingRunner(file: string, ceilingTip: string, dir: string): { fn: ChecksRunner; atCeiling: string[] } {
+    const atCeiling: string[] = [];
+    const fn: ChecksRunner = async (commands, baseDir) => {
+      const deciding = !readJournal(dir).some((e) => e.action === 'gate-fix-ceiling');
+      if (baseDir && deciding && shaAt(baseDir) === ceilingTip) atCeiling.push(baseDir);
+      const names = commands.map((c) => c.cmd);
+      return {
+        ok: false,
+        failedNames: names,
+        output: names.map((n) => `$ ${n}\n${file}(1,1): error TS2345: boom\n`).join(''),
+      };
+    };
+    return { fn, atCeiling };
+  }
+
+  /** A `red-confirm` this pass already took for `sha`'s subtree, on some other branch. */
+  function seedConfirmedRed(dir: string, repo: FixtureRepo, branch: string, sha: string): void {
+    appendJournal(dir, {
+      action: 'red-confirm',
+      branch,
+      sha,
+      phase: 'test',
+      cmd: 'tsc --noEmit',
+      cwd: '.',
+      subtree: repo.git('rev-parse', `${sha}^{tree}`),
+      commands: ['tsc --noEmit'],
+      ran: true,
+      reproduced: true,
+    });
+  }
+
+  /**
+   * THE INHERITED RED, LIFTED FOR NOTHING. The trunk wrote the failing file, the
+   * pass has already confirmed the trunk tip's subtree red, and identical bytes
+   * cannot disagree — so the ceiling is established without running anything, and
+   * the one case that gets minted covers every branch below it.
+   */
+  it('a red the branch INHERITED is minted on the branch that AUTHORED it, at no probe cost', async () => {
+    const repo = inheritedRedFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    const { dir, caseId, ceilingTip } = await inheritedCase(repo, ws, inv);
+    // The pass confirmed this red on a branch carrying the trunk tip's subtree.
+    // WHICH branch took the measurement is not the question authorship answers.
+    seedConfirmedRed(dir, repo, 'module/elsewhere', ceilingTip);
+    const r = ceilingCountingRunner('src/shared.ts', ceilingTip, dir);
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+        neverInvoked,
+        r.fn,
+        fakeInstall,
+      ),
+    ).toBe(1);
+    const journal = readJournal(dir);
+    // The floor is where the red was MEASURED; the ceiling is where the fix goes.
+    expect(journal.find((e) => e.action === 'not-my-bug-owner')!.ownerBranch).toBe('module/cg');
+    const ceiling = journal.find((e) => e.action === 'gate-fix-ceiling')!;
+    expect(ceiling.decided).toBe('lift-shared');
+    expect(ceiling.floor).toBe('module/cg');
+    expect(ceiling.ceiling).toBe('main_patched');
+    expect(ceiling.files).toEqual(['src/shared.ts']);
+    const gateFixes = journal.filter((e) => e.action === 'gate-fix');
+    expect(gateFixes.map((e) => e.branch)).toEqual(['main_patched']);
+    expect(gateFixes[0].files).toEqual(['src/shared.ts']);
+    // NOTHING WAS RUN FOR THE LIFT. The verdict for those bytes was already
+    // journaled, and re-running it would buy the same observation twice.
+    expect(r.atCeiling).toEqual([]);
+    expect(journal.some((e) => e.action === 'red-confirm' && e.phase === 'ceiling')).toBe(false);
+    // And the case is servable: the reopen covers the ceiling's subtree, which
+    // contains the floor, so the fix is not superseded by its own reopen.
+    expect(supersededCaseIds(journal).has(gateFixes[0].caseId as string)).toBe(false);
+    const nc = join(ws, 'nc.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: nc }), greenPreMerge)).toBe(0);
+    const served = JSON.parse(readFileSync(nc, 'utf8')) as { status: string; caseId: string; branch: string };
+    expect(served.status).toBe('case-ready');
+    expect(served.caseId).toBe(gateFixes[0].caseId);
+    expect(served.branch).toBe('main_patched');
+    expect(supersededCaseIds(readJournal(dir)).has(caseId)).toBe(true);
+  });
+
+  /**
+   * A RED TWO BRANCHES SHARE IS A FLOOR, NOT A DEAD END. Nothing the probe
+   * measured distinguishes them — so it names no owner — but authorship does, and
+   * the level that WROTE the failing file can be handed the fix. The measurement
+   * that licenses it is taken at the ceiling, where the content lives.
+   */
+  it('a red no branch can be handed is minted on the branch that AUTHORED it', async () => {
+    const repo = inheritedRedFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    const { dir, caseId, tipSha } = await inheritedCase(repo, ws, inv);
+    // The red at the case branch's own tip was confirmed on a SIBLING carrying
+    // the identical subtree: the verdict holds and it accuses nobody there.
+    seedConfirmedRed(dir, repo, 'module/elsewhere', tipSha);
+    const r = namingRunner(['tsc --noEmit'], 'src/shared.ts');
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+        neverInvoked,
+        r.fn,
+        fakeInstall,
+      ),
+    ).toBe(1);
+    const journal = readJournal(dir);
+    expect(journal.find((e) => e.action === 'not-my-bug-owner')!.owner).toBe('shared');
+    const ceiling = journal.find((e) => e.action === 'gate-fix-ceiling')!;
+    // Measured at the ceiling, because nothing had been: the shared verdict is
+    // about the FLOOR's bytes and says nothing about the trunk tip's.
+    expect(ceiling.decided).toBe('lift-measured');
+    expect(ceiling.ceiling).toBe('main_patched');
+    expect(journal.some((e) => e.action === 'red-confirm' && e.phase === 'ceiling' && e.reproduced === true)).toBe(true);
+    const gateFixes = journal.filter((e) => e.action === 'gate-fix');
+    expect(gateFixes.map((e) => e.branch)).toEqual(['main_patched']);
+    expect(gateFixes[0].files).toEqual(['src/shared.ts']);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; gateFix: { branch: string } };
+    expect(res.status).toBe('gate-fix-required');
+    expect(res.gateFix.branch).toBe('main_patched');
+    const nc = join(ws, 'nc.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: nc }), greenPreMerge)).toBe(0);
+    const served = JSON.parse(readFileSync(nc, 'utf8')) as { status: string; caseId: string };
+    expect(served.caseId).toBe(gateFixes[0].caseId);
+    expect(supersededCaseIds(readJournal(dir)).has(caseId)).toBe(true);
+  });
+
+  /**
+   * AN UNSTABLE CEILING LIFTS NOTHING AND MINTS NOTHING. The level that wrote the
+   * failing file answers red once and green once on the identical tree, so there
+   * is no verdict to carry there — and the floor's red is the same failure, now
+   * known to be unstable where the content lives. Nobody is handed it, and the
+   * agent keeps its resolution.
+   */
+  it('a ceiling that answers both ways blames nobody, and the resolution is KEPT', async () => {
+    const repo = inheritedRedFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    const { dir, caseId, ceilingTip } = await inheritedCase(repo, ws, inv);
+    // Red in the first worktree prepared at the ceiling, green in the second —
+    // the varied re-run, which is the only one that can contradict the first.
+    const seen = new Map<string, string>();
+    const fn: ChecksRunner = async (commands, baseDir) => {
+      const names = commands.map((c) => c.cmd);
+      if (baseDir && shaAt(baseDir) === ceilingTip) {
+        const first = seen.get(ceilingTip);
+        if (first === undefined) seen.set(ceilingTip, baseDir);
+        else if (first !== baseDir) return { ok: true, failedNames: [], output: '' };
+      }
+      return {
+        ok: false,
+        failedNames: names,
+        output: names.map((n) => `$ ${n}\nsrc/shared.ts(1,1): error TS2345: boom\n`).join(''),
+      };
+    };
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+        neverInvoked,
+        fn,
+        fakeInstall,
+      ),
+    ).toBe(0);
+    const journal = readJournal(dir);
+    expect(journal.find((e) => e.action === 'gate-fix-ceiling')!.decided).toBe('refused-unstable');
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    expect(journal.some((e) => e.action === 'not-my-bug-discarded')).toBe(false);
+    const refusal = journal.find((e) => e.action === 'gate-fix-refused')!;
+    expect(refusal.id).toBe('WARN21_CHECKS_FLAKY');
+    expect(refusal.caseId).toBe(caseId);
+    const held = journal.find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect((held.resolution as { markerClean: boolean }).markerClean).toBe(true);
+    expect(machineState(dir).phase).toBe('awaiting-pr');
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { tier: string; issues: Array<{ id: string }> };
+    expect(res.tier).toBe('held');
+    expect(res.issues.map((i) => i.id)).toEqual(['WARN21_CHECKS_FLAKY']);
+  });
+
+  /**
+   * A RED WHERE THE CONTENT IS NOT IS A RED ABOUT THE MACHINE. The same command
+   * is confirmed red at a commit that does not carry the failing file, and
+   * content cannot break a tree it is absent from — so the failure is not about
+   * anybody's code and no branch may be handed it. The refusal carries the
+   * coordinate, because that is what makes it checkable.
+   */
+  it('a confirmed red where the failing file is ABSENT refuses the mint and names the coordinate', async () => {
+    const repo = inheritedRedFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    const { dir, caseId } = await inheritedCase(repo, ws, inv);
+    // Upstream never had `src/shared.ts` — the trunk added it — and the same
+    // command is confirmed red there.
+    const absentAt = repo.sha('main');
+    appendJournal(dir, {
+      action: 'landing-check',
+      branch: 'module/elsewhere',
+      sha: absentAt,
+      ok: false,
+      confirmed: true,
+      failed: ['tsc --noEmit'],
+    });
+    const r = namingRunner(['tsc --noEmit'], 'src/shared.ts');
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+        neverInvoked,
+        r.fn,
+        fakeInstall,
+      ),
+    ).toBe(0);
+    const journal = readJournal(dir);
+    expect(journal.find((e) => e.action === 'gate-fix-ceiling')!.decided).toBe('refused-environment');
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    expect(journal.some((e) => e.action === 'not-my-bug-discarded')).toBe(false);
+    const refusal = journal.find((e) => e.action === 'gate-fix-refused')!;
+    expect(refusal.id).toBe('WARN14_ENVIRONMENT_FAULT');
+    expect(refusal.caseId).toBe(caseId);
+    expect(refusal.reason).toContain('affects everything below main_patched');
+    expect(refusal.reason).toContain(`also red at ${absentAt.slice(0, 12)}`);
+    expect(refusal.reason).toContain('does not carry the content');
+    const held = journal.find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect((held.resolution as { markerClean: boolean }).markerClean).toBe(true);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { tier: string; issues: Array<{ id: string }> };
+    expect(res.tier).toBe('held');
+    expect(res.issues.map((i) => i.id)).toEqual(['WARN14_ENVIRONMENT_FAULT']);
   });
 
   /**
