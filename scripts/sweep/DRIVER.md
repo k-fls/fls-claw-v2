@@ -2121,7 +2121,10 @@ words, on the `case` row as `reproduction`.
   observe it, test a hypothesis or confirm a fix except through `report-case`.
 - **`environment-conditional`** — a key this pass measured BOTH ways (§9.5.1)
   covers the failing commands: the identical subtree ran green somewhere and
-  confirmed red here, so whatever differs is not in the code.
+  confirmed red here, so whatever differs is not in the code. Its paragraph
+  carries the full-suite METHOD instruction too — a failure that comes and goes
+  does not reproduce narrowed either, so the agent cannot observe this one and
+  only `report-case` can confirm a fix.
 
 A CONTESTED KEY OUTRANKS the caller's own evidence. `full-suite-only` is a
 statement about method; a contested key is a directly measured statement about
@@ -2135,8 +2138,19 @@ into the cold-read CASE RECORD rather than becoming a fourth question — Q3
 already asks whether a change contradicts a record in the request:
 
 > An instability case is resolved by making the check deterministic — isolation,
-> a missing reset, a signal — never by widening a timeout, raising a retry count,
-> or weakening an assertion; such an edit contradicts this record.
+> a missing reset, a signal: an edit after which the check gives one answer under
+> any order, load or timing. An edit that leaves the outcome chance-dependent but
+> less likely to fail — a wider timeout, a higher retry count, a sleep, a longer
+> poll interval — or that stops the question being asked — a skipped, deleted or
+> weakened assertion — contradicts this record.
+
+IT IS A CRITERION, NOT A BLACKLIST, and it has to be: a list covers its own items
+and the class has members no list will catch — a `skip` or a deleted test leaves
+the assertion untouched and stops it being ASKED; a sleep reads to its author as
+timing isolation while being a wider timeout by another name. A longer list also
+forbids the wrong things, since splitting a file apart is a legitimate isolation
+fix. So the rule names what a real fix ACHIEVES — one answer under any order,
+load or timing — and the two ways an edit fails that.
 
 So a diff that only gives the check longer arrives in front of the reader beside
 the rule it contradicts, and rejecting it is a reading of the record rather than

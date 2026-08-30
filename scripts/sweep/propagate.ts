@@ -1806,6 +1806,16 @@ async function caseContextLines(
     '```',
     sides.theirs,
     '```',
+    ...(reproduction !== undefined &&
+    reproduction !== null &&
+    reproduction !== 'full-suite-only' &&
+    reproduction !== 'environment-conditional'
+      ? // ONLY THIS DRIVER WRITES THAT FIELD, so a value it does not recognise is
+        // its own defect rather than the agent's. Render nothing — an unexplained
+        // record is worse than none — and say so where an operator will see it.
+        (console.error(`report-case: unrecognised reproduction character '${String(reproduction)}' — no record rendered`),
+        [])
+      : []),
     ...(reproduction === 'full-suite-only' || reproduction === 'environment-conditional'
       ? [
           '',
@@ -3505,16 +3515,26 @@ async function subtreeVerdictAlreadyRed(
  * THE ONE SENTENCE THAT TRAVELS WITH EVERY INSTABILITY CASE — into the materials
  * the agent reads, and into the RECORD the cold reader judges against.
  *
- * Widening a timeout, raising a retry count or weakening an assertion makes the
- * check ask for less and leaves the defect exactly where it was; the case then
- * closes green and the next pass meets the same failure with a weaker net under
- * it. Saying so in the record is what lets the reader answer Q3 — does the
- * change contradict a record in this request — instead of judging a plausible
- * diff on its own terms.
+ * IT STATES A CRITERION, NOT A BLACKLIST. A list of forbidden edits covers its
+ * own items and nothing else, and the class has members no list will catch: a
+ * `skip` or a deleted test leaves the assertion untouched and simply stops it
+ * being asked; a sleep or a longer poll interval reads to its author as timing
+ * isolation while being a wider timeout by another name. A longer list is also
+ * the wrong instrument in the other direction — splitting a file apart IS a
+ * legitimate isolation fix — so the sentence names what a real fix ACHIEVES
+ * (one answer under any order, load or timing) and describes the two ways an
+ * edit fails that: it leaves the outcome to chance, or it stops asking.
+ *
+ * Saying it in the record is what lets the reader answer Q3 — does the change
+ * contradict a record in this request — instead of judging a plausible diff on
+ * its own terms.
  */
 const INSTABILITY_RESOLUTION_RULE =
-  'An instability case is resolved by making the check deterministic — isolation, a missing reset, a signal — ' +
-  'never by widening a timeout, raising a retry count, or weakening an assertion; such an edit contradicts this record.';
+  'An instability case is resolved by making the check deterministic — isolation, a missing reset, a signal: an ' +
+  'edit after which the check gives one answer under any order, load or timing. An edit that leaves the outcome ' +
+  'chance-dependent but less likely to fail — a wider timeout, a higher retry count, a sleep, a longer poll ' +
+  'interval — or that stops the question being asked — a skipped, deleted or weakened assertion — contradicts ' +
+  'this record.';
 
 type ReproductionCharacter =
   /** Narrowed to its own files it does not reproduce: it needs the whole suite. */
@@ -12873,6 +12893,11 @@ function reproductionCharacterLines(character: unknown): string[] {
       'The failure is REAL and so is this case — a check that answers both ways blocks',
       'every branch it touches until it stops. What it is NOT is a wrong assertion, and',
       'reading it as one sends you to change the thing that is already correct.',
+      '',
+      'YOU CANNOT OBSERVE IT NARROWED EITHER. A failure that comes and goes does not',
+      'reproduce when you run its files alone, and you may not run the suite — so you',
+      'cannot see it happen, test a hypothesis, or confirm a fix except through',
+      '`report-case`, one attempt at a time.',
       '',
       `${INSTABILITY_RESOLUTION_RULE}`,
       '',

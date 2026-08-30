@@ -129,8 +129,11 @@ except through `report-case`. `ENVIRONMENT-CONDITIONAL` means the same code ran 
 elsewhere in this pass and red here, so the difference is not in the code. Either way
 make one reading pass with order, shared state, and timing in mind, then either fix or
 claim `held` with your diagnosis. An instability case is resolved by making the check
-deterministic — isolation, a missing reset, a signal — never by widening a timeout,
-raising a retry count, or weakening an assertion; such an edit contradicts this record.
+deterministic — isolation, a missing reset, a signal: an edit after which the check
+gives one answer under any order, load or timing. An edit that leaves the outcome
+chance-dependent but less likely to fail — a wider timeout, a higher retry count, a
+sleep, a longer poll interval — or that stops the question being asked — a skipped,
+deleted or weakened assertion — contradicts this record.
 
 Every materials file ends with the same contract line: after editing, run the
 typechecks yourself and fix what they report; never run the test suites. A hook

@@ -2234,7 +2234,14 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     expect(caseRow.reproduction).toBe('environment-conditional');
     const materials = readFileSync(join(dir, gateCase, 'materials.md'), 'utf8');
     expect(materials).toContain('REPRODUCTION: ENVIRONMENT-CONDITIONAL');
-    expect(materials).toContain('never by widening a timeout, raising a retry count, or weakening an assertion');
+    expect(materials).toContain('An instability case is resolved by making the check deterministic');
+    // The CRITERION, not just the list: an edit that leaves the outcome to chance
+    // and one that stops asking are both named, so neither reads as permitted.
+    expect(materials).toContain('one answer under any order, load or timing');
+    expect(materials).toContain('stops the question being asked');
+    // The raise to `environment-conditional` keeps the method instruction the
+    // full-suite character carries — the agent still cannot observe this one.
+    expect(materials).toContain('YOU CANNOT OBSERVE IT NARROWED EITHER');
 
     writeFileSync(join(wt, 'src/shared.ts'), 'ok\n');
     let seen = '';
@@ -2251,7 +2258,8 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     // The character is NAMED, and the rule travels with it.
     expect(seen).toContain('Reproduction character (driver-measured): environment-conditional');
     expect(seen).toContain('An instability case is resolved by making the check deterministic');
-    expect(seen).toContain('never by widening a timeout, raising a retry count, or weakening an assertion');
+    expect(seen).toContain('one answer under any order, load or timing');
+    expect(seen).toContain('stops the question being asked');
     // …in the record block Q3 asks about, above the questions themselves.
     expect(seen.indexOf('An instability case is resolved')).toBeLessThan(seen.indexOf('## Cold-reader questions'));
     expect(seen).toContain('Does the change contradict any record included in this request?');
@@ -2292,7 +2300,8 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     );
     // BOTH halves are in front of the reader: the widening, and the rule.
     expect(seen).toContain('timeout: 30000');
-    expect(seen).toContain('never by widening a timeout, raising a retry count, or weakening an assertion');
+    expect(seen).toContain('An instability case is resolved by making the check deterministic');
+    expect(seen).toContain('stops the question being asked');
     // And the reject is what the driver recorded — the case does not resolve.
     const journal = readJournal(dir);
     const cold = journal.filter((e) => e.action === 'coldread' && e.caseId === gateCase);
@@ -8712,7 +8721,8 @@ describe('gate-fix — the briefing prices the exit and names the repro class', 
     expect(m).toContain('--tier held');
     // The rule that separates "make it deterministic" from "make it ask for less"
     // travels with every instability case, whichever shape it takes.
-    expect(m).toContain('never by widening a timeout, raising a retry count, or weakening an assertion');
+    expect(m).toContain('An instability case is resolved by making the check deterministic');
+    expect(m).toContain('stops the question being asked');
     // …and it appears BEFORE the file list, not in a footer: an agent must not
     // have to read deep into the materials before it can say "now
     // I can see the full picture".
