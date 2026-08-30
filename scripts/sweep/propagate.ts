@@ -1300,7 +1300,7 @@ function checkKey(subtree: string, cmd: string): string {
 }
 
 /** One command's verdict, with the subtree it was measured on. */
-interface CheckVerdict {
+export interface CheckVerdict {
   cmd: string;
   cwd?: string;
   subtree: string;
@@ -3279,6 +3279,80 @@ function redConfirmations(journal: JournalEntry[]): Map<string, RedConfirmRecord
     });
   }
   return out;
+}
+
+/** Whether a red observation may found a case on the branch it would be rooted on. */
+export type RedObservationVerdict =
+  | { usable: true; observed: CheckVerdict[] }
+  | {
+      usable: false;
+      /** Which finding this is, so the agent is told what it is looking at. */
+      id: 'WARN21_CHECKS_FLAKY' | 'WARN22_RED_UNCONFIRMED';
+      /** One sentence per command that may not found a case, and why. */
+      reasons: string[];
+      observed: CheckVerdict[];
+    };
+
+/**
+ * MAY THIS RED FOUND A CASE ON THIS BRANCH? A journal read and a git read —
+ * nothing is measured, nothing is journaled, nothing is decided elsewhere.
+ *
+ * The answer is PURE because it has to be asked BEFORE anything irreversible
+ * happens. A caller that destroys the agent's resolution and then discovers the
+ * mint refuses has thrown work away for a case it never created; asking first
+ * costs a journal read.
+ *
+ * TWO THINGS ARE CHECKED, per failing command:
+ *  - the SUBTREE the command runs in AT THE ROOTED BRANCH is the one the
+ *    confirmation is about. `bun test` in `container/agent-runner` says nothing
+ *    about `src/`, so a confirmation for another command's subtree authorises
+ *    nothing here;
+ *  - the confirming run was taken ON THE ROOTED BRANCH. A branch that shares the
+ *    subtree shares the VERDICT — it is the same bytes and it is not measured
+ *    again — but a case says "this branch is red", and where two branches carry
+ *    the identical subtree nothing distinguishes them: no branch introduced the
+ *    failure and none of them can be handed the fix. That red blocks both and is
+ *    REPORTED; it accuses neither.
+ *
+ * TWO DIFFERENT FINDINGS, TWO IDS. A check that gave both answers is UNSTABLE
+ * and the instability is the news; a red nobody confirmed here is simply
+ * UNCONFIRMED — the check may be perfectly stable and the branch perfectly red,
+ * and what is missing is a measurement, not a fix. Reporting the second as
+ * flakiness sends the agent hunting an instability that was never observed.
+ */
+export async function redObservationUsable(
+  journal: JournalEntry[],
+  repo: string,
+  rootedOn: string,
+  at: string,
+  commands: VerifyCommand[],
+): Promise<RedObservationVerdict> {
+  const confirmations = redConfirmations(journal);
+  const observed = await checkVerdictKeys(repo, at, commands);
+  const unusable = observed
+    .map((v) => ({ v, rec: confirmations.get(checkKey(v.subtree, v.cmd)) }))
+    .filter(({ rec }) => rec?.reproduced !== true || rec.branch !== rootedOn);
+  if (unusable.length === 0) return { usable: true, observed };
+  const why = ({ v, rec }: (typeof unusable)[number]): string => {
+    const where = v.cwd ? `${v.cwd} (${v.subtree.slice(0, 12)})` : `the tree ${v.subtree.slice(0, 12)}`;
+    if (rec === undefined) return `${v.cmd} was never re-run on ${where}`;
+    if (!rec.reproduced) return `${v.cmd} failed and then PASSED on a re-run of ${where}`;
+    return (
+      `${v.cmd} was confirmed red on ${where} by a run on ${rec.branch}, not on ${rootedOn} — ` +
+      `the two carry the identical subtree, so nothing there distinguishes them`
+    );
+  };
+  return {
+    usable: false,
+    id: unusable.some(({ rec }) => rec?.reproduced === false) ? 'WARN21_CHECKS_FLAKY' : 'WARN22_RED_UNCONFIRMED',
+    reasons: unusable.map(why),
+    observed,
+  };
+}
+
+/** The one sentence a refused red is reported with, wherever it is refused. */
+export function redRefusalDetail(reasons: string[]): string {
+  return `${reasons.join('; ')} — nothing is blamed and nothing is minted`;
 }
 
 /** What a second run of the failing commands, on the identical tree, said. */
@@ -11687,61 +11761,30 @@ async function materializeGateFixCases(
   const { features } = loadRegistry({ inventoryDir: cli.inventory, scopeFile: cli.scopeFile, routingFile: cli.routingFile });
   const none = { served: false as const, cases: [] as GateFixCaseSummary[], reason: '', detail: '', gated: [] as string[] };
   // A SINGLE RED OBSERVATION MAY NOT FOUND A CASE, AND A VERDICT BELONGS TO THE
-  // SUBTREE THE COMMAND RAN IN — both enforced at the one place a case is
+  // SUBTREE THE COMMAND RAN IN — the BACKSTOP, at the one place a case is
   // created, so no caller can reach a mint with an unconfirmed red or with a
-  // red that was never measured where the case is being rooted. Nothing is
-  // re-run here: the confirmation belongs where the tree was standing and its
-  // worktree still had its dependencies, and this is a journal read.
-  //
-  // TWO THINGS ARE CHECKED, per failing command:
-  //  - the SUBTREE the command runs in AT THE ROOTED BRANCH is the one the
-  //    confirmation is about. `bun test` in `container/agent-runner` says
-  //    nothing about `src/`, so a confirmation for another command's subtree
-  //    authorises nothing here;
-  //  - the confirming run was taken ON THE ROOTED BRANCH. A branch that shares
-  //    the subtree shares the VERDICT — it is the same bytes and it is not
-  //    measured again — but a case says "this branch is red", and where two
-  //    branches carry the identical subtree nothing distinguishes them: no
-  //    branch introduced the failure and none of them can be handed the fix.
-  //    That red blocks both and is REPORTED; it accuses neither.
+  // red that was never measured where the case is being rooted. Callers that
+  // must not destroy anything before they know the answer ask
+  // `redObservationUsable` themselves, first; this refuses whatever still
+  // arrives. Nothing is re-run here: the confirmation belongs where the tree was
+  // standing and its worktree still had its dependencies, and this is a journal
+  // read.
   if (opts.redOn) {
     const rootedOn = opts.rootBranch ?? '';
-    const confirmations = redConfirmations(journal);
-    const observed = await checkVerdictKeys(cli.repo, opts.redOn.at, opts.redOn.commands);
-    const unusable = observed
-      .map((v) => ({ v, rec: confirmations.get(checkKey(v.subtree, v.cmd)) }))
-      .filter(({ rec }) => rec?.reproduced !== true || rec.branch !== rootedOn);
-    if (unusable.length > 0) {
-      const why = ({ v, rec }: (typeof unusable)[number]): string => {
-        const where = v.cwd ? `${v.cwd} (${v.subtree.slice(0, 12)})` : `the tree ${v.subtree.slice(0, 12)}`;
-        if (rec === undefined) return `${v.cmd} was never re-run on ${where}`;
-        if (!rec.reproduced) return `${v.cmd} failed and then PASSED on a re-run of ${where}`;
-        return (
-          `${v.cmd} was confirmed red on ${where} by a run on ${rec.branch}, not on ${rootedOn} — ` +
-          `the two carry the identical subtree, so nothing there distinguishes them`
-        );
-      };
-      const detail = `${unusable.map(why).join('; ')} — nothing is blamed and nothing is minted`;
-      // TWO DIFFERENT FINDINGS, TWO IDS. A check that gave both answers is
-      // UNSTABLE and the instability is the news; a red nobody confirmed here is
-      // simply UNCONFIRMED — the check may be perfectly stable and the branch
-      // perfectly red, and what is missing is a measurement, not a fix. Reporting
-      // the second as flakiness sends the agent hunting an instability that was
-      // never observed.
-      const id = unusable.some(({ rec }) => rec?.reproduced === false)
-        ? 'WARN21_CHECKS_FLAKY'
-        : 'WARN22_RED_UNCONFIRMED';
+    const red = await redObservationUsable(journal, cli.repo, rootedOn, opts.redOn.at, opts.redOn.commands);
+    if (!red.usable) {
+      const detail = redRefusalDetail(red.reasons);
       appendJournal(dir, {
         action: 'gate-fix-refused',
-        id,
+        id: red.id,
         branch: rootedOn,
         at: opts.redOn.at,
-        subtrees: observed.map((v) => ({ cmd: v.cmd, ...(v.cwd ? { cwd: v.cwd } : {}), subtree: v.subtree })),
+        subtrees: red.observed.map((v) => ({ cmd: v.cmd, ...(v.cwd ? { cwd: v.cwd } : {}), subtree: v.subtree })),
         commands: opts.redOn.commands.map((c) => c.cmd),
         reason: detail,
       });
-      console.error(`gate-fix [${id}]: ${detail}`);
-      return { ...none, reason: detail, detail, id };
+      console.error(`gate-fix [${red.id}]: ${detail}`);
+      return { ...none, reason: detail, detail, id: red.id };
     }
   }
   // CUT-POINT EXCEPTIONS (cut-points.ts). A MALFORMED file is LOUD and stops
