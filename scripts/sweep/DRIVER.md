@@ -1257,15 +1257,28 @@ BOTH runs are the ones the side is answerable for; a side that answers red and
 green about the same file, in either order, is `flaky` — no owner, no mint,
 `WARN21_CHECKS_FLAKY`, and the case goes to the owner HELD with the resolution
 kept and the instability named. Where the pass has ALREADY re-run these commands
-on the SUBTREES this commit carries and seen the red repeat (§7.6's `red-confirm`
-rows), the confirming probe is skipped: the answer is journaled, and buying it
-again costs another full run — and it would not buy a SECOND observation anyway,
-since the same bytes asked again at another ref are the first measurement
-restated. A red the probe measures itself is still ONE observation — its two runs share a
+on the SUBTREES this commit carries, ON THE BRANCH THIS SIDE WOULD BLAME, and seen
+the red repeat (§7.6's `red-confirm` rows), the confirming probe is skipped: the
+answer is journaled, and buying it again costs another full run — and it would not
+buy a SECOND observation anyway, since the same bytes asked again at another ref
+are the first measurement restated.
+
+**PROVEN OWNER MUST MEAN MINTABLE OWNER**, so the skip is BRANCH-SCOPED, exactly as
+the mint's own check is (§9.1). Where the red for these bytes was confirmed on
+ANOTHER branch, the side answers `shared` instead: the verdict holds — identical
+subtrees cannot disagree — but it names no culprit, no measurement taken here can
+change that (a run on the same bytes restates the same observation), and so the
+probe stops rather than spending a second run and a bisect on an answer that can
+never mint. A branch-blind skip would prove owners the mint then refuses, and by
+then the merge would have been aborted for them.
+
+A red the probe measures itself is still ONE observation — its two runs share a
 worktree and a moment, which is what makes them comparable for the FILE-level
 partition and useless as a determinism check — so the accusation is confirmed the
 way every other accusation is: one varied re-run (§7.6), journaled as a
-`red-confirm` the mint can read. The
+`red-confirm` the mint can read. THAT RE-RUN'S ANSWER IS THE ANSWER: when it does
+not reproduce, the side is UNSTABLE and owns nothing, and the case ends the way any
+unstable side ends it. The
 interaction verdict states PER SIDE which of the two it was and against which
 ref ("absent at the branch tip `<sha12>` (cannot fail there); probed green twice
 at the parent head `<sha12>`"): a probed green and a vacuous one are different
@@ -1274,8 +1287,8 @@ facts, and one string spanning both is relayed as a claim about both tips.
 **A verdict describes a SUBSET, so the failing set is PARTITIONED**
 (`partitionOwners`). Each probe round reports which of the files it was asked
 about fail at the side it names; the remainder is re-asked until every file sits
-in an owner group `{owner, ref, files}` or in a NAMED `interaction`/`unknown`
-remainder. Reading one verdict as the whole story has only two outcomes and both
+in an owner group `{owner, ref, files}` or in a NAMED
+`interaction`/`unknown`/`flaky`/`shared` remainder. Reading one verdict as the whole story has only two outcomes and both
 are wrong: the other owners' files are folded into the named owner's case — that
 owner is handed a defect it did not introduce and cannot judge — or they are
 dropped and the build stays red with nothing minted for them. TERMINATION IS
@@ -1312,9 +1325,11 @@ the same `uncovered` block: they were proven to belong to a branch and no case w
 minted for them either, so from the owner's side they are in exactly a remainder's
 position — still red, nothing prepared. With NO owner found at all, the
 whole set is the remainder and the two non-gate-fix answers apply as before:
-`unknown` falls through to the ordinary checks failure, a `flaky` remainder ends the
+`unknown` falls through to the ordinary checks failure; a `flaky` remainder ends the
 case HELD with the resolution kept (`WARN21_CHECKS_FLAKY` — an unstable side names
-no owner, so there is nothing for the agent to fix and nobody to bill), and
+no owner, so there is nothing for the agent to fix and nobody to bill) and a
+`shared` one ends it the same way (`WARN22_RED_UNCONFIRMED` — the red is real and
+belongs to no branch), both journaling `gate-fix-refused` with the `caseId`; and
 `interaction` WIDENS the
 case's edit scope to the failing files (journaled `scope-widened`, read back by the
 scope guard, exempted from its `conflict-hunks` marker check since a widened file has
@@ -1537,9 +1552,14 @@ dependency install per confirmed red, paid once per (subtree, command) for the
 whole pass.
 
 The outcome is journaled as one `red-confirm` row PER COMMAND,
-carrying the `subtree` that command ran in, the branch it was measured on and
-`reproduced`, and every other accusing path reads those rows rather than paying
-for the same suite again: blame refuses to mint on an observation the journal does
+carrying the `subtree` that command ran in, the branch it was MEASURED on and
+`reproduced`. A row that merely RE-STATES a settled verdict (`ran: false`,
+`reason: 'confirmed-this-pass'`) carries the measuring branch too, not the branch
+that asked: the reader takes the last row per (subtree, command), so attributing a
+re-statement to the asker would move the verdict onto whichever branch happened to
+ask LAST — and make every refusal depend on the order the pass walked its branches
+rather than on where anything was measured. Every other accusing path reads these
+rows rather than paying for the same suite again: blame refuses to mint on an observation the journal does
 not record as confirmed, and the ownership probe (§7.2) skips its own confirming
 run for a subtree already confirmed here. A re-run that cannot be taken at
 all — a command that never spawned, or a second worktree that will not check out
@@ -1703,7 +1723,10 @@ if, FOR EVERY FAILING COMMAND, the pass has journaled a `red-confirm` with
 `reproduced: true` for the subtree that command runs in AT THE BRANCH THE CASE IS
 ROOTED ON, taken by a run ON THAT BRANCH. A red that changed its answer, was never
 re-run, or was confirmed only on another branch carrying the identical subtree
-mints nothing and is journaled `gate-fix-refused` with `WARN21_CHECKS_FLAKY`.
+mints nothing and is journaled `gate-fix-refused` — `WARN21_CHECKS_FLAKY` for a
+check that gave both answers, `WARN22_RED_UNCONFIRMED` for one nobody confirmed
+here. The ownership probe (§7.2) asks the SAME question before it proves an owner,
+so a `--not-my-bug` adjudication never aborts a merge for a case this then refuses.
 
 **A shared verdict blocks; it does not accuse.** Two branches whose relevant
 subtree is the same object cannot disagree about a command that runs there, so one

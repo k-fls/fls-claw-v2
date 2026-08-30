@@ -345,7 +345,7 @@ describe('partitionOwners', () => {
     };
     const p = await partitionOwners(['a.ts', 'b.ts'], 'tip', 'parent', unusable);
     expect(p.groups.map((g) => g.files)).toEqual([['a.ts']]);
-    expect(p.remainder).toEqual({ kind: 'unknown', files: ['b.ts'], detail: expect.any(String) });
+    expect(p.remainder).toEqual({ kind: 'unknown', files: ['b.ts'], ref: null, detail: expect.any(String) });
   });
 });
 

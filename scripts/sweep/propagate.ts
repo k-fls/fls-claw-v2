@@ -3454,10 +3454,15 @@ async function confirmRed(
   const { branch, sha, phase, failed } = args;
   const observedAt = Date.now();
   const known = redConfirmations(readJournal(dir));
-  const journalOne = (v: CheckVerdict, rest: Record<string, unknown>): void =>
+  // THE ROW BELONGS TO THE BRANCH THAT MEASURED IT, which is not always the one
+  // asking. A re-statement journaled under the asker would move the verdict onto
+  // it — last write wins — so whichever branch happened to ask LAST would become
+  // the one the red was confirmed on, and the refusal would depend on the order
+  // the pass walked its branches rather than on where anything was measured.
+  const journalOne = (v: CheckVerdict, rest: Record<string, unknown>, on: string = branch): void =>
     appendJournal(dir, {
       action: 'red-confirm',
-      branch,
+      branch: on,
       sha,
       phase,
       cmd: v.cmd,
@@ -3472,7 +3477,12 @@ async function confirmRed(
   // confirmed is not re-run — on this branch or any other carrying that subtree.
   const settled = failed.filter((v) => known.get(checkKey(v.subtree, v.cmd))?.reproduced === true);
   const owed = failed.filter((v) => !settled.includes(v));
-  for (const v of settled) journalOne(v, { ran: false, reason: 'confirmed-this-pass', reproduced: true });
+  for (const v of settled)
+    journalOne(
+      v,
+      { ran: false, reason: 'confirmed-this-pass', reproduced: true },
+      known.get(checkKey(v.subtree, v.cmd))!.branch,
+    );
   if (owed.length === 0) {
     const names = settled.map((v) => v.cmd);
     return { reproduced: true, flaky: [], detail: `${names.join(', ')} were already confirmed red on this subtree` };
@@ -9774,10 +9784,35 @@ async function adjudicateNotMyBug(p: {
       // fact at the price of another full run of the failing commands — and it
       // would buy it as a SECOND observation, which it is not: the same bytes
       // measured again at a different ref is the first measurement, restated.
+      // PROVEN OWNER MUST MEAN MINTABLE OWNER, so this asks exactly what the mint
+      // asks: confirmed, AND confirmed on the branch this side would blame. A
+      // branch-blind version proves owners the mint then refuses — after the
+      // merge has been aborted for them.
       confirmedRed: async (sha) => {
         const known = redConfirmations(readJournal(dir));
+        const on = sha === branchTip ? branch : rc.parent;
         const keys = await checkVerdictKeys(cli.repo, sha, failedCommands).catch(() => []);
-        return keys.length > 0 && keys.every((k) => known.get(checkKey(k.subtree, k.cmd))?.reproduced === true);
+        return (
+          keys.length > 0 &&
+          keys.every((k) => {
+            const rec = known.get(checkKey(k.subtree, k.cmd));
+            return rec?.reproduced === true && rec.branch === on;
+          })
+        );
+      },
+      // THE OTHER HALF OF THE SAME QUESTION: a red these bytes already carry from
+      // another branch. One command settled elsewhere is enough — the mint needs
+      // EVERY command confirmed here, and nothing measured on this commit can
+      // supply what is already settled for the identical subtree.
+      sharedRed: async (sha) => {
+        const known = redConfirmations(readJournal(dir));
+        const on = sha === branchTip ? branch : rc.parent;
+        const keys = await checkVerdictKeys(cli.repo, sha, failedCommands).catch(() => []);
+        for (const k of keys) {
+          const rec = known.get(checkKey(k.subtree, k.cmd));
+          if (rec?.reproduced === true && rec.branch !== on) return rec.branch;
+        }
+        return null;
       },
       // A RED THIS PROBE MEASURED ITSELF IS STILL ONE OBSERVATION. Its two runs
       // share a worktree and a moment — that is what makes them comparable for
@@ -9786,7 +9821,7 @@ async function adjudicateNotMyBug(p: {
       // one varied re-run, in a separately prepared worktree, journaled where the
       // mint below can read it.
       measuredRed: async (sha) => {
-        await confirmRed(dir, {
+        return confirmRed(dir, {
           branch: sha === branchTip ? branch : rc.parent,
           sha,
           phase: 'ownership',
@@ -9835,7 +9870,7 @@ async function adjudicateNotMyBug(p: {
         branch,
         owner: partition.remainder.kind,
         ownerBranch: null,
-        ref: null,
+        ref: partition.remainder.ref,
         files: partition.remainder.files,
         detail: partition.remainder.detail,
       });
@@ -9853,6 +9888,26 @@ async function adjudicateNotMyBug(p: {
       `not-my-bug: ${partition.groups.length} proven owner(s) in ${partition.rounds} locate round(s)` +
         (partition.remainder ? `; ${partition.remainder.files.length} file(s) ${partition.remainder.kind}` : ''),
     );
+    // A REFUSAL IS A ROW, wherever the refusal is taken. A red whose verdict
+    // another branch already owns is refused HERE — the partition stopped on it,
+    // so no owner group and no mint will ever carry it — and `finish` reads these
+    // rows to report what the pass proved and minted nothing for. A refusal that
+    // lives only in a mid-pass result is one the agent reports from memory.
+    if (partition.remainder?.kind === 'shared') {
+      const at = partition.remainder.ref ?? '';
+      const observed = at ? await checkVerdictKeys(cli.repo, at, failedCommands).catch(() => []) : [];
+      appendJournal(dir, {
+        action: 'gate-fix-refused',
+        id: 'WARN22_RED_UNCONFIRMED',
+        caseId,
+        branch: at === branchTip ? branch : rc.parent,
+        ...(at ? { at } : {}),
+        files: partition.remainder.files,
+        subtrees: observed.map((v) => ({ cmd: v.cmd, ...(v.cwd ? { cwd: v.cwd } : {}), subtree: v.subtree })),
+        commands: failedCommands.map((c) => c.cmd),
+        reason: partition.remainder.detail,
+      });
+    }
 
     if (partition.groups.length === 0) {
       // NOTHING WAS PLACED, so the remainder is the whole failing set and the two
@@ -9861,34 +9916,55 @@ async function adjudicateNotMyBug(p: {
       if (rest.kind === 'unknown') {
         return { handled: false, note: `${verdict.detail}; but ${rest.detail}` };
       }
-      if (rest.kind === 'flaky') {
-        // A SIDE THAT CHANGED ITS ANSWER NAMES NO OWNER. The failure is real on
-        // the merged tree and it is not the agent's — the adjudication proved
-        // that — but the tip that would be blamed for it is red once and green
-        // once on the identical tree, so there is no branch to root a fix on and
-        // nothing for the agent to fix. Same ending as an unstable adjudication:
-        // the case goes to the owner with its resolution INTACT and the
-        // instability named. Over-blocking, visibly, with an artifact.
-        await freezeHeld(cli, dir, rc, [`ownership probe unstable (${rest.files.join(', ')}) -> HELD (resolution kept)`], {
-          resolvedTree: p.resolvedTree,
-          escalation: { tag: ESCALATE_FLAKY, feedback: rest.detail.slice(0, COLDREAD_FEEDBACK_CAP) },
-        });
+      if (rest.kind === 'flaky' || rest.kind === 'shared') {
+        // A SIDE THAT NAMES NO OWNER ENDS THE CASE THE SAME WAY, whichever way it
+        // fails to name one. The failure is real on the merged tree and it is not
+        // the agent's — the adjudication proved that — but the tip that would be
+        // blamed is either red once and green once on the identical tree, or red
+        // on a verdict another branch carrying those bytes already owns. Either
+        // way there is no branch to root a fix on and nothing for the agent to
+        // fix, so the case goes to the owner with its resolution INTACT and the
+        // reason named. Over-blocking, visibly, with an artifact.
+        const shared = rest.kind === 'shared';
+        const id = shared ? 'WARN22_RED_UNCONFIRMED' : 'WARN21_CHECKS_FLAKY';
+        await freezeHeld(
+          cli,
+          dir,
+          rc,
+          [
+            shared
+              ? `pre-existing red no branch can be handed (${rest.files.join(', ')}) -> HELD (resolution kept)`
+              : `ownership probe unstable (${rest.files.join(', ')}) -> HELD (resolution kept)`,
+          ],
+          {
+            resolvedTree: p.resolvedTree,
+            escalation: {
+              tag: shared ? ESCALATE_UNMINTABLE : ESCALATE_FLAKY,
+              feedback: rest.detail.slice(0, COLDREAD_FEEDBACK_CAP),
+            },
+          },
+        );
         reopen(dir, [rc.branch, ...rc.descendants]);
         const stFlaky = readMachineState(dir);
         writeMachineState(dir, { ...stFlaky!, phase: 'awaiting-pr', currentCase: { caseId, branch, tier: 'held' } });
-        progress(`not-my-bug: held (ownership probe unstable) — ${branch}`);
-        console.error(`report-case [WARN21_CHECKS_FLAKY]: ${rest.detail}`);
+        progress(`not-my-bug: held (${shared ? 'no branch can be handed the fix' : 'ownership probe unstable'}) — ${branch}`);
+        console.error(`report-case [${id}]: ${rest.detail}`);
         result(cli, {
           instruction: prHandoff(
             dir,
             caseId,
-            `provide PR description — your resolution stands and NO branch was blamed: the check that would have ` +
-              `named an owner (${rest.files.join(', ')}) is UNSTABLE — red once and green once on the same tree. ` +
-              `Say that plainly and name it.`,
+            shared
+              ? `provide PR description — your resolution stands and NO branch was blamed: the red that would have ` +
+                `named an owner (${rest.files.join(', ')}) is PRE-EXISTING and belongs to no branch — ${rest.detail}. ` +
+                `Say that plainly and name it.`
+              : `provide PR description — your resolution stands and NO branch was blamed: the check that would have ` +
+                `named an owner (${rest.files.join(', ')}) is UNSTABLE — red once and green once on the same tree. ` +
+                `Say that plainly and name it.`,
           ),
           tier: 'held',
           notMyBug: { verdict: verdict.verdict, files: rest.files, owner: rest.kind, probes: verdict.probes + partition.probes, detail: rest.detail },
-          issues: [{ id: 'WARN21_CHECKS_FLAKY', detail: rest.detail }],
+          uncovered: { kind: rest.kind, files: rest.files, detail: rest.detail },
+          issues: [{ id, detail: rest.detail }],
         });
         return { handled: true, code: 0 };
       }
@@ -10338,6 +10414,9 @@ async function adjudicateNotMyBug(p: {
         ...(partition.remainder?.kind === 'flaky'
           ? [{ id: 'WARN21_CHECKS_FLAKY', detail: partition.remainder.detail }]
           : []),
+        ...(partition.remainder?.kind === 'shared'
+          ? [{ id: 'WARN22_RED_UNCONFIRMED', detail: partition.remainder.detail }]
+          : []),
         ...refusedIssues,
       ],
         notMyBug: {
@@ -10379,6 +10458,9 @@ async function adjudicateNotMyBug(p: {
         // its own right rather than a footnote on someone else's case.
         ...(partition.remainder?.kind === 'flaky'
           ? [{ id: 'WARN21_CHECKS_FLAKY', detail: partition.remainder.detail }]
+          : []),
+        ...(partition.remainder?.kind === 'shared'
+          ? [{ id: 'WARN22_RED_UNCONFIRMED', detail: partition.remainder.detail }]
           : []),
         ...refusedIssues,
       ],

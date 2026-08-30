@@ -1421,8 +1421,6 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     repo: FixtureRepo,
     ws: string,
     inv: string,
-    /** Journal rows the adjudication must READ — seeded once the pass dir exists. */
-    seed?: (a: { dir: string; tipSha: string; parentHead: string }) => void,
   ): Promise<{ dir: string; caseId: string; out: string; code: number }> {
     const checks = checksFile(ws);
     await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
@@ -1447,7 +1445,6 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
         output: names.map((n) => `$ ${n}\n${files.map((f) => `${f}(1,1): error TS2345: boom\n`).join('')}`).join(''),
       };
     };
-    seed?.({ dir, tipSha, parentHead });
     const out = join(ws, 'rc.json');
     const code = await cmdSweepReportCase(
       baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
@@ -1600,6 +1597,23 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
   });
 
   /**
+   * A branch owner and an UPSTREAM owner in one failing set. `src/mine.ts` is red
+   * at the branch tip; `src/util.ts` exists only on upstream and is red at the
+   * parent head.
+   */
+  function upstreamCoOwnerFixture(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base: x + mine', { 'src/x.ts': 'orig\n', 'src/mine.ts': 'm\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: x = fork', { 'src/x.ts': 'fork\n' });
+    repo.checkout('main');
+    repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+    repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' });
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+
+  /**
    * ONE MINTABLE OWNER IS ENOUGH TO ABORT, and the refused one still has to be
    * SAID. The mintable owner gets its case and the merge goes, exactly as before;
    * the owner nobody may be handed a fix for joins the files no gate fix covers,
@@ -1607,37 +1621,37 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
    * happened.
    */
   it('one mintable owner and one refused: the mint happens, the refusal is reported', async () => {
-    const repo = twoOwnerFixture();
+    const repo = upstreamCoOwnerFixture();
     const ws = mkWorkspace();
-    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
-    const { dir, caseId, out, code } = await adjudicateTwoOwners(repo, ws, inv, ({ dir, parentHead }) => {
-      // The parent head's red was confirmed on a DIFFERENT branch carrying the
-      // identical subtree. That verdict holds — the same bytes cannot disagree —
-      // but it names no culprit, so `main_patched` may not be handed the fix.
-      appendJournal(dir, {
-        action: 'red-confirm',
-        branch: 'module/elsewhere',
-        sha: parentHead,
-        phase: 'test',
-        cmd: 'tsc --noEmit',
-        cwd: '.',
-        subtree: repo.git('rev-parse', `${parentHead}^{tree}`),
-        commands: ['tsc --noEmit'],
-        ran: true,
-        reproduced: true,
-      });
-    });
-    expect(code).toBe(1);
+    const inv = branchlessInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    seedPriorFailure(dir, caseId, 'typecheck', ['tsc --noEmit']);
+    const wtPath = join(dir, caseId, 'worktree');
+    const tipSha = execFileSync('git', ['-C', wtPath, 'rev-parse', 'HEAD^'], { encoding: 'utf8' }).trim();
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+        neverInvoked,
+        ownershipRunner(wtPath, tipSha, 'src/mine.ts', 'src/util.ts'),
+        fakeInstall,
+      ),
+    ).toBe(1);
     const journal = readJournal(dir);
-    // One case, on the owner whose red WAS confirmed where the case is rooted.
+    // One case, on the one owner a case may be rooted on.
     const gateFixes = journal.filter((e) => e.action === 'gate-fix');
-    expect(gateFixes.map((e) => e.branch)).toEqual(['module/cg']);
-    expect(gateFixes[0].files).toEqual(['src/a.ts']);
+    expect(gateFixes.map((e) => e.branch)).toEqual(['main_patched']);
+    expect(gateFixes[0].files).toEqual(['src/mine.ts']);
+    // The upstream owner is refused BEFORE the bisect and the abort, and the row
+    // names the case it came from.
     const refusal = journal.find((e) => e.action === 'gate-fix-refused')!;
-    expect(refusal.id).toBe('WARN22_RED_UNCONFIRMED');
-    expect(refusal.branch).toBe('main_patched');
+    expect(refusal.id).toBe('WARN15_UPSTREAM_RED');
+    expect(refusal.branch).toBe('main');
     expect(refusal.caseId).toBe(caseId);
-    expect(refusal.files).toEqual(['src/b.ts']);
+    expect(refusal.files).toEqual(['src/util.ts']);
+    // No bisect was paid for the owner that was never going to mint.
+    expect(journal.filter((e) => e.action === 'not-my-bug-bisect').map((e) => e.branch)).toEqual(['main_patched']);
     // A mintable owner exists, so the merge IS aborted and the resolution goes.
     expect(journal.some((e) => e.action === 'not-my-bug-discarded')).toBe(true);
     expect(supersededCaseIds(journal).has(caseId)).toBe(true);
@@ -1650,17 +1664,134 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     const res = JSON.parse(readFileSync(out, 'utf8')) as {
       status: string;
       issues: Array<{ id: string }>;
-      uncovered: { files: string[]; detail: string };
+      uncovered: { kind: string; files: string[]; detail: string };
       instruction: string;
     };
     expect(res.status).toBe('gate-fix-required');
-    // The refused files are NOT covered by any gate fix, so they travel with the
-    // interaction remainder — and the refusal keeps its own id.
-    expect(res.uncovered.files.sort()).toEqual(['src/b.ts', 'src/c.ts']);
-    expect(res.issues.map((i) => i.id)).toContain('WARN22_RED_UNCONFIRMED');
-    expect(res.instruction).toContain('src/b.ts');
+    // The refused owner's files are covered by no gate fix, so they are reported
+    // exactly where a remainder is reported.
+    expect(res.uncovered).toEqual({ kind: 'unmintable-red', files: ['src/util.ts'], detail: expect.any(String) });
+    expect(res.issues.map((i) => i.id)).toContain('WARN15_UPSTREAM_RED');
+    expect(res.instruction).toContain('src/util.ts');
     // A PROCEED arm carries WARN ids only.
     expect(res.issues.every((i) => i.id.startsWith('WARN'))).toBe(true);
+  });
+
+  /**
+   * THE PARTITION AND THE MINT ASK THE SAME QUESTION. A red confirmed on another
+   * branch carrying the identical subtree stops the partition where it stands —
+   * it can never become mintable, so probing and bisecting it buys nothing — and
+   * the case ends HELD with the resolution kept.
+   */
+  it('a red whose verdict another branch owns stops the partition and keeps the resolution', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    seedPriorFailure(dir, caseId, 'typecheck', ['tsc --noEmit']);
+    const wtPath = join(dir, caseId, 'worktree');
+    const tipSha = execFileSync('git', ['-C', wtPath, 'rev-parse', 'HEAD^'], { encoding: 'utf8' }).trim();
+    appendJournal(dir, {
+      action: 'red-confirm',
+      branch: 'module/elsewhere',
+      sha: tipSha,
+      phase: 'test',
+      cmd: 'tsc --noEmit',
+      cwd: '.',
+      subtree: repo.git('rev-parse', `${tipSha}^{tree}`),
+      commands: ['tsc --noEmit'],
+      ran: true,
+      reproduced: true,
+    });
+    const r = namingRunner(['tsc --noEmit'], 'src/util.ts');
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+        neverInvoked,
+        r.fn,
+        fakeInstall,
+      ),
+    ).toBe(0);
+    const journal = readJournal(dir);
+    // NOT a proven owner: the partition stops on a verdict that names nobody.
+    expect(journal.find((e) => e.action === 'not-my-bug-owner')!.owner).toBe('shared');
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    expect(journal.some((e) => e.action === 'not-my-bug-bisect')).toBe(false);
+    expect(journal.some((e) => e.action === 'not-my-bug-discarded')).toBe(false);
+    const refusal = journal.find((e) => e.action === 'gate-fix-refused')!;
+    expect(refusal.id).toBe('WARN22_RED_UNCONFIRMED');
+    expect(refusal.branch).toBe('main_patched');
+    expect(refusal.caseId).toBe(caseId);
+    expect(refusal.reason).toContain('module/elsewhere');
+    const held = journal.find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect((held.resolution as { markerClean: boolean }).markerClean).toBe(true);
+    expect(machineState(dir).phase).toBe('awaiting-pr');
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { tier: string; issues: Array<{ id: string }> };
+    expect(res.tier).toBe('held');
+    expect(res.issues.map((i) => i.id)).toEqual(['WARN22_RED_UNCONFIRMED']);
+  });
+
+  /**
+   * THE CONFIRMING RE-RUN'S ANSWER IS THE ANSWER. The ownership probe's own pair
+   * agrees — same worktree, same moment — and the varied re-run, in a separately
+   * prepared worktree, does not. A side that answers both ways names no owner, so
+   * nothing is bisected, nothing is minted and nothing is destroyed.
+   */
+  it('a side whose confirming re-run does not reproduce names no owner and keeps the resolution', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    seedPriorFailure(dir, caseId, 'typecheck', ['tsc --noEmit']);
+    const wtPath = join(dir, caseId, 'worktree');
+    const out = join(ws, 'rc.json');
+    // The probe reuses ONE worktree per commit; the confirming re-run gets a
+    // freshly prepared one. A second directory at the same sha is therefore the
+    // varied re-run, and it comes back green.
+    const probeDir = new Map<string, string>();
+    const fn: ChecksRunner = async (commands, baseDir) => {
+      const names = commands.map((c) => c.cmd);
+      if (baseDir && baseDir !== wtPath) {
+        const at = execFileSync('git', ['-C', baseDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+        const first = probeDir.get(at);
+        if (first === undefined) probeDir.set(at, baseDir);
+        else if (first !== baseDir) return { ok: true, failedNames: [], output: '' };
+      }
+      return {
+        ok: false,
+        failedNames: names,
+        output: names.map((n) => `$ ${n}\nsrc/util.ts(1,1): error TS2345: boom\n`).join(''),
+      };
+    };
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+        neverInvoked,
+        fn,
+        fakeInstall,
+      ),
+    ).toBe(0);
+    const journal = readJournal(dir);
+    expect(journal.find((e) => e.action === 'not-my-bug')!.verdict).toBe('pre-existing');
+    // NOT `branch`: the side is unstable, so it owns nothing.
+    expect(journal.find((e) => e.action === 'not-my-bug-owner')!.owner).toBe('flaky');
+    expect(journal.some((e) => e.action === 'not-my-bug-bisect')).toBe(false);
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    expect(journal.some((e) => e.action === 'not-my-bug-discarded')).toBe(false);
+    const held = journal.find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect((held.resolution as { markerClean: boolean }).markerClean).toBe(true);
+    expect(machineState(dir).phase).toBe('awaiting-pr');
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      tier: string;
+      issues: Array<{ id: string }>;
+      notMyBug: { owner: string };
+    };
+    expect(res.tier).toBe('held');
+    expect(res.issues.map((i) => i.id)).toEqual(['WARN21_CHECKS_FLAKY']);
+    expect(res.notMyBug.owner).toBe('flaky');
   });
 
   /**

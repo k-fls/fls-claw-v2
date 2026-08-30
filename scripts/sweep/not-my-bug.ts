@@ -461,7 +461,14 @@ export type OwnerKind =
   /** A probe was unusable; ownership undetermined. */
   | 'unknown'
   /** A side answered red and then green on the identical tree: nobody may be blamed. */
-  | 'flaky';
+  | 'flaky'
+  /**
+   * Red, and the red is a verdict already taken on ANOTHER branch carrying the
+   * identical subtree for the failing command. The same bytes cannot disagree, so
+   * the verdict holds here — but it names no culprit, and no case may be rooted on
+   * a branch nothing distinguishes from its sibling.
+   */
+  | 'shared';
 
 export interface OwnershipResult {
   owner: OwnerKind;
@@ -498,18 +505,35 @@ export async function locateOwner(
      */
     hasAnyFile?: (sha: string, files: string[]) => Promise<boolean>;
     /**
-     * Has this pass ALREADY re-run these checks on this commit's tree and seen
-     * the same red twice? Then the confirming probe below is skipped: the answer
-     * is journaled and re-running buys the same fact at full price.
+     * Has this pass already confirmed this red ON THE BRANCH THIS SIDE WOULD
+     * BLAME? Then the confirming probe below is skipped: the answer is journaled
+     * and re-running buys the same fact at full price.
+     *
+     * BRANCH-SCOPED, because minting is. A predicate that proved ownership from
+     * any branch's confirmation would prove owners the mint then refuses — and by
+     * the time it refused, the case would already have been aborted for it.
      */
     confirmedRed?: (sha: string) => Promise<boolean>;
     /**
-     * A red this probe measured HERE, twice, at this commit — journaled by the
-     * caller as a confirmation. Only own measurements are reported: a red read
-     * back from `confirmedRed` is another run's observation, and restating it as
-     * one taken here would turn a shared verdict into a second witness.
+     * Is this commit's red a verdict taken on ANOTHER branch carrying the
+     * identical subtree? Returns that branch. No measurement can move such a red
+     * onto this side — the subtrees are the same object, so a run here restates
+     * the same observation — which is why this side answers `shared` instead of
+     * spending the confirming probe and the bisect that would follow it.
      */
-    measuredRed?: (sha: string) => Promise<void>;
+    sharedRed?: (sha: string) => Promise<string | null>;
+    /**
+     * Confirm a red this probe measured HERE, twice, at this commit — journaled
+     * by the caller. Only own measurements are reported: a red read back from
+     * `confirmedRed` is another run's observation, and restating it as one taken
+     * here would turn a shared verdict into a second witness.
+     *
+     * THE OUTCOME IS THE ANSWER, not a side effect. A confirming re-run that does
+     * not reproduce says the side is UNSTABLE, and a caller that discarded that
+     * would go on to blame a branch on the observation the re-run just
+     * contradicted.
+     */
+    measuredRed?: (sha: string) => Promise<{ reproduced: boolean; detail: string }>;
   } = {},
 ): Promise<OwnershipResult> {
   let probes = 0;
@@ -534,7 +558,9 @@ export async function locateOwner(
     | { kind: 'absent' }
     | { kind: 'red'; files: string[] }
     | { kind: 'green' }
-    | { kind: 'unstable'; files: string[] };
+    /** `detail` when a confirming re-run, not this probe's own pair, contradicted it. */
+    | { kind: 'unstable'; files: string[]; detail?: string }
+    | { kind: 'shared'; files: string[]; on: string };
   const sideFailures = async (sha: string): Promise<SideAnswer> => {
     if (opts.hasAnyFile && !(await opts.hasAnyFile(sha, files))) return { kind: 'absent' };
     const first = await probe({ kind: 'commit', sha }, files);
@@ -543,12 +569,20 @@ export async function locateOwner(
     const failing = files.filter((f) => (first.counts.get(f) ?? 0) > 0);
     if (failing.length > 0) {
       if (opts.confirmedRed && (await opts.confirmedRed(sha))) return { kind: 'red', files: failing };
+      // SPENT PROBES CANNOT BUY THIS SIDE AN OWNER. The red is already settled
+      // for these bytes on another branch, and this commit carries the same
+      // bytes: a run here restates that observation rather than adding one, so
+      // the second probe, the confirming re-run and the bisect after them would
+      // all be paid for an answer that stays unmintable.
+      const shared = opts.sharedRed ? await opts.sharedRed(sha) : null;
+      if (shared) return { kind: 'shared', files: failing, on: shared };
       const again = await probe({ kind: 'commit', sha }, files);
       probes++;
       if (!again.usable) return { kind: 'unusable' };
       const stable = failing.filter((f) => (again.counts.get(f) ?? 0) > 0);
       if (stable.length === 0) return { kind: 'unstable', files: failing };
-      await opts.measuredRed?.(sha);
+      const confirmed = await opts.measuredRed?.(sha);
+      if (confirmed && !confirmed.reproduced) return { kind: 'unstable', files: stable, detail: confirmed.detail };
       return { kind: 'red', files: stable };
     }
     const second = await probe({ kind: 'commit', sha }, files);
@@ -561,6 +595,19 @@ export async function locateOwner(
     return twice.length > 0 ? { kind: 'unstable', files: twice } : { kind: 'green' };
   };
 
+  /** Why a side that flickered may not be read: this probe's pair, or the re-run. */
+  const unstableWhy = (label: string, sha: string, a: { files: string[]; detail?: string }): string =>
+    a.detail
+      ? `${a.files.join(', ')} did not survive the confirming re-run at ${label} ${sha.slice(0, 12)} — ${a.detail} — ` +
+        `so no branch owns this and no fix is minted`
+      : `${a.files.join(', ')} failed and then PASSED at ${label} ${sha.slice(0, 12)} with nothing changed between ` +
+        `the runs — the check is unstable there, so no branch owns this and no fix is minted`;
+  /** Why a side that IS red still names nobody: another branch owns the verdict. */
+  const sharedWhy = (label: string, sha: string, a: { files: string[]; on: string }): string =>
+    `${a.files.join(', ')} are red at ${label} ${sha.slice(0, 12)}, and that red was confirmed on ${a.on} — which ` +
+    `carries the identical subtree for the failing command. The verdict holds and it accuses nobody: nothing there ` +
+    `distinguishes the two branches, so no branch can be handed the fix`;
+
   const bt = await sideFailures(branchTip);
   if (bt.kind === 'unusable') {
     return {
@@ -572,15 +619,10 @@ export async function locateOwner(
     };
   }
   if (bt.kind === 'unstable') {
-    return {
-      owner: 'flaky',
-      ref: null,
-      files: bt.files,
-      probes,
-      detail:
-        `${bt.files.join(', ')} failed and then PASSED at the branch tip ${branchTip.slice(0, 12)} with nothing ` +
-        `changed between the runs — the check is unstable there, so no branch owns this and no fix is minted`,
-    };
+    return { owner: 'flaky', ref: null, files: bt.files, probes, detail: unstableWhy('the branch tip', branchTip, bt) };
+  }
+  if (bt.kind === 'shared') {
+    return { owner: 'shared', ref: branchTip, files: bt.files, probes, detail: sharedWhy('the branch tip', branchTip, bt) };
   }
   if (bt.kind === 'red') {
     return {
@@ -602,15 +644,10 @@ export async function locateOwner(
     };
   }
   if (ph.kind === 'unstable') {
-    return {
-      owner: 'flaky',
-      ref: null,
-      files: ph.files,
-      probes,
-      detail:
-        `${ph.files.join(', ')} failed and then PASSED at the parent head ${parentHead.slice(0, 12)} with nothing ` +
-        `changed between the runs — the check is unstable there, so no branch owns this and no fix is minted`,
-    };
+    return { owner: 'flaky', ref: null, files: ph.files, probes, detail: unstableWhy('the parent head', parentHead, ph) };
+  }
+  if (ph.kind === 'shared') {
+    return { owner: 'shared', ref: parentHead, files: ph.files, probes, detail: sharedWhy('the parent head', parentHead, ph) };
   }
   if (ph.kind === 'red') {
     return {
@@ -655,8 +692,10 @@ export interface OwnerGroup {
 
 /** The files no owner could be proven for — named, never folded into a group. */
 export interface OwnerRemainder {
-  kind: Extract<OwnerKind, 'interaction' | 'unknown' | 'flaky'>;
+  kind: Extract<OwnerKind, 'interaction' | 'unknown' | 'flaky' | 'shared'>;
   files: string[];
+  /** The commit the unmintable red sits at, where the verdict named one. */
+  ref: string | null;
   detail: string;
 }
 
@@ -699,7 +738,8 @@ export async function partitionOwners(
   opts: {
     hasAnyFile?: (sha: string, files: string[]) => Promise<boolean>;
     confirmedRed?: (sha: string) => Promise<boolean>;
-    measuredRed?: (sha: string) => Promise<void>;
+    sharedRed?: (sha: string) => Promise<string | null>;
+    measuredRed?: (sha: string) => Promise<{ reproduced: boolean; detail: string }>;
   } = {},
 ): Promise<OwnerPartition> {
   const groups: OwnerGroup[] = [];
@@ -712,7 +752,7 @@ export async function partitionOwners(
     probes += v.probes;
     rounds++;
     if (v.owner === 'interaction' || v.owner === 'unknown') {
-      remainder = { kind: v.owner, files: rest, detail: v.detail };
+      remainder = { kind: v.owner, files: rest, ref: v.ref, detail: v.detail };
       break;
     }
     // AN UNSTABLE SIDE STOPS THE PARTITION, and it stops it with the files it
@@ -720,8 +760,11 @@ export async function partitionOwners(
     // pair of tips: a side that answers red and then green about one file is a
     // side no verdict may be read off, so re-asking it about the rest would
     // mint on exactly the observation this refuses.
-    if (v.owner === 'flaky') {
-      remainder = { kind: 'flaky', files: rest, detail: v.detail };
+    // A SIDE WHOSE RED BELONGS TO ANOTHER BRANCH STOPS IT THE SAME WAY, and for
+    // the same reason: the rounds share one pair of tips, and re-asking a side
+    // whose verdict names nobody buys probes for an answer that stays unmintable.
+    if (v.owner === 'flaky' || v.owner === 'shared') {
+      remainder = { kind: v.owner, files: rest, ref: v.ref, detail: v.detail };
       break;
     }
     const owned = rest.filter((f) => v.files.includes(f));
@@ -732,6 +775,7 @@ export async function partitionOwners(
       remainder = {
         kind: 'unknown',
         files: rest,
+        ref: null,
         detail: `${v.detail}, but the verdict named none of ${rest.join(', ')} — ownership undetermined for those`,
       };
       break;
