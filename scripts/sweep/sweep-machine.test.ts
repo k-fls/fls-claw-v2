@@ -2180,6 +2180,128 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
   });
 
   /**
+   * Drive an inherited red to a SERVED gate-fix case whose character the mint
+   * measured, with the same subtree recorded GREEN elsewhere in the pass — the
+   * shape that makes the check itself, and not the assertion, the defect.
+   */
+  async function servedContestedGateFix(
+    repo: FixtureRepo,
+    ws: string,
+    inv: string,
+  ): Promise<{ dir: string; gateCase: string; wt: string }> {
+    const { dir, ceilingTip } = await inheritedCase(repo, ws, inv);
+    seedConfirmedRed(dir, repo, 'module/elsewhere', ceilingTip);
+    // The SAME (subtree, command) measured green on another branch: one oid,
+    // both answers, which is the only shape of disagreement that is one.
+    appendJournal(dir, {
+      action: 'landing-check',
+      branch: 'module/green-side',
+      sha: ceilingTip,
+      ok: true,
+      checks: [{ cmd: 'tsc --noEmit', cwd: '.', subtree: repo.git('rev-parse', `${ceilingTip}^{tree}`), ok: true }],
+    });
+    const r = namingRunner(['tsc --noEmit'], 'src/shared.ts');
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true }),
+      neverInvoked,
+      r.fn,
+      fakeInstall,
+    );
+    const gateCase = readJournal(dir).find((e) => e.action === 'gate-fix')!.caseId as string;
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge)).toBe(0);
+    return { dir, gateCase, wt: join(dir, gateCase, 'worktree') };
+  }
+
+  /** A checks gate that passes, so a served gate fix reaches its cold read. */
+  const greenGate: ChecksRunner = async () => ({ ok: true, failedNames: [], output: '' });
+
+  /**
+   * THE CHARACTER REACHES THE READER, IN THE RECORD IT JUDGES AGAINST.
+   *
+   * The cold reader is asked whether a change contradicts a record in its
+   * request — so the rule that separates "make this check deterministic" from
+   * "make it ask for less" has to BE in the request. It is a record, not a fourth
+   * question: Q3 already binds to it, and a reader told the character can answer
+   * about the diff in front of it without being taught anything new.
+   */
+  it('a contested gate fix carries its character and the instability rule into the cold read', async () => {
+    const repo = inheritedRedFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    const { dir, gateCase, wt } = await servedContestedGateFix(repo, ws, inv);
+    // The mint measured it: the same bytes answered both ways this pass.
+    const caseRow = readJournal(dir).find((e) => e.action === 'case' && e.caseId === gateCase)!;
+    expect(caseRow.reproduction).toBe('environment-conditional');
+    const materials = readFileSync(join(dir, gateCase, 'materials.md'), 'utf8');
+    expect(materials).toContain('REPRODUCTION: ENVIRONMENT-CONDITIONAL');
+    expect(materials).toContain('never by widening a timeout, raising a retry count, or weakening an assertion');
+
+    writeFileSync(join(wt, 'src/shared.ts'), 'ok\n');
+    let seen = '';
+    const capture: ColdReadInvoker = async (prompt) => {
+      seen = prompt;
+      return { verdict: 'confirm', notes: 'deterministic fix' };
+    };
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true }),
+      capture,
+      greenGate,
+      fakeInstall,
+    );
+    // The character is NAMED, and the rule travels with it.
+    expect(seen).toContain('Reproduction character (driver-measured): environment-conditional');
+    expect(seen).toContain('An instability case is resolved by making the check deterministic');
+    expect(seen).toContain('never by widening a timeout, raising a retry count, or weakening an assertion');
+    // …in the record block Q3 asks about, above the questions themselves.
+    expect(seen.indexOf('An instability case is resolved')).toBeLessThan(seen.indexOf('## Cold-reader questions'));
+    expect(seen).toContain('Does the change contradict any record included in this request?');
+  });
+
+  /**
+   * A DIFF THAT MAKES THE CHECK ASK FOR LESS IS ANSWERABLE ON Q3. The reader
+   * holds the widening and the rule it contradicts in one request, so rejecting
+   * it is a reading of the record rather than an opinion about test hygiene —
+   * which is exactly what keeps the driver out of the business of having taste.
+   */
+  it('a timeout-widening fix reaches the reader beside the record it contradicts', async () => {
+    const repo = inheritedRedFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    const { dir, gateCase, wt } = await servedContestedGateFix(repo, ws, inv);
+    // The "fix": the assertion is untouched and the check is simply given longer.
+    writeFileSync(join(wt, 'src/shared.ts'), 'broken\ntimeout: 30000\n');
+    let seen = '';
+    const rejectOnRecord: ColdReadInvoker = async (prompt) => {
+      seen = prompt;
+      return {
+        verdict: 'reject',
+        notes: 'q3',
+        answers: {
+          q1: 'no — the assertion is unchanged',
+          q2: 'yes',
+          q3: 'CONTRADICTS the record: the case is environment-conditional and this only widens a timeout',
+        },
+        feedback: 'make the check deterministic instead of giving it longer',
+      } as Awaited<ReturnType<ColdReadInvoker>>;
+    };
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true }),
+      rejectOnRecord,
+      greenGate,
+      fakeInstall,
+    );
+    // BOTH halves are in front of the reader: the widening, and the rule.
+    expect(seen).toContain('timeout: 30000');
+    expect(seen).toContain('never by widening a timeout, raising a retry count, or weakening an assertion');
+    // And the reject is what the driver recorded — the case does not resolve.
+    const journal = readJournal(dir);
+    const cold = journal.filter((e) => e.action === 'coldread' && e.caseId === gateCase);
+    expect(cold.length).toBeGreaterThan(0);
+    expect(cold[cold.length - 1].verdict).toBe('reject');
+    expect(journal.some((e) => e.action === 'resolved' && e.caseId === gateCase)).toBe(false);
+  });
+
+  /**
    * ONE OID, BOTH ANSWERS. A command measured green somewhere and confirmed red
    * somewhere else over the SAME subtree contradicted itself — the only shape of
    * disagreement that is one — and everything downstream of a confirmed red
@@ -8580,7 +8702,7 @@ describe('gate-fix — the briefing prices the exit and names the repro class', 
       gateFix: true,
       head: { sha: tip, height: 0 },
       conflictedPaths: ['src/x.test.ts'],
-      fullSuiteOnly: true,
+      reproduction: 'full-suite-only',
     });
     const journal = readJournal(dir);
     const jc = journaledCases(journal).get(caseId)!;
@@ -8588,6 +8710,9 @@ describe('gate-fix — the briefing prices the exit and names the repro class', 
     const m = gateFixCaseMaterialsForTest(dir, jc, caseRow);
     expect(m).toContain('REPRODUCTION: FULL SUITE ONLY');
     expect(m).toContain('--tier held');
+    // The rule that separates "make it deterministic" from "make it ask for less"
+    // travels with every instability case, whichever shape it takes.
+    expect(m).toContain('never by widening a timeout, raising a retry count, or weakening an assertion');
     // …and it appears BEFORE the file list, not in a footer: an agent must not
     // have to read deep into the materials before it can say "now
     // I can see the full picture".

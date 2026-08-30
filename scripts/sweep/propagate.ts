@@ -1776,6 +1776,13 @@ function inventoryContextLines(features: FeatureEntry[], branch: string, parent:
 async function caseContextLines(
   cli: Cli,
   c: { branch: string; parent: string; head: { sha: string }; conflictedPaths: string[] },
+  /**
+   * The failure's reproduction character, where the case has one. It is part of
+   * the RECORD rather than a fourth question: Q3 already asks whether the change
+   * contradicts a record in the request, and a rule stated here is answerable
+   * against the diff without teaching the reader anything new.
+   */
+  reproduction?: unknown,
 ): Promise<string[]> {
   const registry = loadRegistry({
     inventoryDir: cli.inventory,
@@ -1799,6 +1806,16 @@ async function caseContextLines(
     '```',
     sides.theirs,
     '```',
+    ...(reproduction === 'full-suite-only' || reproduction === 'environment-conditional'
+      ? [
+          '',
+          `### Reproduction character (driver-measured): ${reproduction}`,
+          reproduction === 'environment-conditional'
+            ? 'This check ran GREEN on the identical subtree elsewhere in this pass and CONFIRMED RED here: the code is the same object in both runs, so the difference is not in it.'
+            : 'This failure does not reproduce narrowed to its own files; it needs the whole suite, which is an ordering, shared-state or timing failure rather than a wrong assertion.',
+          INSTABILITY_RESOLUTION_RULE,
+        ]
+      : []),
   ];
 }
 
@@ -3441,9 +3458,12 @@ function greenChecks(journal: JournalEntry[]): Map<string, string> {
  *
  * WHAT IT STILL APPROXIMATES: a suite that reaches outside its own `cwd` can
  * fail for content the subtree does not contain, so an untouched subtree does
- * not strictly prove an untouched population. That is the same approximation
- * subtree-keyed verdicts and the green memo already run on, and no worse here —
- * it is worth stating, not worth claiming otherwise.
+ * not strictly prove an untouched population — the likeliest instance here being
+ * the dependency manifests and lockfiles a run resolves from the workspace root,
+ * which a resolution can change while the cwd oid and its prefix-equality both
+ * hold. That is the same approximation subtree-keyed verdicts and the green memo
+ * already run on, and no worse here — it is worth stating, not worth claiming
+ * otherwise.
  *
  * AT THE ROOT THIS NEVER FIRES, and that is the right answer rather than a gap:
  * `cwd: '.'` keys on the whole tree, and a resolution that changed nothing is
@@ -3471,6 +3491,36 @@ async function subtreeVerdictAlreadyRed(
   }
   return keys;
 }
+
+/**
+ * WHAT KIND OF FAILURE THE AGENT IS HOLDING — stated by the driver, never left
+ * to be inferred from a log.
+ *
+ * Both values describe a REAL failure that gets a real case: refusing to mint on
+ * one costs a case, an agent's attempts and a pull request every pass until the
+ * check is fixed. What they change is what the agent may CONCLUDE and how the
+ * case is resolved, and neither is legible from the output alone.
+ */
+/**
+ * THE ONE SENTENCE THAT TRAVELS WITH EVERY INSTABILITY CASE — into the materials
+ * the agent reads, and into the RECORD the cold reader judges against.
+ *
+ * Widening a timeout, raising a retry count or weakening an assertion makes the
+ * check ask for less and leaves the defect exactly where it was; the case then
+ * closes green and the next pass meets the same failure with a weaker net under
+ * it. Saying so in the record is what lets the reader answer Q3 — does the
+ * change contradict a record in this request — instead of judging a plausible
+ * diff on its own terms.
+ */
+const INSTABILITY_RESOLUTION_RULE =
+  'An instability case is resolved by making the check deterministic — isolation, a missing reset, a signal — ' +
+  'never by widening a timeout, raising a retry count, or weakening an assertion; such an edit contradicts this record.';
+
+type ReproductionCharacter =
+  /** Narrowed to its own files it does not reproduce: it needs the whole suite. */
+  | 'full-suite-only'
+  /** The same subtree was measured GREEN elsewhere in this pass, and RED here. */
+  | 'environment-conditional';
 
 /** One check that answered BOTH ways over the SAME bytes, and where each answer came from. */
 export interface ContestedCheck {
@@ -11474,7 +11524,7 @@ async function adjudicateNotMyBug(p: {
         // run tests). Whether a failure is observable at all decides what to DO
         // with it, so it
         // belongs at the top of the briefing rather than in a log footer.
-        ...(plan.bisect.usedFullCommand ? { fullSuiteOnly: true } : {}),
+        ...(plan.bisect.usedFullCommand ? { reproduction: 'full-suite-only' as const } : {}),
       });
       minted.push({ plan, gate });
     }
@@ -12378,7 +12428,7 @@ export async function cmdSweepReportCase(
     parent: rc.parent,
     height: rc.head.height,
     conflictedPaths: rc.conflictedPaths,
-    contextLines: await caseContextLines(cli, rc),
+    contextLines: await caseContextLines(cli, rc, caseRow?.reproduction),
     widenedPaths: widenedPaths.length > 0 ? { files: widenedPaths, reason: widenedReason } : null,
     conflictDiff: conflictDiff.slice(0, 60000),
     resolutionDiff: resolutionDiff.slice(0, 60000),
@@ -12784,6 +12834,56 @@ export function gateFixCaseMaterialsForTest(dir: string, jc: JournaledCase, case
   return gateFixCaseMaterials(dir, jc, caseRow);
 }
 
+/**
+ * WHAT THE AGENT MAY CONCLUDE FROM THE CHARACTER, and how a case of that kind is
+ * resolved. One paragraph per value, in the driver's words: the difference
+ * between "this assertion is wrong" and "this check is not deterministic" is not
+ * visible in a failing log, and an agent that guesses wrong writes the fix that
+ * makes the check ask for less.
+ */
+function reproductionCharacterLines(character: unknown): string[] {
+  if (character === 'full-suite-only') {
+    return [
+      '',
+      '## REPRODUCTION: FULL SUITE ONLY — you cannot observe this failure',
+      'The driver probed it: narrowed to these files it does NOT reproduce; it needs',
+      'the whole suite running. You may not run the suite, so you cannot see this',
+      'failure happen, cannot test a hypothesis, and cannot confirm a fix — only',
+      '`report-case` can, one attempt at a time.',
+      '',
+      'That is a REASON, not an obstacle to push through. A failure that appears only',
+      'under concurrency is usually about ORDER, SHARED STATE or TIMING between tests',
+      'rather than the logic in the named file — read it once with that in mind.',
+      '',
+      `${INSTABILITY_RESOLUTION_RULE}`,
+      '',
+      'If you cannot name the interaction from the code, `report-case --tier held` and',
+      'write what you found: an unfixable-here finding with a diagnosis is the',
+      'DELIVERABLE for this shape, not a failure to fix it.',
+    ];
+  }
+  if (character === 'environment-conditional') {
+    return [
+      '',
+      '## REPRODUCTION: ENVIRONMENT-CONDITIONAL — the same bytes passed elsewhere',
+      'This check ran GREEN on the IDENTICAL subtree somewhere else in this pass and',
+      'CONFIRMED RED here. The code is the same object in both runs, so whatever',
+      'differs is not in it: order, shared state, timing, or the machine.',
+      '',
+      'The failure is REAL and so is this case — a check that answers both ways blocks',
+      'every branch it touches until it stops. What it is NOT is a wrong assertion, and',
+      'reading it as one sends you to change the thing that is already correct.',
+      '',
+      `${INSTABILITY_RESOLUTION_RULE}`,
+      '',
+      'If you cannot name what leaks or races from the code alone, `report-case --tier',
+      'held` and write what you found — naming the two runs and their difference is a',
+      'complete deliverable for this shape.',
+    ];
+  }
+  return [];
+}
+
 function gateFixCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEntry): string {
   const gf = readJournal(dir).find((e) => e.action === 'gate-fix' && e.caseId === jc.caseId);
   const files = Array.isArray(gf?.files) ? (gf.files as string[]) : (caseRow.conflictedPaths as string[]) ?? [];
@@ -12800,23 +12900,7 @@ function gateFixCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEn
     '',
     `Failing checks: ${failedCommands.join(', ') || '(see the output below)'}`,
     `Attributed to ${jc.branch} — ${String(gf?.reason ?? 'registry ownership')}.`,
-    ...(caseRow.fullSuiteOnly === true
-      ? [
-          '',
-          '## REPRODUCTION: FULL SUITE ONLY — you cannot observe this failure',
-          'The driver probed it: narrowed to these files it does NOT reproduce; it needs',
-          'the whole suite running. You may not run the suite, so you cannot see this',
-          'failure happen, cannot test a hypothesis, and cannot confirm a fix — only',
-          '`report-case` can, one attempt at a time.',
-          '',
-          'That is a REASON, not an obstacle to push through. A failure that appears only',
-          'under concurrency is usually about ORDER, SHARED STATE or TIMING between tests',
-          'rather than the logic in the named file — read it once with that in mind. If',
-          'you cannot name the interaction from the code, `report-case --tier held` and',
-          'write what you found: an unfixable-here finding with a diagnosis is the',
-          'DELIVERABLE for this shape, not a failure to fix it.',
-        ]
-      : []),
+    ...reproductionCharacterLines(caseRow.reproduction),
     ...(candidates.length > 1 ? [`Implicated: ${candidates.join(', ')} (earliest by hierarchy wins).`] : []),
     '',
     '## Files to fix',
@@ -13501,8 +13585,12 @@ async function materializeGateFixCases(
   accused: string | null,
   opts: GateFixEvidence & {
     rootBranch?: string;
-    /** The failure reproduces only under the FULL command (see the call site). */
-    fullSuiteOnly?: boolean;
+    /**
+     * What KIND of failure this is, where the caller's own evidence names one.
+     * The mint can raise it — a key this pass measured both ways is an
+     * instability whatever the caller knew — and never lowers it.
+     */
+    reproduction?: ReproductionCharacter;
     /**
      * Root the case's worktree at THIS commit instead of the branch tip
      * (`--not-my-bug`). Used when the search could not name an
@@ -13997,6 +14085,21 @@ async function materializeGateFixCases(
       console.error(`gate-fix [${ERR_ENVIRONMENT_UNUSABLE}]: ${g.branch} fix worktree has no dependencies — not minting`);
       continue;
     }
+    // A CONTESTED KEY OUTRANKS EVERYTHING THE CALLER KNEW. `full-suite-only` says
+    // the failure hides when narrowed — a statement about METHOD, and advice
+    // about how to read it. A contested key says the identical subtree was
+    // MEASURED GREEN somewhere in this pass and red here, which is the stronger
+    // claim and a directly observed one: the code is the same object in both
+    // runs, so the difference is not in it. It also implies the first (a failure
+    // that comes and goes does not reproduce narrowed either), so nothing is
+    // lost by letting it win.
+    const contested = new Set(unstableEvidence(readJournal(dir)).map((c) => checkKey(c.subtree, c.cmd)));
+    const hereKeys = await checkVerdictKeys(cli.repo, tip, failedCommands).catch(() => []);
+    const reproduction: ReproductionCharacter | undefined = hereKeys.some((k) =>
+      contested.has(checkKey(k.subtree, k.cmd)),
+    )
+      ? 'environment-conditional'
+      : opts.reproduction;
     const caseFile: CaseFile = {
       schemaVersion: 1,
       id: caseId,
@@ -14047,8 +14150,8 @@ async function materializeGateFixCases(
       run: caseFile.run,
       conflictedPaths: g.files,
       // On the `case` row because `gateFixCaseMaterials` is handed THAT row —
-      // a flag written only to the `gate-fix` row never reaches the agent.
-      ...(opts.fullSuiteOnly ? { fullSuiteOnly: true } : {}),
+      // a character written only to the `gate-fix` row never reaches the agent.
+      ...(reproduction ? { reproduction } : {}),
     });
     writeFileSync(join(dir, caseId, 'gate-fix-output.txt'), failedOutput);
     cases.push({ caseId, branch: g.branch, files: g.files, reason: g.reason });

@@ -2107,6 +2107,41 @@ answer, and a gate-fix PR whose own key is contested says so with a
 difference, and reporting it as flakiness sends a reader hunting an instability
 nobody observed.
 
+### 9.5.2 Reproduction character — what kind of failure this is
+
+A check that fails only under the integrated suite, or only in this environment,
+is a REAL failure and gets a real case: refusing to mint one costs a case, an
+agent's attempts and a pull request every pass until the check is fixed. But it
+is a different KIND of failure from a broken assertion, and which one the agent
+is holding is not legible from the output — so the driver says it, in its own
+words, on the `case` row as `reproduction`.
+
+- **`full-suite-only`** — the bisect had to fall back to the FULL failing command,
+  so narrowed to its own files the failure does not appear. The agent cannot
+  observe it, test a hypothesis or confirm a fix except through `report-case`.
+- **`environment-conditional`** — a key this pass measured BOTH ways (§9.5.1)
+  covers the failing commands: the identical subtree ran green somewhere and
+  confirmed red here, so whatever differs is not in the code.
+
+A CONTESTED KEY OUTRANKS the caller's own evidence. `full-suite-only` is a
+statement about method; a contested key is a directly measured statement about
+the bytes, and it implies the first — a failure that comes and goes does not
+reproduce narrowed either.
+
+**THE AGENT IS TOLD WHAT TO CONCLUDE AND HOW TO RESOLVE IT.** The case materials
+carry one section per character saying what it means and what it does not (in
+particular: not a wrong assertion). Both carry the same rule, which also goes
+into the cold-read CASE RECORD rather than becoming a fourth question — Q3
+already asks whether a change contradicts a record in the request:
+
+> An instability case is resolved by making the check deterministic — isolation,
+> a missing reset, a signal — never by widening a timeout, raising a retry count,
+> or weakening an assertion; such an edit contradicts this record.
+
+So a diff that only gives the check longer arrives in front of the reader beside
+the rule it contradicts, and rejecting it is a reading of the record rather than
+an opinion about test hygiene.
+
 ### 9.6 Twins — one commit, offered at two levels
 
 A FIX PROVEN BY THE CHECKS GATE IS PROVEN AT THE TREE IT RAN ON, so it is never

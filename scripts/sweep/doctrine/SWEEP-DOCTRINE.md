@@ -122,11 +122,15 @@ against the new base and keep the approved intent intact.
 that is not a merge conflict; there is no merge, no markers, and `git status` shows a
 clean tree. The materials name the failing checks, the files to fix, the failing
 locations to start from, the tail of the failing output, and the path to the full log.
-Edit the named files so the checks pass. If the materials carry the section
-`REPRODUCTION: FULL SUITE ONLY`, the failure appears only under the whole suite, which
-you may not run — you cannot observe it, test a hypothesis, or confirm a fix except
-through `report-case`; make one reading pass with order, shared state, and timing in
-mind, then either fix or claim `held` with your diagnosis.
+Edit the named files so the checks pass. A `REPRODUCTION:` section names what KIND of
+failure it is. `FULL SUITE ONLY` means the failure appears only under the whole suite,
+which you may not run — you cannot observe it, test a hypothesis, or confirm a fix
+except through `report-case`. `ENVIRONMENT-CONDITIONAL` means the same code ran green
+elsewhere in this pass and red here, so the difference is not in the code. Either way
+make one reading pass with order, shared state, and timing in mind, then either fix or
+claim `held` with your diagnosis. An instability case is resolved by making the check
+deterministic — isolation, a missing reset, a signal — never by widening a timeout,
+raising a retry count, or weakening an assertion; such an edit contradicts this record.
 
 Every materials file ends with the same contract line: after editing, run the
 typechecks yourself and fix what they report; never run the test suites. A hook
