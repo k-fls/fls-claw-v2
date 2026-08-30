@@ -55,7 +55,7 @@ import {
   type JournalEntry,
 } from './propagate.js';
 import { DRIVER_COMMIT_ENV } from './proposal.js';
-import type { GithubTransport } from './publish.js';
+import { parseMachineLines, type GithubTransport } from './publish.js';
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -1957,6 +1957,188 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     expect(journal.some((e) => e.action === 'gate-fix-refused' && e.id === 'WARN22_RED_UNCONFIRMED')).toBe(false);
     const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string };
     expect(res.status).toBe('gate-fix-required');
+  });
+
+  /**
+   * THE SAME BYTES ALREADY FAILED WITHOUT THIS RESOLUTION.
+   *
+   * A check is a function of the subtree it runs in, so a failing command whose
+   * subtree AT THE RESOLVED TREE is an oid the pass already confirmed red is a
+   * failure the resolution had no part in producing. The comparison the probe
+   * pair exists to make has already been made, by git: the two probe runs — an
+   * install and a suite, twice — are simply not spent.
+   */
+  it('a failing subtree the pass already confirmed red skips the probe pair entirely', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = checksFile(ws);
+    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
+    seedPriorFailure(dir, caseId, 'typecheck', ['tsc --noEmit']);
+    const wtPath = join(dir, caseId, 'worktree');
+    // The tree the driver will hash, computed the way it computes it.
+    execFileSync('git', ['-C', wtPath, 'add', '-A'], { encoding: 'utf8' });
+    const resolvedTree = execFileSync('git', ['-C', wtPath, 'write-tree'], { encoding: 'utf8' }).trim();
+    const prefix = execFileSync('git', ['-C', wtPath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    appendJournal(dir, {
+      action: 'red-confirm',
+      branch: 'module/elsewhere',
+      sha: repo.sha('main_patched'),
+      phase: 'test',
+      cmd: 'tsc --noEmit',
+      cwd: '.',
+      subtree: resolvedTree,
+      commands: ['tsc --noEmit'],
+      ran: true,
+      reproduced: true,
+    });
+    // THE BASELINE PROBE, and only it: the clean prefix is the tree
+    // `classifyFailure` compares against, and nothing else in the pass runs
+    // there — the gate runs in the case worktree, the partition at the branch
+    // tip and the parent head.
+    const baselineRuns: string[] = [];
+    const fn: ChecksRunner = async (commands, baseDir) => {
+      if (baseDir !== wtPath && shaAt(baseDir) === prefix) baselineRuns.push(baseDir);
+      const names = commands.map((c) => c.cmd);
+      return {
+        ok: false,
+        failedNames: names,
+        output: names.map((n) => `$ ${n}\nsrc/util.ts(1,1): error TS2345: boom\n`).join(''),
+      };
+    };
+    const out = join(ws, 'rc.json');
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+      neverInvoked,
+      fn,
+      fakeInstall,
+    );
+    // THE DELETION: the baseline is never built and never run.
+    expect(baselineRuns).toEqual([]);
+    const verdict = readJournal(dir).find((e) => e.action === 'not-my-bug')!;
+    expect(verdict.verdict).toBe('pre-existing');
+    expect(verdict.via).toBe('subtree-verdict');
+    expect(verdict.probes).toBe(0);
+  });
+
+  /**
+   * WHAT FAILED, BY THE ONLY IDENTITY THAT IS EXACT. A gate-fix PR carries the
+   * `(command, cwd, subtree oid)` of every failing command, read at the case
+   * head — so a later pass can ask whether it is looking at the same failure
+   * without guessing from a file name or matching error prose.
+   */
+  it('a published gate-fix PR carries the failure signature in its machine block', async () => {
+    const repo = inheritedRedFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    repo.attachBareOrigin();
+    for (const b of ['main', 'main_patched', 'module/cg']) repo.git('push', 'origin', b);
+    const { dir, caseId, ceilingTip } = await inheritedCase(repo, ws, inv);
+    seedConfirmedRed(dir, repo, 'module/elsewhere', ceilingTip);
+    const r = namingRunner(['tsc --noEmit'], 'src/shared.ts');
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true }),
+      neverInvoked,
+      r.fn,
+      fakeInstall,
+    );
+    const gateFix = readJournal(dir).find((e) => e.action === 'gate-fix')!;
+    const gateCase = gateFix.caseId as string;
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge)).toBe(0);
+    // Held with the worktree untouched: the sanctioned diagnosis-only outcome,
+    // which is what publishes a PR the owner reads.
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true }),
+        confirm,
+        greenPreMerge,
+        fakeInstall,
+      ),
+    ).toBe(0);
+    const prDir = join(dir, gateCase, 'pr');
+    mkdirSync(prDir, { recursive: true });
+    writeFileSync(join(prDir, 'title.txt'), 'fix(sweep): the shared defect');
+    writeFileSync(
+      join(prDir, 'body.md'),
+      '# Diagnosis\n\nThe failing test lives above this branch and the fix belongs with its owner.\n',
+    );
+    repo.git('push', 'origin', 'main_patched');
+    const tokenFile = join(ws, 'token.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = fakeGithub();
+    expect(
+      await cmdPublish(baseCli(repo, ws, inv, { cmd: 'publish', caseId: gateCase, execute: true, tokenFile }), gh.factory),
+    ).toBe(0);
+    const prCall = gh.calls.find((c) => c.method === 'POST' && c.path.endsWith('/pulls'))!;
+    const body = (prCall.body as { body: string }).body;
+    const lines = parseMachineLines(body).get('sweep-failure') ?? [];
+    expect(lines).toHaveLength(1);
+    const head = (readJournal(dir).find((e) => e.action === 'case' && e.caseId === gateCase)!.head as { sha: string }).sha;
+    const oid = repo.git('rev-parse', `${head}^{tree}`);
+    // The digest is the case id's own suffix: one files digest, named the same
+    // way wherever it appears.
+    expect(lines[0]).toBe(`cmd=tsc --noEmit cwd=. subtree=${oid.slice(0, 12)} files=${gateCase.slice(-8)}`);
+    expect(caseId).toBeTruthy();
+  });
+
+  /**
+   * ONE OID, BOTH ANSWERS. A command measured green somewhere and confirmed red
+   * somewhere else over the SAME subtree contradicted itself — the only shape of
+   * disagreement that is one — and everything downstream of a confirmed red
+   * treats it as settled, so the pass that saw both answers is the only place it
+   * can be said.
+   */
+  it('a check green and confirmed red over one oid is reported as contested', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    const checks = join(ws, 'checks.json');
+    writeFileSync(checks, JSON.stringify({ typecheck: [{ cmd: 'true', cwd: '.' }], test: [] }));
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }), undefined, greenPreMerge);
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true }),
+      confirm,
+      greenPreMerge,
+      fakeInstall,
+    );
+    const oid = repo.git('rev-parse', 'main_patched^{tree}');
+    appendJournal(dir, {
+      action: 'landing-check',
+      branch: 'module/green-side',
+      sha: repo.sha('main_patched'),
+      ok: true,
+      checks: [{ cmd: 'true', cwd: '.', subtree: oid, ok: true }],
+    });
+    appendJournal(dir, {
+      action: 'red-confirm',
+      branch: 'module/red-side',
+      sha: repo.sha('main_patched'),
+      phase: 'test',
+      cmd: 'true',
+      cwd: '.',
+      subtree: oid,
+      commands: ['true'],
+      ran: true,
+      reproduced: true,
+    });
+    const cmds = join(ws, 'cmds.json');
+    writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }]));
+    const out = join(ws, 'f.json');
+    await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out }));
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      contestedChecks?: Array<{ cmd: string; subtree: string; greenOn: string; redOn: string }>;
+      instruction: string;
+    };
+    expect(res.contestedChecks).toEqual([
+      { cmd: 'true', cwd: '.', subtree: oid, greenOn: 'module/green-side', redOn: 'module/red-side' },
+    ]);
+    expect(res.instruction).toContain('answered BOTH ways over the SAME bytes');
+    expect(res.instruction).toContain('module/green-side');
+    expect(res.instruction).toContain('module/red-side');
   });
 
   /**

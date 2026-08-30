@@ -125,6 +125,9 @@ import {
   checkBaseHeight,
   convertPullRequestToDraft,
   hasMachineLine,
+  parseMachineLines,
+  renderSweepContested,
+  renderSweepFailure,
   renderSweepTwin,
   renderSweepTwinOf,
   withMachineLine,
@@ -1350,13 +1353,17 @@ async function treeOf(repo: string, commit: string): Promise<string> {
  * A cwd that does not exist at this commit resolves to the whole tree instead.
  * Over-keying costs a measurement; under-keying would let two unrelated trees
  * share a verdict, so the fallback goes the safe way.
+ *
+ * ANY TREE-ISH ANSWERS: a commit, or a bare tree oid such as a resolution the
+ * agent produced and nobody has committed. The question is about bytes, and a
+ * caller holding only the bytes asks it the same way.
  */
-async function subtreeOf(repo: string, commit: string, cwd?: string): Promise<string> {
+async function subtreeOf(repo: string, treeish: string, cwd?: string): Promise<string> {
   const rel = (cwd ?? '').replace(/^\.\/?/, '').replace(/\/+$/, '');
-  if (rel === '') return treeOf(repo, commit);
-  const r = await git(repo, ['rev-parse', `${commit}:${rel}`], { allowCodes: [1, 128] });
+  if (rel === '') return treeOf(repo, treeish);
+  const r = await git(repo, ['rev-parse', `${treeish}:${rel}`], { allowCodes: [1, 128] });
   const oid = r.stdout.trim();
-  return r.code === 0 && oid !== '' ? oid : treeOf(repo, commit);
+  return r.code === 0 && oid !== '' ? oid : treeOf(repo, treeish);
 }
 
 /**
@@ -3407,6 +3414,109 @@ function greenChecks(journal: JournalEntry[]): Map<string, string> {
     }
   }
   return out;
+}
+
+/**
+ * IS EVERY FAILING COMMAND'S SUBTREE AT THIS TREE ONE THE PASS ALREADY CONFIRMED
+ * RED? A journal read and a `rev-parse` per command — nothing is measured.
+ *
+ * `null` unless EVERY command matches: a partial answer decides nothing, since a
+ * single command whose bytes nobody has measured is exactly the case the probe
+ * pair exists to settle.
+ */
+async function subtreeVerdictAlreadyRed(
+  cli: Cli,
+  dir: string,
+  tree: string,
+  commands: VerifyCommand[],
+): Promise<CheckVerdict[] | null> {
+  if (commands.length === 0 || !tree) return null;
+  const known = redConfirmations(readJournal(dir));
+  const keys: CheckVerdict[] = [];
+  for (const c of commands) {
+    const subtree = await subtreeOf(cli.repo, tree, c.cwd).catch(() => '');
+    if (!subtree || known.get(checkKey(subtree, c.cmd))?.reproduced !== true) return null;
+    keys.push({ cmd: c.cmd, ...(c.cwd ? { cwd: c.cwd } : {}), subtree });
+  }
+  return keys;
+}
+
+/** One check that answered BOTH ways over the SAME bytes, and where each answer came from. */
+export interface ContestedCheck {
+  cmd: string;
+  cwd?: string;
+  subtree: string;
+  /** The branch a run of this command over these bytes came back GREEN on. */
+  greenOn: string;
+  /** The branch the confirmed RED was measured on. */
+  redOn: string;
+}
+
+/**
+ * CHECKS THAT CONTRADICTED THEMSELVES OVER ONE OID.
+ *
+ * A command is a function of the subtree it runs in, so the same oid answering
+ * green in one place and confirmed red in another is an INSTABILITY — the only
+ * shape of disagreement that is one. It is worth reporting wherever it appears,
+ * because everything downstream of a confirmed red treats it as settled.
+ *
+ * DIFFERING OIDS ARE SILENCE. Two runs over different content that disagree are
+ * a content difference; calling that flakiness sends a reader hunting an
+ * instability nobody observed, which is the error this exists to avoid making.
+ */
+export function unstableEvidence(journal: JournalEntry[]): ContestedCheck[] {
+  const green = greenChecks(journal);
+  const out = new Map<string, ContestedCheck>();
+  for (const e of journal) {
+    if (e.action !== 'red-confirm' || e.reproduced !== true) continue;
+    if (typeof e.cmd !== 'string' || typeof e.subtree !== 'string' || typeof e.branch !== 'string') continue;
+    const key = checkKey(e.subtree, e.cmd);
+    const greenOn = green.get(key);
+    if (greenOn === undefined || out.has(key)) continue;
+    out.set(key, {
+      cmd: e.cmd,
+      ...(typeof e.cwd === 'string' && e.cwd ? { cwd: e.cwd } : {}),
+      subtree: e.subtree,
+      greenOn,
+      redOn: e.branch,
+    });
+  }
+  return [...out.values()];
+}
+
+/**
+ * The driver facts a gate-fix PR's machine block carries: WHAT FAILED, by the
+ * only identity that is exact.
+ *
+ * A files digest names which failing set this was and nothing more — the same
+ * file carries different defects, so a digest match may label a pull request and
+ * may never decide one. The `(command, cwd, subtree oid)` triple is what a later
+ * reader can act on, and it is read from the case head, which is the tree the
+ * fix is rooted on.
+ *
+ * Empty for every case that is not a gate fix: a conflict resolution is not a
+ * failure and has no such identity.
+ */
+async function machineFactLines(cli: Cli, dir: string, caseId: string, headSha: string): Promise<string[]> {
+  const journal = readJournal(dir);
+  const row = journal.find((e) => e.action === 'gate-fix' && e.caseId === caseId);
+  if (!row) return [];
+  const names = new Set(Array.isArray(row.failedCommands) ? (row.failedCommands as string[]) : []);
+  const files = Array.isArray(row.files) ? (row.files as string[]) : [];
+  if (names.size === 0 || files.length === 0) return [];
+  const checks = loadChecksConfig(readMachineState(dir)?.checksFile ?? cli.checksFile);
+  const commands = [...(checks?.typecheck ?? []), ...(checks?.test ?? [])].filter((c) => names.has(c.cmd));
+  if (commands.length === 0) return [];
+  const keys = await checkVerdictKeys(cli.repo, headSha, commands).catch(() => []);
+  const digest = gateFixFilesDigest(files);
+  const contested = new Map(unstableEvidence(journal).map((c) => [checkKey(c.subtree, c.cmd), c]));
+  const lines: string[] = [];
+  for (const k of keys) {
+    lines.push(renderSweepFailure({ cmd: k.cmd, cwd: k.cwd, subtree: k.subtree, filesDigest: digest }));
+    const c = contested.get(checkKey(k.subtree, k.cmd));
+    if (c) lines.push(renderSweepContested({ cmd: c.cmd, subtree: c.subtree, greenOn: c.greenOn }));
+  }
+  return lines;
 }
 
 /** Trees whose landing verdict CHANGED on the identical tree — measured, and still unanswered. */
@@ -6564,7 +6674,10 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
       // The PR-body machine block: driver-maintained, delimited,
       // appended BELOW the agent's prose; posted urges keep it current.
       const pendingAbove = Math.max(0, ctx.chain.heads.length - 1 - jc.head.height);
-      finalBody = withMachineBlock(finalBody, renderMachineBlock(pendingAbove, ctx.watermark12));
+      finalBody = withMachineBlock(
+        finalBody,
+        renderMachineBlock(pendingAbove, ctx.watermark12, await machineFactLines(cli, dir, jc.caseId, headSha)),
+      );
     }
     let result: { url: string; number: number };
     if (reissueTarget) {
@@ -6939,9 +7052,18 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
         const commentBody = await urgeCommentBody(cli, urge);
         // Refresh the machine block on the PR body, then post the comment.
         const pr = await ghExpect(transport, 'GET', `${api}/pulls/${prNumber}`);
+        // THE SAME FACTS, REGENERATED. The block is replaced wholesale here, so
+        // the failure identity has to be re-emitted with the pending count or an
+        // urge would quietly delete it. The case id is in the ref name, which is
+        // the only handle this loop holds.
+        const urgedCase = urge.fixBranch.split('--').slice(1).join('--');
         const newBody = withMachineBlock(
           String(pr.body ?? ''),
-          renderMachineBlock(urge.pending.length, ctx.watermark12),
+          renderMachineBlock(
+            urge.pending.length,
+            ctx.watermark12,
+            await machineFactLines(cli, dir, urgedCase, urge.head),
+          ),
         );
         await ghExpect(transport, 'PATCH', `${api}/pulls/${prNumber}`, { body: newBody });
         await ghExpect(transport, 'POST', `${api}/issues/${prNumber}/comments`, { body: commentBody });
@@ -10222,6 +10344,28 @@ async function adjudicateNotMyBug(p: {
     return { handled: false, note: 'the pre-conflict tree could not be resolved from the case worktree' };
   }
 
+  // THE SAME BYTES ALREADY FAILED WITHOUT THIS RESOLUTION.
+  //
+  // A check is a function of the subtree it runs in, so if every failing
+  // command's subtree AT THE RESOLVED TREE is an oid this pass already confirmed
+  // red, the failure is byte-identical to one measured on a tree the resolution
+  // had no part in — and a resolution cannot be the cause of a failure in
+  // content it did not produce. That is the axiom the green memo already rests
+  // on, asked about a red.
+  //
+  // CAUSE-CLASS-AGNOSTIC ON PURPOSE. It proves "not caused by this resolution"
+  // for an environment fault, an unstable check and a real defect alike, because
+  // it decides nothing else: it skips a PROBE, never an owner. Everything after
+  // this point — the environment classifier, the ownership partition, the
+  // ceiling, the mint's own backstop — runs exactly as it does for a probed
+  // verdict.
+  //
+  // THE CONFLICTED-PATH DROP STAYS IN FRONT OF IT. If the resolution touched the
+  // failing subtree the oid differs, nothing matches, and the full adjudication
+  // runs unchanged. The loop bounds are untouched: this makes one iteration
+  // cheaper and never makes one more available.
+  const sharedRedKeys = await subtreeVerdictAlreadyRed(cli, dir, p.resolvedTree, failedCommands);
+
   // TWO probes over ONE temp worktree. The adjudication runs the failed commands
   // WHOLE, so both sides of the comparison are the population the gate measured;
   // the bisect narrows to the failing files, since it compares a commit against
@@ -10243,13 +10387,24 @@ async function adjudicateNotMyBug(p: {
     { narrow: true },
   );
   try {
-    const verdict = await classifyFailure(resolved, headSha, probe);
+    const verdict = sharedRedKeys
+      ? {
+          verdict: 'pre-existing' as const,
+          files,
+          probes: 0,
+          detail:
+            `every failing command's subtree at the resolved tree is an oid this pass already confirmed RED ` +
+            `(${sharedRedKeys.map((k) => `${k.cmd} @ ${k.subtree.slice(0, 12)}`).join('; ')}) — the same bytes ` +
+            `failed on a tree this resolution had no part in, so it did not cause them`,
+        }
+      : await classifyFailure(resolved, headSha, probe);
     appendJournal(dir, {
       action: 'not-my-bug',
       caseId,
       branch,
       kind,
       verdict: verdict.verdict,
+      ...(sharedRedKeys ? { via: 'subtree-verdict' } : {}),
       files: verdict.files,
       probes: verdict.probes,
       detail: verdict.detail,
@@ -14053,7 +14208,12 @@ export async function cmdSweepFinish(
     const journalNow = readJournal(dir);
     const dropped = droppedProposalRows(journalNow);
     const undecided = undecidedProposalRows(journalNow);
-    if (dropped.length === 0 && undecided.length === 0) {
+    // A CHECK THAT ANSWERED BOTH WAYS OVER ONE OID rides out through whichever
+    // door the pass leaves by, like the closed proposals above: everything
+    // downstream of a confirmed red treats it as settled, so the one place the
+    // contradiction is visible is the pass that saw both answers.
+    const contested = unstableEvidence(journalNow);
+    if (dropped.length === 0 && undecided.length === 0 && contested.length === 0) {
       result(cli, artifact);
       return;
     }
@@ -14065,11 +14225,17 @@ export async function cmdSweepFinish(
       (undecided.length
         ? ` ${undecided.length} pull request(s) could not be judged and were left untouched: ` +
           `${undecided.map((u) => `#${u.number} (${u.branch}: ${u.detail})`).join('; ')} — report the unstable check, do not re-run hoping for a verdict.`
+        : '') +
+      (contested.length
+        ? ` ${contested.length} check(s) answered BOTH ways over the SAME bytes this pass: ` +
+          `${contested.map((c) => `${c.cmd} @ ${c.subtree.slice(0, 12)} (green on ${c.greenOn}, red on ${c.redOn})`).join('; ')} — ` +
+          `report the instability; the code did not differ between those runs.`
         : '');
     result(cli, {
       ...artifact,
       ...(dropped.length ? { droppedProposals: dropped } : {}),
       ...(undecided.length ? { undecidedProposals: undecided } : {}),
+      ...(contested.length ? { contestedChecks: contested } : {}),
       ...(typeof artifact.instruction === 'string' ? { instruction: artifact.instruction + cue } : {}),
     });
   };

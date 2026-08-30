@@ -163,15 +163,75 @@ export async function checkBaseHeight(
 export const MACHINE_BLOCK_BEGIN = '<!-- sweep:d004 -->';
 export const MACHINE_BLOCK_END = '<!-- /sweep:d004 -->';
 
-/** Render the machine block for a HELD PR (pending count behind the freeze). */
-export function renderMachineBlock(pendingCount: number, watermark12: string): string {
+/**
+ * Render the machine block for a HELD PR (pending count behind the freeze).
+ *
+ * `extraLines` are driver facts that belong to THIS publish — the failure's
+ * identity, a contested check — and they are rendered by the block rather than
+ * added to it afterwards. The block is REPLACED wholesale on every publish and
+ * every urge, so a line merged in from outside survives exactly until the next
+ * write; a line the renderer emits is regenerated with the rest of the facts.
+ * (`withMachineLine` is for the other case: a line the driver adds to a block
+ * whose other contents are not its to reproduce.)
+ */
+export function renderMachineBlock(pendingCount: number, watermark12: string, extraLines: string[] = []): string {
   return [
     MACHINE_BLOCK_BEGIN,
     '## Sweep status (driver-maintained — do not edit)',
     `Pending upstream commits beyond this freeze: **${pendingCount}** (as of pass ${watermark12}).`,
     'Kept current by posted urge comments.',
+    ...extraLines,
     MACHINE_BLOCK_END,
   ].join('\n');
+}
+
+/**
+ * A FAILURE IS IDENTIFIED BY THE BYTES IT RAN ON: the command, the directory it
+ * ran in, and the OID of the subtree under that directory. That triple is exact
+ * — two runs of one command over one oid cannot be about different content — so
+ * it is the only identity a later reader may GATE on.
+ *
+ * The files digest rides along because it names WHICH failing set this was, and
+ * it is reported for exactly that: a digest collides across defects in the same
+ * file, so it may label a PR and may never decide one.
+ */
+export function renderSweepFailure(f: { cmd: string; cwd?: string; subtree: string; filesDigest: string }): string {
+  return `<!-- sweep-failure: cmd=${f.cmd} cwd=${f.cwd && f.cwd !== '.' ? f.cwd : '.'} subtree=${f.subtree.slice(0, 12)} files=${f.filesDigest.slice(0, 8)} -->`;
+}
+
+/**
+ * ONE OID, BOTH ANSWERS — the same bytes measured green somewhere and confirmed
+ * red somewhere else in one pass. That is an instability, and it is stated on
+ * the PR the red produced, because the owner reading a fix is the person who
+ * needs to know the check contradicted itself.
+ *
+ * DIFFERING OIDS ARE SILENCE. Two runs over different content that disagree are
+ * not a contradiction at all — they are a content difference — and reporting
+ * them as flakiness sends somebody hunting an instability nobody observed.
+ */
+export function renderSweepContested(c: { cmd: string; subtree: string; greenOn: string }): string {
+  return `<!-- sweep-contested: cmd=${c.cmd} subtree=${c.subtree.slice(0, 12)} green-on=${c.greenOn} -->`;
+}
+
+/** Every `<!-- key: rest -->` (or bare `key: rest`) driver line in a body, by key. */
+const MACHINE_LINE_RE = /^(?:<!--\s*)?(sweep-[a-z-]+):\s*(.*?)\s*(?:-->)?$/;
+
+/**
+ * The driver lines a body carries, keyed by marker.
+ *
+ * ONE READ-BACK for every marker the driver writes — the twin pointers, the
+ * failure identity, a contested check — so a later pass asks one question of a
+ * PR body instead of one regex per marker. Whole-line only: a quote-reply that
+ * embeds a marker is somebody's prose, not a driver fact.
+ */
+export function parseMachineLines(body: string): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  for (const raw of body.split('\n')) {
+    const m = MACHINE_LINE_RE.exec(raw.trim());
+    if (!m) continue;
+    out.set(m[1], [...(out.get(m[1]) ?? []), m[2]]);
+  }
+  return out;
 }
 
 /**

@@ -2061,6 +2061,42 @@ guard and the cold-read diff. An UNCHANGED tree is `ERR32_UNRESOLVED` on ANY
 claim, `held` included ("nothing was fixed") — the pristine-conflict branch would
 otherwise describe an exhibit that never existed.
 
+### 9.5.1 A failure's identity, and what may be decided on it
+
+A FAILURE IS IDENTIFIED BY THE BYTES IT RAN ON: `(command, cwd, subtree oid)`.
+Oid equality is exact — two runs of one command over one oid cannot be about
+different content — so that triple, and only that triple, may GATE a decision. A
+files digest or a normalised error string may REPORT and never decide: the same
+file carries different defects, so a digest collides, and a text match mints on
+innocents.
+
+**THE SAME BYTES ALREADY FAILED WITHOUT THIS RESOLUTION.** When every failing
+command's subtree AT THE RESOLVED TREE is an oid this pass already confirmed red,
+`--not-my-bug` skips its probe pair and records `pre-existing` with
+`via: subtree-verdict` and zero probes. The failure is byte-identical to one
+measured on a tree the resolution had no part in, and a resolution cannot cause a
+failure in content it did not produce — the same axiom the green memo rests on,
+asked about a red. It is cause-class-agnostic BECAUSE it decides nothing else: it
+skips a probe, never an owner, so the environment classifier, the ownership
+partition, the ceiling and the mint's backstop all run as they do for a probed
+verdict. The conflicted-path drop stays in front of it: a resolution that touched
+the failing subtree changes the oid, nothing matches, and the full adjudication
+runs. The loop bounds are untouched — this makes an iteration cheaper, never
+makes one more available.
+
+**GATE-FIX PRs CARRY THE IDENTITY.** Each publish and each urge regenerates the
+machine block with one `sweep-failure: cmd=… cwd=… subtree=… files=…` line per
+failing command, read at the case head; `parseMachineLines` is the one read-back
+for every driver marker in a body.
+
+**ONE OID, BOTH ANSWERS, IS AN INSTABILITY.** A command measured green somewhere
+and confirmed red somewhere else over the SAME subtree contradicted itself; every
+finish result carries those as `contestedChecks` with the branch behind each
+answer, and a gate-fix PR whose own key is contested says so with a
+`sweep-contested:` line. DIFFERING OIDS ARE SILENCE — that is a content
+difference, and reporting it as flakiness sends a reader hunting an instability
+nobody observed.
+
 ### 9.6 Twins — one commit, offered at two levels
 
 A FIX PROVEN BY THE CHECKS GATE IS PROVEN AT THE TREE IT RAN ON, so it is never
