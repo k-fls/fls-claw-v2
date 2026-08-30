@@ -3244,6 +3244,42 @@ function unstableTrees(journal: JournalEntry[]): Set<string> {
   );
 }
 
+/**
+ * Trees this pass measured CONFIRMED RED and minted NOTHING for.
+ *
+ * A red landing that could not be handed to a branch leaves the tree in exactly
+ * the position an UNSTABLE one leaves it: never green, nothing minted, the branch
+ * did not arrive. The merge, however, already happened — so on the next call the
+ * tree has not MOVED, and the no-op skip would pass it over as "nothing arrived
+ * that was not already there". It would then land `no-op -> arrived` and hand its
+ * content down measured by nothing, which is the one thing the landing gate
+ * exists to prevent. So the tree stays OWED a verdict and is measured again.
+ *
+ * A tree whose branch DID take a gate fix is not owed: the fix is what moves it,
+ * and re-running the suite for a red the pass has already acted on buys a known
+ * answer at full price.
+ */
+function owedRedTrees(journal: JournalEntry[]): Set<string> {
+  /** The last landing-check that produced a VERDICT for each tree; skips carry none. */
+  const last = new Map<string, { ok: boolean; confirmed: boolean; branch: string }>();
+  for (const e of journal) {
+    if (e.action !== 'landing-check' || typeof e.tree !== 'string' || typeof e.ok !== 'boolean') continue;
+    last.set(e.tree, {
+      ok: e.ok,
+      confirmed: e.confirmed === true,
+      branch: typeof e.branch === 'string' ? e.branch : '',
+    });
+  }
+  const minted = new Set(
+    journal
+      .filter((e) => (e.action === 'gate-fix' || (e.action === 'case' && e.gateFix === true)) && typeof e.branch === 'string')
+      .map((e) => e.branch as string),
+  );
+  const out = new Set<string>();
+  for (const [tree, v] of last) if (!v.ok && v.confirmed && !minted.has(v.branch)) out.add(tree);
+  return out;
+}
+
 /** A journaled red confirmation: what the re-run said, and where it was taken. */
 interface RedConfirmRecord {
   reproduced: boolean;
@@ -3574,12 +3610,14 @@ async function landingCheck(
   if (!checks || checks.typecheck.length + checks.test.length === 0) return { kind: 'skipped' };
   const sha = await revParse(cli.repo, branch);
   const tree = await treeOf(cli.repo, sha);
-  // A tree this pass recorded UNSTABLE is still OWED a verdict. It was never
-  // green, nothing was minted on it and the branch did not arrive — so a later
-  // call, which lands nothing new because the merge already happened, must
-  // MEASURE it instead of passing it over as a no-op. Skipping it there is how
-  // an unstable tree walks into the pass as though it had been checked.
-  if (tree === treeBefore && !unstableTrees(readJournal(dir)).has(tree)) {
+  // A tree this pass recorded UNSTABLE — or CONFIRMED RED with nothing minted
+  // for it — is still OWED a verdict. It was never green, nothing was minted on
+  // it and the branch did not arrive — so a later call, which lands nothing new
+  // because the merge already happened, must MEASURE it instead of passing it
+  // over as a no-op. Skipping it there is how a tree that was never green walks
+  // into the pass as though it had been checked, and hands its content down.
+  const soFar = readJournal(dir);
+  if (tree === treeBefore && !unstableTrees(soFar).has(tree) && !owedRedTrees(soFar).has(tree)) {
     appendJournal(dir, { action: 'landing-check', branch, sha, tree, ran: false, reason: 'no-op' });
     return { kind: 'skipped' };
   }
@@ -3941,6 +3979,8 @@ export async function cmdRun(
   let gated = false;
   /** A landing whose red did not reproduce: nothing minted, and the branch unverified. */
   let unstableLanding: { branch: string; tree: string; flaky: string[]; detail: string } | null = null;
+  /** A red landing no branch could be handed: nothing minted, nothing arrived. */
+  let refusedLanding: { branch: string; id: string; detail: string } | null = null;
   const diverged: string[] = [];
   const mergeFailed: string[] = [];
   /** §14: this run's per-branch halts under the ERR2x id scheme (CLI output). */
@@ -4366,8 +4406,40 @@ export async function cmdRun(
         break;
       }
       if (landing.kind === 'red') {
-        // A RED LANDING IS A FIX-SHAPED PROBLEM, so it takes the fix-shaped
-        // answer: a gate-fix case on the branch that now carries the defect.
+        // A RED LANDING IS A FIX-SHAPED PROBLEM ONLY WHERE THERE IS A BRANCH TO
+        // HAND THE FIX TO, and that is decided BEFORE the reopen. The reopen is
+        // not free: it supersedes this branch's undispositioned case and its
+        // descendants' cases, which is right when a gate fix replaces them and
+        // pure loss when the mint then refuses. The question is a journal read,
+        // so it is asked first.
+        const redUsable = await redObservationUsable(
+          readJournal(dir),
+          cli.repo,
+          bp.branch,
+          landing.sha,
+          landing.failed,
+        );
+        if (!redUsable.usable) {
+          const why = redRefusalDetail(redUsable.reasons);
+          appendJournal(dir, {
+            action: 'gate-fix-refused',
+            id: redUsable.id,
+            branch: bp.branch,
+            at: landing.sha,
+            subtrees: redUsable.observed.map((v) => ({ cmd: v.cmd, ...(v.cwd ? { cwd: v.cwd } : {}), subtree: v.subtree })),
+            commands: landing.failed.map((c) => c.cmd),
+            reason: why,
+          });
+          // NOT GREEN, AND NOT ARRIVED. The content is red and unverified, so the
+          // branch does not arrive and nothing below it takes its tip. The tree
+          // stays owed a verdict (`owedRedTrees`), so the next call measures it
+          // again rather than skipping it as a no-op merge.
+          refusedLanding = { branch: bp.branch, id: redUsable.id, detail: why };
+          gated = true;
+          issues.push({ id: redUsable.id, detail: `${bp.branch}: ${why}` });
+          console.error(`run [${redUsable.id}]: ${bp.branch} landed RED and no branch may be handed the fix — ${why}`);
+          break;
+        }
         // REOPEN BEFORE MINTING, branch and subtree together. The reopen
         // supersedes this branch's own undispositioned case — a conflict case on
         // a red tree is unjudgeable, its checks fail on a defect the fix already
@@ -4423,7 +4495,9 @@ export async function cmdRun(
     // cases remain" would send the reader looking for one that does not exist.
     missing = unstableLanding
       ? `${unstableLanding.branch} landed an UNSTABLE tree — unverified, nothing minted`
-      : 'open cases remain';
+      : refusedLanding
+        ? `${refusedLanding.branch} landed RED with no branch to hand the fix to — unverified, nothing minted`
+        : 'open cases remain';
   } else {
     const after = readJournal(dir);
     if (canComplete(after)) {
@@ -4446,6 +4520,7 @@ export async function cmdRun(
     diverged,
     mergeFailed,
     ...(unstableLanding ? { unstableLanding } : {}),
+    ...(refusedLanding ? { refusedLanding } : {}),
     issues,
   });
   return 0;

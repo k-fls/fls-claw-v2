@@ -1578,9 +1578,12 @@ its instruction is bounded — re-run once, because a stable answer (green or re
 completes the pass; on a second unstable measurement of the same tree, report to
 the owner and stop. Nothing here is the agent's to fix: no branch was blamed.
 
-**A RED landing is a fix-shaped problem, so it takes the fix-shaped answer.** The
-branch and its transitive descendants are REOPENED — which supersedes the
-branch's own undispositioned case, since a conflict case on a red tree is
+**A RED landing is a fix-shaped problem WHERE THERE IS A BRANCH TO HAND THE FIX
+TO**, and that is settled before anything is reopened: `redObservationUsable`
+(§9.1) is a journal read, and the reopen is not free — it supersedes this branch's
+undispositioned case and its descendants', which is right when a gate fix replaces
+them and pure loss when the mint then refuses. With the red usable, the branch and
+its transitive descendants are REOPENED — a conflict case on a red tree is
 unjudgeable, and the descendants' cases for the same reason — and then a gate-fix
 case is minted on the branch (§9), rooted there because that is the branch now
 carrying the defect. Reopen strictly BEFORE the mint, or the mint supersedes
@@ -1590,12 +1593,25 @@ would be taking the content this gate just refused, and the pass cannot complete
 until the fix lands in any case. The result carries `WARN09_GATE_FIX_SERVED` and
 `gated`, and `next-case` serves the fix on the same call.
 
+**A RED NO BRANCH MAY BE HANDED blocks and mints nothing.** Nothing is reopened
+and no case is created: the refusal is journaled `gate-fix-refused` with its id
+(`WARN21_CHECKS_FLAKY` / `WARN22_RED_UNCONFIRMED`), the result carries it and
+`refusedLanding`, and `run` STOPS the same way. The branch does NOT arrive and its
+tree stays OWED a verdict — a later call re-measures it rather than passing it over
+as a no-op merge, exactly as an unstable tree does. Without that, the next call
+sees a tree that has not moved, skips it as `no-op`, marks the branch `arrived` and
+hands its content down measured by nothing. A tree whose branch DID take a gate fix
+is not owed: the fix is what moves it.
+
 **What it does not run, and why each is safe.**
 
 - The tree did not MOVE — the forced empty merges of a leaf un-skip (§4.5), or a
   branch that gated with no clean prefix. Nothing arrived, so nothing propagates
   that was not already there, and content inherited from before the pass is
-  finish's integration verify to judge (§10.2).
+  finish's integration verify to judge (§10.2). Unless the tree is still OWED a
+  verdict: one this pass measured UNSTABLE, or CONFIRMED RED with nothing minted
+  for it, was never green and its branch never arrived, so it is measured rather
+  than skipped.
 - The COMMAND's SUBTREE was already measured green this pass, on any branch. A
   command runs under its `cwd` and can observe nothing outside it, so its verdict
   is a fact about that subtree — dependencies included, since they install from

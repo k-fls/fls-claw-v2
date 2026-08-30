@@ -5927,6 +5927,105 @@ describe('run — the landing gate', () => {
     expect(res.branch).toBe('main_patched');
   });
 
+  /**
+   * THE LANDING GATE ASKS THE SAME QUESTION THE MINT DOES, before it reopens.
+   *
+   * The failing command runs in `container/agent-runner`, a subtree the upstream
+   * merge does not touch — so the landed tree carries the identical subtree the
+   * red was confirmed on, on ANOTHER branch. The verdict holds and names nobody:
+   * no case may be minted, so no reopen may be journaled for one. But the content
+   * is red and unverified, so the branch must NOT arrive — on this call or the
+   * next, where the merge has already landed and the tree has not moved.
+   */
+  it('a red landing no branch may be handed does not reopen, does not arrive, and stays owed', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: the runner subtree', {
+      'src/mp.ts': 'mp\n',
+      'container/agent-runner/poll-loop.test.ts': 'red\n',
+    });
+    repo.checkout('module/cg', { create: true, at: 'main_patched' });
+    repo.commit('cg work', { 'src/cg.ts': 'cg\n' });
+    repo.checkout('main');
+    repo.commit('U0: upstream moves src only', { 'src/u.ts': 'u\n' });
+    cleanups.push(() => repo.destroy());
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'], owned: ['src/cg.ts'] }]);
+    const dir = dirOf(repo, ws);
+    const cgBefore = repo.sha('module/cg');
+    const checks = join(ws, 'checks.json');
+    writeFileSync(
+      checks,
+      JSON.stringify({
+        typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }],
+        test: [{ cmd: 'vitest run', cwd: 'container/agent-runner' }],
+      }),
+    );
+    // Only the subtree-scoped test command is red; the typecheck is green, so the
+    // pre-merge branch check passes and a pass opens.
+    let runs = 0;
+    const fn: ChecksRunner = async (commands) => {
+      const cmds = commands.map((c) => c.cmd);
+      if (!cmds.includes('vitest run')) return { ok: true, failedNames: [], output: '' };
+      runs++;
+      return {
+        ok: false,
+        failedNames: ['vitest run'],
+        output: '$ vitest run\ncontainer/agent-runner/poll-loop.test.ts(1,1): error TS2345: boom\n',
+      };
+    };
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }))).toBe(0);
+    // The red for THESE BYTES was confirmed on another branch. The upstream merge
+    // leaves the subtree untouched, so the landed tree carries the same object.
+    const runnerSubtree = repo.git('rev-parse', 'main_patched:container/agent-runner');
+    appendJournal(dir, {
+      action: 'red-confirm',
+      branch: 'module/elsewhere',
+      sha: repo.sha('main_patched'),
+      phase: 'test',
+      cmd: 'vitest run',
+      cwd: 'container/agent-runner',
+      subtree: runnerSubtree,
+      commands: ['vitest run'],
+      ran: true,
+      reproduced: true,
+    });
+
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), fn)).toBe(0);
+    const first = readJournal(dir);
+    // NOTHING WAS MINTED AND NOTHING WAS REOPENED: a reopen with no case behind it
+    // supersedes this branch's work for nothing.
+    expect(first.some((e) => e.action === 'gate-fix')).toBe(false);
+    expect(first.some((e) => e.action === 'reopened')).toBe(false);
+    const refusal = first.find((e) => e.action === 'gate-fix-refused')!;
+    expect(refusal.id).toBe('WARN22_RED_UNCONFIRMED');
+    expect(refusal.branch).toBe('main_patched');
+    expect(refusal.reason).toContain('module/elsewhere');
+    expect((refusal.subtrees as Array<{ subtree: string }>)[0].subtree).toBe(runnerSubtree);
+    // ...and the content did not travel.
+    expect(repo.sha('module/cg')).toBe(cgBefore);
+    expect(first.some((e) => e.action === 'arrived' && e.branch === 'main_patched')).toBe(false);
+    expect(first.some((e) => e.action === 'pass-complete')).toBe(false);
+
+    // THE NEXT CALL LANDS NOTHING NEW — the merge already happened — so the no-op
+    // skip would pass the tree over as though it had been checked, and the branch
+    // would arrive on a verdict nobody ever gave it.
+    const before = runs;
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), fn)).toBe(0);
+    const second = readJournal(dir);
+    expect(runs).toBeGreaterThan(before);
+    expect(
+      second
+        .filter((e) => e.action === 'landing-check' && e.ran === false && e.reason === 'no-op')
+        .map((e) => e.branch),
+    ).not.toContain('main_patched');
+    expect(second.some((e) => e.action === 'arrived' && e.branch === 'main_patched')).toBe(false);
+    expect(second.filter((e) => e.action === 'gate-fix-refused')).toHaveLength(2);
+    expect(repo.sha('module/cg')).toBe(cgBefore);
+  });
+
   it('a merge that lands no new tree is not measured', async () => {
     // The leaf un-skip forces EMPTY merges up the cheapest parent chain: the
     // tips move, the trees do not, so there is nothing new to measure.
