@@ -2071,18 +2071,28 @@ file carries different defects, so a digest collides, and a text match mints on
 innocents.
 
 **THE SAME BYTES ALREADY FAILED WITHOUT THIS RESOLUTION.** When every failing
-command's subtree AT THE RESOLVED TREE is an oid this pass already confirmed red,
+command's subtree carries a confirmed red AND is IDENTICAL at the clean prefix,
 `--not-my-bug` skips its probe pair and records `pre-existing` with
-`via: subtree-verdict` and zero probes. The failure is byte-identical to one
-measured on a tree the resolution had no part in, and a resolution cannot cause a
-failure in content it did not produce — the same axiom the green memo rests on,
-asked about a red. It is cause-class-agnostic BECAUSE it decides nothing else: it
-skips a probe, never an owner, so the environment classifier, the ownership
-partition, the ceiling and the mint's backstop all run as they do for a probed
-verdict. The conflicted-path drop stays in front of it: a resolution that touched
-the failing subtree changes the oid, nothing matches, and the full adjudication
-runs. The loop bounds are untouched — this makes an iteration cheaper, never
-makes one more available.
+`via: subtree-verdict` and zero probes. A resolution cannot cause a failure in
+content it did not write — the same axiom the green memo rests on, asked about a
+red. It is cause-class-agnostic BECAUSE it decides nothing else: it skips a
+probe, never an owner, so the environment classifier, the ownership partition,
+the ceiling and the mint's backstop all run as they do for a probed verdict. The
+loop bounds are untouched — this makes an iteration cheaper, never makes one more
+available.
+
+BOTH HALVES ARE LOAD-BEARING. Confirmations are taken at BRANCH TIPS, and a tip
+carries whatever landed on it — including a sibling's resolution of the same
+conflict, which agents here reproduce byte for byte. Matching the resolved oid
+alone would then wave through a failure the resolution itself caused, in a file
+nobody was resolving, so the conflicted-path drop never fires. Prefix-equality
+takes the resolution out of the comparison instead of assuming it out: a
+confirmed red on bytes the prefix already had is resolution-independent whoever
+measured it. At the root (`cwd: '.'`) that condition never holds — a resolution
+that changed nothing is not one — so the shortcut simply does not apply there.
+What it still approximates is a suite that reaches outside its own `cwd`: an
+untouched subtree does not strictly prove an untouched population, the same
+approximation subtree-keyed verdicts already run on.
 
 **GATE-FIX PRs CARRY THE IDENTITY.** Each publish and each urge regenerates the
 machine block with one `sweep-failure: cmd=… cwd=… subtree=… files=…` line per
@@ -2159,8 +2169,9 @@ that is on origin at a DIFFERENT sha is somebody's work: the head is left where 
 is and the failure is reported, because a lease is satisfied by whatever is there
 — including an amended head an owner pushed — so it would authorise exactly the
 overwrite it looks like it prevents. A twin that cannot be published is not a halt
-— the fix still stands on its original ref and the next pass finds the same two
-facts.
+— the next pass re-derives the question from origin as it stands then, twinning
+the head it finds or serving a case where there is no longer a driver commit to
+offer.
 
 **BOTH SIDES CLEAN UP BY THEMSELVES.** Merging either ref puts the commit in that
 target; propagation carries it to the other. `start` classifies a fix ref whose

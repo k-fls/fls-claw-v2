@@ -213,7 +213,16 @@ export function renderSweepContested(c: { cmd: string; subtree: string; greenOn:
   return `<!-- sweep-contested: cmd=${c.cmd} subtree=${c.subtree.slice(0, 12)} green-on=${c.greenOn} -->`;
 }
 
-/** Every `<!-- key: rest -->` (or bare `key: rest`) driver line in a body, by key. */
+/**
+ * Every `<!-- key: rest -->` (or bare `key: rest`) driver line in a body, by key.
+ *
+ * READ BOTH FORMS, WRITE ONLY THE COMMENT. The bare form is accepted so a body a
+ * human tidied still parses, and it is why nothing may TRUST a value from here:
+ * a prose line beginning `sweep-…:` reads as a driver line. Every consumer that
+ * gates on one of these re-verifies the value against git — a ref at a sha, an
+ * oid at a commit — so a forged line changes what is displayed and never what is
+ * decided.
+ */
 const MACHINE_LINE_RE = /^(?:<!--\s*)?(sweep-[a-z-]+):\s*(.*?)\s*(?:-->)?$/;
 
 /**

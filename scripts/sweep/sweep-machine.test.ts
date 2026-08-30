@@ -1960,65 +1960,163 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
   });
 
   /**
-   * THE SAME BYTES ALREADY FAILED WITHOUT THIS RESOLUTION.
-   *
-   * A check is a function of the subtree it runs in, so a failing command whose
-   * subtree AT THE RESOLVED TREE is an oid the pass already confirmed red is a
-   * failure the resolution had no part in producing. The comparison the probe
-   * pair exists to make has already been made, by git: the two probe runs — an
-   * install and a suite, twice — are simply not spent.
+   * `src/x.ts` is the conflict; `container/` is a second suite's cwd that no
+   * resolution of that conflict touches. The two together are what the shortcut
+   * needs to be sound: a failing subtree whose bytes the resolution did not
+   * write.
    */
-  it('a failing subtree the pass already confirmed red skips the probe pair entirely', async () => {
-    const repo = conflictFixture();
-    const ws = mkWorkspace();
-    const inv = branchlessInventory();
-    const checks = checksFile(ws);
-    const { dir, caseId } = await toResolvedCase(repo, ws, inv, checks);
-    seedPriorFailure(dir, caseId, 'typecheck', ['tsc --noEmit']);
+  function subtreeCwdFixture(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base: x + container', { 'src/x.ts': 'orig\n', 'container/agent/poll.test.ts': 'ok\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: x = fork', { 'src/x.ts': 'fork\n' });
+    repo.checkout('main');
+    repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' });
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+
+  /** The pinned contract for those fixtures: one command, running in `container`. */
+  function containerChecksFile(ws: string): string {
+    const f = join(ws, 'checks.json');
+    writeFileSync(f, JSON.stringify({ typecheck: [{ cmd: 'bun test', cwd: 'container' }], test: [] }));
+    return f;
+  }
+
+  /**
+   * Drive a conflict case to a resolution, and hand back the two oids the
+   * shortcut compares: the failing cwd at the RESOLVED tree, and at the CLEAN
+   * PREFIX — the merge minus the resolution.
+   */
+  async function resolvedAndPrefixSubtree(
+    repo: FixtureRepo,
+    ws: string,
+    inv: string,
+    resolution: Record<string, string>,
+  ): Promise<{ dir: string; caseId: string; wtPath: string; prefix: string; resolvedOid: string; prefixOid: string }> {
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: containerChecksFile(ws) }));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
+    const dir = dirOf(repo, ws);
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, resolution);
+    seedPriorFailure(dir, caseId, 'typecheck', ['bun test']);
     const wtPath = join(dir, caseId, 'worktree');
-    // The tree the driver will hash, computed the way it computes it.
     execFileSync('git', ['-C', wtPath, 'add', '-A'], { encoding: 'utf8' });
     const resolvedTree = execFileSync('git', ['-C', wtPath, 'write-tree'], { encoding: 'utf8' }).trim();
     const prefix = execFileSync('git', ['-C', wtPath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
-    appendJournal(dir, {
-      action: 'red-confirm',
-      branch: 'module/elsewhere',
-      sha: repo.sha('main_patched'),
-      phase: 'test',
-      cmd: 'tsc --noEmit',
-      cwd: '.',
-      subtree: resolvedTree,
-      commands: ['tsc --noEmit'],
-      ran: true,
-      reproduced: true,
-    });
-    // THE BASELINE PROBE, and only it: the clean prefix is the tree
-    // `classifyFailure` compares against, and nothing else in the pass runs
-    // there — the gate runs in the case worktree, the partition at the branch
-    // tip and the parent head.
-    const baselineRuns: string[] = [];
+    return {
+      dir,
+      caseId,
+      wtPath,
+      prefix,
+      resolvedOid: repo.git('rev-parse', `${resolvedTree}:container`),
+      prefixOid: repo.git('rev-parse', `${prefix}:container`),
+    };
+  }
+
+  /** Counts the runs `classifyFailure` would take: the clean prefix, nowhere else. */
+  function baselineCounter(wtPath: string, prefix: string): { fn: ChecksRunner; runs: string[] } {
+    const runs: string[] = [];
     const fn: ChecksRunner = async (commands, baseDir) => {
-      if (baseDir !== wtPath && shaAt(baseDir) === prefix) baselineRuns.push(baseDir);
+      if (baseDir !== wtPath && shaAt(baseDir) === prefix) runs.push(baseDir);
       const names = commands.map((c) => c.cmd);
       return {
         ok: false,
         failedNames: names,
-        output: names.map((n) => `$ ${n}\nsrc/util.ts(1,1): error TS2345: boom\n`).join(''),
+        output: names.map((n) => `$ ${n}\ncontainer/agent/poll.test.ts(1,1): error TS2345: boom\n`).join(''),
       };
     };
-    const out = join(ws, 'rc.json');
+    return { fn, runs };
+  }
+
+  /**
+   * THE SAME BYTES ALREADY FAILED WITHOUT THIS RESOLUTION.
+   *
+   * A check is a function of the subtree it runs in, so a failing command whose
+   * subtree is an oid the pass already confirmed red AND is unchanged from the
+   * clean prefix is a failure in content the resolution did not write. The
+   * comparison the probe pair exists to make has already been made, by git: the
+   * two probe runs — an install and a suite, twice — are simply not spent.
+   */
+  it('a failing subtree the resolution did not touch, already confirmed red, skips the probe pair', async () => {
+    const repo = subtreeCwdFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const st = await resolvedAndPrefixSubtree(repo, ws, inv, { 'src/x.ts': 'RESOLVED\n' });
+    // The resolution is entirely outside the failing command's cwd.
+    expect(st.resolvedOid).toBe(st.prefixOid);
+    appendJournal(st.dir, {
+      action: 'red-confirm',
+      branch: 'module/elsewhere',
+      sha: repo.sha('main_patched'),
+      phase: 'test',
+      cmd: 'bun test',
+      cwd: 'container',
+      subtree: st.resolvedOid,
+      commands: ['bun test'],
+      ran: true,
+      reproduced: true,
+    });
+    const r = baselineCounter(st.wtPath, st.prefix);
     await cmdSweepReportCase(
-      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true }),
       neverInvoked,
-      fn,
+      r.fn,
       fakeInstall,
     );
     // THE DELETION: the baseline is never built and never run.
-    expect(baselineRuns).toEqual([]);
-    const verdict = readJournal(dir).find((e) => e.action === 'not-my-bug')!;
+    expect(r.runs).toEqual([]);
+    const verdict = readJournal(st.dir).find((e) => e.action === 'not-my-bug')!;
     expect(verdict.verdict).toBe('pre-existing');
     expect(verdict.via).toBe('subtree-verdict');
     expect(verdict.probes).toBe(0);
+  });
+
+  /**
+   * A CONFIRMATION CAN ITSELF CARRY A RESOLUTION. Confirmations are taken at
+   * branch tips, and a tip holds whatever landed on it — so an oid that matches
+   * the RESOLVED tree proves nothing on its own. Two siblings take one conflict
+   * from one parent, the first resolution lands and its tip is confirmed red
+   * with those bytes in it, and the second agent writes the same resolution,
+   * breaking something nobody was resolving. Only the prefix comparison
+   * separates that from a genuine pre-existing red, and without it the failure
+   * the resolution caused is waved through.
+   */
+  it('a red confirmed on bytes the resolution WROTE does not skip the probe pair', async () => {
+    const repo = subtreeCwdFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    // The resolution reaches INTO the failing command's cwd — the sibling shape,
+    // where the matched confirmation was taken on a tree carrying these bytes.
+    const st = await resolvedAndPrefixSubtree(repo, ws, inv, {
+      'src/x.ts': 'RESOLVED\n',
+      'container/agent/poll.test.ts': 'BROKEN by the resolution\n',
+    });
+    expect(st.resolvedOid).not.toBe(st.prefixOid);
+    appendJournal(st.dir, {
+      action: 'red-confirm',
+      branch: 'module/sibling',
+      sha: repo.sha('main_patched'),
+      phase: 'test',
+      cmd: 'bun test',
+      cwd: 'container',
+      subtree: st.resolvedOid,
+      commands: ['bun test'],
+      ran: true,
+      reproduced: true,
+    });
+    const r = baselineCounter(st.wtPath, st.prefix);
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true }),
+      neverInvoked,
+      r.fn,
+      fakeInstall,
+    );
+    // THE POINT: the shortcut does not fire, so the baseline is measured — the
+    // one tree that is genuinely without any resolution.
+    expect(r.runs.length).toBeGreaterThan(0);
+    const verdict = readJournal(st.dir).find((e) => e.action === 'not-my-bug')!;
+    expect(verdict.via).toBeUndefined();
   });
 
   /**

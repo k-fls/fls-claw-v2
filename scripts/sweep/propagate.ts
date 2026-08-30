@@ -3417,8 +3417,37 @@ function greenChecks(journal: JournalEntry[]): Map<string, string> {
 }
 
 /**
- * IS EVERY FAILING COMMAND'S SUBTREE AT THIS TREE ONE THE PASS ALREADY CONFIRMED
- * RED? A journal read and a `rev-parse` per command — nothing is measured.
+ * IS EVERY FAILING COMMAND'S SUBTREE ONE THE PASS ALREADY CONFIRMED RED, IN
+ * BYTES THIS RESOLUTION DID NOT WRITE? A journal read and two `rev-parse`s per
+ * command — nothing is measured.
+ *
+ * TWO CONDITIONS, and the second is what makes the first mean anything:
+ *
+ *  - the subtree at the RESOLVED tree carries a confirmed red, and
+ *  - that subtree is IDENTICAL at the CLEAN PREFIX — the merge minus the
+ *    resolution — so the resolution left those bytes untouched.
+ *
+ * Without the prefix comparison the shortcut is unsound, because confirmations
+ * are taken at BRANCH TIPS and a tip can carry a resolution. Two siblings take
+ * the same conflict from the same parent; the first one's resolution lands and
+ * its landing gate confirms the failing subtree red AT ITS TIP, resolution
+ * included; the second agent writes the byte-identical resolution — routine
+ * here — which breaks a test in that subtree that nobody was resolving. The oids
+ * match, the conflicted-path drop does not fire because the broken file was
+ * never conflicted, and the failure the resolution DID cause is waved through as
+ * pre-existing. Requiring prefix-equality removes the resolution from the
+ * comparison entirely: a confirmed red on bytes the prefix already had is
+ * resolution-independent by construction, whoever measured it.
+ *
+ * WHAT IT STILL APPROXIMATES: a suite that reaches outside its own `cwd` can
+ * fail for content the subtree does not contain, so an untouched subtree does
+ * not strictly prove an untouched population. That is the same approximation
+ * subtree-keyed verdicts and the green memo already run on, and no worse here —
+ * it is worth stating, not worth claiming otherwise.
+ *
+ * AT THE ROOT THIS NEVER FIRES, and that is the right answer rather than a gap:
+ * `cwd: '.'` keys on the whole tree, and a resolution that changed nothing is
+ * not a resolution — so prefix-equality fails and the full adjudication runs.
  *
  * `null` unless EVERY command matches: a partial answer decides nothing, since a
  * single command whose bytes nobody has measured is exactly the case the probe
@@ -3428,14 +3457,16 @@ async function subtreeVerdictAlreadyRed(
   cli: Cli,
   dir: string,
   tree: string,
+  prefix: string,
   commands: VerifyCommand[],
 ): Promise<CheckVerdict[] | null> {
-  if (commands.length === 0 || !tree) return null;
+  if (commands.length === 0 || !tree || !prefix) return null;
   const known = redConfirmations(readJournal(dir));
   const keys: CheckVerdict[] = [];
   for (const c of commands) {
     const subtree = await subtreeOf(cli.repo, tree, c.cwd).catch(() => '');
     if (!subtree || known.get(checkKey(subtree, c.cmd))?.reproduced !== true) return null;
+    if (subtree !== (await subtreeOf(cli.repo, prefix, c.cwd).catch(() => ''))) return null;
     keys.push({ cmd: c.cmd, ...(c.cwd ? { cwd: c.cwd } : {}), subtree });
   }
   return keys;
@@ -5930,9 +5961,10 @@ export async function publishGateFixTwins(
       });
       published++;
     } catch (e) {
-      // A TWIN THAT COULD NOT BE PUBLISHED IS NOT A HALT. The fix still exists on
-      // its original ref and the ceiling is still red; the next pass finds the
-      // same two facts and tries again.
+      // A TWIN THAT COULD NOT BE PUBLISHED IS NOT A HALT. The next pass asks the
+      // whole question again from origin as it stands then — twinning the head it
+      // finds, or serving a case where there is no longer a driver commit to
+      // offer.
       appendJournal(dir, {
         action: 'gate-fix-twin-failed',
         twinRef: twin.twinRef,
@@ -5967,8 +5999,9 @@ function twinCue(t: TwinReport): string {
     return ` ${t.published} twin PR(s) were published — the same commit offered where the fix belongs; name them.`;
   }
   return (
-    ` ${t.published} twin PR(s) published and ${t.failed} NOT (${t.failedRefs.join(', ')}) — the fix still stands ` +
-    `on its original ref and the next pass retries; report the ones that failed.`
+    ` ${t.published} twin PR(s) published and ${t.failed} NOT (${t.failedRefs.join(', ')}) — the next pass re-derives ` +
+    `from origin as it stands then, which may mean twinning the head it finds or serving a case instead; report the ` +
+    `ones that failed.`
   );
 }
 
@@ -7080,13 +7113,18 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
         // urge would quietly delete it. The case id is in the ref name, which is
         // the only handle this loop holds.
         const urgedCase = urge.fixBranch.split('--').slice(1).join('--');
+        // A POINTER THIS BLOCK DID NOT WRITE STILL BELONGS TO IT. A twin adds its
+        // `sweep-twin` line to whatever block is there; regenerating the block
+        // without it would drop the line until the next twin publish put it back,
+        // and a pointer that blinks is worse than one that is simply absent.
+        const priorBody = String(pr.body ?? '');
+        const carried = (parseMachineLines(priorBody).get('sweep-twin') ?? []).map((ref) => renderSweepTwin(ref));
         const newBody = withMachineBlock(
-          String(pr.body ?? ''),
-          renderMachineBlock(
-            urge.pending.length,
-            ctx.watermark12,
-            await machineFactLines(cli, dir, urgedCase, urge.head),
-          ),
+          priorBody,
+          renderMachineBlock(urge.pending.length, ctx.watermark12, [
+            ...(await machineFactLines(cli, dir, urgedCase, urge.head)),
+            ...carried,
+          ]),
         );
         await ghExpect(transport, 'PATCH', `${api}/pulls/${prNumber}`, { body: newBody });
         await ghExpect(transport, 'POST', `${api}/issues/${prNumber}/comments`, { body: commentBody });
@@ -10383,11 +10421,14 @@ async function adjudicateNotMyBug(p: {
   // ceiling, the mint's own backstop — runs exactly as it does for a probed
   // verdict.
   //
-  // THE CONFLICTED-PATH DROP STAYS IN FRONT OF IT. If the resolution touched the
-  // failing subtree the oid differs, nothing matches, and the full adjudication
-  // runs unchanged. The loop bounds are untouched: this makes one iteration
-  // cheaper and never makes one more available.
-  const sharedRedKeys = await subtreeVerdictAlreadyRed(cli, dir, p.resolvedTree, failedCommands);
+  // THE RESOLUTION IS REMOVED FROM THE COMPARISON, not assumed out of it: each
+  // failing subtree must be IDENTICAL at the clean prefix, so the bytes carrying
+  // the confirmed red are bytes the resolution did not write. A confirmation
+  // taken at some branch tip can itself contain a resolution — the sibling case
+  // in the helper — and matching on the resolved oid alone would let a failure
+  // the resolution caused pass as pre-existing. The loop bounds are untouched:
+  // this makes one iteration cheaper and never makes one more available.
+  const sharedRedKeys = await subtreeVerdictAlreadyRed(cli, dir, p.resolvedTree, headSha, failedCommands);
 
   // TWO probes over ONE temp worktree. The adjudication runs the failed commands
   // WHOLE, so both sides of the comparison are the population the gate measured;
@@ -10416,9 +10457,10 @@ async function adjudicateNotMyBug(p: {
           files,
           probes: 0,
           detail:
-            `every failing command's subtree at the resolved tree is an oid this pass already confirmed RED ` +
-            `(${sharedRedKeys.map((k) => `${k.cmd} @ ${k.subtree.slice(0, 12)}`).join('; ')}) — the same bytes ` +
-            `failed on a tree this resolution had no part in, so it did not cause them`,
+            `every failing command's subtree is an oid this pass already confirmed RED, and is UNCHANGED from the ` +
+            `clean prefix ` +
+            `(${sharedRedKeys.map((k) => `${k.cmd} @ ${k.subtree.slice(0, 12)}`).join('; ')}) — the resolution did ` +
+            `not write those bytes, so it did not cause what they fail at`,
         }
       : await classifyFailure(resolved, headSha, probe);
     appendJournal(dir, {
