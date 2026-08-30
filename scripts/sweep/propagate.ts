@@ -1263,7 +1263,8 @@ export interface UnmintableRed {
   branch: string;
   /** The failing files, where the refusal named them. */
   files: string[];
-  id: string;
+  /** The code the refusal named, where it named one. */
+  id?: string;
   detail: string;
 }
 
@@ -1312,7 +1313,10 @@ export function unmintableReds(journal: JournalEntry[]): UnmintableRed[] {
     out.push({
       branch,
       files,
-      id: typeof e.id === 'string' ? e.id : 'WARN22_RED_UNCONFIRMED',
+      // NO GUESSED CODE. A code is a specific diagnosis and the owner reads it as
+      // one; a row that named none is reported without one rather than under
+      // whatever the reader would have defaulted to.
+      ...(typeof e.id === 'string' ? { id: e.id } : {}),
       detail: String(e.reason ?? ''),
     });
   });
@@ -3356,6 +3360,12 @@ export function owedRedTrees(journal: JournalEntry[]): Set<string> {
 /** A journaled red confirmation: what the re-run said, and where it was taken. */
 interface RedConfirmRecord {
   reproduced: boolean;
+  /**
+   * The re-run could not be TAKEN at all — the environment refused, so nothing
+   * was observed. `reproduced: false` alone cannot say this, and reading it as
+   * "it passed" turns a missing measurement into an accusation of flakiness.
+   */
+  unmeasurable: boolean;
   /** The branch whose tree was standing when the command ran. */
   branch: string;
 }
@@ -3384,6 +3394,7 @@ function redConfirmations(journal: JournalEntry[]): Map<string, RedConfirmRecord
     // pin the pass to the contradicted observation and refuse every later mint.
     out.set(checkKey(e.subtree, e.cmd), {
       reproduced: e.reproduced === true,
+      unmeasurable: e.unmeasurable === true,
       branch: typeof e.branch === 'string' ? e.branch : '',
     });
   }
@@ -3445,6 +3456,7 @@ export async function redObservationUsable(
   const why = ({ v, rec }: (typeof unusable)[number]): string => {
     const where = v.cwd ? `${v.cwd} (${v.subtree.slice(0, 12)})` : `the tree ${v.subtree.slice(0, 12)}`;
     if (rec === undefined) return `${v.cmd} was never re-run on ${where}`;
+    if (rec.unmeasurable) return `${v.cmd} could not be RE-RUN on ${where} — the observation was never taken`;
     if (!rec.reproduced) return `${v.cmd} failed and then PASSED on a re-run of ${where}`;
     return (
       `${v.cmd} was confirmed red on ${where} by a run on ${rec.branch}, not on ${rootedOn} — ` +
@@ -3453,7 +3465,9 @@ export async function redObservationUsable(
   };
   return {
     usable: false,
-    id: unusable.some(({ rec }) => rec?.reproduced === false) ? 'WARN21_CHECKS_FLAKY' : 'WARN22_RED_UNCONFIRMED',
+    // A run that could not be TAKEN is not an instability: nothing gave two
+    // answers, so the finding is a missing measurement.
+    id: unusable.some(({ rec }) => rec?.reproduced === false && !rec.unmeasurable) ? 'WARN21_CHECKS_FLAKY' : 'WARN22_RED_UNCONFIRMED',
     reasons: unusable.map(why),
     observed,
   };
@@ -9616,10 +9630,24 @@ export async function cmdSweepNextCase(
     writeMachineState(dir, st);
     progress(`no more cases${activeGates.length ? ` (${activeGates.length} branch(es) gated)` : ''}`);
     console.error(`next-case: no more cases — finalize (run \`finish\`)${gateNote}`);
+    // A RED NOBODY COULD BE HANDED IS NOT "ALL DONE". There is genuinely nothing
+    // left to SERVE — no branch may be blamed, so no case exists — and `finish`
+    // is still the right next command: its integration verify measures the
+    // content, and the refusal reaches the owner through the finish result. But
+    // an instruction that says only "no case is open" invites the agent to
+    // report a clean pass, and the refusal is the pass's least visible finding.
+    const refusedReds = unmintableReds(journal);
+    const refusedNote = refusedReds.length
+      ? ` A red was PROVEN and could be handed to no branch (${refusedReds
+          .map((u) => `${u.branch}${u.id ? ` (${u.id})` : ''}`)
+          .join(', ')}), so no case was minted for it: \`finish\` measures the content and carries the finding — ` +
+        `report it to the owner from the finish result, not as a clean pass.`
+      : '';
     result(cli, {
       status: 'finalize',
       ...(activeGates.length ? { activeGates } : {}),
-      instruction: `no case is open — run \`finish\`.${gateNote}`,
+      ...(refusedReds.length ? { unmintableReds: refusedReds } : {}),
+      instruction: `no case is open — run \`finish\`.${gateNote}${refusedNote}`,
     });
     return 0;
   }
@@ -12271,6 +12299,10 @@ async function materializeGateFixCases(
     const files = [...new Set(upstreamGroups.flatMap((g) => g.files))];
     appendJournal(dir, {
       action: 'gate-fix-refused',
+      // The id travels ON THE ROW: `unmintableReds` reports what the row says,
+      // and a row that names no code is reported under whatever the reader
+      // defaults to — here, an unconfirmed red, which this is not.
+      id: 'WARN15_UPSTREAM_RED',
       branch: ROOT_BRANCH,
       files,
       reason: 'upstream is outside the sweep mandate — no work may be minted there',
@@ -13351,7 +13383,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     ...unmintableRedsNow.map((u) => ({
       branch: u.branch,
       category: 'unmintable-red',
-      id: u.id,
+      ...(u.id ? { id: u.id } : {}),
       detail: `${u.files.length ? `${u.files.join(', ')}: ` : ''}${u.detail}`,
     })),
   ];
@@ -13403,7 +13435,7 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
   // dropped from the report, and the owner is the only one who can act on it.
   const unmintableCue = unmintableRedsNow.length
     ? ` RED, NO BRANCH TO FIX IT: ${unmintableRedsNow
-        .map((u) => `${u.branch}${u.files.length ? ` [${u.files.join(', ')}]` : ''} (${u.id}) — ${u.detail}`)
+        .map((u) => `${u.branch}${u.files.length ? ` [${u.files.join(', ')}]` : ''}${u.id ? ` (${u.id})` : ''} — ${u.detail}`)
         .join('; ')}. Report these to the owner exactly as written; nothing this pass fixes them.`
     : '';
   const stats = {
