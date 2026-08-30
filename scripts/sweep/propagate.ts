@@ -14291,6 +14291,13 @@ export async function cmdSweepFinish(
     finishResult({ ok: false, issues: [badChecks], halted: 'verify', instruction: badChecks.detail });
     return 1;
   }
+  // WHAT THE VERIFY ACTUALLY RUNS, and in this order: an in-memory command list
+  // wins, then `--commands-file`, then the static default (`cmdVerify`). Finish
+  // threads the PINNED CHECKS CONTRACT into that first slot, so a configured
+  // checks file SILENTLY OVERRIDES a `--commands-file` handed to finish — which
+  // is right (one notion of green in this driver, and the pass gates on what
+  // `start` pinned) and is invisible from the outside, where the flag looks like
+  // the more specific instruction.
   const finishChecks = loadChecksConfig(checksFile);
   const finishTestCommands = finishChecks ? [...finishChecks.typecheck, ...finishChecks.test] : undefined;
   if (!st) {
