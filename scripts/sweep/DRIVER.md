@@ -1347,7 +1347,10 @@ A red measured on UPSTREAM `main` is not lifted at all. It is the shallowest lev
 there is, so nothing can be lifted from it, and a "ceiling" below it would move an
 upstream defect onto a fork branch and manufacture work for a defect that branch does
 not have. It reaches the mintability check as it stands and is refused there
-(`WARN15_UPSTREAM_RED`).
+(`WARN15_UPSTREAM_RED`). That is a different fact from attribution's TRUNK FALLBACK,
+which sends content upstream AUTHORED to the trunk to be fixed as a fork-side shim
+(§9.1): one is upstream's own head proven red, the other is a file nobody in the fork
+wrote.
 
 Every (floor → target) decision is journaled `gate-fix-ceiling` with the floor and its
 ref, the ceiling and its ref, the files, the `decided` arm and its detail — the
@@ -1801,7 +1804,8 @@ adjudication (§7.2), the pre-merge branch check (§6.2), and the landing gate
 (§7.6). The last two start from the branch that is RED rather than from a blame of
 a build log — that branch is the measurement — and then ask §7.2's ceiling question
 about it, because a branch that is red on content it did not write is not where the
-fix belongs.
+fix belongs. The integration verify has no such branch to start from: it blames a
+build by elimination, so its mint takes the measurement itself (§9.1).
 
 ### 9.1 Blame is git history, not the registry
 
@@ -1809,16 +1813,47 @@ fix belongs.
 enforced, because `materializeGateFixCases` is the one place a case is created.
 Blame itself never measures — it reads git history over a failing log somebody
 else produced — so a caller that measured once would hand it an accusation and get
-back a case, a held PR and a named culprit. A caller that can say WHERE its red was
-measured passes `redOn` (the commit, and the commands), and the mint proceeds only
-if, FOR EVERY FAILING COMMAND, the pass has journaled a `red-confirm` with
-`reproduced: true` for the subtree that command runs in AT THE BRANCH THE CASE IS
-ROOTED ON, taken by a run ON THAT BRANCH. A red that changed its answer, was never
-re-run, or was confirmed only on another branch carrying the identical subtree
-mints nothing and is journaled `gate-fix-refused` — `WARN21_CHECKS_FLAKY` for a
-check that gave both answers, `WARN22_RED_UNCONFIRMED` for one nobody confirmed
-here. The ownership probe (§7.2) asks the SAME question before it proves an owner,
-so a `--not-my-bug` adjudication never aborts a merge for a case this then refuses.
+back a case, a held PR and a named culprit.
+
+**EVERY CALLER OWES A MEASUREMENT, AND THE TYPE SAYS SO.** A caller passes EITHER
+`redOn` — the commit its red was confirmed at, and the commands — OR
+`confirmAtRoot`, a way for the mint to take the observation itself. There is no
+third shape: a mint with nothing behind it is not expressible, so no caller reaches
+a case by leaving a field out.
+
+With `redOn` the mint proceeds only if, FOR EVERY FAILING COMMAND, the pass has
+journaled a `red-confirm` with `reproduced: true` for the subtree that command runs
+in AT THE BRANCH THE CASE IS ROOTED ON, taken by a run ON THAT BRANCH. A red that
+changed its answer, was never re-run, or was confirmed only on another branch
+carrying the identical subtree mints nothing and is journaled `gate-fix-refused` —
+`WARN21_CHECKS_FLAKY` for a check that gave both answers, `WARN22_RED_UNCONFIRMED`
+for one nobody confirmed here. The ownership probe (§7.2) asks the SAME question
+before it proves an owner, so a `--not-my-bug` adjudication never aborts a merge for
+a case this then refuses.
+
+With `confirmAtRoot` — the integration verify (§10.2), which attributes a red BUILD
+by elimination over a log naming the file that REPORTED the failure — the mint
+MEASURES each blamed branch at the commit its case would be rooted on. The journal
+is consulted first, with the branch match waived because attribution IS the ceiling
+on this path (§7.2); only a group with no usable confirmation is run, and only after
+the skips above, so nothing is measured for a group that was never going to mint.
+RED mints, and the `red-confirm` rows it writes carry `phase: 'finish'`. GREEN drops
+the group — "`<branch>` is green at its own tip — the red is integration-only; the
+leave-one-out rollback owns that shape" — and leaves by the same doors as every
+other reason nothing was minted. UNSTABLE is `WARN21_CHECKS_FLAKY`; a tip that could
+not be measured at all is `WARN22_RED_UNCONFIRMED`, "no second observation". The
+cost is one worktree, one install and one run per blamed branch that the pass has
+not already confirmed.
+
+REVERSING THAT OBLIGATION COSTS THE FINISH PATH ITS ONLY GUARD: without it finish
+mints again on a branch whose own tip was never measured red, so a file that merely
+REPORTED a failure hands a case to its innocent author — at finish alone, since
+every other mint carries a confirmation of its own.
+
+**ATTRIBUTION'S TRUNK FALLBACK AND UPSTREAM'S OWN RED ARE DIFFERENT FACTS ABOUT
+DIFFERENT COMMITS.** Content upstream authored is attributed to the trunk and fixed
+there as a fork-side shim (the fallback below). Upstream's own head proven red is
+reported (`WARN15_UPSTREAM_RED`) and never minted on.
 
 **A shared verdict blocks; it does not accuse — until authorship distinguishes the
 branches.** Two branches whose relevant subtree is the same object cannot disagree

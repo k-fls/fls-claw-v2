@@ -6995,6 +6995,97 @@ describe('sweep finish — gate-fix on an unattributable red', () => {
     expect(j.filter((e) => e.action === 'gate-fix').length).toBe(before);
   });
 
+  /**
+   * FINISH BLAMES BY ELIMINATION, SO FINISH MEASURES.
+   *
+   * The integration verify reds on a build of many branches and attribution reads
+   * the log, which names the file that REPORTED the failure — not necessarily the
+   * one that caused it. That is an upper bound on where blame may go, never
+   * evidence that the branch it names is red. So the mint measures each blamed
+   * branch at the commit the case would be rooted on, and a branch that is GREEN
+   * there is not handed a case: the red exists only in the integration, which is
+   * the leave-one-out rollback's shape, not an agent's.
+   */
+  it('a blamed branch that is GREEN at its own tip is not handed a finish gate fix', async () => {
+    const repo = gateFixRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { cmds } = redUntilCleared(ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
+    const out = join(ws, 'f1.json');
+    const asked: Array<{ branch: string; sha: string }> = [];
+    expect(
+      await cmdSweepFinish(
+        baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out }),
+        undefined,
+        async (branch, sha) => {
+          asked.push({ branch, sha });
+          return 'green';
+        },
+      ),
+    ).toBe(1);
+    const journal = readJournal(dir);
+    // NO CASE ON A BRANCH THAT PASSES. Blame named it; the measurement did not.
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    expect(journal.some((e) => e.action === 'case' && e.gateFix === true)).toBe(false);
+    // And it was asked about the branch it was about to accuse, at that branch's tip.
+    expect(asked.map((a) => a.branch)).toEqual(['module/cg']);
+    expect(asked[0].sha).toBe(repo.sha('module/cg'));
+    // The drop is a row, with the coordinate a reader can check.
+    const skipped = journal.find((e) => e.action === 'gate-fix-skipped' && e.skipped === 'module/cg')!;
+    expect(skipped.detail).toContain('green at its own tip');
+    expect(skipped.at).toBe(repo.sha('module/cg'));
+    expect((skipped.subtrees as Array<{ subtree: string }>).length).toBeGreaterThan(0);
+    // AND IT LEAVES BY A DOOR THAT ALREADY EXISTS: no case was served, so this is
+    // the ordinary "nothing to mint" ending, carrying the reason.
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { status?: string; instruction: string; issues?: Array<{ id: string }> };
+    expect(res.status).not.toBe('gate-fix-required');
+    expect(res.instruction).toContain('integration-only');
+    expect(res.instruction).toContain('leave-one-out rollback');
+    // Nothing landed: the red still gates the pass.
+    expect(journal.some((e) => e.action === 'pr-published')).toBe(false);
+    expect(journal.some((e) => e.action === 'push')).toBe(false);
+  });
+
+  /**
+   * AND WHEN IT MEASURES RED, IT SAYS SO IN THE JOURNAL. The default confirmer
+   * takes the observation for real — a fresh worktree at the branch tip, its own
+   * install, the failing commands, and the varied re-run every other accusation
+   * pays for — so the case rests on a measurement of THAT branch rather than on a
+   * log that merely named one of its files.
+   */
+  it('a blamed branch measured RED at its own tip is served, and the measurement is journaled', async () => {
+    const repo = gateFixRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { cmds } = redUntilCleared(ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
+    const out = join(ws, 'f1.json');
+    // No confirmer injected: the production one runs, in real worktrees.
+    expect(
+      await cmdSweepFinish(baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: cmds, out })),
+    ).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; gateFix: { branch: string } };
+    expect(res.status).toBe('gate-fix-required');
+    expect(res.gateFix.branch).toBe('module/cg');
+    const journal = readJournal(dir);
+    // THE POINT: the case rests on rows this path wrote, naming the branch it
+    // accuses and the gate that took the measurement.
+    const confirms = journal.filter((e) => e.action === 'red-confirm' && e.phase === 'finish');
+    expect(confirms.length).toBeGreaterThan(0);
+    expect(confirms.every((e) => e.branch === 'module/cg')).toBe(true);
+    expect(confirms.every((e) => e.sha === repo.sha('module/cg'))).toBe(true);
+    expect(confirms.some((e) => e.reproduced === true)).toBe(true);
+  });
+
   it('red + no attribution -> gate-fix case on the OWNING branch, served with a no-merge briefing', async () => {
     const repo = gateFixRepo();
     const ws = mkWorkspace();

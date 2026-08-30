@@ -4538,8 +4538,17 @@ export async function cmdRun(
           runChecks,
           runInstall,
         );
-        const redUsable = lift.refused
-          ? ({ usable: false, id: lift.refused.id, reasons: [lift.refused.detail], observed: [] } as const)
+        // A REFUSAL FROM THE CEILING TABLE IS REPORTED IN THE SAME SHAPE as one
+        // from the journal check, SUBTREES INCLUDED: the row is the only place a
+        // reader learns which object the finding is keyed to, and an empty list
+        // there reads as "no command has a subtree", which is never true.
+        const redUsable: RedObservationVerdict = lift.refused
+          ? {
+              usable: false,
+              id: lift.refused.id,
+              reasons: [lift.refused.detail],
+              observed: await checkVerdictKeys(cli.repo, lift.ref, landing.failed).catch(() => []),
+            }
           : await redObservationUsable(readJournal(dir), cli.repo, lift.branch, lift.ref, landing.failed, {
               attributedCeiling: lift.attributedCeiling,
             });
@@ -10566,8 +10575,8 @@ async function adjudicateNotMyBug(p: {
       // where the case would have been rooted, so its reasons are the ones that
       // say why it could not be.
       const red = await usableAt(target.ref);
-      let licensed: string | null = red.usable ? target.ref : null;
-      if (licensed === null) {
+      if (!red.usable) {
+        let licensed: string | null = null;
         for (const ref of target.refs) {
           if (ref === target.ref) continue;
           if ((await usableAt(ref)).usable) {
@@ -10575,28 +10584,28 @@ async function adjudicateNotMyBug(p: {
             break;
           }
         }
+        if (licensed === null) {
+          refusedOwners.push({
+            target,
+            ownerBranch,
+            id: red.id,
+            detail: redRefusalDetail(red.reasons),
+            subtrees: red.observed.map((v) => ({ cmd: v.cmd, ...(v.cwd ? { cwd: v.cwd } : {}), subtree: v.subtree })),
+          });
+          continue;
+        }
+        target.ref = licensed;
       }
-      if (licensed === null && !red.usable) {
-        refusedOwners.push({
-          target,
-          ownerBranch,
-          id: red.id,
-          detail: redRefusalDetail(red.reasons),
-          subtrees: red.observed.map((v) => ({ cmd: v.cmd, ...(v.cwd ? { cwd: v.cwd } : {}), subtree: v.subtree })),
-        });
-        continue;
-      }
-      if (licensed !== null && (licensed !== target.ref || target.refs.length > 1)) {
+      if (target.refs.length > 1) {
         appendJournal(dir, {
           action: 'gate-fix-red-ref',
           caseId,
           branch: ownerBranch,
-          ref: licensed,
+          ref: target.ref,
           refs: target.refs,
           commands: failedCommands.map((c) => c.cmd),
         });
       }
-      if (licensed !== null) target.ref = licensed;
       mintableGroups.push(target);
     }
     // A REFUSAL IS A ROW, AND THE ROW CARRIES THE CASE IT CAME FROM. Without the
@@ -12602,6 +12611,8 @@ async function confirmRedAt(
   commands: VerifyCommand[],
   runChecks: ChecksRunner,
   runInstall?: InstallRunner,
+  /** Which gate took the measurement — the row says so, and readers scan by it. */
+  phase: string = 'ceiling',
 ): Promise<CeilingVerdict> {
   const keys = await checkVerdictKeys(cli.repo, sha, commands);
   const wt = await addTempWorktree(cli.repo, sha);
@@ -12628,7 +12639,7 @@ async function confirmRedAt(
   const confirm = await confirmRed(dir, {
     branch,
     sha,
-    phase: 'ceiling',
+    phase,
     failed: failedKeys,
     rerun: (again) => variedRerun(cli, sha, failed.filter((c) => again.some((k) => k.cmd === c.cmd)), runChecks, runInstall),
   });
@@ -12694,8 +12705,12 @@ interface LiftDecision {
   /** The commit the case is rooted at and the red observation is keyed to. */
   ref: string;
   attributedCeiling: boolean;
-  /** Set instead of a mint: the table refused, and this is what to report. */
-  refused?: { id: string; detail: string };
+  /**
+   * Set instead of a mint: the table refused, and this is what to report. The id
+   * is one of the two a refused red travels under, because the caller reports it
+   * in exactly the shape `redObservationUsable` produces.
+   */
+  refused?: { id: 'WARN21_CHECKS_FLAKY' | 'WARN22_RED_UNCONFIRMED'; detail: string };
   /**
    * A confirmed red for the same command at a commit that does not carry the
    * failing content. It is REPORTED with the case — it says something about the
@@ -12774,21 +12789,44 @@ async function liftGateFixTarget(
     });
     return d;
   };
-  if (ceil.ties.length > 0 || ceilings.length !== 1) {
+  /** The one branch a lift could go to, or null where no single branch is named. */
+  const ceiling = ceil.ties.length === 0 && ceilings.length === 1 ? ceilings[0] : null;
+  // RED WHERE THE CONTENT IS NOT, carried as a NOTE — see the same scan in the
+  // adjudication. It travels with the case and decides nothing: the key is the
+  // command, and a branch that forked before the failing file existed and is red
+  // on its own unrelated defect matches it exactly. Refusing on it would tell an
+  // agent that no code change can fix a defect a code change fixes.
+  //
+  // ASKED BEFORE ANY ARM ANSWERS, exactly as the adjudication asks it. A red that
+  // stays on its floor is the case most likely to be about the machine, so a scan
+  // placed after the no-lift arms would report the coordinate only where blame
+  // moved — which is the half that needs it least.
+  const absent = await redWhereContentIsAbsent(cli, readJournal(dir), files, commands);
+  const coordinate = absent
+    ? `${files.join(', ')} affects everything below ${ceiling ?? floorBranch}; also red at ` +
+      `${absent.sha.slice(0, 12)} which does not carry the content (${absent.file} is not there)`
+    : undefined;
+  if (coordinate) journalRow({ ...onFloor('environment-noted', coordinate), coordinate }, ceiling, null);
+  /** Everything decided from here carries the coordinate, where there is one. */
+  const withNote = (d: LiftDecision): LiftDecision => (coordinate ? { ...d, coordinate } : d);
+  if (ceiling === null) {
     return journalRow(
-      onFloor(
-        'no-lift-tie',
-        `no single branch can be named the ceiling for ${files.join(', ')}, so blame stays where it was ` +
-          `MEASURED, on ${floorBranch}`,
+      withNote(
+        onFloor(
+          'no-lift-tie',
+          `no single branch can be named the ceiling for ${files.join(', ')}, so blame stays where it was ` +
+            `MEASURED, on ${floorBranch}`,
+        ),
       ),
       null,
       null,
     );
   }
-  const ceiling = ceilings[0];
   if (ceiling === floorBranch) {
     return journalRow(
-      onFloor('no-lift-same', `${floorBranch} authored ${files.join(', ')} — it is both the floor and the ceiling`),
+      withNote(
+        onFloor('no-lift-same', `${floorBranch} authored ${files.join(', ')} — it is both the floor and the ceiling`),
+      ),
       ceiling,
       floorRef,
     );
@@ -12796,27 +12834,16 @@ async function liftGateFixTarget(
   const ceilingTip = await revParse(cli.repo, ceiling).catch(() => '');
   if (!ceilingTip) {
     return journalRow(
-      onFloor(
-        'no-lift-unmeasurable',
-        `the ceiling ${ceiling} does not resolve in this clone, so it cannot be measured — blame stays on ${floorBranch}`,
+      withNote(
+        onFloor(
+          'no-lift-unmeasurable',
+          `the ceiling ${ceiling} does not resolve in this clone, so it cannot be measured — blame stays on ${floorBranch}`,
+        ),
       ),
       ceiling,
       null,
     );
   }
-  // RED WHERE THE CONTENT IS NOT, carried as a NOTE — see the same scan in the
-  // adjudication. It travels with the case and decides nothing: the key is the
-  // command, and a branch that forked before the failing file existed and is red
-  // on its own unrelated defect matches it exactly. Refusing on it would tell an
-  // agent that no code change can fix a defect a code change fixes.
-  const absent = await redWhereContentIsAbsent(cli, readJournal(dir), files, commands);
-  const coordinate = absent
-    ? `${files.join(', ')} affects everything below ${ceiling}; also red at ${absent.sha.slice(0, 12)} which does ` +
-      `not carry the content (${absent.file} is not there)`
-    : undefined;
-  if (coordinate) journalRow({ ...onFloor('environment-noted', coordinate), coordinate }, ceiling, null);
-  /** Everything decided from here carries the coordinate, where there is one. */
-  const withNote = (d: LiftDecision): LiftDecision => (coordinate ? { ...d, coordinate } : d);
   const known = redConfirmations(readJournal(dir));
   const keys = await checkVerdictKeys(cli.repo, ceilingTip, commands).catch(() => []);
   const lifted = (decided: string, detail: string): LiftDecision => ({
@@ -12885,6 +12912,48 @@ async function liftGateFixTarget(
   );
 }
 
+/**
+ * WHAT A CALLER OWES THE MINT: a confirmation, or the authority to take one.
+ *
+ * Blame never measures — it reads git history over a failing log somebody else
+ * produced — so a single red run reaches it as an established fact and comes out
+ * the other side as a case, a held PR and a named culprit. The obligation is
+ * therefore in the TYPE rather than in a convention: a caller either says WHERE
+ * its red was confirmed, or hands the mint a way to confirm one itself. There is
+ * no third shape, and that is the point — "mint with no measurement behind it"
+ * is not expressible, so no future caller can reach a mint by omitting a field.
+ */
+type GateFixEvidence =
+  | {
+      /**
+       * The OBSERVATION this case would rest on: the COMMIT the failing commands
+       * were measured at, and the commands.
+       *
+       * Checked against the confirmations the pass has journaled, PER COMMAND AND
+       * PER SUBTREE: a red that was re-run and reproduced on the subtree the
+       * command runs in mints, and one that changed its answer (or was never
+       * re-run at all) mints nothing. Nothing is re-run here — the confirmation
+       * belongs where the tree was standing and its worktree still had its
+       * dependencies, and this is a journal read.
+       */
+      redOn: { at: string; commands: VerifyCommand[] };
+      confirmAtRoot?: never;
+    }
+  | {
+      redOn?: never;
+      /**
+       * TAKE THE OBSERVATION HERE. The caller has no confirmation to offer — the
+       * integration verify attributes a red build by elimination, over a log that
+       * names the file which REPORTED the failure and not necessarily the one
+       * that caused it — so it authorises the mint to measure each blamed branch
+       * at the commit the case would be rooted on, before accusing it.
+       */
+      confirmAtRoot: RootConfirmer;
+    };
+
+/** Measure one branch at one commit: the four answers a fresh run can give. */
+export type RootConfirmer = (branch: string, sha: string, commands: VerifyCommand[]) => Promise<CeilingVerdict>;
+
 async function materializeGateFixCases(
   cli: Cli,
   dir: string,
@@ -12892,7 +12961,7 @@ async function materializeGateFixCases(
   failedOutput: string,
   failedCommands: VerifyCommand[],
   accused: string | null,
-  opts: {
+  opts: GateFixEvidence & {
     rootBranch?: string;
     /** The failure reproduces only under the FULL command (see the call site). */
     fullSuiteOnly?: boolean;
@@ -12916,28 +12985,12 @@ async function materializeGateFixCases(
      */
     ownedFiles?: string[];
     /**
-     * The OBSERVATION this case would rest on: the COMMIT the failing commands
-     * were measured at, and the commands.
-     *
-     * Blame never measures — it reads git history over a failing log someone
-     * else produced — so a single red run reaches it as an established fact and
-     * comes out the other side as a case, a held PR and a named culprit. When a
-     * caller can say where its red came from, this is checked against the
-     * confirmations the pass has journaled, PER COMMAND AND PER SUBTREE: a red
-     * that was re-run and reproduced on the subtree the command runs in mints,
-     * and one that changed its answer (or was never re-run at all) mints
-     * nothing. Callers that measure twice on their own — the integration
-     * verify, whose determinism probe runs before attribution — pass nothing and
-     * are unaffected.
-     */
-    redOn?: { at: string; commands: VerifyCommand[] };
-    /**
      * `rootBranch` is the CEILING for these files, proven by authorship. The red
      * may then be carried there from any branch sharing the subtree — see
      * `redObservationUsable`, which is where the rule lives.
      */
     attributedCeiling?: boolean;
-  } = {},
+  },
 ): Promise<{
   served: boolean;
   cases: GateFixCaseSummary[];
@@ -13107,6 +13160,10 @@ async function materializeGateFixCases(
   const gated: string[] = [];
   /** Branches whose fix worktree has no environment — the machine, not the branch. */
   const envBlocked: string[] = [];
+  /** Branches the mint measured GREEN at their own tip — blamed, and not red. */
+  const droppedGreen: Array<{ branch: string; detail: string }> = [];
+  /** Branches whose own tip gave no verdict to accuse them with. */
+  const unconfirmed: Array<{ branch: string; detail: string }> = [];
   // A GATE HOLD ALREADY TAKEN THIS PASS BLOCKS EVERYTHING BENEATH IT.
   //
   // A gate fix means the branch is RED. Every descendant merges that branch, so
@@ -13274,6 +13331,76 @@ async function materializeGateFixCases(
     // The head's HEIGHT (see `gateFixHeadHeight`): the tip's coverage on this
     // pass's pinned chain — never a `-1` placeholder.
     const head = { sha: tip, height: await gateFixHeadHeight(cli, chain, tip) };
+    // MEASURE THE BRANCH BEFORE ACCUSING IT, where the caller could not.
+    //
+    // Attribution reads a log that names the file which REPORTED the failure —
+    // not necessarily the one that caused it — so on its own it can hand a case
+    // to the innocent author of a reporting file. It is an upper bound on where
+    // blame may go (which is why the journal check below waives the branch match:
+    // attribution IS the ceiling on this path), never evidence that this branch
+    // is red. So a group whose commands the pass has not already confirmed here
+    // is MEASURED at the commit the case would be rooted on, and what comes back
+    // decides. Paid after the cheap skips above, so nothing is measured for a
+    // group that was never going to mint.
+    if (opts.confirmAtRoot) {
+      const already = await redObservationUsable(readJournal(dir), cli.repo, g.branch, tip, failedCommands, {
+        attributedCeiling: true,
+      });
+      if (!already.usable) {
+        const verdict = await opts.confirmAtRoot(g.branch, tip, failedCommands);
+        const subtrees = (await checkVerdictKeys(cli.repo, tip, failedCommands).catch(() => [])).map((v) => ({
+          cmd: v.cmd,
+          ...(v.cwd ? { cwd: v.cwd } : {}),
+          subtree: v.subtree,
+        }));
+        if (verdict === 'green') {
+          // GREEN AT ITS OWN TIP MEANS THE RED IS NOT THIS BRANCH'S. The failure
+          // exists only in the integration of several branches, and there is a
+          // mechanism for that shape already; a case here would ask an agent to
+          // fix a branch that passes.
+          const detail =
+            `${g.branch} is green at its own tip — the red is integration-only; the leave-one-out rollback ` +
+            `owns that shape`;
+          droppedGreen.push({ branch: g.branch, detail });
+          appendJournal(dir, {
+            action: 'gate-fix-skipped',
+            owner: g.branch,
+            skipped: g.branch,
+            skippedFiles: g.files,
+            at: tip,
+            subtrees,
+            detail,
+          });
+          console.error(`gate-fix: ${detail}`);
+          continue;
+        }
+        if (verdict !== 'red') {
+          // NOT RED AND NOT GREEN. An UNSTABLE tip established nothing in either
+          // direction; a tip that could not be measured yielded no second
+          // observation at all. Neither may found a case, and the two are
+          // different findings, so they travel under different ids.
+          const id = verdict === 'unstable' ? 'WARN21_CHECKS_FLAKY' : 'WARN22_RED_UNCONFIRMED';
+          const detail =
+            verdict === 'unstable'
+              ? `${g.branch} is UNSTABLE at its own tip ${tip.slice(0, 12)} on ${commandNames.join(', ')} — red ` +
+                `once and green once with nothing changed between, so the failure belongs to no branch`
+              : `${g.branch} could not be measured at its own tip ${tip.slice(0, 12)} — no second observation`;
+          unconfirmed.push({ branch: g.branch, detail });
+          appendJournal(dir, {
+            action: 'gate-fix-refused',
+            id,
+            branch: g.branch,
+            at: tip,
+            files: g.files,
+            subtrees,
+            commands: commandNames,
+            reason: detail,
+          });
+          console.error(`gate-fix [${id}]: ${detail}`);
+          continue;
+        }
+      }
+    }
     // NO ENVIRONMENT, NO CASE. A gate fix exists to turn a failing check green;
     // minted into a tree whose dependencies would not install, its gate can
     // never answer, and it would sit in `openCases` blocking `finish`.
@@ -13375,6 +13502,16 @@ async function materializeGateFixCases(
         reason: `dependencies would not install for ${who} — no fix case can be checked, so none was minted`,
         detail: `verify RED, but ${who} has no working environment: the machine has to be fixed before any fix can be judged`,
       };
+    }
+    // A FOURTH AND A FIFTH, from the mint's own measurement: every blamed branch
+    // was GREEN where the case would have been rooted (so the red belongs to the
+    // integration, not to any one of them), or none of them could be measured
+    // there at all. Both mean "no case, and here is what the driver observed" —
+    // they travel out through the same doors as the reasons above, because what
+    // the caller does next is the same in every one of them.
+    if (droppedGreen.length > 0 || unconfirmed.length > 0) {
+      const why = [...droppedGreen, ...unconfirmed].map((d) => d.detail).join('; ');
+      return { ...none, reason: why, detail: `verify RED, but ${why}` };
     }
     const who = looping.join(', ');
     return {
@@ -13527,9 +13664,22 @@ async function collectPassPullRequests(
   return [...byNumber.values()].sort((a, b) => a.number - b.number);
 }
 
-export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) => GithubTransport): Promise<number> {
+export async function cmdSweepFinish(
+  cli: Cli,
+  makeTransport?: (token: string) => GithubTransport,
+  /**
+   * How the mint measures a blamed branch at its own tip. Injected so a pass
+   * under test spawns no suite; the default takes the measurement for real, in a
+   * fresh worktree installed from that tree's own manifests.
+   */
+  confirmAtRoot?: RootConfirmer,
+): Promise<number> {
   const ctx = await attachPass(cli);
   const dir = ctx.dir;
+  const confirmRoot: RootConfirmer =
+    confirmAtRoot ??
+    ((branch, sha, commands) =>
+      confirmRedAt(cli, dir, branch, sha, commands, defaultChecksRunner, undefined, 'finish'));
   let st = readMachineState(dir);
   /**
    * EVERY EXIT FROM FINISH REPORTS THE PROPOSALS THE PASS CLOSED. Deleting a
@@ -13734,7 +13884,14 @@ export async function cmdSweepFinish(cli: Cli, makeTransport?: (token: string) =
     // PR that blocks the next pass until the owner merges).
     if (verifyRc !== 0) {
       const failedOutput = attributionOutput(attrib ?? null);
-      const gate = await materializeGateFixCases(cli, dir, ctx.chain, failedOutput, failedChecksOf(attrib), offender ?? null);
+      // THE MINT MEASURES WHAT THIS PATH CANNOT. The integration verify attributes
+      // a red BUILD by elimination, over a log naming the file that REPORTED the
+      // failure — so there is no observation here tying the red to the branch a
+      // case would accuse. The mint takes one, per blamed branch, at the commit
+      // the case would be rooted on.
+      const gate = await materializeGateFixCases(cli, dir, ctx.chain, failedOutput, failedChecksOf(attrib), offender ?? null, {
+        confirmAtRoot: confirmRoot,
+      });
       if (gate.served) {
         writeMachineState(dir, { ...st, phase: 'open', currentCase: null, finishStep: 'verify' });
         // BATCHED blame: the failing files can belong to several branches, and
