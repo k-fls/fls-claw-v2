@@ -503,6 +503,13 @@ export async function locateOwner(
      * is journaled and re-running buys the same fact at full price.
      */
     confirmedRed?: (sha: string) => Promise<boolean>;
+    /**
+     * A red this probe measured HERE, twice, at this commit — journaled by the
+     * caller as a confirmation. Only own measurements are reported: a red read
+     * back from `confirmedRed` is another run's observation, and restating it as
+     * one taken here would turn a shared verdict into a second witness.
+     */
+    measuredRed?: (sha: string) => Promise<void>;
   } = {},
 ): Promise<OwnershipResult> {
   let probes = 0;
@@ -540,7 +547,9 @@ export async function locateOwner(
       probes++;
       if (!again.usable) return { kind: 'unusable' };
       const stable = failing.filter((f) => (again.counts.get(f) ?? 0) > 0);
-      return stable.length > 0 ? { kind: 'red', files: stable } : { kind: 'unstable', files: failing };
+      if (stable.length === 0) return { kind: 'unstable', files: failing };
+      await opts.measuredRed?.(sha);
+      return { kind: 'red', files: stable };
     }
     const second = await probe({ kind: 'commit', sha }, files);
     probes++;
@@ -690,6 +699,7 @@ export async function partitionOwners(
   opts: {
     hasAnyFile?: (sha: string, files: string[]) => Promise<boolean>;
     confirmedRed?: (sha: string) => Promise<boolean>;
+    measuredRed?: (sha: string) => Promise<void>;
   } = {},
 ): Promise<OwnerPartition> {
   const groups: OwnerGroup[] = [];

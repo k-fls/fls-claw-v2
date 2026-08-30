@@ -1265,6 +1265,54 @@ async function treeOf(repo: string, commit: string): Promise<string> {
   return (await git(repo, ['rev-parse', `${commit}^{tree}`])).stdout.trim();
 }
 
+/**
+ * The SUBTREE a checks command runs in — the object a run of that command is a
+ * function of.
+ *
+ * A command carries a `cwd` (`{ cmd: 'bun test', cwd: 'container/agent-runner' }`),
+ * and everything it can observe lives under that path: its verdict is a fact
+ * about THAT subtree and says nothing about the rest of the tree. A command with
+ * no cwd runs at the repo root, so its subtree IS the whole tree.
+ *
+ * A cwd that does not exist at this commit resolves to the whole tree instead.
+ * Over-keying costs a measurement; under-keying would let two unrelated trees
+ * share a verdict, so the fallback goes the safe way.
+ */
+async function subtreeOf(repo: string, commit: string, cwd?: string): Promise<string> {
+  const rel = (cwd ?? '').replace(/^\.\/?/, '').replace(/\/+$/, '');
+  if (rel === '') return treeOf(repo, commit);
+  const r = await git(repo, ['rev-parse', `${commit}:${rel}`], { allowCodes: [1, 128] });
+  const oid = r.stdout.trim();
+  return r.code === 0 && oid !== '' ? oid : treeOf(repo, commit);
+}
+
+/**
+ * What a check verdict is ABOUT: the subtree the command ran in and the command.
+ *
+ * Both halves are load-bearing. A run of `tsc` says nothing about `bun test`,
+ * and a run of `bun test` in `container/agent-runner` says nothing about `src/`
+ * — so two branches whose `container/agent-runner` subtrees are identical
+ * cannot disagree about it, and neither can two commands that measure different
+ * bytes.
+ */
+function checkKey(subtree: string, cmd: string): string {
+  return `${subtree} :: ${cmd}`;
+}
+
+/** One command's verdict, with the subtree it was measured on. */
+interface CheckVerdict {
+  cmd: string;
+  cwd?: string;
+  subtree: string;
+}
+
+/** Resolve every command's subtree at one commit, in config order. */
+async function checkVerdictKeys(repo: string, commit: string, commands: VerifyCommand[]): Promise<CheckVerdict[]> {
+  const out: CheckVerdict[] = [];
+  for (const c of commands) out.push({ cmd: c.cmd, ...(c.cwd ? { cwd: c.cwd } : {}), subtree: await subtreeOf(repo, commit, c.cwd) });
+  return out;
+}
+
 /** A journaled hard halt (protected-ref refusal, dirty/aborted merge, …). */
 class DriverHalt extends Error {
   constructor(
@@ -3164,15 +3212,26 @@ type LandingVerdict =
   | { kind: 'skipped' }
   | { kind: 'green' }
   | { kind: 'unmeasured' }
-  | { kind: 'red'; output: string; failed: VerifyCommand[]; failedNames: string[]; tree: string }
+  | { kind: 'red'; output: string; failed: VerifyCommand[]; failedNames: string[]; tree: string; sha: string }
   | { kind: 'flaky'; tree: string; failedNames: string[]; flaky: string[]; detail: string };
 
-/** The GREEN trees this pass has already measured → the branch it measured them on. */
-function greenTrees(journal: JournalEntry[]): Map<string, string> {
+/**
+ * Every (subtree, command) this pass measured GREEN → the branch it ran on.
+ *
+ * Keyed on the subtree the command runs in, so a branch that shares another's
+ * `container/agent-runner` subtree inherits its `bun test` verdict and pays for
+ * nothing, while still paying for the commands whose subtrees it does not
+ * share. Rows are written by every gate that runs the configured commands.
+ */
+function greenChecks(journal: JournalEntry[]): Map<string, string> {
   const out = new Map<string, string>();
   for (const e of journal) {
-    if (e.action === 'landing-check' && e.ok === true && typeof e.tree === 'string' && typeof e.branch === 'string') {
-      if (!out.has(e.tree)) out.set(e.tree, e.branch);
+    if (e.action !== 'landing-check' && e.action !== 'branch-check') continue;
+    if (!Array.isArray(e.checks) || typeof e.branch !== 'string') continue;
+    for (const c of e.checks as Array<{ cmd?: unknown; subtree?: unknown; ok?: unknown }>) {
+      if (c.ok !== true || typeof c.cmd !== 'string' || typeof c.subtree !== 'string') continue;
+      const k = checkKey(c.subtree, c.cmd);
+      if (!out.has(k)) out.set(k, e.branch);
     }
   }
   return out;
@@ -3185,32 +3244,39 @@ function unstableTrees(journal: JournalEntry[]): Set<string> {
   );
 }
 
-/**
- * What a red is CONFIRMED under: the TREE it was seen on and the COMMANDS that
- * failed on it. Both halves are load-bearing — a checks run is a function of the
- * tree, and a confirmation of `tsc` says nothing about `bun test`.
- */
-function redKey(tree: string, commands: string[]): string {
-  return `${tree} :: ${[...commands].sort().join(' | ')}`;
+/** A journaled red confirmation: what the re-run said, and where it was taken. */
+interface RedConfirmRecord {
+  reproduced: boolean;
+  /** The branch whose tree was standing when the command ran. */
+  branch: string;
 }
 
 /**
- * The reds this pass has already RE-RUN, and what the re-run said.
+ * The reds this pass has already RE-RUN, keyed by (subtree, command), and what
+ * the re-run said.
  *
- * A confirmed red is a settled fact about a tree, so every later path that would
- * accuse on the same (tree, commands) reads it here instead of paying for the
- * same suite again. An UNSTABLE one is not settled and is deliberately not
- * reusable as a measurement: it records that the driver may not mint on that
- * observation, never that the tree is red.
+ * A confirmed red is a settled fact about a SUBTREE, so every later path that
+ * would accuse on the same (subtree, command) reads it here instead of paying
+ * for the same suite again — including a path standing on a different branch
+ * that carries the identical subtree. An UNSTABLE one is not settled and is
+ * deliberately not reusable as a measurement: it records that the driver may
+ * not mint on that observation, never that the subtree is red.
+ *
+ * The BRANCH the run was taken on is part of the record. Sharing a verdict
+ * spares a second measurement; it does not make the red an observation ABOUT
+ * the second branch, and a case says "this branch is red".
  */
-function redConfirmations(journal: JournalEntry[]): Map<string, boolean> {
-  const out = new Map<string, boolean>();
+function redConfirmations(journal: JournalEntry[]): Map<string, RedConfirmRecord> {
+  const out = new Map<string, RedConfirmRecord>();
   for (const e of journal) {
-    if (e.action !== 'red-confirm' || typeof e.tree !== 'string' || !Array.isArray(e.commands)) continue;
-    // LAST WRITE WINS. An unstable tree is re-measured on a later call, and that
-    // run is the current fact about it: reading the first row instead would pin
-    // the pass to the contradicted observation and refuse every later mint.
-    out.set(redKey(e.tree, (e.commands as unknown[]).map(String)), e.reproduced === true);
+    if (e.action !== 'red-confirm' || typeof e.subtree !== 'string' || typeof e.cmd !== 'string') continue;
+    // LAST WRITE WINS. An unstable subtree is re-measured on a later call, and
+    // that run is the current fact about it: reading the first row instead would
+    // pin the pass to the contradicted observation and refuse every later mint.
+    out.set(checkKey(e.subtree, e.cmd), {
+      reproduced: e.reproduced === true,
+      branch: typeof e.branch === 'string' ? e.branch : '',
+    });
   }
   return out;
 }
@@ -3228,7 +3294,7 @@ interface RedConfirmation {
 
 /**
  * A SINGLE RED OBSERVATION MAY NOT FOUND A CASE — re-run it on the identical
- * tree first.
+ * subtree first.
  *
  * The driver's probes run in a container that is simultaneously installing
  * worktrees, merging and running other suites, so its own
@@ -3239,10 +3305,11 @@ interface RedConfirmation {
  * reproduction at a commit that is green on repeat. Identical input, different
  * verdict: the only thing that can be concluded is that the check is unstable.
  *
- * PAID ONCE, NOT ONCE PER PATH. The landing gate, blame and the ownership probe
- * can all reach the same (tree, commands); the first to re-run journals the
- * answer and the rest read it. Greens are never re-run — only a red that is
- * about to accuse somebody.
+ * PAID ONCE, NOT ONCE PER PATH AND NOT ONCE PER BRANCH. The landing gate, blame
+ * and the ownership probe can all reach the same (subtree, command); the first
+ * to re-run journals the answer and the rest read it, wherever they are
+ * standing. Greens are never re-run — only a red that is about to accuse
+ * somebody.
  *
  * ONLY THE FAILING COMMANDS ARE RE-RUN. They are the whole of the accusation,
  * and re-running the green ones would pay for the part of the suite that is not
@@ -3253,32 +3320,63 @@ async function confirmRed(
   args: {
     branch: string;
     sha: string;
-    tree: string;
     phase: string;
-    failedNames: string[];
+    /** The commands that failed, WITH the subtree each of them ran in. */
+    failed: CheckVerdict[];
     /** Re-run the FAILED commands on the identical tree. */
-    rerun: () => Promise<ChecksRunResult>;
+    rerun: (commands: CheckVerdict[]) => Promise<ChecksRunResult>;
   },
 ): Promise<RedConfirmation> {
-  const { branch, sha, tree, phase, failedNames } = args;
-  const row = { action: 'red-confirm', branch, sha, tree, phase, commands: failedNames };
-  if (redConfirmations(readJournal(dir)).get(redKey(tree, failedNames)) === true) {
-    appendJournal(dir, { ...row, ran: false, reason: 'confirmed-this-pass', reproduced: true });
-    return { reproduced: true, flaky: [], detail: `${failedNames.join(', ')} were already confirmed red on this tree` };
+  const { branch, sha, phase, failed } = args;
+  const known = redConfirmations(readJournal(dir));
+  const journalOne = (v: CheckVerdict, rest: Record<string, unknown>): void =>
+    appendJournal(dir, {
+      action: 'red-confirm',
+      branch,
+      sha,
+      phase,
+      cmd: v.cmd,
+      ...(v.cwd ? { cwd: v.cwd } : {}),
+      subtree: v.subtree,
+      // The command list, for a reader scanning one row: a confirmation covers
+      // exactly one command, and naming it twice costs nothing.
+      commands: [v.cmd],
+      ...rest,
+    });
+  // ALREADY SETTLED, PER COMMAND. A command whose (subtree, command) the pass has
+  // confirmed is not re-run — on this branch or any other carrying that subtree.
+  const settled = failed.filter((v) => known.get(checkKey(v.subtree, v.cmd))?.reproduced === true);
+  const owed = failed.filter((v) => !settled.includes(v));
+  for (const v of settled) journalOne(v, { ran: false, reason: 'confirmed-this-pass', reproduced: true });
+  if (owed.length === 0) {
+    const names = settled.map((v) => v.cmd);
+    return { reproduced: true, flaky: [], detail: `${names.join(', ')} were already confirmed red on this subtree` };
   }
-  const again = await args.rerun();
+  const again = await args.rerun(owed);
   if (again.environmentFault) {
     const detail = `the confirming re-run could not be taken: ${again.environmentFault.detail}`;
-    appendJournal(dir, { ...row, ran: true, reproduced: false, unmeasurable: true, detail });
+    for (const v of owed) journalOne(v, { ran: true, reproduced: false, unmeasurable: true, detail });
     return { reproduced: false, flaky: [], unmeasurable: { detail }, detail };
   }
-  const flaky = failedNames.filter((c) => !again.failedNames.includes(c));
-  const detail = flaky.length
-    ? `${flaky.join(', ')} FAILED and then PASSED on an immediate re-run of the same tree ${tree.slice(0, 12)} — ` +
-      `nothing changed between the two runs, so the failure is non-deterministic and belongs to no branch`
-    : `${failedNames.join(', ')} failed again on a re-run of the same tree ${tree.slice(0, 12)}`;
-  appendJournal(dir, { ...row, ran: true, reproduced: flaky.length === 0, ...(flaky.length ? { flaky } : {}), detail });
-  return { reproduced: flaky.length === 0, flaky, detail };
+  const flaky = owed.filter((v) => !again.failedNames.includes(v.cmd));
+  for (const v of owed) {
+    const changed = flaky.includes(v);
+    journalOne(v, {
+      ran: true,
+      reproduced: !changed,
+      ...(changed ? { flaky: [v.cmd] } : {}),
+      detail: changed
+        ? `${v.cmd} FAILED and then PASSED on a re-run of the identical subtree ${v.subtree.slice(0, 12)} — ` +
+          `nothing changed between the two runs, so the failure is non-deterministic and belongs to no branch`
+        : `${v.cmd} failed again on a re-run of the identical subtree ${v.subtree.slice(0, 12)}`,
+    });
+  }
+  const names = flaky.map((v) => v.cmd);
+  const detail = names.length
+    ? `${names.join(', ')} FAILED and then PASSED on a re-run of the identical subtree — nothing changed between ` +
+      `the two runs, so the failure is non-deterministic and belongs to no branch`
+    : `${failed.map((v) => v.cmd).join(', ')} failed again on a re-run of the identical subtree`;
+  return { reproduced: names.length === 0, flaky: names, detail };
 }
 
 /**
@@ -3331,9 +3429,48 @@ async function landingCheck(
     appendJournal(dir, { action: 'landing-check', branch, sha, tree, ran: false, reason: 'no-op' });
     return { kind: 'skipped' };
   }
-  const already = greenTrees(readJournal(dir)).get(tree);
-  if (already) {
-    appendJournal(dir, { action: 'landing-check', branch, sha, tree, ok: true, measuredOn: already });
+  // WHAT THIS BRANCH STILL OWES, COMMAND BY COMMAND. A command's verdict belongs
+  // to the subtree its `cwd` names, so a branch that shares another's
+  // `container/agent-runner` subtree owes no `bun test` — the answer is the same
+  // object's, already measured — while still owing every command whose subtree
+  // it does not share. The whole-tree question ("has this tree been measured")
+  // cannot express that: it re-measures a suite over bytes nobody changed.
+  const green = greenChecks(readJournal(dir));
+  const phases: Array<{ phase: 'typecheck' | 'test'; owed: VerifyCommand[]; owedKeys: CheckVerdict[] }> = [];
+  /** Every command's outcome, measured or inherited — this row IS the evidence. */
+  const checkRows: Array<{ cmd: string; cwd?: string; subtree: string; ok: boolean; measuredOn?: string }> = [];
+  const inherited = new Set<string>();
+  for (const [phase, commands] of [
+    ['typecheck', checks.typecheck],
+    ['test', checks.test],
+  ] as const) {
+    const keys = await checkVerdictKeys(cli.repo, sha, commands);
+    const owed: VerifyCommand[] = [];
+    const owedKeys: CheckVerdict[] = [];
+    for (let i = 0; i < commands.length; i++) {
+      const on = green.get(checkKey(keys[i].subtree, commands[i].cmd));
+      if (on === undefined) {
+        owed.push(commands[i]);
+        owedKeys.push(keys[i]);
+        continue;
+      }
+      checkRows.push({ ...keys[i], ok: true, measuredOn: on });
+      inherited.add(on);
+    }
+    phases.push({ phase, owed, owedKeys });
+  }
+  if (phases.every((p) => p.owed.length === 0)) {
+    const on = [...inherited].sort();
+    appendJournal(dir, {
+      action: 'landing-check',
+      branch,
+      sha,
+      tree,
+      ok: true,
+      // The verdict is COPIED, and the row says where each half was measured.
+      measuredOn: on.length === 1 ? on[0] : on.join(', '),
+      checks: checkRows,
+    });
     return { kind: 'skipped' };
   }
   const wt = await addTempWorktree(cli.repo, sha);
@@ -3364,12 +3501,14 @@ async function landingCheck(
     }
     // Typecheck FIRST: it is the cheap check and its diagnostics are what make a
     // failure readable; a red typecheck short-circuits the tests.
-    for (const [phase, commands] of [
-      ['typecheck', checks.typecheck],
-      ['test', checks.test],
-    ] as const) {
-      if (commands.length === 0) continue;
-      const r = await runChecks(commands, wt.path);
+    //
+    // THE SHORT-CIRCUIT SURVIVES SUBTREE KEYING. It is an ordering, not a
+    // verdict: a red typecheck says nothing about the test command's subtree, so
+    // nothing green is inherited from it and the tests are simply not run yet.
+    // The pass returns here, the fix lands, and the tests are measured then.
+    for (const { phase, owed, owedKeys } of phases) {
+      if (owed.length === 0) continue;
+      const r = await runChecks(owed, wt.path);
       if (r.environmentFault) {
         appendJournal(dir, {
           action: 'landing-check',
@@ -3381,10 +3520,15 @@ async function landingCheck(
           id: 'WARN14_ENVIRONMENT_FAULT',
           detail: r.environmentFault.detail,
           phase,
+          checks: checkRows,
         });
         console.error(`run [WARN14_ENVIRONMENT_FAULT]: ${branch} — ${r.environmentFault.detail}`);
         return { kind: 'unmeasured' };
       }
+      // GREENS ARE RECORDED ONLY FROM A GREEN PHASE. A runner that stops at the
+      // first failure leaves the commands after it unrun, and an unrun command
+      // recorded green would be inherited by every branch sharing its subtree.
+      for (const k of owedKeys) if (r.ok || r.failedNames.includes(k.cmd)) checkRows.push({ ...k, ok: r.ok });
       if (!r.ok) {
         // ONE RED IS AN OBSERVATION, NOT A VERDICT. What follows a red landing is
         // a reopen of the branch AND its subtree, a gate-fix case minted on it
@@ -3392,14 +3536,14 @@ async function landingCheck(
         // container that is installing worktrees and running other suites at the
         // same time. So the failing commands run AGAIN on the identical tree
         // before any of that happens.
-        const failed = commands.filter((c) => r.failedNames.includes(c.cmd));
+        const failed = owed.filter((c) => r.failedNames.includes(c.cmd));
+        const failedKeys = owedKeys.filter((k) => r.failedNames.includes(k.cmd));
         const confirm = await confirmRed(dir, {
           branch,
           sha,
-          tree,
           phase,
-          failedNames: r.failedNames,
-          rerun: () => runChecks(failed, wt.path),
+          failed: failedKeys,
+          rerun: (again) => runChecks(failed.filter((c) => again.some((k) => k.cmd === c.cmd)), wt.path),
         });
         if (confirm.unmeasurable) {
           // The second run never happened, so there is no second observation and
@@ -3415,6 +3559,7 @@ async function landingCheck(
             id: 'WARN14_ENVIRONMENT_FAULT',
             detail: confirm.unmeasurable.detail,
             phase,
+            checks: checkRows,
           });
           console.error(`run [WARN14_ENVIRONMENT_FAULT]: ${branch} — ${confirm.unmeasurable.detail}`);
           return { kind: 'unmeasured' };
@@ -3432,6 +3577,7 @@ async function landingCheck(
             failed: r.failedNames,
             flaky: confirm.flaky,
             detail: confirm.detail,
+            checks: checkRows,
           });
           return { kind: 'flaky', tree, failedNames: r.failedNames, flaky: confirm.flaky, detail: confirm.detail };
         }
@@ -3444,11 +3590,12 @@ async function landingCheck(
           confirmed: true,
           phase,
           failed: r.failedNames,
+          checks: checkRows,
         });
-        return { kind: 'red', output: r.output, failed, failedNames: r.failedNames, tree };
+        return { kind: 'red', output: r.output, failed, failedNames: r.failedNames, tree, sha };
       }
     }
-    appendJournal(dir, { action: 'landing-check', branch, sha, tree, ok: true });
+    appendJournal(dir, { action: 'landing-check', branch, sha, tree, ok: true, checks: checkRows });
     return { kind: 'green' };
   } finally {
     await wt.remove();
@@ -4075,7 +4222,7 @@ export async function cmdRun(
           // The observation this case rests on. Blame does not re-measure it —
           // the gate above already re-ran it — but it refuses to mint on one
           // that the journal does not record as confirmed.
-          redOn: { tree: landing.tree, commands: landing.failedNames },
+          redOn: { at: landing.sha, commands: landing.failed },
         });
         gated = true;
         issues.push({
@@ -8814,6 +8961,23 @@ export async function firstRedParticipant(
       if (checked.has(key)) {
         if (checked.get(key) === true) continue;
       }
+      // THE SAME SUBTREE IS THE SAME MEASUREMENT. Every configured typecheck is
+      // green on the subtree it runs in, measured on some branch this pass — so
+      // this branch's typecheck is that answer, and running it again would buy
+      // the same fact at full price.
+      const memo = greenChecks(readJournal(dir));
+      const memoKeys = await checkVerdictKeys(cli.repo, sha, checks.typecheck);
+      if (memoKeys.every((k) => memo.has(checkKey(k.subtree, k.cmd)))) {
+        appendJournal(dir, {
+          action: 'branch-check',
+          branch,
+          sha,
+          ok: true,
+          measuredOn: [...new Set(memoKeys.map((k) => memo.get(checkKey(k.subtree, k.cmd))!))].sort().join(', '),
+          checks: memoKeys.map((k) => ({ ...k, ok: true })),
+        });
+        continue;
+      }
       // Dependencies for THIS branch's manifests, not the clone's. Without
       // this a branch declaring its own package reports TS2307 and is blamed
       // for an environment gap — and worse, an unchanged sha flips red->green
@@ -8844,8 +9008,18 @@ export async function firstRedParticipant(
         continue;
       }
       const wtPath = wt.path;
+      const keys = memoKeys;
       const r = await runChecks(checks.typecheck, wtPath);
-      appendJournal(dir, { action: 'branch-check', branch, sha, ok: r.ok, ...(r.ok ? {} : { failed: r.failedNames }) });
+      appendJournal(dir, {
+        action: 'branch-check',
+        branch,
+        sha,
+        ok: r.ok,
+        ...(r.ok ? {} : { failed: r.failedNames }),
+        // The evidence, per command and per subtree: a green here is what spares
+        // the landing gate the same command on any branch carrying that subtree.
+        checks: keys.filter((k) => r.ok || r.failedNames.includes(k.cmd)).map((k) => ({ ...k, ok: r.ok })),
+      });
       if (!r.ok) {
         const failed = checks.typecheck.filter((c) => r.failedNames.includes(c.cmd));
         // ONE RED IS AN OBSERVATION, NOT A VERDICT — and this red blocks every
@@ -8855,10 +9029,9 @@ export async function firstRedParticipant(
         const confirm = await confirmRed(dir, {
           branch,
           sha,
-          tree,
           phase: 'typecheck',
-          failedNames: r.failedNames,
-          rerun: () => runChecks(failed, wtPath),
+          failed: keys.filter((k) => r.failedNames.includes(k.cmd)),
+          rerun: (again) => runChecks(failed.filter((c) => again.some((k) => k.cmd === c.cmd)), wtPath),
         });
         if (!confirm.reproduced) {
           // NOT RED, AND NOT GREEN — so this check has no verdict to give and
@@ -8965,7 +9138,7 @@ export async function cmdSweepNextCase(
       rootBranch: redBranch.branch,
       // The observation the case rests on — confirmed above, and re-read here so
       // no path reaches a mint on a single red run.
-      redOn: { tree: redBranch.tree, commands: redBranch.failedNames },
+      redOn: { at: redBranch.sha, commands: redBranch.failed },
     });
     redGate = { reason: gate.reason, gated: gate.gated };
     progress(`${redBranch.branch} is RED before any merge (${redBranch.failedNames.join(', ')}) — merging nothing`);
@@ -9439,13 +9612,37 @@ async function adjudicateNotMyBug(p: {
         }
         return false;
       },
-      // PAID ONCE PER (TREE, COMMANDS), not once per path. The landing gate
-      // re-runs the same commands on the same trees; where it already confirmed
-      // this one, the confirming probe here would buy a journaled fact at the
-      // price of another full run of the failing commands.
+      // PAID ONCE PER (SUBTREE, COMMAND), not once per path and not once per
+      // branch. Where the pass already confirmed these commands on the subtrees
+      // this commit carries, the confirming probe here would buy a journaled
+      // fact at the price of another full run of the failing commands — and it
+      // would buy it as a SECOND observation, which it is not: the same bytes
+      // measured again at a different ref is the first measurement, restated.
       confirmedRed: async (sha) => {
-        const tree = await treeOf(cli.repo, sha).catch(() => '');
-        return tree !== '' && redConfirmations(readJournal(dir)).get(redKey(tree, failedCommands.map((c) => c.cmd))) === true;
+        const known = redConfirmations(readJournal(dir));
+        const keys = await checkVerdictKeys(cli.repo, sha, failedCommands).catch(() => []);
+        return keys.length > 0 && keys.every((k) => known.get(checkKey(k.subtree, k.cmd))?.reproduced === true);
+      },
+      // A RED THIS PROBE MEASURED ITSELF, at this ref, is a confirmation like any
+      // other and is journaled as one: the mint below reads it, and no other path
+      // pays for the same subtree again.
+      measuredRed: async (sha) => {
+        const branchHere = sha === branchTip ? branch : rc.parent;
+        for (const k of await checkVerdictKeys(cli.repo, sha, failedCommands)) {
+          appendJournal(dir, {
+            action: 'red-confirm',
+            branch: branchHere,
+            sha,
+            phase: 'ownership',
+            cmd: k.cmd,
+            ...(k.cwd ? { cwd: k.cwd } : {}),
+            subtree: k.subtree,
+            commands: [k.cmd],
+            ran: true,
+            reproduced: true,
+            detail: `${k.cmd} failed twice at ${branchHere} ${sha.slice(0, 12)} on subtree ${k.subtree.slice(0, 12)}`,
+          });
+        }
       },
     });
     /** The branch a group's fix has to land on. */
@@ -9769,6 +9966,12 @@ async function adjudicateNotMyBug(p: {
     for (const plan of plans) {
       const gate = await materializeGateFixCases(cli, dir, ctx.chain, plan.gateOutput, failedCommands, null, {
         rootBranch: plan.ownerBranch,
+        // THE OBSERVATION THIS CASE RESTS ON: the ownership probe's own red, at
+        // the ref it measured. Where that ref's subtrees were already red on
+        // another branch the probe measured nothing new — it read a shared
+        // verdict — and this refuses the mint rather than dressing one
+        // measurement up as two.
+        redOn: { at: plan.group.ref, commands: failedCommands },
         // The PROVEN subset. `partitionOwners` ran the failing commands at this
         // owner's ref and reported which files fail THERE; the raw log carries
         // more than that — the other owners' files and the paths the adjudication
@@ -9816,6 +10019,11 @@ async function adjudicateNotMyBug(p: {
         status: 'stopped',
         issues: [
         { id: 'WARN09_GATE_FIX_SERVED', detail: minted.map((m) => m.gate.detail).join(' | ') },
+        // A REFUSAL TRAVELS UNDER ITS OWN ID. "No case was minted" and WHY are
+        // different sentences, and the why decides what the agent reports.
+        ...minted
+          .filter((m) => typeof m.gate.id === 'string')
+          .map((m) => ({ id: m.gate.id!, detail: `${m.plan.ownerBranch}: ${m.gate.reason}` })),
         // The files the probe could not settle travel with their OWN id: they
         // are not part of any gate fix, and an unstable check is a finding in
         // its own right rather than a footnote on someone else's case.
@@ -11374,47 +11582,90 @@ async function materializeGateFixCases(
      */
     ownedFiles?: string[];
     /**
-     * The OBSERVATION this case would rest on: the tree it was seen on and the
-     * commands that failed there.
+     * The OBSERVATION this case would rest on: the COMMIT the failing commands
+     * were measured at, and the commands.
      *
      * Blame never measures — it reads git history over a failing log someone
      * else produced — so a single red run reaches it as an established fact and
      * comes out the other side as a case, a held PR and a named culprit. When a
-     * caller can say which tree and which commands its red came from, this is
-     * checked against the confirmations the pass has journaled: a red that was
-     * re-run and reproduced mints, and one that changed its answer (or was never
-     * re-run at all) mints nothing. Callers that measure twice on their own —
-     * the integration verify, whose determinism probe runs before attribution —
-     * pass nothing and are unaffected.
+     * caller can say where its red came from, this is checked against the
+     * confirmations the pass has journaled, PER COMMAND AND PER SUBTREE: a red
+     * that was re-run and reproduced on the subtree the command runs in mints,
+     * and one that changed its answer (or was never re-run at all) mints
+     * nothing. Callers that measure twice on their own — the integration
+     * verify, whose determinism probe runs before attribution — pass nothing and
+     * are unaffected.
      */
-    redOn?: { tree: string; commands: string[] };
+    redOn?: { at: string; commands: VerifyCommand[] };
   } = {},
-): Promise<{ served: boolean; cases: GateFixCaseSummary[]; reason: string; detail: string; gated: string[] }> {
+): Promise<{
+  served: boolean;
+  cases: GateFixCaseSummary[];
+  reason: string;
+  detail: string;
+  gated: string[];
+  /** The id a REFUSAL carries, so the agent is told which finding it is. */
+  id?: string;
+}> {
   const journal = readJournal(dir);
   const { features } = loadRegistry({ inventoryDir: cli.inventory, scopeFile: cli.scopeFile, routingFile: cli.routingFile });
   const none = { served: false as const, cases: [] as GateFixCaseSummary[], reason: '', detail: '', gated: [] as string[] };
-  // A SINGLE RED OBSERVATION MAY NOT FOUND A CASE — enforced at the one place a
-  // case is created, so no caller can reach a mint with an unconfirmed red.
-  // Nothing is re-run here: the confirmation belongs where the tree was standing
-  // and its worktree still had its dependencies, and this is a journal read.
+  // A SINGLE RED OBSERVATION MAY NOT FOUND A CASE, AND A VERDICT BELONGS TO THE
+  // SUBTREE THE COMMAND RAN IN — both enforced at the one place a case is
+  // created, so no caller can reach a mint with an unconfirmed red or with a
+  // red that was never measured where the case is being rooted. Nothing is
+  // re-run here: the confirmation belongs where the tree was standing and its
+  // worktree still had its dependencies, and this is a journal read.
+  //
+  // TWO THINGS ARE CHECKED, per failing command:
+  //  - the SUBTREE the command runs in AT THE ROOTED BRANCH is the one the
+  //    confirmation is about. `bun test` in `container/agent-runner` says
+  //    nothing about `src/`, so a confirmation for another command's subtree
+  //    authorises nothing here;
+  //  - the confirming run was taken ON THE ROOTED BRANCH. A branch that shares
+  //    the subtree shares the VERDICT — it is the same bytes and it is not
+  //    measured again — but a case says "this branch is red", and where two
+  //    branches carry the identical subtree nothing distinguishes them: no
+  //    branch introduced the failure and none of them can be handed the fix.
+  //    That red blocks both and is REPORTED; it accuses neither.
   if (opts.redOn) {
-    const confirmed = redConfirmations(journal).get(redKey(opts.redOn.tree, opts.redOn.commands));
-    if (confirmed !== true) {
-      const detail =
-        `${opts.redOn.commands.join(', ')} on tree ${opts.redOn.tree.slice(0, 12)} ` +
-        (confirmed === false
-          ? 'failed and then PASSED on a re-run of the identical tree'
-          : 'was never re-run on the identical tree') +
-        ' — one observation cannot found a case, so nothing is blamed and nothing is minted';
+    const rootedOn = opts.rootBranch ?? '';
+    const confirmations = redConfirmations(journal);
+    const observed = await checkVerdictKeys(cli.repo, opts.redOn.at, opts.redOn.commands);
+    const unusable = observed
+      .map((v) => ({ v, rec: confirmations.get(checkKey(v.subtree, v.cmd)) }))
+      .filter(({ rec }) => rec?.reproduced !== true || rec.branch !== rootedOn);
+    if (unusable.length > 0) {
+      const why = ({ v, rec }: (typeof unusable)[number]): string => {
+        const where = v.cwd ? `${v.cwd} (${v.subtree.slice(0, 12)})` : `the tree ${v.subtree.slice(0, 12)}`;
+        if (rec === undefined) return `${v.cmd} was never re-run on ${where}`;
+        if (!rec.reproduced) return `${v.cmd} failed and then PASSED on a re-run of ${where}`;
+        return (
+          `${v.cmd} was confirmed red on ${where} by a run on ${rec.branch}, not on ${rootedOn} — ` +
+          `the two carry the identical subtree, so nothing there distinguishes them`
+        );
+      };
+      const detail = `${unusable.map(why).join('; ')} — nothing is blamed and nothing is minted`;
+      // TWO DIFFERENT FINDINGS, TWO IDS. A check that gave both answers is
+      // UNSTABLE and the instability is the news; a red nobody confirmed here is
+      // simply UNCONFIRMED — the check may be perfectly stable and the branch
+      // perfectly red, and what is missing is a measurement, not a fix. Reporting
+      // the second as flakiness sends the agent hunting an instability that was
+      // never observed.
+      const id = unusable.some(({ rec }) => rec?.reproduced === false)
+        ? 'WARN21_CHECKS_FLAKY'
+        : 'WARN22_RED_UNCONFIRMED';
       appendJournal(dir, {
         action: 'gate-fix-refused',
-        id: 'WARN21_CHECKS_FLAKY',
-        tree: opts.redOn.tree,
-        commands: opts.redOn.commands,
+        id,
+        branch: rootedOn,
+        at: opts.redOn.at,
+        subtrees: observed.map((v) => ({ cmd: v.cmd, ...(v.cwd ? { cwd: v.cwd } : {}), subtree: v.subtree })),
+        commands: opts.redOn.commands.map((c) => c.cmd),
         reason: detail,
       });
-      console.error(`gate-fix [WARN21_CHECKS_FLAKY]: ${detail}`);
-      return { ...none, reason: detail, detail };
+      console.error(`gate-fix [${id}]: ${detail}`);
+      return { ...none, reason: detail, detail, id };
     }
   }
   // CUT-POINT EXCEPTIONS (cut-points.ts). A MALFORMED file is LOUD and stops

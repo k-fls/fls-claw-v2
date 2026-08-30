@@ -251,6 +251,12 @@ your work. Failures come back as follows.
   runs, is non-deterministic (`WARN21_CHECKS_FLAKY`) and settles nothing in either
   direction: do not chase a green run, and never treat the red as somebody's defect.
   Claim `--tier held` and name the unstable check in the text.
+- A check's verdict belongs to the SUBTREE it runs in — `bun test` in
+  `container/agent-runner` says nothing about `src/` — so branches whose subtree for
+  that command is the same object share one verdict. Where a red was confirmed only
+  on such a sibling, no branch is named and no case is minted
+  (`WARN22_RED_UNCONFIRMED`): the failure is real and blocks, and it belongs to
+  nobody. Report it; do not go looking for the branch that caused it.
 - An environment fault (`WARN14_ENVIRONMENT_FAULT` — missing binaries, unresolvable
   modules, broken bindings) is not a code defect and not counted against you: report it
   to the owner and stop until told otherwise.

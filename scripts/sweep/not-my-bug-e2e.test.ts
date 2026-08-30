@@ -29,6 +29,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { makeNotMyBugIncidentFixture } from './fixtures.js';
 import {
+  appendJournal,
   cmdSweepNextCase,
   cmdSweepReportCase,
   cmdSweepReportPr,
@@ -299,5 +300,86 @@ describe('the not-my-bug deadlock, end to end (real checks, real commits)', () =
     expect(supersededCaseIds(journal).has(served.caseId)).toBe(false);
     expect(refused.instruction).toContain('These failures are YOURS');
     expect(refused.instruction).toContain(failingTest);
+  });
+
+  /**
+   * D-075's incident, as a repo: the failing command runs in a subtree that is
+   * BYTE-IDENTICAL on the accused branch and on the branch the red was actually
+   * seen on. One verdict covers both — and it accuses neither.
+   */
+  it('a red seen on another branch carrying the identical subtree blames nobody here', async () => {
+    const { repo, failingTest, conflictedPath } = makeNotMyBugIncidentFixture();
+    cleanups.push(() => repo.destroy());
+    const ws = tmp('nmb-ws-');
+    const inv = branchlessInventory();
+    const cli = (over: Partial<Cli> = {}): Cli => ({
+      installRunner: fakeInstall,
+      cmd: 'plan',
+      repo: repo.dir,
+      workspace: ws,
+      inventory: inv,
+      scopeFile: join(inv, 'no-scope.yaml'),
+      upstream: 'main',
+      execute: true,
+      ...over,
+    });
+    const out = join(ws, 'result.json');
+    expect(
+      await cmdSweepStart(cli({ cmd: 'sweep-start', checksFile: incidentChecksFile(ws), out: join(ws, 'start.json') })),
+    ).toBe(0);
+    const { watermark12 } = JSON.parse(readFileSync(join(ws, 'start.json'), 'utf8')) as { watermark12: string };
+    const dir = passDir(ws, watermark12);
+
+    expect(await cmdSweepNextCase(cli({ cmd: 'next-case', out }), undefined, fakeInstall)).toBe(0);
+    const served = JSON.parse(readFileSync(out, 'utf8')) as { caseId: string; worktree: string };
+    writeFileSync(join(served.worktree, conflictedPath), 'export const createGroup = () => "fork+upstream";\n');
+    expect(
+      await cmdSweepReportCase(cli({ cmd: 'report-case', tier: 'judged', out }), confirm, undefined, fakeInstall),
+    ).toBe(1);
+
+    // THE INCIDENT. Another branch in this pass carries the SAME
+    // `container/agent-runner` subtree — the accused branch changed nothing in it
+    // — and the run-tests command was measured red THERE. That verdict is about
+    // those bytes, so it holds here too; what it cannot do is name a culprit,
+    // because nothing in the subtree distinguishes the two branches.
+    const runnerSubtree = repo.git('rev-parse', 'main_patched:container/agent-runner');
+    appendJournal(dir, {
+      action: 'red-confirm',
+      branch: 'module/agent-group-contributions',
+      sha: repo.sha('main_patched'),
+      phase: 'test',
+      cmd: 'sh run-tests.sh',
+      cwd: 'container/agent-runner',
+      subtree: runnerSubtree,
+      commands: ['sh run-tests.sh'],
+      ran: true,
+      reproduced: true,
+    });
+
+    expect(
+      await cmdSweepReportCase(
+        cli({ cmd: 'report-case', tier: 'judged', notMyBug: true, out }),
+        confirm,
+        undefined,
+        fakeInstall,
+      ),
+    ).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; instruction: string };
+    const journal = readJournal(dir);
+    // THE POINT: no case is minted on a branch this pass never confirmed a red
+    // on. The failure is real and it is reported — it is simply nobody's to fix.
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    expect(journal.some((e) => e.action === 'case' && e.gateFix === true)).toBe(false);
+    expect(res.status).toBe('stopped');
+    const refusal = journal.find((e) => e.action === 'gate-fix-refused')!;
+    expect(refusal.branch).toBe('main_patched');
+    expect(refusal.id).toBe('WARN22_RED_UNCONFIRMED');
+    expect(refusal.reason).toContain('module/agent-group-contributions');
+    expect(refusal.reason).toContain('identical subtree');
+    // And the subtree the refusal is about is the one the command runs in — not
+    // the whole tree, which the two branches do not share.
+    expect((refusal.subtrees as Array<{ subtree: string }>)[0].subtree).toBe(runnerSubtree);
+    expect(runnerSubtree).not.toBe(repo.git('rev-parse', 'main_patched^{tree}'));
+    expect(failingTest).toContain('container/agent-runner');
   });
 });

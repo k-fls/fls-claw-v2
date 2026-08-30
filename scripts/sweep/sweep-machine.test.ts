@@ -49,6 +49,7 @@ import {
   type ChecksRunner,
   type ColdReadInvoker,
   type InstallRunner,
+  type JournalEntry,
 } from './propagate.js';
 import { DRIVER_COMMIT_ENV } from './proposal.js';
 import type { GithubTransport } from './publish.js';
@@ -5767,6 +5768,192 @@ describe('run — the landing gate', () => {
     const row = journal.find((e) => e.action === 'landing-check' && e.branch === 'feat/c');
     expect(row!.ok).toBe(true);
     expect(row!.tree).toBe(repo.git('rev-parse', 'feat/c^{tree}'));
+  });
+});
+
+/**
+ * D-075's first rule, as tests: a check's verdict is a fact about the SUBTREE
+ * its `cwd` names, so branches carrying the identical subtree share one verdict
+ * and branches that do not are each measured.
+ */
+describe('run — a verdict belongs to the subtree the check ran in', () => {
+  /** A runner that records the commands AND the worktree each run was taken in. */
+  function subtreeRunner(redWhen?: (cmd: string, wt: string) => boolean): {
+    fn: ChecksRunner;
+    ran: Array<{ cmds: string[]; cwd: string }>;
+  } {
+    const ran: Array<{ cmds: string[]; cwd: string }> = [];
+    const fn: ChecksRunner = async (commands, cwd) => {
+      ran.push({ cmds: commands.map((c) => c.cmd), cwd });
+      const failedNames = commands.filter((c) => redWhen?.(c.cmd, cwd)).map((c) => c.cmd);
+      return {
+        ok: failedNames.length === 0,
+        failedNames,
+        output: failedNames.length ? `$ ${failedNames[0]}\nsrc/x.ts(1,1): error TS2345: broken.\n` : '',
+      };
+    };
+    return { fn, ran };
+  }
+  /** The shipped shape: a root typecheck and a test command rooted in a SUBDIRECTORY. */
+  function cwdChecks(ws: string): string {
+    const f = join(ws, 'checks.json');
+    writeFileSync(
+      f,
+      JSON.stringify({
+        typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }],
+        test: [{ cmd: 'bun test', cwd: 'container/agent-runner', filter: 'bun test {files}' }],
+      }),
+    );
+    return f;
+  }
+  const runsOf = (ran: Array<{ cmds: string[] }>, cmd: string): number => ran.filter((r) => r.cmds.includes(cmd)).length;
+  /** A fork whose descendant may or may not touch the agent runner. */
+  function runnerRepo(childTouchesRunner: boolean): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base', {
+      'src/x.ts': 'orig\n',
+      'container/agent-runner/src/poll.test.ts': 'ok\n',
+    });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: own file', { 'src/mp.ts': 'mp\n' });
+    repo.checkout('module/cg', { create: true, at: 'main_patched' });
+    repo.commit(
+      'cg work',
+      childTouchesRunner
+        ? { 'src/cg.ts': 'cg\n', 'container/agent-runner/src/cg.test.ts': 'cg\n' }
+        : { 'src/cg.ts': 'cg\n' },
+    );
+    repo.checkout('main');
+    repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+
+  it('two branches carrying the identical subtree share its verdict — the suite runs once, not once per branch', async () => {
+    const repo = runnerRepo(false);
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'], owned: ['src/cg.ts'] }]);
+    const dir = dirOf(repo, ws);
+    const t = subtreeRunner();
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: cwdChecks(ws) }))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn)).toBe(0);
+
+    const journal = readJournal(dir);
+    const mp = journal.find((e) => e.action === 'landing-check' && e.branch === 'main_patched')!;
+    const cg = journal.find((e) => e.action === 'landing-check' && e.branch === 'module/cg')!;
+    expect(mp.ok).toBe(true);
+    expect(cg.ok).toBe(true);
+    // Both branches LANDED different trees, so neither inherits the other's
+    // whole-tree verdict...
+    expect(cg.tree).not.toBe(mp.tree);
+    // ...but `bun test` runs in `container/agent-runner`, and that subtree is the
+    // same object on both. One measurement answers for both, and the journal says
+    // where it was taken.
+    const bunOf = (row: JournalEntry): { subtree: string; ok: boolean; measuredOn?: string } =>
+      (row.checks as Array<{ cmd: string; subtree: string; ok: boolean; measuredOn?: string }>).find(
+        (c) => c.cmd === 'bun test',
+      )!;
+    expect(bunOf(cg).subtree).toBe(bunOf(mp).subtree);
+    expect(bunOf(cg).subtree).toBe(repo.git('rev-parse', 'module/cg:container/agent-runner'));
+    expect(bunOf(cg).measuredOn).toBe('main_patched');
+    expect(runsOf(t.ran, 'bun test')).toBe(1);
+    // The root typecheck measures the WHOLE tree, which the two do not share, so
+    // it is not inherited: sharing follows the bytes, never the branch.
+    const tscOf = (row: JournalEntry): { measuredOn?: string } =>
+      (row.checks as Array<{ cmd: string; measuredOn?: string }>).find((c) => c.cmd === 'tsc --noEmit')!;
+    expect(tscOf(cg).measuredOn).toBeUndefined();
+    expect(journal.filter((e) => e.action === 'arrived').map((e) => e.branch)).toContain('module/cg');
+  });
+
+  it('a branch whose relevant subtree DIFFERS is measured on its own', async () => {
+    const repo = runnerRepo(true);
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'], owned: ['src/cg.ts'] }]);
+    const dir = dirOf(repo, ws);
+    const t = subtreeRunner();
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: cwdChecks(ws) }))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn)).toBe(0);
+
+    const journal = readJournal(dir);
+    const cg = journal.find((e) => e.action === 'landing-check' && e.branch === 'module/cg')!;
+    const bun = (cg.checks as Array<{ cmd: string; subtree: string; measuredOn?: string }>).find((c) => c.cmd === 'bun test')!;
+    // The child added a file under the runner, so its subtree is a different
+    // object and nothing about it has been measured. It pays for its own run.
+    expect(bun.subtree).toBe(repo.git('rev-parse', 'module/cg:container/agent-runner'));
+    expect(bun.subtree).not.toBe(repo.git('rev-parse', 'main_patched:container/agent-runner'));
+    expect(bun.measuredOn).toBeUndefined();
+    expect(runsOf(t.ran, 'bun test')).toBe(2);
+  });
+
+  it('a red confirmed for another command, or on another subtree, authorises nothing here', async () => {
+    // Both commands run at the ROOT here, so the only thing separating their
+    // verdicts is the command itself — and the seeded confirmations differ from
+    // the failing one in exactly one coordinate each.
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n', 'container/agent-runner/src/poll.test.ts': 'ok\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: own file', { 'src/mp.ts': 'mp\n' });
+    repo.checkout('main');
+    repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+    cleanups.push(() => repo.destroy());
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    const f = join(ws, 'checks.json');
+    writeFileSync(
+      f,
+      JSON.stringify({ typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }], test: [{ cmd: 'vitest run', cwd: '.' }] }),
+    );
+    // `vitest run` is red the first time it is asked on a tree and green after —
+    // the load-dependent shape. It never earns a confirmation.
+    const seen = new Set<string>();
+    const t = subtreeRunner((cmd, wt) => {
+      if (cmd !== 'vitest run') return false;
+      const first = !seen.has(wt);
+      seen.add(wt);
+      return first;
+    });
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: f }))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn)).toBe(1);
+    const landed = readJournal(dir).find((e) => e.action === 'landing-check' && e.unstable === true)!;
+    expect(landed.branch).toBe('main_patched');
+
+    // Two confirmed reds the pass could mistake for this one: the SAME subtree
+    // under a different command, and the SAME command on a different subtree.
+    appendJournal(dir, {
+      action: 'red-confirm',
+      branch: 'main_patched',
+      sha: repo.sha('main_patched'),
+      cmd: 'tsc --noEmit',
+      subtree: landed.tree,
+      commands: ['tsc --noEmit'],
+      ran: true,
+      reproduced: true,
+    });
+    appendJournal(dir, {
+      action: 'red-confirm',
+      branch: 'main_patched',
+      sha: repo.sha('main_patched'),
+      cmd: 'vitest run',
+      cwd: 'container/agent-runner',
+      subtree: repo.git('rev-parse', 'main_patched:container/agent-runner'),
+      commands: ['vitest run'],
+      ran: true,
+      reproduced: true,
+    });
+
+    // The tree is still owed a verdict, so this call measures it again — and
+    // neither seeded row answers for `vitest run` on the landed tree.
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn)).toBe(1);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    expect(journal.some((e) => e.action === 'case')).toBe(false);
+    const fresh = journal.filter((e) => e.action === 'red-confirm' && e.cmd === 'vitest run' && e.subtree === landed.tree);
+    expect(fresh.length).toBeGreaterThan(0);
+    expect(fresh.every((e) => e.reproduced === false)).toBe(true);
   });
 });
 

@@ -1257,9 +1257,12 @@ BOTH runs are the ones the side is answerable for; a side that answers red and
 green about the same file, in either order, is `flaky` — no owner, no mint,
 `WARN21_CHECKS_FLAKY`, and the case goes to the owner HELD with the resolution
 kept and the instability named. Where the pass has ALREADY re-run these commands
-on that tree and seen the red repeat (§7.6's `red-confirm` rows), the confirming
-probe is skipped: the answer is journaled, and buying it again costs another full
-run. The
+on the SUBTREES this commit carries and seen the red repeat (§7.6's `red-confirm`
+rows), the confirming probe is skipped: the answer is journaled, and buying it
+again costs another full run — and it would not buy a SECOND observation anyway,
+since the same bytes asked again at another ref are the first measurement
+restated. A red the probe measures itself, twice, at one ref is journaled as a
+`red-confirm` of its own, so the mint below can read it. The
 interaction verdict states PER SIDE which of the two it was and against which
 ref ("absent at the branch tip `<sha12>` (cannot fail there); probed green twice
 at the parent head `<sha12>`"): a probed green and a vacuous one are different
@@ -1498,11 +1501,12 @@ merging and running other suites at the same time, which is where the driver's o
 `REPRODUCTION: FULL SUITE ONLY` class comes back red once and green on repeat. So
 the FAILING COMMANDS (only those — the greens are not in question) run again on
 the identical tree, in the same worktree with the same dependencies, before any of
-that happens. The outcome is journaled as a `red-confirm` row carrying the tree,
-the commands and `reproduced`, and every other accusing path reads that row rather
-than paying for the same suite again: blame refuses to mint on an observation the
-journal does not record as confirmed, and the ownership probe (§7.2) skips its own
-confirming run for a tree already confirmed here. A re-run that cannot be taken at
+that happens. The outcome is journaled as one `red-confirm` row PER COMMAND,
+carrying the `subtree` that command ran in, the branch it was measured on and
+`reproduced`, and every other accusing path reads those rows rather than paying
+for the same suite again: blame refuses to mint on an observation the journal does
+not record as confirmed, and the ownership probe (§7.2) skips its own confirming
+run for a subtree already confirmed here. A re-run that cannot be taken at
 all (a command that never spawned) leaves the tree UNMEASURED, never red.
 
 **A CHANGED VERDICT ACCUSES NOBODY — and is not a green either.** The two runs
@@ -1535,20 +1539,24 @@ until the fix lands in any case. The result carries `WARN09_GATE_FIX_SERVED` and
   branch that gated with no clean prefix. Nothing arrived, so nothing propagates
   that was not already there, and content inherited from before the pass is
   finish's integration verify to judge (§10.2).
-- The TREE was already measured green this pass, on any branch. A checks run is a
-  function of the tree it runs on — dependencies included, since they install
-  from that tree's own manifests — so a second run answers the same question at
-  full price.
+- The COMMAND's SUBTREE was already measured green this pass, on any branch. A
+  command runs under its `cwd` and can observe nothing outside it, so its verdict
+  is a fact about that subtree — dependencies included, since they install from
+  the tree's own manifests — and a branch that changed nothing there would pay
+  full price for an answer already in the journal. Sharing is per command: a
+  branch can inherit `bun test` in `container/agent-runner` and still owe the
+  root typecheck, because the whole tree is not the same object.
 - No environment: a tree whose dependencies will not install, or a command that
   never spawned, yields NO verdict (`WARN13_DEPS_UNUSABLE` /
   `WARN14_ENVIRONMENT_FAULT`). An unmeasured tree is never read as green, and it
   is journaled rather than passed over in silence.
 
 **The evidence is the journal.** Every landing writes one `landing-check` row —
-`branch`, `sha`, `tree`, and either the verdict (`ok`, plus `phase` and `failed` on
-a red, `confirmed` on one that reproduced, `unstable` + `flaky` on one that did
-not) or why no run was owed (`ran: false` with `reason`, or `ok` copied with
-`measuredOn` naming the branch the tree was measured on). So "did this branch
+`branch`, `sha`, `tree`, a `checks` list giving each command its `subtree`, its
+`ok` and, where the verdict was inherited, the `measuredOn` branch it came from,
+and either the verdict (`ok`, plus `phase` and `failed` on a red, `confirmed` on
+one that reproduced, `unstable` + `flaky` on one that did not) or why no run was
+owed (`ran: false` with `reason`, or `ok` copied with `measuredOn`). So "did this branch
 arrive green, and on which tree" is a JOURNAL READ: the question of whether a red
 is inherited from a parent is answered by comparing rows, with nothing re-probed
 and no parent head examined.
@@ -1651,11 +1659,22 @@ a build log — there is nothing to blame, the branch itself is the answer.
 enforced, because `materializeGateFixCases` is the one place a case is created.
 Blame itself never measures — it reads git history over a failing log somebody
 else produced — so a caller that measured once would hand it an accusation and get
-back a case, a held PR and a named culprit. A caller that can say WHICH TREE and
-WHICH COMMANDS its red came from passes `redOn`, and the mint proceeds only if the
-pass has journaled a `red-confirm` for that pair with `reproduced: true`; a red
-that changed its answer, or was never re-run, mints nothing and is journaled
-`gate-fix-refused` with `WARN21_CHECKS_FLAKY`. Nothing is re-run here — the
+back a case, a held PR and a named culprit. A caller that can say WHERE its red was
+measured passes `redOn` (the commit, and the commands), and the mint proceeds only
+if, FOR EVERY FAILING COMMAND, the pass has journaled a `red-confirm` with
+`reproduced: true` for the subtree that command runs in AT THE BRANCH THE CASE IS
+ROOTED ON, taken by a run ON THAT BRANCH. A red that changed its answer, was never
+re-run, or was confirmed only on another branch carrying the identical subtree
+mints nothing and is journaled `gate-fix-refused` with `WARN21_CHECKS_FLAKY`.
+
+**A shared verdict blocks; it does not accuse.** Two branches whose relevant
+subtree is the same object cannot disagree about a command that runs there, so one
+measurement answers for both — that is the saving. But a gate-fix case says "this
+branch is red", and where the bytes are identical nothing distinguishes the
+branches: no branch introduced the failure and none of them can be handed the fix.
+The red still blocks every branch carrying it (content arrives green or it does
+not arrive) and it is REPORTED; what the driver refuses to do is invent an owner
+for it. Nothing is re-run here — the
 confirmation is paid where the tree was standing with its dependencies installed
 (§7.6), and this is a journal read. The integration verify passes no `redOn`: its
 own determinism probe already re-runs the failing commands before attribution.
