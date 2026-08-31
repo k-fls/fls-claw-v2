@@ -115,11 +115,31 @@ export interface QueryInput {
   };
 }
 
-export interface McpServerConfig {
+/**
+ * A local stdio MCP server, launched from `command`.
+ */
+export interface McpStdioServer {
+  type?: 'stdio';
   command: string;
   args: string[];
   env: Record<string, string>;
+  /** Working directory, for providers whose transport supports one. */
+  cwd?: string;
 }
+
+/**
+ * A remote MCP server addressed by URL. Only some providers can serve this
+ * form. Nothing produces one today — the host's stored-server validator
+ * requires a `command` — but the Codex payload's config writer branches on it,
+ * so the type has to express that `type: 'http'` implies a `url`.
+ */
+export interface McpHttpServer {
+  type: 'http';
+  url: string;
+  headers?: Record<string, string>;
+}
+
+export type McpServerConfig = McpStdioServer | McpHttpServer;
 
 export interface AgentQuery {
   /** Push a follow-up message into the active query. */
@@ -151,4 +171,10 @@ export type ProviderEvent =
    * event (tool call, thinking, partial message, anything) so the
    * poll-loop's idle timer stays honest during long tool runs.
    */
-  | { type: 'activity' };
+  | { type: 'activity' }
+  /**
+   * A file the turn produced on disk (e.g. a generated image) that the agent
+   * did not itself send. Providers with no on-disk transcript yield it so the
+   * poll-loop can deliver the artifact.
+   */
+  | { type: 'file'; path: string };

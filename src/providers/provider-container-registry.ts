@@ -69,7 +69,15 @@ export interface ProviderHostCapabilities {
   readonly providesAgentSurfaces?: boolean;
 }
 
-export type ProviderContainerConfigFn = (ctx: ProviderContainerContext) => ProviderContainerContribution;
+/**
+ * May be async: a provider's contribution can compose files before returning
+ * its mounts (the Codex payload's does). The spawn seam awaits it inside
+ * `fatalOnThrow`, so a rejection is classified rather than escaping as a
+ * transient failure.
+ */
+export type ProviderContainerConfigFn = (
+  ctx: ProviderContainerContext,
+) => ProviderContainerContribution | Promise<ProviderContainerContribution>;
 
 interface RegistryEntry {
   fn: ProviderContainerConfigFn;
