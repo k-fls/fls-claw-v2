@@ -38,8 +38,6 @@ import { log } from './log.js';
 function jsonChat(text: string): string {
   return JSON.stringify({ text });
 }
-
-
 function now(): string {
   return new Date().toISOString();
 }

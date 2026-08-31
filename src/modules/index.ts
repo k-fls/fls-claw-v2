@@ -18,9 +18,6 @@
 // registers its handlers at import time.
 import './approvals/index.js';
 import './interactive/index.js';
-// RESOLUTION NOTE: ours (credentials) had `import './scheduling/index.js'` here.
-// Theirs (crypto, 9dbb152) deleted src/modules/scheduling/index.ts — the merge
-// non-conflictedly accepted that deletion, so the import cannot be honored.
 // container-bootstrap before container-env: container-env imports
 // isEnvNameReserved from the container-bootstrap reserved-env registry.
 import './container-bootstrap/index.js';

@@ -1,16 +1,6 @@
-// RESOLUTION NOTE: ours (credentials, be4229d) mocked existsSync to check file
-// presence; index.ts (non-conflicted, pulled from theirs' ed9a3e33) switched to
-// statSync + mtime-keyed cache and removed permanent parse-error caching (cache
-// resets to null on error so next call re-reads). Mocks updated throughout:
-// existsSync → statSync returning { mtimeMs: 1 } for present files and throwing
-// for missing. The "caches parse error permanently" test was inverted to verify
-// re-read happens (readFileSync called twice, not once). Theirs' new readOnly-
-// translation and nonMainReadOnly tests integrated at the end of loadMountAllowlist
-// suite (index.ts lines 71-89: normalizeRoot translates readOnly → allowReadWrite).
-// The "expands ~ in hostPath" test was updated to use the actual process.env.HOME
-// rather than a hardcoded /home/testuser path (index.ts:173 uses process.env.HOME).
 import os from 'os';
 import path from 'path';
+
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
@@ -18,9 +8,20 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 //
 // Retargeted from the fork's `src/mount-security.test.ts` (535 LOC) onto
 // v2's `src/modules/mount-security/index.ts`. Two fork concepts are gone
-// in v2 and so are their tests: the `nonMainReadOnly` allowlist field and
-// the `isMain` second arg to validateMount / validateAdditionalMounts.
-// v2 derives readonly purely from the mount request + the allowed root.
+// in v2 and so are their tests: the `nonMainReadOnly` allowlist field is
+// tolerated (warn-and-ignore) and the `isMain` second arg to validateMount /
+// validateAdditionalMounts is gone — v2 derives readonly purely from the
+// mount request + the allowed root.
+//
+// RESOLUTION NOTE (mount-security conflict):
+// THEIRS' test used vi.mock('fs') with existsSync + readFileSync.
+// OURS' index.ts (merged without conflict) switched to statSync for
+// mtime-keyed caching — see index.ts lines 103 and 115. The mock here
+// follows the implementation: statSync replaces existsSync and a
+// missing-file is signalled by statSync throwing (ENOENT), not by
+// existsSync returning false. The caching test was updated accordingly:
+// parse errors reset the cache to null but a fixed file is picked up on
+// the next call when its mtime changes (index.ts line 160: cache = null).
 
 const { mockStatSync, mockReadFileSync, mockRealpathSync } = vi.hoisted(() => ({
   mockStatSync: vi.fn() as ReturnType<typeof vi.fn>,
@@ -53,6 +54,7 @@ vi.mock('../../log.js', () => ({
 // ── Test data ─────────────────────────────────────────────────────────
 
 const ALLOWLIST_PATH = '/mock/mount-allowlist.json';
+const STAT_HIT = { mtimeMs: 1000 };
 
 const VALID_ALLOWLIST = {
   allowedRoots: [

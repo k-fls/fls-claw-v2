@@ -212,11 +212,14 @@ export interface ParsedSlashCommand {
 
 /**
  * Extract the slash-command word and arguments from a message `content`
- * payload. Mirrors the JSON-text unwrap used elsewhere: chat adapters
- * stamp `{"text": "..."}`; raw strings are also accepted. Returns `null`
- * when the content doesn't begin with a slash command.
+ * payload. Chat adapters stamp `{"text": "..."}`; raw strings are also
+ * accepted. Returns `null` when the content doesn't begin with a slash
+ * command. No quoting / escape parsing — `args` is a plain whitespace split.
  *
- * No quoting / escape parsing — `args` is a plain whitespace split.
+ * When the channel layer marked a leading bot-mention (`mentionPrefixEnd`,
+ * set by the chat-sdk bridge from the bot's own platform identity), the text
+ * is read from that offset — so a group-channel "@bot /auth" is classified
+ * as "/auth" regardless of the mention prefix.
  */
 export function parseSlashCommand(content: string): ParsedSlashCommand | null {
   let text: string;

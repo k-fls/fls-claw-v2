@@ -78,7 +78,6 @@ export const EVICTION_TIMEOUT = parseInt(process.env.EVICTION_TIMEOUT || '144000
 // kills ignore this and use the fast 1s path.
 export const GRACEFUL_STOP_MS = Math.max(2000, parseInt(process.env.GRACEFUL_STOP_MS || '10000', 10) || 10000);
 
-
 // Per-container resource caps, passed through to `docker run`. Default empty =
 // no flag added = today's unbounded behavior (don't OOM existing OSS workloads).
 // Operators opt in: CONTAINER_CPU_LIMIT=2, CONTAINER_MEMORY_LIMIT=8g.
