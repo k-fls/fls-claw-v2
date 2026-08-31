@@ -265,7 +265,11 @@ async function analyzeParent(
 
   let realMerge = false;
   if (sweep.mergePoint) {
-    const probe = sweep.probes.find((p) => p.head.height === sweep.mergePoint!.height);
+    // BY SHA, never by height: parents-model heads are the parent's own
+    // commits and a fork-side run of them shares one derived height, so a
+    // height lookup can answer with a DIFFERENT commit's probe and call a real
+    // merge a no-op (or the reverse).
+    const probe = sweep.probes.find((p) => p.head.sha === sweep.mergePoint!.sha);
     if (probe && probe.clean && probe.treeOid === branchTree) {
       pp.skipReason = 'no-op';
     } else {

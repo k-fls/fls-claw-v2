@@ -182,10 +182,12 @@ export type ParentVerdict = 'merge' | 'skip' | 'defer' | 'up-to-date' | 'case';
 
 /**
  * Reported conflict handed to the resolving agent (§3 step 4). The case unit is
- * a STACKED RUN (DRIVER.md §4.4): the maximal run of consecutive conflicting heights
+ * a STACKED RUN (DRIVER.md §4.4): the maximal run of consecutive conflicting heads
  * whose conflicted path sets intersect, capped (`stack_cap`). `head` is the
  * run's TOP commit — merging it resolves the whole run in one case/cold read;
- * DEFERRED windows and urge tracking are computed against it.
+ * DEFERRED windows and urge tracking are computed against it. Nothing above the
+ * top belongs to the case: it was never probed in combination with what the
+ * branch is taking, so it stays out of the branch and out of the fix ref.
  */
 export interface ConflictCase {
   /** The run's TOP head: sha is the commit to merge, height its trunk index. */
@@ -206,7 +208,7 @@ export interface ParentPlan {
   /** Chosen merge point = largest clean head (§3); null when even the oldest head conflicts. */
   mergePoint: Head | null;
   verdict: ParentVerdict;
-  /** Reported conflict above the merge point (the smallest conflicting height). */
+  /** Reported conflict above the merge point (the run from the first conflicting head). */
   case: ConflictCase | null;
   /** DEFERRED: the lowest blocked DIRECT parent this conflict defers behind. */
   deferredTo: string | null;

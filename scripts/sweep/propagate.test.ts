@@ -2644,11 +2644,11 @@ describe('propagate run — a freeze that arrives after the plan was written', (
 describe('propagate run — a case is emitted against the tip it will be resolved on', () => {
   it('the run, head and height come from ONE live derivation after an earlier parent moved the tip', async () => {
     // Parents merge SEQUENTIALLY, so by the time the second parent's case is
-    // emitted the tip is not the tip the plan was probed against. Here feat/a's
-    // merge carries U0 into feat/c, which lifts feat/c's coverage past height 0
-    // — so the conflicting run that plan time measured as heights 0 and 1 is,
-    // live, height 1 alone. A case that keeps the plan-time run describes
-    // commits its own conflict no longer spans.
+    // emitted the tip is not the tip the plan was probed against. Here feat/a
+    // carries feat/b's older commits, so merging feat/a into feat/c absorbs the
+    // bottom of feat/b's line — the conflicting run that plan time measured as
+    // three commits is, live, feat/b's top commit alone. A case that keeps the
+    // plan-time run describes commits its own conflict no longer spans.
     const repo = initFixtureRepo();
     repo.commit('base: x', { 'src/x.ts': 'orig\n' });
     repo.checkout('main_patched', { create: true, at: 'main' });
@@ -2656,17 +2656,28 @@ describe('propagate run — a case is emitted against the tip it will be resolve
     // U0 also adds a file, so carrying it down is a REAL merge and not a no-op.
     const u0 = repo.commit('U0: x = up0', { 'src/x.ts': 'up0\n', 'src/z.ts': 'z\n' }); // height 0
     const u1 = repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' }); // height 1
-    // feat/a carries U0 with the SAME x resolution feat/c has, so it merges
-    // into feat/c cleanly while still raising its coverage to 0.
-    repo.checkout('feat/a', { create: true, at: 'main_patched' });
-    repo.commit('a: x = fork', { 'src/x.ts': 'fork\n' });
-    repo.git('merge', '--no-ff', '--no-edit', '-X', 'ours', '-m', 'a merges U0', u0);
-    // feat/b exposes heights 0 and 1, both conflicting with feat/c on x.
+    // feat/b exposes a fork commit and heights 0 and 1, all conflicting with
+    // feat/c on x.
     repo.checkout('feat/b', { create: true, at: 'main_patched' });
     repo.commit('b: x = bfork', { 'src/x.ts': 'bfork\n' });
     repo.git('merge', '--no-ff', '--no-edit', '-X', 'ours', '-m', 'b merges U0', u0);
-    repo.git('merge', '--no-ff', '--no-edit', '-X', 'ours', '-m', 'b merges U1', u1);
+    const bAtH0 = repo.sha('feat/b');
+    // b's top commit moves x AGAIN, so the top still conflicts once the commits
+    // below it have been absorbed and become the merge base.
+    try {
+      repo.git('merge', '--no-ff', '--no-edit', '-m', 'b merges U1', u1);
+    } catch {
+      /* expected: x conflicts; resolved below */
+    }
+    repo.write('src/x.ts', 'bfork2\n');
+    repo.git('add', '-A');
+    repo.git('commit', '--no-edit');
     const bTip = repo.sha('feat/b');
+    // feat/a resolves x the SAME way feat/c does, so it merges into feat/c
+    // cleanly while carrying feat/b's line up to h0 down with it.
+    repo.checkout('feat/a', { create: true, at: 'main_patched' });
+    repo.commit('a: x = fork', { 'src/x.ts': 'fork\n' });
+    repo.git('merge', '--no-ff', '--no-edit', '-X', 'ours', '-m', 'a merges b@h0', bAtH0);
     repo.checkout('feat/c', { create: true, at: 'main_patched' });
     repo.commit('c: x = fork', { 'src/x.ts': 'fork\n' });
     repo.checkout('main');
@@ -2687,7 +2698,7 @@ describe('propagate run — a case is emitted against the tip it will be resolve
         branches: Array<{ branch: string; parents: Array<{ parent: string; case: { run: Array<{ height: number }> } | null }> }>;
       }
     ).branches.find((b) => b.branch === 'feat/c')!.parents.find((p) => p.parent === 'feat/b')!;
-    expect(planned.case!.run.map((h) => h.height)).toEqual([0, 1]);
+    expect(planned.case!.run.map((h) => h.height)).toEqual([-1, 0, 1]);
 
     expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
     const row = readJournal(dir).find((e) => e.action === 'case' && e.branch === 'feat/c')!;

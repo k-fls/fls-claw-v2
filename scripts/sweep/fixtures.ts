@@ -231,6 +231,59 @@ export function makePropagationFixture(): {
 }
 
 /**
+ * A PARENT WHOSE WHOLE ADVANCE IS FORK-SIDE — nine commits in ONE height bucket.
+ *
+ *   main          base + U0 (trunk util)                      height 0
+ *   main_patched  base + merge U0 + p1 … p9                   every one at height 0
+ *   feat/child    base + its own edit of src/a.ts, src/b.ts   coverage -1
+ *
+ * None of p1…p9 merges anything from the trunk, so all nine derive the SAME
+ * covered height: the child's window is one bucket deep, and what the child may
+ * take is a question about COMMITS, not about heights. p1 touches only files the
+ * child never edits, so it merges CLEAN; p2…p9 each rewrite src/a.ts and
+ * src/b.ts and conflict with the child on both. Each of p2…p9 also adds a marker
+ * file `src/p<i>.ts`, so what a merge, a case or a fix ref actually carried is
+ * readable off a file list.
+ *
+ * The caller must pass `base` as the driver's `--base`: main_patched absorbs U0,
+ * so the default `merge-base(main_patched, main)` would put the fork point AT
+ * the watermark and leave the pass with an empty chain.
+ */
+export function makeForkRunFixture(): {
+  repo: FixtureRepo;
+  /** The trunk fork point — pass it as `--base`. */
+  base: string;
+  /** p1 — the clean head the child's prefix merge lands at. */
+  cleanHead: string;
+  /** p2 … p9, oldest first; each conflicts with the child on the same two files. */
+  conflicting: string[];
+} {
+  const repo = initFixtureRepo();
+  repo.commit('base: a, b, keep', { 'src/a.ts': 'base\n', 'src/b.ts': 'base\n', 'src/keep.ts': 'base\n' });
+  const base = repo.sha('main');
+  repo.checkout('main_patched', { create: true, at: 'main' });
+  repo.checkout('feat/child', { create: true, at: 'main' });
+  repo.commit('child: forks a and b', { 'src/a.ts': 'child\n', 'src/b.ts': 'child\n' });
+  repo.checkout('main');
+  repo.commit('U0: trunk util', { 'src/u.ts': 'u\n' });
+  repo.checkout('main_patched');
+  repo.merge('main', 'mp merges U0');
+  const cleanHead = repo.commit('p1: docs and keep', { 'docs/p1.md': 'p1\n', 'src/keep.ts': 'kept\n' });
+  const conflicting: string[] = [];
+  for (let i = 2; i <= 9; i++) {
+    conflicting.push(
+      repo.commit(`p${i}: a and b`, {
+        'src/a.ts': `p${i}\n`,
+        'src/b.ts': `p${i}\n`,
+        [`src/p${i}.ts`]: `p${i}\n`,
+      }),
+    );
+  }
+  repo.checkout('main');
+  return { repo, base, cleanHead, conflicting };
+}
+
+/**
  * THE NOT-MY-BUG DEADLOCK, as a repo. Everything a sweep needs to walk
  * straight into the
  * deadlock `--not-my-bug` exists for, with real commits and REAL check commands:

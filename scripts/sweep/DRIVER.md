@@ -79,12 +79,18 @@ A **pass** is one driver run over the whole in-scope DAG.
   everywhere; upstream advancing mid-pass is invisible until the next pass.
 - **Heights**: the trunk first-parent chain is enumerated once
   (`git rev-list --first-parent --reverse`) from the fork point, and each commit
-  gets an index. A *merge head* is the pair `{sha, height}`; every comparison
-  (barrier, DEFERRED, coverage, merge point) uses the height, with the sha as an
-  integrity check. Never compare by commit date or subject. For `main_patched`
-  the chain is enumerated on `main` (which FF-mirrors upstream); parents-model
-  branches are measured against the same single chain, because content reaches
-  them only through parents.
+  gets an index. A *merge head* is the pair `{sha, height}`; the barrier, the
+  DEFERRED check, coverage, the cut and the machine block all compare heights,
+  with the sha as an integrity check. Never compare by commit date or subject.
+  For `main_patched` the chain is enumerated on `main` (which FF-mirrors
+  upstream); parents-model branches are measured against the same single chain,
+  because content reaches them only through parents.
+- **A height is a projection onto the trunk, not an identity.** Several
+  parents-model heads can share one: a parent's fork-side commits advance no
+  upstream coverage, so a whole run of them projects to the same index. Anything
+  that has to tell such heads apart — the order of the merge-point sweep, a case
+  id, a fix ref name — carries the head's sha as well, and the sweep walks its
+  line by POSITION rather than by height.
 - **Coverage** (derived): a branch's covered height is the highest chain index
   whose commit is an ancestor of the branch tip. Ancestry along a first-parent
   chain is monotonic, so this is a binary search with
@@ -414,16 +420,26 @@ For entry-point branches (`main_patched`, edition-composition branches merging
 heads are trunk commits.
 
 For parents-model branches it is the **parent branch's own first-parent
-history**: candidate heads are the parent's commits, each carrying a derivable
-covered height. "Merging the parent at height ≤ N" means merging the newest
-parent commit whose covered height is < N, derived by ancestry probes with no
-stored refs. If the parent advanced in one big merge and no such historical tip
-exists, the child simply does not merge that parent this pass.
+history**: candidate heads are the parent's first-parent commits the branch has
+not yet absorbed — `git rev-list --first-parent --reverse <parentTip>
+^<branchTip>` — each carrying a derivable covered height. Absorption is decided
+by ancestry, and the walk stops at the branch tip, so the line is exactly the
+unabsorbed window. If the parent advanced in one big merge, intermediate heights
+simply do not exist; the commits that do exist are all offered.
 
-**Fork-only parent content**: when the height-filtered line would be empty but the
-parent tip is NOT an ancestor of the child, the parent tip itself (at its derived
-height) is the single candidate head. Otherwise a fork fix merged into a parent
-would not reach descendants until upstream next advanced.
+**Every unabsorbed commit is a candidate**, not one per height. A parent's
+fork-side commits advance no upstream coverage, so a run of them derives one
+height; keeping only the newest of each height collapses that run to the parent's
+tip, and a one-head line has no clean prefix to merge and no older head to sweep.
+The branch then takes nothing it could have taken, the case names the parent's
+tip, and the fix ref carries the parent's whole tip for review. This is also what
+carries fork-only parent content down: a parent whose only new work is fork-side
+has that work enumerated as ordinary heads, so a fork fix merged into a parent
+reaches descendants without waiting for upstream to advance.
+
+**The cut still applies at height grain** (§5.2): heads at or above the block are
+withheld and the removal is announced (`trimmedAt`), a blocked parent's tip
+included.
 
 ### 4.3 Merge-point selection — linear sweep, never bisect
 
@@ -437,11 +453,19 @@ Per branch and per parent, over the parent's eligible line:
 1. Probe the full range first — one in-memory `merge-tree` against the parent's
    eligible tip. Clean → done (the common case, one probe total).
 2. On conflict, sweep the eligible line linearly (one probe per candidate head,
-   oldest → newest), recording clean/conflicted per height.
-3. Merge at the LARGEST clean height — which may lie beyond intermediate
-   conflicting heights, whose content then lands cleanly at tip level.
-4. Report the case starting at the smallest conflicting height above the merge
-   point, stacked per §4.4.
+   oldest → newest), recording clean/conflicted per head.
+3. Merge at the LARGEST clean head — the last clean probe in line order, which
+   may lie beyond intermediate conflicting heads whose content then lands
+   cleanly at tip level.
+4. Report the case starting at the first conflicting head above the merge point,
+   stacked per §4.4.
+
+The sweep orders by POSITION in the line, never by height. Coverage is
+non-decreasing along a first-parent line, so position subsumes height and is
+exact where consecutive heads share one — which is the ordinary parents-model
+case. A height comparison there names an arbitrary member of the tied group as
+the merge point and then hides every conflicting head at that height from step 4,
+returning no case at all while the branch stops dead below the cut.
 
 Probes are checkout-free and cost milliseconds; upstream deltas are tens of
 commits, so linear cost is negligible and correctness beats O(log n).
@@ -475,12 +499,11 @@ process.
 
 ### 4.4 The case unit — commit stacking
 
-A case is the MAXIMAL RUN of consecutive conflicting heights whose conflicted
-path sets intersect — one logical decision — capped by `stack_cap` (default 5;
-global lever in `registry/routing.yaml`, per-entry override on the inventory
-entry). The run breaks at a clean height, at a disjoint-path conflict (its own
-case later), and at the cap. Never stack disjoint-path conflicts; never stack
-across a clean height.
+A case is the MAXIMAL RUN of consecutive conflicting HEADS whose conflicted path
+sets intersect — one logical decision — capped by `stack_cap` (default 5; global
+lever in `registry/routing.yaml`, per-entry override on the inventory entry). The
+run breaks at a clean head, at a disjoint-path conflict (its own case later), and
+at the cap. Never stack disjoint-path conflicts; never stack across a clean head.
 
 The case's `head` is the run's TOP commit, and `conflictedPaths` / `automergeTree`
 are computed at the top, so resolving the case resolves the whole run under ONE
@@ -488,6 +511,13 @@ cold read. This applies to all conflict tiers: MECHANICAL/JUDGED resolve the run
 as one case; a HELD PR's head is the run's top commit, so its diff is the whole
 run. The DEFERRED height check and urge tracking are computed against the run's
 top.
+
+**The run top is also the ceiling of what leaves the pass.** Content above it was
+never probed in combination with anything the branch is taking, so it stays out
+of the branch, out of the case and out of the fix ref: the owner is asked to
+review what the pass verified and nothing else. The remainder is offered again
+after the case resolves — the resolution reopens the branch, and the
+re-derivation serves the rest of the window as its own case, in the same pass.
 
 ### 4.5 No-op skips and the leaf must-merge rule
 
@@ -593,8 +623,9 @@ is the upper CUT-OFF of the merge window — for the branch itself and for every
 descendant. A cut-off exists iff the PR is open and its head is not reachable
 from the branch tip; GitHub squash- and rebase-merges land content without
 ancestry, so the PR's own state is the authority and reachability is
-corroboration. Heights are a comparable projection used to order candidates
-INSIDE an eligible line; they never decide whether a cut-off exists.
+corroboration. Heights are a comparable projection onto the trunk, used to place
+the cut INSIDE an eligible line; they never decide whether a cut-off exists, and
+they are not what orders the line (§4.3).
 
 **Two kinds of proposal, told apart by the HEAD'S SHAPE, never by the ref name.**
 `start` classifies each open sweep PR when it reads it — that is the only moment

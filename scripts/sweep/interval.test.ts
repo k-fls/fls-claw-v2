@@ -2,7 +2,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import { initFixtureRepo, makePropagationFixture } from './fixtures.js';
 import { enumerateChain, type Chain } from './heights.js';
-import { buildEligibleLine, mergePointSweep } from './interval.js';
+import { buildEligibleLine, mergePointSweep, type EligibleLine } from './interval.js';
 import { revParse } from './git.js';
 import { WHOLE_RANGE_BLOCK } from './types.js';
 
@@ -235,8 +235,11 @@ describe('buildEligibleLine (parents model, §4) — no-historical-tip variant',
         model: 'parents',
         chain: chn,
       });
-      // Only height 2 is reachable — no intermediate parent tip at 0 or 1.
-      expect(line.heads.map((h) => h.height)).toEqual([2]);
+      // Heights 0 and 1 are genuinely absent — the parent has no commit whose
+      // coverage is either, so the child cannot merge them this pass. Its own
+      // fork-side commit is still a candidate, at the coverage it derives (-1).
+      expect(line.heads.map((h) => h.height)).toEqual([-1, 2]);
+      expect(line.heads.map((h) => h.sha)).toEqual([await revParse(r.dir, 'P^'), await revParse(r.dir, 'P')]);
     } finally {
       r.destroy();
     }
@@ -289,6 +292,134 @@ describe('buildEligibleLine (parents model, §4) — fork-only parent content', 
         chain: chn,
       });
       expect(line2.heads).toHaveLength(0);
+    } finally {
+      r.destroy();
+    }
+  });
+});
+
+describe('mergePointSweep — order is the line position, not the height', () => {
+  /**
+   * TWO HEADS AT ONE HEIGHT, the older clean and the newer conflicting. Nothing
+   * about a parents-model line forbids this: a parent's fork-side commits
+   * advance no upstream coverage, so a whole run of them derives one height.
+   * A sweep ordered by height picks an arbitrary member of the tied group as the
+   * merge point and then filters the case run with `height > floor`, which
+   * excludes the tied conflicting head — the branch stops with no merge point to
+   * report and no case to serve.
+   */
+  it('a clean and a conflicting head at the SAME height: merge at the clean one, report the conflicting one', async () => {
+    const r = initFixtureRepo();
+    r.commit('base x', { 'src/x.ts': 'orig\n' });
+    const b = r.sha('main');
+    r.commit('U0: util', { 'src/u.ts': 'u\n' }); // trunk, height 0
+    r.checkout('P', { create: true, at: b });
+    r.git('merge', '--no-ff', '--no-edit', '-m', 'P merges U0', r.sha('main'));
+    const pClean = r.commit('P: adds g', { 'src/g.ts': 'g\n' }); // height 0, clean
+    const pConflict = r.commit('P: x = pfork', { 'src/x.ts': 'pfork\n' }); // height 0, conflicts
+    r.checkout('C', { create: true, at: b });
+    r.git('merge', '--no-ff', '--no-edit', '-m', 'C merges U0', r.sha('main'));
+    r.commit('C: x = cfork', { 'src/x.ts': 'cfork\n' });
+    r.checkout('main');
+    try {
+      const cTip = await revParse(r.dir, 'C');
+      // The line is stated OUTRIGHT, so this pins the sweep and nothing else:
+      // two heads, one bucket, the older clean and the newer conflicting.
+      const line: EligibleLine = {
+        branch: 'C',
+        parent: 'P',
+        model: 'parents',
+        coverage: 0,
+        heads: [
+          { sha: pClean, height: 0 },
+          { sha: pConflict, height: 0 },
+        ],
+      };
+      const res = await mergePointSweep(r.dir, cTip, line);
+      expect(res.mergePoint?.sha).toBe(pClean);
+      expect(res.firstConflict?.head.sha).toBe(pConflict);
+      expect(res.firstConflict?.run.map((h) => h.sha)).toEqual([pConflict]);
+      expect(res.firstConflict?.conflictedPaths).toEqual(['src/x.ts']);
+    } finally {
+      r.destroy();
+    }
+  });
+});
+
+describe('parents model — a purely fork-side parent advance', () => {
+  /**
+   * A parent whose only new work is fork-side: three commits, no upstream
+   * progress at all, so all three derive the same height. Every one of them is a
+   * candidate — a line that keeps only the newest has no clean prefix to merge
+   * and no older head to sweep, so the branch takes nothing and the case names
+   * the parent's tip.
+   */
+  function forkAdvance(): { r: ReturnType<typeof initFixtureRepo>; b: string } {
+    const r = initFixtureRepo();
+    r.commit('base x', { 'src/x.ts': 'orig\n' });
+    const b = r.sha('main');
+    r.commit('U0: util', { 'src/u.ts': 'u\n' }); // trunk, height 0 — neither side takes it
+    return { r, b };
+  }
+
+  it('no conflict: every fork commit is a candidate and the whole run merges', async () => {
+    const { r, b } = forkAdvance();
+    r.checkout('P', { create: true, at: b });
+    r.commit('p1: g', { 'src/g.ts': 'g\n' });
+    r.commit('p2: h', { 'src/h.ts': 'h\n' });
+    r.commit('p3: i', { 'src/i.ts': 'i\n' });
+    r.checkout('C', { create: true, at: b });
+    r.commit('c: own', { 'src/c.ts': 'c\n' });
+    r.checkout('main');
+    try {
+      const chn = await enumerateChain(r.dir, 'main', b);
+      const cTip = await revParse(r.dir, 'C');
+      const line = await buildEligibleLine({
+        repo: r.dir,
+        branch: 'C',
+        branchTip: cTip,
+        parent: 'P',
+        model: 'parents',
+        chain: chn,
+      });
+      // Three commits, one bucket: no upstream progress lifts any of them.
+      expect(line.heads.map((h) => h.height)).toEqual([-1, -1, -1]);
+      const res = await mergePointSweep(r.dir, cTip, line);
+      expect(res.cleanFullRange).toBe(true);
+      expect(res.mergePoint?.sha).toBe(await revParse(r.dir, 'P'));
+      expect(res.firstConflict).toBeNull();
+    } finally {
+      r.destroy();
+    }
+  });
+
+  it('conflict from the first fork commit: the case head is the run TOP, not the parent tip', async () => {
+    const { r, b } = forkAdvance();
+    r.checkout('P', { create: true, at: b });
+    const p1 = r.commit('p1: x = p1', { 'src/x.ts': 'p1\n' });
+    const p2 = r.commit('p2: x = p2', { 'src/x.ts': 'p2\n' });
+    r.commit('p3: x = p3', { 'src/x.ts': 'p3\n' });
+    r.checkout('C', { create: true, at: b });
+    r.commit('c: x = cfork', { 'src/x.ts': 'cfork\n' });
+    r.checkout('main');
+    try {
+      const chn = await enumerateChain(r.dir, 'main', b);
+      const cTip = await revParse(r.dir, 'C');
+      const line = await buildEligibleLine({
+        repo: r.dir,
+        branch: 'C',
+        branchTip: cTip,
+        parent: 'P',
+        model: 'parents',
+        chain: chn,
+      });
+      // Cap the run at two: the top of the run is p2, and p3 — never probed in
+      // combination with anything the branch will take — stays out of the case.
+      const res = await mergePointSweep(r.dir, cTip, line, 2);
+      expect(res.mergePoint).toBeNull(); // the first commit already conflicts
+      expect(res.firstConflict?.run.map((h) => h.sha)).toEqual([p1, p2]);
+      expect(res.firstConflict?.head.sha).toBe(p2);
+      expect(res.firstConflict?.head.sha).not.toBe(await revParse(r.dir, 'P'));
     } finally {
       r.destroy();
     }
@@ -382,14 +513,16 @@ describe('buildEligibleLine — the trim at an unresolved conflict (§5.2)', () 
     try {
       const cTip = await revParse(r.dir, 'C');
       const args = { repo: r.dir, branch: 'C', branchTip: cTip, parent: 'P', model: 'parents' as const, chain: chn };
-      expect((await buildEligibleLine(args)).heads.map((h) => h.height)).toEqual([0, 1, 2]);
+      // P's own fork commit derives -1 and is a candidate in its own right;
+      // then one head per upstream merge.
+      expect((await buildEligibleLine(args)).heads.map((h) => h.height)).toEqual([-1, 0, 1, 2]);
 
       const trimmed = await buildEligibleLine({ ...args, blockedAtHeight: 1 });
-      expect(trimmed.heads.map((h) => h.height)).toEqual([0]);
+      expect(trimmed.heads.map((h) => h.height)).toEqual([-1, 0]);
       expect(trimmed.trimmedAt).toBe(1);
 
       const untouched = await buildEligibleLine({ ...args, blockedAtHeight: 3 });
-      expect(untouched.heads.map((h) => h.height)).toEqual([0, 1, 2]);
+      expect(untouched.heads.map((h) => h.height)).toEqual([-1, 0, 1, 2]);
       expect(untouched.trimmedAt).toBeUndefined();
     } finally {
       r.destroy();
@@ -423,12 +556,17 @@ describe('buildEligibleLine — the trim at an unresolved conflict (§5.2)', () 
     try {
       const cTip = await revParse(r.dir, 'C');
       const pTip = await revParse(r.dir, 'P');
+      const pMerge = await revParse(r.dir, 'P^');
       const args = { repo: r.dir, branch: 'C', branchTip: cTip, parent: 'P', model: 'parents' as const, chain: chn };
 
-      // Untrimmed, the parent tip is the single candidate — coverage is equal
-      // on both sides, so nothing but this arm can carry the fork commit down.
+      // Untrimmed, BOTH of P's unabsorbed commits are candidates and both derive
+      // height 0 — coverage is equal on the two sides, so height says nothing
+      // here and ancestry says everything.
       const open = await buildEligibleLine(args);
-      expect(open.heads).toEqual([{ sha: pTip, height: 0 }]);
+      expect(open.heads).toEqual([
+        { sha: pMerge, height: 0 },
+        { sha: pTip, height: 0 },
+      ]);
       expect(open.trimmedAt).toBeUndefined();
 
       // The parent tip sits AT the trim: withheld, and the withholding is
@@ -446,7 +584,10 @@ describe('buildEligibleLine — the trim at an unresolved conflict (§5.2)', () 
       // A trim ABOVE the parent tip's height lets the fork content through and
       // reports no removal.
       const above = await buildEligibleLine({ ...args, blockedAtHeight: 1 });
-      expect(above.heads).toEqual([{ sha: pTip, height: 0 }]);
+      expect(above.heads).toEqual([
+        { sha: pMerge, height: 0 },
+        { sha: pTip, height: 0 },
+      ]);
       expect(above.trimmedAt).toBeUndefined();
     } finally {
       r.destroy();

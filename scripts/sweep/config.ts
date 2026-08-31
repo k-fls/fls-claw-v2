@@ -57,7 +57,7 @@ export const FORK_POINT = 'd85efea229ea63fb0bd4f57a039f4ef73ece563b';
 
 /**
  * Case-stacking cap (DRIVER.md §4.4): a case is the maximal run of consecutive
- * path-intersecting conflicting heights, capped here by default. The lever:
+ * path-intersecting conflicting heads, capped here by default. The lever:
  * global `stack_cap` in registry/routing.yaml; per-feature `stack_cap` on the
  * inventory entry (mirroring the scope-guard lever).
  */
