@@ -9,7 +9,7 @@ import path from 'path';
 import { backfillContainerConfigs } from './backfill-container-configs.js';
 import { DATA_DIR, SHUTDOWN_DRAIN_TIMEOUT_MS } from './config.js';
 import { enforceStartupBackoff } from './circuit-breaker.js';
-import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
+import { migrateGroupsToClaudeLocal } from './migrate-groups-to-claude-local.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';

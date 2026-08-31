@@ -59,29 +59,29 @@ afterEach(() => {
 });
 
 describe('resolveProviderContribution source merge', () => {
-  it('applies both sources for a provider that registers each', () => {
+  it('applies both sources for a provider that registers each', async () => {
     registerRuntime(() => ({ env: { FROM_RUNTIME: '1' }, mounts: [runtimeMount] }));
     registerProviderContainerConfig(PROVIDER, () => ({ env: { FROM_REGISTRY: '1' }, mounts: [registryMount] }));
 
-    const { contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
+    const { contribution } = await resolveProviderContribution(session, agentGroup, containerConfig);
 
     expect(contribution.env).toEqual({ FROM_RUNTIME: '1', FROM_REGISTRY: '1' });
     expect(contribution.mounts).toEqual([runtimeMount, registryMount]);
   });
 
-  it('behaves as before for a provider with only a runtime extension', () => {
+  it('behaves as before for a provider with only a runtime extension', async () => {
     registerRuntime(() => ({ env: { FROM_RUNTIME: '1' }, mounts: [runtimeMount] }));
 
-    const { contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
+    const { contribution } = await resolveProviderContribution(session, agentGroup, containerConfig);
 
     expect(contribution.env).toEqual({ FROM_RUNTIME: '1' });
     expect(contribution.mounts).toEqual([runtimeMount]);
   });
 
-  it('behaves as before for a provider with only a registry entry', () => {
+  it('behaves as before for a provider with only a registry entry', async () => {
     registerProviderContainerConfig(PROVIDER, () => ({ env: { FROM_REGISTRY: '1' }, mounts: [registryMount] }));
 
-    const { contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
+    const { contribution } = await resolveProviderContribution(session, agentGroup, containerConfig);
 
     expect(contribution.env).toEqual({ FROM_REGISTRY: '1' });
     expect(contribution.mounts).toEqual([registryMount]);
@@ -89,17 +89,17 @@ describe('resolveProviderContribution source merge', () => {
 
   // The runtime source's env values are the per-group credential substitutes the
   // proxy matches on, so a registry entry must never shadow one.
-  it('keeps the runtime value when both sources set the same env key', () => {
+  it('keeps the runtime value when both sources set the same env key', async () => {
     registerRuntime(() => ({ env: { SHARED: 'runtime-substitute' } }));
     registerProviderContainerConfig(PROVIDER, () => ({ env: { SHARED: 'registry-placeholder', OTHER: '1' } }));
 
-    const { contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
+    const { contribution } = await resolveProviderContribution(session, agentGroup, containerConfig);
 
     expect(contribution.env).toEqual({ SHARED: 'runtime-substitute', OTHER: '1' });
   });
 
-  it('contributes nothing for a provider that registers neither', () => {
-    const { contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
+  it('contributes nothing for a provider that registers neither', async () => {
+    const { contribution } = await resolveProviderContribution(session, agentGroup, containerConfig);
 
     expect(contribution.env).toBeUndefined();
     expect(contribution.mounts).toBeUndefined();
@@ -110,42 +110,46 @@ describe('resolveProviderContribution failure handling', () => {
   // Left unwrapped, a throw here reads as a transient spawn error: host-sweep
   // re-wakes the session every 60s forever without incrementing the attempt
   // count, so a deterministic bug becomes an infinite quiet retry.
-  it('fails the spawn fatally when the runtime contribution throws', () => {
+  it('fails the spawn fatally when the runtime contribution throws', async () => {
     registerRuntime(() => {
       throw new Error('runtime boom');
     });
 
-    expect(() => resolveProviderContribution(session, agentGroup, containerConfig)).toThrow(FatalSpawnError);
+    await expect(resolveProviderContribution(session, agentGroup, containerConfig)).rejects.toThrow(FatalSpawnError);
   });
 
-  it('fails the spawn fatally when the registry contribution throws', () => {
+  it('fails the spawn fatally when the registry contribution throws', async () => {
     registerProviderContainerConfig(PROVIDER, () => {
       throw new Error('registry boom');
     });
 
-    expect(() => resolveProviderContribution(session, agentGroup, containerConfig)).toThrow(FatalSpawnError);
+    await expect(resolveProviderContribution(session, agentGroup, containerConfig)).rejects.toThrow(FatalSpawnError);
   });
 
   // A contribution does real I/O — the default provider writes its substitute
   // file on every OAuth-mode spawn — so an errno the next attempt may clear has
   // to stay retryable. Wrapping it would poison the session until the user sends
   // another message.
-  it('leaves a transient errno retryable instead of poisoning the spawn', () => {
+  it('leaves a transient errno retryable instead of poisoning the spawn', async () => {
     registerRuntime(() => {
       throw Object.assign(new Error('too many open files'), { code: 'EMFILE' });
     });
 
-    expect(() => resolveProviderContribution(session, agentGroup, containerConfig)).toThrow('too many open files');
-    expect(() => resolveProviderContribution(session, agentGroup, containerConfig)).not.toThrow(FatalSpawnError);
+    await expect(resolveProviderContribution(session, agentGroup, containerConfig)).rejects.toThrow(
+      'too many open files',
+    );
+    await expect(resolveProviderContribution(session, agentGroup, containerConfig)).rejects.not.toThrow(
+      FatalSpawnError,
+    );
   });
 
-  it('names the failing source and preserves the cause', () => {
+  it('names the failing source and preserves the cause', async () => {
     registerProviderContainerConfig(PROVIDER, () => {
       throw new Error('registry boom');
     });
 
     try {
-      resolveProviderContribution(session, agentGroup, containerConfig);
+      await resolveProviderContribution(session, agentGroup, containerConfig);
       expect.unreachable('should have thrown');
     } catch (err) {
       expect((err as Error).message).toContain(PROVIDER);

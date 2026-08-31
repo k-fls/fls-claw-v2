@@ -43,7 +43,7 @@ import {
   stopContainerGraceful,
 } from './container-runtime.js';
 import { assertEgressLaunchable } from './egress-lockdown.js';
-import { composeGroupClaudeMd } from './claude-md-compose.js';
+import { composeGroupProjectDoc, DEFAULT_PROJECT_DOC } from './project-doc-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { initGroupFilesystem } from './group-init.js';
@@ -429,7 +429,7 @@ async function spawnContainer(session: Session): Promise<void> {
   // Resolve the effective provider + any host-side contribution it declares
   // (extra mounts, env passthrough). Computed once and threaded through both
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
-  const { provider, contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
+  const { provider, contribution } = await resolveProviderContribution(session, agentGroup, containerConfig);
 
   // Per-agent-group dynamic contributions. Callbacks run sync; any throw
   // is wrapped in FatalSpawnError by the registry and propagates up to
@@ -457,7 +457,15 @@ async function spawnContainer(session: Session): Promise<void> {
   // collected yet at that point.
   const spawnPre: MergedSpawnPre = fireSpawnPre({ agentGroup, session, providerName: provider, containerConfig });
 
-  const mounts = buildMounts(agentGroup, session, containerConfig, provider, contribution, groupContribution, spawnPre);
+  const mounts = await buildMounts(
+    agentGroup,
+    session,
+    containerConfig,
+    provider,
+    contribution,
+    groupContribution,
+    spawnPre,
+  );
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
@@ -628,11 +636,11 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
  */
 
 /** Exported for tests; the spawn path is its only production caller. */
-export function resolveProviderContribution(
+export async function resolveProviderContribution(
   session: Session,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
-): ProviderResult {
+): Promise<ProviderResult> {
   const provider = resolveProviderName(session.agent_provider, containerConfig.provider);
   const input: ContributionInput = {
     provider,
@@ -669,7 +677,7 @@ export function resolveProviderContribution(
     // unwrapped it reads as transient, and host-sweep then re-wakes the
     // session every 60s without incrementing the attempt count. Same shape as
     // the agent-group and bootstrap contribution seams.
-    runtimePart = fatalOnThrow(`Provider runtime contribution for "${provider}"`, () =>
+    runtimePart = await fatalOnThrow(`Provider runtime contribution for "${provider}"`, () =>
       runtime.containerContribution({
         agentGroupId: input.agentGroupId,
         groupScope: input.groupScope,
@@ -685,7 +693,7 @@ export function resolveProviderContribution(
 
   const fn = getProviderContainerConfig(provider);
   if (fn) {
-    registryPart = fatalOnThrow(`Provider container config for "${provider}"`, () =>
+    registryPart = await fatalOnThrow(`Provider container config for "${provider}"`, () =>
       fn({
         sessionDir: sessionDir(agentGroup.id, session.id),
         agentGroupId: agentGroup.id,
@@ -715,10 +723,17 @@ export function resolveProviderContribution(
  * Run a contribution callback. A deterministic failure becomes fatal so the
  * spawn stops retrying; an errno the next attempt may clear propagates
  * unchanged and stays retryable.
+ *
+ * `await run()` inside the try is load-bearing: a contribution may be async
+ * (the default provider's is), and returning the promise unawaited would let a
+ * rejection escape this classifier entirely — read as transient, so host-sweep
+ * re-wakes the session every 60s forever without incrementing the attempt
+ * count. `container-runner.contribution-merge.test.ts` covers both a
+ * synchronous throw and a rejected promise for exactly that reason.
  */
-function fatalOnThrow<T>(what: string, run: () => T): T {
+async function fatalOnThrow<T>(what: string, run: () => T | Promise<T>): Promise<T> {
   try {
-    return run();
+    return await run();
     // eslint-disable-next-line no-catch-all/no-catch-all -- classified below, then re-thrown either way
   } catch (err) {
     if (isTransientSpawnError(err)) throw err;
@@ -735,7 +750,7 @@ const EMPTY_SPAWN_PRE: MergedSpawnPre = {
   cleanups: [],
 };
 
-export function buildMounts(
+export async function buildMounts(
   agentGroup: AgentGroup,
   session: Session,
   containerConfig: import('./container-config.js').ContainerConfig,
@@ -746,7 +761,7 @@ export function buildMounts(
   // five-parameter `buildMounts`, and the payload must install unmodified.
   groupContribution: AgentGroupContribution = {},
   spawnPre: MergedSpawnPre = EMPTY_SPAWN_PRE,
-): VolumeMount[] {
+): Promise<VolumeMount[]> {
   // The group filesystem is scaffolded by the spawn path, which knows the
   // resolved provider. Scaffolding again here would do it provider-blind and
   // write Claude surfaces into the group directory of a provider that owns its
@@ -762,9 +777,9 @@ export function buildMounts(
     // Sync skill symlinks based on container.json selection before mounting.
     syncSkillSymlinks(claudeDir, containerConfig);
 
-    // Compose CLAUDE.md fresh every spawn from the shared base, enabled skill
-    // fragments, and MCP server instructions. See `claude-md-compose.ts`.
-    composeGroupClaudeMd(agentGroup);
+    // Compose CLAUDE.md fresh every spawn: every instruction source inlined
+    // into one flat file. See `project-doc-compose.ts`.
+    await composeGroupProjectDoc(agentGroup, path.resolve(GROUPS_DIR, agentGroup.folder), DEFAULT_PROJECT_DOC);
   }
 
   const mounts: VolumeMount[] = [];
@@ -797,20 +812,14 @@ export function buildMounts(
     mounts.push({ hostPath: containerJsonPath, containerPath: '/workspace/agent/container.json', readonly: true });
   }
 
-  // Composer-managed CLAUDE.md artifacts — nested RO mounts. These are
-  // regenerated from the shared base + fragments on every spawn; any
-  // agent-side writes would be clobbered, so enforce read-only. Only
-  // CLAUDE.local.md (per-group memory) remains RW via the group-dir mount.
-  // `.claude-shared.md` is a symlink whose target (`/app/CLAUDE.md`) is
-  // already RO-mounted, so writes through it fail regardless — no need for
-  // a nested mount there.
+  // The composed project document — one nested RO mount on top of the RW group
+  // dir, holding the full text of every instruction source. `container/CLAUDE.md`
+  // is read on the host at compose time, so nothing needs it inside the
+  // container. Only CLAUDE.local.md (per-group memory) remains RW via the
+  // group-dir mount.
   const composedClaudeMd = path.join(groupDir, 'CLAUDE.md');
   if (defaultSurfaces && fs.existsSync(composedClaudeMd)) {
     mounts.push({ hostPath: composedClaudeMd, containerPath: '/workspace/agent/CLAUDE.md', readonly: true });
-  }
-  const fragmentsDir = path.join(groupDir, '.claude-fragments');
-  if (defaultSurfaces && fs.existsSync(fragmentsDir)) {
-    mounts.push({ hostPath: fragmentsDir, containerPath: '/workspace/agent/.claude-fragments', readonly: true });
   }
 
   // Global memory directory — always read-only.
