@@ -279,7 +279,9 @@ export function proxyPipe(
  * Forward a request to upstream HTTPS, buffering body both directions
  * so callers can transform request/response bodies (e.g. OAuth token exchange).
  * @param injectHeaders — mutate headers in place to add credentials.
- * @param transformRequest — transform request body before sending upstream.
+ * @param transformRequest — transform request body before sending upstream. May
+ *   be async: the token-exchange handler waits for a concurrent refresh of the
+ *   same credential to finish before it decides which refresh token to send.
  * @param transformResponse — transform response body before sending to client.
  *   Receives the body and HTTP status code. Only called for successful (2xx) responses.
  */
@@ -289,7 +291,7 @@ export async function proxyBuffered(
   targetHost: string,
   targetPort: number,
   injectHeaders: (headers: HeaderMap) => void,
-  transformRequest: (body: string) => string,
+  transformRequest: (body: string) => string | Promise<string>,
   transformResponse: (body: string, statusCode: number) => string,
 ): Promise<void> {
   // Buffer request body
@@ -298,7 +300,7 @@ export async function proxyBuffered(
     clientReq.on('data', (c) => reqChunks.push(c));
     clientReq.on('end', resolve);
   });
-  const reqBody = transformRequest(Buffer.concat(reqChunks).toString());
+  const reqBody = await transformRequest(Buffer.concat(reqChunks).toString());
   const reqBuf = Buffer.from(reqBody);
 
   const headers: HeaderMap = {

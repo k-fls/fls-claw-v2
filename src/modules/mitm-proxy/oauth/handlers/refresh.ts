@@ -60,8 +60,11 @@ export function tryRefresh(
   const inflight = ctx.inFlightRefresh.get(key);
   if (inflight) return inflight;
 
-  const p = runRefresh(provider, scope, ctx, owning).finally(() => {
-    ctx.inFlightRefresh.delete(key);
+  const p: Promise<boolean> = runRefresh(provider, scope, ctx, owning).finally(() => {
+    // Only when still ours: the container-originated intercept path chains onto
+    // this same key and may already have installed itself as the tail. Dropping
+    // that tail would let a third refresh run alongside it.
+    if (ctx.inFlightRefresh.get(key) === p) ctx.inFlightRefresh.delete(key);
   });
   ctx.inFlightRefresh.set(key, p);
   return p;
@@ -97,7 +100,8 @@ async function runRefresh(
   // the host so it can alert the grantor's owners.
   const borrowed = owning !== asCredentialScope(scope);
   const alertBorrowedFailure = (): void => {
-    if (borrowed) ctx.borrowedCredentialEvents?.onBorrowedRefreshFailed({ owningScope: owning, providerId: provider.id });
+    if (borrowed)
+      ctx.borrowedCredentialEvents?.onBorrowedRefreshFailed({ owningScope: owning, providerId: provider.id });
   };
 
   let body: { access_token?: string; refresh_token?: string; expires_in?: number };

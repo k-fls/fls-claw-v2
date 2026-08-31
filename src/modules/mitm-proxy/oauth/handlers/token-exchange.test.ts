@@ -34,7 +34,7 @@ import { buildTokenExchangeHandler } from './token-exchange.js';
 // ── proxyBuffered mock: capture the two transforms ─────────────────────
 const pb = vi.hoisted(() => ({
   captured: null as null | {
-    transformRequest: (body: string) => string;
+    transformRequest: (body: string) => string | Promise<string>;
     transformResponse: (body: string, status: number) => string;
   },
 }));
@@ -53,7 +53,7 @@ vi.mock('../../credential-proxy.js', () => ({
     _host: string,
     _port: number,
     _injectHeaders: (h: Record<string, unknown>) => void,
-    transformRequest: (body: string) => string,
+    transformRequest: (body: string) => string | Promise<string>,
     transformResponse: (body: string, status: number) => string,
   ) => {
     pb.captured = { transformRequest, transformResponse };
@@ -149,7 +149,7 @@ describe('buildTokenExchangeHandler — request transform', () => {
     });
     const { transformRequest } = await capture(makeCtx(engine, vi.fn()));
 
-    const out = transformRequest('grant_type=refresh_token&refresh_token=SUB_REFRESH');
+    const out = await transformRequest('grant_type=refresh_token&refresh_token=SUB_REFRESH');
     const params = new URLSearchParams(out);
     expect(params.get('refresh_token')).toBe('REAL_REFRESH'); // real value sent upstream
     expect(params.get('grant_type')).toBe('refresh_token');
@@ -161,7 +161,7 @@ describe('buildTokenExchangeHandler — request transform', () => {
     const { transformRequest } = await capture(makeCtx(engine, vi.fn()));
 
     const input = 'grant_type=authorization_code&code=abc123';
-    expect(transformRequest(input)).toBe(input);
+    expect(await transformRequest(input)).toBe(input);
     expect(engine.resolveSubstitute).not.toHaveBeenCalled();
   });
 });
@@ -217,7 +217,7 @@ describe('buildTokenExchangeHandler — response transform', () => {
     const { transformRequest, transformResponse } = await capture(makeCtx(engine, store));
 
     // Request carries the grantor-bound refresh substitute — captures the source scope.
-    transformRequest('grant_type=refresh_token&refresh_token=SUB_REFRESH');
+    await transformRequest('grant_type=refresh_token&refresh_token=SUB_REFRESH');
     transformResponse(
       JSON.stringify({ access_token: 'FRESH_ACCESS', refresh_token: 'FRESH_REFRESH', expires_in: 3600 }),
       200,
@@ -245,7 +245,7 @@ describe('buildTokenExchangeHandler — response transform', () => {
 
     // No refresh substitute is swapped for an authorization_code grant, so no
     // source scope is captured → the fresh credential lands in the own scope.
-    transformRequest('grant_type=authorization_code&code=abc123');
+    await transformRequest('grant_type=authorization_code&code=abc123');
     transformResponse(JSON.stringify({ access_token: 'FRESH_ACCESS', expires_in: 3600 }), 200);
 
     expect(store).toHaveBeenCalledTimes(1);
@@ -389,7 +389,7 @@ describe('buildTokenExchangeHandler — binding gate', () => {
     const { transformRequest, transformResponse } = await capture(makeCtx(engine, store));
 
     // The swapped substitute is the proof the caller already held a credential.
-    transformRequest(JSON.stringify({ grant_type: 'refresh_token', refresh_token: 'SUB_OLD_REFRESH' }));
+    await transformRequest(JSON.stringify({ grant_type: 'refresh_token', refresh_token: 'SUB_OLD_REFRESH' }));
     const out = transformResponse(JSON.stringify({ access_token: 'ROTATED', expires_in: 3600 }), 200);
 
     expect(store).toHaveBeenCalledTimes(1);
