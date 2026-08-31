@@ -71,6 +71,7 @@ import { startCliServer } from './cli/socket-server.js';
 // credential path). Registered explicitly at boot (not via the modules barrel)
 // so unit tests don't arm the spawn-time validator unexpectedly.
 import { registerClaudeCredentialProvider } from './providers/claude-credential.js';
+import { registerCodexCredentialProvider } from './providers/codex-credential.js';
 import { registerGithubCredentialProvider } from './providers/github-credential.js';
 import {
   CredentialProxy,
@@ -140,6 +141,7 @@ async function main(): Promise<void> {
   tokenEngine.setBorrowSourceResolver((groupScope) => getBorrowSource(groupScope as unknown as string) ?? undefined);
   registerClaudeCredentialProvider();
   registerGithubCredentialProvider();
+  registerCodexCredentialProvider();
   const credentialProxy = new CredentialProxy();
   // Bind the SAME address host-rpc binds (serviceBindHost), driven by
   // CLAW_HOST_NET_MODE: open (default) → 0.0.0.0 (rootless; the proxy's
