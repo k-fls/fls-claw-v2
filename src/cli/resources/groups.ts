@@ -1,6 +1,12 @@
 import { randomUUID } from 'crypto';
 
-import type { AdditionalMountConfig, McpServerConfig } from '../../container-config.js';
+import {
+  mcpServerPluginOwner,
+  parseMcpServerConfig,
+  validateMcpServerName,
+  type AdditionalMountConfig,
+  type McpServerConfig,
+} from '../../container-config.js';
 import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
 import { createAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
@@ -15,8 +21,34 @@ import {
 } from '../../db/container-configs.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { createAgentFromTemplate } from '../../templates/create-agent.js';
+import {
+  formatRestampResult,
+  groupsCarryingPlugin,
+  restampAgentFromTemplate,
+  type RestampResult,
+} from '../../templates/restamp.js';
+import { isValidTimezone } from '../../timezone.js';
 import type { AgentGroup, ContainerConfigRow } from '../../types.js';
 import { registerResource } from '../crud.js';
+import { localizeIsoTimestamps } from '../format.js';
+
+/**
+ * Parse a --timezone flag: undefined = not passed, null = explicit clear
+ * (empty string → follow the install default), otherwise a validated IANA id.
+ * Invalid ids throw here, in the handler — for agent callers that is after
+ * approval (rare, self-healing: a retry raises a fresh card).
+ */
+function parseTimezoneFlag(value: unknown): string | null | undefined {
+  if (value === undefined) return undefined;
+  const tz = String(value);
+  if (tz === '') return null;
+  if (!isValidTimezone(tz)) {
+    throw new Error(
+      `invalid --timezone: "${tz}" is not an IANA timezone id (e.g. "Europe/Lisbon"); pass "" to follow the install default`,
+    );
+  }
+  return tz;
+}
 
 /** Deserialize JSON columns for display. */
 function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
@@ -34,6 +66,7 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     packages_npm: JSON.parse(row.packages_npm),
     additional_mounts: JSON.parse(row.additional_mounts),
     cli_scope: row.cli_scope,
+    timezone: row.timezone,
     updated_at: row.updated_at,
   };
 }
@@ -73,14 +106,53 @@ registerResource({
     create: {
       access: 'approval',
       description:
-        'Create (or return the existing) agent group with its container config. Idempotent on --folder. ' +
-        'With --template <ref>, stamp from a local template under templates/ (MCP servers + instructions ' +
-        '+ skills). Use --folder <slug> and --name <display name>.',
+        'Create (or return the existing) agent group with its container config. Idempotent on --folder (bare creates only; --folder cannot be combined with --template). ' +
+        'With --template <ref>, stamp from a local agent plugin under templates/ (skills + MCP servers ' +
+        '+ optional persona, context, and paused recurring tasks). When a group already carries the plugin, ' +
+        'this instead shows the in-place update plan for it — every plugin-owned surface that would change, ' +
+        'flagging local customizations that would be lost; memory, plugin-data/, user-added MCP servers, wiring, ' +
+        'and sessions are never touched. Pass --yes to apply the update (then run `ncl groups restart`), ' +
+        '--id <group-id> to pick among several stamped groups, or --new to stamp another agent regardless. ' +
+        'Without --template, use --folder <slug> (required) and --name <display name>; with --template the ' +
+        "folder derives from the agent name (--name overrides the template's own). " +
+        'Optional --timezone <IANA id> sets the group timezone (template task schedules fire in it); like --name, it applies only when a group is created — both are ignored on the in-place update of an existing group.',
       handler: async (args) => {
+        const timezone = parseTimezoneFlag(args.timezone) ?? undefined;
         if (args.template) {
-          return createAgentFromTemplate(String(args.template), {
+          // Two identity models: a bare group IS its folder; a templated group
+          // IS its plugin. --folder belongs to the first and would be silently
+          // ignored here, so reject the mix instead of surprising the caller.
+          if (args.folder) {
+            throw new Error(
+              "--folder applies only to bare creates; a templated group's folder is derived from its name at first stamp and never changes on update",
+            );
+          }
+          const ref = String(args.template);
+          // Same plugin already stamped → in-place update (dry run without
+          // --yes), never a duplicate agent. --new opts out; agent callers
+          // have --id auto-filled, so they always target their own group.
+          if (args.new !== true) {
+            const carriers = args.id ? [] : groupsCarryingPlugin(ref);
+            if (carriers.length > 1) {
+              throw new Error(
+                `${carriers.length} groups already carry this plugin: ` +
+                  carriers.map((g) => `"${g.name}" (${g.id})`).join(', ') +
+                  '. Pass --id <group-id> to update one, or --new to stamp another agent.',
+              );
+            }
+            const targetId = args.id ? String(args.id) : carriers[0]?.id;
+            if (targetId) {
+              const result = restampAgentFromTemplate(ref, targetId, { apply: args.yes === true });
+              return result.applied
+                ? result
+                : { ...result, note: `${result.note} Pass --new to stamp a separate agent instead.` };
+            }
+          }
+          const { group, report } = createAgentFromTemplate(ref, {
             name: args.name ? String(args.name) : undefined,
+            timezone,
           });
+          return report.length > 0 ? { ...group, templateReport: report } : group;
         }
         const folder = args.folder as string;
         if (!folder) throw new Error('--folder is required');
@@ -100,8 +172,15 @@ registerResource({
           ensureContainerConfig(id);
         })();
         initGroupFilesystem(group);
+        if (timezone) updateContainerConfigScalars(id, { timezone });
         return getAgentGroupByFolder(folder);
       },
+      // The restamp path returns a plan that wants the aligned-lines view;
+      // everything else keeps the generic JSON rendering.
+      formatHuman: (data) =>
+        data !== null && typeof data === 'object' && 'changes' in data && 'plugin' in data
+          ? formatRestampResult(data as RestampResult)
+          : JSON.stringify(localizeIsoTimestamps(data), null, 2),
     },
     delete: {
       access: 'approval',
@@ -253,7 +332,8 @@ registerResource({
       access: 'approval',
       description:
         'Update container config scalar fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
-        'Use --id <group-id> and any of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope.',
+        'Use --id <group-id> and any of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, ' +
+        '--timezone (IANA id like "Europe/Lisbon"; "" clears back to the install default; scheduled-task times follow it immediately, message display after restart).',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -263,10 +343,19 @@ registerResource({
         const updates: Partial<
           Pick<
             ContainerConfigRow,
-            'provider' | 'model' | 'effort' | 'image_tag' | 'assistant_name' | 'max_messages_per_prompt' | 'cli_scope'
+            | 'provider'
+            | 'model'
+            | 'effort'
+            | 'image_tag'
+            | 'assistant_name'
+            | 'max_messages_per_prompt'
+            | 'cli_scope'
+            | 'timezone'
           >
         > = {};
         if (args.provider !== undefined) updates.provider = args.provider as string;
+        const timezone = parseTimezoneFlag(args.timezone);
+        if (timezone !== undefined) updates.timezone = timezone;
         if (args.model !== undefined) updates.model = args.model as string;
         if (args.effort !== undefined) updates.effort = args.effort as string;
         if (args.image_tag !== undefined) updates.image_tag = args.image_tag as string;
@@ -283,7 +372,7 @@ registerResource({
 
         if (Object.keys(updates).length === 0) {
           throw new Error(
-            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope',
+            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --timezone',
           );
         }
 
@@ -297,24 +386,33 @@ registerResource({
       access: 'approval',
       description:
         'Add an MCP server to a group. Requires `ncl groups restart` to take effect. ' +
-        'Use --id <group-id> --name <server-name> --command <cmd> [--args <json-array>] [--env <json-object>].',
+        'Use --id <group-id> --name <server-name> with either --command <cmd> [--args <json-array>] [--env <json-object>] ' +
+        'or --url <url> [--headers <json-object>] (HTTPS, or plain HTTP for localhost / host.docker.internal).',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
         const name = args.name as string;
         if (!name) throw new Error('--name is required');
-        const command = args.command as string;
-        if (!command) throw new Error('--command is required');
+        validateMcpServerName(name);
 
         const row = getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
 
         const servers = JSON.parse(row.mcp_servers) as Record<string, McpServerConfig>;
-        servers[name] = {
-          command,
-          args: args.args ? (JSON.parse(args.args as string) as string[]) : [],
-          env: args.env ? (JSON.parse(args.env as string) as Record<string, string>) : {},
-        };
+        const owner = mcpServerPluginOwner(servers[name]);
+        if (owner) {
+          throw new Error(
+            `MCP server "${name}" is owned by plugin "${owner}" — ` +
+              'update the plugin and restamp it (`ncl groups create --template <ref> --yes`) instead of editing it directly',
+          );
+        }
+        servers[name] = parseMcpServerConfig({
+          command: args.command,
+          url: args.url,
+          args: args.args === undefined ? undefined : JSON.parse(String(args.args)),
+          env: args.env === undefined ? undefined : JSON.parse(String(args.env)),
+          headers: args.headers === undefined ? undefined : JSON.parse(String(args.headers)),
+        });
         updateContainerConfigJson(id, 'mcp_servers', servers);
 
         return { added: name, servers };
@@ -335,6 +433,13 @@ registerResource({
 
         const servers = JSON.parse(row.mcp_servers) as Record<string, McpServerConfig>;
         if (!servers[name]) throw new Error(`MCP server "${name}" not found`);
+        const owner = mcpServerPluginOwner(servers[name]);
+        if (owner) {
+          throw new Error(
+            `MCP server "${name}" is owned by plugin "${owner}" — ` +
+              'it would reappear on the next restamp; remove it from the plugin instead',
+          );
+        }
         delete servers[name];
         updateContainerConfigJson(id, 'mcp_servers', servers);
 

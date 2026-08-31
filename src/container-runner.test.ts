@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { describe, expect, it } from 'vitest';
 
-import { resolveProviderName } from './container-runner.js';
+import { hardeningArgs, resolveProviderName } from './container-runner.js';
 
 describe('resolveProviderName', () => {
   it('prefers session over container config', () => {
@@ -44,6 +44,22 @@ describe('buildContainerArgs ordering invariant (structural)', () => {
     expect(mountsLoop).toBeGreaterThan(-1);
     expect(gatewayApply).toBeGreaterThan(-1);
     expect(gatewayApply).toBeGreaterThan(mountsLoop);
+  });
+});
+
+describe('plugins read-only mount (structural)', () => {
+  // Stamped plugin content must be immutable inside the container (Agent
+  // Plugins contract: writes go to plugin-data/). Driving buildMounts needs a
+  // provider registry + composed group surfaces, so guard the wiring
+  // structurally: the plugins dir must be mounted at CONTAINER_PLUGINS_DIR
+  // with readonly: true.
+  it('mounts groups/<folder>/plugins read-only', () => {
+    const src = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf-8');
+    const idx = src.indexOf("path.join(groupDir, 'plugins')");
+    expect(idx).toBeGreaterThan(-1);
+    const mountExpr = src.slice(idx, idx + 200);
+    expect(mountExpr).toContain('CONTAINER_PLUGINS_DIR');
+    expect(mountExpr).toContain('readonly: true');
   });
 });
 
@@ -112,5 +128,29 @@ describe('syncSkillSymlinks blocked-entry warning (structural)', () => {
     const tail = src.slice(createLoop);
     expect(tail).toMatch(/else if \(!entry\.isSymbolicLink\(\)\)/);
     expect(tail).toMatch(/log\.warn\(\s*'Shared skill not symlinked/);
+  });
+});
+
+describe('hardeningArgs', () => {
+  it('always emits the three unconditional flags', () => {
+    const args = hardeningArgs('2048');
+    expect(args).toContain('--cap-drop=ALL');
+    expect(args.join(' ')).toContain('--security-opt no-new-privileges');
+    expect(args).toContain('--init');
+  });
+
+  it('emits the pids limit when positive', () => {
+    expect(hardeningArgs('2048').join(' ')).toContain('--pids-limit 2048');
+  });
+
+  // cgroups v2 rejects `--pids-limit 0` with EINVAL, killing the spawn.
+  it('omits the pids limit for 0, negatives, blank and garbage', () => {
+    for (const v of ['0', '-1', '', '   ', 'lots']) {
+      expect(hardeningArgs(v).join(' ')).not.toContain('--pids-limit');
+    }
+  });
+
+  it('floors fractional values', () => {
+    expect(hardeningArgs('2048.7').join(' ')).toContain('--pids-limit 2048');
   });
 });

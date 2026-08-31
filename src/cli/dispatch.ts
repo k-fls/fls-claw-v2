@@ -6,7 +6,7 @@
  * Every command passes the guard before its handler runs — the decision
  * (allow / hold / deny) comes from the command's catalog entry, derived at
  * registration (see cli/guard.ts). Dispatch keeps the mechanics: arg
- * auto-fill, the sessions-get existence oracle, `--help` interception,
+ * auto-fill, the sessions-get/-history existence-oracle guard, `--help` interception,
  * parseArgs, and post-handler row filtering. An approved replay re-enters
  * here carrying the verified approval row as its grant — the guard re-checks
  * the structural checks live, and the `approved: true` boolean no longer
@@ -14,6 +14,7 @@
  */
 import { getContainerConfig } from '../db/container-configs.js';
 import { getAgentGroup } from '../db/agent-groups.js';
+import { getMessagingGroupAgentByPair } from '../db/messaging-groups.js';
 import { getSession } from '../db/sessions.js';
 import { guard, type GuardActor } from '../guard/index.js';
 import { registerApprovalHandler, requestApproval } from '../modules/approvals/index.js';
@@ -87,12 +88,25 @@ export async function dispatch(
       if (cmd.resource === 'groups' || cmd.resource === 'destinations') {
         fill.id = req.args.id ?? ctx.agentGroupId;
       }
+
+      // Group-scoped agents may only inspect or update the wiring for the
+      // conversation they are currently serving. Never trust a caller ID.
+      if (req.args.help !== true && (req.command === 'wirings-get' || req.command === 'wirings-update')) {
+        const wiring = getMessagingGroupAgentByPair(ctx.messagingGroupId, ctx.agentGroupId);
+        if (!wiring) return err(req.id, 'forbidden', 'Wiring not found for this conversation.');
+        fill.id = wiring.id;
+      }
       req = { ...req, args: { ...req.args, ...fill } };
 
-      // Fail-closed pre-handler check for sessions-get: returns "not found"
-      // regardless of whether the UUID exists in another group, preventing an
-      // existence oracle across group boundaries.
-      if (cmd.resource === 'sessions' && req.command === 'sessions-get' && req.args.id) {
+      // Fail-closed pre-handler check for sessions-get/-history: returns
+      // "not found" regardless of whether the UUID exists in another group,
+      // preventing an existence oracle across group boundaries. (history
+      // also self-scopes in its handler — this is defense-in-depth.)
+      if (
+        cmd.resource === 'sessions' &&
+        (req.command === 'sessions-get' || req.command === 'sessions-history') &&
+        req.args.id
+      ) {
         const s = getSession(req.args.id as string);
         if (!s || s.agent_group_id !== ctx.agentGroupId) {
           return err(req.id, 'handler-error', `session not found: ${req.args.id}`);
