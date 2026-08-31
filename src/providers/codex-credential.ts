@@ -69,6 +69,9 @@ const PROVIDER_ID = 'codex';
 /** Credential path for the ChatGPT account identifier (`tokens.account_id`). */
 export const CRED_ACCOUNT_ID = 'account_id';
 
+/** Credential path for the identity token — captured so it can be substituted. */
+export const CRED_ID_TOKEN = 'id_token';
+
 const AUTH_HOST = 'auth.openai.com';
 const CHATGPT_HOST = 'chatgpt.com';
 const API_HOST = 'api.openai.com';
@@ -108,6 +111,19 @@ export const CODEX_OAUTH_PROVIDER: OAuthProvider = {
   refreshStrategy: 'redirect',
   // Codex reads auth.json; the payload strips OPENAI_API_KEY from the CLI env.
   envBindings: [],
+  // The token response carries four credential-bearing fields, not the two the
+  // handler swaps by default. Declaring the other two is what keeps a real
+  // id_token — and the email, user id and plan type inside it — from reaching
+  // the container on every refresh.
+  credentialResponseFields: [
+    { field: 'id_token', credentialPath: CRED_ID_TOKEN },
+    { field: 'account_id', credentialPath: CRED_ACCOUNT_ID },
+  ],
+  // Capture nothing into cleartext metadata. The request-side default persists
+  // every non-transient field, which here would be the device-auth id and the
+  // user code; the account identifier this provider does need is stored by the
+  // declared-field path above, not by capture.
+  tokenFieldCapture: { fromRequest: [], fromResponse: [] },
 };
 
 function b64url(value: string): string {

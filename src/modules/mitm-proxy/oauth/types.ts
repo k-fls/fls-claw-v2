@@ -79,6 +79,16 @@ export interface OAuthProvider {
   envBindings?: EnvVarBinding[];
   /** Parsed `_credential_format`. */
   credentialFormat?: Record<string, CredentialFormatSpec>;
+  /**
+   * Credential-bearing response fields beyond `access_token` / `refresh_token`,
+   * each with the credential path its real value is stored under.
+   *
+   * The handler substitutes every field named here on the way back to the
+   * container. Without this, a token response's other fields pass through in
+   * the clear — for a provider whose response carries an identity token, that
+   * hands the container real credential material and the claims inside it.
+   */
+  credentialResponseFields?: { field: string; credentialPath: string }[];
   /** Parsed `_token_field_capture`. */
   tokenFieldCapture?: {
     fromRequest?: string[];
