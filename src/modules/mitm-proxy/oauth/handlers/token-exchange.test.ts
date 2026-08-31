@@ -39,6 +39,13 @@ const pb = vi.hoisted(() => ({
   },
 }));
 
+// The episode gate. Default true so the pre-existing cases keep describing a
+// legitimate host-driven sign-in; the gate's own cases flip it.
+const bridge = vi.hoisted(() => ({ inEpisode: true }));
+vi.mock('../../../credentials/auth-bridge.js', () => ({
+  isAuthEpisodeContainer: () => bridge.inEpisode,
+}));
+
 vi.mock('../../credential-proxy.js', () => ({
   proxyBuffered: async (
     _req: unknown,
@@ -123,12 +130,13 @@ function makeCtx(engine: TokenSubstituteEngine, store: ReturnType<typeof vi.fn>)
 /** Build the handler and capture its transforms (proxyBuffered is mocked). */
 async function capture(ctx: HandlerContext, over: Partial<OAuthProvider> = {}) {
   const handler = buildTokenExchangeHandler(provider(over), rule(), ctx);
-  await handler({} as never, {} as never, 'api.example.com', 443, SCOPE);
+  await handler({} as never, {} as never, 'api.example.com', 443, SCOPE, '172.29.0.9');
   return pb.captured!;
 }
 
 afterEach(() => {
   pb.captured = null;
+  bridge.inEpisode = true;
   vi.clearAllMocks();
 });
 
@@ -331,5 +339,61 @@ describe('buildTokenExchangeHandler — response transform', () => {
     expect(transformResponse(errBody, 400)).toBe(errBody);
     expect(store).not.toHaveBeenCalled();
     expect(engine.getOrCreateSubstitute).not.toHaveBeenCalled();
+  });
+});
+
+describe('buildTokenExchangeHandler — binding gate', () => {
+  it('refuses to bind a new credential when the caller is not a sign-in episode container', async () => {
+    bridge.inEpisode = false;
+    const store = vi.fn();
+    const engine = makeEngine({ getOrCreateSubstitute: vi.fn(() => 'SUB') });
+    const { transformResponse } = await capture(makeCtx(engine, store));
+
+    const out = transformResponse(
+      JSON.stringify({ access_token: 'REAL_ACCESS', refresh_token: 'REAL_REFRESH', expires_in: 3600 }),
+      200,
+    );
+
+    expect(store).not.toHaveBeenCalled();
+    // Blanked, not passed through: an un-episoded caller must not come away
+    // holding the real token the ungated path would have substituted.
+    expect(out).not.toContain('REAL_ACCESS');
+    expect(out).not.toContain('REAL_REFRESH');
+    expect(JSON.parse(out).access_token).toBe('');
+  });
+
+  it('blanks the provider-declared fields too when it refuses', async () => {
+    bridge.inEpisode = false;
+    const store = vi.fn();
+    const engine = makeEngine({ getOrCreateSubstitute: vi.fn(() => 'SUB') });
+    const { transformResponse } = await capture(makeCtx(engine, store), {
+      credentialResponseFields: [{ field: 'id_token', credentialPath: 'id_token' }],
+    });
+
+    const out = transformResponse(JSON.stringify({ access_token: 'REAL_ACCESS', id_token: 'REAL_ID' }), 200);
+
+    expect(out).not.toContain('REAL_ID');
+    expect(JSON.parse(out).id_token).toBe('');
+  });
+
+  it('still rotates for an ordinary session container, which has no episode', async () => {
+    bridge.inEpisode = false;
+    const store = vi.fn();
+    const engine = makeEngine({
+      getOrCreateSubstitute: vi.fn(() => 'SUB'),
+      resolveSubstitute: vi.fn(() => ({
+        realToken: 'REAL_OLD_REFRESH',
+        mapping: { credentialScope: asCredentialScope('test-group') },
+      })),
+    });
+    const { transformRequest, transformResponse } = await capture(makeCtx(engine, store));
+
+    // The swapped substitute is the proof the caller already held a credential.
+    transformRequest(JSON.stringify({ grant_type: 'refresh_token', refresh_token: 'SUB_OLD_REFRESH' }));
+    const out = transformResponse(JSON.stringify({ access_token: 'ROTATED', expires_in: 3600 }), 200);
+
+    expect(store).toHaveBeenCalledTimes(1);
+    expect(store.mock.calls[0][3].value).toBe('ROTATED');
+    expect(JSON.parse(out).access_token).toBe('SUB');
   });
 });

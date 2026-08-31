@@ -11,6 +11,7 @@
  * buffer-both-ways primitive). Bodies may be JSON or form-encoded —
  * `parseBody` handles both transparently.
  */
+import { isAuthEpisodeContainer } from '../../../credentials/auth-bridge.js';
 import { proxyBuffered } from '../../credential-proxy.js';
 import type { HostHandler } from '../../credential-proxy.js';
 import { logger } from '../../logger.js';
@@ -92,7 +93,7 @@ export function buildTokenExchangeHandler(
   rule: InterceptRule,
   ctx: HandlerContext,
 ): HostHandler {
-  return async (clientReq, clientRes, targetHost, targetPort, groupScope) => {
+  return async (clientReq, clientRes, targetHost, targetPort, groupScope, sourceIP) => {
     const scopeAttrs = extractScopeAttrs(targetHost, rule);
     let capturedReq: Record<string, string> | null = null;
     // When this exchange is a refresh (grant_type=refresh_token), the request
@@ -103,6 +104,10 @@ export function buildTokenExchangeHandler(
     // transform. Left undefined for a fresh auth (authorization_code), which
     // establishes the requester's OWN credential and stores to its own scope.
     let refreshSourceScope: CredentialScope | undefined;
+    // True once a substitute refresh token has been swapped for its real value:
+    // proof the caller already held a credential for this scope, so the exchange
+    // rotates one rather than binding a new one.
+    let rotatesExisting = false;
 
     await proxyBuffered(
       clientReq,
@@ -125,6 +130,7 @@ export function buildTokenExchangeHandler(
             // Store the refreshed token to the scope this substitute is bound
             // to (grantor for a borrowed credential), not the requester's own.
             refreshSourceScope = entry.mapping.credentialScope;
+            rotatesExisting = true;
             parsed.set('refresh_token', entry.realToken);
             return parsed.serialize();
           }
@@ -135,6 +141,29 @@ export function buildTokenExchangeHandler(
       (body, _statusCode) => {
         const parsed = parseBody(body);
         if (!parsed?.fields.access_token) return body;
+
+        // Binding a NEW credential is gated on a host-driven sign-in episode:
+        // the caller must be that episode's own auth container, for this scope.
+        // Rotation is not gated — it comes from ordinary session containers that
+        // have no episode, and its write is pinned to the scope the swapped
+        // substitute already resolves to, so it cannot bind a foreign account.
+        //
+        // Refusing means blanking the credential fields, not passing the body
+        // through: an un-episoded container that kept the upstream response
+        // would hold a REAL token where the ungated path would have given it a
+        // substitute, which is the opposite of the intended outcome.
+        if (!rotatesExisting && !isAuthEpisodeContainer(sourceIP, String(groupScope))) {
+          logger.warn(
+            { provider: provider.id, scope: groupScope, sourceIP },
+            'oauth.token-exchange: credential binding outside a sign-in episode — refused',
+          );
+          parsed.set('access_token', '');
+          if (parsed.fields.refresh_token) parsed.set('refresh_token', '');
+          for (const extra of provider.credentialResponseFields ?? []) {
+            if (typeof parsed.fields[extra.field] === 'string') parsed.set(extra.field, '');
+          }
+          return parsed.serialize();
+        }
 
         try {
           const authFields = captureAuthFields(capturedReq, parsed.fields, provider);
@@ -183,6 +212,12 @@ export function buildTokenExchangeHandler(
           // A fresh credential for this scope — clear any pending expired alert
           // (a grantor re-auth heals every borrower).
           ctx.borrowedCredentialEvents?.onCredentialHealed({ credentialScope: targetScope, providerId: provider.id });
+          // The pivotal event of the whole flow, and the only evidence a
+          // rotation happened at all.
+          logger.info(
+            { provider: provider.id, scope: targetScope, credentialPath: CRED_OAUTH, rotation: rotatesExisting },
+            'oauth.token-exchange: credential captured',
+          );
 
           const subAccess = ctx.tokenEngine.getOrCreateSubstitute(provider.id, scopeAttrs, groupScope, CRED_OAUTH);
           if (!subAccess) {
