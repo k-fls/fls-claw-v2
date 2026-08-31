@@ -250,9 +250,13 @@ provider author has to satisfy them:
 
 - **The transport must be interceptable HTTPS.** The proxy MITMs TLS
   over CONNECT and DNAT'd `:443`; it does not intercept a WebSocket
-  upgrade. A provider runtime that can select a WebSocket transport must
-  pin the HTTP one, in a place the container cannot overwrite at
-  startup.
+  upgrade. A runtime that can select a WebSocket transport should be
+  pinned to the HTTP one, in a place the container cannot overwrite at
+  startup — and where no such pin is reachable, its HTTP *fallback* is
+  what the credential path rests on, which makes the fallback something
+  to verify rather than assume. Codex is that case: its model catalog
+  prefers WebSockets and no config key on the pinned CLI turns that off
+  (`docs/solutions/integration-issues/codex-responses-websocket-cannot-be-pinned-off.md`).
 - **Path rules should be no wider than the runtime needs.** Interception
   is host-level, so registering a rule makes that host decrypted for
   every group. A path the provider never uses is best left unmatched:
