@@ -2710,7 +2710,7 @@ describe('propagate run — a case is emitted against the tip it will be resolve
     expect(head.sha).toBe(bTip);
     expect(head.height).toBe(1);
     expect(row.height).toBe(1);
-    expect(row.caseId).toBe('feat__c--feat__b-h1');
+    expect(row.caseId).toBe(`feat__c--feat__b-h1-${bTip.slice(0, 8)}`);
   });
 });
 

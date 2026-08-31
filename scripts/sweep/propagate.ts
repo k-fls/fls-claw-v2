@@ -4877,7 +4877,7 @@ export async function cmdRun(
         }
         const caseFile: CaseFile = {
           schemaVersion: 1,
-          id: caseId(bp.branch, pp.parent, live.head.height), // B8: branch+PARENT+height (run TOP)
+          id: caseId(bp.branch, pp.parent, live.head.height, live.head.sha), // B8: branch+PARENT+height+sha8 (run TOP)
           branch: bp.branch,
           parent: pp.parent,
           head: live.head, // the run's TOP commit (stacked-run model)
@@ -5748,13 +5748,13 @@ async function freezeHeld(
 }
 
 /**
- * N5: the CONFLICT case-id shape (`slug(branch)--slug(parent)-h<n>`, steps.ts).
- * `<n>` may be NEGATIVE and that is not a sentinel: `deriveCoverage` returns -1
- * for a head that sits BELOW this pass's pinned chain, which parents-model
- * cases hit routinely — which is also exactly why a gate fix wearing a fake
- * `-h-1` would be indistinguishable from a real case id.
+ * N5: the CONFLICT case-id shape (`slug(branch)--slug(parent)-h<n>-<sha8>`,
+ * steps.ts). `<n>` may be NEGATIVE and that is not a sentinel: `deriveCoverage`
+ * returns -1 for a head that sits BELOW this pass's pinned chain, which
+ * parents-model cases hit routinely — which is also exactly why a gate fix
+ * wearing a fake `-h-1` would be indistinguishable from a real case id.
  */
-const CONFLICT_CASE_ID_RE = /^[A-Za-z0-9_-]+-h-?\d+$/;
+const CONFLICT_CASE_ID_RE = /^[A-Za-z0-9_-]+-h-?\d+-[0-9a-f]{8}$/;
 
 /**
  * N5: does `id` have a shape the DRIVER generates? `--case` is joined into
@@ -5773,14 +5773,16 @@ function isGeneratedCaseId(id: string): boolean {
 }
 
 /**
- * The deterministic fix/sweep branch name for a case (naming rule of §8:
- * branch+PARENT+height so two parents of one branch conflicting at the same
- * height cannot collide — B8). Derived ONLY from the case identity + its head
- * sha — no wall clock — so a retried publish (e.g. a JUDGED publish re-run
- * after a crash, days later) computes the SAME name instead of pushing an
- * orphan ref. The head sha disambiguates re-occurrences of the same
- * branch/parent/height across watermarks. (The HELD path additionally PINS
- * the name in merge_status.fixBranch at freeze time and prefers that.)
+ * The deterministic fix/sweep branch name for a case (naming rule of §8). A
+ * conflict case's ref IS its case id under `fix/sweep/` — branch, PARENT,
+ * height and the conflict head's sha8, the same four parts for the same reason
+ * (`caseId`, steps.ts): two parents of one branch at one height are distinct
+ * cases, and so are two runs of one parent's commits at one height. Derived
+ * ONLY from the case identity + its head sha — no wall clock — so a retried
+ * publish (e.g. a JUDGED publish re-run after a crash, days later) computes the
+ * SAME name instead of pushing an orphan ref, and re-occurrences across
+ * watermarks stay apart. (The HELD path additionally PINS the name in
+ * merge_status.fixBranch at freeze time and prefers that.)
  *
  * A GATE FIX has no parent and no height, so it names itself with its own
  * identity (the case id) after the `<slug(branch)>--` prefix every fix ref
@@ -8765,7 +8767,9 @@ async function materializeReissueCase(
   const carried = (await namesOf(probe.treeOid, args.refSha)).filter(
     (p) => !conflicting.has(p) && !movedSince.has(p),
   );
-  const cid = caseId(args.branch, parent, height);
+  // The ref name's sha8 IS the conflict head's, so the reissue's id is the one
+  // the original case wore and the ref keeps naming its own case.
+  const cid = caseId(args.branch, parent, height, conflictHead);
   const head = { sha: conflictHead, height };
   const feat = args.features.find((f) => f.branch === args.branch);
   const caseFile: CaseFile = {

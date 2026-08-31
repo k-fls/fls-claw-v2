@@ -42,13 +42,23 @@ export function slug(name: string): string {
 }
 
 /**
- * Case id = branch + PARENT + height (B8). The parent slug is essential: a
- * multi-parent branch whose two parents conflict at the SAME height would
- * otherwise collide on branch+height, and the double-resolve guard would make
- * the second case unresolvable for the whole pass (deadlock).
+ * Case id = branch + PARENT + height + the conflict HEAD's sha8 (B8).
+ *
+ * Each part answers a collision that is fatal rather than cosmetic — a second
+ * case sharing an id inherits the first's `resolved` disposition, drops out of
+ * `openCases`, and can never be served:
+ *  - the PARENT slug: a multi-parent branch whose two parents conflict at the
+ *    SAME height would otherwise collide on branch+height;
+ *  - the HEAD sha8: parents-model heads are the parent's own commits, so one
+ *    height covers a whole run of them. Resolving the first run reopens the
+ *    branch, the re-derivation offers the bucket's remainder, and that second
+ *    case sits at the same branch+parent+height as the one just resolved.
+ *
+ * It is also the suffix `fixBranchName` puts on a conflict fix ref, so the ref
+ * name is the case id under `fix/sweep/` and the two name one identity.
  */
-export function caseId(branch: string, parent: string, height: number): string {
-  return `${slug(branch)}--${slug(parent)}-h${height}`;
+export function caseId(branch: string, parent: string, height: number, headSha: string): string {
+  return `${slug(branch)}--${slug(parent)}-h${height}-${headSha.slice(0, 8)}`;
 }
 
 export function writeJsonFile(path: string, value: unknown): void {

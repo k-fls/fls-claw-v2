@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { initFixtureRepo, type FixtureRepo } from './fixtures.js';
+import { initFixtureRepo, makeForkRunFixture, type FixtureRepo } from './fixtures.js';
 import {
   MACHINE_BLOCK_BEGIN,
   MACHINE_BLOCK_END,
@@ -138,6 +138,14 @@ const GOOD_BODY = [
   '',
   'The fork pinned src/x.ts to its own variant; the incoming upstream commit rewrites the same line.',
   'If yes, we resolve by keeping the fork line; if no, the fork patch is retired and upstream lands as-is.',
+].join('\n');
+
+const FORK_RUN_TITLE = 'freeze: feat/child keeps its src/a.ts and src/b.ts against the parent run';
+const FORK_RUN_BODY = [
+  'Decision needed: on src/a.ts and src/b.ts, does the child variant win over the parent run (yes = keep the child, no = take the parent)?',
+  '',
+  'The child pinned src/a.ts and src/b.ts to its own variant; the incoming parent commits rewrite the same lines.',
+  'If yes, we resolve by keeping the child lines; if no, the child patch is retired and the parent run lands as-is.',
 ].join('\n');
 
 function writeText(prDir: string, title: string, body: string): void {
@@ -301,6 +309,69 @@ async function setupEscalatedHeldCase(): Promise<{
 }
 
 // --- Pre-PR height check (DRIVER.md §10.4) + the PR machine block (§5.5) ---------
+
+describe('publish — a fork-side parent run is held at the run TOP, never at the parent tip', () => {
+  /**
+   * WHAT THE OWNER IS ASKED TO REVIEW IS WHAT THE PASS VERIFIED, and no more.
+   *
+   * The parent's whole advance is fork-side, so its nine commits share one
+   * height: p1 merges clean and p2 is the cut. The branch takes the clean prefix
+   * and the case covers the stacked run above it, capped at five — so p7…p9 were
+   * never probed in combination with anything the branch will carry, and the
+   * held ref must not contain them. The fix ref's diff is the whole of the
+   * question: content past the cut appearing there is content nobody verified,
+   * offered for review as if it had been.
+   */
+  it('the DRAFT head carries the clean prefix plus the run, and nothing above the run top', async () => {
+    const { repo, base, cleanHead, conflicting } = makeForkRunFixture();
+    cleanups.push(() => repo.destroy());
+    const bareDir = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    repo.git('push', 'origin', 'feat/child');
+    const runTop = conflicting[4]; // p6 — the fifth conflicting commit (stack_cap 5)
+
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'child', branch: 'feat/child', parents: ['main_patched'] }]);
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, { base, ...o });
+    expect(await cmdSweepStart(cli({ cmd: 'sweep-start' }))).toBe(0);
+    expect(await cmdSweepNextCase(cli({ cmd: 'next-case' }))).toBe(0);
+    const caseId = currentCaseId(dir);
+
+    // The clean prefix LANDED, and it stopped at the clean head.
+    const merge = readJournal(dir).find((e) => e.action === 'merge' && e.branch === 'feat/child')!;
+    expect((merge.head as { sha: string }).sha).toBe(cleanHead);
+    const landed = repo.git('ls-tree', '-r', '--name-only', repo.sha('feat/child')).split('\n');
+    expect(landed).toContain('docs/p1.md');
+    // …and nothing above it: the branch is capped at the processed height.
+    for (const i of [2, 3, 4, 5, 6, 7, 8, 9]) expect(landed).not.toContain(`src/p${i}.ts`);
+
+    // The case is the stacked run above the cut, topped at p6 — not the tip.
+    const caseRow = readJournal(dir).find((e) => e.action === 'case' && e.branch === 'feat/child')!;
+    expect((caseRow.head as { sha: string }).sha).toBe(runTop);
+    expect((caseRow.run as Array<{ sha: string }>).map((h) => h.sha)).toEqual(conflicting.slice(0, 5));
+    expect(caseId).toBe(`feat__child--main_patched-h0-${runTop.slice(0, 8)}`);
+
+    // Freeze pristine and publish: the DRAFT head is the automerge tree at the
+    // run top, parented on the branch tip and the run top.
+    expect(await cmdSweepReportCase(cli({ cmd: 'report-case', tier: 'held', execute: true }), neverInvoked)).toBe(0);
+    repo.git('push', 'origin', 'feat/child'); // simulated target push -> ERR14 passes
+    writeText(join(dir, caseId, 'pr'), FORK_RUN_TITLE, FORK_RUN_BODY);
+    const out = join(ws, 'out.json');
+    expect(await cmdPublish(cli({ cmd: 'publish', caseId, out }), fakeGithub().factory)).toBe(0);
+    const head = readOut(out).head!.commit;
+    expect(repo.git('rev-parse', `${head}^2`)).toBe(runTop);
+
+    // THE DIFF THE OWNER SEES: the conflicted files and the run's own additions,
+    // and nothing p7…p9 brought.
+    const changed = repo.git('diff', '--name-only', repo.sha('feat/child'), head).split('\n').filter(Boolean);
+    expect(changed).toContain('src/a.ts');
+    expect(changed).toContain('src/b.ts');
+    for (const i of [2, 3, 4, 5, 6]) expect(changed).toContain(`src/p${i}.ts`);
+    for (const i of [7, 8, 9]) expect(changed).not.toContain(`src/p${i}.ts`);
+    expect(repo.git('-C', bareDir, 'for-each-ref', 'refs/heads/fix')).toBe(''); // dry run: nothing pushed
+  });
+});
 
 describe('publish — pre-PR height check (ERR14, MERGE-POLICY.md §5)', () => {
   function heightFixture(): { repo: FixtureRepo } {
@@ -599,7 +670,7 @@ describe('propagate publish — check battery (blocking ids reachable)', () => {
     expect(await cmdPublish(cli({ cmd: 'publish', caseId, out }))).toBe(1); // no resolve/held yet
     expect(readOut(out).issues.some((i) => i.id === 'ERR01_CASE_NOT_OPEN')).toBe(true);
 
-    expect(await cmdPublish(cli({ cmd: 'publish', caseId: 'no__such--case-h9', out }))).toBe(1);
+    expect(await cmdPublish(cli({ cmd: 'publish', caseId: 'no__such--case-h9-deadbeef', out }))).toBe(1);
     expect(readOut(out).issues.some((i) => i.id === 'ERR01_CASE_NOT_OPEN')).toBe(true);
 
     expect(await cmdPublish(cli({ cmd: 'publish', caseId: '../evil', out }))).toBe(2);

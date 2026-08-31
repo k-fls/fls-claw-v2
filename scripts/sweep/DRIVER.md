@@ -2518,13 +2518,18 @@ resolution: a recorded resolution tree missing from the object store
 (`WARN06_RESOLUTION_TREE_MISSING`) and a branch tip that moved so the frozen
 resolution no longer re-merges cleanly (`WARN07_RESOLUTION_TIP_MOVED`).
 
-Naming: resolution/freeze refs are
-`fix/sweep/<slug(branch)>--<slug(parent)>-h<height>-<sha8>`; gate-fix refs are
-`fix/sweep/<slug(branch)>--<gate-fix case id>`. Case ids are
-`<slug(branch)>--<slug(parent)>-h<height>` — the parent slug is essential, because
-two parents of one branch conflicting at the same height are distinct cases, and
-with branch+height alone the second would trip the double-resolve guard and
-deadlock.
+Naming: conflict case ids are
+`<slug(branch)>--<slug(parent)>-h<height>-<sha8 of the conflict head>`, and the
+resolution/freeze ref is that id under `fix/sweep/` — one identity, spelled once.
+Gate-fix refs are `fix/sweep/<slug(branch)>--<gate-fix case id>`.
+
+Each part of a conflict id answers a collision that would be fatal rather than
+cosmetic, because a second case wearing the first's id inherits its `resolved`
+disposition, drops out of the open-case set and can never be served. The parent
+slug: two parents of one branch conflicting at the same height are distinct
+cases. The head sha8: one height covers a whole run of a parent's commits, so
+resolving the first run and re-deriving the remainder produces a second case at
+the same branch, parent and height.
 
 If a publish crashed between creating the PR and journaling it, an open PR found
 by head with no journal row is adopted as this case's PR rather than erroring.

@@ -21,7 +21,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 
-import { initFixtureRepo, type FixtureRepo } from './fixtures.js';
+import { initFixtureRepo, makeForkRunFixture, type FixtureRepo } from './fixtures.js';
 import { isAncestor } from './git.js';
 import {
   CHECKS_FAIL_LIMIT,
@@ -5265,6 +5265,11 @@ describe('sweep start — origin-derived merge_status', () => {
     expect(caseRow.fixBranch).toBe(fixBranch);
     expect(caseRow.priorHead).toBe(fixHead);
     const caseId = caseRow.caseId as string;
+    // The ref was pushed by an earlier pass and is parsed, not generated: parent,
+    // height and conflict-head sha8 all come off its name, and the id the
+    // revision wears is that name under `fix/sweep/` — one identity, so the
+    // revision cannot be mistaken for a second case on the same conflict.
+    expect(caseId).toBe(fixBranch.slice('fix/sweep/'.length));
     // The branch stays PR_ID (blocked row) — the case is a revision, not a merge.
     expect(readJournal(dir).some((e) => e.action === 'origin-blocked' && e.branch === 'main_patched')).toBe(true);
     // The worktree pending file carries the PRIOR RESOLUTION, not markers.
@@ -6720,6 +6725,105 @@ describe('next-case — a participating branch that is RED before any merge', ()
  * The rule these pin: content that propagates arrives green, or it does not
  * arrive.
  */
+describe('run — a fork-side parent run is taken commit by commit', () => {
+  /**
+   * ONE HEIGHT, TWO CASES, IN ONE PASS. The parent's advance is entirely
+   * fork-side, so its nine commits share a height and the stack cap splits them
+   * across two cases: resolving the first reopens the branch, and the
+   * re-derivation offers the bucket's REMAINDER — same branch, same parent, same
+   * height. The two cases are told apart by their conflict head, which is why
+   * the id carries it: a second case wearing the first's id inherits its
+   * `resolved` disposition, drops out of `openCases`, and can never be served.
+   */
+  it('resolving the first run reopens the branch and the remainder is served as a second case at the same height', async () => {
+    const { repo, base, conflicting } = makeForkRunFixture();
+    cleanups.push(() => repo.destroy());
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'child', branch: 'feat/child', parents: ['main_patched'] }]);
+    const dir = dirOf(repo, ws);
+    const cli = (o: Partial<Cli> = {}): Cli => baseCli(repo, ws, inv, { base, ...o });
+
+    expect(await cmdSweepStart(cli())).toBe(0);
+    expect(await cmdSweepNextCase(cli(), greenPreMerge)).toBe(0);
+    const first = currentCaseId(dir);
+    expect(first).toBe(`feat__child--main_patched-h0-${conflicting[4].slice(0, 8)}`); // run top = p6
+
+    resolveWorktree(dir, first, { 'src/a.ts': 'RESOLVED-a\n', 'src/b.ts': 'RESOLVED-b\n' });
+    expect(await cmdSweepReportCase(cli({ cmd: 'report-case', tier: 'mechanical', execute: true }), confirm)).toBe(0);
+    const afterResolve = readJournal(dir);
+    expect(afterResolve.some((e) => e.action === 'resolved' && e.caseId === first)).toBe(true);
+    expect(afterResolve.some((e) => e.action === 'reopened' && e.branch === 'feat/child')).toBe(true);
+
+    expect(await cmdSweepNextCase(cli(), greenPreMerge)).toBe(0);
+    const second = currentCaseId(dir);
+    // Same branch, same parent, same HEIGHT — a different conflict head.
+    expect(second).toBe(`feat__child--main_patched-h0-${conflicting[7].slice(0, 8)}`); // run top = p9
+    expect(second).not.toBe(first);
+    const journal = readJournal(dir);
+    const secondRow = journal.find((e) => e.action === 'case' && e.caseId === second)!;
+    expect((secondRow.head as { sha: string; height: number })).toMatchObject({ sha: conflicting[7], height: 0 });
+    expect((secondRow.run as Array<{ sha: string }>).map((h) => h.sha)).toEqual(conflicting.slice(5));
+    // Served, not swallowed: the first case's disposition is its own.
+    expect(openCases(journal).map((c) => c.caseId)).toContain(second);
+    expect(openCases(journal).map((c) => c.caseId)).not.toContain(first);
+  });
+
+  /**
+   * THE LANDING GATE MEASURES A BRANCH THAT GATED ON A CASE IN THE SAME CALL.
+   *
+   * The clean prefix moved the tree, so it is owed a verdict whatever else the
+   * branch did — and when that verdict is red, the reopen supersedes the case
+   * just emitted. Serving a conflict case on a tree whose checks fail is asking
+   * the agent to judge a merge against a defect the gate fix already describes.
+   */
+  it('a clean prefix that lands RED supersedes the case emitted above it and serves the fix instead', async () => {
+    const { repo, base, cleanHead, conflicting } = makeForkRunFixture();
+    cleanups.push(() => repo.destroy());
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'child', branch: 'feat/child', parents: ['main_patched'], owned: ['src/a.ts'] }]);
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    repo.git('push', 'origin', 'feat/child');
+    // Red on the CHILD'S LANDED TREE only: it is the one tree carrying both the
+    // trunk util the prefix brought down and the child's own src/a.ts.
+    const landedChild = (cwd: string): boolean =>
+      existsSync(join(cwd, 'src/u.ts')) && readFileSync(join(cwd, 'src/a.ts'), 'utf8').includes('child');
+    const fn: ChecksRunner = async (commands, cwd) => {
+      const cmds = commands.map((c) => c.cmd);
+      const red = cmds.includes('vitest run') && landedChild(cwd);
+      return {
+        ok: !red,
+        failedNames: red ? cmds : [],
+        output: red ? `$ ${cmds[0]}\nsrc/a.ts(1,1): error TS2345: the landed tree is broken.\n` : '',
+      };
+    };
+    const checks = join(ws, 'checks.json');
+    writeFileSync(
+      checks,
+      JSON.stringify({ typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }], test: [{ cmd: 'vitest run', cwd: '.' }] }),
+    );
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { base, checksFile: checks }))).toBe(0);
+    const out = join(ws, 'nc.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { base, out }), fn)).toBe(0);
+
+    const journal = readJournal(dir);
+    // The prefix merged, the case above it was emitted, and the landing measured red.
+    expect((journal.find((e) => e.action === 'merge' && e.branch === 'feat/child')!.head as { sha: string }).sha).toBe(cleanHead);
+    const conflictCase = journal.find((e) => e.action === 'case' && e.branch === 'feat/child')!;
+    expect((conflictCase.head as { sha: string }).sha).toBe(conflicting[4]);
+    expect(journal.find((e) => e.action === 'landing-check' && e.branch === 'feat/child')!.ok).toBe(false);
+    // The gate ran for a branch that had already gated, and its reopen won.
+    expect(supersededCaseIds(journal)).toContain(conflictCase.caseId as string);
+    expect(openCases(journal).map((c) => c.caseId)).not.toContain(conflictCase.caseId as string);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; caseId?: string };
+    expect(res.status).toBe('case-ready');
+    expect(res.caseId).toContain('gate-fix-feat__child');
+    expect(openCases(journal).map((c) => c.caseId)).toContain(res.caseId);
+  });
+});
+
 describe('run — the landing gate', () => {
   /** Every command list handed over, plus a red-when predicate on the tree. */
   function tracingRunner(redWhen?: (cwd: string) => boolean): {
