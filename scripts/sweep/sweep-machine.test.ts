@@ -6902,6 +6902,94 @@ describe('run — the landing gate', () => {
     expect(new Set(vitest.map((r) => r.cwd)).size).toBe(2);
   });
 
+  /**
+   * AN UNSTABLE RED MINTS NOTHING, so nothing else writes down what it was. The
+   * row names the COMMANDS and a reader coming back to it cannot tell a wrong
+   * assertion from an environment gap from an instability — which is the one
+   * question this row exists to raise.
+   */
+  it('an unstable landing keeps its evidence: the row carries the tail, the file carries every run', async () => {
+    const repo = flakyLandingRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'], owned: ['src/cg.ts'] }]);
+    const dir = dirOf(repo, ws);
+    const t = unstableRunner(landedRed);
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksJson(ws) }))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn)).toBe(1);
+
+    const row = readJournal(dir).find((e) => e.action === 'landing-check' && e.unstable === true)!;
+    expect(row.files).toEqual(['src/mp.ts']);
+    expect(row.fingerprints).toEqual(['ts src/mp.ts TS2345 the landed tree is broken.']);
+    expect(String(row.outputTail)).toContain('src/mp.ts(1,1): error TS2345');
+    expect(row.outputFile).toBe(join('landing', 'main_patched-test-1.txt'));
+    // EVERY RUN, in the order they were taken and each under a `$ ` header, so a
+    // reader of a checks log is never handed a re-run's diagnostics as the first
+    // run's.
+    const log = readFileSync(join(dir, String(row.outputFile)), 'utf8');
+    expect(log).toContain('src/mp.ts(1,1): error TS2345');
+    expect(log).toContain('$ --- alone re-run ---');
+    expect(log).toContain('$ --- sequence replay ---');
+  });
+
+  it('a landing red that prints 100k characters keeps a bounded tail and the whole log', async () => {
+    const repo = flakyLandingRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'], owned: ['src/cg.ts'] }]);
+    const dir = dirOf(repo, ws);
+    // The diagnostics come LAST, which is why the row keeps a tail rather than a
+    // head: a suite prints its passing output first.
+    const noise = 'x'.repeat(100_000);
+    const fn: ChecksRunner = async (commands, cwd) => {
+      const cmds = commands.map((c) => c.cmd);
+      if (!cmds.includes('vitest run') || !landedRed(cwd)) return { ok: true, failedNames: [], output: '' };
+      return {
+        ok: false,
+        failedNames: ['vitest run'],
+        output: `$ vitest run\n${noise}\nsrc/mp.ts(1,1): error TS2345: the landed tree is broken.\n`,
+      };
+    };
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksJson(ws) }))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), fn)).toBe(0);
+
+    const row = readJournal(dir).find((e) => e.action === 'landing-check' && e.confirmed === true)!;
+    expect(String(row.outputTail).length).toBeLessThanOrEqual(4000);
+    expect(String(row.outputTail)).toContain('src/mp.ts(1,1): error TS2345');
+    // The journal is bounded; the LOG is not. The whole run is on disk.
+    const log = readFileSync(join(dir, String(row.outputFile)), 'utf8');
+    expect(log.length).toBeGreaterThan(100_000);
+    expect(log).toContain('src/mp.ts(1,1): error TS2345');
+  });
+
+  it('a red-confirm row carries the RE-RUN it was decided by, not the run it was confirming', async () => {
+    const repo = flakyLandingRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'], owned: ['src/cg.ts'] }]);
+    const dir = dirOf(repo, ws);
+    // Two observations of one defect, told apart by what they print.
+    let asked = 0;
+    const fn: ChecksRunner = async (commands, cwd) => {
+      const cmds = commands.map((c) => c.cmd);
+      if (!cmds.includes('vitest run') || !landedRed(cwd)) return { ok: true, failedNames: [], output: '' };
+      const which = ++asked === 1 ? 'the standing worktree' : 'the confirming re-run';
+      return { ok: false, failedNames: ['vitest run'], output: `$ vitest run\nsrc/mp.ts(1,1): error TS2345: ${which}.\n` };
+    };
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksJson(ws) }))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), fn)).toBe(0);
+
+    const journal = readJournal(dir);
+    const confirm = journal.find((e) => e.action === 'red-confirm' && e.cmd === 'vitest run')!;
+    expect(confirm.reproduced).toBe(true);
+    expect(confirm.fingerprints).toEqual(['ts src/mp.ts TS2345 the confirming re-run.']);
+    expect(String(confirm.outputTail)).toContain('the confirming re-run');
+    // And the landing row keeps the run IT judged: two observations, two records.
+    const row = journal.find((e) => e.action === 'landing-check' && e.confirmed === true)!;
+    expect(String(row.outputTail)).toContain('the standing worktree');
+    expect(readFileSync(join(dir, String(row.outputFile)), 'utf8')).toContain('$ --- alone re-run ---');
+  });
+
   it('a landing whose tree is RED reaches no child, and the journal names the failing commands', async () => {
     const repo = initFixtureRepo();
     repo.commit('base: x', { 'src/x.ts': 'orig\n' });

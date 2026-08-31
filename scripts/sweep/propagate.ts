@@ -2997,6 +2997,16 @@ async function installDeps(cli: Cli, wtPath: string, runInstall?: InstallRunner)
 const INSTALL_OUTPUT_TAIL = 2000;
 
 /**
+ * How many characters of a FAILING CHECKS RUN's output are kept on a journal row.
+ *
+ * Enough for the failing test names and the first assertion diff, which is what
+ * tells a wrong assertion from an environment gap from an instability; a suite
+ * can print megabytes of passing output before them, and a journal is not a log
+ * file. The whole thing is written beside the pass and the row names the file.
+ */
+const FAILURE_OUTPUT_TAIL = 4000;
+
+/**
  * WHAT AN INSTALL FAILURE WAS.
  *
  * A bare "it failed" cannot be acted on: a manifest the resolution wrote badly
@@ -3831,6 +3841,33 @@ interface RedConfirmation {
   /** The re-run itself could not be taken, so there is no second observation at all. */
   unmeasurable?: { detail: string };
   detail: string;
+  /**
+   * What each confirming run PRINTED, re-rooted at the repo the way blame reads
+   * it and labelled with which experiment it was, in the order they were taken.
+   * The caller appends them to the failing-output file it keeps beside the pass.
+   * FORENSIC ONLY — no verdict is taken from them.
+   */
+  runs?: Array<{ label: string; output: string }>;
+}
+
+/**
+ * The forensic half of a row: WHAT the run printed, at the two grains a reader
+ * needs — a fingerprint set to compare failures with, and enough of the tail to
+ * read one.
+ *
+ * NOTHING READS THESE PROGRAMMATICALLY. `unstableEvidence`, `redConfirmations`
+ * and `owedRedTrees` decide on `reproduced` and `unstable` and are untouched by
+ * them. They exist because a red row that names only its COMMANDS cannot be
+ * classified once the pass has moved on, and only a MINT writes an output file —
+ * so an unstable red, which mints nothing, left no trace of what failed at all.
+ * A gating consumer may not be added without its own ruling.
+ */
+function failureEvidence(rooted: string): Record<string, unknown> {
+  if (rooted.trim() === '') return {};
+  return {
+    fingerprints: fingerprintKeys(parseFailureFingerprints(rooted)),
+    outputTail: rooted.slice(-FAILURE_OUTPUT_TAIL),
+  };
 }
 
 /**
@@ -4007,6 +4044,13 @@ async function confirmRed(
    * red.
    */
   const aloneGreen = owed.filter((v) => !again.failedNames.includes(v.cmd));
+  // WHAT EACH EXPERIMENT PRINTED, re-rooted at the repo the same way blame reads
+  // it, so a reader who comes back to the row is not handed a command's paths
+  // from that command's own cwd.
+  const runs: Array<{ label: string; output: string }> = [
+    { label: 'alone re-run', output: rootChecksOutput(again.output, owed.map((v) => ({ cmd: v.cmd, ...(v.cwd ? { cwd: v.cwd } : {}) }))) },
+  ];
+  const aloneEvidence = failureEvidence(runs[0].output);
   /** A command the accusation-only run reproduced: its verdict is in, at one worktree's cost. */
   const journalAlone = (v: CheckVerdict): void =>
     journalOne(v, {
@@ -4014,12 +4058,14 @@ async function confirmRed(
       variation,
       rerunMode: 'alone',
       reproduced: true,
+      ...aloneEvidence,
       detail:
         `${v.cmd} failed again on the identical subtree ${v.subtree.slice(0, 12)}, in a worktree checked out and ` +
         `installed afresh ${variation.separatedMs}ms after the first run (the container's other work is NOT quiet)`,
     });
   let replayFailed: string[] = [];
   let replayVariation: typeof variation | undefined;
+  let replayEvidence: Record<string, unknown> = {};
   if (aloneGreen.length > 0) {
     /** The second observation is missing, not green: an absent experiment settles nothing. */
     const unmeasurableReplay = (why: string): RedConfirmation => {
@@ -4028,7 +4074,7 @@ async function confirmRed(
         if (aloneGreen.includes(v)) journalOne(v, { ran: true, aloneGreen: true, reproduced: false, unmeasurable: true, detail });
         else journalAlone(v);
       }
-      return { reproduced: false, flaky: [], unmeasurable: { detail }, detail };
+      return { reproduced: false, flaky: [], unmeasurable: { detail }, detail, runs };
     };
     const replay = await args.replaySequence(args.sequence);
     if ('unprepared' in replay) return unmeasurableReplay(replay.unprepared);
@@ -4040,6 +4086,8 @@ async function confirmRed(
       separatedMs: Math.max(0, replay.startedAt - observedAt),
       loadIsolated: false,
     };
+    runs.push({ label: 'sequence replay', output: rootChecksOutput(replay.result.output, args.sequence) });
+    replayEvidence = failureEvidence(runs[runs.length - 1].output);
   }
   const sequenceNames = args.sequence.map((c) => c.cmd).join(', ');
   const flaky = aloneGreen.filter((v) => !replayFailed.includes(v.cmd));
@@ -4055,6 +4103,9 @@ async function confirmRed(
       ...(replayVariation ? { replayVariation } : {}),
       aloneGreen: true,
       reproduced: !changed,
+      // The REPLAY is what decided this row, so the replay's output is what the
+      // row keeps — the accusation alone printed a green.
+      ...replayEvidence,
       ...(changed ? { replayGreen: true, flaky: [v.cmd] } : { context: 'sequence' }),
       detail: changed
         ? `${v.cmd} failed and then PASSED under the replayed command sequence (${sequenceNames}) on the ` +
@@ -4072,7 +4123,46 @@ async function confirmRed(
       `failure belongs to no branch`
     : `${failed.map((v) => v.cmd).join(', ')} failed again on the identical subtree, in a separately prepared ` +
       `worktree ${variation.separatedMs}ms later`;
-  return { reproduced: names.length === 0, flaky: names, detail };
+  return { reproduced: names.length === 0, flaky: names, detail, runs };
+}
+
+/**
+ * WHAT A RED LANDING PRINTED, KEPT WHERE A READER CAN FIND IT.
+ *
+ * A landing red row names the COMMANDS and nothing else, so once the pass has
+ * moved on nobody can say WHICH failure it was — a wrong assertion, an
+ * environment gap and an instability are the same row at that grain. Only a MINT
+ * writes an output file today, and an unstable red mints nothing, so the reds
+ * hardest to classify are exactly the ones that left no trace.
+ *
+ * The whole output goes beside the pass and the row keeps the tail. Each
+ * confirming run is appended under a `$ ` separator, because `$ <cmd>` is what
+ * starts a command's section for every reader of a checks log (`rootChecksOutput`,
+ * `parseFailingFiles`) — a re-run's diagnostics must not be read as the first
+ * run's.
+ *
+ * FORENSIC ONLY: nothing reads the fields it returns programmatically.
+ */
+function landingEvidence(
+  dir: string,
+  branch: string,
+  phase: string,
+  rooted: string,
+  runs: Array<{ label: string; output: string }>,
+): Record<string, unknown> {
+  // A tree stays owed a verdict after an unstable or unminted red, so the same
+  // branch and phase are measured again in one pass; each run keeps its own file.
+  let n = 1;
+  const nameAt = (i: number): string => join('landing', `${slug(branch)}-${phase}-${i}.txt`);
+  while (existsSync(join(dir, nameAt(n)))) n++;
+  const rel = nameAt(n);
+  mkdirSync(join(dir, 'landing'), { recursive: true });
+  writeFileSync(join(dir, rel), [rooted, ...runs.map((x) => `$ --- ${x.label} ---\n${x.output}`)].join('\n'));
+  return {
+    files: parseFailingFiles(rooted),
+    ...failureEvidence(rooted),
+    outputFile: rel,
+  };
 }
 
 /**
@@ -4277,6 +4367,10 @@ async function landingCheck(
           console.error(`run [WARN14_ENVIRONMENT_FAULT]: ${branch} — ${confirm.unmeasurable.detail}`);
           return { kind: 'unmeasured' };
         }
+        // THE EVIDENCE OUTLIVES THE VERDICT. Both rows below carry it, because
+        // both are reds a later reader has to classify and neither of them mints
+        // the output file a gate fix gets.
+        const evidence = landingEvidence(dir, branch, phase, rootChecksOutput(r.output, failed), confirm.runs ?? []);
         if (!confirm.reproduced) {
           appendJournal(dir, {
             action: 'landing-check',
@@ -4291,6 +4385,7 @@ async function landingCheck(
             flaky: confirm.flaky,
             detail: confirm.detail,
             checks: checkRows,
+            ...evidence,
           });
           return { kind: 'flaky', tree, failedNames: r.failedNames, flaky: confirm.flaky, detail: confirm.detail };
         }
@@ -4304,6 +4399,7 @@ async function landingCheck(
           phase,
           failed: r.failedNames,
           checks: checkRows,
+          ...evidence,
         });
         return { kind: 'red', output: r.output, failed, failedNames: r.failedNames, tree, sha };
       }

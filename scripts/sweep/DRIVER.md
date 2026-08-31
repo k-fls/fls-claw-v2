@@ -1744,6 +1744,20 @@ arrive green, and on which tree" is a JOURNAL READ: the question of whether a re
 is inherited from a parent is answered by comparing rows, with nothing re-probed
 and no parent head examined.
 
+**AND A RED SAYS WHAT IT WAS.** Naming the failing COMMANDS is not saying what
+failed: a wrong assertion, an environment gap and an instability are the same row
+at that grain, and only a MINT writes an output file — so an unstable red, which
+mints nothing, is exactly the red nobody can classify afterwards. Both red rows
+therefore carry `files`, `fingerprints` and `outputTail` (bounded at
+`FAILURE_OUTPUT_TAIL`: enough for the failing test names and the first assertion
+diff, because a journal is not a log file), plus `outputFile` — a pass-dir
+relative path to `landing/<slug(branch)>-<phase>-<n>.txt`, holding the whole
+first run with each confirming run appended under a `$ ` header. `red-confirm`
+rows carry the same two fields for the run that DECIDED them. These are FORENSIC:
+nothing reads them programmatically, `unstableEvidence`/`redConfirmations`/
+`owedRedTrees` are unchanged by them, and no gating consumer may be added without
+its own ruling.
+
 ## 8. Tiers and enforcement
 
 ### 8.1 The ladder
