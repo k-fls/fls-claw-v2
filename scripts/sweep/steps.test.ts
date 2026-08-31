@@ -1,9 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { makePropagationFixture } from './fixtures.js';
+import { initFixtureRepo, makePropagationFixture } from './fixtures.js';
 import { enumerateChain, type Chain } from './heights.js';
-import { verifyStepFile } from './steps.js';
+import { allParentsSkipped, deriveBranch, type DeriveBranchArgs } from './plan.js';
+import { buildStepFile, verifyStepFile } from './steps.js';
 import type { StepFile, StepVerifyContext } from './steps.js';
+import { WHOLE_RANGE_BLOCK } from './types.js';
 
 const { repo, base, chain } = makePropagationFixture();
 let c: Chain;
@@ -92,3 +94,131 @@ describe('verifyStepFile — rejects forged / hand-edited inputs (§7)', () => {
     expect(r.errors.join('\n')).toMatch(/!= pass watermark/);
   });
 });
+
+// --- the step's reason slot carries the PARENT-LEVEL answer ---------------
+//
+// Per-commit window enumeration makes "merge point below, conflict above" the
+// normal shape of a parent, so a parent whose merge point is a tree-identical
+// no-op can still end as a `case` or a `defer`. The step file must say which:
+// the leaf / always_merge rule reads the reason alone, and 'no-op' tells it a
+// blocked branch merely had nothing to take.
+describe('buildStepFile — the skip reason is the parent-level answer', () => {
+  // THE DIAMOND. feat/leaf has two parents and already carries `src/a.ts =
+  // shared` because it grew out of feat/p2; feat/p1 arrives at the same content
+  // by its own commit (a tree-identical, clean merge point) and then diverges
+  // on `src/x.ts` (a genuine conflict above it). feat/p2 has nothing left to
+  // give, so no real merge can land and the leaf rule is live.
+  const repo = initFixtureRepo();
+  repo.commit('base: x + a', { 'src/x.ts': 'orig\n', 'src/a.ts': 'orig\n' });
+  const base = repo.sha('main');
+  repo.checkout('main_patched', { create: true, at: 'main' });
+  repo.checkout('feat/p2', { create: true, at: 'main_patched' });
+  repo.commit('feat/p2: a = shared', { 'src/a.ts': 'shared\n' });
+  repo.checkout('feat/leaf', { create: true, at: 'feat/p2' });
+  repo.commit('feat/leaf: x = leaf', { 'src/x.ts': 'leaf\n' });
+  repo.checkout('feat/p1', { create: true, at: 'main_patched' });
+  repo.commit('feat/p1: a = shared', { 'src/a.ts': 'shared\n' }); // tree-identical arrival
+  repo.commit('feat/p1: x = p1', { 'src/x.ts': 'p1\n' }); // conflicts with the leaf
+  repo.checkout('main');
+  repo.commit('U0: util', { 'src/util.ts': 'u\n' }); // the pass carries progress
+  afterAll(() => repo.destroy());
+
+  const leafArgs = (chain: Chain): DeriveBranchArgs => ({
+    repo: repo.dir,
+    branch: 'feat/leaf',
+    kind: 'inventory',
+    model: 'parents',
+    parents: ['feat/p1', 'feat/p2'],
+    chain,
+    ancestors: ['feat/p1', 'feat/p2', 'main_patched'],
+    tierFloor: 'clean',
+    isLeaf: true,
+    alwaysMerge: false,
+  });
+
+  async function leafCtx(chain: Chain): Promise<StepVerifyContext> {
+    return {
+      chain,
+      branchTip: repo.sha('feat/leaf'),
+      arrivedParents: new Set(['feat/p1', 'feat/p2']),
+      passHasProgress: true,
+    };
+  }
+
+  it('a conflict above a no-op merge point is reported as conflict-pending', async () => {
+    const chain = await enumerateChain(repo.dir, 'main', base);
+    const bp = await deriveBranch(leafArgs(chain));
+    const p1 = bp.parents.find((p) => p.parent === 'feat/p1')!;
+    expect(p1.mergePoint).not.toBeNull(); // the tree-identical commit IS the merge point
+    expect(p1.case?.conflictedPaths).toEqual(['src/x.ts']);
+    expect(p1.verdict).toBe('case');
+
+    const step = buildStepFile(bp, chain.watermark);
+    const m1 = step.merges.find((m) => m.parent === 'feat/p1')!;
+    expect(m1.action).toBe('skip');
+    expect(m1.skipReason).toBe('conflict-pending');
+    expect(p1.skipReason).toBeNull(); // the parent's answer is `case`, not the merge point's shape
+  });
+
+  it('the leaf/always_merge rule exempts a branch blocked on that conflict instead of halting it', async () => {
+    const chain = await enumerateChain(repo.dir, 'main', base);
+    const step = buildStepFile(await deriveBranch(leafArgs(chain)), chain.watermark);
+    const r = await verifyStepFile(repo.dir, step, await leafCtx(chain));
+    expect(r.errors).toEqual([]);
+    expect(r.ok).toBe(true);
+  });
+
+  it('the same conflict deferred behind a blocked parent is reported as deferred', async () => {
+    const chain = await enumerateChain(repo.dir, 'main', base);
+    const bp = await deriveBranch({
+      ...leafArgs(chain),
+      blockHeightOf: new Map([['feat/p2', WHOLE_RANGE_BLOCK]]),
+    });
+    const p1 = bp.parents.find((p) => p.parent === 'feat/p1')!;
+    expect(p1.verdict).toBe('defer');
+    expect(p1.deferredTo).toBe('feat/p2');
+    expect(p1.skipReason).toBeNull(); // 'no-op' must not leak into a defer
+
+    const step = buildStepFile(bp, chain.watermark);
+    expect(reasonFor(step, 'feat/p1')).toBe('deferred');
+
+    const r = await verifyStepFile(repo.dir, step, await leafCtx(chain));
+    expect(r.errors).toEqual([]);
+    expect(r.ok).toBe(true);
+  });
+
+  it('an up-to-date parent names itself in the reason, matching how the journal reads it', async () => {
+    const chain = await enumerateChain(repo.dir, 'main', base);
+    const bp = await deriveBranch(leafArgs(chain));
+    const p2 = bp.parents.find((p) => p.parent === 'feat/p2')!;
+    expect(p2.verdict).toBe('up-to-date');
+    expect(reasonFor(buildStepFile(bp, chain.watermark), 'feat/p2')).toBe('up-to-date');
+  });
+
+  // PASSES BEFORE THE FIX TOO — the guard is that the plain no-op path is
+  // untouched: a merge point that no-ops with nothing above it still reports
+  // 'no-op', still counts as "every parent no-op'd", and the build-time
+  // vocabulary assertion does not fire on it.
+  it('a plain no-op merge point still reports no-op and still feeds the un-skip pass', async () => {
+    const chain = await enumerateChain(repo.dir, 'main', base);
+    // feat/p1 minus its conflicting top: a tree-identical arrival and nothing more.
+    repo.git('update-ref', 'refs/heads/feat/p1-noop', repo.sha('feat/p1^'));
+    const bp = await deriveBranch({
+      ...leafArgs(chain),
+      parents: ['feat/p1-noop'],
+      ancestors: ['feat/p1-noop', 'main_patched'],
+    });
+    const pp = bp.parents[0];
+    expect(pp.verdict).toBe('skip');
+    expect(pp.skipReason).toBe('no-op');
+    expect(allParentsSkipped(bp)).toBe(true);
+
+    const step = buildStepFile(bp, chain.watermark); // must NOT throw
+    expect(step.merges[0].skipReason).toBe('no-op');
+  });
+
+});
+
+function reasonFor(step: StepFile, parent: string): string | null {
+  return step.merges.find((m) => m.parent === parent)!.skipReason;
+}

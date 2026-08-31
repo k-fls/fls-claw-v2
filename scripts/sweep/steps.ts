@@ -79,6 +79,10 @@ export function readCaseFile(path: string): CaseFile {
  * becomes a `merge` step; every other verdict (skip / up-to-date / case / defer)
  * lands no merge from that parent this run (a `case` is emitted separately and
  * the branch halts on it).
+ *
+ * Every skip row NAMES its reason — the parent-level answer, not the merge
+ * point's shape. `up-to-date` says so in the reason as well as the verdict, so
+ * the file and the journal (which renders `skipReason ?? verdict`) read alike.
  */
 export function buildStepFile(bp: BranchPlan, watermark: string): StepFile {
   const merges: StepMerge[] = bp.parents.map((pp) => ({
@@ -87,7 +91,14 @@ export function buildStepFile(bp: BranchPlan, watermark: string): StepFile {
     action: pp.verdict === 'merge' ? 'merge' : 'skip',
     head: pp.verdict === 'merge' ? pp.mergePoint : null,
     skipReason:
-      pp.skipReason ?? (pp.verdict === 'case' ? 'conflict-pending' : pp.verdict === 'defer' ? 'deferred' : null),
+      pp.skipReason ??
+      (pp.verdict === 'case'
+        ? 'conflict-pending'
+        : pp.verdict === 'defer'
+          ? 'deferred'
+          : pp.verdict === 'up-to-date'
+            ? 'up-to-date'
+            : null),
     forced: pp.forced,
   }));
   const model = bp.parents[0]?.model ?? 'parents';

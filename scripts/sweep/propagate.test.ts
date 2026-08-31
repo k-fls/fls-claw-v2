@@ -55,6 +55,7 @@ import {
   type MachineVerdict,
 } from './propagate.js';
 import type { GithubTransport } from './publish.js';
+import { readStepFile } from './steps.js';
 import { verifyEverything } from './verify.js';
 
 const cleanups: Array<() => void> = [];
@@ -3596,5 +3597,56 @@ describe('a red is answered only by work done AFTER it, on ITS files', () => {
       row({ action: 'landing-check', branch: 'module/cg', tree: 'T2', ok: true }),
     ];
     expect(unmintableReds(journal).map((u) => u.branch)).toEqual(['main_patched']);
+  });
+});
+
+// --- a leaf blocked on a conflict ABOVE a no-op merge point ------------------
+describe('propagate run — a leaf whose conflict sits above a tree-identical merge point', () => {
+  it('serves the case and completes, instead of halting on the leaf/always_merge rule', async () => {
+    // THE DIAMOND. feat/leaf grew out of feat/p2, so it already carries
+    // `src/a.ts = shared`; feat/p1 reaches that same content by its own commit
+    // — a clean, tree-identical merge point — and then diverges on `src/x.ts`,
+    // a conflict the leaf cannot merge past. Everything else is already at the
+    // watermark, so nothing can land on the leaf this pass, and the pass still
+    // carries progress (the chain holds U0). The leaf is BLOCKED, not idle, and
+    // the step must say so or the leaf rule halts it.
+    const repo = initFixtureRepo();
+    repo.commit('base: x + a', { 'src/x.ts': 'orig\n', 'src/a.ts': 'orig\n' });
+    const base = repo.sha('main');
+    repo.commit('U0: util', { 'src/util.ts': 'u\n' }); // the pass carries progress
+    repo.checkout('main_patched', { create: true, at: 'main' }); // already at the watermark
+    repo.checkout('feat/p2', { create: true, at: 'main_patched' });
+    repo.commit('feat/p2: a = shared', { 'src/a.ts': 'shared\n' });
+    repo.checkout('feat/leaf', { create: true, at: 'feat/p2' });
+    repo.commit('feat/leaf: x = leaf', { 'src/x.ts': 'leaf\n' });
+    repo.checkout('feat/p1', { create: true, at: 'main_patched' });
+    repo.commit('feat/p1: a = shared', { 'src/a.ts': 'shared\n' }); // tree-identical arrival
+    repo.commit('feat/p1: x = p1', { 'src/x.ts': 'p1\n' }); // the conflict above it
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'p1', branch: 'feat/p1', parents: ['main_patched'] },
+      { id: 'p2', branch: 'feat/p2', parents: ['main_patched'] },
+      { id: 'leaf', branch: 'feat/leaf', parents: ['feat/p1', 'feat/p2'] },
+    ]);
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, { base, ...o });
+    await cmdPlan(cli({ cmd: 'plan' }));
+    const leafTip = repo.sha('feat/leaf');
+
+    expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'halt')).toBe(false);
+    // The leaf is served as a case against the parent it cannot merge past…
+    const row = journal.find((e) => e.action === 'case' && e.branch === 'feat/leaf')!;
+    expect(row).toBeDefined();
+    expect(row.parent).toBe('feat/p1');
+    // …its tip does not move, and the step names the block rather than a no-op.
+    expect(repo.sha('feat/leaf')).toBe(leafTip);
+    const step = readStepFile(join(dir, 'step-feat__leaf.json'));
+    expect(step.merges.find((m) => m.parent === 'feat/p1')!.skipReason).toBe('conflict-pending');
+    expect(step.merges.find((m) => m.parent === 'feat/p2')!.skipReason).toBe('up-to-date');
   });
 });

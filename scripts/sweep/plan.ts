@@ -264,6 +264,12 @@ async function analyzeParent(
   }
 
   let realMerge = false;
+  // The merge point's own shape is held in a LOCAL, not in the reason slot: the
+  // slot carries the PARENT-LEVEL answer, and at this point the parent's answer
+  // is still open. A no-op merge point below a conflict makes the parent a
+  // `case` (or a `defer`), and writing 'no-op' here would spend the slot on the
+  // merge point and hide that.
+  let mergeNoOp = false;
   if (sweep.mergePoint) {
     // BY SHA, never by height: parents-model heads are the parent's own
     // commits and a fork-side run of them shares one derived height, so a
@@ -271,7 +277,7 @@ async function analyzeParent(
     // merge a no-op (or the reverse).
     const probe = sweep.probes.find((p) => p.head.sha === sweep.mergePoint!.sha);
     if (probe && probe.clean && probe.treeOid === branchTree) {
-      pp.skipReason = 'no-op';
+      mergeNoOp = true;
     } else {
       realMerge = true;
     }
@@ -301,6 +307,12 @@ async function analyzeParent(
   else if (pp.deferredTo) pp.verdict = 'defer';
   else if (pp.case) pp.verdict = 'case';
   else pp.verdict = 'skip';
+  // Only a parent whose answer IS "nothing to take" reports the merge point's
+  // no-op. `case` and `defer` are answers of their own and `buildStepFile`
+  // names them; leaving 'no-op' in their slot tells the step verifier a blocked
+  // parent merely no-op'd, and the leaf/always_merge rule then halts a branch
+  // that cannot merge.
+  if (pp.verdict === 'skip' && mergeNoOp) pp.skipReason = 'no-op';
   return pp;
 }
 

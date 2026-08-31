@@ -524,6 +524,12 @@ re-derivation serves the rest of the window as its own case, in the same pass.
 - A parent merge whose merge-tree result tree equals the branch's current tree is
   a no-op: journaled `skip`, no merge commit. Merge-base consequences are benign
   — the next real merge covers the gap.
+- A skip row names the PARENT'S answer, never the merge point's shape. A window
+  is a run of commits, so a no-op merge point and a conflict above it is the
+  ordinary shape of a parent: that parent's answer is `conflict-pending` (or
+  `deferred`), and the branch is BLOCKED, not idle. `no-op` names a parent that
+  has nothing left to give, `up-to-date` one that never had anything — the two
+  reasons the un-skip pass acts on.
 - Leaves and entries flagged `always_merge: true` must land at least one real
   merge per pass when the pass carries upstream progress. If every parent chain
   above such a branch no-op'd, the driver un-skips the CHEAPEST parent chain: the
