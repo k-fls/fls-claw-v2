@@ -204,18 +204,65 @@ export function gpgDecryptAt(home: string, ciphertext: string): string {
 // Detection
 // ---------------------------------------------------------------------------
 
-/** Detect if a string contains a PGP-encrypted message. */
+/**
+ * Invisible / zero-width characters that can ride along in a copy/paste (from
+ * a web page, a rich editor, or Slack) and silently defeat gpg's armor parser.
+ * `String.prototype.trim()` does NOT strip these — they are Unicode category
+ * Cf (format), not whitespace. Base64 armor never legitimately contains them.
+ * U+200B ZWSP, U+200C ZWNJ, U+200D ZWJ, U+2060 word-joiner, U+FEFF BOM, U+00AD soft hyphen.
+ */
+const INVISIBLE_CHARS = /[\u200B\u200C\u200D\u2060\uFEFF\u00AD]/g;
+
+/**
+ * Detect a complete PGP-encrypted message. Requires BOTH the BEGIN and END
+ * markers so a truncated paste (BEGIN only) is rejected up front with a clear
+ * "missing the BEGIN/END headers" re-prompt rather than being handed to gpg,
+ * which fails opaquely. Invisible chars are stripped first so a contaminated
+ * marker line still matches.
+ */
 export function isPgpMessage(text: string): boolean {
-  return text.includes('-----BEGIN PGP MESSAGE-----');
+  const t = text.replace(INVISIBLE_CHARS, '');
+  return t.includes('-----BEGIN PGP MESSAGE-----') && t.includes('-----END PGP MESSAGE-----');
 }
 
 /**
- * Normalize a PGP/PEM armored block: trim whitespace from each line and
- * drop empty lines — except the mandatory blank line after a BEGIN header
- * (required by the PGP armor format).
+ * Normalize a PGP/PEM armored block so gpg can parse it despite common
+ * copy/paste damage.
+ *
+ * A PGP MESSAGE is rebuilt canonically: the exact BEGIN/END marker lines, any
+ * armor headers, the mandatory blank line, then the base64 payload with all
+ * whitespace and stray blank lines removed. This repairs the paste artifacts
+ * that make gpg report "no valid OpenPGP data found" — most importantly a
+ * base64 body glued onto the BEGIN marker line (observed in the field: the
+ * newline after the marker was dropped, so gpg never recognizes the armor
+ * header), plus a missing blank separator, reflowed wrapping, extra dashes on
+ * the delimiters, or an invisible char contaminating a marker line.
+ *
+ * A PEM key block (no PGP MESSAGE markers) falls back to a per-line trim that
+ * preserves the mandatory blank line after its BEGIN header.
  */
 export function normalizeArmoredBlock(block: string): string {
-  const lines = block.split('\n');
+  const cleaned = block.replace(INVISIBLE_CHARS, '');
+
+  const pgp = cleaned.match(/-{2,}BEGIN PGP MESSAGE-{2,}([\s\S]*?)-{2,}END PGP MESSAGE-{2,}/);
+  if (pgp) {
+    const inner = pgp[1]
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+    // Preserve leading armor headers ("Key: value"); base64 never contains
+    // ": " so a payload line can't be mistaken for a header.
+    const headers: string[] = [];
+    let i = 0;
+    while (i < inner.length && /^[A-Za-z][A-Za-z0-9-]*: /.test(inner[i])) {
+      headers.push(inner[i]);
+      i++;
+    }
+    const body = inner.slice(i);
+    return ['-----BEGIN PGP MESSAGE-----', ...headers, '', ...body, '-----END PGP MESSAGE-----'].join('\n');
+  }
+
+  const lines = cleaned.split('\n');
   const result: string[] = [];
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
