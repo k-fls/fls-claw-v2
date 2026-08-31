@@ -67,7 +67,15 @@ describe('poll loop — /upload-trace command', () => {
 
 async function runPollLoopWithTimeout(provider: MockProvider, signal: AbortSignal, timeoutMs: number): Promise<void> {
   return Promise.race([
-    runPollLoop({ provider, providerName: 'mock', cwd: '/tmp' }),
+    // The signal goes INTO the loop. Racing an abort listener against a loop
+    // that cannot hear the abort only settles this promise: the loop itself
+    // runs on, and `afterEach`'s `closeSessionDb()` does not stop it either.
+    // The next file's `initTestSessionDb()` then repoints the module-level
+    // handle in `db/connection.ts` at a fresh in-memory database, and the
+    // orphan — still polling through the same accessor — starts consuming that
+    // file's messages, marking them processing before the test's own loop can
+    // see them.
+    runPollLoop({ provider, providerName: 'mock', cwd: '/tmp', signal }),
     new Promise<void>((_, reject) => {
       signal.addEventListener('abort', () => reject(new Error('aborted')));
     }),
