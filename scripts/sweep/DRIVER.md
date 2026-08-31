@@ -2689,12 +2689,12 @@ Committed with the code:
   `registry/prompts/` (`overlap-check.md`, `catch-all-triage.md`);
 - `scripts/sweep/checks.json` — the checks gate's typecheck/test command lists,
   each test command carrying a `filter` template (`{files}`) that makes narrowed
-  re-probing affordable (§7.3). EVERY tsconfig the fork owns needs its own entry:
-  the root project includes `src/**` alone, so a directory outside it is checked
-  by nothing unless it is named here, and a gate that checks nothing passes
-  everything. `container/agent-runner` and `scripts/sweep` are those directories,
-  and the driver's own code is in the second one — a type error there is a red
-  build like any other, blamed and minted by the same rules;
+  re-probing affordable (§7.3). Every command here runs against EVERY branch in
+  scope, so a command may only name paths the whole fork carries: a project that
+  exists on one branch fails everywhere else and reds the base before anything
+  merges. The driver's own sources are branch-local in exactly that way, so their
+  typecheck (`tsc -p scripts/sweep`) belongs to whatever gates that branch before
+  it is pushed, never to this list;
 - `scripts/sweep/cut-point-exceptions.yaml` — blame's history facts (§9.2). Its
   home is beside `checks.json`, not under `registry/`: it is DRIVER-read config
   that blame consumes, exactly as `checks.json` is driver-read config the checks
