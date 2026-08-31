@@ -217,27 +217,44 @@ describe('buildStepFile — the skip reason is the parent-level answer', () => {
     expect(step.merges[0].skipReason).toBe('no-op');
   });
 
+  /** An all-skip leaf plan whose parents carry exactly these reasons. */
+  const allSkipLeaf = (reasons: Array<string | null>): BranchPlan => ({
+    branch: 'feat/leaf',
+    kind: 'inventory',
+    tierFloor: 'clean',
+    isLeaf: true,
+    alwaysMerge: false,
+    ancestors: [],
+    parents: reasons.map((skipReason, i) => ({
+      parent: `feat/p${i}`,
+      model: 'parents',
+      mergePoint: null,
+      verdict: 'skip',
+      case: null,
+      deferredTo: null,
+      skipReason,
+    })),
+  });
+
   it('an all-skip leaf step whose reasons are in neither vocabulary is refused at build time', () => {
-    const bp: BranchPlan = {
-      branch: 'feat/leaf',
-      kind: 'inventory',
-      tierFloor: 'clean',
-      isLeaf: true,
-      alwaysMerge: false,
-      ancestors: [],
-      parents: [
-        {
-          parent: 'feat/p1',
-          model: 'parents',
-          mergePoint: null,
-          verdict: 'skip',
-          case: null,
-          deferredTo: null,
-          skipReason: 'invented',
-        },
-      ],
-    };
-    expect(() => buildStepFile(bp, c.watermark)).toThrow(/unclassified skip reason\(s\).*invented/s);
+    expect(() => buildStepFile(allSkipLeaf(['invented']), c.watermark)).toThrow(
+      /unclassified skip reason\(s\).*invented/s,
+    );
+  });
+
+  it('one stray reason among no-ops is refused too — the leaf rule would read the row as a plain no-op', () => {
+    // A single classified reason cannot vouch for the rest: these rows reach the
+    // leaf rule as "every parent no-op'd" and halt the branch with the generic
+    // string, which is the very shape the assertion exists to catch. Only a
+    // BLOCKED reason sanctions a step outright; short of that, EVERY reason must
+    // be un-skip input.
+    // The offending list ends at the em dash, so matching it proves the message
+    // names 'bogus' ALONE — 'no-op' is classified and is not an offender.
+    expect(() => buildStepFile(allSkipLeaf(['no-op', 'bogus']), c.watermark)).toThrow(
+      /unclassified skip reason\(s\) on an all-skip leaf\/always_merge step: bogus —/,
+    );
+    // A blocked reason still sanctions the step, unknowns beside it included.
+    expect(() => buildStepFile(allSkipLeaf(['conflict-pending', 'bogus']), c.watermark)).not.toThrow();
   });
 });
 

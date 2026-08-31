@@ -97,17 +97,20 @@ const UNSKIP_INPUT_SKIP_REASONS = new Set(['no-op', 'up-to-date']);
  * The leaf / always_merge rule decides from skip reasons alone, so a reason it
  * has never heard of reads as "this branch merely no-op'd" and halts a branch
  * that is in fact blocked. The verifier stays a verifier: instead of teaching
- * it to guess, the AUTHOR refuses to emit an all-skip leaf step whose reasons
- * are in neither the block vocabulary nor the un-skip input set — a new reason
- * must be classified into one of them before it can reach the rule.
+ * it to guess, the AUTHOR refuses to emit an all-skip leaf step it cannot
+ * account for: throw unless a BLOCKED reason is present — which sanctions the
+ * step outright, so unknowns beside it cannot change the rule's answer — or
+ * EVERY reason is un-skip input. One stray reason among no-ops is the whole
+ * point: those rows reach the rule as a plain all-no-op and halt the branch.
  */
 function assertClassifiedSkipReasons(branch: string, ruled: boolean, merges: StepMerge[]): void {
   if (!ruled || merges.length === 0) return;
   if (!merges.every((m) => m.action === 'skip')) return;
   const reasons = merges.map((m) => m.skipReason);
   if (reasons.some((r) => r !== null && BLOCKED_SKIP_REASONS.has(r))) return;
-  if (reasons.some((r) => r !== null && UNSKIP_INPUT_SKIP_REASONS.has(r))) return;
-  const offending = [...new Set(reasons.map((r) => (r === null ? 'null' : r)))].join(', ');
+  const unclassified = reasons.filter((r) => r === null || !UNSKIP_INPUT_SKIP_REASONS.has(r));
+  if (unclassified.length === 0) return;
+  const offending = [...new Set(unclassified.map((r) => (r === null ? 'null' : r)))].join(', ');
   throw new Error(
     `${branch}: unclassified skip reason(s) on an all-skip leaf/always_merge step: ${offending} — ` +
       `classify each as blocked (${[...BLOCKED_SKIP_REASONS].join(', ')}) or as un-skip input ` +
