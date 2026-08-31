@@ -7,7 +7,7 @@
  *      sight. Returns null when the payload doesn't carry enough to identify
  *      a sender.
  *   2. setAccessGate — runs after agent resolution. Enforces the
- *      unknown_sender_policy (strict/request_approval/public) and the
+ *      unknown_sender_policy (strict/request_approval/decline_notify/public) and the
  *      owner/global-admin/scoped-admin/member access hierarchy. Records its
  *      own `dropped_messages` row on refusal (structural drops are recorded
  *      by core).
@@ -55,7 +55,7 @@ import {
 import { deletePendingSenderApproval, getPendingSenderApproval } from './db/pending-sender-approvals.js';
 import { hasAdminPrivilege } from './db/user-roles.js';
 import { getUser, upsertUser } from './db/users.js';
-import { requestSenderApproval } from './sender-approval.js';
+import { declineAndNotify, requestSenderApproval } from './sender-approval.js';
 import { ensureUserDm } from './user-dm.js';
 
 // ── Free-text name input state ──
@@ -149,10 +149,14 @@ function handleUnknownSender(
 
   if (decision.effect === 'allow') return; // 'public' — handled before the gate; fall through silently.
 
+  const isDeclineNotify = mg.unknown_sender_policy === 'decline_notify';
+
   log.info(
-    decision.effect === 'hold'
-      ? 'MESSAGE DROPPED — unknown sender (approval requested)'
-      : 'MESSAGE DROPPED — unknown sender (strict policy)',
+    isDeclineNotify
+      ? 'MESSAGE DROPPED — unknown sender (decline-and-notify policy)'
+      : decision.effect === 'hold'
+        ? 'MESSAGE DROPPED — unknown sender (approval requested)'
+        : 'MESSAGE DROPPED — unknown sender (strict policy)',
     {
       messagingGroupId: mg.id,
       agentGroupId,
@@ -161,6 +165,31 @@ function handleUnknownSender(
     },
   );
   recordDroppedMessage(dropRecord);
+
+  // decline_notify: polite in-DM decline + one-line owner FYI, no
+  // card. Fire-and-forget like the hold path — declineAndNotify dedupes
+  // itself (24h stamp) and logs failures internally; the sender's message
+  // stays dropped either way.
+  if (isDeclineNotify) {
+    // The decline copy assumes a 1:1 DM surface. The policy is
+    // settable on groups (ncl / setup register), where delivering it would
+    // post the decline publicly into the channel — treat groups as strict:
+    // the drop above stands, nothing is sent.
+    if (mg.is_group === 1) {
+      log.warn('decline_notify on a group messaging group — treated as strict (no public decline)', {
+        messagingGroupId: mg.id,
+      });
+      return;
+    }
+    declineAndNotify({
+      messagingGroupId: mg.id,
+      agentGroupId,
+      senderIdentity: userId,
+      senderName,
+      event,
+    }).catch((err) => log.error('decline_notify flow threw', { err }));
+    return;
+  }
 
   // Fire-and-forget; pick-approver + delivery + row-insert are all async.
   // If it fails it logs internally — the user's message still stays dropped
@@ -469,7 +498,8 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     const agentGroups = getAllAgentGroups();
     const options = buildAgentSelectionOptions(agentGroups, approverId);
     const title = '📋 Choose an agent';
-    updatePendingChannelApprovalCard(row.messaging_group_id, title, JSON.stringify(options));
+    const question = 'Which agent should handle this channel?';
+    updatePendingChannelApprovalCard(row.messaging_group_id, title, question, JSON.stringify(options));
 
     try {
       await adapter.deliver(
@@ -481,7 +511,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
           type: 'ask_question',
           questionId: row.messaging_group_id,
           title,
-          question: 'Which agent should handle this channel?',
+          question,
           options,
         }),
       );
