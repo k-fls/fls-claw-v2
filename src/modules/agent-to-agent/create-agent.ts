@@ -18,7 +18,7 @@ import path from 'path';
 
 import { GROUPS_DIR } from '../../config.js';
 import { createAgentGroup, getAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
-import { getContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
+import { getContainerConfig } from '../../db/container-configs.js';
 import { getSession } from '../../db/sessions.js';
 import { wakeContainer } from '../../container-runner.js';
 import { initGroupFilesystem } from '../../group-init.js';
@@ -138,17 +138,15 @@ async function performCreateAgent(
     created_at: now,
   };
   createAgentGroup(newGroup);
-  // A subagent inherits its creator's provider. Provider is a DB property; the
-  // child is created provider-agnostic, then stamped with the parent's runtime
-  // so a single-provider install (e.g. codex-only, where claude isn't
-  // authenticated) doesn't spawn a child on a runtime it can't reach. The
+  // Subagent path: a child inherits its creator's EFFECTIVE provider, NOT the
+  // instance-wide default — so a child is never spawned on a runtime the parent
+  // can't reach (e.g. a codex-only install where claude isn't authenticated).
+  // Passing it explicitly to initGroupFilesystem pins the child's scaffold and
+  // stamps its config row in one step (a NULL parent resolves to claude). The
   // operator can still flip a child later with `ncl groups config update
-  // --provider`. claude (the built-in default) leaves the column unset.
-  const parentProvider = getContainerConfig(sourceGroup.id)?.provider ?? undefined;
+  // --provider`.
+  const parentProvider = getContainerConfig(sourceGroup.id)?.provider ?? 'claude';
   initGroupFilesystem(newGroup, { instructions: instructions ?? undefined, provider: parentProvider });
-  if (parentProvider) {
-    updateContainerConfigScalars(newGroup.id, { provider: parentProvider });
-  }
 
   // Insert bidirectional destination rows (= ACL grants).
   // Creator refers to child by the name it chose; child refers to creator as "parent".
