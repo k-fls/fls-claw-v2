@@ -111,13 +111,25 @@ export function onDeliveryAdapterReady(cb: AdapterReadyCallback): void {
  * — there's nowhere to mark-failed since the message never landed in
  * messages_out.
  */
-export function deliverDirect(channelType: string, platformId: string, threadId: string | null, text: string): void {
+export function deliverDirect(
+  channelType: string,
+  platformId: string,
+  threadId: string | null,
+  text: string,
+  /**
+   * Invoked once the send settles. Delivery is asynchronous and detached, so a
+   * caller that must react to failure — rather than assume success — has to be
+   * told; a synchronous try/catch around this function observes nothing.
+   */
+  onSettled?: (delivered: boolean, err?: unknown) => void,
+): void {
   const adapter = deliveryAdapter;
   if (!adapter) {
     log.warn('deliverDirect: no delivery adapter configured — dropping reply', {
       channelType,
       platformId,
     });
+    onSettled?.(false);
     return;
   }
   // plain: true tells the bridge to pass this through verbatim (raw), never
@@ -131,6 +143,7 @@ export function deliverDirect(channelType: string, platformId: string, threadId:
     for (let attempt = 1; attempt <= MAX_DELIVERY_ATTEMPTS; attempt++) {
       try {
         await adapter.deliver(channelType, platformId, threadId, 'chat', content);
+        onSettled?.(true);
         return;
       } catch (err) {
         lastErr = err;
@@ -152,6 +165,7 @@ export function deliverDirect(channelType: string, platformId: string, threadId:
       attempts: MAX_DELIVERY_ATTEMPTS,
       err: lastErr,
     });
+    onSettled?.(false, lastErr);
   })();
 }
 
