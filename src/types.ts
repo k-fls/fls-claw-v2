@@ -56,6 +56,13 @@ export interface MessagingGroup {
    * the column itself defaults to NULL in SQLite.
    */
   denied_at?: string | null;
+  /**
+   * When set, our own bot has LEFT the platform channel this row maps to
+   * (written by a channel membership module, migration 022) — the wiring
+   * survives, but delivery/typing should skip the row until the bot rejoins
+   * (which clears it). Optional on the TS type per the denied_at convention.
+   */
+  detached_at?: string | null;
   created_at: string;
 }
 

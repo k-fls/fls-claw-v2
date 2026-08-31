@@ -21,6 +21,7 @@ import {
   categorizeMessage,
   isClearCommand,
   isRunnerCommand,
+  isSessionEcho,
   stripInternalTags,
   type RoutingContext,
 } from './formatter.js';
@@ -216,7 +217,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         commandIds.push(msg.id);
         continue;
       }
-      if ((msg.kind === 'chat' || msg.kind === 'chat-sdk') && isUploadTraceCommand(msg)) {
+      // isSessionEcho guard: a copied "/upload-trace" from another session is
+      // ambient context, never a runner command (isClearCommand self-guards).
+      if ((msg.kind === 'chat' || msg.kind === 'chat-sdk') && !isSessionEcho(msg) && isUploadTraceCommand(msg)) {
         log('Uploading session trace to Hugging Face');
         writeMessageOut({
           id: generateId(),
@@ -498,7 +501,14 @@ export async function processQuery(
         // everything. Filtering on thread_id here caused deadlocks when the
         // initial batch and follow-ups had mismatched thread_ids (e.g. a
         // host-generated welcome trigger with null thread vs a Discord DM reply).
-        const newMessages = pending.filter((m) => m.kind !== 'system');
+        // Accumulated trigger=0 context rows must never be pushed into a live
+        // turn on their own — the agent would answer ambient context that was
+        // not addressed to it. They ride along only when a real trigger=1
+        // follow-up is also pending; otherwise they stay pending for a future
+        // batch (mirrors the two-phase initial-batch selection in
+        // db/messages-in.ts).
+        const hasFollowUpTrigger = pending.some((m) => m.kind !== 'system' && m.trigger === 1);
+        const newMessages = pending.filter((m) => m.kind !== 'system' && (m.trigger === 1 || hasFollowUpTrigger));
         if (newMessages.length === 0) return;
 
         // Accumulated context must not engage a warm query by itself.

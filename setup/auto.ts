@@ -33,7 +33,10 @@ import * as p from '@clack/prompts';
 import k from 'kleur';
 
 import { BACK_TO_CHANNEL_SELECTION } from './lib/back-nav.js';
-import { runChannelSkill } from './channels/run-channel-skill.js';
+// The pre-step-aware entry point consults each channel's registered wizard
+// extensions (setup/channels/companions.ts) before running its install skill
+// — the wizard itself stays free of channel-specific imports.
+import { runChannelSkillWithPreStep } from './channels/run-channel-skill.js';
 import { runInheritScript } from './lib/inherit-script.js';
 import { pingCliAgent, type PingResult } from './lib/agent-ping.js';
 import { getSetupProvider, listSetupProviders } from './providers/registry.js';
@@ -675,22 +678,22 @@ async function main(): Promise<void> {
       // Every channel now runs through the SKILL.md-driven flow — the whole
       // connect+wire procedure lives in each add-<channel>/SKILL.md.
       if (channelChoice === 'telegram') {
-        result = await runChannelSkill('telegram', displayName!, { offerBack: true });
+        result = await runChannelSkillWithPreStep('telegram', displayName!, { offerBack: true });
       } else if (channelChoice === 'discord') {
-        result = await runChannelSkill('discord', displayName!, { offerBack: true });
+        result = await runChannelSkillWithPreStep('discord', displayName!, { offerBack: true });
       } else if (channelChoice === 'whatsapp') {
-        result = await runChannelSkill('whatsapp', displayName!, { offerBack: true });
+        result = await runChannelSkillWithPreStep('whatsapp', displayName!, { offerBack: true });
       } else if (channelChoice === 'signal') {
-        result = await runChannelSkill('signal', displayName!, { offerBack: true });
+        result = await runChannelSkillWithPreStep('signal', displayName!, { offerBack: true });
       } else if (channelChoice === 'teams') {
         // Fresh create resolves the owner DM proactively and wires inline (the
         // welcome message reaches the human first); a drop-through re-run
         // resolves nothing and falls back to the deferred-wire ending.
-        result = await runChannelSkill('teams', displayName!, { wireIfResolved: true, offerBack: true });
+        result = await runChannelSkillWithPreStep('teams', displayName!, { wireIfResolved: true, offerBack: true });
       } else if (channelChoice === 'slack') {
-        result = await runChannelSkill('slack', displayName!, { offerBack: true });
+        result = await runChannelSkillWithPreStep('slack', displayName!, { offerBack: true });
       } else if (channelChoice === 'imessage') {
-        result = await runChannelSkill('imessage', displayName!, { offerBack: true });
+        result = await runChannelSkillWithPreStep('imessage', displayName!, { offerBack: true });
       } else if (channelChoice === 'other') {
         result = await askOtherChannelName();
       } else {
