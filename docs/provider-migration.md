@@ -7,7 +7,7 @@ NanoClaw's runtime does not migrate anything when you switch. Provider-neutral s
 ## Preconditions
 
 1. **The target provider is installed** — run its `/add-<provider>` skill and rebuild the container image (`./container/build.sh`). If the provider isn't installed (or the name is a typo), the container fails at boot and the host surfaces its last words in the logs: look for `Container exited non-zero` with a `stderrTail` like `Unknown provider: codexx. Registered: claude, codex`.
-2. **Auth is configured** — each provider documents its own auth in its install skill (for Codex: a ChatGPT-subscription or API-key credential held on the host and injected by the MITM credential proxy).
+2. **Auth is configured** — each provider documents its own auth in its install skill. For Codex that is a ChatGPT-subscription credential held on the host and swapped in by the MITM credential proxy; it is bound in-channel rather than by the operator, so a switched group prompts a group admin to sign in on its next message. Nothing about it is configured before the switch, and a group with no credential yet fails its spawn with `requires credential provider(s) not bound to this group: codex` rather than starting and 401ing.
 
 ## Switching
 
@@ -42,3 +42,5 @@ ncl groups restart --id <group-id>
 ```
 
 Rollback is lossless by construction: the per-provider continuation slot means Claude resumes its previous session (subject to normal transcript-rotation age limits), and `CLAUDE.local.md` was never modified by the switch. Memory written **while on the other provider** lives in that provider's store — run `/migrate-memory` again if you want it carried back.
+
+One thing rollback does not undo: the ChatGPT session bound during the Codex stint. It stays valid at OpenAI until whoever signed in signs it out of their account, and if they signed in with an account they also use from their own Codex CLI, the eviction that caused is theirs to repair. `/creds delete codex` in the group's channel drops the host's copy.

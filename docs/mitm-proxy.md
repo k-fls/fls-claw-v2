@@ -221,6 +221,43 @@ OAuth submodule itself.
   No legacy-format migration runs; legacy files are logged and skipped.
 - The engine never stores or deletes credentials. Both mutations live
   in the credentials module's resolver.
+- **Binding a new credential is gated on a sign-in episode; rotating one
+  is not.** The token-exchange handler serves an authorization-code or
+  device-authorization grant only while a host-driven sign-in episode is
+  in flight for the calling scope and the caller is that episode's own
+  auth container; otherwise it blanks the credential fields rather than
+  passing the upstream response through. The refresh grant is exempt —
+  it originates from ordinary session containers with no episode, and
+  its write is pinned to the scope the swapped refresh substitute
+  already resolves to.
+- **Every credential-bearing response field a provider declares is
+  substituted**, not only `access_token` / `refresh_token`. A provider
+  whose token response also carries an identity token or an account
+  identifier lists them in `credentialResponseFields`; anything not
+  listed and not handled by default reaches the container in the clear.
+- **Refresh is serialized per (owning scope, provider)**, across both
+  the host-initiated helper and the container-originated intercept. A
+  credential is per group while containers are per session, so a group's
+  sessions share one refresh substitute; a second refresh waits for the
+  first and then re-resolves, so it sends the rotated token rather than
+  the one its predecessor spent. Providers that rotate refresh tokens
+  and detect reuse invalidate the whole session family otherwise.
+
+## Provider-side constraints
+
+Two constraints belong to the provider, not the proxy, and a new
+provider author has to satisfy them:
+
+- **The transport must be interceptable HTTPS.** The proxy MITMs TLS
+  over CONNECT and DNAT'd `:443`; it does not intercept a WebSocket
+  upgrade. A provider runtime that can select a WebSocket transport must
+  pin the HTTP one, in a place the container cannot overwrite at
+  startup.
+- **Path rules should be no wider than the runtime needs.** Interception
+  is host-level, so registering a rule makes that host decrypted for
+  every group. A path the provider never uses is best left unmatched:
+  the request is then forwarded carrying the substitute and fails,
+  rather than being swapped.
 
 ## Consumer usage
 
