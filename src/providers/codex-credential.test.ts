@@ -21,14 +21,28 @@ vi.mock('../config.js', async (importOriginal) => ({
 vi.mock('../log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
+// The sign-in spawns a container; stub it so the acquire branches are unit
+// testable without Docker.
+vi.mock('../auth-container.js', () => ({ spawnAuthContainer: vi.fn() }));
+vi.mock('../modules/permissions/access.js', () => ({ canAccessAgentGroup: vi.fn() }));
+vi.mock('../modules/approvals/primitive.js', () => ({ pickApprover: vi.fn(() => []) }));
+vi.mock('../modules/permissions/db/users.js', () => ({ getUser: vi.fn(() => undefined) }));
 
 import {
   registerCodexCredentialProvider,
+  _resetCodexSignInGuardForTests,
   codexAuthFilePath,
   CODEX_OAUTH_PROVIDER,
   CRED_ACCOUNT_ID,
 } from './codex-credential.js';
 import { DATA_DIR } from '../config.js';
+import { spawnAuthContainer } from '../auth-container.js';
+import { canAccessAgentGroup } from '../modules/permissions/access.js';
+import { pickApprover } from '../modules/approvals/primitive.js';
+import { ACQUIRE } from '../credential-acquisition.js';
+import { CONTAINER_FEEDBACK } from '../modules/credentials/providers/types.js';
+import { REAUTH } from '../modules/credentials/reauth.js';
+import type { InteractionOrigin } from '../host-interactions.js';
 import { getCredentialProvider, _resetProviderRegistryForTests } from '../modules/credentials/providers/registry.js';
 import { AGENT_RUNTIME } from '../modules/credentials/providers/types.js';
 import { asGroupScope, asCredentialScope } from '../modules/credentials/types.js';
@@ -37,7 +51,6 @@ import {
   initTokenEngine,
   _resetTokenEngineForTests,
   CRED_OAUTH,
-  CRED_OAUTH_REFRESH,
   type SubstitutesSpec,
 } from '../modules/mitm-proxy/index.js';
 
@@ -111,6 +124,8 @@ describe('codex credential provider', () => {
     priorXdg = process.env.XDG_CONFIG_HOME;
     process.env.XDG_CONFIG_HOME = path.join(TMP_ROOT, 'config');
 
+    vi.clearAllMocks();
+    _resetCodexSignInGuardForTests();
     _resetProviderRegistryForTests();
     _resetTokenEngineForTests();
     initTokenEngine((scope) => getOrCreateResolverForAgentGroup(scope));
@@ -247,6 +262,178 @@ describe('codex credential provider', () => {
       storeCredential({ account: false });
       contribute();
       expect(fs.existsSync(codexAuthFilePath(AGENT_GROUP_ID))).toBe(false);
+    });
+  });
+  describe('sign-in', () => {
+    const KEY = { channelType: 'cli', platformId: 'local', threadId: null, userId: 'cli:op' };
+
+    function origin(replies: string[]): InteractionOrigin {
+      return {
+        key: KEY,
+        agentGroupId: AGENT_GROUP_ID,
+        messagingGroupId: 'mg-1',
+        replyAddr: { channelType: 'cli', platformId: 'local', threadId: null },
+        writeReply: (text) => replies.push(text),
+      };
+    }
+
+    function acquireExt() {
+      const p = getCredentialProvider('codex', asCredentialScope(FOLDER));
+      const ext = p?.getExtension?.(ACQUIRE);
+      if (!ext) throw new Error('ACQUIRE extension missing');
+      return ext;
+    }
+
+    const asAdmin = (): void => {
+      vi.mocked(canAccessAgentGroup).mockReturnValue({ allowed: true, reason: 'admin_of_group' });
+    };
+
+    it('declines a non-admin, names who can, and spawns nothing', async () => {
+      vi.mocked(canAccessAgentGroup).mockReturnValue({ allowed: true, reason: 'member' });
+      vi.mocked(pickApprover).mockReturnValue(['cli:boss']);
+      const replies: string[] = [];
+
+      const ok = await acquireExt().acquire({ origin: origin(replies), credentialScope: asCredentialScope(FOLDER) });
+
+      expect(ok).toBe(false);
+      expect(spawnAuthContainer).not.toHaveBeenCalled();
+      expect(replies.join(' ')).toContain('cli:boss');
+      expect(
+        getOrCreateResolverForAgentGroup(asGroupScope(FOLDER)).resolve(asCredentialScope(FOLDER), 'codex', CRED_OAUTH),
+      ).toBeNull();
+    });
+
+    it('declines an unknown sender rather than treating them as an admin', async () => {
+      vi.mocked(canAccessAgentGroup).mockReturnValue({ allowed: false, reason: 'unknown_user' });
+      const replies: string[] = [];
+
+      const ok = await acquireExt().acquire({ origin: origin(replies), credentialScope: asCredentialScope(FOLDER) });
+
+      expect(ok).toBe(false);
+      expect(spawnAuthContainer).not.toHaveBeenCalled();
+      expect(replies).toHaveLength(1);
+    });
+
+    it('spawns the device-login mode for an admin and reports success once a credential resolves', async () => {
+      asAdmin();
+      // The proxy captures during the run; simulate that.
+      vi.mocked(spawnAuthContainer).mockImplementation(async () => {
+        storeCredential();
+      });
+      const replies: string[] = [];
+
+      const ok = await acquireExt().acquire({ origin: origin(replies), credentialScope: asCredentialScope(FOLDER) });
+
+      expect(ok).toBe(true);
+      const call = vi.mocked(spawnAuthContainer).mock.calls[0][0];
+      expect(call.mode).toBe('codex_device');
+      expect(call.folder).toBe(FOLDER);
+      expect(call.nonce).toMatch(/^[0-9a-f]{32}$/);
+    });
+
+    it('decides success by the credential, not by the container exiting cleanly', async () => {
+      asAdmin();
+      vi.mocked(spawnAuthContainer).mockResolvedValue(undefined);
+      const replies: string[] = [];
+
+      const ok = await acquireExt().acquire({ origin: origin(replies), credentialScope: asCredentialScope(FOLDER) });
+
+      expect(ok).toBe(false);
+      expect(replies.join(' ')).toContain('did not complete');
+    });
+
+    it('reports plainly when the spawn throws, leaving no credential', async () => {
+      asAdmin();
+      vi.mocked(spawnAuthContainer).mockRejectedValue(new Error('docker gone'));
+      const replies: string[] = [];
+
+      const ok = await acquireExt().acquire({ origin: origin(replies), credentialScope: asCredentialScope(FOLDER) });
+
+      expect(ok).toBe(false);
+      expect(replies.join(' ')).toContain('failed');
+    });
+
+    it('mounts a throwaway Codex home and never seeds it from an existing auth file', async () => {
+      asAdmin();
+      vi.mocked(spawnAuthContainer).mockResolvedValue(undefined);
+
+      await acquireExt().acquire({ origin: origin([]), credentialScope: asCredentialScope(FOLDER) });
+
+      const call = vi.mocked(spawnAuthContainer).mock.calls[0][0];
+      const scratch = path.join(TMP_ROOT, 'scratch');
+      fs.mkdirSync(scratch, { recursive: true });
+      const contribution = call.contribute!(scratch);
+
+      const mount = contribution.mounts![0];
+      expect(mount.containerPath).toBe('/home/node/.codex');
+      expect(mount.hostPath.startsWith(scratch)).toBe(true);
+      expect(mount.readonly).toBe(false);
+      // Freshly created and empty — nothing copied in from any existing home.
+      expect(fs.readdirSync(mount.hostPath)).toEqual([]);
+      expect(mount.hostPath).not.toBe(codexAuthFilePath(AGENT_GROUP_ID));
+    });
+
+    it('does not start a second episode while one is in flight', async () => {
+      asAdmin();
+      let release: (() => void) | undefined;
+      vi.mocked(spawnAuthContainer).mockImplementation(
+        () =>
+          new Promise<void>((resolve) => {
+            release = resolve;
+          }),
+      );
+
+      const first = acquireExt().acquire({ origin: origin([]), credentialScope: asCredentialScope(FOLDER) });
+      const secondReplies: string[] = [];
+      const second = await acquireExt().acquire({
+        origin: origin(secondReplies),
+        credentialScope: asCredentialScope(FOLDER),
+      });
+
+      expect(second).toBe(false);
+      expect(secondReplies.join(' ')).toContain('already under way');
+      expect(spawnAuthContainer).toHaveBeenCalledTimes(1);
+
+      release!();
+      await first;
+    });
+
+    it('releases the in-flight guard so a later attempt can run', async () => {
+      asAdmin();
+      vi.mocked(spawnAuthContainer).mockResolvedValue(undefined);
+
+      await acquireExt().acquire({ origin: origin([]), credentialScope: asCredentialScope(FOLDER) });
+      await acquireExt().acquire({ origin: origin([]), credentialScope: asCredentialScope(FOLDER) });
+
+      expect(spawnAuthContainer).toHaveBeenCalledTimes(2);
+    });
+
+    it('re-authentication runs the same routine and states the rejection reason', async () => {
+      asAdmin();
+      vi.mocked(spawnAuthContainer).mockResolvedValue(undefined);
+      const p = getCredentialProvider('codex', asCredentialScope(FOLDER));
+      const replies: string[] = [];
+
+      await p!.getExtension!(REAUTH)!.reauth({
+        origin: origin(replies),
+        credentialScope: asCredentialScope(FOLDER),
+        classification: 'auth-invalid',
+        reason: 'token_expired',
+      });
+
+      expect(replies.join(' ')).toContain('token_expired');
+      expect(vi.mocked(spawnAuthContainer).mock.calls[0][0].mode).toBe('codex_device');
+    });
+
+    it('routes an auth rejection to reauth and anything else to the surfaced error', () => {
+      const p = getCredentialProvider('codex', asCredentialScope(FOLDER));
+      const fb = p!.getExtension!(CONTAINER_FEEDBACK)!;
+      const call = (classification: string) => fb.onContainerError({ classification } as never, undefined, {} as never);
+      expect(call('auth-invalid')).toBe('reauth');
+      // A seat limit must not be re-authenticated; the proxy-side classifier
+      // that produces that tag lands in a later unit.
+      expect(call('rate-limit')).toBe('surface');
+      expect(call('other')).toBe('surface');
     });
   });
 });

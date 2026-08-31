@@ -1,16 +1,18 @@
 /**
  * Browser-auth container spawn — the host side of P3.
  *
- * A short-lived container that runs `claude setup-token` / `claude auth login`
- * for one OAuth episode. NOT routed through the session-centric
+ * A short-lived container that runs one provider's auth CLI for one OAuth
+ * episode — `claude setup-token` / `claude auth login`, or a device login such
+ * as `codex login --device-auth`. NOT routed through the session-centric
  * `spawnContainer`: an auth container is not a session (no heartbeat, poll
  * loop, or session DB).
  *
  * It DOES route through the MITM proxy (unconditionally): the proxy intercepts
  * the CLI's token-exchange and stores the real credential host-side. This is
- * how the credential is captured — the runner only drives the OAuth UX
- * (relay the URL, deliver the pasted code); it does NOT read the token (the CLI
- * only ever sees substitutes). Verified live: `claude setup-token` hits
+ * how the credential is captured — the runner only drives the OAuth UX (relay
+ * the URL and deliver the pasted code, or for a device flow simply wait while
+ * the proxy relays the user code); it does NOT read the token (the CLI only
+ * ever sees substitutes). Verified live: `claude setup-token` hits
  * `platform.claude.com/v1/oauth/token`, which the proxy captures (incl.
  * `authFields` like `client_id`, needed for later refresh).
  *
@@ -47,7 +49,12 @@ import { buildMitmProxyContribution } from './modules/mitm-proxy/index.js';
 import type { VolumeMount } from './providers/provider-container-registry.js';
 import { log } from './log.js';
 
-export type AuthMode = 'setup_token' | 'auth_login';
+/**
+ * Duplicated container-side in `container/agent-runner/src/auth/mode.ts`, which
+ * owns the command each mode runs; it crosses the boundary as
+ * `NANOCLAW_AUTH_MODE`, so the two move together.
+ */
+export type AuthMode = 'setup_token' | 'auth_login' | 'codex_device';
 
 /** Backstop kill — the host episode times out at 10 min; allow margin past that. */
 const AUTH_MAX_LIFETIME_MS = 12 * 60_000;

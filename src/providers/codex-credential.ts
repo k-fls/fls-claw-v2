@@ -10,8 +10,8 @@
  * The payload (`src/providers/codex.ts`) already creates
  * `<DATA_DIR>/v2-sessions/<agentGroupId>/.codex-shared/` and mounts it at
  * `/home/node/.codex`, so this contributor writes the file and returns NO
- * mount. `CODEX_AUTH_FILE_SUBPATH` and the payload's mount must agree; the
- * test pins that agreement.
+ * mount. `codexAuthFilePath` and the payload's mount must agree; the test pins
+ * that agreement.
  *
  * Substitute shapes are format-preserving against a real `auth.json`: all
  * three token fields are JWTs and `account_id` is a UUID. `id_token` is built
@@ -32,13 +32,29 @@ import { DATA_DIR } from '../config.js';
 import {
   registerCredentialProvider,
   mergeContributions,
+  getOrCreateResolverForAgentGroup,
   defaultManifestBuilder,
   noManifestSideEffect,
   ExtensionBag,
   AGENT_RUNTIME,
+  CONTAINER_FEEDBACK,
+  REAUTH,
+  startAuthEpisode,
   type AgentRuntimeExt,
   type ContainerContributor,
+  type ContainerFeedbackExt,
+  type CredentialScope,
+  type ReauthContext,
+  type ReauthExt,
 } from '../modules/credentials/index.js';
+import { spawnAuthContainer } from '../auth-container.js';
+import { asContainerScope } from '../modules/container-bootstrap/index.js';
+import { canAccessAgentGroup } from '../modules/permissions/access.js';
+import { pickApprover } from '../modules/approvals/primitive.js';
+import { getUser } from '../modules/permissions/db/users.js';
+import { log } from '../log.js';
+import type { InteractionOrigin } from '../host-interactions.js';
+import { ACQUIRE, type AcquireExt, type AcquireContext } from '../credential-acquisition.js';
 import {
   oauthSubstitutesFor,
   getTokenEngine,
@@ -191,13 +207,136 @@ const agentRuntime: AgentRuntimeExt = {
 };
 
 /**
+ * One sign-in per (group, provider) at a time. The wake-time acquire path has
+ * no guard of its own, so without this a second message arriving while a
+ * container is still polling would start a second episode — and the first
+ * episode's credential would be cleared out from under it.
+ */
+const inFlightSignIn = new Set<string>();
+
+/** Test-only: the guard is module state and outlives a registry reset. */
+export function _resetCodexSignInGuardForTests(): void {
+  inFlightSignIn.clear();
+}
+
+/** Who the group can ask, for the message a non-admin gets. */
+function approverNames(agentGroupId: string | null): string[] {
+  return pickApprover(agentGroupId).map((id) => getUser(id)?.display_name || id);
+}
+
+/**
+ * Codex sign-in: admin-gated, then a device login inside an auth container.
+ *
+ * Success is decided by a credential resolving afterwards, not by the
+ * container's exit status — the proxy captures the token during the run, and a
+ * CLI can exit zero having done nothing.
+ *
+ * Replies on every terminal branch, including the non-admin decline. The
+ * wake-time gate leaves the triggering message pending and re-wakes only once a
+ * credential is stored, so a silent branch strands that message until somebody
+ * happens to send another.
+ */
+async function runCodexSignIn(origin: InteractionOrigin, scope: CredentialScope, reason?: string): Promise<boolean> {
+  const folder = String(scope);
+  const userId = origin.key.userId;
+  const decision = userId ? canAccessAgentGroup(userId, origin.agentGroupId ?? '') : null;
+  // Members can use the group but not bind its credential; only owner, global
+  // admin, or an admin of this group can.
+  if (!decision?.allowed || decision.reason === 'member') {
+    const who = approverNames(origin.agentGroupId);
+    origin.writeReply(
+      who.length > 0
+        ? `Signing in to Codex needs an admin of this group. Ask one of: ${who.join(', ')}.`
+        : 'Signing in to Codex needs an admin of this group, and none is configured yet.',
+    );
+    return false;
+  }
+
+  const guardKey = `${folder}:${PROVIDER_ID}`;
+  if (inFlightSignIn.has(guardKey)) {
+    origin.writeReply('A Codex sign-in is already under way for this group — finish that one first.');
+    return false;
+  }
+  inFlightSignIn.add(guardKey);
+
+  const resolver = getOrCreateResolverForAgentGroup(scope);
+  // Start clean: a rejected credential must not read as success afterwards.
+  resolver.delete(scope, PROVIDER_ID);
+
+  const nonce = randomBytes(16).toString('hex');
+  const episode = startAuthEpisode({ scopeFolder: folder, nonce, origin });
+  try {
+    origin.writeReply(
+      (reason ? `Your stored Codex credential was rejected (${reason}). ` : '') +
+        'Starting Codex sign-in — launching a secure auth container. ' +
+        'A link and a code will arrive here; you have about 10 minutes to complete it.',
+    );
+    await spawnAuthContainer({
+      scope: asContainerScope(folder),
+      folder,
+      mode: 'codex_device',
+      nonce,
+      contribute: (scratchDir) => {
+        // A throwaway home, never seeded from an existing auth file. OpenAI
+        // rotates refresh tokens, so two consumers sharing one ChatGPT OAuth
+        // session strand each other at the first refresh — taking down the
+        // operator's own CLI along with this group. `scratchDir` is removed on
+        // every exit path by the spawner.
+        const home = path.join(scratchDir, 'codex');
+        fs.mkdirSync(home, { recursive: true });
+        return {
+          mounts: [{ hostPath: home, containerPath: '/home/node/.codex', readonly: false }],
+          env: { CODEX_HOME: '/home/node/.codex' },
+        };
+      },
+    });
+
+    if (resolver.resolve(scope, PROVIDER_ID, CRED_OAUTH)) {
+      origin.writeReply('Codex sign-in complete — credential stored. Retrying your request now.');
+      return true;
+    }
+    origin.writeReply('Sign-in did not complete — no credential stored.');
+    return false;
+  } catch (err) {
+    log.error('Codex sign-in failed', { folder, err });
+    origin.writeReply('Sign-in failed unexpectedly — no credential stored.');
+    return false;
+  } finally {
+    episode.end();
+    inFlightSignIn.delete(guardKey);
+  }
+}
+
+const acquire: AcquireExt = {
+  acquire: (ctx: AcquireContext) => runCodexSignIn(ctx.origin, ctx.credentialScope),
+};
+
+const reauth: ReauthExt = {
+  reauth: (ctx: ReauthContext) => runCodexSignIn(ctx.origin, ctx.credentialScope, ctx.reason),
+};
+
+/**
+ * An auth rejection drives re-authentication; everything else surfaces through
+ * the container's own error line. A seat-limit rejection must NOT land here as
+ * `auth-invalid` — re-authenticating an exhausted seat cannot help, and the
+ * proxy-side classifier that separates the two is a later unit.
+ */
+const containerFeedback: ContainerFeedbackExt = {
+  onContainerError: (event) => (event.classification === 'auth-invalid' ? 'reauth' : 'surface'),
+};
+
+/**
  * Register the Codex provider. Call exactly once at boot, AFTER
  * `initTokenEngine` (the substitution facet reads the engine) and BEFORE
  * `proxy.start()` (whose `rebuildIndex` indexes these swap rules). Duplicate-id
  * registration throws — the registry is the guard.
  */
 export function registerCodexCredentialProvider(): void {
-  const ext = new ExtensionBag().set(AGENT_RUNTIME, agentRuntime);
+  const ext = new ExtensionBag()
+    .set(AGENT_RUNTIME, agentRuntime)
+    .set(ACQUIRE, acquire)
+    .set(CONTAINER_FEEDBACK, containerFeedback)
+    .set(REAUTH, reauth);
   const provider: SubstitutingProvider = {
     id: PROVIDER_ID,
     buildManifest: defaultManifestBuilder(PROVIDER_ID),
