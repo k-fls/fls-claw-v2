@@ -15,6 +15,8 @@ import {
   LinkButton,
   type CardChild,
   type Adapter,
+  type AssistantContextChangedEvent,
+  type AssistantThreadStartedEvent,
   type ConcurrencyStrategy,
   type Message as ChatMessage,
 } from 'chat';
@@ -39,6 +41,164 @@ interface GatewayAdapter extends Adapter {
 export interface ReplyContext {
   text: string;
   sender: string;
+}
+
+// ---------------------------------------------------------------------------
+// Agent-DM opened hook (assistant_thread_started)
+// ---------------------------------------------------------------------------
+
+/** The user opened an agent DM (assistant thread started). Registered by the
+ *  host to (re)assert onboarding prompts at a moment the user is provably
+ *  looking — prompt sets made before the DM was ever opened may not render. */
+export interface AgentDmOpenedEvent {
+  instance: string;
+  channelId: string;
+}
+
+let agentDmOpenedHandler: ((event: AgentDmOpenedEvent) => void | Promise<void>) | null = null;
+
+export function setAgentDmOpenedHandler(fn: (event: AgentDmOpenedEvent) => void | Promise<void>): void {
+  agentDmOpenedHandler = fn;
+}
+
+function dispatchAgentDmOpened(event: AgentDmOpenedEvent): void {
+  if (!agentDmOpenedHandler) return;
+  try {
+    Promise.resolve(agentDmOpenedHandler(event)).catch((err) =>
+      log.warn('Agent-DM opened handler failed', { channelId: event.channelId, err }),
+    );
+  } catch (err) {
+    log.warn('Agent-DM opened handler threw', { channelId: event.channelId, err });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Agent-mode app context
+// ---------------------------------------------------------------------------
+
+/** One "what the user is viewing" entity, rendered by the container formatter. */
+export interface AppContextEntity {
+  type: string;
+  id: string;
+}
+
+/**
+ * Latest assistant context per (instance, DM channel, user), attached to the
+ * NEXT inbound DM message as content.app_context and consumed. Platforms
+ * whose DM surface materializes threads and reports client context send
+ * app_context as its own event (assistant_thread_started legacy /
+ * app_context_changed in agent view), not on the message payload, so the
+ * bridge has to hold it across the event → message gap. Short TTL: a stale
+ * "viewing X" is worse than none.
+ */
+const APP_CONTEXT_TTL_MS = 5 * 60 * 1000;
+const appContextCache = new Map<string, { entities: AppContextEntity[]; at: number }>();
+
+/** Channel ids arrive both raw ("D0123") and platform-encoded ("slack:D0123")
+ *  depending on the emitting path — key on the final segment so both match. */
+function appContextKey(instance: string, channelId: string, userId: string): string {
+  const channel = channelId.includes(':') ? channelId.slice(channelId.lastIndexOf(':') + 1) : channelId;
+  return `${instance}|${channel}|${userId}`;
+}
+
+/**
+ * Derive ordered entities from an SDK assistant event. The installed chat
+ * core (4.29.0) parses assistant_thread_started / app_context_changed into a
+ * `context` object (channelId/teamId/threadEntryPoint — the legacy assistant
+ * context shape) with no entities array; prefer a real `entities` array
+ * whenever a future SDK forwards the platform's ordered agent-context
+ * entities.
+ */
+export function appContextEntities(
+  event: AssistantThreadStartedEvent | AssistantContextChangedEvent,
+): AppContextEntity[] {
+  const raw = event as unknown as Record<string, unknown>;
+  const direct = raw.entities ?? (raw.context as Record<string, unknown> | undefined)?.entities;
+  if (Array.isArray(direct)) {
+    return direct
+      .map((e) => {
+        const entity = e as Record<string, unknown> | null;
+        const type = typeof entity?.type === 'string' ? entity.type : '';
+        const idValue = entity?.id ?? entity?.channel_id ?? entity?.entity_id;
+        const id = typeof idValue === 'string' ? idValue : '';
+        return { type, id };
+      })
+      .filter((e) => e.type !== '' && e.id !== '');
+  }
+  const channelId = event.context?.channelId;
+  return typeof channelId === 'string' && channelId ? [{ type: 'channel', id: channelId }] : [];
+}
+
+export function cacheAppContext(
+  instance: string,
+  channelId: string,
+  userId: string,
+  entities: AppContextEntity[],
+  now = Date.now(),
+): void {
+  const key = appContextKey(instance, channelId, userId);
+  if (entities.length === 0) {
+    appContextCache.delete(key);
+    return;
+  }
+  appContextCache.set(key, { entities, at: now });
+}
+
+/** Consume the cached context (single-shot: it describes what the user was
+ *  viewing when they sent the NEXT message, not every message after). */
+export function takeAppContext(
+  instance: string,
+  channelId: string,
+  userId: string,
+  now = Date.now(),
+): AppContextEntity[] | undefined {
+  const key = appContextKey(instance, channelId, userId);
+  const hit = appContextCache.get(key);
+  if (!hit) return undefined;
+  appContextCache.delete(key);
+  if (now - hit.at > APP_CONTEXT_TTL_MS) return undefined;
+  return hit.entities;
+}
+
+/**
+ * Attach the cached app context to an inbound DM message's content JSON
+ * (content.app_context = { entities: [...] }). A context the SDK attached
+ * directly on the message payload wins — the cache only fills the
+ * event → message gap.
+ */
+export function attachAppContext(
+  content: Record<string, unknown>,
+  instance: string,
+  channelId: string,
+  userId: string | undefined,
+): void {
+  if (content.app_context) return;
+  if (!userId) return;
+  const entities = takeAppContext(instance, channelId, userId);
+  if (entities && entities.length > 0) {
+    content.app_context = { entities };
+  }
+}
+
+/**
+ * Root-thread a top-level DM message: on platforms whose DM surface
+ * materializes conversation threads (agent-view semantics), every top-level
+ * DM message is the root of a conversation thread — replying in-thread and
+ * setting per-thread status on that ts is what OPENS the thread in the
+ * client. Such adapters map top-level DM messages to an EMPTY threadTs
+ * (`…:<channel>:`), so without this the thread never materializes: no
+ * in-thread reply, no status target, no per-thread session.
+ *
+ * The message id is the platform ts for chat-sdk adapters, so appending it to
+ * the dangling `:` yields the canonical thread id. Plain (non-agent) DM
+ * wirings are unaffected downstream: the router strips thread ids when the
+ * wiring's thread policy is off, restoring today's top-level behavior.
+ */
+export function normalizeDmThreadId(threadId: string, messageId: string): string {
+  if (threadId.endsWith(':') && messageId && !messageId.includes(':')) {
+    return threadId + messageId;
+  }
+  return threadId;
 }
 
 /** Extract reply context from a platform-specific raw message. Return null if no reply. */
@@ -246,6 +406,9 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     );
   }
   const transformText = (t: string): string => (config.transformOutboundText ? config.transformOutboundText(t) : t);
+  /** Registry/routing key for this bridge — also the app-context cache
+   *  namespace. Default instances key by the platform name. */
+  const instanceKey = config.instance ?? adapter.name;
   let chat: Chat;
   let state: SqliteStateAdapter;
   let setupConfig: ChannelSetup;
@@ -389,7 +552,17 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           sender: (message.author as any)?.fullName ?? (message.author as any)?.userId ?? 'unknown',
           threadId: thread.id,
         });
-        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, true, false));
+        const inbound = await messageToInbound(message, true, false);
+        // Agent-mode app context: DM-only by platform design.
+        attachAppContext(
+          inbound.content as Record<string, unknown>,
+          instanceKey,
+          channelId,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (message.author as any)?.userId,
+        );
+        const dmThreadId = normalizeDmThreadId(thread.id, message.id);
+        await setupConfig.onInbound(channelId, dmThreadId, inbound);
       });
 
       // Plain messages in unsubscribed threads.
@@ -406,6 +579,19 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const channelId = adapter.channelIdFromThreadId(thread.id);
         await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, false, true));
       });
+
+      // Agent-mode assistant context: cache the latest "what the user is
+      // viewing" per (channel, user). The installed chat core (4.29.0)
+      // dispatches both the legacy assistant_thread_started and the
+      // agent_view app_context_changed events into these handlers.
+      const rememberAppContext = (event: AssistantThreadStartedEvent | AssistantContextChangedEvent): void => {
+        cacheAppContext(instanceKey, event.channelId, event.userId, appContextEntities(event));
+      };
+      chat.onAssistantThreadStarted((event) => {
+        rememberAppContext(event);
+        dispatchAgentDmOpened({ instance: instanceKey, channelId: event.channelId });
+      });
+      chat.onAssistantContextChanged(rememberAppContext);
 
       // Handle button clicks (ask_user_question)
       chat.onAction(async (event) => {
@@ -446,6 +632,12 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       });
 
       await chat.initialize();
+
+      // Test seam: unit tests drive the SDK's public process* dispatchers
+      // (processAssistantContextChanged, …) against the handlers registered
+      // above without a live platform. Not part of the ChannelAdapter
+      // contract.
+      (bridge as unknown as { _chat?: Chat })._chat = chat;
 
       // Start Gateway listener for adapters that support it (e.g., Discord)
       const gatewayAdapter = adapter as GatewayAdapter;

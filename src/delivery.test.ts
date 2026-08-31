@@ -36,7 +36,7 @@ import {
 } from './db/index.js';
 import { getDeliveredIds } from './db/session-db.js';
 import { resolveSession, resolveTaskSession, outboundDbPath, openInboundDb } from './session-manager.js';
-import { deliverSessionMessages, setDeliveryAdapter } from './delivery.js';
+import { deliverSessionMessages, registerDeliveryBatchPreview, setDeliveryAdapter } from './delivery.js';
 import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
 
 function now(): string {
@@ -406,5 +406,37 @@ describe('deliverSessionMessages — task_log rows (one-door task delivery)', ()
     // Marked delivered — the row is not retried.
     const delivered = getDeliveredIds(openInboundDb('ag-1', session.id));
     expect(delivered.has('log-1')).toBe(true);
+  });
+});
+
+describe('deliverSessionMessages — batch preview hooks', () => {
+  it('hooks see the whole undelivered batch before row processing; a throwing hook never breaks delivery', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'bp-1');
+    insertOutbound('ag-1', session.id, 'bp-2');
+
+    const seen: Array<{ kinds: string[]; sessionId: string }> = [];
+    registerDeliveryBatchPreview((batch, s) => {
+      seen.push({ kinds: batch.map((m) => m.kind), sessionId: s.id });
+    });
+    registerDeliveryBatchPreview(() => {
+      throw new Error('hook exploded');
+    });
+
+    const sent: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        sent.push(content);
+        return undefined;
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(seen.length).toBe(1);
+    expect(seen[0].kinds).toEqual(['chat', 'chat']);
+    expect(seen[0].sessionId).toBe(session.id);
+    expect(sent.length).toBe(2); // the throwing hook did not block delivery
   });
 });

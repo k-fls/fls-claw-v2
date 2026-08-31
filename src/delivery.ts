@@ -70,7 +70,14 @@ export interface ChannelDeliveryAdapter {
      *  Host-internal only — containers never see instance. */
     instance?: string,
   ): Promise<string | undefined>;
-  setTyping?(channelType: string, platformId: string, threadId: string | null, instance?: string): Promise<void>;
+  setTyping?(
+    channelType: string,
+    platformId: string,
+    threadId: string | null,
+    instance?: string,
+    status?: string,
+    statusKind?: 'auto' | 'agent',
+  ): Promise<void>;
 }
 
 let deliveryAdapter: ChannelDeliveryAdapter | null = null;
@@ -198,6 +205,23 @@ async function drainSession(session: Session): Promise<void> {
 
     // Ensure platform_message_id column exists (migration for existing sessions)
     migrateDeliveredTable(inDb);
+
+    // Batch preview: registered modules peek at the whole undelivered batch
+    // before rows are processed one-by-one — e.g. a module prefetching an
+    // expensive per-message resource in parallel when the batch contains
+    // several rows that would otherwise each pay the cost sequentially.
+    // Hooks see kind+content only, must be fast, and must never break
+    // delivery.
+    for (const hook of batchPreviewHooks) {
+      try {
+        hook(
+          undelivered.map((m) => ({ kind: m.kind, content: m.content })),
+          session,
+        );
+      } catch (err) {
+        log.warn('Delivery batch-preview hook failed', { sessionId: session.id, err });
+      }
+    }
 
     for (const msg of undelivered) {
       try {
@@ -448,6 +472,13 @@ const deliveryActions = new Map<string, DeliveryEntry>();
 
 function isUnguardedEntry(entry: DeliveryEntry): entry is Extract<DeliveryEntry, { guard: Unguarded }> {
   return isUnguarded(entry.guard);
+}
+
+/** See the batch-preview invocation in the delivery poll for semantics. */
+type DeliveryBatchPreviewHook = (batch: Array<{ kind: string; content: string }>, session: Session) => void;
+const batchPreviewHooks: DeliveryBatchPreviewHook[] = [];
+export function registerDeliveryBatchPreview(hook: DeliveryBatchPreviewHook): void {
+  batchPreviewHooks.push(hook);
 }
 
 export function registerDeliveryAction(action: string, handler: DeliveryActionHandler, unguardedDecl: Unguarded): void;
