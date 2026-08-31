@@ -5,7 +5,7 @@ import { enumerateChain, type Chain } from './heights.js';
 import { allParentsSkipped, deriveBranch, type DeriveBranchArgs } from './plan.js';
 import { buildStepFile, verifyStepFile } from './steps.js';
 import type { StepFile, StepVerifyContext } from './steps.js';
-import { WHOLE_RANGE_BLOCK } from './types.js';
+import { WHOLE_RANGE_BLOCK, type BranchPlan } from './types.js';
 
 const { repo, base, chain } = makePropagationFixture();
 let c: Chain;
@@ -217,6 +217,28 @@ describe('buildStepFile — the skip reason is the parent-level answer', () => {
     expect(step.merges[0].skipReason).toBe('no-op');
   });
 
+  it('an all-skip leaf step whose reasons are in neither vocabulary is refused at build time', () => {
+    const bp: BranchPlan = {
+      branch: 'feat/leaf',
+      kind: 'inventory',
+      tierFloor: 'clean',
+      isLeaf: true,
+      alwaysMerge: false,
+      ancestors: [],
+      parents: [
+        {
+          parent: 'feat/p1',
+          model: 'parents',
+          mergePoint: null,
+          verdict: 'skip',
+          case: null,
+          deferredTo: null,
+          skipReason: 'invented',
+        },
+      ],
+    };
+    expect(() => buildStepFile(bp, c.watermark)).toThrow(/unclassified skip reason\(s\).*invented/s);
+  });
 });
 
 function reasonFor(step: StepFile, parent: string): string | null {

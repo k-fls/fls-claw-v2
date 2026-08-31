@@ -548,6 +548,15 @@ is ≤ the watermark; all parents arrived this pass (journal); skip claims are
 recomputed via merge-tree; the leaf rule is honored. A verification failure is a
 hard halt, journaled.
 
+The leaf rule reads skip reasons alone, so the reason vocabulary is CLOSED and
+the file's AUTHOR keeps it that way. An all-skip step for a leaf or an
+`always_merge` branch carries either a BLOCKED reason — `conflict-pending`,
+`deferred`, `unskip-blocked`, `unskip-conflict`, the exempt set the rule reads as
+"cannot merge yet" — or an un-skip INPUT reason, `no-op` / `up-to-date`. Any
+other reason is refused at build time, named in the error: a reason is classified
+into one of the two sets before it can reach the rule, and the verifier is
+spared having to guess at reasons it has never heard of.
+
 The same trust rule governs cases (§6.4): `case.json` is a POINTER, never an
 authority.
 

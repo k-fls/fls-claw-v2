@@ -75,6 +75,47 @@ export function readCaseFile(path: string): CaseFile {
 }
 
 /**
+ * The skip reasons the leaf / always_merge rule reads as BLOCKED: the branch
+ * cannot merge yet, so an all-skip step is sanctioned (§6, `verifyStepFile`).
+ *
+ * `held` is deliberately absent: a branch whose merge_status is PR_ID is
+ * short-circuited branch-level in `cmdRun` (journaled `skip held`, arrived,
+ * next branch) and never reaches a step file at all.
+ */
+const BLOCKED_SKIP_REASONS = new Set(['conflict-pending', 'deferred', 'unskip-blocked', 'unskip-conflict']);
+
+/**
+ * The skip reasons that are the un-skip pass's INPUT: the parent genuinely has
+ * nothing to give, which is exactly the premise the leaf / always_merge un-skip
+ * acts on (it forces a chain, or rewrites these rows to an `unskip-*` abort).
+ */
+const UNSKIP_INPUT_SKIP_REASONS = new Set(['no-op', 'up-to-date']);
+
+/**
+ * THE WRITER POLICES ITS OWN VOCABULARY.
+ *
+ * The leaf / always_merge rule decides from skip reasons alone, so a reason it
+ * has never heard of reads as "this branch merely no-op'd" and halts a branch
+ * that is in fact blocked. The verifier stays a verifier: instead of teaching
+ * it to guess, the AUTHOR refuses to emit an all-skip leaf step whose reasons
+ * are in neither the block vocabulary nor the un-skip input set — a new reason
+ * must be classified into one of them before it can reach the rule.
+ */
+function assertClassifiedSkipReasons(branch: string, ruled: boolean, merges: StepMerge[]): void {
+  if (!ruled || merges.length === 0) return;
+  if (!merges.every((m) => m.action === 'skip')) return;
+  const reasons = merges.map((m) => m.skipReason);
+  if (reasons.some((r) => r !== null && BLOCKED_SKIP_REASONS.has(r))) return;
+  if (reasons.some((r) => r !== null && UNSKIP_INPUT_SKIP_REASONS.has(r))) return;
+  const offending = [...new Set(reasons.map((r) => (r === null ? 'null' : r)))].join(', ');
+  throw new Error(
+    `${branch}: unclassified skip reason(s) on an all-skip leaf/always_merge step: ${offending} — ` +
+      `classify each as blocked (${[...BLOCKED_SKIP_REASONS].join(', ')}) or as un-skip input ` +
+      `(${[...UNSKIP_INPUT_SKIP_REASONS].join(', ')}) before it reaches the leaf rule`,
+  );
+}
+
+/**
  * Derive the per-branch step contract from its plan row. A `merge`/forced verdict
  * becomes a `merge` step; every other verdict (skip / up-to-date / case / defer)
  * lands no merge from that parent this run (a `case` is emitted separately and
@@ -101,6 +142,7 @@ export function buildStepFile(bp: BranchPlan, watermark: string): StepFile {
             : null),
     forced: pp.forced,
   }));
+  assertClassifiedSkipReasons(bp.branch, bp.isLeaf || bp.alwaysMerge, merges);
   const model = bp.parents[0]?.model ?? 'parents';
   const legalParents = model === 'entry' ? ['main'] : bp.parents.map((p) => p.parent);
   const requiredParents = model === 'entry' ? [] : bp.parents.map((p) => p.parent);
@@ -245,12 +287,7 @@ export async function verifyStepFile(repo: string, step: StepFile, ctx: StepVeri
   // because a chain hop genuinely conflicts ('unskip-conflict', the §6
   // pre-probe) — is not no-op'ing and is exempt (it cannot merge yet).
   const blocked = step.merges.some(
-    (m) =>
-      m.action === 'skip' &&
-      (m.skipReason === 'conflict-pending' ||
-        m.skipReason === 'deferred' ||
-        m.skipReason === 'unskip-blocked' ||
-        m.skipReason === 'unskip-conflict'),
+    (m) => m.action === 'skip' && m.skipReason !== null && BLOCKED_SKIP_REASONS.has(m.skipReason),
   );
   if (
     (step.isLeaf || step.alwaysMerge) &&
