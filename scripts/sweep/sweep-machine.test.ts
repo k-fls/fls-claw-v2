@@ -1566,8 +1566,9 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     repo: FixtureRepo,
     ws: string,
     inv: string,
+    checks: string = checksFile(ws),
   ): Promise<{ dir: string; caseId: string; tipSha: string; ceilingTip: string }> {
-    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksFile(ws) }));
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
     await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
     const dir = dirOf(repo, ws);
     const caseId = currentCaseId(dir);
@@ -1770,6 +1771,57 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     const res = JSON.parse(readFileSync(out, 'utf8')) as { tier: string; issues: Array<{ id: string }> };
     expect(res.tier).toBe('held');
     expect(res.issues.map((i) => i.id)).toEqual(['WARN21_CHECKS_FLAKY']);
+  });
+
+  /**
+   * A CEILING RED THAT NEEDS THE COMMAND BEFORE IT IS STILL A CEILING RED. The
+   * measurement at the ceiling runs the whole failing list, and only the second
+   * command fails — after the first has run in that worktree. Re-running the
+   * accused command alone puts it in a tree where the first never ran, which is
+   * not the experiment it failed in: it comes back green there however real the
+   * defect is. Replaying the sequence is what settles it, and the ceiling is
+   * lifted onto rather than refused for an instability nobody observed.
+   */
+  it('a ceiling red that needs the command before it is LIFTED onto, not refused as unstable', async () => {
+    const repo = inheritedRedFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    const checks = checksFile(ws, { typecheck: ['tsc --noEmit', 'tsc -b'] });
+    const { dir, caseId, ceilingTip } = await inheritedCase(repo, ws, inv, checks);
+    /** Worktrees `tsc --noEmit` has already run in — the state `tsc -b` needs. */
+    const typechecked = new Set<string>();
+    const fn: ChecksRunner = async (commands, baseDir) => {
+      const names = commands.map((c) => c.cmd);
+      const after = typechecked.has(baseDir) || names.includes('tsc --noEmit');
+      if (names.includes('tsc --noEmit')) typechecked.add(baseDir);
+      const failedNames =
+        baseDir && shaAt(baseDir) === ceilingTip ? names.filter((n) => n === 'tsc -b' && after) : names;
+      return {
+        ok: failedNames.length === 0,
+        failedNames,
+        output: failedNames.map((n) => `$ ${n}\nsrc/shared.ts(1,1): error TS2345: boom\n`).join(''),
+      };
+    };
+    const out = join(ws, 'rc.json');
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+      neverInvoked,
+      fn,
+      fakeInstall,
+    );
+    const journal = readJournal(dir);
+    // THE POINT: the ceiling was measured RED, not stamped unstable.
+    expect(journal.find((e) => e.action === 'gate-fix-ceiling')!.decided).toBe('lift-measured');
+    const confirm = journal.find((e) => e.action === 'red-confirm' && e.phase === 'ceiling' && e.cmd === 'tsc -b')!;
+    expect(confirm.reproduced).toBe(true);
+    expect(confirm.aloneGreen).toBe(true);
+    expect(confirm.context).toBe('sequence');
+    // Nothing here is refused for an INSTABILITY: the accusation's other command
+    // is simply green where the content lives, which is a separate rule and a
+    // separate id. The resolution is kept either way.
+    expect(journal.filter((e) => e.action === 'gate-fix-refused').map((e) => e.id)).not.toContain('WARN21_CHECKS_FLAKY');
+    expect(journal.some((e) => e.action === 'not-my-bug-discarded')).toBe(false);
+    expect(journal.some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
   });
 
   /**
@@ -6726,6 +6778,130 @@ describe('run — the landing gate', () => {
     expect(res.branch).toBe('main_patched');
   });
 
+  /**
+   * THE ORDINARY ORDER-DEPENDENT FAILURE: the test command fails only where the
+   * typecheck has already run in the SAME worktree. A re-run of the accused
+   * command ALONE can never see it — a pristine tree has nothing before it — so
+   * repeating the whole experiment is the only probe that can tell this apart
+   * from a check that answers at random.
+   */
+  function orderDependentRunner(redTree: (cwd: string) => boolean): {
+    fn: ChecksRunner;
+    ran: Array<{ cmds: string[]; cwd: string }>;
+  } {
+    const ran: Array<{ cmds: string[]; cwd: string }> = [];
+    /** Worktrees a typecheck has already run in — the state the failure needs. */
+    const typechecked = new Set<string>();
+    const fn: ChecksRunner = async (commands, cwd) => {
+      const cmds = commands.map((c) => c.cmd);
+      ran.push({ cmds, cwd });
+      const after = typechecked.has(cwd) || cmds.includes('tsc --noEmit');
+      if (cmds.includes('tsc --noEmit')) typechecked.add(cwd);
+      if (!cmds.includes('vitest run') || !redTree(cwd) || !after) return { ok: true, failedNames: [], output: '' };
+      return {
+        ok: false,
+        failedNames: ['vitest run'],
+        output: '$ vitest run\nsrc/mp.ts(1,1): error TS2345: the landed tree is broken.\n',
+      };
+    };
+    return { fn, ran };
+  }
+
+  it('a red that NEEDS the commands before it is confirmed by replaying the sequence, not stamped flaky', async () => {
+    const repo = flakyLandingRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'], owned: ['src/cg.ts'] }]);
+    const dir = dirOf(repo, ws);
+    const t = orderDependentRunner(landedRed);
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksJson(ws) }))).toBe(0);
+    const out = join(ws, 'nc.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), t.fn)).toBe(0);
+
+    const journal = readJournal(dir);
+    // THE POINT: the accusation alone was green, and that did not end the probe.
+    const landed = journal.find((e) => e.action === 'landing-check' && e.branch === 'main_patched' && e.ok === false)!;
+    expect(landed.confirmed).toBe(true);
+    expect(landed.unstable).toBeUndefined();
+    const confirm = journal.find((e) => e.action === 'red-confirm' && e.cmd === 'vitest run')!;
+    expect(confirm.reproduced).toBe(true);
+    expect(confirm.aloneGreen).toBe(true);
+    expect(confirm.context).toBe('sequence');
+    // THE GREEN LIVES ON THAT ROW AND NOWHERE ELSE. A `landing-check` or
+    // `branch-check` green for this command on this tree would be inherited by
+    // every branch carrying the subtree, and a genuinely red one would go
+    // unmeasured.
+    const rowChecks = (e: JournalEntry): Array<{ cmd: string; ok: boolean; subtree: string }> =>
+      (Array.isArray(e.checks) ? e.checks : []) as Array<{ cmd: string; ok: boolean; subtree: string }>;
+    expect(
+      journal
+        .filter((e) => e.action === 'landing-check' || e.action === 'branch-check')
+        .some((e) => rowChecks(e).some((c) => c.cmd === 'vitest run' && c.ok && c.subtree === landed.tree)),
+    ).toBe(false);
+    // The case is minted, and it is labelled for what the two runs showed.
+    const gate = journal.find((e) => e.action === 'gate-fix')!;
+    expect(gate.branch).toBe('main_patched');
+    expect(journal.find((e) => e.action === 'case' && e.caseId === gate.caseId)!.reproduction).toBe(
+      'environment-conditional',
+    );
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; branch?: string };
+    expect(res.status).toBe('case-ready');
+    expect(res.branch).toBe('main_patched');
+  });
+
+  it('a red that goes green ALONE and green under the REPLAY is the instability WARN21 names', async () => {
+    const repo = flakyLandingRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'], owned: ['src/cg.ts'] }]);
+    const dir = dirOf(repo, ws);
+    const t = unstableRunner(landedRed);
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksJson(ws) }))).toBe(0);
+    const out = join(ws, 'nc.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), t.fn)).toBe(1);
+
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    const confirm = journal.find((e) => e.action === 'red-confirm' && e.cmd === 'vitest run')!;
+    expect(confirm.reproduced).toBe(false);
+    expect(confirm.aloneGreen).toBe(true);
+    expect(confirm.replayGreen).toBe(true);
+    expect(confirm.flaky).toEqual(['vitest run']);
+    // THE FINDING IS ONLY TRUE BECAUSE THE SEQUENCE WAS REPLAYED, so it says so:
+    // "it passed on its own" would be a statement about a different experiment.
+    expect(String(confirm.detail)).toContain('replayed command sequence');
+    const row = journal.find((e) => e.action === 'landing-check' && e.unstable === true)!;
+    expect(row.id).toBe('WARN21_CHECKS_FLAKY');
+    expect(String(row.detail)).toContain('replayed command sequence');
+    // Three runs of the failing command: the gate's, the accusation alone, and
+    // the replayed sequence.
+    expect(landingRuns(t.ran)).toBe(3);
+  });
+
+  it('a red that reproduces ALONE spawns ONE re-run worktree, and the row says which experiment answered', async () => {
+    const repo = flakyLandingRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'], owned: ['src/cg.ts'] }]);
+    const dir = dirOf(repo, ws);
+    // Red on every ask. The accusation alone reproduces, so the sequence replay
+    // could add nothing and is not paid for.
+    const t = unstableRunner(landedRed, () => true);
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksJson(ws) }))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn)).toBe(0);
+
+    const confirm = readJournal(dir).find((e) => e.action === 'red-confirm' && e.cmd === 'vitest run')!;
+    expect(confirm.reproduced).toBe(true);
+    expect(confirm.rerunMode).toBe('alone');
+    expect(confirm.aloneGreen).toBeUndefined();
+    // TWO runs of the failing command, in TWO worktrees, and the second was
+    // handed the accusation alone — a `['tsc --noEmit', 'vitest run']` list here
+    // would be a replay bought for a question already answered.
+    const vitest = t.ran.filter((r) => r.cmds.includes('vitest run'));
+    expect(vitest.map((r) => r.cmds)).toEqual([['vitest run'], ['vitest run']]);
+    expect(new Set(vitest.map((r) => r.cwd)).size).toBe(2);
+  });
+
   it('a landing whose tree is RED reaches no child, and the journal names the failing commands', async () => {
     const repo = initFixtureRepo();
     repo.commit('base: x', { 'src/x.ts': 'orig\n' });
@@ -7162,16 +7338,13 @@ describe('run — a verdict belongs to the subtree the check ran in', () => {
       f,
       JSON.stringify({ typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }], test: [{ cmd: 'vitest run', cwd: '.' }] }),
     );
-    // `vitest run` is red the first time it is asked on a tree and green after —
-    // the load-dependent shape. It never earns a confirmation.
-    // Red the FIRST time the command is asked in this pass and green after — the
-    // load-window shape. Counted per command, never per worktree: the confirming
-    // re-run is deliberately taken somewhere else.
-    // Red on every ODD ask and green on the even one that follows, so each call's
-    // observation is contradicted by its own confirming re-run: the load window
-    // opens, is measured, and has closed by the time the second run is prepared.
+    // `vitest run` is red on the FIRST ask of a call and green on every re-run of
+    // it — alone AND under the replayed command sequence — so each call's
+    // observation is contradicted by its own confirming probe: the load window
+    // opens, is measured, and has closed by the time either second run is
+    // prepared. It never earns a confirmation.
     let asked = 0;
-    const t = subtreeRunner((cmd) => cmd === 'vitest run' && ++asked % 2 === 1);
+    const t = subtreeRunner((cmd) => cmd === 'vitest run' && ++asked === 1);
 
     expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: f }))).toBe(0);
     expect(await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn)).toBe(1);
@@ -7204,6 +7377,7 @@ describe('run — a verdict belongs to the subtree the check ran in', () => {
 
     // The tree is still owed a verdict, so this call measures it again — and
     // neither seeded row answers for `vitest run` on the landed tree.
+    asked = 0; // the load window opens again for the second call's first ask
     expect(await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn)).toBe(1);
     const journal = readJournal(dir);
     expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);

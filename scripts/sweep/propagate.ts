@@ -3564,6 +3564,13 @@ export interface ContestedCheck {
  * DIFFERING OIDS ARE SILENCE. Two runs over different content that disagree are
  * a content difference; calling that flakiness sends a reader hunting an
  * instability nobody observed, which is the error this exists to avoid making.
+ *
+ * THE CONFIRMATION ITSELF CAN BE THE DISAGREEMENT. A red that passes when the
+ * accused command runs alone and fails again when the sequence it failed in is
+ * replayed answered both ways over one oid, in this driver's own probe. Nothing
+ * outside it need have run at all, and the second source is that row — the green
+ * lives on the `red-confirm` row alone, because a green row anywhere else would
+ * be inherited as a measured verdict.
  */
 export function unstableEvidence(journal: JournalEntry[]): ContestedCheck[] {
   const green = greenChecks(journal);
@@ -3572,7 +3579,9 @@ export function unstableEvidence(journal: JournalEntry[]): ContestedCheck[] {
     if (e.action !== 'red-confirm' || e.reproduced !== true) continue;
     if (typeof e.cmd !== 'string' || typeof e.subtree !== 'string' || typeof e.branch !== 'string') continue;
     const key = checkKey(e.subtree, e.cmd);
-    const greenOn = green.get(key);
+    // A green measured ELSEWHERE names the branch it was measured on and wins:
+    // it is the stronger coordinate, and the alone re-run is the fallback.
+    const greenOn = green.get(key) ?? (e.aloneGreen === true ? `${e.branch} (alone re-run)` : undefined);
     if (greenOn === undefined || out.has(key)) continue;
     out.set(key, {
       cmd: e.cmd,
@@ -3893,9 +3902,17 @@ type RerunOutcome =
  * standing. Greens are never re-run — only a red that is about to accuse
  * somebody.
  *
- * ONLY THE FAILING COMMANDS ARE RE-RUN. They are the whole of the accusation,
- * and re-running the green ones would pay for the part of the suite that is not
- * in question.
+ * THE ACCUSATION IS JUDGED ON THE FAILING COMMANDS; THE EXPERIMENT THEY FAILED
+ * IN IS WHAT GETS REPEATED. Those are two different questions, and answering the
+ * second with the first is how a real failure gets stamped flaky. The accused
+ * command handed a pristine worktree, with nothing run before it, is not the run
+ * that failed: a failure that depends on an earlier command — the order, the
+ * state it left behind, the process it left listening — cannot reproduce there
+ * BY CONSTRUCTION, so it comes back green every time and the check is called
+ * unstable every time. A green on the accusation alone is therefore not an
+ * answer; the whole executed sequence is replayed in a second fresh worktree,
+ * and only the accused command's verdict in that replay is read, because only it
+ * was ever accused.
  */
 async function confirmRed(
   dir: string,
@@ -3905,8 +3922,16 @@ async function confirmRed(
     phase: string;
     /** The commands that failed, WITH the subtree each of them ran in. */
     failed: CheckVerdict[];
-    /** Re-run the FAILED commands on the identical tree, in a fresh environment. */
-    rerun: (commands: CheckVerdict[]) => Promise<RerunOutcome>;
+    /**
+     * Every command the standing worktree executed up to and INCLUDING the
+     * failing one, in the order it ran them — the experiment the red happened
+     * in, which is what the replay repeats.
+     */
+    sequence: VerifyCommand[];
+    /** The FAILED commands ALONE, on the identical tree, in a fresh environment. */
+    rerunAlone: (commands: CheckVerdict[]) => Promise<RerunOutcome>;
+    /** The whole executed sequence, on the identical tree, in a SECOND fresh environment. */
+    replaySequence: (sequence: VerifyCommand[]) => Promise<RerunOutcome>;
   },
 ): Promise<RedConfirmation> {
   const { branch, sha, phase, failed } = args;
@@ -3945,7 +3970,7 @@ async function confirmRed(
     const names = settled.map((v) => v.cmd);
     return { reproduced: true, flaky: [], detail: `${names.join(', ')} were already confirmed red on this subtree` };
   }
-  const rerun = await args.rerun(owed);
+  const rerun = await args.rerunAlone(owed);
   if ('unprepared' in rerun) {
     const detail = `the confirming re-run could not be taken: ${rerun.unprepared}`;
     for (const v of owed) journalOne(v, { ran: false, reproduced: false, unmeasurable: true, detail });
@@ -3967,25 +3992,84 @@ async function confirmRed(
     /** The container is shared; nothing here can quiet it. */
     loadIsolated: false,
   };
-  const flaky = owed.filter((v) => !again.failedNames.includes(v.cmd));
+  /**
+   * Commands the accusation-only re-run did not reproduce — NOT YET A VERDICT.
+   *
+   * This run handed the accused command a pristine worktree with nothing run
+   * before it, which is a DIFFERENT experiment from the one that failed. A
+   * failure that needs what ran earlier cannot reproduce here however real it
+   * is, so a green says only that the accusation alone is not the whole
+   * experiment. The sequence replay below is what answers.
+   *
+   * THIS GREEN IS RECORDED ON THE `red-confirm` ROW AND NOWHERE ELSE — never as a
+   * `branch-check` or `landing-check` green row. `greenChecks` inherits those,
+   * and a sibling landing would then skip measuring a subtree that is genuinely
+   * red.
+   */
+  const aloneGreen = owed.filter((v) => !again.failedNames.includes(v.cmd));
+  /** A command the accusation-only run reproduced: its verdict is in, at one worktree's cost. */
+  const journalAlone = (v: CheckVerdict): void =>
+    journalOne(v, {
+      ran: true,
+      variation,
+      rerunMode: 'alone',
+      reproduced: true,
+      detail:
+        `${v.cmd} failed again on the identical subtree ${v.subtree.slice(0, 12)}, in a worktree checked out and ` +
+        `installed afresh ${variation.separatedMs}ms after the first run (the container's other work is NOT quiet)`,
+    });
+  let replayFailed: string[] = [];
+  let replayVariation: typeof variation | undefined;
+  if (aloneGreen.length > 0) {
+    /** The second observation is missing, not green: an absent experiment settles nothing. */
+    const unmeasurableReplay = (why: string): RedConfirmation => {
+      const detail = `the confirming re-run could not be taken: ${why}`;
+      for (const v of owed) {
+        if (aloneGreen.includes(v)) journalOne(v, { ran: true, aloneGreen: true, reproduced: false, unmeasurable: true, detail });
+        else journalAlone(v);
+      }
+      return { reproduced: false, flaky: [], unmeasurable: { detail }, detail };
+    };
+    const replay = await args.replaySequence(args.sequence);
+    if ('unprepared' in replay) return unmeasurableReplay(replay.unprepared);
+    if (replay.result.environmentFault) return unmeasurableReplay(replay.result.environmentFault.detail);
+    replayFailed = replay.result.failedNames;
+    replayVariation = {
+      freshWorktree: replay.worktree,
+      freshInstall: true,
+      separatedMs: Math.max(0, replay.startedAt - observedAt),
+      loadIsolated: false,
+    };
+  }
+  const sequenceNames = args.sequence.map((c) => c.cmd).join(', ');
+  const flaky = aloneGreen.filter((v) => !replayFailed.includes(v.cmd));
   for (const v of owed) {
+    if (!aloneGreen.includes(v)) {
+      journalAlone(v);
+      continue;
+    }
     const changed = flaky.includes(v);
     journalOne(v, {
       ran: true,
       variation,
+      ...(replayVariation ? { replayVariation } : {}),
+      aloneGreen: true,
       reproduced: !changed,
-      ...(changed ? { flaky: [v.cmd] } : {}),
+      ...(changed ? { replayGreen: true, flaky: [v.cmd] } : { context: 'sequence' }),
       detail: changed
-        ? `${v.cmd} FAILED and then PASSED on the identical subtree ${v.subtree.slice(0, 12)} — the code did not ` +
-          `change between the two runs, so the failure is non-deterministic and belongs to no branch`
-        : `${v.cmd} failed again on the identical subtree ${v.subtree.slice(0, 12)}, in a worktree checked out and ` +
-          `installed afresh ${variation.separatedMs}ms after the first run (the container's other work is NOT quiet)`,
+        ? `${v.cmd} failed and then PASSED under the replayed command sequence (${sequenceNames}) on the ` +
+          `identical subtree ${v.subtree.slice(0, 12)} — neither the code nor the commands run before it changed ` +
+          `between the two runs, so the failure belongs to no branch`
+        : `${v.cmd} passed on its own and failed again on the identical subtree ${v.subtree.slice(0, 12)} when the ` +
+          `command sequence it failed in (${sequenceNames}) was replayed in a worktree checked out and installed ` +
+          `afresh — the failure needs what ran before it, and it is real`,
     });
   }
   const names = flaky.map((v) => v.cmd);
   const detail = names.length
-    ? `${names.join(', ')} FAILED and then PASSED on the identical subtree — the code did not change between ` +
-      `the two runs, so the failure is non-deterministic and belongs to no branch`
+    ? `${names.join(', ')} failed and then PASSED under the replayed command sequence (${sequenceNames}) on the ` +
+      `identical subtree — neither the code nor the commands run before it changed between the two runs, so the ` +
+      `failure belongs to no branch`
     : `${failed.map((v) => v.cmd).join(', ')} failed again on the identical subtree, in a separately prepared ` +
       `worktree ${variation.separatedMs}ms later`;
   return { reproduced: names.length === 0, flaky: names, detail };
@@ -4120,9 +4204,18 @@ async function landingCheck(
     // verdict: a red typecheck says nothing about the test command's subtree, so
     // nothing green is inherited from it and the tests are simply not run yet.
     // The pass returns here, the fix lands, and the tests are measured then.
+    //
+    // AND THE ORDER IS PART OF THE MEASUREMENT. Every phase's commands are
+    // appended here as they run, so a red arrives with the whole experiment it
+    // happened in — a failure that needs the typecheck that ran before it is
+    // reproducible only by repeating both, and the phases before the failing one
+    // were green by construction, so the replay re-runs them green and then
+    // meets the accused command exactly where the standing worktree did.
+    const executed: VerifyCommand[] = [];
     for (const { phase, owed, owedKeys } of phases) {
       if (owed.length === 0) continue;
       const r = await runChecks(owed, wt.path);
+      executed.push(...owed);
       if (r.environmentFault) {
         appendJournal(dir, {
           action: 'landing-check',
@@ -4157,11 +4250,13 @@ async function landingCheck(
           sha,
           phase,
           failed: failedKeys,
+          sequence: executed,
           // NOT IN THIS WORKTREE. The standing one is where the red was just
           // seen; a second run in it repeats the same moment on the same
           // installed tree, which detects randomness and nothing else.
-          rerun: (again) =>
+          rerunAlone: (again) =>
             variedRerun(cli, sha, failed.filter((c) => again.some((k) => k.cmd === c.cmd)), runChecks, runInstall),
+          replaySequence: (seq) => variedRerun(cli, sha, seq, runChecks, runInstall),
         });
         if (confirm.unmeasurable) {
           // The second run never happened, so there is no second observation and
@@ -9964,8 +10059,11 @@ export async function firstRedParticipant(
           sha,
           phase: 'typecheck',
           failed: keys.filter((k) => r.failedNames.includes(k.cmd)),
-          rerun: (again) =>
+          // The whole typecheck list is what ran here, in this order.
+          sequence: checks.typecheck,
+          rerunAlone: (again) =>
             variedRerun(cli, sha, failed.filter((c) => again.some((k) => k.cmd === c.cmd)), runChecks, runInstall),
+          replaySequence: (seq) => variedRerun(cli, sha, seq, runChecks, runInstall),
         });
         if (!confirm.reproduced) {
           // NOT RED, AND NOT GREEN — so this check has no verdict to give and
@@ -10681,7 +10779,12 @@ async function adjudicateNotMyBug(p: {
           sha,
           phase: 'ownership',
           failed: await checkVerdictKeys(cli.repo, sha, failedCommands),
-          rerun: (again) =>
+          // The subset probe runs the failing set WHOLE, so the sequence and the
+          // judged set are the same list here: nothing ran before the accusation
+          // that the replay could restore, and the replay repeats the accusation
+          // itself, which IS the experiment it failed in.
+          sequence: failedCommands,
+          rerunAlone: (again) =>
             variedRerun(
               cli,
               sha,
@@ -10689,6 +10792,7 @@ async function adjudicateNotMyBug(p: {
               p.runChecks,
               p.runInstall,
             ),
+          replaySequence: (seq) => variedRerun(cli, sha, seq, p.runChecks, p.runInstall),
         });
       },
     });
@@ -13288,7 +13392,10 @@ async function confirmRedAt(
     sha,
     phase,
     failed: failedKeys,
-    rerun: (again) => variedRerun(cli, sha, failed.filter((c) => again.some((k) => k.cmd === c.cmd)), runChecks, runInstall),
+    // The whole list ran here, in this order, and only part of it is accused.
+    sequence: commands,
+    rerunAlone: (again) => variedRerun(cli, sha, failed.filter((c) => again.some((k) => k.cmd === c.cmd)), runChecks, runInstall),
+    replaySequence: (seq) => variedRerun(cli, sha, seq, runChecks, runInstall),
   });
   if (confirm.unmeasurable) return 'unmeasurable';
   return confirm.reproduced ? 'red' : 'unstable';

@@ -1608,9 +1608,38 @@ of the branch and its whole subtree, a gate-fix case minted on it and a held PR
 naming it — and the gate measures in a container that is installing worktrees,
 merging and running other suites at the same time, which is where the driver's own
 `REPRODUCTION: FULL SUITE ONLY` class comes back red once and green on repeat. So
-the FAILING COMMANDS (only those — the greens are not in question) run again on
-the identical tree before any of that happens — and NOT in the worktree the red
-was just seen in.
+the red runs again on the identical tree before any of that happens — and NOT in
+the worktree it was just seen in.
+
+**WHAT IS JUDGED AND WHAT IS REPEATED ARE DIFFERENT LISTS.** The accusation is the
+FAILING COMMANDS and only those, so only their verdict is ever read: the greens
+are not in question. But the run that failed was a SEQUENCE — the gate executes
+`typecheck` then `test` in one worktree — and handing the accused command a
+pristine tree with nothing run before it is a different experiment from the one
+that produced the red. A failure that needs what ran earlier (the order, the
+state it left, a process it left listening) cannot reproduce there BY
+CONSTRUCTION: it comes back green every time, and a real defect is stamped flaky
+every time. So the probe is two steps, and it stops at the first that answers:
+
+1. The FAILING COMMANDS alone, in a fresh worktree. Red ⇒ confirmed, at one
+   worktree's cost (`rerunMode: 'alone'`), and step 2 is never taken.
+2. Green there settles nothing, so the WHOLE EXECUTED SEQUENCE is replayed in a
+   SECOND fresh worktree — and only the accused command's verdict in it is read,
+   because only it was accused. The phases before the failing one were green by
+   construction (a red typecheck returns before the tests), so the replay
+   re-runs them green and then meets the accused command where the gate did.
+   Red ⇒ confirmed, and the row carries `aloneGreen: true` with
+   `context: 'sequence'`. Green ⇒ the check answered both ways over one oid with
+   the identical command sequence, which is the instability `WARN21_CHECKS_FLAKY`
+   names, and the row says so (`replayGreen: true`).
+
+A confirmation that needed the sequence is a check that ALSO passed on the same
+oid, in this driver's own probe, so `unstableEvidence` reports it contested
+(`greenOn: '<branch> (alone re-run)'`) and the mint labels the case
+`environment-conditional` (§7.2). The alone-green is recorded on the `red-confirm`
+row and NOWHERE ELSE — never as a `branch-check` or `landing-check` green, which
+`greenChecks` would inherit, letting a sibling landing skip measuring a subtree
+that is genuinely red.
 
 **A DETERMINISM PROBE MUST VARY SOMETHING.** Two runs back to back in one worktree
 share the moment, the machine's load, the filesystem and the installed dependency
@@ -1625,12 +1654,15 @@ The row states exactly that and no more: `variation.freshWorktree` (the path),
 honesty: the container is shared with whatever else is running in it, so a
 confirmation means "reproduced in a second environment, prepared separately, N ms
 later" — never "reproduced independently of load". Cost: one checkout and one
-dependency install per confirmed red, paid once per (subtree, command) for the
-whole pass.
+dependency install per confirmed red — a second only where the accusation alone
+came back green — paid once per (subtree, command) for the whole pass.
 
 The outcome is journaled as one `red-confirm` row PER COMMAND,
-carrying the `subtree` that command ran in, the branch it was MEASURED on and
-`reproduced`. A row that merely RE-STATES a settled verdict (`ran: false`,
+carrying the `subtree` that command ran in, the branch it was MEASURED on,
+`reproduced`, and which experiment answered — `rerunMode: 'alone'` for a red the
+accusation alone reproduced, or `aloneGreen` plus `context`/`replayGreen` and a
+second `replayVariation` for one the sequence replay decided. A row that merely
+RE-STATES a settled verdict (`ran: false`,
 `reason: 'confirmed-this-pass'`) carries the measuring branch too, not the branch
 that asked: the reader takes the last row per (subtree, command), so attributing a
 re-statement to the asker would move the verdict onto whichever branch happened to
@@ -1643,10 +1675,10 @@ all — a command that never spawned, or a second worktree that will not check o
 or install — leaves the tree UNMEASURED, never red: there is no second
 observation, and one observation may not found a case.
 
-**A CHANGED VERDICT ACCUSES NOBODY — and is not a green either.** The two runs
-disagree about one tree, so the only established fact is that the check is
-unstable: nothing is minted, no branch is blamed, and the finding reported is the
-INSTABILITY (`WARN21_CHECKS_FLAKY`). But content that propagates arrives green or
+**A CHANGED VERDICT ACCUSES NOBODY — and is not a green either.** The runs
+disagree about one tree under the same command sequence, so the only established
+fact is that the check is unstable: nothing is minted, no branch is blamed, and
+the finding reported is the INSTABILITY (`WARN21_CHECKS_FLAKY`). But content that propagates arrives green or
 does not arrive, and a flaky measurement is not a green one — so the branch does
 NOT arrive, nothing below it takes its tip, the pass cannot seal, and the tree
 stays OWED a verdict: a later call re-measures it instead of passing it over as a
