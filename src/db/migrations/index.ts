@@ -17,6 +17,7 @@ import { migration016 } from './016-messaging-group-instance.js';
 import { moduleApprovalsPendingApprovals } from './module-approvals-pending-approvals.js';
 import { moduleApprovalsTitleOptions } from './module-approvals-title-options.js';
 import { migration018 } from './018-approvals-approver-user-id.js';
+import { migration019 } from './019-wiring-threads.js';
 // Fork migration — namespaced out of upstream's numeric sequence (`16-fls-NN-…`
 // filename, `flsMigrationNNN` binding, `fls-…` name) so upstream's incrementing
 // 0NN migrations never collide with ours on merge. `16` = the upstream epoch
@@ -55,6 +56,7 @@ export const migrations: Migration[] = [
   migration014,
   migration015,
   migration016,
+  migration019,
   // Fork migrations run last (after every upstream migration) — they depend on
   // upstream tables already existing, and appending keeps them clear of the
   // upstream sequence.
