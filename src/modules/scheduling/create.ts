@@ -45,47 +45,58 @@ export interface ScheduledTaskRow {
 }
 
 /**
+ * The deterministic slug half of a task id. Exposed so template restamping can
+ * find the live series a named task produced (`<slug>-<4hex>`).
+ */
+export function taskNameSlug(name: unknown): string {
+  if (typeof name !== 'string') return '';
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 24)
+    .replace(/-+$/g, '');
+}
+
+/**
  * Short, readable, filesystem/thread-safe task id. With a name → `<slug>-<4hex>`;
  * without one → `t-<6hex>`. Always matches /^[a-z0-9-]+$/ so it is safe as a
  * thread suffix, filename, and copy-pasteable CLI argument.
  */
 export function makeTaskId(name: unknown): string {
   const hex = (n: number): string => randomUUID().replace(/-/g, '').slice(0, n);
-  const slug =
-    typeof name === 'string'
-      ? name
-          .toLowerCase()
-          .replace(/[^a-z0-9]+/g, '-')
-          .replace(/^-+|-+$/g, '')
-          .slice(0, 24)
-          .replace(/-+$/g, '')
-      : '';
+  const slug = taskNameSlug(name);
   return slug ? `${slug}-${hex(4)}` : `t-${hex(6)}`;
 }
 
-export function parseProcessAfter(value: unknown): string {
+export function parseProcessAfter(value: unknown, tz: string = TIMEZONE): string {
   if (typeof value !== 'string' || value.length === 0) throw new Error('--process-after is required');
-  const date = parseZonedToUtc(value, TIMEZONE);
+  const date = parseZonedToUtc(value, tz);
   if (Number.isNaN(date.getTime())) throw new Error(`invalid --process-after: ${value}`);
   return date.toISOString();
 }
 
-export function validateRecurrence(value: string | null | undefined): void {
+export function validateRecurrence(value: string | null | undefined, tz: string = TIMEZONE): void {
   if (!value) return;
   try {
-    CronExpressionParser.parse(value, { tz: TIMEZONE });
+    CronExpressionParser.parse(value, { tz });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     throw new Error(`invalid --recurrence: ${msg}`, { cause: err });
   }
 }
 
-export function enforceRecurrenceLimit(recurrence: string | null, override: boolean, hasScript: boolean): void {
+export function enforceRecurrenceLimit(
+  recurrence: string | null,
+  override: boolean,
+  hasScript: boolean,
+  tz: string = TIMEZONE,
+): void {
   // A gate script is the sanctioned mitigation: a skipped fire costs no agent
   // tokens, so scripted tasks may poll faster without the explicit override.
   if (!recurrence || override || hasScript) return;
   const horizon = Date.now() + 24 * 60 * 60 * 1000;
-  const interval = CronExpressionParser.parse(recurrence, { tz: TIMEZONE });
+  const interval = CronExpressionParser.parse(recurrence, { tz });
   let fires = 0;
   while (fires <= MAX_DAILY_FIRES) {
     const next = interval.next();
@@ -95,7 +106,12 @@ export function enforceRecurrenceLimit(recurrence: string | null, override: bool
   if (fires > MAX_DAILY_FIRES) throw new Error(RECURRENCE_LIMIT_WARNING);
 }
 
-/** Validate task semantics and derive its first run without writing anything. */
+/**
+ * Validate task semantics and derive its first run without writing anything.
+ * `timezone` grounds wall-clock interpretation (cron grid, naive
+ * --process-after) — pass the owning group's effective timezone
+ * (`resolveGroupTimezone`); it defaults to the install-global one.
+ */
 export function prepareScheduledTask(input: {
   name?: string;
   prompt: string;
@@ -103,20 +119,22 @@ export function prepareScheduledTask(input: {
   processAfter?: string;
   script?: string | null;
   dangerouslyOverrideRecurrenceLimit?: boolean;
+  timezone?: string;
 }): PreparedScheduledTask {
   if (!input.prompt) throw new Error('--prompt is required');
   const recurrence = input.recurrence ?? null;
   const script = input.script ?? null;
-  validateRecurrence(recurrence);
-  enforceRecurrenceLimit(recurrence, input.dangerouslyOverrideRecurrenceLimit === true, script !== null);
+  const tz = input.timezone ?? TIMEZONE;
+  validateRecurrence(recurrence, tz);
+  enforceRecurrenceLimit(recurrence, input.dangerouslyOverrideRecurrenceLimit === true, script !== null, tz);
 
   let processAfter: string;
   if (input.processAfter === undefined && recurrence) {
-    const next = CronExpressionParser.parse(recurrence, { tz: TIMEZONE }).next().toISOString();
+    const next = CronExpressionParser.parse(recurrence, { tz }).next().toISOString();
     if (!next) throw new Error(`--recurrence has no upcoming run: ${recurrence}`);
     processAfter = next;
   } else {
-    processAfter = parseProcessAfter(input.processAfter);
+    processAfter = parseProcessAfter(input.processAfter, tz);
   }
 
   return { name: input.name, prompt: input.prompt, recurrence, script, processAfter };
