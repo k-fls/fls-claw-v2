@@ -4051,6 +4051,28 @@ async function confirmRed(
     { label: 'alone re-run', output: rootChecksOutput(again.output, owed.map((v) => ({ cmd: v.cmd, ...(v.cwd ? { cwd: v.cwd } : {}) }))) },
   ];
   const aloneEvidence = failureEvidence(runs[0].output);
+  /**
+   * A SECOND WORKTREE BUYS SOMETHING ONLY WHERE THE SEQUENCE IS RICHER THAN WHAT
+   * STEP A RAN.
+   *
+   * Step A ran `owed`; the replay runs `args.sequence`. Where the sequence names
+   * nothing step A did not run, the two are the SAME experiment, and the replay
+   * is a third sample of it — while a green in step A is already the check
+   * answering both ways over one oid, which is exactly the instability WARN21
+   * names. Paying for a tie-breaker there converts that instability into a
+   * confirmed red on a majority of samples, which is not what any of this
+   * measures.
+   *
+   * COMPARED AGAINST `owed`, WHICH IS WHAT STEP A ACTUALLY RAN — never against
+   * `failed`. A command the pass already settled is skipped, so step A can run a
+   * strict subset of the accusation while the sequence still names the sibling:
+   * the replay restores it and IS richer. Both lists derive from one source list,
+   * so their order is shared by construction and only membership is in question.
+   *
+   * This is what keeps `context: 'sequence'` sound: it can only ever come from an
+   * experiment that had more in it than the accusation alone.
+   */
+  const richerSequence = args.sequence.some((c) => !owed.some((k) => k.cmd === c.cmd));
   /** A command the accusation-only run reproduced: its verdict is in, at one worktree's cost. */
   const journalAlone = (v: CheckVerdict): void =>
     journalOne(v, {
@@ -4066,7 +4088,7 @@ async function confirmRed(
   let replayFailed: string[] = [];
   let replayVariation: typeof variation | undefined;
   let replayEvidence: Record<string, unknown> = {};
-  if (aloneGreen.length > 0) {
+  if (aloneGreen.length > 0 && richerSequence) {
     /** The second observation is missing, not green: an absent experiment settles nothing. */
     const unmeasurableReplay = (why: string): RedConfirmation => {
       const detail = `the confirming re-run could not be taken: ${why}`;
@@ -4106,11 +4128,17 @@ async function confirmRed(
       // The REPLAY is what decided this row, so the replay's output is what the
       // row keeps — the accusation alone printed a green.
       ...replayEvidence,
-      ...(changed ? { replayGreen: true, flaky: [v.cmd] } : { context: 'sequence' }),
+      ...(changed
+        ? { ...(richerSequence ? { replayGreen: true } : {}), flaky: [v.cmd] }
+        : { context: 'sequence' }),
       detail: changed
-        ? `${v.cmd} failed and then PASSED under the replayed command sequence (${sequenceNames}) on the ` +
-          `identical subtree ${v.subtree.slice(0, 12)} — neither the code nor the commands run before it changed ` +
-          `between the two runs, so the failure belongs to no branch`
+        ? richerSequence
+          ? `${v.cmd} failed and then PASSED under the replayed command sequence (${sequenceNames}) on the ` +
+            `identical subtree ${v.subtree.slice(0, 12)} — neither the code nor the commands run before it changed ` +
+            `between the two runs, so the failure belongs to no branch`
+          : `${v.cmd} failed and then PASSED under the same command set on the identical subtree ` +
+            `${v.subtree.slice(0, 12)} — neither the code nor the commands changed between the two runs, so the ` +
+            `failure belongs to no branch`
         : `${v.cmd} passed on its own and failed again on the identical subtree ${v.subtree.slice(0, 12)} when the ` +
           `command sequence it failed in (${sequenceNames}) was replayed in a worktree checked out and installed ` +
           `afresh — the failure needs what ran before it, and it is real`,
@@ -4118,9 +4146,12 @@ async function confirmRed(
   }
   const names = flaky.map((v) => v.cmd);
   const detail = names.length
-    ? `${names.join(', ')} failed and then PASSED under the replayed command sequence (${sequenceNames}) on the ` +
-      `identical subtree — neither the code nor the commands run before it changed between the two runs, so the ` +
-      `failure belongs to no branch`
+    ? richerSequence
+      ? `${names.join(', ')} failed and then PASSED under the replayed command sequence (${sequenceNames}) on the ` +
+        `identical subtree — neither the code nor the commands run before it changed between the two runs, so the ` +
+        `failure belongs to no branch`
+      : `${names.join(', ')} failed and then PASSED under the same command set on the identical subtree — ` +
+        `neither the code nor the commands changed between the two runs, so the failure belongs to no branch`
     : `${failed.map((v) => v.cmd).join(', ')} failed again on the identical subtree, in a separately prepared ` +
       `worktree ${variation.separatedMs}ms later`;
   return { reproduced: names.length === 0, flaky: names, detail, runs };
@@ -10875,10 +10906,10 @@ async function adjudicateNotMyBug(p: {
           sha,
           phase: 'ownership',
           failed: await checkVerdictKeys(cli.repo, sha, failedCommands),
-          // The subset probe runs the failing set WHOLE, so the sequence and the
-          // judged set are the same list here: nothing ran before the accusation
-          // that the replay could restore, and the replay repeats the accusation
-          // itself, which IS the experiment it failed in.
+          // The subset probe runs the failing set WHOLE, so the sequence IS the
+          // accusation: nothing ran before it that a replay could restore, and one
+          // re-run settles it. Where a sibling command is already settled and
+          // skipped, the sequence puts it back and the replay earns its worktree.
           sequence: failedCommands,
           rerunAlone: (again) =>
             variedRerun(

@@ -1623,15 +1623,27 @@ every time. So the probe is two steps, and it stops at the first that answers:
 
 1. The FAILING COMMANDS alone, in a fresh worktree. Red ⇒ confirmed, at one
    worktree's cost (`rerunMode: 'alone'`), and step 2 is never taken.
-2. Green there settles nothing, so the WHOLE EXECUTED SEQUENCE is replayed in a
-   SECOND fresh worktree — and only the accused command's verdict in it is read,
-   because only it was accused. The phases before the failing one were green by
-   construction (a red typecheck returns before the tests), so the replay
-   re-runs them green and then meets the accused command where the gate did.
-   Red ⇒ confirmed, and the row carries `aloneGreen: true` with
-   `context: 'sequence'`. Green ⇒ the check answered both ways over one oid with
-   the identical command sequence, which is the instability `WARN21_CHECKS_FLAKY`
-   names, and the row says so (`replayGreen: true`).
+2. Green there settles nothing WHEN THE SEQUENCE IS RICHER than what step 1 ran,
+   so the WHOLE EXECUTED SEQUENCE is replayed in a SECOND fresh worktree — and
+   only the accused command's verdict in it is read, because only it was accused.
+   The phases before the failing one were green by construction (a red typecheck
+   returns before the tests), so the replay re-runs them green and then meets the
+   accused command where the gate did. Red ⇒ confirmed, and the row carries
+   `aloneGreen: true` with `context: 'sequence'`. Green ⇒ the check answered both
+   ways over one oid under the identical sequence, which is the instability
+   `WARN21_CHECKS_FLAKY` names, and the row says so (`replayGreen: true`).
+
+RICHER IS MEASURED AGAINST WHAT STEP 1 RAN, not against the accusation. Where the
+sequence names nothing step 1 ran without, the two steps are the SAME experiment
+and the replay is a third sample of it: step 1's green is ALREADY the check
+answering both ways, so it is the verdict and no second worktree is bought. That
+is why `context: 'sequence'` is sound — it can only come from an experiment with
+more in it than the accusation alone. A command the pass already SETTLED is
+skipped by step 1, so step 1 can run a strict subset of the accusation while the
+sequence still names the sibling; the replay restores it and is richer. The
+landing gate is richer in every shape that matters, because a prior phase always
+ran. `next-case`'s pre-merge typecheck, the ceiling probe and the ownership probe
+run the whole accused list, so each is settled by one re-run.
 
 A confirmation that needed the sequence is a check that ALSO passed on the same
 oid, in this driver's own probe, so `unstableEvidence` reports it contested

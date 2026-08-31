@@ -1825,6 +1825,125 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
   });
 
   /**
+   * AN ACCUSATION THAT IS THE WHOLE EXPERIMENT IS SETTLED BY ONE RE-RUN.
+   *
+   * The ceiling probe runs the accused list and nothing else, so re-running that
+   * list alone repeats the experiment exactly. Its green is therefore already the
+   * check answering both ways over one oid — the instability — and a third sample
+   * would only break the tie on a majority, which is not what any of this
+   * measures. So no second worktree is bought, and no row claims a replay.
+   */
+  it('an accusation that IS the whole experiment is settled by ONE re-run, and its green is the instability', async () => {
+    const repo = inheritedRedFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    const { dir, caseId, ceilingTip } = await inheritedCase(repo, ws, inv);
+    // Red on every ODD run at the ceiling. One re-run sees green and stops; a
+    // third would see red again and call the same bytes CONFIRMED.
+    let ceilingRuns = 0;
+    const worktrees = new Set<string>();
+    const fn: ChecksRunner = async (commands, baseDir) => {
+      const names = commands.map((c) => c.cmd);
+      if (baseDir && shaAt(baseDir) === ceilingTip) {
+        ceilingRuns++;
+        if (!readJournal(dir).some((e) => e.action === 'gate-fix-ceiling')) worktrees.add(baseDir);
+        if (ceilingRuns % 2 === 0) return { ok: true, failedNames: [], output: '' };
+      }
+      return {
+        ok: false,
+        failedNames: names,
+        output: names.map((n) => `$ ${n}\nsrc/shared.ts(1,1): error TS2345: boom\n`).join(''),
+      };
+    };
+    const out = join(ws, 'rc.json');
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+      neverInvoked,
+      fn,
+      fakeInstall,
+    );
+    const journal = readJournal(dir);
+    expect(journal.find((e) => e.action === 'gate-fix-ceiling')!.decided).toBe('refused-unstable');
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    const confirm = journal.find((e) => e.action === 'red-confirm' && e.phase === 'ceiling')!;
+    expect(confirm.reproduced).toBe(false);
+    expect(confirm.aloneGreen).toBe(true);
+    // NO REPLAY WAS TAKEN, so no row may imply one — including the sentence.
+    expect(confirm.replayVariation).toBeUndefined();
+    expect(confirm.replayGreen).toBeUndefined();
+    expect(String(confirm.detail)).toContain('the same command set');
+    expect(String(confirm.detail)).not.toContain('replayed command sequence');
+    // THE COST: the standing worktree and ONE re-run.
+    expect(worktrees.size).toBe(2);
+    expect(journal.find((e) => e.action === 'gate-fix-refused')!.id).toBe('WARN21_CHECKS_FLAKY');
+    expect(journal.some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
+  });
+
+  /**
+   * THE SETTLED SIBLING — the pin on the predicate, which compares the sequence
+   * against WHAT THE ALONE RE-RUN RAN and not against the accusation.
+   *
+   * Both commands are accused here, so an accusation-based test would say the
+   * sequence adds nothing and skip the replay. It adds a great deal: one command
+   * is already settled this pass and is not re-run, so the alone re-run is a
+   * STRICT SUBSET of the experiment, and the sequence puts the sibling back. The
+   * red needs it. Read this before narrowing the predicate to the failing set.
+   */
+  it('a settled sibling makes the sequence richer than the alone re-run, and the replay is taken', async () => {
+    const repo = inheritedRedFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    const checks = checksFile(ws, { typecheck: ['tsc --noEmit', 'tsc -b'] });
+    const { dir, ceilingTip } = await inheritedCase(repo, ws, inv, checks);
+    // `tsc --noEmit` is already confirmed red on the subtree the ceiling's tip
+    // carries, so the confirming probe owes only `tsc -b`.
+    seedConfirmedRed(dir, repo, 'module/elsewhere', ceilingTip);
+    /** Worktrees `tsc --noEmit` has already run in — the state `tsc -b` needs. */
+    const typechecked = new Set<string>();
+    let ceilingRuns = 0;
+    const fn: ChecksRunner = async (commands, baseDir) => {
+      const names = commands.map((c) => c.cmd);
+      const after = typechecked.has(baseDir) || names.includes('tsc --noEmit');
+      if (names.includes('tsc --noEmit')) typechecked.add(baseDir);
+      if (baseDir && shaAt(baseDir) === ceilingTip && ++ceilingRuns > 1) {
+        const failedNames = names.filter((n) => n === 'tsc -b' && after);
+        return {
+          ok: failedNames.length === 0,
+          failedNames,
+          output: failedNames.map((n) => `$ ${n}\nsrc/shared.ts(1,1): error TS2345: boom\n`).join(''),
+        };
+      }
+      return {
+        ok: false,
+        failedNames: names,
+        output: names.map((n) => `$ ${n}\nsrc/shared.ts(1,1): error TS2345: boom\n`).join(''),
+      };
+    };
+    const out = join(ws, 'rc.json');
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true, out }),
+      neverInvoked,
+      fn,
+      fakeInstall,
+    );
+    const journal = readJournal(dir);
+    // `tsc --noEmit` was RE-STATED from the settled verdict, never re-run...
+    const restated = journal.find(
+      (e) => e.action === 'red-confirm' && e.phase === 'ceiling' && e.cmd === 'tsc --noEmit',
+    )!;
+    expect(restated.ran).toBe(false);
+    expect(restated.reason).toBe('confirmed-this-pass');
+    // ...so the alone re-run ran `tsc -b` by itself, went green, and the replay
+    // that put the sibling back is what confirmed it.
+    const confirm = journal.find((e) => e.action === 'red-confirm' && e.phase === 'ceiling' && e.cmd === 'tsc -b')!;
+    expect(confirm.reproduced).toBe(true);
+    expect(confirm.aloneGreen).toBe(true);
+    expect(confirm.context).toBe('sequence');
+    expect(confirm.replayVariation).toBeTruthy();
+    expect(journal.find((e) => e.action === 'gate-fix-ceiling')!.decided).toBe('lift-measured');
+  });
+
+  /**
    * A RED WHERE THE CONTENT IS NOT IS REPORTED, AND IT DECIDES NOTHING.
    *
    * The same command is confirmed red at a commit that does not carry the failing
