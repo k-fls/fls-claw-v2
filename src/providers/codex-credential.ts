@@ -93,8 +93,11 @@ export function codexAuthFilePath(agentGroupId: string): string {
 export const CODEX_OAUTH_PROVIDER: OAuthProvider = {
   id: PROVIDER_ID,
   rules: [
-    { anchor: AUTH_HOST, pathPattern: /^\/deviceauth\/usercode$/, mode: 'device-code' },
-    { anchor: AUTH_HOST, pathPattern: /^\/deviceauth\/token$/, mode: 'token-exchange' },
+    // Paths observed on the wire from the pinned CLI (0.138.0) against a
+    // forged certificate, not inferred from the binary's strings: the device
+    // endpoints sit under /api/accounts, which the strings did not show.
+    { anchor: AUTH_HOST, pathPattern: /^\/api\/accounts\/deviceauth\/usercode$/, mode: 'device-code' },
+    { anchor: AUTH_HOST, pathPattern: /^\/api\/accounts\/deviceauth\/token$/, mode: 'token-exchange' },
     { anchor: AUTH_HOST, pathPattern: /^\/oauth\/token$/, mode: 'token-exchange' },
     { anchor: AUTH_HOST, pathPattern: /^\/api\/accounts\/v1\//, mode: 'bearer-swap' },
     { anchor: CHATGPT_HOST, pathPattern: /^\/backend-api\//, mode: 'bearer-swap' },

@@ -143,8 +143,8 @@ describe('codex credential provider', () => {
 
   describe('rule table', () => {
     it('routes the device-authorization and token endpoints to their handlers', () => {
-      expect(ruleFor('auth.openai.com', '/deviceauth/usercode')).toBe('device-code');
-      expect(ruleFor('auth.openai.com', '/deviceauth/token')).toBe('token-exchange');
+      expect(ruleFor('auth.openai.com', '/api/accounts/deviceauth/usercode')).toBe('device-code');
+      expect(ruleFor('auth.openai.com', '/api/accounts/deviceauth/token')).toBe('token-exchange');
       expect(ruleFor('auth.openai.com', '/oauth/token')).toBe('token-exchange');
     });
 
@@ -155,6 +155,9 @@ describe('codex credential provider', () => {
 
     it('matches no rule on a path outside the recorded set', () => {
       expect(ruleFor('auth.openai.com', '/oauth/authorize')).toBeNull();
+      // The paths the binary's strings suggested, which the wire disproved.
+      expect(ruleFor('auth.openai.com', '/deviceauth/usercode')).toBeNull();
+      expect(ruleFor('auth.openai.com', '/deviceauth/token')).toBeNull();
       expect(ruleFor('chatgpt.com', '/')).toBeNull();
       expect(ruleFor('ab.chatgpt.com', '/otlp/v1/metrics')).toBeNull();
     });
