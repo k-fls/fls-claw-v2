@@ -6,11 +6,11 @@
  *
  *   pnpm exec tsx setup/index.ts --step provider-auth codex
  *
- * Same walk-through, same vault-only invariant, idempotent (each provider's
- * runAuth short-circuits when its secret already exists) — and unlike
- * re-running full setup, it touches nothing else: no install-wide default
- * provider rewrite, no service changes. Provider install skills call this as
- * their auth step so there is exactly one auth implementation per provider.
+ * Same walk-through, idempotent (each provider's runAuth short-circuits when
+ * its credential is already bound) — and unlike re-running full setup, it
+ * touches nothing else: no install-wide default provider rewrite, no service
+ * changes. Provider install skills call this as their auth step so there is
+ * exactly one auth implementation per provider.
  */
 import { execSync } from 'child_process';
 import fs from 'fs';
@@ -43,15 +43,20 @@ export async function run(args: string[]): Promise<void> {
   const script = INSTALL_SCRIPTS[name];
   if (script) {
     // Install OR refresh: the script is idempotent and is also the upgrade
-    // path — payload files resync and a bumped Dockerfile pin replaces the
-    // local one. Rebuild the image only when the Dockerfile actually changed
-    // (payload code is mounted, not baked).
-    const dfPath = path.join(process.cwd(), 'container', 'Dockerfile');
-    const dfBefore = fs.readFileSync(dfPath, 'utf-8');
+    // path — payload files resync and a bumped CLI pin replaces the local one.
+    // Rebuild the image only when something baked into it changed (payload code
+    // is mounted, not baked). A provider CLI pin lands in the global-CLI
+    // manifest rather than the Dockerfile, so watching the Dockerfile alone
+    // leaves the image without the binary the provider is about to launch.
+    const bakedFiles = ['container/Dockerfile', 'container/cli-tools.json'].map((rel) => path.join(process.cwd(), rel));
+    const bakedBefore = bakedFiles.map((file) => (fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : null));
     console.log(`${entry ? 'Refreshing' : 'Installing'} ${name}…`);
     execSync(`bash ${script}`, { stdio: 'inherit' });
-    if (fs.readFileSync(dfPath, 'utf-8') !== dfBefore) {
-      console.log('Dockerfile pin changed — rebuilding the container image…');
+    const changed = bakedFiles.filter(
+      (file, i) => (fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : null) !== bakedBefore[i],
+    );
+    if (changed.length > 0) {
+      console.log(`${changed.map((f) => path.basename(f)).join(', ')} changed — rebuilding the container image…`);
       execSync('./container/build.sh', { stdio: 'inherit' });
     }
     if (!entry) {

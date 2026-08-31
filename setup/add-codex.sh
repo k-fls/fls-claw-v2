@@ -58,12 +58,14 @@ FORK_OWNED=(
   src/providers/codex-host-contribution.test.ts
 )
 
-# The setup barrel is not wired here: `setup/providers/codex.ts` is authored on
-# this edition rather than copied, so importing it now would reference a module
-# nothing has created yet.
+# `setup/providers/codex.ts` is authored on this edition rather than copied, but
+# its barrel import is still wired here: without it the setup picker's
+# `await import('./providers/codex.js')` resolves nothing and the provider has
+# no setup entry.
 BARRELS=(
   src/providers/index.ts
   container/agent-runner/src/providers/index.ts
+  setup/providers/index.ts
 )
 
 ALREADY_INSTALLED=true
@@ -78,11 +80,13 @@ emit_status() {
 }
 log() { echo "[add-codex] $*" >&2; }
 
-# Idempotent: a complete install has the host provider file, the host barrel
-# import, and the Codex CLI in the container manifest. Any missing → (re)install.
+# Idempotent: a complete install has the host provider file, the host and setup
+# barrel imports, and the Codex CLI in the container manifest. Any missing →
+# (re)install.
 need_install() {
   [ ! -f src/providers/codex.ts ] && return 0
   ! grep -q "^import './codex.js';" src/providers/index.ts 2>/dev/null && return 0
+  ! grep -q "^import './codex.js';" setup/providers/index.ts 2>/dev/null && return 0
   ! grep -q '@openai/codex' container/cli-tools.json 2>/dev/null && return 0
   return 1
 }

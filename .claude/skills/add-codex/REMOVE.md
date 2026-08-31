@@ -13,13 +13,24 @@ ncl groups config update --id <group-id> --provider claude
 ncl groups restart --id <group-id>
 ```
 
-## 2. Delete the barrel imports
+## 2. Delete the barrel imports and the credential registration
 
 Delete (do not comment out) the `import './codex.js';` line from each of:
 
 - `src/providers/index.ts`
 - `container/agent-runner/src/providers/index.ts`
 - `setup/providers/index.ts`
+
+The credential provider is not barrel-driven — registration is an explicit call
+inside the host entry point. Delete both lines from `src/index.ts`:
+
+```
+import { registerCodexCredentialProvider } from './providers/codex-credential.js';
+registerCodexCredentialProvider();
+```
+
+Leaving the call while deleting the file breaks host boot outright; leaving both
+keeps the OpenAI hosts intercepted for every group with no credential behind them.
 
 ## 3. Delete every copied file
 
@@ -40,7 +51,8 @@ rm -f src/providers/codex.ts \
       container/agent-runner/src/providers/codex-cli-tools.test.ts \
       setup/providers/codex.ts \
       setup/providers/codex.test.ts \
-      setup/providers/codex-registration.test.ts
+      src/providers/codex-credential.ts \
+      src/providers/codex-credential.test.ts
 ```
 
 This skill itself (`.claude/skills/add-codex/`) stays — it ships with trunk so the provider can be re-added later.
@@ -61,9 +73,21 @@ node -e '
 '
 ```
 
-## 5. Vault secret (optional)
+## 5. Stored ChatGPT credentials (optional)
 
-The ChatGPT/OpenAI secret in the OneCLI vault grants nothing once the provider is gone. To remove it: `onecli secrets list`, then `onecli secrets delete --id <id>` for the `chatgpt.com` / `api.openai.com` entry.
+Each signed-in group holds its own credential in the host store, and it grants
+nothing once the provider is gone. Per group, from a channel that engages it:
+
+```
+/creds delete codex
+```
+
+Or on the host, remove the keys file directly — one per signed-in scope:
+`${XDG_CONFIG_HOME:-~/.config}/nanoclaw/credentials/<group-folder>/codex.keys.json`.
+
+Revoking at OpenAI is a separate step and belongs to whoever signed in: the
+stored refresh token stays valid at the provider until they sign the session out
+of their ChatGPT account.
 
 ## 6. Rebuild and verify
 
