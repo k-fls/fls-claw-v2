@@ -159,6 +159,52 @@ export function toPlainText(s: string): string {
     .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');
 }
 
+/** Escape a string for literal use inside a RegExp. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Locate a leading @-mention of THIS bot in the message's plain text and
+ * return the offset where the real content begins (just past the mention
+ * token and its trailing separators). Returns 0 when there is no leading
+ * bot mention — the text is left untouched; we only mark a boundary so the
+ * host command gate can classify a mention-prefixed slash command without
+ * anyone mutating what the container stores/receives.
+ *
+ * To engage a bot in a group channel a user @-mentions it, and platforms
+ * deliver that mention as a literal prefix on the plain text — e.g.
+ * "@U0AKKG67T7X /auth" (Slack, flattened from `<@U…>`), "<@123> /auth" or
+ * "<@!123> /auth" (Discord), "@botname /auth" (Telegram).
+ *
+ * Channel-correct by identity: when the adapter exposes the bot's own id
+ * (`botUserId`, e.g. Slack) and/or username (`userName`, e.g. Telegram),
+ * ONLY the bot's own mention matches — never a mention of another user, in
+ * either the "<@id>" or bare "@handle" form. When identity is unavailable
+ * but the platform confirmed this message mentions the bot (`isMention`),
+ * fall back to a generic leading @-token so the boundary is still marked.
+ */
+export function leadingBotMentionEnd(
+  text: string,
+  botUserId?: string,
+  botUserName?: string,
+  isMention?: boolean,
+): number {
+  const ids = [botUserId, botUserName?.replace(/^@/, '')]
+    .filter((v): v is string => typeof v === 'string' && v.length > 0)
+    .map(escapeRegExp);
+  if (ids.length > 0) {
+    const alt = ids.join('|');
+    const m = text.match(new RegExp(`^\\s*(?:<@[!&]?(?:${alt})>|@(?:${alt}))[\\s,:]*`, 'i'));
+    if (m) return m[0].length;
+  }
+  if (isMention) {
+    const m = text.match(/^\s*(?:<@[!&]?[A-Za-z0-9._-]+>|@[A-Za-z0-9._-]+)[\s,:]*/);
+    if (m) return m[0].length;
+  }
+  return 0;
+}
+
 export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
   const { adapter } = config;
   // The instance name becomes a webhook route segment (the route regex is
@@ -234,6 +280,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
     // Drop raw to save DB space (can be very large)
     serialized.raw = undefined;
+
+    // Annotate (never strip) a leading @-mention of THIS bot so the host
+    // command gate can classify slash commands that arrive mention-prefixed
+    // in group channels ("@bot /auth" → "/auth"), while the container still
+    // receives the verbatim text. See leadingBotMentionEnd.
+    const plainText = typeof serialized.text === 'string' ? serialized.text : '';
+    const mentionEnd = leadingBotMentionEnd(plainText, adapter.botUserId, adapter.userName, isMention);
+    if (mentionEnd > 0) serialized.mentionPrefixEnd = mentionEnd;
 
     return {
       id: message.id,
