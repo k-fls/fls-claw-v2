@@ -352,8 +352,10 @@ describe('buildTokenExchangeHandler — derived credentials', () => {
 
     const { transformResponse } = await capture(makeCtx(engine, store), {
       credentialResponseFields: [{ field: 'id_token', credentialPath: 'id_token' }],
-      deriveCredentials: (fields) => {
-        const claims = JSON.parse(Buffer.from(String(fields.id_token).split('.')[1], 'base64url').toString());
+      deriveCredentials: (fields): Record<string, string> => {
+        const claims = JSON.parse(Buffer.from(String(fields.id_token).split('.')[1], 'base64url').toString()) as {
+          'https://api.openai.com/auth'?: { chatgpt_account_id?: string };
+        };
         const account = claims['https://api.openai.com/auth']?.chatgpt_account_id;
         return account ? { account_id: account } : {};
       },
