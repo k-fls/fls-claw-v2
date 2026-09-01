@@ -76,6 +76,8 @@ interface AuthEpisode {
   codeDelivery: 'paste' | 'callback';
   /** Names the service in the sign-in prompt. */
   label: string;
+  /** Authorize URL the CLI emitted; carries the callback target for delivery. */
+  authUrl?: string;
 }
 
 /** Returned to the provider so it can tear the episode down when its auth container exits. */
@@ -120,7 +122,7 @@ export function bindAuthEpisodeContainerIP(nonce: string, ip: string, containerN
  * module, which already imports this one. Returns false when the paste is not a
  * usable callback URL, so the prompt can ask again.
  */
-export type AuthCallbackDeliverer = (containerName: string, pasted: string) => Promise<boolean>;
+export type AuthCallbackDeliverer = (containerName: string, pasted: string, authUrl: string) => Promise<boolean>;
 
 let callbackDeliverer: AuthCallbackDeliverer | null = null;
 
@@ -193,6 +195,7 @@ function endEpisode(scopeFolder: string, episode: AuthEpisode): void {
 function promptForCode(episode: AuthEpisode, url: string, instructions: string | undefined): void {
   if (episode.urlPrompted) return;
   episode.urlPrompted = true;
+  episode.authUrl = url;
 
   const wantsCallback = episode.codeDelivery === 'callback';
   const fallback = wantsCallback
@@ -244,7 +247,7 @@ async function completeCallback(episode: AuthEpisode, pasted: string | null): Pr
     episode.code.resolve({ cancelled: true });
     return;
   }
-  if (!callbackDeliverer || !episode.containerName) {
+  if (!callbackDeliverer || !episode.containerName || !episode.authUrl) {
     log.error('auth-bridge: no callback deliverer or container for episode', { scopeFolder: episode.scopeFolder });
     episode.origin.writeReply('Could not complete the sign-in — the auth container is gone. Try again.');
     episode.code.resolve({ cancelled: true });
@@ -252,7 +255,7 @@ async function completeCallback(episode: AuthEpisode, pasted: string | null): Pr
   }
   let delivered = false;
   try {
-    delivered = await callbackDeliverer(episode.containerName, pasted);
+    delivered = await callbackDeliverer(episode.containerName, pasted, episode.authUrl);
     // eslint-disable-next-line no-catch-all/no-catch-all -- any failure is "not delivered"
   } catch (err) {
     log.error('auth-bridge: callback delivery threw', { scopeFolder: episode.scopeFolder, err });

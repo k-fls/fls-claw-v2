@@ -164,21 +164,48 @@ export function redactCallbackShape(input: string): string {
     .replace(/[A-Za-z0-9_-]{12,}/g, '…');
 }
 
-export async function deliverPastedCallback(containerName: string, pasted: string): Promise<boolean> {
-  const parsed = parseCallbackUrl(pasted);
-  if (!parsed) {
-    log.warn('oauth: pasted text is not a localhost callback URL', {
+/**
+ * Query of a pasted callback, with chat-client decoration undone.
+ *
+ * Only the query is read. The host and port come from the authorize URL we
+ * relayed, which is authoritative — a chat client renders a link however it
+ * likes (Slack drops the scheme and port from what it shows), and requiring the
+ * user's copy to survive that intact is a dependency on someone else's UI.
+ */
+export function callbackQueryFrom(input: string): URLSearchParams | null {
+  let trimmed = input.trim();
+  if (trimmed.startsWith('<') && trimmed.endsWith('>')) {
+    trimmed = trimmed.slice(1, -1);
+    // Slack's link form is `<url|label>`.
+    const label = trimmed.indexOf('|');
+    if (label !== -1) trimmed = trimmed.slice(0, label);
+  }
+  // Slack HTML-escapes `&` in message text whether or not it linkified the URL.
+  // Left encoded, `&amp;state=` is a parameter named `amp;state`.
+  trimmed = trimmed.replace(/&amp;/g, '&');
+
+  const q = trimmed.indexOf('?');
+  if (q === -1) return null;
+  const params = new URLSearchParams(trimmed.slice(q + 1));
+  return params.get('code') && params.get('state') ? params : null;
+}
+
+export async function deliverPastedCallback(containerName: string, pasted: string, authUrl: string): Promise<boolean> {
+  const params = callbackQueryFrom(pasted);
+  const target = localhostCallbackFromAuthUrl(authUrl);
+  if (!params || !target) {
+    log.warn('oauth: pasted text is not a callback URL', {
       containerName,
       length: pasted.length,
       shape: redactCallbackShape(pasted),
     });
     return false;
   }
-  const url =
-    `http://localhost:${parsed.port}/auth/callback` +
-    `?code=${encodeURIComponent(parsed.code)}&state=${encodeURIComponent(parsed.state)}`;
+  // Every parameter forwarded, not just code and state: the CLI is entitled to
+  // read anything it put in its own redirect_uri, and Codex's carries `scope`.
+  const url = `http://localhost:${target.port}${target.path}?${params.toString()}`;
   await dockerExecDeliver(containerName, url);
-  log.info('oauth: delivered browser callback into the auth container', { containerName, port: parsed.port });
+  log.info('oauth: delivered browser callback into the auth container', { containerName, port: target.port });
   return true;
 }
 

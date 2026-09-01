@@ -47,7 +47,7 @@ function origin(): InteractionOrigin {
 const CALLBACK = 'http://localhost:1455/auth/callback?code=abc&state=xyz';
 
 /** Drive an episode to the point where the paste has been handled. */
-async function runPaste(pasted: string | null, deliverer: (n: string, p: string) => Promise<boolean>) {
+async function runPaste(pasted: string | null, deliverer: (n: string, p: string, a: string) => Promise<boolean>) {
   paste.reply = pasted;
   setAuthCallbackDeliverer(deliverer);
   startAuthEpisode({ scopeFolder: 'grp', nonce: 'n1', origin: origin(), codeDelivery: 'callback', label: 'Codex' });
@@ -77,13 +77,13 @@ describe('callback delivery', () => {
 
     await runPaste(CALLBACK, deliver);
 
-    expect(deliver).toHaveBeenCalledWith('nanoclaw-auth-grp-1', CALLBACK);
+    expect(deliver).toHaveBeenCalledWith('nanoclaw-auth-grp-1', CALLBACK, expect.stringContaining('authorize'));
   });
 
   it('tells the user what a callback URL looks like when the paste is not one', async () => {
     await runPaste('not-a-url', async () => false);
 
-    expect(replies.join(' ')).toContain('localhost:1455/auth/callback');
+    expect(replies.join(' ')).toContain('code=');
   });
 
   it('delivers nothing when the user cancels', async () => {
