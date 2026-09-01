@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# `ncl` against the containerized host.
+#
+# The CLI talks over a unix socket under the repo's data/ directory. That socket
+# is created inside the VM, and a unix socket on a virtiofs share does not work
+# across the VM boundary — connecting from the Mac gets ECONNREFUSED. So the
+# client has to run where the socket does.
+set -euo pipefail
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+exec docker exec -w "$REPO" claw-host ./bin/ncl "$@"
