@@ -1,16 +1,13 @@
 /**
  * Provider-neutral per-group persona ("instructions prepend").
  *
- * A template stamps its standing instructions here (src/templates/create-agent.ts).
  * Each provider's project-doc composer inlines this content at the TOP of the
- * doc it generates every spawn — `CLAUDE.md` (Claude, src/project-doc-compose.ts)
- * or `AGENTS.md` (Codex, src/providers/codex-agents-md.ts on the providers
- * branch) — so a template persona lands at system-prompt tier on every provider
- * rather than in a recall-tier memory file.
+ * doc it generates every spawn — `CLAUDE.md` via `project-doc-compose.ts`,
+ * `AGENTS.md` via `providers/codex-agents-md.ts` — so a persona lands at
+ * system-prompt tier rather than in a recall-tier memory file.
  *
- * This module is the single owner of the filename + read semantics so the two
- * composers (one on main, one on the providers donor branch) never hardcode the
- * path independently. Absent file ⇒ null ⇒ no-op for non-template groups.
+ * Single owner of the filename and read semantics, so no composer hardcodes the
+ * path independently. Absent file ⇒ null ⇒ no-op.
  */
 import fs from 'fs';
 import path from 'path';

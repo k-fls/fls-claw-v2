@@ -117,14 +117,10 @@ export const CODEX_OAUTH_PROVIDER: OAuthProvider = {
   deviceVerificationUri: 'https://auth.openai.com/codex/device',
   // Codex reads auth.json; the payload strips OPENAI_API_KEY from the CLI env.
   envBindings: [],
-  // The token response carries four credential-bearing fields, not the two the
-  // handler swaps by default. Declaring the other two is what keeps a real
-  // id_token — and the email, user id and plan type inside it — from reaching
-  // the container on every refresh.
-  credentialResponseFields: [
-    { field: 'id_token', credentialPath: CRED_ID_TOKEN },
-    { field: 'account_id', credentialPath: CRED_ACCOUNT_ID },
-  ],
+  // The token response carries a third credential-bearing field beyond the two
+  // the handler swaps by default. Declaring it keeps a real id_token — and the
+  // email, user id and plan type inside it — out of the container.
+  credentialResponseFields: [{ field: 'id_token', credentialPath: CRED_ID_TOKEN }],
   // The account identifier is NOT a field of the token response — observed on
   // the wire, the response carries no `account_id` at all. It lives inside the
   // identity token's claims, which is where the CLI reads it from too. Without

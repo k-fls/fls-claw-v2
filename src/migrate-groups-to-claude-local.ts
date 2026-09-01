@@ -1,7 +1,6 @@
 /**
  * One-time cutover from the `groups/global/CLAUDE.md` + `.claude-global.md`
- * pattern, kept alive after the composer it shipped with was superseded by
- * `project-doc-compose.ts`. Runs on every host startup and is idempotent.
+ * pattern. Runs on every host startup and is idempotent.
  */
 import fs from 'fs';
 import path from 'path';
@@ -10,17 +9,6 @@ import { GROUPS_DIR } from './config.js';
 import { log } from './log.js';
 import { COMPOSED_DOC_PREFIX } from './project-doc-compose.js';
 
-/**
- * For each group dir:
- *   - remove `.claude-global.md` symlink if present
- *   - rename `CLAUDE.md` → `CLAUDE.local.md` (only if `CLAUDE.local.md`
- *     doesn't already exist — preserves pre-cutover content as per-group
- *     memory; after the first spawn regenerates `CLAUDE.md`, this branch
- *     is skipped because `CLAUDE.local.md` now exists)
- *
- * Globally:
- *   - delete `groups/global/` (content already in `container/CLAUDE.md`)
- */
 /**
  * True when the file is a spawn-composed project document rather than
  * pre-cutover per-group content. Promoting one to `CLAUDE.local.md` would copy
@@ -37,6 +25,17 @@ function isComposedDoc(filePath: string): boolean {
   return head === COMPOSED_DOC_PREFIX;
 }
 
+/**
+ * For each group dir:
+ *   - remove `.claude-global.md` symlink if present
+ *   - rename `CLAUDE.md` → `CLAUDE.local.md` (only if `CLAUDE.local.md`
+ *     doesn't already exist — preserves pre-cutover content as per-group
+ *     memory; after the first spawn regenerates `CLAUDE.md`, this branch
+ *     is skipped because `CLAUDE.local.md` now exists)
+ *
+ * Globally:
+ *   - delete `groups/global/` (content already in `container/CLAUDE.md`)
+ */
 export function migrateGroupsToClaudeLocal(): void {
   if (!fs.existsSync(GROUPS_DIR)) return;
 

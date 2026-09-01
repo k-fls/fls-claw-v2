@@ -43,7 +43,6 @@ describe('registration', () => {
     expect(entry!.value).toBe('codex');
     expect(entry!.runAuth).toBeTypeOf('function');
     expect(entry!.runInstallCheck).toBeTypeOf('function');
-    expect(entry!.offerFailureAssist).toBeTypeOf('function');
     // Claude stays the built-in default and the first option in the picker.
     expect(listSetupProviders()[0]!.value).toBe('claude');
   });

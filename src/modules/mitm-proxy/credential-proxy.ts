@@ -289,9 +289,7 @@ export function proxyPipe(
  * Forward a request to upstream HTTPS, buffering body both directions
  * so callers can transform request/response bodies (e.g. OAuth token exchange).
  * @param injectHeaders — mutate headers in place to add credentials.
- * @param transformRequest — transform request body before sending upstream. May
- *   be async: the token-exchange handler waits for a concurrent refresh of the
- *   same credential to finish before it decides which refresh token to send.
+ * @param transformRequest — transform request body before sending upstream.
  * @param transformResponse — transform response body before sending to client.
  *   Receives the body and HTTP status code. Only called for successful (2xx) responses.
  */
@@ -301,7 +299,7 @@ export async function proxyBuffered(
   targetHost: string,
   targetPort: number,
   injectHeaders: (headers: HeaderMap) => void,
-  transformRequest: (body: string) => string | Promise<string>,
+  transformRequest: (body: string) => string,
   transformResponse: (body: string, statusCode: number) => string,
 ): Promise<void> {
   // Buffer request body
@@ -310,7 +308,7 @@ export async function proxyBuffered(
     clientReq.on('data', (c) => reqChunks.push(c));
     clientReq.on('end', resolve);
   });
-  const reqBody = await transformRequest(Buffer.concat(reqChunks).toString());
+  const reqBody = transformRequest(Buffer.concat(reqChunks).toString());
   const reqBuf = Buffer.from(reqBody);
 
   const headers: HeaderMap = {
@@ -452,23 +450,6 @@ export class CredentialProxy {
       req.on('error', noop);
       res.on('error', noop);
 
-      // A protocol upgrade is not interceptable: the swap works on buffered
-      // headers and bodies, and an upgraded socket carries neither. Refuse it
-      // immediately rather than forwarding it unswapped — a client that prefers
-      // WebSockets (the Codex CLI does, for `wss://api.openai.com/v1/responses`)
-      // falls back to HTTPS on the first refusal, whereas letting the handshake
-      // through reaches upstream with no usable credential and produces a retry
-      // storm plus a 401 that reads like an authentication failure.
-      if (req.headers.upgrade) {
-        logger.info(
-          { url: req.url, upgrade: req.headers.upgrade },
-          'mitm: refusing protocol upgrade — not interceptable, client should fall back',
-        );
-        res.writeHead(501, { connection: 'close' });
-        res.end('Protocol upgrade not supported');
-        return;
-      }
-
       const meta = this.socketMeta.get(req.socket);
       if (!meta) {
         logger.error({ url: req.url }, 'MITM request with no socket metadata');
@@ -496,11 +477,8 @@ export class CredentialProxy {
     });
 
     // Node routes an upgrade request to `'upgrade'`, never to `'request'`, and
-    // with no listener it destroys the socket silently — which a client reads
-    // as a transport fault and retries, rather than as a refusal it should fall
-    // back from. Answer explicitly instead. Same reasoning as the `upgrade`
-    // check in the request handler above; both arrival shapes are covered
-    // because which one fires depends on how the client framed the handshake.
+    // with no listener it destroys the socket silently, which a client reads as
+    // a transport fault.
     this.mitmDispatcher.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) => {
       socket.on('error', noop);
       const meta = this.socketMeta.get(socket);
@@ -516,21 +494,11 @@ export class CredentialProxy {
   /**
    * Forward a protocol upgrade (WebSocket) with its credentials swapped.
    *
-   * The buffered path cannot serve an upgrade: it reads a whole request and a
-   * whole response, and an upgraded connection has neither. But the credential
-   * on this path lives entirely in the handshake — the frames that follow carry
-   * none — so swapping the handshake headers and then piping the two sockets
-   * byte-for-byte is a complete interception, not a partial one.
-   *
-   * Refusing instead is not an option in practice: a client that prefers
-   * WebSockets does not necessarily fall back on a refusal. The Codex CLI
-   * retries and reports the error, so refusing strands the agent.
-   *
-   * Swapping reuses `swapSubstituteHeaders`, the same helper the buffered
-   * handler uses, so the bound-domain guard and the codec's encoding rules hold
-   * here identically. An upgrade to a host with no matching rule is tunnelled
-   * unmodified — the substitute travels, which fails closed exactly as it does
-   * on an unmatched path elsewhere.
+   * The buffered path cannot serve an upgrade — it reads a whole request and a
+   * whole response, and an upgraded connection has neither. The credential here
+   * lives entirely in the handshake, so swapping its headers and piping the two
+   * sockets is a complete interception. An upgrade to a host with no matching
+   * rule is tunnelled unmodified: the substitute travels, which fails closed.
    */
   private async tunnelUpgrade(req: IncomingMessage, clientSocket: Socket, head: Buffer, meta: MitmMeta): Promise<void> {
     const rule = this.findMatchingRule(meta.targetHost, req.url || '/', meta.sourceIP);
@@ -538,9 +506,7 @@ export class CredentialProxy {
     delete headers['proxy-connection'];
     delete headers['proxy-authorization'];
 
-    // The swap needs the OAuth module's handler context, which lives there and
-    // not here — same reason the buffered handlers are built there and
-    // registered as rules. Absent (tests, no OAuth module) → tunnel unmodified.
+    // Absent (tests, no OAuth module) → tunnel unmodified.
     const swappedCount = rule && this._upgradeSwapper ? this._upgradeSwapper(headers, meta.targetHost, meta.scope) : 0;
 
     logger.info(

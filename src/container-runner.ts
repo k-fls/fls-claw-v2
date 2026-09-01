@@ -10,7 +10,7 @@ import path from 'path';
 import { OneCLI } from '@onecli-sh/sdk';
 
 import { type AgentGroupContribution, invokeAgentGroupContributions } from './agent-group-contributions.js';
-import { FatalSpawnError, isSpawnPoisoned, isTransientSpawnError, markSpawnPoisoned } from './spawn-failure.js';
+import { FatalSpawnError, isSpawnPoisoned, markSpawnPoisoned } from './spawn-failure.js';
 import { mergeContributions, type ContainerContributionResult } from './modules/credentials/providers/contributions.js';
 import {
   CONTAINER_CPU_LIMIT,
@@ -662,81 +662,59 @@ export async function resolveProviderContribution(
   // provider served only its runtime extension gets neither its own surfaces
   // nor the defaults.
   //
-  // Runtime env wins a key collision: its values are the per-group credential
-  // substitutes the proxy matches on, and a registry entry must not shadow one.
-  //
   // The split of the merged result into the spawn-facing env/mounts and the
   // host-only `cliVersion` (in-use bookkeeping) lives here and nowhere else.
   const parts: ContainerContributionResult[] = [];
-  let runtimePart: ContainerContributionResult | null = null;
-  let registryPart: ContainerContributionResult | null = null;
 
   if (input.runtime) {
     const runtime = input.runtime;
-    // A deterministic contribution failure must fail the spawn fatally:
-    // unwrapped it reads as transient, and host-sweep then re-wakes the
-    // session every 60s without incrementing the attempt count. Same shape as
-    // the agent-group and bootstrap contribution seams.
-    runtimePart = await fatalOnThrow(`Provider runtime contribution for "${provider}"`, () =>
-      runtime.containerContribution({
-        agentGroupId: input.agentGroupId,
-        groupScope: input.groupScope,
-        sessionDir: input.sessionDir,
-        hostEnv: input.hostEnv,
-        runtimeConfig: runtime.parseRuntimeConfig(input.runtimeConfig),
-        agentProvider: input.agentProvider,
-        providerVersion: input.providerVersion,
-      }),
+    parts.push(
+      await fatalOnThrow(`Provider runtime contribution for "${provider}"`, () =>
+        runtime.containerContribution({
+          agentGroupId: input.agentGroupId,
+          groupScope: input.groupScope,
+          sessionDir: input.sessionDir,
+          hostEnv: input.hostEnv,
+          runtimeConfig: runtime.parseRuntimeConfig(input.runtimeConfig),
+          agentProvider: input.agentProvider,
+          providerVersion: input.providerVersion,
+        }),
+      ),
     );
-    parts.push(runtimePart);
   }
 
   const fn = getProviderContainerConfig(provider);
   if (fn) {
-    registryPart = await fatalOnThrow(`Provider container config for "${provider}"`, () =>
-      fn({
-        sessionDir: sessionDir(agentGroup.id, session.id),
-        agentGroupId: agentGroup.id,
-        groupDir: path.resolve(GROUPS_DIR, agentGroup.folder),
-        selectedSkills: selectedSkillNames(containerConfig),
-        hostEnv: process.env,
-      }),
+    parts.push(
+      await fatalOnThrow(`Provider container config for "${provider}"`, () =>
+        fn({
+          sessionDir: sessionDir(agentGroup.id, session.id),
+          agentGroupId: agentGroup.id,
+          groupDir: path.resolve(GROUPS_DIR, agentGroup.folder),
+          selectedSkills: selectedSkillNames(containerConfig),
+          hostEnv: process.env,
+        }),
+      ),
     );
-    parts.push(registryPart);
   }
 
   const { env, mounts, cliVersion } = mergeContributions(parts);
-
-  if (env && runtimePart?.env && registryPart?.env) {
-    const runtimeEnv = runtimePart.env;
-    const shadowed = Object.keys(runtimeEnv).filter((key) => key in registryPart.env!);
-    if (shadowed.length > 0) {
-      log.warn('Provider contribution env collision — runtime value kept', { provider, keys: shadowed });
-      Object.assign(env, runtimeEnv);
-    }
-  }
 
   return { provider, contribution: { env, mounts }, cliVersion: cliVersion ?? null };
 }
 
 /**
- * Run a contribution callback. A deterministic failure becomes fatal so the
- * spawn stops retrying; an errno the next attempt may clear propagates
- * unchanged and stays retryable.
- *
- * `await run()` inside the try is load-bearing: a contribution may be async
- * (the default provider's is), and returning the promise unawaited would let a
- * rejection escape this classifier entirely — read as transient, so host-sweep
- * re-wakes the session every 60s forever without incrementing the attempt
- * count. `container-runner.contribution-merge.test.ts` covers both a
- * synchronous throw and a rejected promise for exactly that reason.
+ * Run a contribution callback, turning a failure into a fatal spawn error so
+ * the spawn stops retrying. `await run()` inside the try is load-bearing: a
+ * contribution may be async, and returning the promise unawaited would let a
+ * rejection escape unclassified — read as transient, so host-sweep re-wakes the
+ * session every 60s without incrementing the attempt count.
  */
 async function fatalOnThrow<T>(what: string, run: () => T | Promise<T>): Promise<T> {
   try {
     return await run();
-    // eslint-disable-next-line no-catch-all/no-catch-all -- classified below, then re-thrown either way
+    // eslint-disable-next-line no-catch-all/no-catch-all -- re-thrown as fatal
   } catch (err) {
-    if (isTransientSpawnError(err)) throw err;
     throw new FatalSpawnError(`${what} failed: ${(err as Error).message ?? String(err)}`, { cause: err });
   }
 }
@@ -756,16 +734,14 @@ export async function buildMounts(
   containerConfig: import('./container-config.js').ContainerConfig,
   provider: string,
   providerContribution: ProviderContainerContribution,
-  // Fork-added, and optional so the upstream signature still type-checks: the
-  // Codex payload ships a host-contribution test written against upstream's
-  // five-parameter `buildMounts`, and the payload must install unmodified.
+  // Optional so upstream's five-parameter call still type-checks — the Codex
+  // payload ships a host-contribution test written against it.
   groupContribution: AgentGroupContribution = {},
   spawnPre: MergedSpawnPre = EMPTY_SPAWN_PRE,
 ): Promise<VolumeMount[]> {
-  // The group filesystem is scaffolded by the spawn path, which knows the
-  // resolved provider. Scaffolding again here would do it provider-blind and
-  // write Claude surfaces into the group directory of a provider that owns its
-  // own — the surfaces this function then declines to mount.
+  // The spawn path scaffolds the group filesystem, with the resolved provider.
+  // Doing it here too would be provider-blind, writing Claude surfaces into the
+  // group directory of a provider that owns its own.
 
   // Default agent surfaces (composed project doc, skill links, provider state
   // dir) apply unless the provider's registration declares it provides its

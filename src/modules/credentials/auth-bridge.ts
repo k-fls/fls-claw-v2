@@ -112,28 +112,6 @@ export function authEpisodeOriginByContainerIP(ip: string): InteractionOrigin | 
 }
 
 /**
- * Is `ip` the auth container of an in-flight sign-in episode for `scopeFolder`?
- *
- * This is an authorization answer, unlike `authEpisodeOriginByContainerIP`
- * which only resolves a recipient. Both halves matter: the episode must be for
- * the calling scope, and the caller must be that episode's own container — a
- * scope-only check would let a second episode's container bind against the
- * first, and an IP-only check would let an episode for one group bind a
- * credential for another.
- */
-export function isAuthEpisodeContainer(ip: string | undefined, scopeFolder: string): boolean {
-  if (!ip) return false;
-  const episode = episodesByContainerIP.get(ip);
-  return episode !== undefined && episode.scopeFolder === scopeFolder;
-}
-
-/** End the episode whose auth container holds `ip`. Idempotent. */
-export function endAuthEpisodeByContainerIP(ip: string): void {
-  const episode = episodesByContainerIP.get(ip);
-  if (episode) endEpisode(episode.scopeFolder, episode);
-}
-
-/**
  * Open an auth episode for a group scope. The provider passes the `nonce` it
  * also seeds into the auth container's env, and the `origin` to prompt the
  * user on. Replaces (and cancels) any existing episode for the same scope.

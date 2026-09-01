@@ -34,16 +34,9 @@ import { buildTokenExchangeHandler } from './token-exchange.js';
 // ── proxyBuffered mock: capture the two transforms ─────────────────────
 const pb = vi.hoisted(() => ({
   captured: null as null | {
-    transformRequest: (body: string) => string | Promise<string>;
+    transformRequest: (body: string) => string;
     transformResponse: (body: string, status: number) => string;
   },
-}));
-
-// The episode gate. Default true so the pre-existing cases keep describing a
-// legitimate host-driven sign-in; the gate's own cases flip it.
-const bridge = vi.hoisted(() => ({ inEpisode: true }));
-vi.mock('../../../credentials/auth-bridge.js', () => ({
-  isAuthEpisodeContainer: () => bridge.inEpisode,
 }));
 
 vi.mock('../../credential-proxy.js', () => ({
@@ -53,7 +46,7 @@ vi.mock('../../credential-proxy.js', () => ({
     _host: string,
     _port: number,
     _injectHeaders: (h: Record<string, unknown>) => void,
-    transformRequest: (body: string) => string | Promise<string>,
+    transformRequest: (body: string) => string,
     transformResponse: (body: string, status: number) => string,
   ) => {
     pb.captured = { transformRequest, transformResponse };
@@ -136,7 +129,6 @@ async function capture(ctx: HandlerContext, over: Partial<OAuthProvider> = {}) {
 
 afterEach(() => {
   pb.captured = null;
-  bridge.inEpisode = true;
   vi.clearAllMocks();
 });
 
@@ -149,7 +141,7 @@ describe('buildTokenExchangeHandler — request transform', () => {
     });
     const { transformRequest } = await capture(makeCtx(engine, vi.fn()));
 
-    const out = await transformRequest('grant_type=refresh_token&refresh_token=SUB_REFRESH');
+    const out = transformRequest('grant_type=refresh_token&refresh_token=SUB_REFRESH');
     const params = new URLSearchParams(out);
     expect(params.get('refresh_token')).toBe('REAL_REFRESH'); // real value sent upstream
     expect(params.get('grant_type')).toBe('refresh_token');
@@ -161,7 +153,7 @@ describe('buildTokenExchangeHandler — request transform', () => {
     const { transformRequest } = await capture(makeCtx(engine, vi.fn()));
 
     const input = 'grant_type=authorization_code&code=abc123';
-    expect(await transformRequest(input)).toBe(input);
+    expect(transformRequest(input)).toBe(input);
     expect(engine.resolveSubstitute).not.toHaveBeenCalled();
   });
 });
@@ -217,7 +209,7 @@ describe('buildTokenExchangeHandler — response transform', () => {
     const { transformRequest, transformResponse } = await capture(makeCtx(engine, store));
 
     // Request carries the grantor-bound refresh substitute — captures the source scope.
-    await transformRequest('grant_type=refresh_token&refresh_token=SUB_REFRESH');
+    transformRequest('grant_type=refresh_token&refresh_token=SUB_REFRESH');
     transformResponse(
       JSON.stringify({ access_token: 'FRESH_ACCESS', refresh_token: 'FRESH_REFRESH', expires_in: 3600 }),
       200,
@@ -245,7 +237,7 @@ describe('buildTokenExchangeHandler — response transform', () => {
 
     // No refresh substitute is swapped for an authorization_code grant, so no
     // source scope is captured → the fresh credential lands in the own scope.
-    await transformRequest('grant_type=authorization_code&code=abc123');
+    transformRequest('grant_type=authorization_code&code=abc123');
     transformResponse(JSON.stringify({ access_token: 'FRESH_ACCESS', expires_in: 3600 }), 200);
 
     expect(store).toHaveBeenCalledTimes(1);
@@ -339,61 +331,5 @@ describe('buildTokenExchangeHandler — response transform', () => {
     expect(transformResponse(errBody, 400)).toBe(errBody);
     expect(store).not.toHaveBeenCalled();
     expect(engine.getOrCreateSubstitute).not.toHaveBeenCalled();
-  });
-});
-
-describe('buildTokenExchangeHandler — binding gate', () => {
-  it('refuses to bind a new credential when the caller is not a sign-in episode container', async () => {
-    bridge.inEpisode = false;
-    const store = vi.fn();
-    const engine = makeEngine({ getOrCreateSubstitute: vi.fn(() => 'SUB') });
-    const { transformResponse } = await capture(makeCtx(engine, store));
-
-    const out = transformResponse(
-      JSON.stringify({ access_token: 'REAL_ACCESS', refresh_token: 'REAL_REFRESH', expires_in: 3600 }),
-      200,
-    );
-
-    expect(store).not.toHaveBeenCalled();
-    // Blanked, not passed through: an un-episoded caller must not come away
-    // holding the real token the ungated path would have substituted.
-    expect(out).not.toContain('REAL_ACCESS');
-    expect(out).not.toContain('REAL_REFRESH');
-    expect(JSON.parse(out).access_token).toBe('');
-  });
-
-  it('blanks the provider-declared fields too when it refuses', async () => {
-    bridge.inEpisode = false;
-    const store = vi.fn();
-    const engine = makeEngine({ getOrCreateSubstitute: vi.fn(() => 'SUB') });
-    const { transformResponse } = await capture(makeCtx(engine, store), {
-      credentialResponseFields: [{ field: 'id_token', credentialPath: 'id_token' }],
-    });
-
-    const out = transformResponse(JSON.stringify({ access_token: 'REAL_ACCESS', id_token: 'REAL_ID' }), 200);
-
-    expect(out).not.toContain('REAL_ID');
-    expect(JSON.parse(out).id_token).toBe('');
-  });
-
-  it('still rotates for an ordinary session container, which has no episode', async () => {
-    bridge.inEpisode = false;
-    const store = vi.fn();
-    const engine = makeEngine({
-      getOrCreateSubstitute: vi.fn(() => 'SUB'),
-      resolveSubstitute: vi.fn(() => ({
-        realToken: 'REAL_OLD_REFRESH',
-        mapping: { credentialScope: asCredentialScope('test-group') },
-      })),
-    });
-    const { transformRequest, transformResponse } = await capture(makeCtx(engine, store));
-
-    // The swapped substitute is the proof the caller already held a credential.
-    await transformRequest(JSON.stringify({ grant_type: 'refresh_token', refresh_token: 'SUB_OLD_REFRESH' }));
-    const out = transformResponse(JSON.stringify({ access_token: 'ROTATED', expires_in: 3600 }), 200);
-
-    expect(store).toHaveBeenCalledTimes(1);
-    expect(store.mock.calls[0][3].value).toBe('ROTATED');
-    expect(JSON.parse(out).access_token).toBe('SUB');
   });
 });

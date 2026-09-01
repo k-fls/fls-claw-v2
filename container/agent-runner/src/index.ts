@@ -128,10 +128,9 @@ async function main(): Promise<void> {
   // and keeps its native memory untouched.
   if (provider.usesMemoryScaffold) ensureMemoryScaffold();
 
-  // A provider whose harness re-establishes its own context window needs the
-  // hook that re-renders memory at startup / clear / compact. Optional call:
-  // this fork's memory model is file-based and Claude implements nothing here,
-  // so an unconditional call would break the default provider.
+  // Re-renders memory at startup / clear / compact, for a provider whose
+  // harness re-establishes its own context window. File-based-memory providers
+  // implement nothing here.
   provider.registerMemorySessionHook?.(MEMORY_SESSION_HOOK);
 
   await runPollLoop({

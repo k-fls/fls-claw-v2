@@ -2,10 +2,7 @@ import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
 
-// Leading `_` is allowed because setup creates one: `setup/auto.ts` provisions
-// the CLI ping agent as `_ping-test`. Leading `-` stays rejected — a folder name
-// is interpolated into command argv, where it would read as a flag.
-const GROUP_FOLDER_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$/;
+const GROUP_FOLDER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const RESERVED_FOLDERS = new Set(['global']);
 
 export function isValidGroupFolder(folder: string): boolean {

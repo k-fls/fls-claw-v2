@@ -222,15 +222,10 @@ export function initOAuthModule(opts: InitOAuthModuleOptions): OAuthModuleHandle
     borrowedCredentialEvents: opts.borrowedCredentialEvents,
   };
 
-  // Protocol upgrades cannot ride the buffered handlers, but their credential
-  // lives entirely in the handshake headers — so the proxy tunnels them and
-  // asks this to swap on the way past. Registered here because the codecs and
-  // the handler context are this module's, not the proxy's.
-  // The default codec, deliberately: a handshake carries a scheme-prefixed
-  // bearer, which is exactly what it decodes. A provider with a bespoke
-  // transport codec (GitHub's Basic-over-git-HTTPS) does not open WebSockets,
-  // and reaching its `OAuthProvider` from here is not possible anyway for the
-  // programmatically-registered ones.
+  // Registered here because the codecs and the handler context are this
+  // module's, not the proxy's. The default codec covers it: a handshake carries
+  // a scheme-prefixed bearer, and a provider with a bespoke transport codec
+  // (GitHub's Basic-over-git-HTTPS) does not open WebSockets.
   const upgradeCodec = buildDefaultTransportCodec(undefined);
   opts.proxy.setUpgradeHeaderSwapper(
     (headers, targetHost, scope) =>

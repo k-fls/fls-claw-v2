@@ -207,10 +207,9 @@ describe('buildMounts agent surfaces', () => {
     expect(containerPaths).not.toContain('/workspace/agent/CLAUDE.md');
     // Composer did NOT run for this group.
     expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, 'CLAUDE.md'))).toBe(false);
-    // Nor did a second, provider-blind scaffold: `buildMounts` used to call
-    // `initGroupFilesystem` without the provider, which reports no capabilities
-    // for an omitted name and so wrote the default Claude memory file into a
-    // group whose provider owns its own surfaces.
+    // Nor does a second, provider-blind scaffold: `initGroupFilesystem` called
+    // without the provider reports no capabilities and writes the default
+    // Claude memory file into a group whose provider owns its own surfaces.
     expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, 'CLAUDE.local.md'))).toBe(false);
     // Core mounts and the provider's own contribution are intact.
     expect(containerPaths).toContain('/workspace');

@@ -17,16 +17,11 @@ export interface AgentProvider {
   readonly usesMemoryScaffold?: boolean;
 
   /**
-   * Optional. Providers whose harness re-establishes its own context window
-   * (a native SessionStart / clear / compact hook) get the runner's memory
-   * hook registration here, and are responsible for wiring it into whatever
-   * config their harness reads.
-   *
-   * Optional rather than required because this fork's memory model is
-   * file-based: `ensureMemoryScaffold` writes the tree into the agent's
-   * workspace and the composed project doc points at it, which is all Claude
-   * needs. A provider that wants the hook opts in by implementing this; one
-   * that does not is simply never called.
+   * Optional. A provider whose harness re-establishes its own context window
+   * (a native SessionStart / clear / compact hook) receives the runner's memory
+   * hook registration here and wires it into whatever config that harness
+   * reads. A provider on the file-based memory model implements nothing and is
+   * never called.
    */
   registerMemorySessionHook?(hook: MemorySessionHookRegistration): void;
 
@@ -131,9 +126,7 @@ export interface QueryInput {
   };
 }
 
-/**
- * A local stdio MCP server, launched from `command`.
- */
+/** A local stdio MCP server, launched from `command`. */
 export interface McpStdioServer {
   type?: 'stdio';
   command: string;
@@ -143,12 +136,7 @@ export interface McpStdioServer {
   cwd?: string;
 }
 
-/**
- * A remote MCP server addressed by URL. Only some providers can serve this
- * form. Nothing produces one today — the host's stored-server validator
- * requires a `command` — but the Codex payload's config writer branches on it,
- * so the type has to express that `type: 'http'` implies a `url`.
- */
+/** A remote MCP server addressed by URL. Only some providers can serve this form. */
 export interface McpHttpServer {
   type: 'http';
   url: string;

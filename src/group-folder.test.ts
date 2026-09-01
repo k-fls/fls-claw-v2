@@ -11,20 +11,6 @@ describe('group folder validation', () => {
     expect(isValidGroupFolder('Team_42')).toBe(true);
   });
 
-  // `setup/auto.ts` provisions the CLI ping agent with this exact folder, so
-  // rejecting it made every spawn of that group fail: the credential-availability
-  // check throws before the container is ever built.
-  it('accepts the leading-underscore folder setup itself creates', () => {
-    expect(isValidGroupFolder('_ping-test')).toBe(true);
-    expect(isValidGroupFolder('_')).toBe(true);
-  });
-
-  it('still rejects a leading dash or dot, which argv and traversal care about', () => {
-    expect(isValidGroupFolder('-rf')).toBe(false);
-    expect(isValidGroupFolder('.hidden')).toBe(false);
-    expect(isValidGroupFolder('..')).toBe(false);
-  });
-
   it('rejects traversal and reserved names', () => {
     expect(isValidGroupFolder('../../etc')).toBe(false);
     expect(isValidGroupFolder('/tmp')).toBe(false);

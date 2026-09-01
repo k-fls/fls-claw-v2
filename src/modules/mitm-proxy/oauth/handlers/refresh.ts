@@ -60,11 +60,8 @@ export function tryRefresh(
   const inflight = ctx.inFlightRefresh.get(key);
   if (inflight) return inflight;
 
-  const p: Promise<boolean> = runRefresh(provider, scope, ctx, owning).finally(() => {
-    // Only when still ours: the container-originated intercept path chains onto
-    // this same key and may already have installed itself as the tail. Dropping
-    // that tail would let a third refresh run alongside it.
-    if (ctx.inFlightRefresh.get(key) === p) ctx.inFlightRefresh.delete(key);
+  const p = runRefresh(provider, scope, ctx, owning).finally(() => {
+    ctx.inFlightRefresh.delete(key);
   });
   ctx.inFlightRefresh.set(key, p);
   return p;

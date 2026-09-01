@@ -35,12 +35,11 @@ import {
   type HostInteractionContext,
   type InteractionOrigin,
 } from '../../../host-interactions.js';
-import { deliverDirect } from '../../../delivery.js';
 import { log } from '../../../log.js';
 import { lookupContainerSession } from '../../container-bootstrap/index.js';
 import { openInboundDb } from '../../../session-manager.js';
 
-import { authEpisodeOriginByContainerIP, endAuthEpisodeByContainerIP } from '../../credentials/auth-bridge.js';
+import { authEpisodeOriginByContainerIP } from '../../credentials/auth-bridge.js';
 import type { AuthCodeDeliver, OAuthEvents } from './handler-context.js';
 
 /** Time budget for the `docker exec … curl` callback delivery. */
@@ -90,14 +89,12 @@ function resolveContainerOrigin(sourceIP: string | undefined): { origin: Interac
  * deliver the captured code back into the container, so it keeps the
  * session-only resolution.
  */
-function resolveDeviceCodeOrigin(
-  sourceIP: string | undefined,
-): { origin: InteractionOrigin; recipient: string; via: 'session' | 'episode' } | null {
+function resolveDeviceCodeOrigin(sourceIP: string | undefined): { origin: InteractionOrigin } | null {
   const session = resolveContainerOrigin(sourceIP);
-  if (session) return { origin: session.origin, recipient: session.sessionId, via: 'session' };
+  if (session) return { origin: session.origin };
   if (!sourceIP) return null;
   const episodeOrigin = authEpisodeOriginByContainerIP(sourceIP);
-  return episodeOrigin ? { origin: episodeOrigin, recipient: sourceIP, via: 'episode' } : null;
+  return episodeOrigin ? { origin: episodeOrigin } : null;
 }
 
 /**
@@ -182,32 +179,14 @@ export const oauthInteractive: OAuthEvents = {
   notifyDeviceCode({ sourceIP, providerId, userCode, verificationUri, borrowedFrom }) {
     const resolved = resolveDeviceCodeOrigin(sourceIP);
     if (!resolved) {
-      // Warning, not info: this is "the code never reached anyone", which is
-      // indistinguishable from "the user ignored it" unless it is logged loudly.
       log.warn('oauth.device-code: no identifiable user to notify — code not relayed', { sourceIP, providerId });
-      if (sourceIP) endAuthEpisodeByContainerIP(sourceIP);
       return;
     }
-    // Addressed through `deliverDirect` rather than `origin.writeReply` because
-    // only the former reports the outcome: a silent drop would leave the user
-    // waiting out the auth container's lifetime cap with no explanation.
-    const { channelType, platformId, threadId } = resolved.origin.replyAddr;
-    deliverDirect(
-      channelType,
-      platformId,
-      threadId,
+    resolved.origin.writeReply(
       shadowWarning(providerId, borrowedFrom) +
         `🔐 *${providerId}* wants to authorize.\n\n` +
         `Open ${verificationUri} and enter this code:\n\n\`${userCode}\`\n\n` +
         'Once you approve in the browser, the agent will pick up the credential automatically.',
-      (delivered, err) => {
-        if (delivered) {
-          log.info('oauth.device-code: relayed', { providerId, recipient: resolved.recipient, via: resolved.via });
-          return;
-        }
-        log.warn('oauth.device-code: could not deliver the code — ending the episode', { providerId, sourceIP, err });
-        if (sourceIP) endAuthEpisodeByContainerIP(sourceIP);
-      },
     );
   },
 

@@ -115,10 +115,9 @@ function sendUpstreamBuffered(
  * Returns one `SwapEntry` per swapped header so a caller can replay the rebuild
  * after a refresh.
  *
- * Extracted so the buffered request path and the upgrade tunnel share one
- * implementation. A WebSocket handshake carries its credential in exactly these
- * headers, and a second copy of this logic would be a second place for the
- * bound-domain guard to be forgotten.
+ * Shared by the buffered request path and the upgrade tunnel — a WebSocket
+ * handshake carries its credential in exactly these headers, and a second copy
+ * would be a second place for the bound-domain guard to be forgotten.
  */
 export function swapSubstituteHeaders(
   headers: HeaderMap,

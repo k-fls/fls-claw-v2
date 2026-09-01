@@ -154,7 +154,7 @@ Host boot wiring lives in `src/index.ts` (init token engine → register provide
 
 ### Sign-in
 
-A group with no credential for a required provider is not failed silently: the wake-time acquisition gate offers an interactive sign-in in the group's own channel (`src/credential-acquisition.ts` → the provider's `ACQUIRE` extension), and `/auth` reaches the same flow on demand. Claude offers a GPG-encrypted key paste plus two subscription modes; Codex is admin-gated and runs `codex login --device-auth` inside a short-lived auth container, with the proxy relaying the pairing code privately and capturing the real tokens out of the token exchange. Capture of a *new* credential is served only inside that sign-in episode; rotation is not gated, and is serialized per group scope so a group's concurrent sessions cannot trip a provider's refresh-reuse detection.
+A group with no credential for a required provider is not failed silently: the wake-time acquisition gate offers an interactive sign-in in the group's own channel (`src/credential-acquisition.ts` → the provider's `ACQUIRE` extension), and `/auth` reaches the same flow on demand. Claude offers a GPG-encrypted key paste plus two subscription modes; Codex is admin-gated and runs `codex login --device-auth` inside a short-lived auth container, with the proxy relaying the pairing code privately and capturing the real tokens out of the token exchange. Capture and rotation both run through the proxy's token-exchange handler, which stores the real credential host-side and hands the container a substitute.
 
 ### Approvals
 

@@ -209,16 +209,9 @@ async function sweepSession(session: Session): Promise<void> {
     let justWoke = false;
     if (dueCount > 0 && !isContainerRunning(session.id)) {
       log.info('Waking container for due messages', { sessionId: session.id, count: dueCount });
-      // A retryable spawn failure returns false and leaves the messages
-      // pending. A fatal one rejects, and the session is already marked
-      // poisoned by then — contain it here so the remaining sessions in this
-      // tick still get swept.
-      try {
-        await wakeContainer(session);
-        // eslint-disable-next-line no-catch-all/no-catch-all -- the session is poisoned; the sweep continues
-      } catch (err) {
-        log.error('Wake for due messages failed fatally', { sessionId: session.id, err });
-      }
+      // wakeContainer never throws — transient spawn failures (OneCLI down,
+      // etc.) return false and leave messages pending for the next tick.
+      await wakeContainer(session);
       justWoke = true;
     }
 

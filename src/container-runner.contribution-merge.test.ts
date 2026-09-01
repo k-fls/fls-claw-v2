@@ -87,17 +87,6 @@ describe('resolveProviderContribution source merge', () => {
     expect(contribution.mounts).toEqual([registryMount]);
   });
 
-  // The runtime source's env values are the per-group credential substitutes the
-  // proxy matches on, so a registry entry must never shadow one.
-  it('keeps the runtime value when both sources set the same env key', async () => {
-    registerRuntime(() => ({ env: { SHARED: 'runtime-substitute' } }));
-    registerProviderContainerConfig(PROVIDER, () => ({ env: { SHARED: 'registry-placeholder', OTHER: '1' } }));
-
-    const { contribution } = await resolveProviderContribution(session, agentGroup, containerConfig);
-
-    expect(contribution.env).toEqual({ SHARED: 'runtime-substitute', OTHER: '1' });
-  });
-
   it('contributes nothing for a provider that registers neither', async () => {
     const { contribution } = await resolveProviderContribution(session, agentGroup, containerConfig);
 
@@ -124,23 +113,6 @@ describe('resolveProviderContribution failure handling', () => {
     });
 
     await expect(resolveProviderContribution(session, agentGroup, containerConfig)).rejects.toThrow(FatalSpawnError);
-  });
-
-  // A contribution does real I/O — the default provider writes its substitute
-  // file on every OAuth-mode spawn — so an errno the next attempt may clear has
-  // to stay retryable. Wrapping it would poison the session until the user sends
-  // another message.
-  it('leaves a transient errno retryable instead of poisoning the spawn', async () => {
-    registerRuntime(() => {
-      throw Object.assign(new Error('too many open files'), { code: 'EMFILE' });
-    });
-
-    await expect(resolveProviderContribution(session, agentGroup, containerConfig)).rejects.toThrow(
-      'too many open files',
-    );
-    await expect(resolveProviderContribution(session, agentGroup, containerConfig)).rejects.not.toThrow(
-      FatalSpawnError,
-    );
   });
 
   it('names the failing source and preserves the cause', async () => {

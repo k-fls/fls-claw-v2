@@ -332,8 +332,8 @@ async function main(): Promise<void> {
     // Agent runtime pick. Claude is the default and a no-op — choosing it
     // runs the existing Claude auth flow unchanged. A branch provider walks
     // its own auth (e.g. Codex, whose credential binds in-channel through the
-    // credential proxy) and verifies its payload is wired. The pick installs and authenticates
-    // the runtime; it is NOT an install-wide default — and it is NOT a
+    // credential proxy) and verifies its payload is wired. The pick installs
+    // and authenticates the runtime; it is NOT an install-wide default — and it is NOT a
     // creation flag. Provider is a DB property of a group: the creation flows
     // create provider-agnostic groups, and setup sets the picked provider on
     // each via `ncl groups config update --provider` right after creating it

@@ -1,23 +1,15 @@
 /**
  * Provider-agnostic template-skill materialization.
  *
- * A template stamps its skills as REAL directories into the group-private store
- * `data/v2-sessions/<group-id>/.claude-shared/skills/<name>` (src/templates/create-agent.ts).
- * Claude reads that store directly — it is mounted at `~/.claude/skills`, and
- * real dirs survive the symlink-only skill-link prune. Every OTHER surfaces-owning
- * provider (codex, opencode, pi, …) reads a DIFFERENT per-group skills directory,
- * often READ-ONLY-mounted, so the skills must be copied there host-side, before
- * the container starts.
+ * Group template skills live as real directories under
+ * `data/v2-sessions/<group-id>/.claude-shared/skills/`. Claude reads that store
+ * directly (mounted at `~/.claude/skills`); every other surfaces-owning provider
+ * reads a different per-group skills directory, often read-only-mounted, so the
+ * skills must be copied there host-side before the container starts.
  *
- * This is the single shared spot that does that copy. Each provider's host-side
- * container contribution calls it once with its own skills dir (codex →
- * `.agents/skills`; a future provider → whatever it reads). Adding a provider
- * therefore adds one call, not a new mirror implementation. The copied dirs are
- * real (not symlinks), so they survive providers' symlink-only prunes and persist
- * across respawns.
- *
- * This module is a main-owned seam that provider payloads (on the `providers`
- * donor branch) import — mirrors src/group-persona.ts.
+ * Each provider's host-side container contribution calls this once with its own
+ * skills dir (codex → `.agents/skills`), so adding a provider adds a call rather
+ * than a second mirror implementation.
  */
 import fs from 'fs';
 import path from 'path';

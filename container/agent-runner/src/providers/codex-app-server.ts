@@ -397,18 +397,10 @@ export function writeCodexConfigToml(
     `sandbox_mode = ${tomlBasicString(CODEX_SANDBOX_MODE)}`,
     `approval_policy = ${tomlBasicString(CODEX_APPROVAL_POLICY)}`,
     `project_doc_max_bytes = ${CODEX_PROJECT_DOC_MAX_BYTES}`,
-    // Transport pin. The bundled model catalog sets `prefer_websockets = true`,
-    // and a WebSocket upgrade is the one thing the credential proxy cannot
-    // intercept — the swap works on buffered headers and bodies, an upgraded
-    // socket has neither. Left alone, every turn goes to
-    // `wss://api.openai.com/v1/responses` and fails; the CLI reports the error
-    // rather than falling back, so this is not a latency question.
-    //
-    // `supports_websockets` lives on the provider, and the built-in `openai`
-    // provider is reserved ("Built-in providers cannot be overridden"), so the
-    // pin has to arrive as a custom provider that mirrors the built-in
-    // ChatGPT-auth shape. `requires_openai_auth` keeps it on the auth.json
-    // credential rather than an API key.
+    // Transport pin: the bundled model catalog sets `prefer_websockets = true`,
+    // and `supports_websockets` lives on the provider — but the built-in
+    // `openai` provider is reserved and cannot be overridden, so the pin has to
+    // arrive as a custom provider mirroring the built-in ChatGPT-auth shape.
     `model_provider = ${tomlBasicString(CODEX_MODEL_PROVIDER_ID)}`,
   ];
   if (opts.model) lines.push(`model = ${tomlBasicString(opts.model)}`);
@@ -425,8 +417,7 @@ export function writeCodexConfigToml(
   lines.push('generate_memories = false');
   lines.push('');
 
-  // See the `model_provider` note above. Mirrors the built-in ChatGPT provider
-  // shape; only `supports_websockets` differs.
+  // Mirrors the built-in ChatGPT provider shape; only `supports_websockets` differs.
   lines.push(`[model_providers.${CODEX_MODEL_PROVIDER_ID}]`);
   lines.push(`name = ${tomlBasicString('OpenAI')}`);
   lines.push(`base_url = ${tomlBasicString(CODEX_CHATGPT_BASE_URL)}`);

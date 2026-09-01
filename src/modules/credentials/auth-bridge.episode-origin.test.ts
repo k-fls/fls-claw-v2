@@ -18,8 +18,6 @@ import {
   _resetAuthBridgeForTests,
   authEpisodeOriginByContainerIP,
   bindAuthEpisodeContainerIP,
-  endAuthEpisodeByContainerIP,
-  isAuthEpisodeContainer,
   startAuthEpisode,
 } from './auth-bridge.js';
 
@@ -75,15 +73,6 @@ describe('auth episode container-IP binding', () => {
     expect(authEpisodeOriginByContainerIP('10.0.0.5')).toBeNull();
   });
 
-  it('ends the episode addressed by its container IP', () => {
-    startAuthEpisode({ scopeFolder: 'grp', nonce: 'n1', origin: origin('alice') });
-    bindAuthEpisodeContainerIP('n1', '10.0.0.5');
-
-    endAuthEpisodeByContainerIP('10.0.0.5');
-
-    expect(authEpisodeOriginByContainerIP('10.0.0.5')).toBeNull();
-  });
-
   it('resolves nothing for an IP that belongs to no episode', () => {
     expect(authEpisodeOriginByContainerIP('10.0.0.9')).toBeNull();
   });
@@ -99,40 +88,5 @@ describe('auth episode container-IP binding', () => {
 
     // No bind call — a session container resolves through its session instead.
     expect(authEpisodeOriginByContainerIP('10.0.0.7')).toBeNull();
-  });
-});
-
-describe('isAuthEpisodeContainer', () => {
-  it('authorizes only the episode own container, for the episode own scope', () => {
-    startAuthEpisode({ scopeFolder: 'grp', nonce: 'n1', origin: origin('a') });
-    bindAuthEpisodeContainerIP('n1', '10.0.0.5');
-
-    expect(isAuthEpisodeContainer('10.0.0.5', 'grp')).toBe(true);
-    // Right container, wrong scope — an episode for one group must not
-    // authorize a binding for another.
-    expect(isAuthEpisodeContainer('10.0.0.5', 'other-grp')).toBe(false);
-    // Right scope, wrong container — an ordinary session container of the same
-    // group is not the episode.
-    expect(isAuthEpisodeContainer('10.0.0.9', 'grp')).toBe(false);
-  });
-
-  it('refuses when there is no episode, no binding, or no caller IP', () => {
-    expect(isAuthEpisodeContainer('10.0.0.5', 'grp')).toBe(false);
-
-    // Started but the container IP was never bound.
-    startAuthEpisode({ scopeFolder: 'grp', nonce: 'n1', origin: origin('a') });
-    expect(isAuthEpisodeContainer('10.0.0.5', 'grp')).toBe(false);
-
-    bindAuthEpisodeContainerIP('n1', '10.0.0.5');
-    expect(isAuthEpisodeContainer(undefined, 'grp')).toBe(false);
-  });
-
-  it('stops authorizing once the episode ends', () => {
-    startAuthEpisode({ scopeFolder: 'grp', nonce: 'n1', origin: origin('a') });
-    bindAuthEpisodeContainerIP('n1', '10.0.0.5');
-    expect(isAuthEpisodeContainer('10.0.0.5', 'grp')).toBe(true);
-
-    endAuthEpisodeByContainerIP('10.0.0.5');
-    expect(isAuthEpisodeContainer('10.0.0.5', 'grp')).toBe(false);
   });
 });
