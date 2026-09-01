@@ -151,14 +151,27 @@ export const dockerExecDeliver: AuthCodeDeliver = (containerName, callbackUrl) =
  * carrying extra query junk (or a chat client's link decoration) still produces
  * the exact callback the CLI expects.
  */
+/**
+ * Structure of a paste, with every token-shaped run replaced. What matters when
+ * a callback is refused is the decoration around it — `<…>`, `|label`, `&amp;`,
+ * the scheme, the port, the parameter names — and none of that is secret, while
+ * the values include an authorization code.
+ */
+export function redactCallbackShape(input: string): string {
+  return input
+    .trim()
+    .slice(0, 200)
+    .replace(/[A-Za-z0-9_-]{12,}/g, '…');
+}
+
 export async function deliverPastedCallback(containerName: string, pasted: string): Promise<boolean> {
   const parsed = parseCallbackUrl(pasted);
   if (!parsed) {
-    // Length only, never the text: a real callback carries an authorization
-    // code. Without this the difference between "they pasted junk" and "the
-    // delivery failed" is invisible, which is how a chat client's escaping went
-    // unnoticed.
-    log.warn('oauth: pasted text is not a localhost callback URL', { containerName, length: pasted.length });
+    log.warn('oauth: pasted text is not a localhost callback URL', {
+      containerName,
+      length: pasted.length,
+      shape: redactCallbackShape(pasted),
+    });
     return false;
   }
   const url =

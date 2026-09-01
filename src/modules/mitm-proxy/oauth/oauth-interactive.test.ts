@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { parseCallbackUrl, shadowWarning } from './oauth-interactive.js';
+import { parseCallbackUrl, redactCallbackShape, shadowWarning } from './oauth-interactive.js';
 
 describe('parseCallbackUrl', () => {
   it('extracts code, state, and port from a localhost callback URL', () => {
@@ -43,6 +43,17 @@ describe('parseCallbackUrl', () => {
     expect(parseCallbackUrl('http://localhost:1234/cb?code=a')).toBeNull(); // no state
     expect(parseCallbackUrl('http://localhost/cb?code=a&state=b')).toBeNull(); // no port
     expect(parseCallbackUrl('not a url')).toBeNull();
+  });
+});
+
+describe('redactCallbackShape', () => {
+  it('keeps the decoration that explains a refusal and drops the values', () => {
+    const shape = redactCallbackShape(
+      '<http://localhost:1455/auth/callback?code=AbCdEfGhIjKlMnOp&amp;state=XyZwVuTsRqPoNm|localhost:1455>',
+    );
+
+    expect(shape).toBe('<http://localhost:1455/auth/callback?code=…&amp;state=…|localhost:1455>');
+    expect(shape).not.toContain('AbCdEfGhIjKlMnOp');
   });
 });
 
