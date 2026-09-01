@@ -129,15 +129,21 @@ export function parseCallbackUrl(input: string): { code: string; state: string; 
 }
 
 /**
- * Production `AuthCodeDeliver`: `docker exec <name> curl -sf <url>` to hit
- * the container's own localhost callback. Exported so the host can wire it
- * into the OAuth module at boot (and tests can substitute a fake).
+ * Production `AuthCodeDeliver`: `docker exec <name> curl -sfL <url>` to hit the
+ * container's own localhost callback. Exported so the host can wire it into the
+ * OAuth module at boot (and tests can substitute a fake).
+ *
+ * `-L` is load-bearing. A CLI serving its own callback redirects the browser to
+ * a success page and waits for that fetch before exiting — the Codex login
+ * does. Stopping at the redirect completes the token exchange but leaves the
+ * process running, which holds the sign-in's in-flight guard for the whole
+ * container lifetime and refuses the next attempt as "already under way".
  */
 export const dockerExecDeliver: AuthCodeDeliver = (containerName, callbackUrl) =>
   new Promise((resolve, reject) => {
     execFile(
       CONTAINER_RUNTIME_BIN,
-      ['exec', containerName, 'curl', '-sf', callbackUrl],
+      ['exec', containerName, 'curl', '-sfL', callbackUrl],
       { timeout: DELIVERY_TIMEOUT_MS },
       (err) => (err ? reject(err) : resolve()),
     );

@@ -1,6 +1,20 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import { callbackQueryFrom, parseCallbackUrl, redactCallbackShape, shadowWarning } from './oauth-interactive.js';
+const exec = vi.hoisted(() => ({ args: [] as string[] }));
+vi.mock('child_process', () => ({
+  execFile: (_bin: string, args: string[], _opts: unknown, cb: (e: unknown) => void) => {
+    exec.args = args;
+    cb(null);
+  },
+}));
+
+import {
+  callbackQueryFrom,
+  dockerExecDeliver,
+  parseCallbackUrl,
+  redactCallbackShape,
+  shadowWarning,
+} from './oauth-interactive.js';
 
 describe('parseCallbackUrl', () => {
   it('extracts code, state, and port from a localhost callback URL', () => {
@@ -107,5 +121,16 @@ describe('shadowWarning', () => {
     expect(w).toContain('slack_flsclaw-ai-native-marketing');
     expect(w).toContain('shadow');
     expect(w.endsWith('\n\n')).toBe(true); // renders as a leading block before the prompt
+  });
+});
+
+describe('dockerExecDeliver', () => {
+  // A CLI serving its own callback redirects to a success page and waits for
+  // that fetch before exiting. Stopping at the redirect leaves it running, which
+  // holds the sign-in's in-flight guard and refuses the next attempt.
+  it('follows the redirect the callback returns', async () => {
+    await dockerExecDeliver('some-container', 'http://localhost:1455/auth/callback?code=a&state=b');
+
+    expect(exec.args).toContain('-sfL');
   });
 });
