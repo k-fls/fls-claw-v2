@@ -44,7 +44,13 @@ export function materializeTemplateSkills(agentGroupId: string, destSkillsDir: s
 
   fs.mkdirSync(destSkillsDir, { recursive: true });
   for (const name of fs.readdirSync(src)) {
-    if (!fs.statSync(path.join(src, name)).isDirectory()) continue;
+    // lstat, not stat: the source also holds Claude's shared-skill symlinks,
+    // whose targets are CONTAINER paths (`/app/skills/<name>`) and therefore
+    // dangling on the host. stat follows them and throws ENOENT, which the
+    // spawn seam classifies as fatal — so one Claude symlink made every
+    // surfaces-owning provider unspawnable. A symlink is not a directory, so
+    // lstat skips it and only the template's real dirs are copied.
+    if (!fs.lstatSync(path.join(src, name)).isDirectory()) continue;
     const dest = path.join(destSkillsDir, name);
     fs.rmSync(dest, { recursive: true, force: true });
     fs.cpSync(path.join(src, name), dest, { recursive: true });
