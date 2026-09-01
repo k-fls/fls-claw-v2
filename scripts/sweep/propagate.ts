@@ -4485,6 +4485,14 @@ export async function cmdRun(
   // missing cases (synthetic `resolved` + `reopened`) so the loop below
   // re-derives the branch instead of leaving it open forever.
   await crashHeal(cli, dir, readJournal(dir));
+  // Stale-case heal, IMMEDIATELY AFTER the crash heal and for the same reason:
+  // a case the pass can neither serve nor conclude has to be dropped before the
+  // pass state is read. The order is load-bearing — crashHeal disposes the
+  // cases whose head already landed, so staleHeal never considers one of them.
+  // Its own predicate is different in kind (the branch tip moved, not the
+  // content landed) and it writes different rows (`case-stale` + `reopened`,
+  // never a `resolved`), which is why it is a sibling and not an arm.
+  await staleHeal(cli, dir, readJournal(dir));
   const journal = readJournal(dir);
   const statusView = passStatusView(cli, journal);
   const blockedSet = new Set(statusView.keys()); // merge_status != NONE (PR_ID ∪ DEFERRED)
@@ -5313,6 +5321,126 @@ async function crashHeal(cli: Cli, dir: string, journal: JournalEntry[]): Promis
     reopen(dir, [e.branch, ...transitiveDescendants(edges, e.branch)]);
     closed.add(e.caseId as string);
     healed.push(e.caseId as string);
+  }
+  return healed;
+}
+
+/**
+ * Stale-case heal: a swept branch's tip MOVED under an OPEN pass — someone
+ * pushed to it, or the driver was redeployed onto a branch that is both its own
+ * source and swept content. The case's automerge tree was computed against the
+ * tip AT EMISSION, so `reverifyCase` now reports automerge-tree drift and
+ * answers ERR02_CASE_STALE to every conclusion, while `next-case` keeps serving
+ * the same case until ERR44_CASE_LOOPING refuses it. A stale case has no legal
+ * disposition, so `finish` halts on ERR34_CASES_REMAIN too: both guards are
+ * individually right and jointly leave the pass no move at all.
+ *
+ * The heal DROPS the stale case and lets git re-derive it: a `case-stale`
+ * record row plus `reopen` of the branch and its descendants, and NOTHING ELSE.
+ * Specifically NOT crashHeal's synthetic `resolved`. crashHeal's predicate is
+ * "the head already LANDED" — content, so a terminal disposition is the truth.
+ * This predicate is "the CONTEXT moved" — tips, and the conflict is still live.
+ * When only the branch TIP moves the re-derived case keeps the SAME id (the
+ * id's sha8 is the CONFLICT HEAD's, parent-side, which branch movement does not
+ * touch), and `lastDisposition` is terminal regardless of order: a `resolved`
+ * row for that id would make the re-emitted case dead on arrival and the pass
+ * would sail straight past a live conflict. The reopen is positional instead —
+ * `supersededCaseIds` drops the pre-reopen case row, the branch loop below
+ * re-derives the branch in THIS SAME invocation, and the fresh emission lands
+ * AFTER the `reopened` row and survives.
+ *
+ * NO `reverifyCase` runs here, deliberately. The heal does not need to know
+ * what the fresh state IS — only to journal the reopen, so the loop about to
+ * execute re-derives it. That leaves the predicate at one `revParse` per open
+ * conflict case, as cheap as crashHeal's ancestry test, which is why the heal
+ * belongs at run time and needs no command of its own.
+ *
+ * Mid-flight staleness is untouched and that split is deliberate: an agent
+ * working a case while git moves under it still gets ERR02 from `report-case`,
+ * telling it to stop and run `next-case` — and the heal fires on that
+ * `next-case`. Nothing is ever surfaced to the agent at SERVE time.
+ *
+ * There is no parent-side arm: a parent's tip moves mid-pass only through a
+ * resolve or a merge the driver itself journals, and those paths already reopen
+ * the descendants.
+ */
+async function staleHeal(cli: Cli, dir: string, journal: JournalEntry[]): Promise<string[]> {
+  const edges = planEdgesOf(dir);
+  const healed: string[] = [];
+  /** Branches this heal already reopened — their cases are superseded already. */
+  const reopenedHere = new Set<string>();
+  for (const jc of openCases(journal)) {
+    if (reopenedHere.has(jc.branch)) continue;
+    const row = [...journal].reverse().find((e) => e.action === 'case' && e.caseId === jc.caseId);
+    // NEVER stale-heal a GATE-FIX or a REISSUE case — the deadlock this heals
+    // cannot arise there. Their re-verification authorities (`reverifyGateFixCase`
+    // and `reverifyReissueCase`) each re-derive against LIVE git — the branch tip
+    // (or the driver's rooted point) and a fresh probe against `origin/<branch>`
+    // — instead of comparing a recomputed automerge against one pinned to the
+    // tip at emission. A moved tip simply produces a different, still-valid
+    // derivation there, so there is nothing to heal and a reopen would only
+    // supersede a case the driver deliberately manufactured.
+    if (row?.gateFix === true || row?.reissue === true) continue;
+    if (!(await refExists(cli.repo, jc.branch))) continue; // a deleted branch is ERR02's, not this heal's
+    const liveTip = await revParse(cli.repo, jc.branch);
+    // THE PREDICATE, one git call. `createCaseWorktree` builds the worktree at a
+    // clean-prefix commit whose ONLY parent is the branch tip it was emitted
+    // against, so the worktree's `HEAD^` IS the recorded tip — no merge is
+    // recomputed to ask whether the branch moved.
+    const wtPath = caseWorktreePath(dir, jc.caseId);
+    const recordedTip = existsSync(wtPath) ? await revParse(wtPath, 'HEAD^').catch(() => null) : null;
+    let stale: boolean;
+    if (recordedTip !== null) {
+      stale = recordedTip !== liveTip;
+    } else {
+      // Worktree gone (removed, or never built): fall back to recomputing the
+      // automerge against the live tip and comparing it with the recorded one.
+      // case.json is agent-writable (§7), and that is tolerable HERE and nowhere
+      // else: the worst a tampered value buys is a spurious heal, whose
+      // re-emission immediately rewrites case.json from git. No merge, no
+      // publish and no disposition rests on it.
+      const casePath = join(dir, jc.caseId, 'case.json');
+      if (!existsSync(casePath)) continue;
+      let recordedTree: string;
+      try {
+        recordedTree = readCaseFile(casePath).automergeTree;
+      } catch {
+        continue; // unreadable pointer: nothing to compare, and nothing to heal from
+      }
+      stale = (await newStyleMergeTree(cli.repo, liveTip, jc.head.sha)).treeOid !== recordedTree;
+    }
+    if (!stale) continue;
+    // DIVERGENCE GUARD. Heal only FORWARD movement — the recorded tip an
+    // ancestor of the live one. A non-fast-forward tip is rewritten history, and
+    // that is owner territory: the push phase already escalates it, and silently
+    // re-deriving the case around it would erase the evidence. With no recorded
+    // tip there is nothing to test ancestry against, so the fallback path above
+    // cannot claim divergence and heals.
+    const forward = recordedTip === null || (await isAncestor(cli.repo, recordedTip, liveTip));
+    // FORENSIC ROW, read by nothing. Every decision this heal makes is made
+    // here; the row exists so a later reader can see why a case disappeared and
+    // was re-derived — and so a divergent tip leaves a record even though the
+    // driver adapts to none of it.
+    appendJournal(dir, {
+      action: 'case-stale',
+      caseId: jc.caseId,
+      branch: jc.branch,
+      parent: jc.parent,
+      recordedTip,
+      liveTip,
+      head: jc.head,
+      drift: forward ? 'branch-tip' : 'divergent',
+      detail: forward
+        ? `'${jc.branch}' moved ${recordedTip ? `${recordedTip.slice(0, 12)} -> ` : ''}${liveTip.slice(0, 12)} ` +
+          `after case ${jc.caseId} was emitted — the case is dropped and re-derived from git this call`
+        : `'${jc.branch}' moved NON-FAST-FORWARD ${recordedTip!.slice(0, 12)} -> ${liveTip.slice(0, 12)} under the ` +
+          `open pass: history was rewritten, so case ${jc.caseId} is NOT healed — the owner decides`,
+    });
+    if (!forward) continue;
+    reopen(dir, [jc.branch, ...transitiveDescendants(edges, jc.branch)]);
+    for (const b of [jc.branch, ...transitiveDescendants(edges, jc.branch)]) reopenedHere.add(b);
+    healed.push(jc.caseId);
+    console.error(`run: case ${jc.caseId} went stale ('${jc.branch}' moved) — re-deriving it from git this call`);
   }
   return healed;
 }
@@ -8564,18 +8692,20 @@ async function reissueCaseMaterials(
 
 /** Undispositioned cases this pass, topmost-first (DAG order = journal order). */
 /**
- * Cases SUPERSEDED by a later reopen. Resolving a case reopens its
- * branch + descendants (§8); the next `run` re-derives each reopened branch
- * against its now-ADVANCED parent and re-emits a FRESH case — new conflict
- * head, new height (so a new caseId), new conflict set. The pre-reopen case is
- * never dispositioned (it was superseded, not resolved), so every "open case"
- * reader MUST drop it: otherwise `openCases` still serves the stale case first
- * (lower index) and `report-case` fires ERR02_CASE_STALE forever, the branch
- * stays wrongly excluded from the publishable set even after the fresh case
- * resolves, and the pass never completes. A case is superseded when its LAST
- * `case` entry precedes its branch's most-recent `reopened` (using the last
- * entry, not `firstIndex`, so a case re-emitted under the SAME caseId after the
- * reopen correctly survives). A reopen that re-emits nothing (branch healed /
+ * Cases SUPERSEDED by a later reopen. A resolve reopens the case's branch +
+ * descendants (§8), and so does the stale-case heal; the next `run` re-derives
+ * each reopened branch and re-emits a FRESH case. The pre-reopen case carries no
+ * disposition — it is superseded, not resolved — so every "open case" reader
+ * MUST drop it: otherwise `openCases` serves the stale case first (lower index),
+ * `report-case` answers ERR02_CASE_STALE to every conclusion, the branch stays
+ * wrongly excluded from the publishable set even after the fresh case resolves,
+ * and the pass never completes. A case is superseded when its LAST `case` entry
+ * precedes its branch's most-recent `reopened` — the LAST entry, not
+ * `firstIndex`, so a case re-emitted under the SAME caseId after the reopen
+ * correctly survives. That is load-bearing for `staleHeal`: a re-derivation
+ * against an ADVANCED PARENT yields a new conflict head and height (hence a new
+ * caseId), but a branch whose own TIP moved keeps both, and the re-emission
+ * reuses the id it superseded. A reopen that re-emits nothing (branch healed /
  * merged clean / deferred) simply leaves the branch with no open case — right.
  */
 export function supersededCaseIds(journal: JournalEntry[]): Set<string> {
@@ -10541,7 +10671,18 @@ export async function cmdSweepNextCase(
   // zero times" is answerable: `case` rows come from `run`,
   // `report` and the gate-fix reopen, never from here, so without this row a
   // re-serve would leave no trace at all.
-  const servedBefore = readJournal(dir).filter((e) => e.action === 'case-served' && e.caseId === jc.caseId).length;
+  // SERVES ARE COUNTED PER EMISSION, not per caseId. A case re-emitted after a
+  // stale heal wears the SAME id (the id's sha8 is the conflict head's), so a
+  // count over the whole journal would hand the fresh case its predecessor's
+  // tally, arrive at the limit on the first serve and refuse it — the deadlock
+  // the heal exists to break, reborn one step later. Only serves that happened
+  // AFTER the case's last `case` row describe the case being served now; the
+  // limit below is unchanged and still right for a genuinely looping live case.
+  const jNow = readJournal(dir);
+  const lastEmitted = jNow.reduce((last, e, i) => (e.action === 'case' && e.caseId === jc.caseId ? i : last), -1);
+  const servedBefore = jNow.filter(
+    (e, i) => i > lastEmitted && e.action === 'case-served' && e.caseId === jc.caseId,
+  ).length;
   const serves = servedBefore + 1;
   if (serves > CASE_SERVE_LIMIT) {
     const detail =
