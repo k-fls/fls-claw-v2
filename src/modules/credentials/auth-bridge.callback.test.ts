@@ -28,6 +28,7 @@ vi.mock('../interactions/index.js', () => ({
 import type { InteractionOrigin } from '../../host-interactions.js';
 import {
   _resetAuthBridgeForTests,
+  looksShortened,
   bindAuthEpisodeContainerIP,
   setAuthCallbackDeliverer,
   startAuthEpisode,
@@ -92,5 +93,15 @@ describe('callback delivery', () => {
     await runPaste(null, deliver);
 
     expect(deliver).not.toHaveBeenCalled();
+  });
+});
+
+describe('looksShortened', () => {
+  it('recognises the anchor label Slack sends in place of the URL', () => {
+    expect(looksShortened('localhost/auth/callback?code=…&scope=openid+profile+email…&…')).toBe(true);
+  });
+
+  it('does not flag a real callback', () => {
+    expect(looksShortened('http://localhost:1455/auth/callback?code=abc123&state=xyz789')).toBe(false);
   });
 });

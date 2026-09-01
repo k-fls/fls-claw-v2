@@ -174,6 +174,12 @@ export function redactCallbackShape(input: string): string {
  */
 export function callbackQueryFrom(input: string): URLSearchParams | null {
   let trimmed = input.trim();
+  // Code formatting is how a user stops a chat client turning the URL into a
+  // link; the delimiters arrive as literal text.
+  trimmed = trimmed
+    .replace(/^```+|```+$/g, '')
+    .replace(/^`+|`+$/g, '')
+    .trim();
   if (trimmed.startsWith('<') && trimmed.endsWith('>')) {
     trimmed = trimmed.slice(1, -1);
     // Slack's link form is `<url|label>`.

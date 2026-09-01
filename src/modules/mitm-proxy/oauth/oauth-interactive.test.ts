@@ -71,9 +71,16 @@ describe('callbackQueryFrom', () => {
     expect(q?.get('scope')).toContain('openid');
   });
 
+  it('reads it out of code formatting, which is how a user stops Slack linkifying it', () => {
+    expect(callbackQueryFrom('`' + REAL + '`')?.get('state')).toBe('gbs9SzWnAvIZjGUAM1T7eNXl7c6TRIB4ouXNraJ-iaY');
+    expect(callbackQueryFrom('```' + REAL + '```')?.get('code')).toBe('ac_16a_HcNheghQ.la6Teqpyj5DXTLSn6gqoak05g5SZ');
+  });
+
   it('returns null without both code and state', () => {
     expect(callbackQueryFrom('http://localhost:1455/cb?code=a')).toBeNull();
     expect(callbackQueryFrom('no url here')).toBeNull();
+    // What Slack actually delivered: the anchor's shortened label, values gone.
+    expect(callbackQueryFrom('localhost/auth/callback?code=…&scope=openid+profile+email…&…')).toBeNull();
   });
 });
 

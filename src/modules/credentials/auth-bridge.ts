@@ -200,7 +200,9 @@ function promptForCode(episode: AuthEpisode, url: string, instructions: string |
   const wantsCallback = episode.codeDelivery === 'callback';
   const fallback = wantsCallback
     ? 'Your browser will then fail to load a `localhost` page — that is expected. ' +
-      'Copy the full URL from the address bar and paste it back here.'
+      'Copy the full URL from the address bar and paste it back here **wrapped in backticks**, ' +
+      'like `http://localhost:1455/auth/callback?code=...`. Without them Slack turns it into a ' +
+      'shortened link and only that short text arrives, so the code never reaches the sign-in.'
     : 'After authorizing, copy the resulting code (or callback URL) and paste it back here.';
   const prompt =
     `${episode.label} sign-in — open this URL in your browser and authorize:\n\n` +
@@ -242,6 +244,16 @@ function promptForCode(episode: AuthEpisode, url: string, instructions: string |
  * which unblocks teardown; success is still decided by whether a credential
  * lands, never by this.
  */
+/**
+ * True when a paste is a link label a chat client shortened rather than the URL
+ * itself. Slack renders a pasted URL as an anchor and delivers only that
+ * anchor's text, ellipsis and all, so the code and state never arrive — a
+ * failure the user can act on only if it is named.
+ */
+export function looksShortened(input: string): boolean {
+  return input.includes('…') || /\.\.\.(?:&|$)/.test(input);
+}
+
 async function completeCallback(episode: AuthEpisode, pasted: string | null): Promise<void> {
   if (!pasted) {
     episode.code.resolve({ cancelled: true });
@@ -262,8 +274,12 @@ async function completeCallback(episode: AuthEpisode, pasted: string | null): Pr
   }
   if (!delivered) {
     episode.origin.writeReply(
-      'That did not look like the callback URL. It looks like ' +
-        '`http://localhost:1455/auth/callback?code=...&state=...`. Run the sign-in again to retry.',
+      looksShortened(pasted)
+        ? 'That was the shortened link text, not the URL — the code and state are missing from it. ' +
+            'Paste it again wrapped in backticks so the chat client sends it verbatim, ' +
+            'then run the sign-in again.'
+        : 'That did not look like the callback URL — it needs the `code=` and `state=` values ' +
+            'from the address bar. Run the sign-in again to retry.',
     );
   }
   episode.code.resolve({ cancelled: true });
