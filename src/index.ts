@@ -80,12 +80,14 @@ import {
   initOAuthModule,
   oauthInteractive,
   dockerExecDeliver,
+  deliverPastedCallback,
   borrowedCredentialNotifier,
 } from './modules/mitm-proxy/index.js';
 import {
   getBorrowSource,
   getOrCreateResolverForAgentGroup,
   regenerateAllManifests,
+  setAuthCallbackDeliverer,
 } from './modules/credentials/index.js';
 import { CREDENTIAL_PROXY_PORT } from './config.js';
 
@@ -142,6 +144,10 @@ async function main(): Promise<void> {
   registerClaudeCredentialProvider();
   registerGithubCredentialProvider();
   registerCodexCredentialProvider();
+  // The auth-container browser flow completes by curling the pasted callback
+  // into the container; parsing and `docker exec` live in the mitm-proxy module,
+  // which already imports the auth bridge.
+  setAuthCallbackDeliverer(deliverPastedCallback);
   const credentialProxy = new CredentialProxy();
   // Bind the SAME address host-rpc binds (serviceBindHost), driven by
   // CLAW_HOST_NET_MODE: open (default) → 0.0.0.0 (rootless; the proxy's

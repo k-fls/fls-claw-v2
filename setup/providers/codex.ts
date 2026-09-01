@@ -9,7 +9,7 @@
  *
  * On this edition a Codex credential is bound by the running host, in the
  * group's own channel: the wake-time acquisition gate offers the sign-in to a
- * group admin, a short-lived auth container runs the device login, and the
+ * group admin, a short-lived auth container runs the chosen login route, and the
  * credential proxy captures the real tokens out of the token exchange. Setup
  * therefore verifies and reports; it never holds a credential of its own. See
  * `src/providers/codex-credential.ts`.

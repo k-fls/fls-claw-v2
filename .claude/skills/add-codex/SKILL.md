@@ -140,7 +140,7 @@ The registration tests import only the real barrels — they go red if a barrel 
 There is nothing to run here. A Codex group signs itself in, in its own channel, the first time somebody messages it:
 
 1. The wake-time gate sees no Codex credential for the group and offers the ChatGPT sign-in — **only** to an owner, a global admin, or an admin of that agent group. Anyone else gets a message naming who can.
-2. On acceptance a short-lived auth container runs `codex login --device-auth`. The proxy intercepts the device-authorization response and relays the link and pairing code privately to the accepting user.
+2. The user picks a route. **Browser** (default) runs `codex login`: the runner relays the authorize URL, the user authorizes, their browser fails to reach `localhost:1455`, and they paste that URL back — the host delivers it into the auth container. **Device code** runs `codex login --device-auth`, which needs device-code authorization enabled in ChatGPT security settings (an enterprise workspace often withholds it). **API key** stores a GPG-encrypted OpenAI platform key instead, billed separately from any ChatGPT subscription.
 3. They authorize at OpenAI. The container polls the token endpoint; the proxy captures the real tokens out of that exchange, stores them against the group, and hands the container substitutes.
 4. The group respawns and answers the original message.
 

@@ -134,6 +134,24 @@ export const dockerExecDeliver: AuthCodeDeliver = (containerName, callbackUrl) =
     );
   });
 
+/**
+ * `AuthCallbackDeliverer` for the auth-container browser flow: parse what the
+ * user pasted and curl it into the container's own localhost listener.
+ *
+ * Rebuilt from the parsed parts rather than forwarded verbatim, so a paste
+ * carrying extra query junk (or a chat client's link decoration) still produces
+ * the exact callback the CLI expects.
+ */
+export async function deliverPastedCallback(containerName: string, pasted: string): Promise<boolean> {
+  const parsed = parseCallbackUrl(pasted);
+  if (!parsed) return false;
+  const url =
+    `http://localhost:${parsed.port}/auth/callback` +
+    `?code=${encodeURIComponent(parsed.code)}&state=${encodeURIComponent(parsed.state)}`;
+  await dockerExecDeliver(containerName, url);
+  return true;
+}
+
 /** Parse the authorize URL's `redirect_uri` to find the localhost callback target. */
 function localhostCallbackFromAuthUrl(authUrl: string): { port: number; path: string } | null {
   try {

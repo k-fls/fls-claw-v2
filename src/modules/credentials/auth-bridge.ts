@@ -65,6 +65,17 @@ interface AuthEpisode {
   urlPrompted: boolean;
   /** Set once the episode's auth container has an allocated IP. */
   containerIP?: string;
+  /** Set alongside `containerIP`; the target for a callback delivery. */
+  containerName?: string;
+  /**
+   * How the user's paste reaches the CLI. `paste` resolves the `/auth/code`
+   * long-poll the runner is waiting on; `callback` is for a CLI that reads no
+   * code from stdin and is instead listening on its own localhost port, so the
+   * host delivers the browser's redirect into the container.
+   */
+  codeDelivery: 'paste' | 'callback';
+  /** Names the service in the sign-in prompt. */
+  label: string;
 }
 
 /** Returned to the provider so it can tear the episode down when its auth container exits. */
@@ -92,14 +103,30 @@ const episodesByContainerIP = new Map<string, AuthEpisode>();
  * Bind a spawned auth container's IP to its episode, identified by the nonce
  * both were created with. No-op when the nonce matches no live episode.
  */
-export function bindAuthEpisodeContainerIP(nonce: string, ip: string): void {
+export function bindAuthEpisodeContainerIP(nonce: string, ip: string, containerName?: string): void {
   const episode = [...episodes.values()].find((e) => e.nonce === nonce);
   if (!episode) {
     log.warn('auth-bridge: no live episode for nonce — container IP not bound', { ip });
     return;
   }
   episode.containerIP = ip;
+  episode.containerName = containerName;
   episodesByContainerIP.set(ip, episode);
+}
+
+/**
+ * Delivers a browser callback the user pasted into the episode's auth
+ * container. Injected because parsing and `docker exec` live in the mitm-proxy
+ * module, which already imports this one. Returns false when the paste is not a
+ * usable callback URL, so the prompt can ask again.
+ */
+export type AuthCallbackDeliverer = (containerName: string, pasted: string) => Promise<boolean>;
+
+let callbackDeliverer: AuthCallbackDeliverer | null = null;
+
+/** Wire the callback deliverer. Called once at boot. */
+export function setAuthCallbackDeliverer(fn: AuthCallbackDeliverer): void {
+  callbackDeliverer = fn;
 }
 
 /**
@@ -120,6 +147,8 @@ export function startAuthEpisode(args: {
   scopeFolder: string;
   nonce: string;
   origin: InteractionOrigin;
+  codeDelivery?: 'paste' | 'callback';
+  label?: string;
 }): AuthEpisodeHandle {
   const { scopeFolder, nonce, origin } = args;
   const existing = episodes.get(scopeFolder);
@@ -128,7 +157,15 @@ export function startAuthEpisode(args: {
     if (existing.containerIP) episodesByContainerIP.delete(existing.containerIP);
     existing.code.resolve({ cancelled: true });
   }
-  const episode: AuthEpisode = { scopeFolder, nonce, origin, code: deferred<AuthCodeResult>(), urlPrompted: false };
+  const episode: AuthEpisode = {
+    scopeFolder,
+    nonce,
+    origin,
+    code: deferred<AuthCodeResult>(),
+    urlPrompted: false,
+    codeDelivery: args.codeDelivery ?? 'paste',
+    label: args.label ?? 'Claude',
+  };
   episodes.set(scopeFolder, episode);
   log.info('auth-bridge: episode started', { scopeFolder });
   return {
@@ -157,10 +194,15 @@ function promptForCode(episode: AuthEpisode, url: string, instructions: string |
   if (episode.urlPrompted) return;
   episode.urlPrompted = true;
 
+  const wantsCallback = episode.codeDelivery === 'callback';
+  const fallback = wantsCallback
+    ? 'Your browser will then fail to load a `localhost` page — that is expected. ' +
+      'Copy the full URL from the address bar and paste it back here.'
+    : 'After authorizing, copy the resulting code (or callback URL) and paste it back here.';
   const prompt =
-    'Claude sign-in — open this URL in your browser and authorize:\n\n' +
+    `${episode.label} sign-in — open this URL in your browser and authorize:\n\n` +
     `${url}\n\n` +
-    (instructions ?? 'After authorizing, copy the resulting code (or callback URL) and paste it back here.') +
+    (instructions ?? fallback) +
     '\n\nOr reply "cancel".';
 
   pastePlainOn(episode.origin, {
@@ -168,7 +210,12 @@ function promptForCode(episode: AuthEpisode, url: string, instructions: string |
     validate: (text) => (text.trim().length > 0 ? null : 'That looked empty — paste the code, or reply "cancel".'),
   }).then(
     (r) => {
-      episode.code.resolve(r.reason === 'submitted' && r.text ? { code: r.text.trim() } : { cancelled: true });
+      const submitted = r.reason === 'submitted' && r.text ? r.text.trim() : null;
+      if (wantsCallback) {
+        void completeCallback(episode, submitted);
+        return;
+      }
+      episode.code.resolve(submitted ? { code: submitted } : { cancelled: true });
     },
     (err) => {
       // The only expected rejection is a slot conflict (another interaction
@@ -183,6 +230,40 @@ function promptForCode(episode: AuthEpisode, url: string, instructions: string |
       episode.code.resolve({ cancelled: true });
     },
   );
+}
+
+/**
+ * Deliver a pasted browser callback into the episode's auth container. The CLI
+ * is blocked on its own localhost listener, so this — not the `/auth/code`
+ * long-poll — is what completes the flow. The episode is resolved either way,
+ * which unblocks teardown; success is still decided by whether a credential
+ * lands, never by this.
+ */
+async function completeCallback(episode: AuthEpisode, pasted: string | null): Promise<void> {
+  if (!pasted) {
+    episode.code.resolve({ cancelled: true });
+    return;
+  }
+  if (!callbackDeliverer || !episode.containerName) {
+    log.error('auth-bridge: no callback deliverer or container for episode', { scopeFolder: episode.scopeFolder });
+    episode.origin.writeReply('Could not complete the sign-in — the auth container is gone. Try again.');
+    episode.code.resolve({ cancelled: true });
+    return;
+  }
+  let delivered = false;
+  try {
+    delivered = await callbackDeliverer(episode.containerName, pasted);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- any failure is "not delivered"
+  } catch (err) {
+    log.error('auth-bridge: callback delivery threw', { scopeFolder: episode.scopeFolder, err });
+  }
+  if (!delivered) {
+    episode.origin.writeReply(
+      'That did not look like the callback URL. It looks like ' +
+        '`http://localhost:1455/auth/callback?code=...&state=...`. Run the sign-in again to retry.',
+    );
+  }
+  episode.code.resolve({ cancelled: true });
 }
 
 function nonceOf(body: unknown): string | null {

@@ -28,21 +28,32 @@ describe('isAuthMode', () => {
 });
 
 describe('specFor', () => {
-  it('maps each Claude mode to its own command and keeps the code relay', () => {
+  it('maps each Claude mode to its own command and returns the code over stdin', () => {
     expect(specFor('setup_token').command).toBe('claude setup-token');
     expect(specFor('auth_login').command).toBe('claude auth login');
-    expect(specFor('setup_token').relaysCode).toBe(true);
-    expect(specFor('auth_login').relaysCode).toBe(true);
+    expect(specFor('setup_token').codeReturn).toBe('stdin');
+    expect(specFor('auth_login').codeReturn).toBe('stdin');
   });
 
-  it('maps the Codex mode to a device login with no code relay', () => {
+  it('maps the Codex device mode to a device login that relays no URL', () => {
     const spec = specFor('codex_device');
     expect(spec.command).toBe('codex login --device-auth');
-    expect(spec.relaysCode).toBe(false);
+    expect(spec.relaysUrl).toBe(false);
+    expect(spec.codeReturn).toBe('none');
   });
 
-  it('gives the device flow a human-scale wait, under the host lifetime backstop', () => {
+  // `codex login` reads no code from stdin — it blocks on its own localhost
+  // listener — so the runner relays the URL and the host delivers the callback.
+  it('maps the Codex browser mode to a URL relay with a host-delivered callback', () => {
+    const spec = specFor('codex_login');
+    expect(spec.command).toBe('codex login');
+    expect(spec.relaysUrl).toBe(true);
+    expect(spec.codeReturn).toBe('callback');
+  });
+
+  it('gives the browser-scale flows a human wait, under the host lifetime backstop', () => {
     const device = specFor('codex_device').exitWaitMs;
+    expect(specFor('codex_login').exitWaitMs).toBe(device);
     expect(device).toBeGreaterThan(specFor('auth_login').exitWaitMs);
     // The host kills the container at 12 min; its timeout must fire first.
     expect(device).toBeLessThan(12 * 60_000);

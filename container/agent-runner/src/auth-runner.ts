@@ -19,6 +19,11 @@
  * the proxy relays the user code out of the device-authorization response, so
  * the runner only spawns and waits. No scrape, no long-poll, no write-back.
  *
+ * Callback (`codex login`) — the CLI prints its authorize URL and waits on its
+ * own localhost HTTP listener. The runner scrapes and relays the URL, then
+ * waits: the HOST delivers the browser's callback into this container, because
+ * the CLI reads no code from stdin.
+ *
  * It does NOT capture the credential: the auth container routes through the
  * MITM proxy, which intercepts the CLI's token-exchange and stores the real
  * token host-side. The runner only drives the UX; the host decides success by
@@ -115,7 +120,7 @@ async function main(): Promise<void> {
   const spec = specFor(mode);
   const cli = spawnCli(mode);
 
-  if (!spec.relaysCode) {
+  if (!spec.relaysUrl) {
     // The proxy relays the user code; nothing to scrape and nothing to feed
     // back. Just let the CLI finish its own polling.
     await cli.waitExit(spec.exitWaitMs);
@@ -134,13 +139,17 @@ async function main(): Promise<void> {
   }
 
   await client.postUrl(url);
-  const code = await client.pollCode();
-  if ('cancelled' in code) {
-    cli.kill();
-    fail('user cancelled or timed out');
-  }
 
-  cli.send(code.code);
+  if (spec.codeReturn === 'stdin') {
+    const code = await client.pollCode();
+    if ('cancelled' in code) {
+      cli.kill();
+      fail('user cancelled or timed out');
+    }
+    cli.send(code.code);
+  }
+  // `callback`: the host curls the browser's redirect into this container's own
+  // listener, so there is nothing to poll for and nothing to type.
 
   // Wait for the CLI to complete the token-exchange (intercepted + captured by
   // the host proxy) and exit. No local capture — the proxy owns it.

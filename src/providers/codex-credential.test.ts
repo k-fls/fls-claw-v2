@@ -27,6 +27,16 @@ vi.mock('../auth-container.js', () => ({ spawnAuthContainer: vi.fn() }));
 vi.mock('../modules/permissions/access.js', () => ({ canAccessAgentGroup: vi.fn() }));
 vi.mock('../modules/approvals/primitive.js', () => ({ pickApprover: vi.fn(() => []) }));
 vi.mock('../modules/permissions/db/users.js', () => ({ getUser: vi.fn(() => undefined) }));
+// The acquire/reauth entry point is a menu now. Default to the first route
+// (browser sign-in); the device-mode case overrides `pick`.
+const menu = vi.hoisted(() => ({ pick: 0 as number | null, options: [] as string[][] }));
+vi.mock('../modules/interactions/index.js', () => ({
+  pickOptionOn: async (_o: unknown, opts: { options: string[] }) => {
+    menu.options.push(opts.options);
+    return menu.pick == null ? { index: null, reason: 'cancelled' } : { index: menu.pick, reason: 'submitted' };
+  },
+  pastePgpOn: async () => ({ reason: 'cancelled' }),
+}));
 
 import {
   registerCodexCredentialProvider,
@@ -287,6 +297,11 @@ describe('codex credential provider', () => {
       return ext;
     }
 
+    beforeEach(() => {
+      menu.pick = 0;
+      menu.options = [];
+    });
+
     const asAdmin = (): void => {
       vi.mocked(canAccessAgentGroup).mockReturnValue({ allowed: true, reason: 'admin_of_group' });
     };
@@ -329,9 +344,34 @@ describe('codex credential provider', () => {
 
       expect(ok).toBe(true);
       const call = vi.mocked(spawnAuthContainer).mock.calls[0][0];
-      expect(call.mode).toBe('codex_device');
+      // The first route, and the one that needs no workspace setting.
+      expect(call.mode).toBe('codex_login');
       expect(call.folder).toBe(FOLDER);
       expect(call.nonce).toMatch(/^[0-9a-f]{32}$/);
+    });
+
+    it('spawns the device-login mode when that route is chosen instead', async () => {
+      asAdmin();
+      menu.pick = 1;
+      vi.mocked(spawnAuthContainer).mockImplementation(async () => {
+        storeCredential();
+      });
+
+      const ok = await acquireExt().acquire({ origin: origin([]), credentialScope: asCredentialScope(FOLDER) });
+
+      expect(ok).toBe(true);
+      expect(vi.mocked(spawnAuthContainer).mock.calls[0][0].mode).toBe('codex_device');
+    });
+
+    it('offers the browser route ahead of the device route, which names its prerequisite', async () => {
+      asAdmin();
+      vi.mocked(spawnAuthContainer).mockResolvedValue(undefined);
+
+      await acquireExt().acquire({ origin: origin([]), credentialScope: asCredentialScope(FOLDER) });
+
+      expect(menu.options[0][0]).toMatch(/browser/i);
+      expect(menu.options[0][1]).toMatch(/device authorization/i);
+      expect(menu.options[0][2]).toMatch(/API key/i);
     });
 
     it('decides success by the credential, not by the container exiting cleanly', async () => {
@@ -425,7 +465,7 @@ describe('codex credential provider', () => {
       });
 
       expect(replies.join(' ')).toContain('token_expired');
-      expect(vi.mocked(spawnAuthContainer).mock.calls[0][0].mode).toBe('codex_device');
+      expect(vi.mocked(spawnAuthContainer).mock.calls[0][0].mode).toBe('codex_login');
     });
 
     it('routes an auth rejection to reauth and anything else to the surfaced error', () => {

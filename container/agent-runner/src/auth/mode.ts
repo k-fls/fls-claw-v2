@@ -11,34 +11,63 @@
  * boundary as `NANOCLAW_AUTH_MODE`), so the two move together.
  */
 
-export type AuthMode = 'setup_token' | 'auth_login' | 'codex_device';
+export type AuthMode = 'setup_token' | 'auth_login' | 'codex_device' | 'codex_login';
 
 export interface AuthModeSpec {
   /** Command line run under the PTY. */
   command: string;
   /**
-   * Whether the flow needs the runner to relay a URL out and feed a pasted
-   * code back. False for a device flow: the CLI polls the provider itself and
-   * the proxy relays the user code from the device-authorization response, so
-   * the runner only has to wait for the CLI to exit.
+   * Whether the runner scrapes the CLI's authorization URL and relays it to the
+   * host. False for a device flow: the proxy relays the user code out of the
+   * device-authorization response instead.
    */
-  relaysCode: boolean;
+  relaysUrl: boolean;
+  /**
+   * How the authorization gets back to the CLI.
+   *
+   *  - `stdin`    — the runner long-polls the host for a code and types it in.
+   *  - `callback` — the CLI is waiting on its own localhost HTTP listener, so
+   *                 the HOST delivers the callback into this container and the
+   *                 runner only waits for the CLI to exit.
+   *  - `none`     — the CLI polls the provider itself.
+   */
+  codeReturn: 'stdin' | 'callback' | 'none';
   /** How long to wait for the CLI to exit once the flow is under way. */
   exitWaitMs: number;
 }
 
 const CODE_RELAY_EXIT_WAIT_MS = 30_000;
 /**
- * A device flow spends its whole life waiting for a human to open a link and
- * type a code. Must stay under the host's container lifetime backstop so the
- * host, not this timer, decides the episode is over.
+ * A browser or device flow spends its whole life waiting for a human to open a
+ * link. Must stay under the host's container lifetime backstop so the host, not
+ * this timer, decides the episode is over.
  */
 const DEVICE_EXIT_WAIT_MS = 10 * 60_000;
 
 const SPECS: Record<AuthMode, AuthModeSpec> = {
-  setup_token: { command: 'claude setup-token', relaysCode: true, exitWaitMs: CODE_RELAY_EXIT_WAIT_MS },
-  auth_login: { command: 'claude auth login', relaysCode: true, exitWaitMs: CODE_RELAY_EXIT_WAIT_MS },
-  codex_device: { command: 'codex login --device-auth', relaysCode: false, exitWaitMs: DEVICE_EXIT_WAIT_MS },
+  setup_token: {
+    command: 'claude setup-token',
+    relaysUrl: true,
+    codeReturn: 'stdin',
+    exitWaitMs: CODE_RELAY_EXIT_WAIT_MS,
+  },
+  auth_login: {
+    command: 'claude auth login',
+    relaysUrl: true,
+    codeReturn: 'stdin',
+    exitWaitMs: CODE_RELAY_EXIT_WAIT_MS,
+  },
+  codex_device: {
+    command: 'codex login --device-auth',
+    relaysUrl: false,
+    codeReturn: 'none',
+    exitWaitMs: DEVICE_EXIT_WAIT_MS,
+  },
+  // `codex login` prints its authorize URL and waits on http://localhost:1455.
+  // It reads no code from stdin, so the host delivers the browser's callback
+  // into this container instead. Unlike the device flow it needs no
+  // workspace-level device-code authorization.
+  codex_login: { command: 'codex login', relaysUrl: true, codeReturn: 'callback', exitWaitMs: DEVICE_EXIT_WAIT_MS },
 };
 
 export function isAuthMode(value: unknown): value is AuthMode {

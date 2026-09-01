@@ -24,6 +24,23 @@ const CODEX_MODEL_PROVIDER_ID = 'openai-custom';
 /** The built-in ChatGPT-auth base URL, read off the pinned binary's own default. */
 const CODEX_CHATGPT_BASE_URL = 'https://chatgpt.com/backend-api/codex';
 
+/** Platform base URL, used when the group holds an API key rather than a ChatGPT session. */
+const CODEX_API_BASE_URL = 'https://api.openai.com/v1';
+
+/**
+ * Which credential shape the host wrote. The two route to different hosts and
+ * only the ChatGPT one carries `requires_openai_auth`, so pinning the transport
+ * without reading this would send an API key to the subscription endpoint.
+ */
+function codexAuthMode(codexConfigDir: string): 'apikey' | 'chatgpt' {
+  try {
+    const raw = fs.readFileSync(path.join(codexConfigDir, 'auth.json'), 'utf-8');
+    return (JSON.parse(raw) as { auth_mode?: unknown }).auth_mode === 'apikey' ? 'apikey' : 'chatgpt';
+  } catch {
+    return 'chatgpt';
+  }
+}
+
 export interface CodexMemorySessionHook {
   readonly command: string;
   readonly legacyCommands: readonly string[];
@@ -417,12 +434,14 @@ export function writeCodexConfigToml(
   lines.push('generate_memories = false');
   lines.push('');
 
-  // Mirrors the built-in ChatGPT provider shape; only `supports_websockets` differs.
+  // Mirrors the built-in provider shape for whichever credential the group
+  // holds; only `supports_websockets` differs from the built-in.
+  const authMode = codexAuthMode(codexConfigDir);
   lines.push(`[model_providers.${CODEX_MODEL_PROVIDER_ID}]`);
   lines.push(`name = ${tomlBasicString('OpenAI')}`);
-  lines.push(`base_url = ${tomlBasicString(CODEX_CHATGPT_BASE_URL)}`);
+  lines.push(`base_url = ${tomlBasicString(authMode === 'apikey' ? CODEX_API_BASE_URL : CODEX_CHATGPT_BASE_URL)}`);
   lines.push('wire_api = "responses"');
-  lines.push('requires_openai_auth = true');
+  lines.push(`requires_openai_auth = ${authMode === 'apikey' ? 'false' : 'true'}`);
   lines.push('supports_websockets = false');
   lines.push('');
 

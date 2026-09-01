@@ -39,6 +39,9 @@ import {
   AGENT_RUNTIME,
   CONTAINER_FEEDBACK,
   REAUTH,
+  ensureGpgKey,
+  gpgHomeForScope,
+  buildPgpEncryptUrl,
   startAuthEpisode,
   type AgentRuntimeExt,
   type ContainerContributor,
@@ -54,6 +57,7 @@ import { pickApprover } from '../modules/approvals/primitive.js';
 import { getUser } from '../modules/permissions/db/users.js';
 import { log } from '../log.js';
 import type { InteractionOrigin } from '../host-interactions.js';
+import { pastePgpOn, pickOptionOn } from '../modules/interactions/index.js';
 import { ACQUIRE, type AcquireExt, type AcquireContext } from '../credential-acquisition.js';
 import {
   oauthSubstitutesFor,
@@ -71,6 +75,9 @@ export const CRED_ACCOUNT_ID = 'account_id';
 
 /** Credential path for the identity token — captured so it can be substituted. */
 export const CRED_ID_TOKEN = 'id_token';
+
+/** Platform API key, the non-subscription route. Stored under its own path. */
+export const CRED_API_KEY = 'api_key';
 
 const AUTH_HOST = 'auth.openai.com';
 const CHATGPT_HOST = 'chatgpt.com';
@@ -179,6 +186,9 @@ function codexSubstitutes(): SubstitutingProvider['substitutes'] {
     ...base,
     generateSubstitute(realValue: string, credentialPath: string): string | null {
       if (credentialPath === CRED_ACCOUNT_ID) return randomUUID();
+      // `sk-` prefix preserved: the CLI stores this verbatim and sends it as a
+      // bearer, and a value that does not look like a key is rejected locally.
+      if (credentialPath === CRED_API_KEY) return `sk-${randomBytes(36).toString('base64url')}`;
       // Returning a JWT for a value that is not one would not preserve the
       // format the CLI parses, so decline instead — the caller treats a null
       // substitute as "no credential" rather than shipping a broken one.
@@ -213,6 +223,17 @@ function writeNoFollow(filePath: string, content: string): void {
 export const codexAuthFile: ContainerContributor = (ctx) => {
   const engine = getTokenEngine();
   const { groupScope } = ctx;
+
+  // API-key mode is a different `auth.json` shape entirely, and the CLI reads
+  // `auth_mode` to decide which. Checked first: a group holding a key has no
+  // OAuth tokens to write.
+  const subApiKey = engine.getOrCreateSubstitute(PROVIDER_ID, {}, groupScope, CRED_API_KEY);
+  if (subApiKey) {
+    const keyPath = codexAuthFilePath(ctx.agentGroupId);
+    fs.mkdirSync(path.dirname(keyPath), { recursive: true });
+    writeNoFollow(keyPath, JSON.stringify({ auth_mode: 'apikey', OPENAI_API_KEY: subApiKey }));
+    return {};
+  }
 
   const subAccess = engine.getOrCreateSubstitute(PROVIDER_ID, {}, groupScope, CRED_OAUTH);
   if (!subAccess) return {};
@@ -285,7 +306,12 @@ function approverNames(agentGroupId: string | null): string[] {
  * credential is stored, so a silent branch strands that message until somebody
  * happens to send another.
  */
-async function runCodexSignIn(origin: InteractionOrigin, scope: CredentialScope, reason?: string): Promise<boolean> {
+async function runCodexSignIn(
+  origin: InteractionOrigin,
+  scope: CredentialScope,
+  mode: 'codex_login' | 'codex_device',
+  reason?: string,
+): Promise<boolean> {
   const folder = String(scope);
   const userId = origin.key.userId;
   const decision = userId ? canAccessAgentGroup(userId, origin.agentGroupId ?? '') : null;
@@ -313,17 +339,28 @@ async function runCodexSignIn(origin: InteractionOrigin, scope: CredentialScope,
   resolver.delete(scope, PROVIDER_ID);
 
   const nonce = randomBytes(16).toString('hex');
-  const episode = startAuthEpisode({ scopeFolder: folder, nonce, origin });
+  // A browser login blocks on the CLI's own localhost listener, so the host
+  // delivers the pasted callback into the container rather than answering the
+  // runner's code long-poll.
+  const episode = startAuthEpisode({
+    scopeFolder: folder,
+    nonce,
+    origin,
+    codeDelivery: mode === 'codex_login' ? 'callback' : 'paste',
+    label: 'Codex',
+  });
   try {
     origin.writeReply(
       (reason ? `Your stored Codex credential was rejected (${reason}). ` : '') +
         'Starting Codex sign-in — launching a secure auth container. ' +
-        'A link and a code will arrive here; you have about 10 minutes to complete it.',
+        (mode === 'codex_login'
+          ? 'A sign-in link will arrive here shortly; you have about 10 minutes to complete it.'
+          : 'A link and a code will arrive here; you have about 10 minutes to complete it.'),
     );
     await spawnAuthContainer({
       scope: asContainerScope(folder),
       folder,
-      mode: 'codex_device',
+      mode,
       nonce,
       contribute: (scratchDir) => {
         // A throwaway home, never seeded from an existing auth file. OpenAI
@@ -356,12 +393,111 @@ async function runCodexSignIn(origin: InteractionOrigin, scope: CredentialScope,
   }
 }
 
+/** OpenAI platform key, as `codex login --with-api-key` accepts it. */
+const OPENAI_API_KEY_RE = /^sk-[A-Za-z0-9_-]{20,}$/;
+
+/**
+ * API-key sign-in: the key is pasted GPG-encrypted and decrypted host-side, so
+ * it never crosses chat in cleartext. Billed against the OpenAI platform rather
+ * than a ChatGPT subscription — offered because a workspace can withhold both
+ * the device-code setting and the OAuth app.
+ */
+async function runCodexApiKeyPaste(origin: InteractionOrigin, scope: CredentialScope): Promise<boolean> {
+  ensureGpgKey(scope);
+  const r = await pastePgpOn(origin, {
+    prompt:
+      'Paste an OpenAI API key (`sk-…`). This bills the OpenAI platform, not a ChatGPT subscription.\n\n' +
+      `1. Encrypt it for this group here: ${buildPgpEncryptUrl(scope)}\n` +
+      '2. Paste the resulting `-----BEGIN PGP MESSAGE-----` block back here.\n\n' +
+      'Or reply `cancel`.',
+    gpgHome: gpgHomeForScope(scope),
+    validate: (plaintext) =>
+      OPENAI_API_KEY_RE.test(plaintext.trim())
+        ? null
+        : 'The decrypted value is not an OpenAI API key (expected `sk-…`).',
+  });
+
+  if (r.reason !== 'submitted' || !r.text) {
+    origin.writeReply(
+      r.reason === 'cancelled' ? 'Cancelled — no credential stored.' : 'Timed out — no credential stored.',
+    );
+    return false;
+  }
+
+  getOrCreateResolverForAgentGroup(scope).store(scope, PROVIDER_ID, CRED_API_KEY, {
+    value: r.text.trim(),
+    updated_ts: Date.now(),
+    expires_ts: 0,
+  });
+  origin.writeReply('API key stored. Retrying your request now.');
+  return true;
+}
+
+interface CodexAuthOption {
+  label: string;
+  run: (origin: InteractionOrigin, scope: CredentialScope, reason?: string) => Promise<boolean>;
+}
+
+/**
+ * The routes into a Codex credential, most-preferred first.
+ *
+ * Browser OAuth leads because it is the ordinary `codex login` and needs no
+ * workspace setting. Device code is listed second and named for its
+ * prerequisite: OpenAI gates it behind "device code authorization" in ChatGPT
+ * security settings, which an enterprise workspace commonly withholds.
+ */
+function codexAuthOptions(): CodexAuthOption[] {
+  return [
+    {
+      label: 'Sign in with ChatGPT in a browser',
+      run: (origin, scope, reason) => runCodexSignIn(origin, scope, 'codex_login', reason),
+    },
+    {
+      label: 'Sign in with ChatGPT using a device code (needs device authorization enabled)',
+      run: (origin, scope, reason) => runCodexSignIn(origin, scope, 'codex_device', reason),
+    },
+    {
+      label: 'Paste an OpenAI API key (GPG-encrypted, platform billing)',
+      run: (origin, scope) => runCodexApiKeyPaste(origin, scope),
+    },
+  ];
+}
+
+/** Present the Codex auth menu and run the chosen route. */
+async function runCodexAuthMenu(
+  origin: InteractionOrigin,
+  scope: CredentialScope,
+  intro: string,
+  reason?: string,
+): Promise<boolean> {
+  const options = codexAuthOptions();
+  const pick = await pickOptionOn(origin, { prompt: intro, options: options.map((o) => o.label) });
+  if (pick.reason !== 'submitted' || pick.index == null) {
+    origin.writeReply(
+      pick.reason === 'cancelled' ? 'Cancelled — no credential stored.' : 'Timed out — no credential stored.',
+    );
+    return false;
+  }
+  return options[pick.index].run(origin, scope, reason);
+}
+
 const acquire: AcquireExt = {
-  acquire: (ctx: AcquireContext) => runCodexSignIn(ctx.origin, ctx.credentialScope),
+  acquire: (ctx: AcquireContext) =>
+    runCodexAuthMenu(
+      ctx.origin,
+      ctx.credentialScope,
+      'I need a Codex credential to continue. How would you like to sign in?',
+    ),
 };
 
 const reauth: ReauthExt = {
-  reauth: (ctx: ReauthContext) => runCodexSignIn(ctx.origin, ctx.credentialScope, ctx.reason),
+  reauth: (ctx: ReauthContext) =>
+    runCodexAuthMenu(
+      ctx.origin,
+      ctx.credentialScope,
+      '*Authentication required for Codex.* How would you like to re-authenticate?',
+      ctx.reason,
+    ),
 };
 
 /**

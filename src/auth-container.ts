@@ -55,7 +55,7 @@ import { log } from './log.js';
  * owns the command each mode runs; it crosses the boundary as
  * `NANOCLAW_AUTH_MODE`, so the two move together.
  */
-export type AuthMode = 'setup_token' | 'auth_login' | 'codex_device';
+export type AuthMode = 'setup_token' | 'auth_login' | 'codex_device' | 'codex_login';
 
 /** Backstop kill — the host episode times out at 10 min; allow margin past that. */
 const AUTH_MAX_LIFETIME_MS = 12 * 60_000;
@@ -162,13 +162,14 @@ export interface SpawnAuthContainerOptions {
  */
 export async function spawnAuthContainer(opts: SpawnAuthContainerOptions): Promise<void> {
   const allocated = allocateContainerIP(opts.scope);
+  const stamp = Date.now();
+  const containerName = `nanoclaw-auth-${opts.folder}-${stamp}`;
   // An auth container is deliberately session-less, so an interactive OAuth
   // handler cannot resolve its user the way it does for a session container.
   // Bind its IP to the episode instead — the episode already holds the origin
-  // of whoever accepted this sign-in.
-  bindAuthEpisodeContainerIP(opts.nonce, allocated.ip);
-  const stamp = Date.now();
-  const containerName = `nanoclaw-auth-${opts.folder}-${stamp}`;
+  // of whoever accepted this sign-in. The name rides along because a browser
+  // flow completes by delivering the callback into this container.
+  bindAuthEpisodeContainerIP(opts.nonce, allocated.ip, containerName);
   const workDir = path.join(DATA_DIR, 'auth-spawns', `${opts.folder}-${stamp}`);
   fs.mkdirSync(workDir, { recursive: true });
 
