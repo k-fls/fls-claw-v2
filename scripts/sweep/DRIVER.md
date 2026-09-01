@@ -988,6 +988,26 @@ cannot leave the case open forever, and no second merge happens. The rule is
 SKIPPED for gate-fix cases: their head IS the branch tip by construction, so the
 heuristic is structurally inapplicable.
 
+**Stale-case heal.** A swept branch may MOVE under an OPEN pass — someone pushes
+to it, or the driver is redeployed onto a branch that is both its own source and
+swept content — and the stale-case heal re-derives it. The case's automerge tree
+is a statement about the tip AT EMISSION, so `report-case` answers
+`ERR02_CASE_STALE` on the drift while `next-case` keeps serving the same case up
+to `ERR44_CASE_LOOPING`, and a case with no legal disposition halts `finish` on
+`ERR34_CASES_REMAIN`: both guards are right and together they leave no move.
+`run` heals it beside the crash heal and immediately after it — a forensic
+`case-stale` row plus `reopened` for the branch and its descendants, and nothing
+else. The same invocation re-derives the branch and serves the fresh case, whose
+serve count is counted from its own emission. NOT a synthetic `resolved`: a moved
+branch tip leaves the conflict head, and therefore the caseId, unchanged, and a
+terminal row under that id would kill the re-emission and carry the pass past a
+live conflict. Only FORWARD movement heals; a non-fast-forward tip is journaled
+`drift: "divergent"` and left to the owner, who owns rewritten history. The rule
+is SKIPPED for gate-fix and reissue cases, whose re-verification already derives
+against live git. Staleness reached MID-CASE is untouched: `report-case` still
+refuses it and tells the agent to stop and run `next-case`, and the heal fires
+there. Deploys to the driver's OWN branch still belong between passes.
+
 ### 6.3 The case worktree and materials
 
 The case worktree is a PENDING DIFF, not a checkout of the merge. The driver
