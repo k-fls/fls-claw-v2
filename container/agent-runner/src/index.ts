@@ -29,6 +29,7 @@ import { loadConfig } from './config.js';
 import { buildSystemPromptAddendum } from './destinations.js';
 import { ensureEnvVarsFile } from './env-vars.js';
 import { ensureMemoryScaffold } from './memory-scaffold.js';
+import { MEMORY_SESSION_HOOK } from './memory/session-hook.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
@@ -126,6 +127,12 @@ async function main(): Promise<void> {
   // boot (idempotent). Default off — the trunk default (Claude) omits the flag
   // and keeps its native memory untouched.
   if (provider.usesMemoryScaffold) ensureMemoryScaffold();
+
+  // A provider whose harness re-establishes its own context window needs the
+  // hook that re-renders memory at startup / clear / compact. Optional call:
+  // this fork's memory model is file-based and Claude implements nothing here,
+  // so an unconditional call would break the default provider.
+  provider.registerMemorySessionHook?.(MEMORY_SESSION_HOOK);
 
   await runPollLoop({
     provider,

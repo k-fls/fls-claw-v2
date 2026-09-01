@@ -1,3 +1,5 @@
+import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
+
 export interface AgentProvider {
   /**
    * True if the provider's underlying SDK handles slash commands natively and
@@ -13,6 +15,20 @@ export interface AgentProvider {
    * provider, never gated on a provider name.
    */
   readonly usesMemoryScaffold?: boolean;
+
+  /**
+   * Optional. Providers whose harness re-establishes its own context window
+   * (a native SessionStart / clear / compact hook) get the runner's memory
+   * hook registration here, and are responsible for wiring it into whatever
+   * config their harness reads.
+   *
+   * Optional rather than required because this fork's memory model is
+   * file-based: `ensureMemoryScaffold` writes the tree into the agent's
+   * workspace and the composed project doc points at it, which is all Claude
+   * needs. A provider that wants the hook opts in by implementing this; one
+   * that does not is simply never called.
+   */
+  registerMemorySessionHook?(hook: MemorySessionHookRegistration): void;
 
   /**
    * Optional. Called by the poll-loop after each completed exchange (a
