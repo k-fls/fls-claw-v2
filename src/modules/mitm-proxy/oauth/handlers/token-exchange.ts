@@ -135,6 +135,11 @@ export function buildTokenExchangeHandler(
       (body, _statusCode) => {
         const parsed = parseBody(body);
         if (!parsed?.fields.access_token) return body;
+        // Upstream's own values, before any field is swapped for a substitute.
+        // Derivation reads a credential out of another field's contents, so it
+        // has to see what the provider sent rather than what the container is
+        // about to be handed.
+        const upstreamFields = { ...parsed.fields };
 
         try {
           const authFields = captureAuthFields(capturedReq, parsed.fields, provider);
@@ -239,7 +244,7 @@ export function buildTokenExchangeHandler(
           // Stored only — writing a substitute into a field the client never
           // expected would corrupt the shape it parses. The spawn
           // contribution mints the substitute when it writes them out.
-          for (const [credentialPath, real] of Object.entries(provider.deriveCredentials?.(parsed.fields) ?? {})) {
+          for (const [credentialPath, real] of Object.entries(provider.deriveCredentials?.(upstreamFields) ?? {})) {
             if (!real) continue;
             ctx
               .resolverFor(groupScope)

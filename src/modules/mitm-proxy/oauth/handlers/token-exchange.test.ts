@@ -333,3 +333,41 @@ describe('buildTokenExchangeHandler — response transform', () => {
     expect(engine.getOrCreateSubstitute).not.toHaveBeenCalled();
   });
 });
+
+describe('buildTokenExchangeHandler — derived credentials', () => {
+  /** A JWT in shape only, carrying `claims` a provider can derive from. */
+  function jwt(claims: Record<string, unknown>): string {
+    const seg = (o: unknown): string => Buffer.from(JSON.stringify(o)).toString('base64url');
+    return `${seg({ alg: 'RS256' })}.${seg(claims)}.sig`;
+  }
+
+  // Derivation reads a credential out of ANOTHER field's contents, and that
+  // field is itself substituted on the way back. Reading the post-substitution
+  // fields decodes the synthetic token instead of upstream's, so nothing is
+  // derived — which left the spawn contribution one value short and, finding it
+  // missing, silently declined to write the container's auth file at all.
+  it('derives from upstream values, not from the substitutes already swapped in', async () => {
+    const store = vi.fn();
+    const engine = makeEngine({ getOrCreateSubstitute: vi.fn(() => jwt({ exp: 1 })) });
+
+    const { transformResponse } = await capture(makeCtx(engine, store), {
+      credentialResponseFields: [{ field: 'id_token', credentialPath: 'id_token' }],
+      deriveCredentials: (fields) => {
+        const claims = JSON.parse(Buffer.from(String(fields.id_token).split('.')[1], 'base64url').toString());
+        const account = claims['https://api.openai.com/auth']?.chatgpt_account_id;
+        return account ? { account_id: account } : {};
+      },
+    });
+
+    transformResponse(
+      JSON.stringify({
+        access_token: 'REAL_ACCESS',
+        id_token: jwt({ 'https://api.openai.com/auth': { chatgpt_account_id: 'acct-42' } }),
+      }),
+      200,
+    );
+
+    const derived = store.mock.calls.find((c) => c[2] === 'account_id');
+    expect(derived?.[3].value).toBe('acct-42');
+  });
+});
