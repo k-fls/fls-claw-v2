@@ -34,6 +34,13 @@ vi.mock('../../credentials/index.js', () => ({
     id === h.providerProvider
       ? { id, getExtension: (t: unknown) => (t === h.REAUTH && h.hasReauth ? { reauth: h.reauth } : undefined) }
       : undefined,
+  // Pulled in transitively by credential-acquisition, which owns the runtime
+  // menu. No provider declares a runtime label here, so the menu never opens
+  // and these cases exercise the single-runtime path.
+  defineExtension: (id: string) => ({ id }),
+  getAllCredentialProviders: () => [],
+  availableProviderIds: () => new Set<string>(),
+  AGENT_RUNTIME: { id: 'agent-runtime' },
 }));
 
 import { handleAuthCommand, _resetAuthCommandForTests } from './auth.js';

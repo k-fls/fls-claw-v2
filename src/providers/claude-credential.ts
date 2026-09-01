@@ -386,6 +386,7 @@ async function runAuthMenu(
 }
 
 const acquire: AcquireExt = {
+  runtimeLabel: 'Claude — Anthropic subscription or API key',
   acquire: (ctx: AcquireContext) =>
     runAuthMenu(ctx.origin, ctx.credentialScope, {
       intro: 'I need a Claude credential to continue. How would you like to provide it?',

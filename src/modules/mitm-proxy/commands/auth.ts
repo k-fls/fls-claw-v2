@@ -31,6 +31,7 @@ import { getMessagingGroupAgents } from '../../../db/messaging-groups.js';
 import { BeginInteractionConflictError, type InteractionOrigin } from '../../../host-interactions.js';
 import { log } from '../../../log.js';
 import { asCredentialScope, getCredentialProvider, REAUTH } from '../../credentials/index.js';
+import { chooseRuntimeOn, offerableRuntimes, runtimeNeedsCredential } from '../../../credential-acquisition.js';
 import type { AgentGroup } from '../../../types.js';
 
 export const AUTH_HELP = 'Re-authenticate the agent group — /auth [group-folder]';
@@ -126,29 +127,10 @@ export function handleAuthCommand(ctx: HostCommandContext): void {
   inFlight.add(dedupKey);
   log.info('Auth command: starting interactive (re)auth', { folder: group.folder, providerId, userId: ctx.userId });
 
-  // Launch fire-and-forget: the provider opens its interaction slot
+  // Launch fire-and-forget: the first step opens its interaction slot
   // synchronously (before its first await), so the slot is active by the time
   // this handler returns — the router must NOT block on the minutes-long flow.
-  let flow: Promise<boolean>;
-  try {
-    flow = reauthExt.reauth({
-      origin,
-      credentialScope: asCredentialScope(group.folder),
-      classification: 'manual',
-      reason: '',
-    });
-  } catch (err) {
-    inFlight.delete(dedupKey);
-    if (err instanceof BeginInteractionConflictError) {
-      ctx.replyText('Another interactive flow is already active on this channel. Finish or cancel it first.');
-    } else {
-      log.error('Auth command: flow threw at launch', { dedupKey, err });
-      ctx.replyText('Command failed.');
-    }
-    return;
-  }
-
-  void flow.then(
+  void runAuthFlow(origin, group, providerId).then(
     (stored) => {
       inFlight.delete(dedupKey);
       if (stored) {
@@ -164,6 +146,52 @@ export function handleAuthCommand(ctx: HostCommandContext): void {
       log.error('Auth command: flow failed', { dedupKey, err });
     },
   );
+}
+
+/**
+ * Settle which runtime the group should be on, then authenticate it.
+ *
+ * Where more than one runtime is offerable the menu is shown with the current
+ * one marked, so `/auth` is both "re-authenticate me" and "switch me" without a
+ * second verb; picking the current entry is exactly the old behaviour. A single
+ * offerable runtime skips the menu, so an install with one agent sees no change.
+ *
+ * Resolves true when the group's credential state changed and its containers
+ * should restart.
+ */
+async function runAuthFlow(origin: InteractionOrigin, group: AgentGroup, currentProviderId: string): Promise<boolean> {
+  let providerId = currentProviderId;
+
+  const options = offerableRuntimes();
+  if (options.length > 1) {
+    const chosen = await chooseRuntimeOn(
+      origin,
+      group.id,
+      options.map((o) => (o.id === currentProviderId ? { ...o, label: `${o.label} — current` } : o)),
+      'Which agent should this group run as?',
+    );
+    if (!chosen) return false;
+    providerId = chosen;
+  }
+
+  // A switch to a runtime that already holds a credential needs no sign-in;
+  // the restart is the whole job.
+  if (providerId !== currentProviderId && !runtimeNeedsCredential(group.folder, providerId)) {
+    origin.writeReply(`Switched to *${providerId}*, which is already signed in. Restarting the agent.`);
+    return true;
+  }
+
+  const ext = getCredentialProvider(providerId)?.getExtension?.(REAUTH);
+  if (!ext) {
+    origin.writeReply(`Provider *${providerId}* does not support interactive (re)authentication.`);
+    return false;
+  }
+  return ext.reauth({
+    origin,
+    credentialScope: asCredentialScope(group.folder),
+    classification: 'manual',
+    reason: '',
+  });
 }
 
 /** Test hook — clears dedup state between cases. */
