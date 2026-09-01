@@ -196,6 +196,13 @@ export function callbackQueryFrom(input: string): URLSearchParams | null {
   return params.get('code') && params.get('state') ? params : null;
 }
 
+/** The auth bridge's callback seam: recognise a paste, then hand it to the CLI. */
+export const pastedCallbackHandler = {
+  isCallback: (pasted: string): boolean => callbackQueryFrom(pasted) !== null,
+  deliver: (containerName: string, pasted: string, authUrl: string): Promise<boolean> =>
+    deliverPastedCallback(containerName, pasted, authUrl),
+};
+
 export async function deliverPastedCallback(containerName: string, pasted: string, authUrl: string): Promise<boolean> {
   const params = callbackQueryFrom(pasted);
   const target = localhostCallbackFromAuthUrl(authUrl);

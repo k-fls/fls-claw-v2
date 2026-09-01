@@ -129,7 +129,12 @@ export { buildMitmProxyContribution, type MitmProxyContribution } from './observ
 // Interactive OAuth host surface (device-code notice + authorize-stub code
 // relay) + the production code-delivery primitive. The host passes both to
 // `initOAuthModule` at boot.
-export { oauthInteractive, dockerExecDeliver, deliverPastedCallback } from './oauth/oauth-interactive.js';
+export {
+  oauthInteractive,
+  dockerExecDeliver,
+  deliverPastedCallback,
+  pastedCallbackHandler,
+} from './oauth/oauth-interactive.js';
 export { borrowedCredentialNotifier } from './oauth/borrowed-cred-notify.js';
 export type { OAuthEvents, AuthCodeDeliver } from './oauth/handler-context.js';
 

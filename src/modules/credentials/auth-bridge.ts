@@ -122,13 +122,17 @@ export function bindAuthEpisodeContainerIP(nonce: string, ip: string, containerN
  * module, which already imports this one. Returns false when the paste is not a
  * usable callback URL, so the prompt can ask again.
  */
-export type AuthCallbackDeliverer = (containerName: string, pasted: string, authUrl: string) => Promise<boolean>;
+export interface AuthCallbackHandler {
+  /** Whether a paste carries a usable callback, checked before the slot closes. */
+  isCallback(pasted: string): boolean;
+  deliver(containerName: string, pasted: string, authUrl: string): Promise<boolean>;
+}
 
-let callbackDeliverer: AuthCallbackDeliverer | null = null;
+let callbackHandler: AuthCallbackHandler | null = null;
 
-/** Wire the callback deliverer. Called once at boot. */
-export function setAuthCallbackDeliverer(fn: AuthCallbackDeliverer): void {
-  callbackDeliverer = fn;
+/** Wire the callback handler. Called once at boot. */
+export function setAuthCallbackHandler(handler: AuthCallbackHandler): void {
+  callbackHandler = handler;
 }
 
 /**
@@ -210,9 +214,26 @@ function promptForCode(episode: AuthEpisode, url: string, instructions: string |
     (instructions ?? fallback) +
     '\n\nOr reply "cancel".';
 
+  // Validating here rather than after the slot closes is what lets a mistyped or
+  // client-mangled paste be corrected: `pastePlainOn` re-prompts on a validation
+  // failure, keeping the episode and its auth container alive. Ending the
+  // episode instead would strand a user whose chat client shortened the URL,
+  // with a fresh sign-in as the only way back.
+  const validate = wantsCallback
+    ? (text: string): string | null =>
+        callbackHandler?.isCallback(text) === false
+          ? looksShortened(text)
+            ? 'That was the shortened link text, not the URL — its code and state are missing. ' +
+              'Paste it again wrapped in backticks so Slack sends it verbatim.'
+            : 'That does not carry the `code=` and `state=` values. Copy the full URL from the ' +
+              'address bar and paste it wrapped in backticks.'
+          : null
+    : (text: string): string | null =>
+        text.trim().length > 0 ? null : 'That looked empty — paste the code, or reply "cancel".';
+
   pastePlainOn(episode.origin, {
     prompt,
-    validate: (text) => (text.trim().length > 0 ? null : 'That looked empty — paste the code, or reply "cancel".'),
+    validate,
   }).then(
     (r) => {
       const submitted = r.reason === 'submitted' && r.text ? r.text.trim() : null;
@@ -259,7 +280,7 @@ async function completeCallback(episode: AuthEpisode, pasted: string | null): Pr
     episode.code.resolve({ cancelled: true });
     return;
   }
-  if (!callbackDeliverer || !episode.containerName || !episode.authUrl) {
+  if (!callbackHandler || !episode.containerName || !episode.authUrl) {
     log.error('auth-bridge: no callback deliverer or container for episode', { scopeFolder: episode.scopeFolder });
     episode.origin.writeReply('Could not complete the sign-in — the auth container is gone. Try again.');
     episode.code.resolve({ cancelled: true });
@@ -267,20 +288,15 @@ async function completeCallback(episode: AuthEpisode, pasted: string | null): Pr
   }
   let delivered = false;
   try {
-    delivered = await callbackDeliverer(episode.containerName, pasted, episode.authUrl);
+    delivered = await callbackHandler.deliver(episode.containerName, pasted, episode.authUrl);
     // eslint-disable-next-line no-catch-all/no-catch-all -- any failure is "not delivered"
   } catch (err) {
     log.error('auth-bridge: callback delivery threw', { scopeFolder: episode.scopeFolder, err });
   }
+  // The paste already passed `isCallback`, so reaching here means the delivery
+  // itself failed rather than the input.
   if (!delivered) {
-    episode.origin.writeReply(
-      looksShortened(pasted)
-        ? 'That was the shortened link text, not the URL — the code and state are missing from it. ' +
-            'Paste it again wrapped in backticks so the chat client sends it verbatim, ' +
-            'then run the sign-in again.'
-        : 'That did not look like the callback URL — it needs the `code=` and `state=` values ' +
-            'from the address bar. Run the sign-in again to retry.',
-    );
+    episode.origin.writeReply('Could not hand the callback to the sign-in. Run the sign-in again to retry.');
   }
   episode.code.resolve({ cancelled: true });
 }

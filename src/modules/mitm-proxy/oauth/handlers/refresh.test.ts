@@ -92,9 +92,7 @@ function buildCtx(opts: { seed?: Array<{ scope: CredentialScope; cred: Credentia
           credId === CRED_OAUTH ? (byScope.get(scope as string) ?? null) : null,
         store: (scope: CredentialScope, p: string, credId: string, cred: Credential) => {
           if ((scope as string) !== own) {
-            throw new Error(
-              `resolver.store: cannot write under scope '${scope}' from resolver owning '${own}'`,
-            );
+            throw new Error(`resolver.store: cannot write under scope '${scope}' from resolver owning '${own}'`);
           }
           storeCalls.push({ ownerScope: own, writeScope: scope as string });
           store(scope, p, credId, cred);
@@ -307,7 +305,11 @@ describe('tryRefresh — borrowed-credential expiry events', () => {
   const borrower: GroupScope = asGroupScope('borrower-group');
 
   it('fires onBorrowedRefreshFailed (not onCredentialHealed) when a borrowed refresh is rejected', async () => {
-    const fetchImpl = vi.fn(async () => ({ ok: false, status: 400, json: async () => ({}) })) as unknown as typeof fetch;
+    const fetchImpl = vi.fn(async () => ({
+      ok: false,
+      status: 400,
+      json: async () => ({}),
+    })) as unknown as typeof fetch;
     const { ctx, onFailed, onHealed } = buildCtx({
       seed: [{ scope: GRANTOR, cred: cred('GRANTOR_ACCESS', 'GRANTOR_REFRESH') }],
       fetchImpl,
@@ -341,7 +343,11 @@ describe('tryRefresh — borrowed-credential expiry events', () => {
   });
 
   it('does NOT fire onBorrowedRefreshFailed for a self-owned refresh failure', async () => {
-    const fetchImpl = vi.fn(async () => ({ ok: false, status: 400, json: async () => ({}) })) as unknown as typeof fetch;
+    const fetchImpl = vi.fn(async () => ({
+      ok: false,
+      status: 400,
+      json: async () => ({}),
+    })) as unknown as typeof fetch;
     const { ctx, onFailed } = buildCtx({
       seed: [{ scope: OWN, cred: cred('OWN_ACCESS', 'OWN_REFRESH') }],
       fetchImpl,
