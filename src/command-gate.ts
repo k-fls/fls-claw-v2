@@ -267,7 +267,8 @@ export function parseSlashCommand(content: string): ParsedSlashCommand | null {
  *
  * Precedence (highest first):
  *   1. Not a slash command → pass
- *   2. FILTERED_COMMANDS → filter (defensive — also caught pre-fanout)
+ *   2. FILTERED_COMMANDS, when nothing is registered for it → filter
+ *      (defensive — also caught pre-fanout)
  *   3. Registered 'agent'-scope host command → handle (or deny if anonymous
  *      or the caller fails the command's declared `access` level)
  *   4. ADMIN_COMMANDS → pass (admin) / deny (non-admin)
@@ -284,9 +285,13 @@ export function gateCommand(content: string, userId: string | null, agentGroupId
 
   const command = parsed.command;
 
-  if (FILTERED_COMMANDS.has(command)) return { action: 'filter' };
-
   const entry = hostCommands.get(command);
+  // A host registration wins over the filter list: filtering exists to keep a
+  // CLI built-in from reaching the container, and a host handler does that too.
+  // Without this a registered command is advertised by `/help` and then
+  // silently swallowed.
+  if (!entry && FILTERED_COMMANDS.has(command)) return { action: 'filter' };
+
   if (entry && entry.scope === 'agent') {
     if (userId == null) return { action: 'deny', command };
     if (!passesCommandAccess(entry.access, userId, agentGroupId)) return { action: 'deny', command };
@@ -498,9 +503,11 @@ export function classifyAtMessagingGroup(content: string, userId: string | null)
 
   const command = parsed.command;
 
-  if (FILTERED_COMMANDS.has(command)) return { action: 'filter' };
-
   const entry = hostCommands.get(command);
+  // Registered at any scope → not filtered here; an agent-scope command is
+  // dispatched by the per-agent classifier after fan-out.
+  if (!entry && FILTERED_COMMANDS.has(command)) return { action: 'filter' };
+
   if (entry && entry.scope !== 'agent') {
     if (userId == null) return { action: 'deny', command };
     // 'global-admin' is enforceable here (no group needed). 'group-admin'

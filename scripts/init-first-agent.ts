@@ -211,7 +211,10 @@ async function main(): Promise<void> {
   // — so a non-Claude group never gets stale CLAUDE.* files written here.
   ensureContainerConfig(ag.id);
   // Runtime provider lives on the config row, not the deprecated agent_provider.
-  if (pickedProvider && pickedProvider !== 'claude') {
+  // Recorded even for the default: an unset column means nobody has chosen yet,
+  // which is what makes the wake-time gate offer the runtime menu — an operator
+  // who already picked here must not be asked again on the first message.
+  if (pickedProvider) {
     updateContainerConfigScalars(ag.id, { provider: pickedProvider });
   }
   const groupDir = path.resolve(GROUPS_DIR, folder);

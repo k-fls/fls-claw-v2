@@ -64,6 +64,7 @@ import './cli/commands/index.js';
 
 // Top-level host commands. Side-effect registration.
 import './commands/stop.js'; // /stop (B1a)
+import './commands/logout.js'; // /logout
 import './cli/delivery-action.js';
 import { startCliServer } from './cli/socket-server.js';
 

@@ -59,6 +59,7 @@ import { log } from '../log.js';
 import type { InteractionOrigin } from '../host-interactions.js';
 import { pastePgpOn, pickOptionOn } from '../modules/interactions/index.js';
 import { ACQUIRE, type AcquireExt, type AcquireContext } from '../credential-acquisition.js';
+import { getProviderContainerConfig } from './provider-container-registry.js';
 import {
   oauthSubstitutesFor,
   getTokenEngine,
@@ -482,6 +483,12 @@ async function runCodexAuthMenu(
 }
 
 const acquire: AcquireExt = {
+  runtimeLabel: 'Codex — OpenAI ChatGPT subscription',
+  // The credential half registers unconditionally from `src/index.ts`; the
+  // runtime half arrives with the `/add-codex` payload, which is what puts an
+  // entry in the provider-container registry. Without that entry the group
+  // would be switched to a runtime that cannot spawn.
+  isRuntimeAvailable: () => getProviderContainerConfig(PROVIDER_ID) !== undefined,
   acquire: (ctx: AcquireContext) =>
     runCodexAuthMenu(
       ctx.origin,

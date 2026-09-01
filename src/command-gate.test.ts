@@ -117,9 +117,9 @@ describe('gateCommand — existing behaviors', () => {
     expect(gateCommand('hello', 'user-1', 'ag-1')).toEqual({ action: 'pass' });
   });
 
-  it('filtered commands return filter', () => {
+  it('filtered commands return filter when nothing is registered for them', () => {
     expect(gateCommand(jsonChat('/login'), 'user-1', 'ag-1')).toEqual({ action: 'filter' });
-    expect(gateCommand(jsonChat('/logout'), 'user-1', 'ag-1')).toEqual({ action: 'filter' });
+    expect(gateCommand(jsonChat('/doctor'), 'user-1', 'ag-1')).toEqual({ action: 'filter' });
   });
 
   it('admin commands: admin user passes', () => {
@@ -161,6 +161,26 @@ describe('isAdmin', () => {
     ensureUser('o');
     grantRole({ user_id: 'o', role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
     expect(isAdmin('o', 'ag-1')).toBe(true);
+  });
+});
+
+describe('host registration beats the filter list', () => {
+  // A registered handler keeps the command off the container just as filtering
+  // would, so the registration wins. Without this the command is advertised by
+  // `/help` and then silently swallowed — how `/logout` shipped dead.
+  it('dispatches a registered command whose name is also filtered', () => {
+    const handler: HostCommandHandler = vi.fn();
+    registerHostCommand('/remote-control', handler, { scope: 'agent', access: 'any' });
+
+    const result = gateCommand(jsonChat('/remote-control'), 'user-1', 'ag-1');
+
+    expect(result.action).toBe('handle');
+  });
+
+  it('does not filter it pre-fanout either, so the per-agent pass can dispatch', () => {
+    registerHostCommand('/config', vi.fn(), { scope: 'agent', access: 'any' });
+
+    expect(classifyAtMessagingGroup(jsonChat('/config'), 'user-1')).toEqual({ action: 'none' });
   });
 });
 
