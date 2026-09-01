@@ -120,7 +120,8 @@ async function main(): Promise<void> {
   const spec = specFor(mode);
   const cli = spawnCli(mode);
 
-  if (!spec.relaysUrl) {
+  const authUrlPattern = spec.authUrlPattern;
+  if (!authUrlPattern) {
     // The proxy relays the user code; nothing to scrape and nothing to feed
     // back. Just let the CLI finish its own polling.
     await cli.waitExit(spec.exitWaitMs);
@@ -132,7 +133,7 @@ async function main(): Promise<void> {
   const client = makeAuthRpcClient({ baseUrl: `http://host.docker.internal:${port}`, nonce });
 
   const urlMatch = await cli.waitFor(/https?:\/\/\S+/, URL_WAIT_MS);
-  const url = urlMatch ? extractOAuthUrl(cli.output, spec.authUrlPattern!) : null;
+  const url = urlMatch ? extractOAuthUrl(cli.output, authUrlPattern) : null;
   if (!url) {
     // Carry what the CLI actually said. Without it a missing binary, an
     // unwritable home and a genuine timeout are the same line in the host log,

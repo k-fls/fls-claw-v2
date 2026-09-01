@@ -35,10 +35,23 @@ describe('specFor', () => {
     expect(specFor('auth_login').codeReturn).toBe('stdin');
   });
 
+  // A mode that relays a URL but names no shape to look for matches the empty
+  // string and extracts nothing, so the sign-in dies reporting no URL. Asserted
+  // per mode rather than on one of them: `auth_login` was the one that lost its
+  // pattern, and a spot check of `setup_token` would have passed.
+  it.each(['setup_token', 'auth_login', 'codex_login'] as const)(
+    'gives %s a pattern to scrape, since it relays a URL',
+    (mode) => {
+      const spec = specFor(mode);
+      expect(spec.codeReturn).not.toBe('none');
+      expect(spec.authUrlPattern).toBeInstanceOf(RegExp);
+    },
+  );
+
   it('maps the Codex device mode to a device login that relays no URL', () => {
     const spec = specFor('codex_device');
     expect(spec.command).toBe('codex login --device-auth');
-    expect(spec.relaysUrl).toBe(false);
+    expect(spec.authUrlPattern).toBeUndefined();
     expect(spec.codeReturn).toBe('none');
   });
 
@@ -47,7 +60,7 @@ describe('specFor', () => {
   it('maps the Codex browser mode to a URL relay with a host-delivered callback', () => {
     const spec = specFor('codex_login');
     expect(spec.command).toBe('codex login');
-    expect(spec.relaysUrl).toBe(true);
+    expect(spec.authUrlPattern).toBeInstanceOf(RegExp);
     expect(spec.codeReturn).toBe('callback');
   });
 

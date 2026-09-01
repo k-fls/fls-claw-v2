@@ -19,17 +19,17 @@ export interface AuthModeSpec {
   /** Command line run under the PTY. */
   command: string;
   /**
-   * Which authorize URL to scrape. Per-CLI because each prints other links
-   * alongside it — `codex login` also prints a device-auth hint — and matching
-   * the wrong one relays a page the user cannot authorize on.
+   * Which authorize URL to scrape, and — by its presence — whether the runner
+   * relays one at all. A device flow omits it: the proxy relays the user code
+   * out of the device-authorization response instead.
+   *
+   * The pattern is per-CLI because each prints other links alongside the
+   * authorize URL (`codex login` also prints a device-auth hint), so matching
+   * the first URL would relay a page the user cannot authorize on. Carrying the
+   * flag on the pattern rather than beside it keeps a mode from claiming to
+   * relay a URL while naming no shape to look for.
    */
   authUrlPattern?: RegExp;
-  /**
-   * Whether the runner scrapes the CLI's authorization URL and relays it to the
-   * host. False for a device flow: the proxy relays the user code out of the
-   * device-authorization response instead.
-   */
-  relaysUrl: boolean;
   /**
    * How the authorization gets back to the CLI.
    *
@@ -56,19 +56,17 @@ const SPECS: Record<AuthMode, AuthModeSpec> = {
   setup_token: {
     command: 'claude setup-token',
     authUrlPattern: CLAUDE_OAUTH_URL_RE,
-    relaysUrl: true,
     codeReturn: 'stdin',
     exitWaitMs: CODE_RELAY_EXIT_WAIT_MS,
   },
   auth_login: {
     command: 'claude auth login',
-    relaysUrl: true,
+    authUrlPattern: CLAUDE_OAUTH_URL_RE,
     codeReturn: 'stdin',
     exitWaitMs: CODE_RELAY_EXIT_WAIT_MS,
   },
   codex_device: {
     command: 'codex login --device-auth',
-    relaysUrl: false,
     codeReturn: 'none',
     exitWaitMs: DEVICE_EXIT_WAIT_MS,
   },
@@ -79,7 +77,6 @@ const SPECS: Record<AuthMode, AuthModeSpec> = {
   codex_login: {
     command: 'codex login',
     authUrlPattern: CODEX_OAUTH_URL_RE,
-    relaysUrl: true,
     codeReturn: 'callback',
     exitWaitMs: DEVICE_EXIT_WAIT_MS,
   },
