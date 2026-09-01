@@ -49,6 +49,8 @@ import { loadDiscoveryProviders, type DiscoveryLoadResult } from './discovery-lo
 import { startDiscoveryRefreshSchedule, type RefreshResult, type RefreshScheduleHandle } from './discovery-refresh.js';
 import { toSubstitutingProvider } from './provider-adapter.js';
 import type { AuthCodeDeliver, BorrowedCredentialEvents, HandlerContext, OAuthEvents } from './handler-context.js';
+import { buildDefaultTransportCodec } from './handlers/default-codec.js';
+import { swapSubstituteHeaders } from './handlers/bearer-swap.js';
 import type { OAuthProvider } from './types.js';
 import type { SubstitutesSpec, SubstitutingProvider } from '../types.js';
 import { logger } from '../logger.js';
@@ -219,6 +221,22 @@ export function initOAuthModule(opts: InitOAuthModuleOptions): OAuthModuleHandle
     deliverCallback: opts.deliverCallback,
     borrowedCredentialEvents: opts.borrowedCredentialEvents,
   };
+
+  // Protocol upgrades cannot ride the buffered handlers, but their credential
+  // lives entirely in the handshake headers — so the proxy tunnels them and
+  // asks this to swap on the way past. Registered here because the codecs and
+  // the handler context are this module's, not the proxy's.
+  // The default codec, deliberately: a handshake carries a scheme-prefixed
+  // bearer, which is exactly what it decodes. A provider with a bespoke
+  // transport codec (GitHub's Basic-over-git-HTTPS) does not open WebSockets,
+  // and reaching its `OAuthProvider` from here is not possible anyway for the
+  // programmatically-registered ones.
+  const upgradeCodec = buildDefaultTransportCodec(undefined);
+  opts.proxy.setUpgradeHeaderSwapper(
+    (headers, targetHost, scope) =>
+      swapSubstituteHeaders(headers, { codec: upgradeCodec, ctx, groupScope: scope, scopeAttrs: {}, targetHost })
+        .length,
+  );
 
   const registered: string[] = [];
   for (const provider of loaded.providers.values()) {

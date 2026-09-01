@@ -24,7 +24,7 @@ import { createServer, IncomingMessage, request as httpRequest, Server, ServerRe
 import { request as httpsRequest, RequestOptions } from 'https';
 import { connect as netConnect, Socket } from 'net';
 import { Duplex, PassThrough } from 'stream';
-import { TLSSocket } from 'tls';
+import { connect as tlsConnect, TLSSocket } from 'tls';
 import type { Server as NetServer } from 'net';
 
 import { lookupContainerIP } from '../container-bootstrap/index.js';
@@ -151,6 +151,16 @@ interface MitmMeta {
   /** Tap exclusion check — set when connection is tapped. */
   checkExclusion?: import('./proxy-tap-logger.js').TapExclusionCheck;
 }
+
+/**
+ * Swap substitutes in an upgrade handshake's headers, in place. Returns the
+ * number replaced (for logging). Registered by the OAuth module at init.
+ */
+export type UpgradeHeaderSwapper = (
+  headers: Record<string, string | number | string[] | undefined>,
+  targetHost: string,
+  scope: GroupScope,
+) => number;
 
 /** Options for the credential proxy. */
 export interface CredentialProxyOptions {
@@ -427,6 +437,12 @@ export class CredentialProxy {
    */
   private mitmDispatcher: Server;
   private socketMeta = new WeakMap<object, MitmMeta>();
+  /**
+   * Swaps substitutes in a protocol-upgrade handshake's headers, returning how
+   * many it replaced. Supplied by the OAuth module, which owns the handler
+   * context and the codecs; unset here means upgrades tunnel unmodified.
+   */
+  private _upgradeSwapper: UpgradeHeaderSwapper | null = null;
 
   constructor() {
     this.mitmDispatcher = createServer((req, res) => {
@@ -435,6 +451,23 @@ export class CredentialProxy {
       // the process via uncaughtException.
       req.on('error', noop);
       res.on('error', noop);
+
+      // A protocol upgrade is not interceptable: the swap works on buffered
+      // headers and bodies, and an upgraded socket carries neither. Refuse it
+      // immediately rather than forwarding it unswapped — a client that prefers
+      // WebSockets (the Codex CLI does, for `wss://api.openai.com/v1/responses`)
+      // falls back to HTTPS on the first refusal, whereas letting the handshake
+      // through reaches upstream with no usable credential and produces a retry
+      // storm plus a 401 that reads like an authentication failure.
+      if (req.headers.upgrade) {
+        logger.info(
+          { url: req.url, upgrade: req.headers.upgrade },
+          'mitm: refusing protocol upgrade — not interceptable, client should fall back',
+        );
+        res.writeHead(501, { connection: 'close' });
+        res.end('Protocol upgrade not supported');
+        return;
+      }
 
       const meta = this.socketMeta.get(req.socket);
       if (!meta) {
@@ -461,6 +494,80 @@ export class CredentialProxy {
         proxyPipe(req, res, meta.targetHost, meta.targetPort, () => {}, meta.scope);
       }
     });
+
+    // Node routes an upgrade request to `'upgrade'`, never to `'request'`, and
+    // with no listener it destroys the socket silently — which a client reads
+    // as a transport fault and retries, rather than as a refusal it should fall
+    // back from. Answer explicitly instead. Same reasoning as the `upgrade`
+    // check in the request handler above; both arrival shapes are covered
+    // because which one fires depends on how the client framed the handshake.
+    this.mitmDispatcher.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) => {
+      socket.on('error', noop);
+      const meta = this.socketMeta.get(socket);
+      if (!meta) {
+        logger.error({ url: req.url }, 'MITM upgrade with no socket metadata');
+        socket.destroy();
+        return;
+      }
+      void this.tunnelUpgrade(req, socket, head, meta);
+    });
+  }
+
+  /**
+   * Forward a protocol upgrade (WebSocket) with its credentials swapped.
+   *
+   * The buffered path cannot serve an upgrade: it reads a whole request and a
+   * whole response, and an upgraded connection has neither. But the credential
+   * on this path lives entirely in the handshake — the frames that follow carry
+   * none — so swapping the handshake headers and then piping the two sockets
+   * byte-for-byte is a complete interception, not a partial one.
+   *
+   * Refusing instead is not an option in practice: a client that prefers
+   * WebSockets does not necessarily fall back on a refusal. The Codex CLI
+   * retries and reports the error, so refusing strands the agent.
+   *
+   * Swapping reuses `swapSubstituteHeaders`, the same helper the buffered
+   * handler uses, so the bound-domain guard and the codec's encoding rules hold
+   * here identically. An upgrade to a host with no matching rule is tunnelled
+   * unmodified — the substitute travels, which fails closed exactly as it does
+   * on an unmatched path elsewhere.
+   */
+  private async tunnelUpgrade(req: IncomingMessage, clientSocket: Socket, head: Buffer, meta: MitmMeta): Promise<void> {
+    const rule = this.findMatchingRule(meta.targetHost, req.url || '/', meta.sourceIP);
+    const headers: Record<string, string | number | string[] | undefined> = { ...req.headers, host: meta.targetHost };
+    delete headers['proxy-connection'];
+    delete headers['proxy-authorization'];
+
+    // The swap needs the OAuth module's handler context, which lives there and
+    // not here — same reason the buffered handlers are built there and
+    // registered as rules. Absent (tests, no OAuth module) → tunnel unmodified.
+    const swappedCount = rule && this._upgradeSwapper ? this._upgradeSwapper(headers, meta.targetHost, meta.scope) : 0;
+
+    logger.info(
+      { url: req.url, host: meta.targetHost, scope: meta.scope, matched: !!rule, swapped: swappedCount },
+      'mitm: tunnelling protocol upgrade',
+    );
+
+    const upstream = tlsConnect(
+      { host: meta.targetHost, port: meta.targetPort, servername: meta.targetHost, ALPNProtocols: ['http/1.1'] },
+      () => {
+        const lines = [`${req.method} ${req.url} HTTP/1.1`];
+        for (const [name, value] of Object.entries(headers)) {
+          if (value === undefined) continue;
+          for (const v of Array.isArray(value) ? value : [value]) lines.push(`${name}: ${String(v)}`);
+        }
+        upstream.write(lines.join('\r\n') + '\r\n\r\n');
+        if (head.length) upstream.write(head);
+        clientSocket.pipe(upstream);
+        upstream.pipe(clientSocket);
+      },
+    );
+    upstream.on('error', (err) => {
+      logger.warn({ err, host: meta.targetHost }, 'mitm: upgrade tunnel upstream error');
+      clientSocket.destroy();
+    });
+    clientSocket.on('error', () => upstream.destroy());
+    clientSocket.on('close', () => upstream.destroy());
   }
 
   // ── State management ────────────────────────────────────────────
@@ -665,6 +772,11 @@ export class CredentialProxy {
    * Tests use this to exercise anchor lookup without constructing a full
    * `SubstitutingProvider` literal.
    */
+  /** Register the upgrade-handshake swapper. Called once by the OAuth module. */
+  setUpgradeHeaderSwapper(fn: UpgradeHeaderSwapper): void {
+    this._upgradeSwapper = fn;
+  }
+
   _addHostRuleForTests(hostPattern: RegExp, pathPattern: RegExp, handler: HostHandler, providerId: string): void {
     addRuleToMap(this.anchorRules, hostPattern, pathPattern, handler, providerId);
   }
