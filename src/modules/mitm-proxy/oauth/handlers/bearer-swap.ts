@@ -23,7 +23,7 @@ import { logger } from '../../logger.js';
 import { CRED_OAUTH, asCredentialScope } from '../../types.js';
 import type { CredentialScope, GroupScope } from '../../types.js';
 import type { HandlerContext } from '../handler-context.js';
-import type { CredentialContext, InterceptRule, OAuthProvider } from '../types.js';
+import type { CredentialContext, CredentialTransportCodec, InterceptRule, OAuthProvider } from '../types.js';
 
 import { buildDefaultTransportCodec, parseAuthScheme } from './default-codec.js';
 import { tryRefresh } from './refresh.js';
@@ -110,6 +110,79 @@ function sendUpstreamBuffered(
   });
 }
 
+/**
+ * Scan headers and swap any substitute found for its real value, in place.
+ * Returns one `SwapEntry` per swapped header so a caller can replay the rebuild
+ * after a refresh.
+ *
+ * Shared by the buffered request path and the upgrade tunnel — a WebSocket
+ * handshake carries its credential in exactly these headers, and a second copy
+ * would be a second place for the bound-domain guard to be forgotten.
+ */
+export function swapSubstituteHeaders(
+  headers: HeaderMap,
+  opts: {
+    codec: CredentialTransportCodec;
+    ctx: HandlerContext;
+    groupScope: GroupScope;
+    scopeAttrs: Record<string, string>;
+    targetHost: string;
+  },
+): SwapEntry[] {
+  const { codec, ctx, groupScope, scopeAttrs, targetHost } = opts;
+  const swapped: SwapEntry[] = [];
+  for (const [name, value] of Object.entries(headers)) {
+    if (typeof value !== 'string') continue;
+
+    const scheme = parseAuthScheme(value);
+    const candidate = codec.fromTransport(value, {
+      credentialName: '',
+      scheme,
+      headerName: name,
+      targetHost,
+    });
+    if (!candidate) continue;
+
+    const entry = ctx.tokenEngine.resolveWithRestriction(candidate, groupScope, scopeAttrs);
+    // Nested sub-tokens (oauth/refresh) never travel in headers — skip them.
+    if (!entry || entry.mapping.credentialPath.includes('/')) continue;
+
+    // Bound-domain guard: a credential stamped with a `boundDomain`
+    // (non-global, container-sourced) may only be injected at a request
+    // host sharing its registrable domain. On mismatch, forward the
+    // substitute unswapped (a useless fake) rather than the real token.
+    // `boundDomain` rides on the resolution result — no second lookup.
+    if (entry.boundDomain && !sameRegistrableDomain(targetHost, entry.boundDomain)) {
+      logger.warn(
+        {
+          providerId: entry.mapping.providerId,
+          targetHost,
+          boundDomain: entry.boundDomain,
+        },
+        'bearer-swap: request host outside credential bound domain — forwarding substitute unswapped',
+      );
+      continue;
+    }
+
+    const encodeCtx: CredentialContext = {
+      credentialName: entry.mapping.credentialPath,
+      scheme,
+      headerName: name,
+      targetHost,
+    };
+    const rebuild = (realToken: string): string => codec.toTransport(realToken, encodeCtx);
+    headers[name] = rebuild(entry.realToken);
+    swapped.push({
+      headerName: name,
+      substitute: candidate,
+      credentialId: entry.mapping.credentialPath,
+      credentialScope: entry.mapping.credentialScope,
+      rebuild,
+    });
+  }
+  return swapped;
+}
+
 export function buildBearerSwapHandler(provider: OAuthProvider, rule: InterceptRule, ctx: HandlerContext): HostHandler {
   const refreshStrategy = provider.refreshStrategy;
   // A provider may own its on-wire encoding (e.g. GitHub git-HTTPS Basic);
@@ -152,61 +225,7 @@ export function buildBearerSwapHandler(provider: OAuthProvider, rule: InterceptR
 
     const scopeAttrs = extractScopeAttrs(targetHost, rule);
     const headers = prepareHeaders(clientReq, targetHost);
-
-    // Scan headers, swap substitutes for real values. The codec owns the
-    // on-wire encoding: `fromTransport` extracts the bare candidate, the engine
-    // resolves it, and `toTransport` rebuilds the wire value from the real token
-    // (and again on a refresh replay, via the `rebuild` closure).
-    const swapped: SwapEntry[] = [];
-    for (const [name, value] of Object.entries(headers)) {
-      if (typeof value !== 'string') continue;
-
-      const scheme = parseAuthScheme(value);
-      const candidate = codec.fromTransport(value, {
-        credentialName: '',
-        scheme,
-        headerName: name,
-        targetHost,
-      });
-      if (!candidate) continue;
-
-      const entry = ctx.tokenEngine.resolveWithRestriction(candidate, groupScope, scopeAttrs);
-      // Nested sub-tokens (oauth/refresh) never travel in headers — skip them.
-      if (!entry || entry.mapping.credentialPath.includes('/')) continue;
-
-      // Bound-domain guard: a credential stamped with a `boundDomain`
-      // (non-global, container-sourced) may only be injected at a request
-      // host sharing its registrable domain. On mismatch, forward the
-      // substitute unswapped (a useless fake) rather than the real token.
-      // `boundDomain` rides on the resolution result — no second lookup.
-      if (entry.boundDomain && !sameRegistrableDomain(targetHost, entry.boundDomain)) {
-        logger.warn(
-          {
-            providerId: entry.mapping.providerId,
-            targetHost,
-            boundDomain: entry.boundDomain,
-          },
-          'bearer-swap: request host outside credential bound domain — forwarding substitute unswapped',
-        );
-        continue;
-      }
-
-      const encodeCtx: CredentialContext = {
-        credentialName: entry.mapping.credentialPath,
-        scheme,
-        headerName: name,
-        targetHost,
-      };
-      const rebuild = (realToken: string): string => codec.toTransport(realToken, encodeCtx);
-      headers[name] = rebuild(entry.realToken);
-      swapped.push({
-        headerName: name,
-        substitute: candidate,
-        credentialId: entry.mapping.credentialPath,
-        credentialScope: entry.mapping.credentialScope,
-        rebuild,
-      });
-    }
+    const swapped = swapSubstituteHeaders(headers, { codec, ctx, groupScope, scopeAttrs, targetHost });
 
     // Owning (source) scope per swapped credential — the grantor's scope for a
     // borrowed credential, the requester's own scope otherwise. Refresh dedup

@@ -29,6 +29,7 @@ import { loadConfig } from './config.js';
 import { buildSystemPromptAddendum } from './destinations.js';
 import { ensureEnvVarsFile } from './env-vars.js';
 import { ensureMemoryScaffold } from './memory-scaffold.js';
+import { MEMORY_SESSION_HOOK } from './memory/session-hook.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
@@ -74,9 +75,9 @@ async function main(): Promise<void> {
   // Runtime-generated system-prompt addendum: agent identity (name) plus
   // the live destinations map. Everything else (capabilities, per-module
   // instructions, per-channel formatting) is loaded by Claude Code from
-  // /workspace/agent/CLAUDE.md — the composed entry imports the shared
-  // base (/app/CLAUDE.md) and each enabled module's fragment. Per-group
-  // memory lives in /workspace/agent/CLAUDE.local.md (auto-loaded).
+  // /workspace/agent/CLAUDE.md — one flat file the host composes each spawn
+  // with every instruction source inlined. Per-group memory lives in
+  // /workspace/agent/CLAUDE.local.md (auto-loaded).
   const instructions = buildSystemPromptAddendum(config.assistantName || undefined);
 
   // Discover additional directories mounted at /workspace/extra/*
@@ -126,6 +127,11 @@ async function main(): Promise<void> {
   // boot (idempotent). Default off — the trunk default (Claude) omits the flag
   // and keeps its native memory untouched.
   if (provider.usesMemoryScaffold) ensureMemoryScaffold();
+
+  // Re-renders memory at startup / clear / compact, for a provider whose
+  // harness re-establishes its own context window. File-based-memory providers
+  // implement nothing here.
+  provider.registerMemorySessionHook?.(MEMORY_SESSION_HOOK);
 
   await runPollLoop({
     provider,

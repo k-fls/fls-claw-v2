@@ -331,9 +331,9 @@ async function main(): Promise<void> {
   if (!skip.has('auth')) {
     // Agent runtime pick. Claude is the default and a no-op — choosing it
     // runs the existing Claude auth flow unchanged. A branch provider walks
-    // its own auth (e.g. Codex: ChatGPT subscription or API key, vault-only)
-    // and verifies its payload is wired. The pick installs and authenticates
-    // the runtime; it is NOT an install-wide default — and it is NOT a
+    // its own auth (e.g. Codex, whose credential binds in-channel through the
+    // credential proxy) and verifies its payload is wired. The pick installs
+    // and authenticates the runtime; it is NOT an install-wide default — and it is NOT a
     // creation flag. Provider is a DB property of a group: the creation flows
     // create provider-agnostic groups, and setup sets the picked provider on
     // each via `ncl groups config update --provider` right after creating it
@@ -805,7 +805,7 @@ function sendChatMessage(message: string): Promise<void> {
 // Codex is the only one offered here; opencode/ollama install via their own
 // /add-* skills. Each is installed by its self-contained setup/add-<name>.sh.
 const INSTALLABLE_PROVIDERS = [
-  { value: 'codex', label: 'Codex', hint: 'OpenAI — ChatGPT subscription or API key' },
+  { value: 'codex', label: 'Codex', hint: 'OpenAI — ChatGPT subscription, signed in from chat' },
 ] as const;
 
 async function askAgentProviderChoice(): Promise<string> {

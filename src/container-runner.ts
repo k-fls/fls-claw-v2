@@ -11,6 +11,7 @@ import { OneCLI } from '@onecli-sh/sdk';
 
 import { type AgentGroupContribution, invokeAgentGroupContributions } from './agent-group-contributions.js';
 import { FatalSpawnError, isSpawnPoisoned, markSpawnPoisoned } from './spawn-failure.js';
+import { mergeContributions, type ContainerContributionResult } from './modules/credentials/providers/contributions.js';
 import {
   CONTAINER_CPU_LIMIT,
   CONTAINER_IMAGE,
@@ -42,7 +43,7 @@ import {
   stopContainerGraceful,
 } from './container-runtime.js';
 import { assertEgressLaunchable } from './egress-lockdown.js';
-import { composeGroupClaudeMd } from './claude-md-compose.js';
+import { composeGroupProjectDoc, DEFAULT_PROJECT_DOC } from './project-doc-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { initGroupFilesystem } from './group-init.js';
@@ -428,7 +429,7 @@ async function spawnContainer(session: Session): Promise<void> {
   // Resolve the effective provider + any host-side contribution it declares
   // (extra mounts, env passthrough). Computed once and threaded through both
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
-  const { provider, contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
+  const { provider, contribution } = await resolveProviderContribution(session, agentGroup, containerConfig);
 
   // Per-agent-group dynamic contributions. Callbacks run sync; any throw
   // is wrapped in FatalSpawnError by the registry and propagates up to
@@ -456,7 +457,15 @@ async function spawnContainer(session: Session): Promise<void> {
   // collected yet at that point.
   const spawnPre: MergedSpawnPre = fireSpawnPre({ agentGroup, session, providerName: provider, containerConfig });
 
-  const mounts = buildMounts(agentGroup, session, containerConfig, provider, contribution, groupContribution, spawnPre);
+  const mounts = await buildMounts(
+    agentGroup,
+    session,
+    containerConfig,
+    provider,
+    contribution,
+    groupContribution,
+    spawnPre,
+  );
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
@@ -626,11 +635,12 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
  * Pure so the precedence can be unit-tested without a DB or filesystem.
  */
 
-function resolveProviderContribution(
+/** Exported for tests; the spawn path is its only production caller. */
+export async function resolveProviderContribution(
   session: Session,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
-): ProviderResult {
+): Promise<ProviderResult> {
   const provider = resolveProviderName(session.agent_provider, containerConfig.provider);
   const input: ContributionInput = {
     provider,
@@ -644,53 +654,94 @@ function resolveProviderContribution(
     runtime: getCredentialProvider(provider)?.getExtension?.(AGENT_RUNTIME),
   };
 
-  // The container shape comes from the provider's AGENT_RUNTIME extension, whose
-  // `containerContribution` merges a set of contributor calls (base env, mitm
-  // credential substitutes, runtime-updater's CLI-version mount, …). Capability
-  // layers add a call to that merge, so this resolver stays agnostic. Here we
-  // split the spawn-facing env/mounts from the host-only `cliVersion` (in-use
-  // bookkeeping) — the one place that split lives.
+  // One provider name may carry both contribution sources: the credential
+  // provider's AGENT_RUNTIME extension (base env, mitm credential substitutes,
+  // runtime-updater's CLI-version mount, …) and its entry in the
+  // provider-container registry (its own mounts and env). Both must always be
+  // applied — `providerProvidesAgentSurfaces` reads the registry entry, so a
+  // provider served only its runtime extension gets neither its own surfaces
+  // nor the defaults.
+  //
+  // The split of the merged result into the spawn-facing env/mounts and the
+  // host-only `cliVersion` (in-use bookkeeping) lives here and nowhere else.
+  const parts: ContainerContributionResult[] = [];
+
   if (input.runtime) {
-    const { env, mounts, cliVersion } = input.runtime.containerContribution({
-      agentGroupId: input.agentGroupId,
-      groupScope: input.groupScope,
-      sessionDir: input.sessionDir,
-      hostEnv: input.hostEnv,
-      runtimeConfig: input.runtime.parseRuntimeConfig(input.runtimeConfig),
-      agentProvider: input.agentProvider,
-      providerVersion: input.providerVersion,
-    });
-    return { provider, contribution: { env, mounts }, cliVersion: cliVersion ?? null };
+    const runtime = input.runtime;
+    parts.push(
+      await fatalOnThrow(`Provider runtime contribution for "${provider}"`, () =>
+        runtime.containerContribution({
+          agentGroupId: input.agentGroupId,
+          groupScope: input.groupScope,
+          sessionDir: input.sessionDir,
+          hostEnv: input.hostEnv,
+          runtimeConfig: runtime.parseRuntimeConfig(input.runtimeConfig),
+          agentProvider: input.agentProvider,
+          providerVersion: input.providerVersion,
+        }),
+      ),
+    );
   }
 
-  // Legacy fallback: out-of-tree providers that register only a single
-  // host-config fn in the provider-container registry (no AGENT_RUNTIME ext).
   const fn = getProviderContainerConfig(provider);
-  const contribution = fn
-    ? fn({
-        sessionDir: sessionDir(agentGroup.id, session.id),
-        agentGroupId: agentGroup.id,
-        groupDir: path.resolve(GROUPS_DIR, agentGroup.folder),
-        selectedSkills: selectedSkillNames(containerConfig),
-        hostEnv: process.env,
-      })
-    : {};
-  return { provider, contribution, cliVersion: null };
+  if (fn) {
+    parts.push(
+      await fatalOnThrow(`Provider container config for "${provider}"`, () =>
+        fn({
+          sessionDir: sessionDir(agentGroup.id, session.id),
+          agentGroupId: agentGroup.id,
+          groupDir: path.resolve(GROUPS_DIR, agentGroup.folder),
+          selectedSkills: selectedSkillNames(containerConfig),
+          hostEnv: process.env,
+        }),
+      ),
+    );
+  }
+
+  const { env, mounts, cliVersion } = mergeContributions(parts);
+
+  return { provider, contribution: { env, mounts }, cliVersion: cliVersion ?? null };
 }
 
-export function buildMounts(
+/**
+ * Run a contribution callback, turning a failure into a fatal spawn error so
+ * the spawn stops retrying. `await run()` inside the try is load-bearing: a
+ * contribution may be async, and returning the promise unawaited would let a
+ * rejection escape unclassified — read as transient, so host-sweep re-wakes the
+ * session every 60s without incrementing the attempt count.
+ */
+async function fatalOnThrow<T>(what: string, run: () => T | Promise<T>): Promise<T> {
+  try {
+    return await run();
+    // eslint-disable-next-line no-catch-all/no-catch-all -- re-thrown as fatal
+  } catch (err) {
+    throw new FatalSpawnError(`${what} failed: ${(err as Error).message ?? String(err)}`, { cause: err });
+  }
+}
+
+/** Neutral element for the optional `spawnPre` parameter. */
+const EMPTY_SPAWN_PRE: MergedSpawnPre = {
+  mounts: [],
+  env: {},
+  args: [],
+  needsRootEntrypoint: false,
+  cleanups: [],
+};
+
+export async function buildMounts(
   agentGroup: AgentGroup,
   session: Session,
   containerConfig: import('./container-config.js').ContainerConfig,
   provider: string,
   providerContribution: ProviderContainerContribution,
-  groupContribution: AgentGroupContribution,
-  spawnPre: MergedSpawnPre,
-): VolumeMount[] {
-  // Per-group filesystem state lives forever after first creation. Init is
-  // idempotent: it only writes paths that don't already exist, so this call
-  // is a no-op for groups that have spawned before.
-  initGroupFilesystem(agentGroup);
+  // Optional so upstream's five-parameter call still type-checks — the Codex
+  // payload ships a host-contribution test written against it.
+  groupContribution: AgentGroupContribution = {},
+  spawnPre: MergedSpawnPre = EMPTY_SPAWN_PRE,
+): Promise<VolumeMount[]> {
+  // The spawn path scaffolds the group filesystem, with the resolved provider.
+  // Doing it here too would be provider-blind, writing Claude surfaces into the
+  // group directory of a provider that owns its own.
 
   // Default agent surfaces (composed project doc, skill links, provider state
   // dir) apply unless the provider's registration declares it provides its
@@ -702,9 +753,9 @@ export function buildMounts(
     // Sync skill symlinks based on container.json selection before mounting.
     syncSkillSymlinks(claudeDir, containerConfig);
 
-    // Compose CLAUDE.md fresh every spawn from the shared base, enabled skill
-    // fragments, and MCP server instructions. See `claude-md-compose.ts`.
-    composeGroupClaudeMd(agentGroup);
+    // Compose CLAUDE.md fresh every spawn: every instruction source inlined
+    // into one flat file. See `project-doc-compose.ts`.
+    await composeGroupProjectDoc(agentGroup, path.resolve(GROUPS_DIR, agentGroup.folder), DEFAULT_PROJECT_DOC);
   }
 
   const mounts: VolumeMount[] = [];
@@ -737,20 +788,14 @@ export function buildMounts(
     mounts.push({ hostPath: containerJsonPath, containerPath: '/workspace/agent/container.json', readonly: true });
   }
 
-  // Composer-managed CLAUDE.md artifacts — nested RO mounts. These are
-  // regenerated from the shared base + fragments on every spawn; any
-  // agent-side writes would be clobbered, so enforce read-only. Only
-  // CLAUDE.local.md (per-group memory) remains RW via the group-dir mount.
-  // `.claude-shared.md` is a symlink whose target (`/app/CLAUDE.md`) is
-  // already RO-mounted, so writes through it fail regardless — no need for
-  // a nested mount there.
+  // The composed project document — one nested RO mount on top of the RW group
+  // dir, holding the full text of every instruction source. `container/CLAUDE.md`
+  // is read on the host at compose time, so nothing needs it inside the
+  // container. Only CLAUDE.local.md (per-group memory) remains RW via the
+  // group-dir mount.
   const composedClaudeMd = path.join(groupDir, 'CLAUDE.md');
   if (defaultSurfaces && fs.existsSync(composedClaudeMd)) {
     mounts.push({ hostPath: composedClaudeMd, containerPath: '/workspace/agent/CLAUDE.md', readonly: true });
-  }
-  const fragmentsDir = path.join(groupDir, '.claude-fragments');
-  if (defaultSurfaces && fs.existsSync(fragmentsDir)) {
-    mounts.push({ hostPath: fragmentsDir, containerPath: '/workspace/agent/.claude-fragments', readonly: true });
   }
 
   // Global memory directory — always read-only.

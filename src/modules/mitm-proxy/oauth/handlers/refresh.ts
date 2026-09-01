@@ -97,7 +97,8 @@ async function runRefresh(
   // the host so it can alert the grantor's owners.
   const borrowed = owning !== asCredentialScope(scope);
   const alertBorrowedFailure = (): void => {
-    if (borrowed) ctx.borrowedCredentialEvents?.onBorrowedRefreshFailed({ owningScope: owning, providerId: provider.id });
+    if (borrowed)
+      ctx.borrowedCredentialEvents?.onBorrowedRefreshFailed({ owningScope: owning, providerId: provider.id });
   };
 
   let body: { access_token?: string; refresh_token?: string; expires_in?: number };

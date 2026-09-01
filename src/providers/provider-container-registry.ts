@@ -69,7 +69,15 @@ export interface ProviderHostCapabilities {
   readonly providesAgentSurfaces?: boolean;
 }
 
-export type ProviderContainerConfigFn = (ctx: ProviderContainerContext) => ProviderContainerContribution;
+/**
+ * May be async: a provider's contribution can compose files before returning
+ * its mounts (the Codex payload's does). The spawn seam awaits it inside
+ * `fatalOnThrow`, so a rejection is classified rather than escaping as a
+ * transient failure.
+ */
+export type ProviderContainerConfigFn = (
+  ctx: ProviderContainerContext,
+) => ProviderContainerContribution | Promise<ProviderContainerContribution>;
 
 interface RegistryEntry {
   fn: ProviderContainerConfigFn;
@@ -105,4 +113,13 @@ export function providerProvidesAgentSurfaces(name: string | null | undefined): 
 
 export function listProviderContainerConfigNames(): string[] {
   return [...registry.keys()];
+}
+
+/**
+ * Test-only. The registry is module-global and refuses a duplicate id, so
+ * without a reset each scenario would need its own provider name registered at
+ * module scope.
+ */
+export function resetProviderContainerConfigsForTest(): void {
+  registry.clear();
 }

@@ -200,5 +200,5 @@ export { requestReauth, sanitizeReason, _resetReauthDispatcherForTests } from '.
 // Side-effect: registers the `/auth/*` host-rpc handler (the browser-auth
 // container↔user bridge). Dormant until a provider opens an auth episode.
 import './auth-bridge.js';
-export { startAuthEpisode, _resetAuthBridgeForTests } from './auth-bridge.js';
-export type { AuthEpisodeHandle, AuthCodeResult } from './auth-bridge.js';
+export { startAuthEpisode, setAuthCallbackHandler, _resetAuthBridgeForTests } from './auth-bridge.js';
+export type { AuthEpisodeHandle, AuthCodeResult, AuthCallbackHandler } from './auth-bridge.js';

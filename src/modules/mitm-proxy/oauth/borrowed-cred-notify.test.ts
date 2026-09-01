@@ -8,9 +8,10 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const h = vi.hoisted(() => ({
   approvers: ['discord:owner'] as string[],
-  dmTarget: { userId: 'discord:owner', messagingGroup: { channel_type: 'discord', platform_id: 'dm-1' } } as
-    | { userId: string; messagingGroup: { channel_type: string; platform_id: string } }
-    | null,
+  dmTarget: { userId: 'discord:owner', messagingGroup: { channel_type: 'discord', platform_id: 'dm-1' } } as {
+    userId: string;
+    messagingGroup: { channel_type: string; platform_id: string };
+  } | null,
   channels: [] as Array<{ id: string; channel_type: string; platform_id: string }>,
   deliver: vi.fn(),
   now: 1_000_000,

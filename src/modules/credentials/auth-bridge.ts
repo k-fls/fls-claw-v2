@@ -63,6 +63,21 @@ interface AuthEpisode {
   code: Deferred<AuthCodeResult>;
   /** Guard so a re-POSTed /auth/url opens the user prompt only once. */
   urlPrompted: boolean;
+  /** Set once the episode's auth container has an allocated IP. */
+  containerIP?: string;
+  /** Set alongside `containerIP`; the target for a callback delivery. */
+  containerName?: string;
+  /**
+   * How the user's paste reaches the CLI. `paste` resolves the `/auth/code`
+   * long-poll the runner is waiting on; `callback` is for a CLI that reads no
+   * code from stdin and is instead listening on its own localhost port, so the
+   * host delivers the browser's redirect into the container.
+   */
+  codeDelivery: 'paste' | 'callback';
+  /** Names the service in the sign-in prompt. */
+  label: string;
+  /** Authorize URL the CLI emitted; carries the callback target for delivery. */
+  authUrl?: string;
 }
 
 /** Returned to the provider so it can tear the episode down when its auth container exits. */
@@ -76,6 +91,60 @@ export interface AuthEpisodeHandle {
 const episodes = new Map<string, AuthEpisode>();
 
 /**
+ * Auth-container IP → episode, so a request from a container that has no
+ * session still resolves to the user who accepted that sign-in.
+ *
+ * Deliberately not keyed by scope. `startAuthEpisode` replaces the episode for
+ * a scope, but the replaced episode's container can still be polling — a
+ * scope-keyed lookup would hand that container's device code to whoever opened
+ * the second episode.
+ */
+const episodesByContainerIP = new Map<string, AuthEpisode>();
+
+/**
+ * Bind a spawned auth container's IP to its episode, identified by the nonce
+ * both were created with. No-op when the nonce matches no live episode.
+ */
+export function bindAuthEpisodeContainerIP(nonce: string, ip: string, containerName?: string): void {
+  const episode = [...episodes.values()].find((e) => e.nonce === nonce);
+  if (!episode) {
+    log.warn('auth-bridge: no live episode for nonce — container IP not bound', { ip });
+    return;
+  }
+  episode.containerIP = ip;
+  episode.containerName = containerName;
+  episodesByContainerIP.set(ip, episode);
+}
+
+/**
+ * Delivers a browser callback the user pasted into the episode's auth
+ * container. Injected because parsing and `docker exec` live in the mitm-proxy
+ * module, which already imports this one. Returns false when the paste is not a
+ * usable callback URL, so the prompt can ask again.
+ */
+export interface AuthCallbackHandler {
+  /** Whether a paste carries a usable callback, checked before the slot closes. */
+  isCallback(pasted: string): boolean;
+  deliver(containerName: string, pasted: string, authUrl: string): Promise<boolean>;
+}
+
+let callbackHandler: AuthCallbackHandler | null = null;
+
+/** Wire the callback handler. Called once at boot. */
+export function setAuthCallbackHandler(handler: AuthCallbackHandler): void {
+  callbackHandler = handler;
+}
+
+/**
+ * The origin that accepted the sign-in whose auth container holds `ip`, or null.
+ * Read-only: this resolves a recipient, it never authorizes anything. The
+ * bridge's own nonce gate is unchanged.
+ */
+export function authEpisodeOriginByContainerIP(ip: string): InteractionOrigin | null {
+  return episodesByContainerIP.get(ip)?.origin ?? null;
+}
+
+/**
  * Open an auth episode for a group scope. The provider passes the `nonce` it
  * also seeds into the auth container's env, and the `origin` to prompt the
  * user on. Replaces (and cancels) any existing episode for the same scope.
@@ -84,14 +153,25 @@ export function startAuthEpisode(args: {
   scopeFolder: string;
   nonce: string;
   origin: InteractionOrigin;
+  codeDelivery?: 'paste' | 'callback';
+  label?: string;
 }): AuthEpisodeHandle {
   const { scopeFolder, nonce, origin } = args;
   const existing = episodes.get(scopeFolder);
   if (existing) {
     log.warn('auth-bridge: replacing in-flight auth episode', { scopeFolder });
+    if (existing.containerIP) episodesByContainerIP.delete(existing.containerIP);
     existing.code.resolve({ cancelled: true });
   }
-  const episode: AuthEpisode = { scopeFolder, nonce, origin, code: deferred<AuthCodeResult>(), urlPrompted: false };
+  const episode: AuthEpisode = {
+    scopeFolder,
+    nonce,
+    origin,
+    code: deferred<AuthCodeResult>(),
+    urlPrompted: false,
+    codeDelivery: args.codeDelivery ?? 'paste',
+    label: args.label ?? 'Claude',
+  };
   episodes.set(scopeFolder, episode);
   log.info('auth-bridge: episode started', { scopeFolder });
   return {
@@ -105,6 +185,7 @@ export function startAuthEpisode(args: {
 function endEpisode(scopeFolder: string, episode: AuthEpisode): void {
   if (episodes.get(scopeFolder) !== episode) return; // already replaced / ended
   episodes.delete(scopeFolder);
+  if (episode.containerIP) episodesByContainerIP.delete(episode.containerIP);
   episode.code.resolve({ cancelled: true }); // idempotent if already resolved
   log.info('auth-bridge: episode ended', { scopeFolder });
 }
@@ -118,19 +199,49 @@ function endEpisode(scopeFolder: string, episode: AuthEpisode): void {
 function promptForCode(episode: AuthEpisode, url: string, instructions: string | undefined): void {
   if (episode.urlPrompted) return;
   episode.urlPrompted = true;
+  episode.authUrl = url;
 
+  const wantsCallback = episode.codeDelivery === 'callback';
+  const fallback = wantsCallback
+    ? 'Your browser will then fail to load a `localhost` page — that is expected. ' +
+      'Copy the full URL from the address bar and paste it back here **wrapped in backticks**, ' +
+      'like `http://localhost:1455/auth/callback?code=...`. Without them Slack turns it into a ' +
+      'shortened link and only that short text arrives, so the code never reaches the sign-in.'
+    : 'After authorizing, copy the resulting code (or callback URL) and paste it back here.';
   const prompt =
-    'Claude sign-in — open this URL in your browser and authorize:\n\n' +
+    `${episode.label} sign-in — open this URL in your browser and authorize:\n\n` +
     `${url}\n\n` +
-    (instructions ?? 'After authorizing, copy the resulting code (or callback URL) and paste it back here.') +
+    (instructions ?? fallback) +
     '\n\nOr reply "cancel".';
+
+  // Validating here rather than after the slot closes is what lets a mistyped or
+  // client-mangled paste be corrected: `pastePlainOn` re-prompts on a validation
+  // failure, keeping the episode and its auth container alive. Ending the
+  // episode instead would strand a user whose chat client shortened the URL,
+  // with a fresh sign-in as the only way back.
+  const validate = wantsCallback
+    ? (text: string): string | null =>
+        callbackHandler?.isCallback(text) === false
+          ? looksShortened(text)
+            ? 'That was the shortened link text, not the URL — its code and state are missing. ' +
+              'Paste it again wrapped in backticks so Slack sends it verbatim.'
+            : 'That does not carry the `code=` and `state=` values. Copy the full URL from the ' +
+              'address bar and paste it wrapped in backticks.'
+          : null
+    : (text: string): string | null =>
+        text.trim().length > 0 ? null : 'That looked empty — paste the code, or reply "cancel".';
 
   pastePlainOn(episode.origin, {
     prompt,
-    validate: (text) => (text.trim().length > 0 ? null : 'That looked empty — paste the code, or reply "cancel".'),
+    validate,
   }).then(
     (r) => {
-      episode.code.resolve(r.reason === 'submitted' && r.text ? { code: r.text.trim() } : { cancelled: true });
+      const submitted = r.reason === 'submitted' && r.text ? r.text.trim() : null;
+      if (wantsCallback) {
+        void completeCallback(episode, submitted);
+        return;
+      }
+      episode.code.resolve(submitted ? { code: submitted } : { cancelled: true });
     },
     (err) => {
       // The only expected rejection is a slot conflict (another interaction
@@ -145,6 +256,49 @@ function promptForCode(episode: AuthEpisode, url: string, instructions: string |
       episode.code.resolve({ cancelled: true });
     },
   );
+}
+
+/**
+ * Deliver a pasted browser callback into the episode's auth container. The CLI
+ * is blocked on its own localhost listener, so this — not the `/auth/code`
+ * long-poll — is what completes the flow. The episode is resolved either way,
+ * which unblocks teardown; success is still decided by whether a credential
+ * lands, never by this.
+ */
+/**
+ * True when a paste is a link label a chat client shortened rather than the URL
+ * itself. Slack renders a pasted URL as an anchor and delivers only that
+ * anchor's text, ellipsis and all, so the code and state never arrive — a
+ * failure the user can act on only if it is named.
+ */
+export function looksShortened(input: string): boolean {
+  return input.includes('…') || /\.\.\.(?:&|$)/.test(input);
+}
+
+async function completeCallback(episode: AuthEpisode, pasted: string | null): Promise<void> {
+  if (!pasted) {
+    episode.code.resolve({ cancelled: true });
+    return;
+  }
+  if (!callbackHandler || !episode.containerName || !episode.authUrl) {
+    log.error('auth-bridge: no callback deliverer or container for episode', { scopeFolder: episode.scopeFolder });
+    episode.origin.writeReply('Could not complete the sign-in — the auth container is gone. Try again.');
+    episode.code.resolve({ cancelled: true });
+    return;
+  }
+  let delivered = false;
+  try {
+    delivered = await callbackHandler.deliver(episode.containerName, pasted, episode.authUrl);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- any failure is "not delivered"
+  } catch (err) {
+    log.error('auth-bridge: callback delivery threw', { scopeFolder: episode.scopeFolder, err });
+  }
+  // The paste already passed `isCallback`, so reaching here means the delivery
+  // itself failed rather than the input.
+  if (!delivered) {
+    episode.origin.writeReply('Could not hand the callback to the sign-in. Run the sign-in again to retry.');
+  }
+  episode.code.resolve({ cancelled: true });
 }
 
 function nonceOf(body: unknown): string | null {
@@ -195,4 +349,5 @@ registerScopedHostRpc('/auth', handleAuthRpc);
 export function _resetAuthBridgeForTests(): void {
   for (const ep of episodes.values()) ep.code.resolve({ cancelled: true });
   episodes.clear();
+  episodesByContainerIP.clear();
 }

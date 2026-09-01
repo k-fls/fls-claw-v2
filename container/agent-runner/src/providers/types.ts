@@ -1,3 +1,5 @@
+import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
+
 export interface AgentProvider {
   /**
    * True if the provider's underlying SDK handles slash commands natively and
@@ -13,6 +15,15 @@ export interface AgentProvider {
    * provider, never gated on a provider name.
    */
   readonly usesMemoryScaffold?: boolean;
+
+  /**
+   * Optional. A provider whose harness re-establishes its own context window
+   * (a native SessionStart / clear / compact hook) receives the runner's memory
+   * hook registration here and wires it into whatever config that harness
+   * reads. A provider on the file-based memory model implements nothing and is
+   * never called.
+   */
+  registerMemorySessionHook?(hook: MemorySessionHookRegistration): void;
 
   /**
    * Optional. Called by the poll-loop after each completed exchange (a
@@ -115,11 +126,24 @@ export interface QueryInput {
   };
 }
 
-export interface McpServerConfig {
+/** A local stdio MCP server, launched from `command`. */
+export interface McpStdioServer {
+  type?: 'stdio';
   command: string;
   args: string[];
   env: Record<string, string>;
+  /** Working directory, for providers whose transport supports one. */
+  cwd?: string;
 }
+
+/** A remote MCP server addressed by URL. Only some providers can serve this form. */
+export interface McpHttpServer {
+  type: 'http';
+  url: string;
+  headers?: Record<string, string>;
+}
+
+export type McpServerConfig = McpStdioServer | McpHttpServer;
 
 export interface AgentQuery {
   /** Push a follow-up message into the active query. */
@@ -151,4 +175,10 @@ export type ProviderEvent =
    * event (tool call, thinking, partial message, anything) so the
    * poll-loop's idle timer stays honest during long tool runs.
    */
-  | { type: 'activity' };
+  | { type: 'activity' }
+  /**
+   * A file the turn produced on disk (e.g. a generated image) that the agent
+   * did not itself send. Providers with no on-disk transcript yield it so the
+   * poll-loop can deliver the artifact.
+   */
+  | { type: 'file'; path: string };

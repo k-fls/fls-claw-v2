@@ -71,7 +71,7 @@ afterEach(() => {
 });
 
 describe('initGroupFilesystem agent surfaces', () => {
-  it('writes the default surfaces when no provider is given (today’s behavior)', () => {
+  it('writes the default surfaces when no provider is given (today’s behavior)', async () => {
     const ag = group('ag-default', 'default-group');
     createAgentGroup(ag);
 
@@ -84,7 +84,7 @@ describe('initGroupFilesystem agent surfaces', () => {
     expect(fs.existsSync(path.join(claudeDir, 'skills'))).toBe(true);
   });
 
-  it('writes the seed into the memory scaffold — never CLAUDE.* — for a provider with its own surfaces', () => {
+  it('writes the seed into the memory scaffold — never CLAUDE.* — for a provider with its own surfaces', async () => {
     const ag = group('ag-surfy', 'surfy-group');
     createAgentGroup(ag);
 
@@ -103,7 +103,7 @@ describe('initGroupFilesystem agent surfaces', () => {
     expect(fs.existsSync(path.join(sessionRoot, '.claude-shared'))).toBe(false);
   });
 
-  it('writes nothing at all for a surfaces-owning provider without instructions', () => {
+  it('writes nothing at all for a surfaces-owning provider without instructions', async () => {
     const ag = group('ag-surfy-bare', 'surfy-bare-group');
     createAgentGroup(ag);
 
@@ -114,7 +114,7 @@ describe('initGroupFilesystem agent surfaces', () => {
     expect(fs.existsSync(path.join(groupDir, 'memory'))).toBe(false);
   });
 
-  it('treats an unregistered provider name as default surfaces', () => {
+  it('treats an unregistered provider name as default surfaces', async () => {
     const ag = group('ag-unknown', 'unknown-group');
     createAgentGroup(ag);
 
@@ -129,7 +129,7 @@ describe('initGroupFilesystem deferred seed (.seed.md)', () => {
   // `.seed.md` and defer placement to the first spawn, where the DB-resolved
   // provider is known. group-init places it into the right surface and
   // consumes it. Red-on-delete: if that placement is removed, these fail.
-  it('places .seed.md into CLAUDE.local.md for the default provider, then consumes it', () => {
+  it('places .seed.md into CLAUDE.local.md for the default provider, then consumes it', async () => {
     const ag = group('ag-seed-default', 'seed-default');
     createAgentGroup(ag);
     const groupDir = path.join(GROUPS_DIR, ag.folder);
@@ -142,7 +142,7 @@ describe('initGroupFilesystem deferred seed (.seed.md)', () => {
     expect(fs.existsSync(path.join(groupDir, '.seed.md'))).toBe(false);
   });
 
-  it('places .seed.md into the memory scaffold (never CLAUDE.*) for a surfaces-owning provider, then consumes it', () => {
+  it('places .seed.md into the memory scaffold (never CLAUDE.*) for a surfaces-owning provider, then consumes it', async () => {
     const ag = group('ag-seed-surfy', 'seed-surfy');
     createAgentGroup(ag);
     const groupDir = path.join(GROUPS_DIR, ag.folder);
@@ -160,13 +160,13 @@ describe('initGroupFilesystem deferred seed (.seed.md)', () => {
 });
 
 describe('buildMounts agent surfaces', () => {
-  it('mounts the default surfaces for an unregistered provider (today’s behavior)', () => {
+  it('mounts the default surfaces for an unregistered provider (today’s behavior)', async () => {
     const ag = group('ag-mounts-default', 'mounts-default');
     createAgentGroup(ag);
     ensureContainerConfig(ag.id);
     initGroupFilesystem(ag, {});
 
-    const mounts = buildMounts(ag, session('s1', ag.id), containerConfig(), 'claude', {}, {}, EMPTY_SPAWN_PRE);
+    const mounts = await buildMounts(ag, session('s1', ag.id), containerConfig(), 'claude', {}, {}, EMPTY_SPAWN_PRE);
 
     const byContainerPath = new Map(mounts.map((m) => [m.containerPath, m]));
     expect(byContainerPath.has('/home/node/.claude')).toBe(true);
@@ -176,7 +176,7 @@ describe('buildMounts agent surfaces', () => {
     expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, 'CLAUDE.md'))).toBe(true);
   });
 
-  it('suppresses the default surfaces and keeps contributed mounts for a surfaces-providing provider', () => {
+  it('suppresses the default surfaces and keeps contributed mounts for a surfaces-providing provider', async () => {
     const ag = group('ag-mounts-surfy', 'mounts-surfy');
     createAgentGroup(ag);
     ensureContainerConfig(ag.id);
@@ -191,7 +191,7 @@ describe('buildMounts agent surfaces', () => {
         },
       ],
     };
-    const mounts = buildMounts(
+    const mounts = await buildMounts(
       ag,
       session('s2', ag.id),
       containerConfig(),
@@ -207,6 +207,10 @@ describe('buildMounts agent surfaces', () => {
     expect(containerPaths).not.toContain('/workspace/agent/CLAUDE.md');
     // Composer did NOT run for this group.
     expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, 'CLAUDE.md'))).toBe(false);
+    // Nor does a second, provider-blind scaffold: `initGroupFilesystem` called
+    // without the provider reports no capabilities and writes the default
+    // Claude memory file into a group whose provider owns its own surfaces.
+    expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, 'CLAUDE.local.md'))).toBe(false);
     // Core mounts and the provider's own contribution are intact.
     expect(containerPaths).toContain('/workspace');
     expect(containerPaths).toContain('/workspace/agent');

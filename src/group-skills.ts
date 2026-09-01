@@ -1,0 +1,50 @@
+/**
+ * Provider-agnostic template-skill materialization.
+ *
+ * Group template skills live as real directories under
+ * `data/v2-sessions/<group-id>/.claude-shared/skills/`. Claude reads that store
+ * directly (mounted at `~/.claude/skills`); every other surfaces-owning provider
+ * reads a different per-group skills directory, often read-only-mounted, so the
+ * skills must be copied there host-side before the container starts.
+ *
+ * Each provider's host-side container contribution calls this once with its own
+ * skills dir (codex → `.agents/skills`), so adding a provider adds a call rather
+ * than a second mirror implementation.
+ */
+import fs from 'fs';
+import path from 'path';
+
+import { DATA_DIR } from './config.js';
+
+/** The group-private store templates stamp skills into (Claude's read plane). */
+function templateSkillsSource(agentGroupId: string): string {
+  return path.join(DATA_DIR, 'v2-sessions', agentGroupId, '.claude-shared', 'skills');
+}
+
+/**
+ * Copy a group's template skills into a provider's per-group skills directory.
+ * No-op if the group has no template skills, or if `destSkillsDir` IS the source
+ * (Claude, which reads the source directly — copying onto itself would delete it).
+ * Idempotent: overwrites each template skill so edits propagate on respawn. It
+ * manages only its own skill dirs — other entries in the destination (e.g. a
+ * provider's shared-skill symlinks) are left untouched.
+ */
+export function materializeTemplateSkills(agentGroupId: string, destSkillsDir: string): void {
+  const src = templateSkillsSource(agentGroupId);
+  if (!fs.existsSync(src)) return;
+  if (path.resolve(src) === path.resolve(destSkillsDir)) return;
+
+  fs.mkdirSync(destSkillsDir, { recursive: true });
+  for (const name of fs.readdirSync(src)) {
+    // lstat, not stat: the source also holds Claude's shared-skill symlinks,
+    // whose targets are CONTAINER paths (`/app/skills/<name>`) and therefore
+    // dangling on the host. stat follows them and throws ENOENT, which the
+    // spawn seam classifies as fatal — so one Claude symlink made every
+    // surfaces-owning provider unspawnable. A symlink is not a directory, so
+    // lstat skips it and only the template's real dirs are copied.
+    if (!fs.lstatSync(path.join(src, name)).isDirectory()) continue;
+    const dest = path.join(destSkillsDir, name);
+    fs.rmSync(dest, { recursive: true, force: true });
+    fs.cpSync(path.join(src, name), dest, { recursive: true });
+  }
+}

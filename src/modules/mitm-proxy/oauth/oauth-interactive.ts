@@ -39,6 +39,7 @@ import { log } from '../../../log.js';
 import { lookupContainerSession } from '../../container-bootstrap/index.js';
 import { openInboundDb } from '../../../session-manager.js';
 
+import { authEpisodeOriginByContainerIP } from '../../credentials/auth-bridge.js';
 import type { AuthCodeDeliver, OAuthEvents } from './handler-context.js';
 
 /** Time budget for the `docker exec … curl` callback delivery. */
@@ -75,15 +76,46 @@ function resolveContainerOrigin(sourceIP: string | undefined): { origin: Interac
 }
 
 /**
- * Parse a localhost callback URL into code + state + port. Accepts the
- * raw URL the user copies from their browser address bar; tolerant of the
- * Slack `<…>` / `&amp;` wrapping as a precaution. Port from v1.
+ * Origin for a device-code relay. A session container resolves through its
+ * session as usual; an auth container has none by design, so it falls back to
+ * the sign-in episode its IP is bound to.
+ *
+ * The fallback is keyed on the container's IP — the episode's own identity —
+ * never on its scope. `startAuthEpisode` replaces the episode for a scope, so a
+ * scope-keyed lookup would hand a still-polling container's code to whoever
+ * opened the second episode.
+ *
+ * Device-code only. The authorize-stub path additionally needs a session id to
+ * deliver the captured code back into the container, so it keeps the
+ * session-only resolution.
+ */
+function resolveDeviceCodeOrigin(sourceIP: string | undefined): { origin: InteractionOrigin } | null {
+  const session = resolveContainerOrigin(sourceIP);
+  if (session) return { origin: session.origin };
+  if (!sourceIP) return null;
+  const episodeOrigin = authEpisodeOriginByContainerIP(sourceIP);
+  return episodeOrigin ? { origin: episodeOrigin } : null;
+}
+
+/**
+ * Parse a localhost callback URL into code + state + port. Accepts the raw URL
+ * the user copies from their browser address bar, and undoes the decorations a
+ * chat client applies on the way in. Port from v1.
  */
 export function parseCallbackUrl(input: string): { code: string; state: string; port: number } | null {
   let trimmed = input.trim();
   if (trimmed.startsWith('<') && trimmed.endsWith('>')) {
-    trimmed = trimmed.slice(1, -1).replace(/&amp;/g, '&');
+    trimmed = trimmed.slice(1, -1);
+    // Slack's link form is `<url|label>`; the label would otherwise be read as
+    // part of the final query value.
+    const label = trimmed.indexOf('|');
+    if (label !== -1) trimmed = trimmed.slice(0, label);
   }
+  // Slack HTML-escapes `&` in message text whether or not it linkified the URL,
+  // and it does not linkify `localhost`. Left encoded, `&amp;state=` parses as a
+  // parameter named `amp;state`, so `state` reads as absent and a perfectly good
+  // callback is rejected.
+  trimmed = trimmed.replace(/&amp;/g, '&');
   try {
     const url = new URL(trimmed);
     const code = url.searchParams.get('code');
@@ -97,19 +129,104 @@ export function parseCallbackUrl(input: string): { code: string; state: string; 
 }
 
 /**
- * Production `AuthCodeDeliver`: `docker exec <name> curl -sf <url>` to hit
- * the container's own localhost callback. Exported so the host can wire it
- * into the OAuth module at boot (and tests can substitute a fake).
+ * Production `AuthCodeDeliver`: `docker exec <name> curl -sfL <url>` to hit the
+ * container's own localhost callback. Exported so the host can wire it into the
+ * OAuth module at boot (and tests can substitute a fake).
+ *
+ * `-L` is load-bearing. A CLI serving its own callback redirects the browser to
+ * a success page and waits for that fetch before exiting — the Codex login
+ * does. Stopping at the redirect completes the token exchange but leaves the
+ * process running, which holds the sign-in's in-flight guard for the whole
+ * container lifetime and refuses the next attempt as "already under way".
  */
 export const dockerExecDeliver: AuthCodeDeliver = (containerName, callbackUrl) =>
   new Promise((resolve, reject) => {
     execFile(
       CONTAINER_RUNTIME_BIN,
-      ['exec', containerName, 'curl', '-sf', callbackUrl],
+      ['exec', containerName, 'curl', '-sfL', callbackUrl],
       { timeout: DELIVERY_TIMEOUT_MS },
       (err) => (err ? reject(err) : resolve()),
     );
   });
+
+/**
+ * `AuthCallbackDeliverer` for the auth-container browser flow: parse what the
+ * user pasted and curl it into the container's own localhost listener.
+ *
+ * Rebuilt from the parsed parts rather than forwarded verbatim, so a paste
+ * carrying extra query junk (or a chat client's link decoration) still produces
+ * the exact callback the CLI expects.
+ */
+/**
+ * Structure of a paste, with every token-shaped run replaced. What matters when
+ * a callback is refused is the decoration around it — `<…>`, `|label`, `&amp;`,
+ * the scheme, the port, the parameter names — and none of that is secret, while
+ * the values include an authorization code.
+ */
+export function redactCallbackShape(input: string): string {
+  return input
+    .trim()
+    .slice(0, 200)
+    .replace(/[A-Za-z0-9_-]{12,}/g, '…');
+}
+
+/**
+ * Query of a pasted callback, with chat-client decoration undone.
+ *
+ * Only the query is read. The host and port come from the authorize URL we
+ * relayed, which is authoritative — a chat client renders a link however it
+ * likes (Slack drops the scheme and port from what it shows), and requiring the
+ * user's copy to survive that intact is a dependency on someone else's UI.
+ */
+export function callbackQueryFrom(input: string): URLSearchParams | null {
+  let trimmed = input.trim();
+  // Code formatting is how a user stops a chat client turning the URL into a
+  // link; the delimiters arrive as literal text.
+  trimmed = trimmed
+    .replace(/^```+|```+$/g, '')
+    .replace(/^`+|`+$/g, '')
+    .trim();
+  if (trimmed.startsWith('<') && trimmed.endsWith('>')) {
+    trimmed = trimmed.slice(1, -1);
+    // Slack's link form is `<url|label>`.
+    const label = trimmed.indexOf('|');
+    if (label !== -1) trimmed = trimmed.slice(0, label);
+  }
+  // Slack HTML-escapes `&` in message text whether or not it linkified the URL.
+  // Left encoded, `&amp;state=` is a parameter named `amp;state`.
+  trimmed = trimmed.replace(/&amp;/g, '&');
+
+  const q = trimmed.indexOf('?');
+  if (q === -1) return null;
+  const params = new URLSearchParams(trimmed.slice(q + 1));
+  return params.get('code') && params.get('state') ? params : null;
+}
+
+/** The auth bridge's callback seam: recognise a paste, then hand it to the CLI. */
+export const pastedCallbackHandler = {
+  isCallback: (pasted: string): boolean => callbackQueryFrom(pasted) !== null,
+  deliver: (containerName: string, pasted: string, authUrl: string): Promise<boolean> =>
+    deliverPastedCallback(containerName, pasted, authUrl),
+};
+
+export async function deliverPastedCallback(containerName: string, pasted: string, authUrl: string): Promise<boolean> {
+  const params = callbackQueryFrom(pasted);
+  const target = localhostCallbackFromAuthUrl(authUrl);
+  if (!params || !target) {
+    log.warn('oauth: pasted text is not a callback URL', {
+      containerName,
+      length: pasted.length,
+      shape: redactCallbackShape(pasted),
+    });
+    return false;
+  }
+  // Every parameter forwarded, not just code and state: the CLI is entitled to
+  // read anything it put in its own redirect_uri, and Codex's carries `scope`.
+  const url = `http://localhost:${target.port}${target.path}?${params.toString()}`;
+  await dockerExecDeliver(containerName, url);
+  log.info('oauth: delivered browser callback into the auth container', { containerName, port: target.port });
+  return true;
+}
 
 /** Parse the authorize URL's `redirect_uri` to find the localhost callback target. */
 function localhostCallbackFromAuthUrl(authUrl: string): { port: number; path: string } | null {
@@ -154,9 +271,9 @@ export function shadowWarning(providerId: string, borrowedFrom?: string): string
 
 export const oauthInteractive: OAuthEvents = {
   notifyDeviceCode({ sourceIP, providerId, userCode, verificationUri, borrowedFrom }) {
-    const resolved = resolveContainerOrigin(sourceIP);
+    const resolved = resolveDeviceCodeOrigin(sourceIP);
     if (!resolved) {
-      log.info('oauth.device-code: no identifiable user to notify', { sourceIP, providerId });
+      log.warn('oauth.device-code: no identifiable user to notify — code not relayed', { sourceIP, providerId });
       return;
     }
     resolved.origin.writeReply(

@@ -49,6 +49,8 @@ import { loadDiscoveryProviders, type DiscoveryLoadResult } from './discovery-lo
 import { startDiscoveryRefreshSchedule, type RefreshResult, type RefreshScheduleHandle } from './discovery-refresh.js';
 import { toSubstitutingProvider } from './provider-adapter.js';
 import type { AuthCodeDeliver, BorrowedCredentialEvents, HandlerContext, OAuthEvents } from './handler-context.js';
+import { buildDefaultTransportCodec } from './handlers/default-codec.js';
+import { swapSubstituteHeaders } from './handlers/bearer-swap.js';
 import type { OAuthProvider } from './types.js';
 import type { SubstitutesSpec, SubstitutingProvider } from '../types.js';
 import { logger } from '../logger.js';
@@ -167,6 +169,17 @@ export function oauthSubstitutesFor(provider: OAuthProvider): SubstitutesSpec {
     inFlightRefresh: new Map(),
     redirectRefreshBreaker: new Map(),
     isGlobalProvider: (id) => hasProxyInstance() && getProxy().isGlobalProvider(id),
+    // Accessors, not copies. A programmatic provider registers before
+    // `initOAuthModule` assigns these, so a value captured here would be
+    // permanently undefined and the provider could never reach a user. The
+    // handlers read them through `ctx` at request time, by which point init
+    // has run.
+    get oauthEvents() {
+      return moduleOAuthEvents;
+    },
+    get deliverCallback() {
+      return moduleDeliverCallback;
+    },
   };
   return toSubstitutingProvider(provider, ctx).substitutes;
 }
@@ -208,6 +221,17 @@ export function initOAuthModule(opts: InitOAuthModuleOptions): OAuthModuleHandle
     deliverCallback: opts.deliverCallback,
     borrowedCredentialEvents: opts.borrowedCredentialEvents,
   };
+
+  // Registered here because the codecs and the handler context are this
+  // module's, not the proxy's. The default codec covers it: a handshake carries
+  // a scheme-prefixed bearer, and a provider with a bespoke transport codec
+  // (GitHub's Basic-over-git-HTTPS) does not open WebSockets.
+  const upgradeCodec = buildDefaultTransportCodec(undefined);
+  opts.proxy.setUpgradeHeaderSwapper(
+    (headers, targetHost, scope) =>
+      swapSubstituteHeaders(headers, { codec: upgradeCodec, ctx, groupScope: scope, scopeAttrs: {}, targetHost })
+        .length,
+  );
 
   const registered: string[] = [];
   for (const provider of loaded.providers.values()) {

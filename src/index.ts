@@ -9,7 +9,7 @@ import path from 'path';
 import { backfillContainerConfigs } from './backfill-container-configs.js';
 import { DATA_DIR, SHUTDOWN_DRAIN_TIMEOUT_MS } from './config.js';
 import { enforceStartupBackoff } from './circuit-breaker.js';
-import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
+import { migrateGroupsToClaudeLocal } from './migrate-groups-to-claude-local.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
@@ -71,6 +71,7 @@ import { startCliServer } from './cli/socket-server.js';
 // credential path). Registered explicitly at boot (not via the modules barrel)
 // so unit tests don't arm the spawn-time validator unexpectedly.
 import { registerClaudeCredentialProvider } from './providers/claude-credential.js';
+import { registerCodexCredentialProvider } from './providers/codex-credential.js';
 import { registerGithubCredentialProvider } from './providers/github-credential.js';
 import {
   CredentialProxy,
@@ -79,12 +80,14 @@ import {
   initOAuthModule,
   oauthInteractive,
   dockerExecDeliver,
+  pastedCallbackHandler,
   borrowedCredentialNotifier,
 } from './modules/mitm-proxy/index.js';
 import {
   getBorrowSource,
   getOrCreateResolverForAgentGroup,
   regenerateAllManifests,
+  setAuthCallbackHandler,
 } from './modules/credentials/index.js';
 import { CREDENTIAL_PROXY_PORT } from './config.js';
 
@@ -140,6 +143,11 @@ async function main(): Promise<void> {
   tokenEngine.setBorrowSourceResolver((groupScope) => getBorrowSource(groupScope as unknown as string) ?? undefined);
   registerClaudeCredentialProvider();
   registerGithubCredentialProvider();
+  registerCodexCredentialProvider();
+  // The auth-container browser flow completes by curling the pasted callback
+  // into the container; parsing and `docker exec` live in the mitm-proxy module,
+  // which already imports the auth bridge.
+  setAuthCallbackHandler(pastedCallbackHandler);
   const credentialProxy = new CredentialProxy();
   // Bind the SAME address host-rpc binds (serviceBindHost), driven by
   // CLAW_HOST_NET_MODE: open (default) → 0.0.0.0 (rootless; the proxy's

@@ -62,7 +62,7 @@ For ad-hoc queries from skills or scripts, use the in-tree wrapper rather than t
 | `src/container-restart.ts` | Kill + on-wake respawn for agent group containers |
 | `src/db/` | DB layer — agent_groups, messaging_groups, sessions, container_configs, user_roles, user_dms, pending_*, migrations |
 | `src/channels/` | Channel adapter infra (registry, Chat SDK bridge); specific channel adapters are skill-installed from the `channels` branch |
-| `src/providers/` | Host-side provider container-config (`claude` baked in; `opencode` etc. installed from the `providers` branch) |
+| `src/providers/` | Host-side provider container-config (`claude` baked in; `opencode` etc. installed from the `providers` branch) and the credential providers (`claude-credential.ts`, `github-credential.ts`, `codex-credential.ts`) |
 | `container/agent-runner/src/` | Agent-runner: poll loop, formatter, provider abstraction, MCP tools, destinations |
 | `container/skills/` | Container skills mounted into every agent session (`credentials`, `auth-providers`, `welcome`, `self-customize`, `agent-browser`, `slack-formatting`) |
 | `groups/<folder>/` | Per-agent-group filesystem (CLAUDE.md, skills, per-group `agent-runner-src/` overlay) |
@@ -101,7 +101,7 @@ Key files: `src/cli/dispatch.ts` (dispatcher + approval handler), `src/cli/crud.
 Trunk does not ship any specific channel adapter or non-default agent provider. The codebase is the registry/infra; the actual adapters and providers live on long-lived sibling branches and get copied in by skills:
 
 - **`channels` branch** — Discord, Slack, Telegram, WhatsApp, Teams, Linear, GitHub, iMessage, Webex, Resend, Matrix, Google Chat, WhatsApp Cloud (+ helpers, tests, channel-specific setup steps). Installed via `/add-<channel>` skills.
-- **`providers` branch** — OpenCode (and any future non-default agent providers). Installed via `/add-opencode`.
+- **`providers` branch** — OpenCode and Codex (and any future non-default agent providers). Installed via `/add-opencode`, `/add-codex`. Codex's *credential* half is the exception: `src/providers/codex-credential.ts` and `setup/providers/codex.ts` live on trunk, because credential providers register from an explicit call in `src/index.ts` rather than from a barrel.
 
 Each `/add-<name>` skill is idempotent: `git fetch origin <branch>` → copy module(s) into the standard paths → append a self-registration import to the relevant barrel → `pnpm install <pkg>@<pinned-version>` → build.
 
@@ -144,13 +144,17 @@ The container agent learns this through two container skills (not an always-on g
 - **`credentials`** (`container/skills/credentials/SKILL.md`) — how substitutes work, pulling one with the `get_credential` MCP tool, binding it to an env var, and error recovery. Never ask the user for a raw credential.
 - **`auth-providers`** (`container/skills/auth-providers/SKILL.md`) — how a group declares its own provider definition (in `/workspace/agent/.auth-discovery/`) for a service the proxy doesn't know, and applies it live with `reload_auth_providers`.
 
-Host boot wiring lives in `src/index.ts` (init token engine → register providers → `CredentialProxy.start()` → `setProxyInstance`). Providers ship as `SubstitutingProvider`s (e.g. `src/providers/claude-credential.ts`, `src/providers/github-credential.ts`); ~60 are known out of the box. There is **no** `onecli`/vault CLI, no per-agent "secret mode", and no external service at `127.0.0.1:10254` in this credential path.
+Host boot wiring lives in `src/index.ts` (init token engine → register providers → `CredentialProxy.start()` → `setProxyInstance`). Providers ship as `SubstitutingProvider`s (e.g. `src/providers/claude-credential.ts`, `src/providers/github-credential.ts`, `src/providers/codex-credential.ts`); ~60 are known out of the box. Codex is the file-delivered case: its substitute reaches the CLI as a group-scoped `auth.json` the host writes at every spawn, because the Codex runtime filters its child-process env through a closed allowlist. There is **no** `onecli`/vault CLI, no per-agent "secret mode", and no external service at `127.0.0.1:10254` in this credential path.
 
 ### Providers and access
 
 - **Automatic injection.** Many providers publish a substitute as an env var at container start, so the agent just makes the request. Others are pulled on demand via `get_credential(providerId, credentialPath[, envVar])`.
 - **Per-group scope + borrow.** The proxy identifies the calling container by IP → group scope and resolves credentials through the group's per-group resolver, which enforces grant/borrow access checks (`getOrCreateResolverForAgentGroup`). A group with no own credential for a provider can be wired to borrow another group's via the borrow-source resolver.
 - **Bound-domain confinement.** Because a group can edit its own provider defs, a credential captured for a group provider is pinned to the registrable domain it was issued for — editing a def to point elsewhere forwards only the (useless) substitute. Built-in global providers are exempt.
+
+### Sign-in
+
+A group with no credential for a required provider is not failed silently: the wake-time acquisition gate offers an interactive sign-in in the group's own channel (`src/credential-acquisition.ts` → the provider's `ACQUIRE` extension), and `/auth` reaches the same flow on demand. Claude offers a GPG-encrypted key paste plus two subscription modes. Codex is admin-gated and offers three routes: a browser sign-in (`codex login`, the default — the runner relays the authorize URL and the host delivers the pasted callback into the auth container), a device code (`codex login --device-auth`, which OpenAI gates behind a workspace security setting), and a GPG-encrypted OpenAI API key. All three run in a short-lived auth container with the proxy capturing the real credential. Capture and rotation both run through the proxy's token-exchange handler, which stores the real credential host-side and hands the container a substitute.
 
 ### Approvals
 

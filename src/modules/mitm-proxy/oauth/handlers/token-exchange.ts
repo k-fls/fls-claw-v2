@@ -135,6 +135,11 @@ export function buildTokenExchangeHandler(
       (body, _statusCode) => {
         const parsed = parseBody(body);
         if (!parsed?.fields.access_token) return body;
+        // Upstream's own values, before any field is swapped for a substitute.
+        // Derivation reads a credential out of another field's contents, so it
+        // has to see what the provider sent rather than what the container is
+        // about to be handed.
+        const upstreamFields = { ...parsed.fields };
 
         try {
           const authFields = captureAuthFields(capturedReq, parsed.fields, provider);
@@ -202,6 +207,49 @@ export function buildTokenExchangeHandler(
               CRED_OAUTH_REFRESH,
             );
             if (subRefresh) parsed.set('refresh_token', subRefresh);
+          }
+
+          // Every other credential-bearing field the provider declares. These
+          // are stored first so the minted substitute has a real value to
+          // resolve back to, then swapped in the response. Anything not
+          // declared and not handled above leaves this handler unchanged — for
+          // a provider whose response carries an identity token, that would be
+          // real credential material, and the claims inside it, handed to the
+          // container.
+          for (const extra of provider.credentialResponseFields ?? []) {
+            const real = parsed.fields[extra.field];
+            if (typeof real !== 'string' || !real) continue;
+            ctx
+              .resolverFor(groupScope)
+              .changeScope(targetScope)
+              .store(targetScope, provider.id, extra.credentialPath, { value: real, updated_ts: Date.now() });
+            const sub = ctx.tokenEngine.getOrCreateSubstitute(
+              provider.id,
+              scopeAttrs,
+              groupScope,
+              extra.credentialPath,
+            );
+            if (sub) {
+              parsed.set(extra.field, sub);
+            } else {
+              logger.warn(
+                { provider: provider.id, scope: groupScope, field: extra.field },
+                'oauth.token-exchange: could not mint substitute for a declared credential field — dropping it',
+              );
+              parsed.set(extra.field, '');
+            }
+          }
+
+          // Credentials the response does not carry as fields of its own.
+          // Stored only — writing a substitute into a field the client never
+          // expected would corrupt the shape it parses. The spawn
+          // contribution mints the substitute when it writes them out.
+          for (const [credentialPath, real] of Object.entries(provider.deriveCredentials?.(upstreamFields) ?? {})) {
+            if (!real) continue;
+            ctx
+              .resolverFor(groupScope)
+              .changeScope(targetScope)
+              .store(targetScope, provider.id, credentialPath, { value: real, updated_ts: Date.now() });
           }
 
           return parsed.serialize();

@@ -23,8 +23,12 @@ source "$PROJECT_ROOT/setup/lib/channels-remote.sh"
 REMOTE=$(resolve_channels_remote)
 BRANCH="${REMOTE}/providers"
 
-# The codex payload — host provider, container runtime, setup module, doctrine.
-# Barrels are appended to, not copied.
+# The codex payload — host provider, container runtime, doctrine. Barrels are
+# appended to, not copied.
+#
+# NOT here, deliberately: `setup/providers/codex.ts` and its two tests. Upstream's
+# is the OneCLI-vault auth module, and this edition has no vault — it is authored
+# here instead, so a re-run cannot reintroduce a vault path.
 PAYLOAD_FILES=(
   src/providers/codex.ts
   src/providers/codex-agents-md.ts
@@ -40,11 +44,24 @@ PAYLOAD_FILES=(
   container/agent-runner/src/providers/codex.turns.test.ts
   container/agent-runner/src/providers/codex-app-server.test.ts
   container/agent-runner/src/providers/codex-cli-tools.test.ts
-  setup/providers/codex.ts
-  setup/providers/codex.test.ts
-  setup/providers/codex-registration.test.ts
   container/AGENTS.md
 )
+# Copied only when absent. This edition owns the transport pin inside the
+# container-side Codex config writer, and the container rewrites that file at
+# agent-runner startup — a refresh that restored upstream's copy would silently
+# drop the pin.
+FORK_OWNED=(
+  container/agent-runner/src/providers/codex-app-server.ts
+  # Upstream's buildMounts has no snapshot; this edition's pulls its launch
+  # shape from container-bootstrap, so the test has to initialise one before
+  # calling it. Two added lines, kept across refreshes.
+  src/providers/codex-host-contribution.test.ts
+)
+
+# `setup/providers/codex.ts` is authored on this edition rather than copied, but
+# its barrel import is still wired here: without it the setup picker's
+# `await import('./providers/codex.js')` resolves nothing and the provider has
+# no setup entry.
 BARRELS=(
   src/providers/index.ts
   container/agent-runner/src/providers/index.ts
@@ -63,11 +80,13 @@ emit_status() {
 }
 log() { echo "[add-codex] $*" >&2; }
 
-# Idempotent: a complete install has the host provider file, the host barrel
-# import, and the Codex CLI in the container manifest. Any missing → (re)install.
+# Idempotent: a complete install has the host provider file, the host and setup
+# barrel imports, and the Codex CLI in the container manifest. Any missing →
+# (re)install.
 need_install() {
   [ ! -f src/providers/codex.ts ] && return 0
   ! grep -q "^import './codex.js';" src/providers/index.ts 2>/dev/null && return 0
+  ! grep -q "^import './codex.js';" setup/providers/index.ts 2>/dev/null && return 0
   ! grep -q '@openai/codex' container/cli-tools.json 2>/dev/null && return 0
   return 1
 }
@@ -82,7 +101,16 @@ if need_install; then
   }
 
   log "Copying Codex payload from ${BRANCH}…"
+  is_fork_owned() {
+    local needle=$1 f
+    for f in "${FORK_OWNED[@]}"; do [ "$f" = "$needle" ] && return 0; done
+    return 1
+  }
   for f in "${PAYLOAD_FILES[@]}"; do
+    if is_fork_owned "$f" && [ -f "$f" ]; then
+      log "  keeping fork-owned ${f}"
+      continue
+    fi
     mkdir -p "$(dirname "$f")"
     git show "${BRANCH}:$f" > "$f" 2>/dev/null || {
       emit_status failed "providers branch is missing ${f}"

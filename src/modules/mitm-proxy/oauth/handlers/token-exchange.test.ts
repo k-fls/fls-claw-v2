@@ -55,13 +55,14 @@ vi.mock('../../credential-proxy.js', () => ({
 
 const SCOPE: GroupScope = asGroupScope('test-group');
 
-function provider(): OAuthProvider {
+function provider(over: Partial<OAuthProvider> = {}): OAuthProvider {
   return {
     id: 'example',
     rules: [],
     scopeKeys: [],
     substituteConfig: { prefixLen: 4, suffixLen: 4, delimiters: '-._~' },
     refreshStrategy: 'redirect',
+    ...over,
   } as OAuthProvider;
 }
 
@@ -100,9 +101,7 @@ function makeCtx(engine: TokenSubstituteEngine, store: ReturnType<typeof vi.fn>)
       r = {
         store: (scope: CredentialScope, ...rest: unknown[]) => {
           if ((scope as string) !== own) {
-            throw new Error(
-              `resolver.store: cannot write under scope '${scope}' from resolver owning '${own}'`,
-            );
+            throw new Error(`resolver.store: cannot write under scope '${scope}' from resolver owning '${own}'`);
           }
           (store as (...a: unknown[]) => unknown)(scope, ...rest);
         },
@@ -122,9 +121,9 @@ function makeCtx(engine: TokenSubstituteEngine, store: ReturnType<typeof vi.fn>)
 }
 
 /** Build the handler and capture its transforms (proxyBuffered is mocked). */
-async function capture(ctx: HandlerContext) {
-  const handler = buildTokenExchangeHandler(provider(), rule(), ctx);
-  await handler({} as never, {} as never, 'api.example.com', 443, SCOPE);
+async function capture(ctx: HandlerContext, over: Partial<OAuthProvider> = {}) {
+  const handler = buildTokenExchangeHandler(provider(over), rule(), ctx);
+  await handler({} as never, {} as never, 'api.example.com', 443, SCOPE, '172.29.0.9');
   return pb.captured!;
 }
 
@@ -201,9 +200,7 @@ describe('buildTokenExchangeHandler — response transform', () => {
     const engine = makeEngine({
       // The swapped refresh substitute is bound to the grantor's scope.
       resolveSubstitute: vi.fn((s: string) =>
-        s === 'SUB_REFRESH'
-          ? { realToken: 'REAL_GRANTOR_REFRESH', mapping: { credentialScope: GRANTOR } }
-          : null,
+        s === 'SUB_REFRESH' ? { realToken: 'REAL_GRANTOR_REFRESH', mapping: { credentialScope: GRANTOR } } : null,
       ),
       getOrCreateSubstitute: vi.fn((_pid: string, _attrs: unknown, _scope: GroupScope, path: string) =>
         path === CRED_OAUTH ? 'SUB_ACCESS' : path === CRED_OAUTH_REFRESH ? 'SUB_REFRESH' : null,
@@ -247,6 +244,84 @@ describe('buildTokenExchangeHandler — response transform', () => {
     expect(store.mock.calls[0][0]).toBe(asCredentialScope(SCOPE)); // own scope, not a grantor
   });
 
+  // A provider whose token response carries more than access/refresh — an
+  // identity token and an account identifier — used to hand both to the
+  // container in the clear, along with every claim inside the identity token.
+  it('substitutes every credential-bearing field the provider declares, not just the two', async () => {
+    const store = vi.fn();
+    const engine = makeEngine({
+      getOrCreateSubstitute: vi.fn(
+        (_pid: string, _attrs: unknown, _scope: GroupScope, path: string) => `SUB_${path.toUpperCase()}`,
+      ),
+    });
+    const { transformResponse } = await capture(makeCtx(engine, store), {
+      credentialResponseFields: [
+        { field: 'id_token', credentialPath: 'id_token' },
+        { field: 'account_id', credentialPath: 'account_id' },
+      ],
+    });
+
+    const REAL_ID = 'header.eyJlbWFpbCI6InBlcnNvbkBleGFtcGxlLmNvbSJ9.sig';
+    const out = transformResponse(
+      JSON.stringify({
+        access_token: 'REAL_ACCESS',
+        refresh_token: 'REAL_REFRESH',
+        id_token: REAL_ID,
+        account_id: 'REAL_ACCOUNT',
+        expires_in: 3600,
+      }),
+      200,
+    );
+
+    // Nothing real reaches the container.
+    expect(out).not.toContain('REAL_ACCESS');
+    expect(out).not.toContain('REAL_REFRESH');
+    expect(out).not.toContain(REAL_ID);
+    expect(out).not.toContain('REAL_ACCOUNT');
+
+    const parsed = JSON.parse(out);
+    expect(parsed.id_token).toBe('SUB_ID_TOKEN');
+    expect(parsed.account_id).toBe('SUB_ACCOUNT_ID');
+
+    // Each declared field's real value is persisted, so its substitute resolves.
+    const stored = Object.fromEntries(store.mock.calls.map((c) => [c[2], c[3].value]));
+    expect(stored['id_token']).toBe(REAL_ID);
+    expect(stored['account_id']).toBe('REAL_ACCOUNT');
+  });
+
+  it('blanks a declared field rather than leaking it when no substitute can be minted', async () => {
+    const store = vi.fn();
+    const engine = makeEngine({
+      getOrCreateSubstitute: vi.fn((_pid: string, _attrs: unknown, _scope: GroupScope, path: string) =>
+        path === 'id_token' ? null : `SUB_${path.toUpperCase()}`,
+      ),
+    });
+    const { transformResponse } = await capture(makeCtx(engine, store), {
+      credentialResponseFields: [{ field: 'id_token', credentialPath: 'id_token' }],
+    });
+
+    const out = transformResponse(
+      JSON.stringify({ access_token: 'REAL_ACCESS', id_token: 'REAL_ID', expires_in: 3600 }),
+      200,
+    );
+
+    expect(out).not.toContain('REAL_ID');
+    expect(JSON.parse(out).id_token).toBe('');
+  });
+
+  it('leaves a provider that declares no extra fields exactly as before', async () => {
+    const store = vi.fn();
+    const engine = makeEngine({
+      getOrCreateSubstitute: vi.fn(() => 'SUB'),
+    });
+    const { transformResponse } = await capture(makeCtx(engine, store));
+
+    const out = transformResponse(JSON.stringify({ access_token: 'REAL_ACCESS', id_token: 'PASSTHROUGH' }), 200);
+
+    // Unchanged behaviour: an undeclared field is not touched.
+    expect(JSON.parse(out).id_token).toBe('PASSTHROUGH');
+  });
+
   it('passes the body through untouched when there is no access_token', async () => {
     const store = vi.fn();
     const engine = makeEngine({});
@@ -256,5 +331,45 @@ describe('buildTokenExchangeHandler — response transform', () => {
     expect(transformResponse(errBody, 400)).toBe(errBody);
     expect(store).not.toHaveBeenCalled();
     expect(engine.getOrCreateSubstitute).not.toHaveBeenCalled();
+  });
+});
+
+describe('buildTokenExchangeHandler — derived credentials', () => {
+  /** A JWT in shape only, carrying `claims` a provider can derive from. */
+  function jwt(claims: Record<string, unknown>): string {
+    const seg = (o: unknown): string => Buffer.from(JSON.stringify(o)).toString('base64url');
+    return `${seg({ alg: 'RS256' })}.${seg(claims)}.sig`;
+  }
+
+  // Derivation reads a credential out of ANOTHER field's contents, and that
+  // field is itself substituted on the way back. Reading the post-substitution
+  // fields decodes the synthetic token instead of upstream's, so nothing is
+  // derived — which left the spawn contribution one value short and, finding it
+  // missing, silently declined to write the container's auth file at all.
+  it('derives from upstream values, not from the substitutes already swapped in', async () => {
+    const store = vi.fn();
+    const engine = makeEngine({ getOrCreateSubstitute: vi.fn(() => jwt({ exp: 1 })) });
+
+    const { transformResponse } = await capture(makeCtx(engine, store), {
+      credentialResponseFields: [{ field: 'id_token', credentialPath: 'id_token' }],
+      deriveCredentials: (fields): Record<string, string> => {
+        const claims = JSON.parse(Buffer.from(String(fields.id_token).split('.')[1], 'base64url').toString()) as {
+          'https://api.openai.com/auth'?: { chatgpt_account_id?: string };
+        };
+        const account = claims['https://api.openai.com/auth']?.chatgpt_account_id;
+        return account ? { account_id: account } : {};
+      },
+    });
+
+    transformResponse(
+      JSON.stringify({
+        access_token: 'REAL_ACCESS',
+        id_token: jwt({ 'https://api.openai.com/auth': { chatgpt_account_id: 'acct-42' } }),
+      }),
+      200,
+    );
+
+    const derived = store.mock.calls.find((c) => c[2] === 'account_id');
+    expect(derived?.[3].value).toBe('acct-42');
   });
 });

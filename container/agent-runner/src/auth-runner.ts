@@ -2,17 +2,27 @@
  * Browser-auth runner — alternate container entrypoint.
  *
  * The host mounts this over /app/src/index.ts for a short-lived auth container,
- * so the normal entrypoint's `bun run /app/src/index.ts` runs it. It runs
- * `claude setup-token` / `claude auth login` under a very wide PTY (so the Ink
- * TUI never wraps the OAuth URL) and bridges the CLI's interactive OAuth to
- * the user over host-rpc — the container is the caller, so no host→container
- * stdin:
+ * so the normal entrypoint's `bun run /app/src/index.ts` runs it. It runs the
+ * provider's auth CLI under a very wide PTY (so an Ink TUI never wraps the OAuth
+ * URL). Two flow shapes, selected by the mode's spec:
+ *
+ * Code-relay (`claude setup-token` / `claude auth login`) — the container is the
+ * caller, so there is no host→container stdin:
  *
  *   1. spawn the CLI under `script` (allocates the PTY; `stty columns 500`)
  *   2. scrape the OAuth URL from stdout → POST it to the host (/auth/url)
  *   3. long-poll the host (/auth/code) for the code the user pasted in chat
  *   4. write that code to the CLI's local stdin
  *   5. wait for the CLI to finish the token-exchange and exit
+ *
+ * Device (`codex login --device-auth`) — the CLI polls the provider itself and
+ * the proxy relays the user code out of the device-authorization response, so
+ * the runner only spawns and waits. No scrape, no long-poll, no write-back.
+ *
+ * Callback (`codex login`) — the CLI prints its authorize URL and waits on its
+ * own localhost HTTP listener. The runner scrapes and relays the URL, then
+ * waits: the HOST delivers the browser's callback into this container, because
+ * the CLI reads no code from stdin.
  *
  * It does NOT capture the credential: the auth container routes through the
  * MITM proxy, which intercepts the CLI's token-exchange and stores the real
@@ -23,12 +33,10 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 
 import { makeAuthRpcClient } from './auth/rpc-client.js';
 import { extractOAuthUrl } from './auth/parse.js';
+import { readAuthEnv, specFor, type AuthMode } from './auth/mode.js';
 
 const URL_WAIT_MS = 60_000;
-const EXIT_WAIT_MS = 30_000;
 const POLL_INTERVAL_MS = 250;
-
-type AuthMode = 'setup_token' | 'auth_login';
 
 function fail(msg: string): never {
   console.error(`auth-runner: ${msg}`);
@@ -36,13 +44,9 @@ function fail(msg: string): never {
 }
 
 function readEnv() {
-  const mode = process.env.NANOCLAW_AUTH_MODE;
-  const nonce = process.env.NANOCLAW_AUTH_NONCE;
-  const port = process.env.NANOCLAW_HOST_RPC_PORT;
-  if (mode !== 'setup_token' && mode !== 'auth_login') fail(`bad NANOCLAW_AUTH_MODE: ${mode}`);
-  if (!nonce) fail('NANOCLAW_AUTH_NONCE not set');
-  if (!port) fail('NANOCLAW_HOST_RPC_PORT not set');
-  return { mode: mode as AuthMode, nonce, port };
+  const parsed = readAuthEnv(process.env);
+  if ('error' in parsed) fail(parsed.error);
+  return parsed;
 }
 
 /** Drives the CLI subprocess: accumulates PTY output and waits on patterns. */
@@ -102,7 +106,7 @@ class CliSession {
 }
 
 function spawnCli(mode: AuthMode): CliSession {
-  const cliCommand = mode === 'setup_token' ? 'claude setup-token' : 'claude auth login';
+  const cliCommand = specFor(mode).command;
   // `script` allocates the PTY; the wide column count stops Ink from wrapping
   // (a wrapped URL is corrupted by the \r overwrites). Ported from v1.
   const proc = spawn('script', ['-qc', `stty columns 500 && ${cliCommand}`, '/dev/null'], {
@@ -113,29 +117,48 @@ function spawnCli(mode: AuthMode): CliSession {
 
 async function main(): Promise<void> {
   const { mode, nonce, port } = readEnv();
-  const client = makeAuthRpcClient({ baseUrl: `http://host.docker.internal:${port}`, nonce });
-
+  const spec = specFor(mode);
   const cli = spawnCli(mode);
 
-  const urlMatch = await cli.waitFor(/https?:\/\/\S+/, URL_WAIT_MS);
-  const url = urlMatch ? extractOAuthUrl(cli.output) : null;
-  if (!url) {
+  const authUrlPattern = spec.authUrlPattern;
+  if (!authUrlPattern) {
+    // The proxy relays the user code; nothing to scrape and nothing to feed
+    // back. Just let the CLI finish its own polling.
+    await cli.waitExit(spec.exitWaitMs);
     cli.kill();
-    fail('CLI exited or timed out before emitting an OAuth URL');
+    console.error(`auth-runner: ${mode} flow complete`);
+    process.exit(0);
+  }
+
+  const client = makeAuthRpcClient({ baseUrl: `http://host.docker.internal:${port}`, nonce });
+
+  const urlMatch = await cli.waitFor(/https?:\/\/\S+/, URL_WAIT_MS);
+  const url = urlMatch ? extractOAuthUrl(cli.output, authUrlPattern) : null;
+  if (!url) {
+    // Carry what the CLI actually said. Without it a missing binary, an
+    // unwritable home and a genuine timeout are the same line in the host log,
+    // and the container is `--rm` so nothing survives to inspect afterwards.
+    const tail = cli.output.trim().slice(-500);
+    cli.kill();
+    fail(`CLI emitted no OAuth URL — last output: ${tail || '(none)'}`);
   }
 
   await client.postUrl(url);
-  const code = await client.pollCode();
-  if ('cancelled' in code) {
-    cli.kill();
-    fail('user cancelled or timed out');
-  }
 
-  cli.send(code.code);
+  if (spec.codeReturn === 'stdin') {
+    const code = await client.pollCode();
+    if ('cancelled' in code) {
+      cli.kill();
+      fail('user cancelled or timed out');
+    }
+    cli.send(code.code);
+  }
+  // `callback`: the host curls the browser's redirect into this container's own
+  // listener, so there is nothing to poll for and nothing to type.
 
   // Wait for the CLI to complete the token-exchange (intercepted + captured by
   // the host proxy) and exit. No local capture — the proxy owns it.
-  await cli.waitExit(EXIT_WAIT_MS);
+  await cli.waitExit(spec.exitWaitMs);
   cli.kill();
   console.error(`auth-runner: ${mode} flow complete`);
   process.exit(0);

@@ -221,6 +221,31 @@ OAuth submodule itself.
   No legacy-format migration runs; legacy files are logged and skipped.
 - The engine never stores or deletes credentials. Both mutations live
   in the credentials module's resolver.
+- **Every credential-bearing response field a provider declares is
+  substituted**, not only `access_token` / `refresh_token`. A provider
+  whose token response also carries an identity token or an account
+  identifier lists them in `credentialResponseFields`; anything not
+  listed and not handled by default reaches the container in the clear.
+
+## Provider-side constraints
+
+Two constraints belong to the provider, not the proxy, and a new
+provider author has to satisfy them:
+
+- **The transport must be interceptable.** The proxy MITMs TLS over
+  CONNECT and DNAT'd `:443`. A protocol upgrade cannot ride the buffered
+  handlers, so it is tunnelled with its handshake headers swapped — the
+  credential on that path lives entirely in the handshake. A runtime that
+  can select a WebSocket transport is still better pinned to the HTTP one
+  where a pin is reachable; on the pinned Codex CLI no config key turns
+  the preference off directly
+  (`docs/solutions/integration-issues/codex-responses-websocket-cannot-be-pinned-off.md`),
+  so the pin arrives as a custom model provider instead.
+- **Path rules should be no wider than the runtime needs.** Interception
+  is host-level, so registering a rule makes that host decrypted for
+  every group. A path the provider never uses is best left unmatched:
+  the request is then forwarded carrying the substitute and fails,
+  rather than being swapped.
 
 ## Consumer usage
 

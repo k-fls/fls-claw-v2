@@ -45,7 +45,8 @@ export function buildDeviceCodeHandler(
           return body;
         }
         const userCode = parsed.fields.user_code;
-        const verificationUri = parsed.fields.verification_uri_complete || parsed.fields.verification_uri;
+        const verificationUri =
+          parsed.fields.verification_uri_complete || parsed.fields.verification_uri || provider.deviceVerificationUri;
         if (userCode && verificationUri) {
           ctx.oauthEvents?.notifyDeviceCode({
             sourceIP,
@@ -55,8 +56,17 @@ export function buildDeviceCodeHandler(
             borrowedFrom: ctx.tokenEngine.borrowedFrom(provider.id, scope) ?? undefined,
           });
         } else {
+          // Field NAMES only, never values: without them a shape mismatch is
+          // indistinguishable from a transport failure, and the response is the
+          // one thing that cannot be read from the provider's own docs.
           logger.warn(
-            { provider: provider.id, scope, hasCode: !!userCode, hasUri: !!verificationUri },
+            {
+              provider: provider.id,
+              scope,
+              hasCode: !!userCode,
+              hasUri: !!verificationUri,
+              fields: Object.keys(parsed.fields),
+            },
             'oauth.device-code: response missing user_code / verification_uri',
           );
         }

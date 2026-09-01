@@ -85,4 +85,26 @@ describe('buildAuthSpawnArgs', () => {
     const args = buildAuthSpawnArgs(baseInput());
     expect(args[args.length - 1]).toBe('nanoclaw-agent:latest');
   });
+  it('carries the codex device mode and its throwaway home through unchanged', () => {
+    const s = buildAuthSpawnArgs(
+      baseInput({
+        mode: 'codex_device',
+        mounts: [{ hostPath: '/data/auth-spawns/test-1/codex', containerPath: '/home/node/.codex', readonly: false }],
+        extraEnv: { CODEX_HOME: '/home/node/.codex' },
+      }),
+    ).join(' ');
+    expect(s).toContain('NANOCLAW_AUTH_MODE=codex_device');
+    expect(s).toContain('CODEX_HOME=/home/node/.codex');
+    expect(s).toContain('-v /data/auth-spawns/test-1/codex:/home/node/.codex');
+    // The throwaway home is writable; a read-only mount would fail the login.
+    expect(s).not.toContain('/home/node/.codex:ro');
+  });
+
+  it('builds byte-identical args for the two Claude modes as before', () => {
+    for (const mode of ['setup_token', 'auth_login'] as const) {
+      const s = buildAuthSpawnArgs(baseInput({ mode })).join(' ');
+      expect(s).toContain(`NANOCLAW_AUTH_MODE=${mode}`);
+      expect(s).toContain('-v /data/auth-spawns/test-1/claude:/home/node/.claude');
+    }
+  });
 });
