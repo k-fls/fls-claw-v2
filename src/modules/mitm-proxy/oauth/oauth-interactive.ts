@@ -98,15 +98,24 @@ function resolveDeviceCodeOrigin(sourceIP: string | undefined): { origin: Intera
 }
 
 /**
- * Parse a localhost callback URL into code + state + port. Accepts the
- * raw URL the user copies from their browser address bar; tolerant of the
- * Slack `<…>` / `&amp;` wrapping as a precaution. Port from v1.
+ * Parse a localhost callback URL into code + state + port. Accepts the raw URL
+ * the user copies from their browser address bar, and undoes the decorations a
+ * chat client applies on the way in. Port from v1.
  */
 export function parseCallbackUrl(input: string): { code: string; state: string; port: number } | null {
   let trimmed = input.trim();
   if (trimmed.startsWith('<') && trimmed.endsWith('>')) {
-    trimmed = trimmed.slice(1, -1).replace(/&amp;/g, '&');
+    trimmed = trimmed.slice(1, -1);
+    // Slack's link form is `<url|label>`; the label would otherwise be read as
+    // part of the final query value.
+    const label = trimmed.indexOf('|');
+    if (label !== -1) trimmed = trimmed.slice(0, label);
   }
+  // Slack HTML-escapes `&` in message text whether or not it linkified the URL,
+  // and it does not linkify `localhost`. Left encoded, `&amp;state=` parses as a
+  // parameter named `amp;state`, so `state` reads as absent and a perfectly good
+  // callback is rejected.
+  trimmed = trimmed.replace(/&amp;/g, '&');
   try {
     const url = new URL(trimmed);
     const code = url.searchParams.get('code');
@@ -144,11 +153,19 @@ export const dockerExecDeliver: AuthCodeDeliver = (containerName, callbackUrl) =
  */
 export async function deliverPastedCallback(containerName: string, pasted: string): Promise<boolean> {
   const parsed = parseCallbackUrl(pasted);
-  if (!parsed) return false;
+  if (!parsed) {
+    // Length only, never the text: a real callback carries an authorization
+    // code. Without this the difference between "they pasted junk" and "the
+    // delivery failed" is invisible, which is how a chat client's escaping went
+    // unnoticed.
+    log.warn('oauth: pasted text is not a localhost callback URL', { containerName, length: pasted.length });
+    return false;
+  }
   const url =
     `http://localhost:${parsed.port}/auth/callback` +
     `?code=${encodeURIComponent(parsed.code)}&state=${encodeURIComponent(parsed.state)}`;
   await dockerExecDeliver(containerName, url);
+  log.info('oauth: delivered browser callback into the auth container', { containerName, port: parsed.port });
   return true;
 }
 

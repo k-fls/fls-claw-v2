@@ -19,6 +19,26 @@ describe('parseCallbackUrl', () => {
     });
   });
 
+  // Slack escapes `&` in message text and does not linkify `localhost`, so the
+  // callback arrives escaped but unwrapped. Read literally, `&amp;state=` is a
+  // parameter named `amp;state` and `state` looks absent — which silently
+  // rejected every Slack sign-in.
+  it('decodes &amp; even when the URL is not wrapped', () => {
+    expect(parseCallbackUrl('http://localhost:1455/auth/callback?code=a&amp;state=b')).toEqual({
+      code: 'a',
+      state: 'b',
+      port: 1455,
+    });
+  });
+
+  it("drops the label from Slack's <url|label> form rather than reading it as state", () => {
+    expect(parseCallbackUrl('<http://localhost:1455/cb?code=a&amp;state=b|localhost:1455>')).toEqual({
+      code: 'a',
+      state: 'b',
+      port: 1455,
+    });
+  });
+
   it('returns null when code, state, or port is missing', () => {
     expect(parseCallbackUrl('http://localhost:1234/cb?code=a')).toBeNull(); // no state
     expect(parseCallbackUrl('http://localhost/cb?code=a&state=b')).toBeNull(); // no port
