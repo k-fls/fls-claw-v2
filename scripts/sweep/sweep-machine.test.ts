@@ -9993,3 +9993,213 @@ describe('gate-fix twins — the same commit, offered at the ceiling', () => {
     expect(journal.some((e) => e.action === 'origin-blocked' && e.branch === 'module/cg')).toBe(false);
   });
 });
+
+describe('run — a swept branch that MOVED under the open pass (the stale-case heal)', () => {
+  /** A fast-forward commit onto `branch` — git moving under the pass. */
+  const advance = (repo: FixtureRepo, branch: string, files: Record<string, string>, msg: string): string => {
+    repo.checkout(branch);
+    const sha = repo.commit(msg, files);
+    repo.checkout('main');
+    return sha;
+  };
+  /** A NON-fast-forward rewrite of `branch` (plumbing: no checkout, no extra ref). */
+  const rewrite = (repo: FixtureRepo, branch: string, msg: string): string => {
+    const base = repo.sha(`${branch}~1`);
+    const sha = repo.git('commit-tree', repo.git('rev-parse', `${base}^{tree}`), '-p', base, '-m', msg);
+    repo.git('update-ref', `refs/heads/${branch}`, sha);
+    return sha;
+  };
+  const passCmds = (ws: string): string => {
+    const f = join(ws, 'cmds-true.json');
+    writeFileSync(f, JSON.stringify([{ cmd: 'true' }]));
+    return f;
+  };
+
+  it('breaks the deadlock: the stale case is dropped, re-derived from git and served — and CONCLUDABLE', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: join(ws, 'n1.json') }), greenPreMerge)).toBe(0);
+    const caseId = currentCaseId(dir);
+
+    // GIT MOVES UNDER THE PASS — the driver is redeployed onto a branch that is
+    // both its own source and swept content. The conflict on src/x.ts is
+    // untouched, so the case is still live; only its automerge tree is now a
+    // statement about a tip that no longer exists.
+    advance(repo, 'main_patched', { 'src/z.ts': 'owner work\n' }, 'owner: unrelated commit');
+
+    const out = join(ws, 'n2.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), greenPreMerge)).toBe(0);
+    const journal = readJournal(dir);
+    const stale = journal.find((e) => e.action === 'case-stale' && e.caseId === caseId)!;
+    expect(stale).toBeTruthy();
+    expect(stale.drift).toBe('branch-tip');
+    expect(stale.branch).toBe('main_patched');
+    expect(stale.liveTip).toBe(repo.sha('main_patched'));
+    expect(journal.some((e) => e.action === 'reopened' && e.branch === 'main_patched')).toBe(true);
+    // The case is RE-DERIVED, not disposed: a synthetic `resolved` would be
+    // terminal for this id whatever its order, and the re-emission wears the
+    // SAME id (its sha8 is the conflict head's, which the branch never moved).
+    expect(journal.some((e) => e.action === 'resolved' && e.caseId === caseId)).toBe(false);
+    const emissions = journal.filter((e) => e.action === 'case' && e.caseId === caseId);
+    expect(emissions.length).toBe(2);
+    const served = JSON.parse(readFileSync(out, 'utf8')) as { caseId?: string; status?: string };
+    expect(served.caseId).toBe(caseId);
+    expect(openCases(readJournal(dir)).map((c) => c.caseId)).toEqual([caseId]);
+
+    // AND THE CONCLUSION IS ACCEPTED. This is the whole point: before the heal,
+    // `report-case` answered ERR02_CASE_STALE on the automerge drift and
+    // `next-case` answered ERR44_CASE_LOOPING, so the pass had no legal move.
+    const rc = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true, out: rc }),
+        neverInvoked,
+      ),
+    ).toBe(0);
+    expect(openCases(readJournal(dir)).map((c) => c.caseId)).not.toContain(caseId);
+  });
+
+  it('the serve count restarts at the re-emission — a healed case is not born at the serve limit', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    for (const n of [1, 2, 3, 4]) {
+      expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: join(ws, `n${n}.json`) }), greenPreMerge)).toBe(0);
+    }
+    const caseId = currentCaseId(dir);
+    advance(repo, 'main_patched', { 'src/z.ts': 'owner work\n' }, 'owner: unrelated commit');
+
+    // Serve 5 would be REFUSED on the old count. The case being served is a
+    // different derivation of the same conflict, so it is served as its first.
+    const out = join(ws, 'n5.json');
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), greenPreMerge)).toBe(0);
+    const r = JSON.parse(readFileSync(out, 'utf8')) as { status?: string; warning?: string; caseId?: string };
+    expect(r.caseId).toBe(caseId);
+    expect(r.status).toBe('case-ready');
+    expect(r.warning).toBeUndefined(); // not a 5th serve, so no loop warning either
+    const served = readJournal(dir).filter((e) => e.action === 'case-served' && e.caseId === caseId);
+    expect(served.map((e) => e.serves)).toEqual([1, 2, 3, 4, 1]);
+    expect(readJournal(dir).some((e) => e.action === 'case-serve-limit')).toBe(false);
+  });
+
+  it('a tip movement that DISSOLVES the conflict lands the merge and clears the pass', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const upstreamTop = repo.sha('main');
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: join(ws, 'n1.json') }), greenPreMerge)).toBe(0);
+    const caseId = currentCaseId(dir);
+
+    // The owner drops the fork line on the conflicted file themselves: the branch
+    // moves FORWARD and the conflict dissolves with it, leaving a merge that
+    // simply lands.
+    advance(repo, 'main_patched', { 'src/x.ts': 'orig\n' }, 'owner: drop the fork line');
+    repo.git('push', 'origin', 'main_patched');
+
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: join(ws, 'n2.json') }), greenPreMerge)).toBe(0);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'case-stale' && e.caseId === caseId)).toBe(true);
+    expect(journal.some((e) => e.action === 'reopened' && e.branch === 'main_patched')).toBe(true);
+    // Nothing left to serve, because there is nothing left to resolve: the
+    // re-derivation merges the upstream head the case was minted over.
+    const stale = journal.findIndex((e) => e.action === 'case-stale');
+    expect(journal.findIndex((e, i) => i > stale && e.action === 'merge' && e.branch === 'main_patched')).toBeGreaterThan(stale);
+    expect(await isAncestor(repo.dir, upstreamTop, repo.sha('main_patched'))).toBe(true);
+    expect(openCases(journal).length).toBe(0);
+    // …so `finish` is no longer wedged on ERR34_CASES_REMAIN.
+    const out = join(ws, 'finish.json');
+    expect(
+      await cmdSweepFinish(
+        baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, commandsFile: passCmds(ws), out }),
+      ),
+    ).toBe(0);
+    const fin = JSON.parse(readFileSync(out, 'utf8')) as { ok: boolean; issues?: Array<{ id: string }> };
+    expect((fin.issues ?? []).map((i) => i.id)).not.toContain('ERR34_CASES_REMAIN');
+    expect(fin.ok).toBe(true);
+  });
+
+  it('REWRITTEN history is recorded and NOT adapted to — the owner decides, the driver does not', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: join(ws, 'n1.json') }), greenPreMerge)).toBe(0);
+    const caseId = currentCaseId(dir);
+    const recordedTip = repo.sha('main_patched');
+    const rewritten = rewrite(repo, 'main_patched', 'owner: rebased history');
+
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: join(ws, 'n2.json') }), greenPreMerge)).toBe(0);
+    const journal = readJournal(dir);
+    const stale = journal.find((e) => e.action === 'case-stale' && e.caseId === caseId)!;
+    expect(stale).toBeTruthy();
+    expect(stale.drift).toBe('divergent');
+    expect(stale.recordedTip).toBe(recordedTip);
+    expect(stale.liveTip).toBe(rewritten);
+    // Silently re-deriving around a rewrite would erase the evidence, so the
+    // row is written and nothing else happens: no reopen, and the case STANDS.
+    expect(journal.some((e) => e.action === 'reopened' && e.branch === 'main_patched')).toBe(false);
+    expect(openCases(journal).map((c) => c.caseId)).toEqual([caseId]);
+  });
+
+  it('GUARD: mid-flight, `report-case` still answers ERR02 and heals nothing — the agent is told to stop', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: join(ws, 'n1.json') }), greenPreMerge)).toBe(0);
+    const caseId = currentCaseId(dir);
+    advance(repo, 'main_patched', { 'src/z.ts': 'owner work\n' }, 'owner: unrelated commit');
+
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true, out }),
+        neverInvoked,
+      ),
+    ).toBe(1);
+    const r = JSON.parse(readFileSync(out, 'utf8')) as { issues: Array<{ id: string; detail: string }> };
+    expect(r.issues.map((i) => i.id)).toContain('ERR02_CASE_STALE');
+    expect(r.issues.some((i) => /automerge-tree drift/.test(i.detail))).toBe(true);
+    // The heal is `run`'s, and `report-case` runs none of it: the case is
+    // untouched and still open, waiting for the `next-case` the refusal asks for.
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'case-stale')).toBe(false);
+    expect(journal.some((e) => e.action === 'reopened' && e.branch === 'main_patched')).toBe(false);
+    expect(openCases(journal).map((c) => c.caseId)).toEqual([caseId]);
+  });
+
+  it('GUARD: a HELD case is not healed when its branch moves — a disposition is not staleness', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: join(ws, 'n1.json') }), greenPreMerge)).toBe(0);
+    const caseId = currentCaseId(dir);
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true, out: join(ws, 'rc.json') }),
+        neverInvoked,
+      ),
+    ).toBe(0);
+    writePr(dir, caseId, 'held x', 'Decision needed: the fork line in src/x.ts.');
+    expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
+    advance(repo, 'main_patched', { 'src/z.ts': 'owner work\n' }, 'owner: unrelated commit');
+
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { out: join(ws, 'n2.json') }), greenPreMerge)).toBe(0);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'case-stale')).toBe(false);
+    expect(journal.filter((e) => e.action === 'case' && e.caseId === caseId).length).toBe(1);
+  });
+});
