@@ -318,6 +318,22 @@ export function buildTokenExchangeHandler(
               }
             }
 
+            // Credentials the response does not carry as fields of its own.
+            // Stored only — writing a substitute into a field the client never
+            // expected would corrupt the shape it parses. The spawn
+            // contribution mints the substitute when it writes them out.
+            for (const [credentialPath, real] of Object.entries(provider.deriveCredentials?.(parsed.fields) ?? {})) {
+              if (!real) continue;
+              ctx
+                .resolverFor(groupScope)
+                .changeScope(targetScope)
+                .store(targetScope, provider.id, credentialPath, { value: real, updated_ts: Date.now() });
+              logger.info(
+                { provider: provider.id, scope: targetScope, credentialPath },
+                'oauth.token-exchange: derived credential stored',
+              );
+            }
+
             return parsed.serialize();
           } catch (err) {
             logger.error({ err, provider: provider.id }, 'oauth.token-exchange: response processing failed');

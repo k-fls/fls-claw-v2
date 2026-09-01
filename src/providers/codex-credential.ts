@@ -109,6 +109,12 @@ export const CODEX_OAUTH_PROVIDER: OAuthProvider = {
   scopeKeys: [],
   substituteConfig: { prefixLen: 0, suffixLen: 0, delimiters: '.-_' },
   refreshStrategy: 'redirect',
+  // Observed on the wire against the real endpoint: the device-authorization
+  // response carries only device_auth_id, user_code, interval and expires_at —
+  // no verification URI. The CLI holds this URL as a constant and prints it
+  // itself, so the relay has to supply it or the user gets a code and nowhere
+  // to enter it.
+  deviceVerificationUri: 'https://auth.openai.com/codex/device',
   // Codex reads auth.json; the payload strips OPENAI_API_KEY from the CLI env.
   envBindings: [],
   // The token response carries four credential-bearing fields, not the two the
@@ -119,12 +125,40 @@ export const CODEX_OAUTH_PROVIDER: OAuthProvider = {
     { field: 'id_token', credentialPath: CRED_ID_TOKEN },
     { field: 'account_id', credentialPath: CRED_ACCOUNT_ID },
   ],
+  // The account identifier is NOT a field of the token response — observed on
+  // the wire, the response carries no `account_id` at all. It lives inside the
+  // identity token's claims, which is where the CLI reads it from too. Without
+  // this the contribution has no account id, writes no auth.json, and the
+  // container runs unauthenticated.
+  deriveCredentials(fields): Record<string, string> {
+    const accountId = chatgptAccountIdFromJwt(fields.id_token ?? fields.access_token ?? '');
+    return accountId ? { [CRED_ACCOUNT_ID]: accountId } : {};
+  },
   // Capture nothing into cleartext metadata. The request-side default persists
   // every non-transient field, which here would be the device-auth id and the
   // user code; the account identifier this provider does need is stored by the
   // declared-field path above, not by capture.
   tokenFieldCapture: { fromRequest: [], fromResponse: [] },
 };
+
+/**
+ * Read `chatgpt_account_id` out of a Codex JWT's namespaced auth claim. Returns
+ * null for anything that is not a decodable three-segment token carrying it —
+ * the caller treats that as "no account id" rather than failing the exchange,
+ * because a token response is not worth losing over a claim shape change.
+ */
+function chatgptAccountIdFromJwt(token: string): string | null {
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  try {
+    const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf-8')) as Record<string, unknown>;
+    const ns = claims[CLAIM_NAMESPACE] as { chatgpt_account_id?: unknown } | undefined;
+    return typeof ns?.chatgpt_account_id === 'string' ? ns.chatgpt_account_id : null;
+    // eslint-disable-next-line no-catch-all/no-catch-all -- an undecodable token is "no account id"
+  } catch {
+    return null;
+  }
+}
 
 function b64url(value: string): string {
   return Buffer.from(value, 'utf-8').toString('base64url');

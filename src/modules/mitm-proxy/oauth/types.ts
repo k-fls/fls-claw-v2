@@ -75,6 +75,25 @@ export interface OAuthProvider {
   scopeKeys: string[];
   substituteConfig: SubstituteConfig;
   refreshStrategy: RefreshStrategy;
+  /**
+   * Verification URL for a device flow whose authorization response does not
+   * carry one. The RFC treats `verification_uri` as part of the response, but a
+   * provider may instead hold it as a constant its own client knows, in which
+   * case the relay has nothing to send the user without this. Response fields
+   * still win when present.
+   */
+  deviceVerificationUri?: string;
+  /**
+   * Derive credential values the token response does not carry as fields of its
+   * own — e.g. an account identifier that lives only inside an identity token's
+   * claims. Returns credentialPath → real value.
+   *
+   * Derived values are stored exactly like `credentialResponseFields`, so the
+   * engine can mint a substitute for them and the proxy can swap it on the wire.
+   * They are NOT written back into the response: the container never saw them
+   * there, and inventing a field would change the shape its client parses.
+   */
+  deriveCredentials?(responseFields: Record<string, string>): Record<string, string>;
   /** Parsed `_env_vars`. */
   envBindings?: EnvVarBinding[];
   /** Parsed `_credential_format`. */
