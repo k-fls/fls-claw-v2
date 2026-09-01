@@ -13,9 +13,17 @@
 
 export type AuthMode = 'setup_token' | 'auth_login' | 'codex_device' | 'codex_login';
 
+import { CLAUDE_OAUTH_URL_RE, CODEX_OAUTH_URL_RE } from './parse.js';
+
 export interface AuthModeSpec {
   /** Command line run under the PTY. */
   command: string;
+  /**
+   * Which authorize URL to scrape. Per-CLI because each prints other links
+   * alongside it — `codex login` also prints a device-auth hint — and matching
+   * the wrong one relays a page the user cannot authorize on.
+   */
+  authUrlPattern?: RegExp;
   /**
    * Whether the runner scrapes the CLI's authorization URL and relays it to the
    * host. False for a device flow: the proxy relays the user code out of the
@@ -47,6 +55,7 @@ const DEVICE_EXIT_WAIT_MS = 10 * 60_000;
 const SPECS: Record<AuthMode, AuthModeSpec> = {
   setup_token: {
     command: 'claude setup-token',
+    authUrlPattern: CLAUDE_OAUTH_URL_RE,
     relaysUrl: true,
     codeReturn: 'stdin',
     exitWaitMs: CODE_RELAY_EXIT_WAIT_MS,
@@ -67,7 +76,13 @@ const SPECS: Record<AuthMode, AuthModeSpec> = {
   // It reads no code from stdin, so the host delivers the browser's callback
   // into this container instead. Unlike the device flow it needs no
   // workspace-level device-code authorization.
-  codex_login: { command: 'codex login', relaysUrl: true, codeReturn: 'callback', exitWaitMs: DEVICE_EXIT_WAIT_MS },
+  codex_login: {
+    command: 'codex login',
+    authUrlPattern: CODEX_OAUTH_URL_RE,
+    relaysUrl: true,
+    codeReturn: 'callback',
+    exitWaitMs: DEVICE_EXIT_WAIT_MS,
+  },
 };
 
 export function isAuthMode(value: unknown): value is AuthMode {

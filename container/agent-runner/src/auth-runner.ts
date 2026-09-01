@@ -132,10 +132,14 @@ async function main(): Promise<void> {
   const client = makeAuthRpcClient({ baseUrl: `http://host.docker.internal:${port}`, nonce });
 
   const urlMatch = await cli.waitFor(/https?:\/\/\S+/, URL_WAIT_MS);
-  const url = urlMatch ? extractOAuthUrl(cli.output) : null;
+  const url = urlMatch ? extractOAuthUrl(cli.output, spec.authUrlPattern!) : null;
   if (!url) {
+    // Carry what the CLI actually said. Without it a missing binary, an
+    // unwritable home and a genuine timeout are the same line in the host log,
+    // and the container is `--rm` so nothing survives to inspect afterwards.
+    const tail = cli.output.trim().slice(-500);
     cli.kill();
-    fail('CLI exited or timed out before emitting an OAuth URL');
+    fail(`CLI emitted no OAuth URL — last output: ${tail || '(none)'}`);
   }
 
   await client.postUrl(url);
