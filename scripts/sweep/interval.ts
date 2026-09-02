@@ -29,7 +29,8 @@
  */
 import { DEFAULT_STACK_CAP } from './config.js';
 import { deriveCoverage, shaAtHeight, type Chain } from './heights.js';
-import { ancestryPath, firstParentChain, newStyleMergeTree, revParse } from './git.js';
+import { ancestryPath, blobOidAt, firstParentChain, git, newStyleMergeTree, overlayTreePaths, revParse } from './git.js';
+import { inSurface, type Surface } from './surface.js';
 
 export interface EligibleLine {
   branch: string;
@@ -319,4 +320,250 @@ export async function mergePointSweep(
     probes,
     probeCount: probes.length,
   };
+}
+
+// ---------------------------------------------------------------------------
+// The pending walk (§4.3): probe candidates oldest -> newest with a
+// hypothetical tip that ADVANCES on every step, auto-resolving what is not the
+// owner's question, and stopping at the first conflict that is.
+// ---------------------------------------------------------------------------
+
+/** One landed walk step: the candidate, the tree it left, what it auto-resolved. */
+export interface WalkStep {
+  sha: string;
+  /** The hypothetical tip's tree AFTER this step (auto-resolutions applied). */
+  tree: string;
+  /** Conflicted paths this step resolved itself (sorted; empty on a clean step). */
+  autoResolved: string[];
+}
+
+export interface WalkConflict {
+  /** The stop commit — the single candidate the case is about. */
+  head: string;
+  /** The unresolved IN-SURFACE conflicted paths — the case's whole question. */
+  conflictedPaths: string[];
+  /**
+   * The exhibit tree: the automerge with every auto-resolvable member already
+   * resolved, so markers exist ONLY at `conflictedPaths`.
+   */
+  automergeTree: string;
+  reproduction: { command: string };
+}
+
+export interface WalkResult {
+  branch: string;
+  parent: string;
+  model: 'entry' | 'parents';
+  /** No candidates — nothing to take from this parent. */
+  upToDate: boolean;
+  /** The landed prefix, in walk order (every candidate below the stop). */
+  steps: WalkStep[];
+  /**
+   * The tree the branch lands at (the last step's tree, plus the final
+   * reconciliation when the walk absorbed the source anchor); null when no
+   * step landed.
+   */
+  landTree: string | null;
+  /** Paths the final reconciliation took from the source anchor (sorted). */
+  reconciled: string[];
+  conflict: WalkConflict | null;
+  probeCount: number;
+}
+
+/**
+ * The paths a merge commit's author DECIDED — where the recorded tree differs
+ * from the automerge of its own first two parents. Input to the equivalence
+ * rule below; null for a non-merge commit.
+ */
+async function decidedPaths(repo: string, commit: string): Promise<Set<string> | null> {
+  const parents = (await git(repo, ['rev-list', '--parents', '-n', '1', commit])).stdout.trim().split(/\s+/).slice(1);
+  if (parents.length < 2) return null;
+  const mt = await newStyleMergeTree(repo, parents[0], parents[1]);
+  const diff = await git(repo, ['diff', '--name-only', mt.treeOid, `${commit}^{tree}`], { allowCodes: [1] });
+  return new Set(diff.stdout.split('\n').filter(Boolean));
+}
+
+/**
+ * One step of the walk engine, shared by `pendingWalk` and `replayPrefix` so
+ * derivation and re-verification cannot disagree about what a step does.
+ *
+ * Probe `merge-tree(hyp, C)`; on conflict, partition the conflicted paths:
+ *  - OUT-OF-SURFACE members auto-resolve to the INCOMING side (`tree(C)`'s
+ *    blob, or its absence): the branch has nothing of its own there, so the
+ *    collision is between two states the source's author already integrated —
+ *    at a merge commit those blobs ARE the author's own integration.
+ *  - IN-SURFACE members at a MERGE commit auto-resolve where the branch
+ *    already AGREES with the author's decision (`tree(branchTip)`'s blob equals
+ *    `tree(C)`'s at a path the author decided): the question was answered by
+ *    both sides identically, so there is nothing to ask.
+ *  - anything left is the owner's question: the step STOPS.
+ */
+export async function walkStep(
+  repo: string,
+  hyp: string,
+  candidate: string,
+  surface: Surface,
+  branchTipSha: string,
+): Promise<
+  | { kind: 'advance'; tree: string; autoResolved: string[] }
+  | { kind: 'stop'; conflict: WalkConflict }
+> {
+  const probe = await newStyleMergeTree(repo, hyp, candidate);
+  if (probe.clean) return { kind: 'advance', tree: probe.treeOid, autoResolved: [] };
+  const inS = probe.conflictFiles.filter((p) => inSurface(surface, p));
+  const outS = probe.conflictFiles.filter((p) => !inSurface(surface, p));
+  const decided = inS.length > 0 ? await decidedPaths(repo, candidate) : null;
+  const agreed: string[] = [];
+  if (decided) {
+    for (const p of inS) {
+      if (!decided.has(p)) continue;
+      const branchBlob = await blobOidAt(repo, branchTipSha, p);
+      const candidateBlob = await blobOidAt(repo, candidate, p);
+      if (branchBlob !== null && branchBlob === candidateBlob) agreed.push(p);
+    }
+  }
+  const agreedSet = new Set(agreed);
+  const autoResolved = [...outS, ...agreed].sort();
+  const remaining = inS.filter((p) => !agreedSet.has(p));
+  const resolvedTree =
+    autoResolved.length > 0 ? await overlayTreePaths(repo, probe.treeOid, candidate, autoResolved) : probe.treeOid;
+  if (remaining.length === 0) return { kind: 'advance', tree: resolvedTree, autoResolved };
+  return {
+    kind: 'stop',
+    conflict: {
+      head: candidate,
+      conflictedPaths: remaining,
+      automergeTree: resolvedTree,
+      reproduction: reproCommand(hyp, candidate),
+    },
+  };
+}
+
+/** Advance the hypothetical tip: a ref-less merge commit carrying real ancestry. */
+async function advanceHyp(repo: string, hyp: string, candidate: string, tree: string): Promise<string> {
+  const res = await git(repo, ['commit-tree', tree, '-p', hyp, '-p', candidate, '-m', `walk: absorb ${candidate}`]);
+  return res.stdout.trim();
+}
+
+/**
+ * The FINAL RECONCILIATION: when the walk absorbed the source anchor itself,
+ * out-of-surface paths that still differ from the anchor take the anchor's
+ * blobs. Mid-walk auto-resolutions can leave such residue; the author of the
+ * source already integrated those paths, so the endpoint must agree with them.
+ * Returns the reconciled tree and the paths taken (sorted).
+ */
+export async function reconcileToAnchor(
+  repo: string,
+  tree: string,
+  anchor: string,
+  surface: Surface,
+): Promise<{ tree: string; reconciled: string[] }> {
+  const diff = await git(repo, ['diff', '--name-only', tree, `${anchor}^{tree}`], { allowCodes: [1] });
+  const paths = diff.stdout
+    .split('\n')
+    .filter(Boolean)
+    .filter((p) => !inSurface(surface, p))
+    .sort();
+  if (paths.length === 0) return { tree, reconciled: [] };
+  return { tree: await overlayTreePaths(repo, tree, anchor, paths), reconciled: paths };
+}
+
+/**
+ * Walk one eligible line (§4.3). THE HYPOTHETICAL TIP ADVANCES ON EVERY STEP,
+ * clean ones included: probing every candidate against the unmoved branch tip
+ * reports conflicts the executed sequence never meets, even on a linear chain
+ * — each probe after the first would merge a candidate against a tip that is
+ * missing what the walk already took. The advance is a ref-less commit-tree,
+ * so the probes see exactly the ancestry the landed segment will have.
+ *
+ * The walk stops at the FIRST conflict the engine cannot resolve itself
+ * (`walkStep`); the case is that single candidate, and everything below it is
+ * the landed prefix. There is no merge-past-a-conflict and no case stacking:
+ * what lands is exactly what was probed in sequence, and what is asked is
+ * exactly one commit's in-surface question.
+ */
+export async function pendingWalk(
+  repo: string,
+  branchTip: string,
+  line: EligibleLine,
+  surface: Surface,
+  sourceAnchor: string,
+): Promise<WalkResult> {
+  const { branch, parent, model, heads } = line;
+  const base = { branch, parent, model } as const;
+  if (heads.length === 0) {
+    return { ...base, upToDate: true, steps: [], landTree: null, reconciled: [], conflict: null, probeCount: 0 };
+  }
+  const tipSha = await revParse(repo, branchTip);
+  let hyp = tipSha;
+  const steps: WalkStep[] = [];
+  let conflict: WalkConflict | null = null;
+  let probeCount = 0;
+  for (const candidate of heads) {
+    probeCount++;
+    const step = await walkStep(repo, hyp, candidate, surface, tipSha);
+    if (step.kind === 'stop') {
+      conflict = step.conflict;
+      break;
+    }
+    steps.push({ sha: candidate, tree: step.tree, autoResolved: step.autoResolved });
+    hyp = await advanceHyp(repo, hyp, candidate, step.tree);
+  }
+  let landTree = steps.length > 0 ? steps[steps.length - 1].tree : null;
+  let reconciled: string[] = [];
+  if (landTree !== null && conflict === null && steps[steps.length - 1].sha === sourceAnchor) {
+    const rec = await reconcileToAnchor(repo, landTree, sourceAnchor, surface);
+    landTree = rec.tree;
+    reconciled = rec.reconciled;
+  }
+  return { ...base, upToDate: false, steps, landTree, reconciled, conflict, probeCount };
+}
+
+/** A step-file merge row's landed prefix entry (steps.ts). */
+export interface PrefixStep {
+  sha: string;
+  autoResolved: string[];
+}
+
+/**
+ * Re-verify a recorded prefix FROM FIRST PRINCIPLES (steps.ts): replay the
+ * walk engine over exactly the recorded candidates and require every step to
+ * fully advance with exactly the recorded auto-resolutions. The replay never
+ * searches — it probes nothing beyond the prefix — so verification costs what
+ * the landing costs and trusts nothing the file claims.
+ */
+export async function replayPrefix(
+  repo: string,
+  branchTip: string,
+  prefix: readonly PrefixStep[],
+  surface: Surface,
+  sourceAnchor: string,
+): Promise<{ ok: boolean; tree: string | null; errors: string[] }> {
+  const errors: string[] = [];
+  const tipSha = await revParse(repo, branchTip);
+  let hyp = tipSha;
+  let tree: string | null = null;
+  for (const p of prefix) {
+    const step = await walkStep(repo, hyp, p.sha, surface, tipSha);
+    if (step.kind === 'stop') {
+      errors.push(
+        `prefix step ${p.sha.slice(0, 12)} does not fully resolve (unresolved: ${step.conflict.conflictedPaths.join(', ')})`,
+      );
+      return { ok: false, tree: null, errors };
+    }
+    const recorded = [...p.autoResolved].sort().join(',');
+    const recomputed = [...step.autoResolved].sort().join(',');
+    if (recorded !== recomputed) {
+      errors.push(
+        `prefix step ${p.sha.slice(0, 12)} auto-resolution mismatch: recorded [${recorded}] != recomputed [${recomputed}]`,
+      );
+      return { ok: false, tree: null, errors };
+    }
+    tree = step.tree;
+    hyp = await advanceHyp(repo, hyp, p.sha, step.tree);
+  }
+  if (tree !== null && prefix.length > 0 && prefix[prefix.length - 1].sha === sourceAnchor) {
+    tree = (await reconcileToAnchor(repo, tree, sourceAnchor, surface)).tree;
+  }
+  return { ok: true, tree, errors };
 }

@@ -10,8 +10,64 @@ import {
   resetCoverageDerivations,
   type Chain,
 } from './heights.js';
-import { buildEligibleLine, mergePointSweep, withheldByCut, type EligibleLine } from './interval.js';
-import { ancestryPath, firstParentChain, isAncestor, revParse } from './git.js';
+import {
+  buildEligibleLine,
+  mergePointSweep,
+  pendingWalk,
+  reconcileToAnchor,
+  replayPrefix,
+  walkStep,
+  withheldByCut,
+  type EligibleLine,
+} from './interval.js';
+import {
+  ancestryPath,
+  blobOidAt,
+  firstParentChain,
+  git,
+  isAncestor,
+  newStyleMergeTree,
+  revParse,
+} from './git.js';
+import { computeSurface, inSurface } from './surface.js';
+import type { FixtureRepo } from './fixtures.js';
+
+/**
+ * An AUTHORED merge built with plumbing: merge `otherSha` into `branch` with a
+ * tree the author decided — the branch's tree overlaid with `files` — so a
+ * conflicting fixture merge needs no worktree mergetool dance.
+ */
+async function authoredMerge(
+  r: FixtureRepo,
+  branch: string,
+  otherSha: string,
+  files: Record<string, string>,
+  message = 'authored merge',
+): Promise<string> {
+  let tree = (await git(r.dir, ['rev-parse', `${branch}^{tree}`])).stdout.trim();
+  for (const [path, content] of Object.entries(files)) {
+    const blob = (await git(r.dir, ['hash-object', '-w', '--stdin'], { input: content })).stdout.trim();
+    const idx = r.dir + '/.overlay-index';
+    const env = { GIT_INDEX_FILE: idx };
+    await git(r.dir, ['read-tree', tree], { env });
+    await git(r.dir, ['update-index', '--add', '--cacheinfo', `100644,${blob},${path}`], { env });
+    tree = (await git(r.dir, ['write-tree'], { env })).stdout.trim();
+  }
+  const tip = (await git(r.dir, ['rev-parse', branch])).stdout.trim();
+  const m = (await git(r.dir, ['commit-tree', tree, '-p', tip, '-p', otherSha, '-m', message])).stdout.trim();
+  await git(r.dir, ['update-ref', `refs/heads/${branch}`, m]);
+  return m;
+}
+
+/** A fixture tree: `commit`'s tree with `path` replaced by literal `content`. */
+async function overlayTreePathsForTest(r: FixtureRepo, commit: string, path: string, content: string): Promise<string> {
+  const blob = (await git(r.dir, ['hash-object', '-w', '--stdin'], { input: content })).stdout.trim();
+  const idx = r.dir + '/.overlay-index';
+  const env = { GIT_INDEX_FILE: idx };
+  await git(r.dir, ['read-tree', `${commit}^{tree}`], { env });
+  await git(r.dir, ['update-index', '--add', '--cacheinfo', `100644,${blob},${path}`], { env });
+  return (await git(r.dir, ['write-tree'], { env })).stdout.trim();
+}
 import { WHOLE_RANGE_BLOCK } from './types.js';
 
 const { repo, base, chain } = makePropagationFixture();
@@ -798,6 +854,320 @@ describe('withheldByCut — the cut as a containment test (§5.2)', () => {
       // An off-chain commit costs exactly one derivation.
       expect((await mintHead(r.dir, chn, await revParse(r.dir, 'P'))).height).toBe(2);
       expect(coverageDerivations()).toBe(1);
+    } finally {
+      r.destroy();
+    }
+  });
+});
+
+describe('pendingWalk — the advancing walk (§4.3)', () => {
+  /**
+   * FALSE CONFLICTS WITHOUT THE ADVANCE, even on a linear chain. P1 makes the
+   * same edit the branch made (their lines converge); P2 then edits that region
+   * again. Probed against the UNMOVED branch tip, P2 conflicts (both sides
+   * changed the region vs the old base); probed against a tip that absorbed P1,
+   * the merge base is P1 and P2's delta applies cleanly — which is exactly what
+   * the executed sequence meets.
+   */
+  it('advances the hypothetical tip on clean steps — a linear chain lands whole where static probes conflict', async () => {
+    const r = initFixtureRepo();
+    try {
+      r.commit('base', { 'src/f.ts': 'one\ntwo\nthree\nfour\nfive\n' });
+      const base = r.sha('main');
+      r.checkout('B', { create: true, at: base });
+      r.commit('branch converges', { 'src/f.ts': 'ONE\ntwo\nthree\nfour\nfive\n' });
+      r.checkout('P', { create: true, at: base });
+      const p1 = r.commit('p1: same edit', { 'src/f.ts': 'ONE\ntwo\nthree\nfour\nfive\n' });
+      const p2 = r.commit('p2: edits the region again', { 'src/f.ts': 'ONE-AGAIN\ntwo\nthree\nfour\nfive\n' });
+      r.checkout('main');
+      const bTip = await revParse(r.dir, 'B');
+      const pTip = await revParse(r.dir, 'P');
+
+      // The static probe of p2 against the unmoved tip conflicts.
+      const staticProbe = await newStyleMergeTree(r.dir, bTip, p2);
+      expect(staticProbe.clean).toBe(false);
+
+      const surface = await computeSurface(r.dir, pTip, bTip);
+      const line: EligibleLine = { branch: 'B', parent: 'P', model: 'parents', heads: [p1, p2] };
+      const res = await pendingWalk(r.dir, bTip, line, surface, pTip);
+      expect(res.conflict).toBeNull();
+      expect(res.steps.map((s) => s.sha)).toEqual([p1, p2]);
+      expect(res.steps.every((s) => s.autoResolved.length === 0)).toBe(true);
+      expect(await blobOidAt(r.dir, res.landTree!, 'src/f.ts')).toBe(await blobOidAt(r.dir, p2, 'src/f.ts'));
+    } finally {
+      r.destroy();
+    }
+  });
+
+  /**
+   * THE STOP IS THE FIRST UNRESOLVABLE CONFLICT AND THE CASE IS ONE COMMIT.
+   * Nothing above the stop is probed, and nothing above it enters the case.
+   */
+  it('stops at the first in-surface conflict; the case is that single commit and nothing above it', async () => {
+    const r = initFixtureRepo();
+    try {
+      r.commit('base', { 'src/f.ts': 'v0\n', 'src/g.ts': 'g0\n', 'src/h.ts': 'h0\n' });
+      const base = r.sha('main');
+      r.checkout('B', { create: true, at: base });
+      r.commit('fork edit', { 'src/f.ts': 'fork\n' });
+      r.checkout('P', { create: true, at: base });
+      const c1 = r.commit('c1 clean', { 'src/g.ts': 'g1\n' });
+      const c2 = r.commit('c2 conflicts', { 'src/f.ts': 'p2\n' });
+      const c3 = r.commit('c3 conflicts too', { 'src/f.ts': 'p3\n' });
+      r.checkout('main');
+      const bTip = await revParse(r.dir, 'B');
+      const pTip = await revParse(r.dir, 'P');
+      const surface = await computeSurface(r.dir, pTip, bTip);
+      const line: EligibleLine = { branch: 'B', parent: 'P', model: 'parents', heads: [c1, c2, c3] };
+      const res = await pendingWalk(r.dir, bTip, line, surface, pTip);
+      expect(res.steps.map((s) => s.sha)).toEqual([c1]);
+      expect(res.conflict?.head).toBe(c2);
+      expect(res.conflict?.conflictedPaths).toEqual(['src/f.ts']);
+      // c3 was never probed: the stop ends the walk.
+      expect(res.probeCount).toBe(2);
+      // The landed prefix carries c1's content and none of the conflict.
+      expect(await blobOidAt(r.dir, res.landTree!, 'src/g.ts')).toBe(await blobOidAt(r.dir, c1, 'src/g.ts'));
+      expect(await blobOidAt(r.dir, res.landTree!, 'src/f.ts')).toBe(await blobOidAt(r.dir, bTip, 'src/f.ts'));
+    } finally {
+      r.destroy();
+    }
+  });
+
+  /**
+   * OUT-OF-SURFACE CONFLICTS ARE NOBODY'S QUESTION. Two source lineages edit a
+   * file the branch never touched; their collision — and the author's own
+   * resolution of it in the merge commit — auto-resolve step by step, and the
+   * walk lands the author's endpoint with no case.
+   */
+  it('auto-resolves out-of-surface conflicts to the incoming side and lands the author endpoint', async () => {
+    const r = initFixtureRepo();
+    try {
+      r.commit('base', { 'src/f_out.ts': 'o0\n', 'src/f_in.ts': 'i0\n' });
+      const base = r.sha('main');
+      r.checkout('B', { create: true, at: base });
+      r.commit('fork edit', { 'src/f_in.ts': 'iB\n' });
+      r.checkout('P', { create: true, at: base });
+      const x = r.commit('x: upstream state 1', { 'src/f_out.ts': 'oX\n' });
+      r.checkout('Y', { create: true, at: base });
+      const y = r.commit('y: upstream state 2', { 'src/f_out.ts': 'oY\n' });
+      // The author integrates y and resolves the collision himself.
+      const m = await authoredMerge(r, 'P', y, { 'src/f_out.ts': 'oM\n' }, 'author integrates');
+      r.checkout('main');
+      const bTip = await revParse(r.dir, 'B');
+      const surface = await computeSurface(r.dir, m, bTip);
+      const line: EligibleLine = { branch: 'B', parent: 'P', model: 'parents', heads: [x, y, m] };
+      const res = await pendingWalk(r.dir, bTip, line, surface, m);
+      expect(res.conflict).toBeNull();
+      expect(res.steps.map((s) => s.sha)).toEqual([x, y, m]);
+      // The collision between the two upstream states auto-resolved mid-walk...
+      expect(res.steps.some((s) => s.autoResolved.includes('src/f_out.ts'))).toBe(true);
+      // ...and the endpoint carries the AUTHOR's resolution, not either input.
+      expect(await blobOidAt(r.dir, res.landTree!, 'src/f_out.ts')).toBe(await blobOidAt(r.dir, m, 'src/f_out.ts'));
+      expect(await blobOidAt(r.dir, res.landTree!, 'src/f_in.ts')).toBe(await blobOidAt(r.dir, bTip, 'src/f_in.ts'));
+    } finally {
+      r.destroy();
+    }
+  });
+
+  /**
+   * A MIXED conflict pre-resolves its out-of-surface members INTO the exhibit:
+   * the case carries only the in-surface question, and the exhibit tree has
+   * markers only there.
+   */
+  it('a mixed conflict ships an exhibit with out-of-surface members already resolved', async () => {
+    const r = initFixtureRepo();
+    try {
+      r.commit('base', { 'src/f_in.ts': 'i0\n', 'src/f_out.ts': 'o0\n' });
+      const base = r.sha('main');
+      r.checkout('B', { create: true, at: base });
+      r.commit('fork edit', { 'src/f_in.ts': 'iB\n' });
+      r.checkout('P', { create: true, at: base });
+      const x = r.commit('x', { 'src/f_out.ts': 'oX\n' });
+      r.checkout('Z', { create: true, at: base });
+      const z = r.commit('z: touches both', { 'src/f_in.ts': 'iZ\n', 'src/f_out.ts': 'oZ\n' });
+      const m = await authoredMerge(
+        r,
+        'P',
+        z,
+        { 'src/f_out.ts': 'oM\n', 'src/f_in.ts': 'iZ\n' },
+        'author integrates z',
+      );
+      r.checkout('main');
+      const bTip = await revParse(r.dir, 'B');
+      const surface = await computeSurface(r.dir, m, bTip);
+      const line: EligibleLine = { branch: 'B', parent: 'P', model: 'parents', heads: [x, z, m] };
+      const res = await pendingWalk(r.dir, bTip, line, surface, m);
+      expect(res.conflict?.head).toBe(z);
+      // The case is the in-surface question only...
+      expect(res.conflict?.conflictedPaths).toEqual(['src/f_in.ts']);
+      // ...and the exhibit resolved the out-of-surface member to the incoming side.
+      expect(await blobOidAt(r.dir, res.conflict!.automergeTree, 'src/f_out.ts')).toBe(
+        await blobOidAt(r.dir, z, 'src/f_out.ts'),
+      );
+      const exhibited = (
+        await git(r.dir, ['cat-file', 'blob', `${res.conflict!.automergeTree}:src/f_in.ts`])
+      ).stdout;
+      expect(exhibited).toContain('<<<<<<<');
+    } finally {
+      r.destroy();
+    }
+  });
+
+  it('a line whose content the branch already carries lands a tree equal to the branch tree (no-op)', async () => {
+    const r = initFixtureRepo();
+    try {
+      r.commit('base', { 'src/f.ts': 'v0\n' });
+      const base = r.sha('main');
+      r.checkout('P', { create: true, at: base });
+      const c1 = r.commit('p change', { 'src/f.ts': 'v1\n' });
+      // The branch SQUASHED the same content (no ancestry).
+      r.checkout('B', { create: true, at: base });
+      r.commit('squash of p change', { 'src/f.ts': 'v1\n' });
+      r.checkout('main');
+      const bTip = await revParse(r.dir, 'B');
+      const surface = await computeSurface(r.dir, c1, bTip);
+      const line: EligibleLine = { branch: 'B', parent: 'P', model: 'parents', heads: [c1] };
+      const res = await pendingWalk(r.dir, bTip, line, surface, c1);
+      expect(res.conflict).toBeNull();
+      expect(res.landTree).toBe((await git(r.dir, ['rev-parse', `${bTip}^{tree}`])).stdout.trim());
+    } finally {
+      r.destroy();
+    }
+  });
+});
+
+describe('walkStep — the shared step engine', () => {
+  /**
+   * SKIP-BY-EQUIVALENCE at a merge step: the author DECIDED a path (the
+   * recorded tree differs from the automerge of the merge's own parents), and
+   * the branch already carries exactly that decision. The step resolves to the
+   * agreed blob instead of stopping. The hypothetical tip is built explicitly
+   * here because the shape only arises mid-walk (an earlier clean step moved
+   * the path off the branch's own blob).
+   */
+  it('resolves an in-surface conflict where the branch already agrees with the merge author', async () => {
+    const r = initFixtureRepo();
+    try {
+      r.commit('base', { 'src/p.ts': 'l1\nl2\nl3\nl4\nl5\nl6\nl7\n' });
+      const base = r.sha('main');
+      // The branch's own blob == the author's decision.
+      r.checkout('B', { create: true, at: base });
+      r.commit('branch carries the decision', { 'src/p.ts': 'l1\nl2\nDECIDED\nl4\nl5\nl6\nl7\n' });
+      // The merge commit whose author decided the path.
+      r.checkout('S1', { create: true, at: base });
+      const s1 = r.commit('side 1', { 'src/p.ts': 'l1\nl2\nS1\nl4\nl5\nl6\nl7\n' });
+      r.checkout('S2', { create: true, at: base });
+      r.commit('side 2', { 'src/p.ts': 'l1\nl2\nS2\nl4\nl5\nl6\nl7\n' });
+      const m = await authoredMerge(r, 'S2', s1, { 'src/p.ts': 'l1\nl2\nDECIDED\nl4\nl5\nl6\nl7\n' }, 'decide');
+      r.git('checkout', '-f', 'main');
+      const bTip = await revParse(r.dir, 'B');
+      // A hypothetical tip whose blob agrees with NEITHER side (an earlier walk
+      // step moved the disputed region), so the probe genuinely conflicts.
+      const hypTree = await overlayTreePathsForTest(r, bTip, 'src/p.ts', 'l1\nl2\nHYP\nl4\nl5\nl6\nl7\n');
+      const hyp = (await git(r.dir, ['commit-tree', hypTree, '-p', bTip, '-m', 'hyp'])).stdout.trim();
+      const surface = await computeSurface(r.dir, m, bTip);
+      expect(inSurface(surface, 'src/p.ts')).toBe(true);
+      const probe = await newStyleMergeTree(r.dir, hyp, m);
+      expect(probe.clean).toBe(false);
+      const step = await walkStep(r.dir, hyp, m, surface, bTip);
+      expect(step.kind).toBe('advance');
+      if (step.kind === 'advance') {
+        expect(step.autoResolved).toEqual(['src/p.ts']);
+        expect(await blobOidAt(r.dir, step.tree, 'src/p.ts')).toBe(await blobOidAt(r.dir, m, 'src/p.ts'));
+      }
+    } finally {
+      r.destroy();
+    }
+  });
+
+  it('does NOT resolve where the branch disagrees with the merge author — that is the owner question', async () => {
+    const r = initFixtureRepo();
+    try {
+      r.commit('base', { 'src/p.ts': 'l1\nl2\nl3\nl4\nl5\nl6\nl7\n' });
+      const base = r.sha('main');
+      r.checkout('B', { create: true, at: base });
+      r.commit('branch disagrees', { 'src/p.ts': 'l1\nl2\nFORK\nl4\nl5\nl6\nl7\n' });
+      r.checkout('S1', { create: true, at: base });
+      const s1 = r.commit('side 1', { 'src/p.ts': 'l1\nl2\nS1\nl4\nl5\nl6\nl7\n' });
+      r.checkout('S2', { create: true, at: base });
+      r.commit('side 2', { 'src/p.ts': 'l1\nl2\nS2\nl4\nl5\nl6\nl7\n' });
+      const m = await authoredMerge(r, 'S2', s1, { 'src/p.ts': 'l1\nl2\nDECIDED\nl4\nl5\nl6\nl7\n' }, 'decide');
+      r.git('checkout', '-f', 'main');
+      const bTip = await revParse(r.dir, 'B');
+      const surface = await computeSurface(r.dir, m, bTip);
+      const step = await walkStep(r.dir, bTip, m, surface, bTip);
+      expect(step.kind).toBe('stop');
+      if (step.kind === 'stop') expect(step.conflict.conflictedPaths).toEqual(['src/p.ts']);
+    } finally {
+      r.destroy();
+    }
+  });
+});
+
+describe('reconcileToAnchor — the endpoint agrees with the source out of surface', () => {
+  it('takes the anchor blob at differing out-of-surface paths and leaves in-surface paths alone', async () => {
+    const r = initFixtureRepo();
+    try {
+      r.commit('base', { 'src/f_in.ts': 'i0\n', 'src/f_out.ts': 'o0\n' });
+      const base = r.sha('main');
+      r.checkout('B', { create: true, at: base });
+      r.commit('fork', { 'src/f_in.ts': 'iB\n' });
+      r.checkout('P', { create: true, at: base });
+      const p = r.commit('source', { 'src/f_in.ts': 'iP\n', 'src/f_out.ts': 'oP\n' });
+      r.checkout('main');
+      const bTip = await revParse(r.dir, 'B');
+      const surface = await computeSurface(r.dir, p, bTip);
+      // A landed tree that drifted from the anchor at both paths.
+      const drifted = await overlayTreePathsForTest(r, bTip, 'src/f_out.ts', 'oDRIFT\n');
+      const rec = await reconcileToAnchor(r.dir, drifted, p, surface);
+      expect(rec.reconciled).toEqual(['src/f_out.ts']);
+      expect(await blobOidAt(r.dir, rec.tree, 'src/f_out.ts')).toBe(await blobOidAt(r.dir, p, 'src/f_out.ts'));
+      // In-surface divergence (the fork's own content) is NOT overwritten.
+      expect(await blobOidAt(r.dir, rec.tree, 'src/f_in.ts')).toBe(await blobOidAt(r.dir, bTip, 'src/f_in.ts'));
+    } finally {
+      r.destroy();
+    }
+  });
+});
+
+describe('replayPrefix — first-principles re-verification of a landed prefix', () => {
+  it('reproduces the walk exactly and rejects a forged auto-resolution list', async () => {
+    const r = initFixtureRepo();
+    try {
+      r.commit('base', { 'src/f_out.ts': 'o0\n', 'src/f_in.ts': 'i0\n' });
+      const base = r.sha('main');
+      r.checkout('B', { create: true, at: base });
+      r.commit('fork', { 'src/f_in.ts': 'iB\n' });
+      r.checkout('P', { create: true, at: base });
+      const x = r.commit('x', { 'src/f_out.ts': 'oX\n' });
+      r.checkout('Y', { create: true, at: base });
+      const y = r.commit('y', { 'src/f_out.ts': 'oY\n' });
+      const m = await authoredMerge(r, 'P', y, { 'src/f_out.ts': 'oM\n' }, 'integrate');
+      r.checkout('main');
+      const bTip = await revParse(r.dir, 'B');
+      const surface = await computeSurface(r.dir, m, bTip);
+      const line: EligibleLine = { branch: 'B', parent: 'P', model: 'parents', heads: [x, y, m] };
+      const walk = await pendingWalk(r.dir, bTip, line, surface, m);
+      expect(walk.conflict).toBeNull();
+
+      const prefix = walk.steps.map((s) => ({ sha: s.sha, autoResolved: s.autoResolved }));
+      const replay = await replayPrefix(r.dir, bTip, prefix, surface, m);
+      expect(replay.ok).toBe(true);
+      expect(replay.tree).toBe(walk.landTree);
+
+      // A forged auto-resolution list does not verify.
+      const forged = prefix.map((p, i) => (i === prefix.length - 1 ? { ...p, autoResolved: [] } : p));
+      const bad = await replayPrefix(r.dir, bTip, forged, surface, m);
+      expect(bad.ok).toBe(false);
+      expect(bad.errors.join('\n')).toMatch(/auto-resolution mismatch|does not fully resolve/);
+
+      // A prefix that includes a genuinely conflicting candidate does not verify.
+      r.checkout('Q', { create: true, at: base });
+      const q = r.commit('q: in-surface conflict', { 'src/f_in.ts': 'iQ\n' });
+      r.checkout('main');
+      const stopped = await replayPrefix(r.dir, bTip, [{ sha: q, autoResolved: [] }], surface, m);
+      expect(stopped.ok).toBe(false);
+      expect(stopped.errors.join('\n')).toContain('does not fully resolve');
     } finally {
       r.destroy();
     }
