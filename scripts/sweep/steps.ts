@@ -7,9 +7,11 @@
  * from git state + the pinned chain, that
  *   - the step is for THIS pass (watermark matches),
  *   - every parent is a legal inventory parent (or `main` for entry branches),
- *   - each head's sha matches its claimed height and lies on the parent's
- *     eligible line (entry: the trunk chain; parents: the parent's first-parent
- *     line with derived coverage),
+ *   - each merge row's landed PREFIX is legal (entry: trunk chain commits in
+ *     ascending order; parents: pending, unabsorbed commits of that parent) and
+ *     REPLAYS to exactly the claimed tree (interval.ts `replayPrefix` — same
+ *     engine, first principles),
+ *   - the head is the prefix's top and its sha matches its claimed height,
  *   - the height is within the chain (height <= watermark),
  *   - every required parent has arrived this pass (journal barrier),
  *   - skip claims are genuine no-ops (merge-tree result tree == branch tree),
@@ -21,8 +23,10 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-import { deriveCoverage, shaAtHeight, type Chain } from './heights.js';
-import { firstParentChain, git, isAncestor, newStyleMergeTree, revParse } from './git.js';
+import { deriveCoverage, heightOfSha, shaAtHeight, type Chain } from './heights.js';
+import { git, isAncestor, newStyleMergeTree, revParse } from './git.js';
+import { replayPrefix } from './interval.js';
+import { computeSurface } from './surface.js';
 import type { BranchPlan, CaseFile, StepFile, StepMerge } from './types.js';
 
 export type { StepFile, CaseFile } from './types.js';
@@ -50,9 +54,9 @@ export function slug(name: string): string {
  *  - the PARENT slug: a multi-parent branch whose two parents conflict at the
  *    SAME height would otherwise collide on branch+height;
  *  - the HEAD sha8: parents-model heads are the parent's own commits, so one
- *    height covers a whole run of them. Resolving the first run reopens the
- *    branch, the re-derivation offers the bucket's remainder, and that second
- *    case sits at the same branch+parent+height as the one just resolved.
+ *    height covers many of them. Resolving one conflict reopens the branch,
+ *    the re-derivation walks on to the next stop, and that second case sits at
+ *    the same branch+parent+height as the one just resolved.
  *
  * It is also the suffix `fixBranchName` puts on a conflict fix ref, so the ref
  * name is the case id under `fix/sweep/` and the two name one identity.
@@ -134,6 +138,7 @@ export function buildStepFile(bp: BranchPlan, watermark: string): StepFile {
     model: pp.model,
     action: pp.verdict === 'merge' ? 'merge' : 'skip',
     head: pp.verdict === 'merge' ? pp.mergePoint : null,
+    ...(pp.verdict === 'merge' && !pp.forced && pp.prefix ? { prefix: pp.prefix, tree: pp.landTree } : {}),
     skipReason:
       pp.skipReason ??
       (pp.verdict === 'case'
@@ -237,35 +242,84 @@ export async function verifyStepFile(repo: string, step: StepFile, ctx: StepVeri
         push(`head height ${height} out of range (chain length ${chainLen}) — height > watermark`);
         continue;
       }
+      // A non-forced merge lands a walked PREFIX; the head is its top.
+      if (!m.prefix || m.prefix.length === 0 || !m.tree) {
+        push(`merge from '${m.parent}' names no landed prefix/tree`);
+        continue;
+      }
+      if (m.prefix[m.prefix.length - 1].sha !== sha) {
+        push(`merge from '${m.parent}': head ${sha.slice(0, 12)} is not the prefix's top`);
+        continue;
+      }
+      let membershipOk = true;
       if (m.model === 'entry') {
-        // Head sha must be the trunk commit at that exact height (forged sha/height).
-        const expected = shaAtHeight(ctx.chain, height);
-        if (expected !== sha) {
-          push(
-            `entry head sha ${sha.slice(0, 12)} != trunk commit at height ${height} (${expected?.slice(0, 12) ?? 'none'})`,
-          );
-          continue;
+        // Every prefix commit must be a trunk chain commit, in ascending chain
+        // order; the head's chain index must equal the claimed height.
+        let prev = -1;
+        for (const ps of m.prefix) {
+          const idx = heightOfSha(ctx.chain, ps.sha);
+          if (idx < 0) {
+            push(`entry prefix sha ${ps.sha.slice(0, 12)} is not a trunk chain commit`);
+            membershipOk = false;
+            break;
+          }
+          if (idx <= prev) {
+            push(`entry prefix sha ${ps.sha.slice(0, 12)} out of chain order`);
+            membershipOk = false;
+            break;
+          }
+          prev = idx;
+        }
+        if (membershipOk && heightOfSha(ctx.chain, sha) !== height) {
+          push(`entry head sha ${sha.slice(0, 12)} chain index != claimed height ${height}`);
+          membershipOk = false;
         }
       } else {
-        // Parents model: head must be on the parent's first-parent line AND its
-        // derived coverage must equal the claimed height.
+        // Parents model: every prefix commit must be PENDING for this branch —
+        // reachable from the parent tip, not from the branch tip — and the
+        // head's derived coverage must equal the claimed height.
         const parentTip = await revParse(repo, m.parent);
-        const line = await firstParentChain(repo, parentTip, ctx.chain.base);
-        if (!line.includes(sha)) {
-          push(`parents head sha ${sha.slice(0, 12)} is not on '${m.parent}' first-parent line`);
-          continue;
+        for (const ps of m.prefix) {
+          if (!(await isAncestor(repo, ps.sha, parentTip))) {
+            push(`prefix sha ${ps.sha.slice(0, 12)} is not reachable from '${m.parent}'`);
+            membershipOk = false;
+            break;
+          }
+          if (await isAncestor(repo, ps.sha, ctx.branchTip)) {
+            push(`prefix sha ${ps.sha.slice(0, 12)} is already absorbed by the branch`);
+            membershipOk = false;
+            break;
+          }
         }
-        const cov = (await deriveCoverage(repo, ctx.chain, sha)).height;
-        if (cov !== height) {
-          push(`parents head ${sha.slice(0, 12)} derived coverage ${cov} != claimed height ${height}`);
-          continue;
+        if (membershipOk) {
+          const cov = (await deriveCoverage(repo, ctx.chain, sha)).height;
+          if (cov !== height) {
+            push(`parents head ${sha.slice(0, 12)} derived coverage ${cov} != claimed height ${height}`);
+            membershipOk = false;
+          }
         }
       }
+      if (!membershipOk) continue;
 
-      // A real merge must actually change the branch tree; a no-op should have
-      // been recorded as `skip`.
-      const probe = await newStyleMergeTree(repo, step.branch, sha);
-      if (probe.clean && probe.treeOid === branchTree) {
+      // Replay the prefix from first principles (the same walk engine): every
+      // step must fully advance with exactly the recorded auto-resolutions and
+      // the landed tree must be exactly the claimed one. A real merge must
+      // actually change the branch tree; a no-op should have been recorded as
+      // `skip`.
+      const anchor = m.model === 'entry' ? ctx.chain.watermark : await revParse(repo, m.parent);
+      const surface = await computeSurface(repo, anchor, ctx.branchTip);
+      const replay = await replayPrefix(repo, ctx.branchTip, m.prefix, surface, anchor);
+      if (!replay.ok) {
+        for (const e of replay.errors) push(`merge from '${m.parent}': ${e}`);
+        continue;
+      }
+      if (replay.tree !== m.tree) {
+        push(
+          `merge from '${m.parent}': claimed tree ${m.tree.slice(0, 12)} != replayed tree ${replay.tree?.slice(0, 12) ?? 'none'}`,
+        );
+        continue;
+      }
+      if (replay.tree === branchTree) {
         push(`merge from '${m.parent}' at height ${height} is a no-op (should be skip)`);
         continue;
       }

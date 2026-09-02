@@ -59,7 +59,7 @@ describe('plan pure helpers', () => {
 });
 
 // --- entry-model derivation: non-monotonic window surfaces a case ---------
-describe('derivePlan — entry model, non-monotonic case (§3)', () => {
+describe('derivePlan — entry model, the walk stops at the first conflict (§3)', () => {
   const repo = initFixtureRepo();
   repo.commit('base: x', { 'src/x.ts': 'orig\n' });
   const base = repo.sha('main');
@@ -72,13 +72,17 @@ describe('derivePlan — entry model, non-monotonic case (§3)', () => {
   repo.commit('U3: x = up3', { 'src/x.ts': 'up3\n' });
   afterAll(() => repo.destroy());
 
-  it('merges past the intermediate conflict and reports the smallest conflict above', async () => {
+  it('lands the clean prefix and reports the FIRST conflict — the walk stops there', async () => {
     const plan = await derivePlan({ repo: repo.dir, upstreamRef: 'main', base, features: [], scope: {} });
     expect(plan.order).toEqual(['main_patched']);
     const mp = plan.branches[0];
     expect(mp.parents[0].verdict).toBe('merge');
-    expect(mp.parents[0].mergePoint?.height).toBe(2);
-    expect(mp.parents[0].case?.head.height).toBe(3);
+    // Height 0 lands; height 1 rewrites the fork's own file and is the stop —
+    // the case is that one commit, and heights 2..3 wait above it.
+    expect(mp.parents[0].mergePoint?.height).toBe(0);
+    expect(mp.parents[0].prefix?.map((ps) => ps.sha)).toEqual([mp.parents[0].mergePoint?.sha]);
+    expect(mp.parents[0].landTree).toMatch(/^[0-9a-f]{40}$/);
+    expect(mp.parents[0].case?.head.height).toBe(1);
     expect(mp.parents[0].case?.conflictedPaths).toEqual(['src/x.ts']);
   });
 

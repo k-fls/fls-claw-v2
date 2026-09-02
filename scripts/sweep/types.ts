@@ -90,8 +90,6 @@ export interface FeatureEntry {
   test_anchors?: string[];
   /** Per-feature scope-guard override (§7 lever); beats the global default. */
   scope_guard?: ScopeGuardMode;
-  /** Per-feature case-stacking cap override (DRIVER.md §4.4 lever); beats routing.yaml `stack_cap`. */
-  stack_cap?: number;
   /** Tier floor (§1): 'judged' floors every merge of this branch at JUDGED. */
   tier_floor?: 'judged';
   /** Leaf/always_merge rule (§6): force an (empty) merge even when parents no-op. */
@@ -99,12 +97,10 @@ export interface FeatureEntry {
   routing?: { keywords?: string[]; always_check_on?: string[] };
 }
 
-/** scripts/sweep/registry/routing.yaml — the two global driver levers. */
+/** scripts/sweep/registry/routing.yaml — the global driver lever. */
 export interface RoutingConfig {
   /** Global default scope-guard mode (§7 lever); per-feature `scope_guard` overrides. */
   scopeGuardMode?: ScopeGuardMode;
-  /** Global case-stacking cap (DRIVER.md §4.4, `stack_cap`); per-feature `stack_cap` overrides. */
-  stackCap?: number;
 }
 
 /**
@@ -181,39 +177,50 @@ export type Tier = 'clean' | 'mechanical' | 'judged' | 'held' | 'deferred';
 export type ParentVerdict = 'merge' | 'skip' | 'defer' | 'up-to-date' | 'case';
 
 /**
- * Reported conflict handed to the resolving agent (§3 step 4). The case unit is
- * a STACKED RUN (DRIVER.md §4.4): the maximal run of consecutive conflicting heads
- * whose conflicted path sets intersect, capped (`stack_cap`). `head` is the
- * run's TOP commit — merging it resolves the whole run in one case/cold read;
- * DEFERRED windows and urge tracking are computed against it. Nothing above the
- * top belongs to the case: it was never probed in combination with what the
- * branch is taking, so it stays out of the branch and out of the fix ref.
+ * Reported conflict handed to the resolving agent (§3 step 4). The case is
+ * EXACTLY ONE COMMIT (DRIVER.md §4.4): the walk's stop — the first candidate
+ * whose in-surface conflict the driver cannot resolve itself. DEFERRED windows
+ * and urge tracking are computed against it. Nothing above the stop belongs to
+ * the case: it was never probed in combination with what the branch is taking,
+ * so it stays out of the branch and out of the fix ref.
  */
 export interface ConflictCase {
-  /** The run's TOP head: sha is the commit to merge, height its trunk index. */
+  /** The stop commit: sha is the commit to merge, height its trunk projection. */
   head: Head;
-  /** The stacked run, ascending by height; run[run.length - 1] === head. */
-  run: Head[];
-  /** Conflicted paths at the run TOP (the cumulative conflict set). */
+  /** The unresolved IN-SURFACE conflicted paths — the case's whole question. */
   conflictedPaths: string[];
-  /** Tree oid of the conflicted automerge (conflict markers), from new-style merge-tree. */
+  /**
+   * The exhibit tree: the automerge with every auto-resolvable member already
+   * resolved, so conflict markers exist ONLY at `conflictedPaths`.
+   */
   automergeTree: string;
   reproduction: { command: string };
+}
+
+/** One landed step of a walk prefix, as a step file records it (steps.ts). */
+export interface WalkPrefixStep {
+  sha: string;
+  /** Conflicted paths the step resolved itself (sorted; empty on a clean step). */
+  autoResolved: string[];
 }
 
 /** One parent's contribution to a branch's pass (`plan.json`). */
 export interface ParentPlan {
   parent: string;
   model: 'entry' | 'parents';
-  /** Chosen merge point = largest clean head (§3); null when even the oldest head conflicts. */
+  /** The landed prefix's TOP candidate (§3); null when nothing lands. */
   mergePoint: Head | null;
+  /** The landed walk prefix, in walk order (verdict `merge`). */
+  prefix?: WalkPrefixStep[];
+  /** The tree the prefix lands (reconciliation applied) — the merge commit's tree. */
+  landTree?: string;
   verdict: ParentVerdict;
-  /** Reported conflict above the merge point (the run from the first conflicting head). */
+  /** Reported conflict at the walk's stop (the commit above the landed prefix). */
   case: ConflictCase | null;
   /** DEFERRED: the lowest blocked DIRECT parent this conflict defers behind. */
   deferredTo: string | null;
-  /** DEFERRED: the height of X's own conflict (the run TOP) — the block-height this
-   * branch contributes to its children's height-MIN when it is itself deferred. */
+  /** DEFERRED: the height of X's own conflict (the walk's stop) — the block-height
+   * this branch contributes to its children's height-MIN when it is itself deferred. */
   deferHeight?: number;
   /** No-op reason when verdict is skip. */
   skipReason: string | null;
@@ -230,8 +237,6 @@ export interface BranchPlan {
   alwaysMerge: boolean;
   /** Transitive inventory ancestors (for DEFERRED matching). */
   ancestors: string[];
-  /** Effective case-stacking cap for this branch (DRIVER.md §4.4 lever, resolved at derivation). */
-  stackCap?: number;
   parents: ParentPlan[];
   /** Cheapest parent chain un-skipped to keep the leaf/always_merge invariant (§6). */
   unskipChain?: string[];
@@ -261,6 +266,10 @@ export interface StepMerge {
   model: 'entry' | 'parents';
   action: 'merge' | 'skip';
   head: Head | null;
+  /** The landed walk prefix (non-forced merges); the verifier replays it. */
+  prefix?: WalkPrefixStep[];
+  /** The tree the prefix lands — what the merge commit will carry. */
+  tree?: string;
   skipReason: string | null;
   /** Forced (empty) merge for the leaf/always_merge rule (§6). */
   forced?: boolean;
@@ -289,10 +298,8 @@ export interface CaseFile {
   id: string;
   branch: string;
   parent: string;
-  /** The case run's TOP head (DRIVER.md §4.4). */
+  /** The stop commit (DRIVER.md §4.4) — the single commit the case is about. */
   head: Head;
-  /** The stacked run (ascending); when absent the case is its single head. */
-  run?: Head[];
   tierFloor: Tier;
   conflictedPaths: string[];
   /**
@@ -307,7 +314,7 @@ export interface CaseFile {
   carriedPaths?: string[];
   automergeTree: string;
   reproduction: { command: string };
-  /** DEFERRED-check inputs (§5); firstConflictHeight = the run's TOP height. */
+  /** DEFERRED-check inputs (§5); firstConflictHeight = the stop commit's height. */
   deferredCheck: { firstConflictHeight: number; transitiveAncestors: string[] };
 }
 

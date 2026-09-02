@@ -72,7 +72,7 @@ describe('local-tree loaders', () => {
   );
   writeFileSync(join(inventory, 'feat.broken.yaml'), 'id: feat.broken\nname: no kind\n');
   const routingFile = join(scratch, 'routing.yaml');
-  writeFileSync(routingFile, 'schemaVersion: 1\nscope_guard_mode: conflict-hunks\nstack_cap: 3\n');
+  writeFileSync(routingFile, 'schemaVersion: 1\nscope_guard_mode: conflict-hunks\n');
   const scopeFile = join(scratch, 'scope.yaml');
   writeFileSync(scopeFile, 'exclude: ["wip/**"]\n');
 
@@ -80,7 +80,7 @@ describe('local-tree loaders', () => {
     const reg = loadRegistry({ inventoryDir: inventory, routingFile, scopeFile });
     expect(reg.features.map((f) => f.id)).toEqual(['feat.good']);
     expect(reg.warnings.some((w) => w.includes('feat.broken'))).toBe(true);
-    expect(reg.routing).toEqual({ scopeGuardMode: 'conflict-hunks', stackCap: 3 });
+    expect(reg.routing).toEqual({ scopeGuardMode: 'conflict-hunks' });
     expect(reg.scope).toEqual({ exclude: ['wip/**'] });
   });
 

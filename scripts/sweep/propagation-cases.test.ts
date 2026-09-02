@@ -34,7 +34,8 @@ import { describe, expect, it } from 'vitest';
 import { checkDeferred } from './deferred.js';
 import { isAncestor, newStyleMergeTree } from './git.js';
 import { deriveCoverage, type Chain } from './heights.js';
-import { mergePointSweep, type EligibleLine } from './interval.js';
+import { pendingWalk, type EligibleLine } from './interval.js';
+import { computeSurface } from './surface.js';
 
 const DIR = join(dirname(fileURLToPath(import.meta.url)), 'test-cases', 'propagation');
 const REPO = (() => {
@@ -147,10 +148,10 @@ const pinnedChain = (): Chain => ({
 const AVAILABLE = present(BASE) && present(WATERMARK) && chainShas().length === 98;
 
 describe.skipIf(!AVAILABLE)('propagation real-DAG cases (mined from the live fork)', () => {
-  // p7 — largest-clean-height / linear conflict profile (§3, class 7). VERIFIED.
+  // p7 — first-conflict / linear conflict profile (§3, class 7). VERIFIED.
   // The mined fork tip can be unreachable (owner rebase) → pin-by-patch fallback.
   const P7_HEIGHTS = [1, 30, 61, 62, 80, 98];
-  it('p7: entry-model sweep merges at height 61; the case run starts at 62 and stacks to the sparse-line top (MERGE-POLICY.md §2)', () => {
+  it('p7: the entry-model walk lands the clean prefix through 61 and stops at 62 — one commit, one case', async () => {
     const c = loadCase('p7-conflict-profile-role-grant.yaml');
     // Chain commits it probes must be present (loud); the fork tip resolves via
     // the pinned sha or, once rebased away, the pin patch.
@@ -158,8 +159,8 @@ describe.skipIf(!AVAILABLE)('propagation real-DAG cases (mined from the live for
     if (!ensure('p7', { ...chainAnchors, watermark: WATERMARK })) return;
     const branch = resolveTip('p7', c.tip as string, c.pin_patch as string | undefined);
     if (!branch) return;
-    // Endpoints + one mid clean (30) + one mid conflict (80) — enough to prove
-    // "largest clean == 61, smallest conflict above == 62" without probing all 98.
+    // Endpoints + one mid clean (30) — enough to prove "the prefix through 61
+    // lands and 62 is the stop" without probing all 98.
     const line: EligibleLine = {
       branch,
       parent: 'main',
@@ -170,19 +171,15 @@ describe.skipIf(!AVAILABLE)('propagation real-DAG cases (mined from the live for
     expect(heightSha(61)).toBe(c.expected.largest_clean_sha);
     expect(heightSha(62)).toBe(c.expected.smallest_conflicting_sha);
 
-    return mergePointSweep(REPO, branch, line).then((res) => {
-      expect(res.mergePoint).toBe(c.expected.largest_clean_sha);
-      // DRIVER.md §4.4 stacking: the real profile conflicts on the SAME single path
-      // from 62 to the watermark, so on this sparse line the run stacks over
-      // all three conflicting candidate heads (62, 80, 98; below the cap of 5)
-      // and the case head is the run's TOP. The run still STARTS at the
-      // smallest conflicting height above the merge point.
-      expect(res.firstConflict?.run[0]).toBe(c.expected.smallest_conflicting_sha);
-      expect(res.firstConflict?.run).toEqual([62, 80, 98].map((h) => heightSha(h)));
-      expect(res.firstConflict?.head).toBe(heightSha(98));
-      // Constant single-path profile: the top's conflict set is the case's.
-      expect(res.firstConflict?.conflictedPaths).toEqual(c.expected.case_conflicted_paths);
-    });
+    const surface = await computeSurface(REPO, WATERMARK, branch);
+    const res = await pendingWalk(REPO, branch, line, surface, WATERMARK);
+    expect(res.steps.map((st) => st.sha)).toEqual([1, 30, 61].map((h) => heightSha(h)));
+    // The case is exactly the FIRST conflicting candidate. 80 and 98 conflict
+    // too on this profile, but they are above the stop and were never probed
+    // in combination with what the branch takes.
+    expect(res.conflict?.head).toBe(c.expected.smallest_conflicting_sha);
+    expect(res.conflict?.conflictedPaths).toEqual(c.expected.case_conflicted_paths);
+    expect(res.probeCount).toBe(4);
   });
 
   it('p7: derived coverage is 0 (mining) i.e. -1 (0-based) — no pending chain commit merged', async () => {
@@ -192,7 +189,7 @@ describe.skipIf(!AVAILABLE)('propagation real-DAG cases (mined from the live for
     expect((await deriveCoverage(REPO, pinnedChain(), branch)).height).toBe(-1);
   });
 
-  it('p7 (FALLBACK): pin-by-patch synthesis reproduces the sweep even ignoring the live tip', () => {
+  it('p7 (FALLBACK): pin-by-patch synthesis reproduces the walk even ignoring the live tip', async () => {
     const c = loadCase('p7-conflict-profile-role-grant.yaml');
     const abs = c.pin_patch ? join(DIR, c.pin_patch as string) : null;
     if (!abs || !existsSync(abs)) {
@@ -210,15 +207,11 @@ describe.skipIf(!AVAILABLE)('propagation real-DAG cases (mined from the live for
       model: 'entry',
       heads: heights.map((h) => heightSha(h)),
     };
-    return mergePointSweep(REPO, branch, line).then((res) => {
-      expect(res.mergePoint).toBe(c.expected.largest_clean_sha);
-      // DRIVER.md §4.4: run starts at 62 and stacks over the sparse line's other
-      // conflicting head (98, same single-path conflict set).
-      expect(res.firstConflict?.run[0]).toBe(c.expected.smallest_conflicting_sha);
-      expect(res.firstConflict?.run).toEqual([62, 98].map((h) => heightSha(h)));
-      expect(res.firstConflict?.head).toBe(heightSha(98));
-      expect(res.firstConflict?.conflictedPaths).toEqual(c.expected.case_conflicted_paths);
-    });
+    const surface = await computeSurface(REPO, WATERMARK, branch);
+    const res = await pendingWalk(REPO, branch, line, surface, WATERMARK);
+    expect(res.steps.map((st) => st.sha)).toEqual([1, 61].map((h) => heightSha(h)));
+    expect(res.conflict?.head).toBe(c.expected.smallest_conflicting_sha);
+    expect(res.conflict?.conflictedPaths).toEqual(c.expected.case_conflicted_paths);
   });
 
   // p2 — DEFERRED positive (§5, class 2). VERIFIED. Uses the NEW window rule.

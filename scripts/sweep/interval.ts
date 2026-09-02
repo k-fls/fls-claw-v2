@@ -1,36 +1,26 @@
 /**
- * scripts/sweep/interval.ts — eligible-line construction (§4) and the LINEAR
- * merge-point sweep (§3).
+ * scripts/sweep/interval.ts — eligible-line construction (§4) and the pending
+ * walk (§3/§4.3).
  *
- * "Merging up to height k conflicts" is NOT monotonic in k: a later upstream
- * commit can rewrite a disputed region so the tip-level three-way merge is
- * clean again. So we NEVER bisect for conflicts. Instead: one
- * full-range merge-tree probe first (the common case — clean, one probe); on
- * conflict, a linear oldest->newest sweep, merging at the LARGEST clean height
- * (which may lie beyond intermediate conflicting heads).
+ * Candidates are enumerated at COMMIT GRAIN over the whole pending DAG and
+ * probed oldest -> newest by a hypothetical tip that ADVANCES on every step,
+ * so each probe sees exactly the ancestry the landed segment will have. The
+ * walk stops at the first conflict it cannot resolve itself; the case is that
+ * single commit and the landed prefix is everything below it. Conflict-ness is
+ * NOT monotonic along a line, and the walk never assumes it is: it decides
+ * step by step, never by bisection.
  *
- * Case stacking (DRIVER.md §4.4): the reported case STARTS at the first
- * conflicting head above the merge point and is the MAXIMAL RUN of consecutive
- * conflicting heads whose conflicted path sets intersect (one logical
- * decision), capped (`stack_cap`, default 5). The run breaks at a clean head,
- * at a disjoint-path conflict (its own case later), and at the cap. The case's
- * head is the run's TOP commit — conflict set and automerge tree are taken at
- * the top, so resolving the case resolves the whole run, and content above the
- * top is left out of the branch, the case and the fix ref alike.
- *
- * The line is walked by POSITION, not by height: parents-model candidates are
- * the parent's own commits, and a run of fork-side commits shares one derived
- * height. THE WALK IS HEIGHT-FREE — candidates are shas, the cut is a
- * containment test, and a `{sha, height}` is minted only where a commit becomes
- * load-bearing (the merge point, the case head — plan.ts).
+ * The line is walked by POSITION, not by height: candidates are shas, the cut
+ * is a containment test, and a `{sha, height}` is minted only where a commit
+ * becomes load-bearing (the landed prefix's top, the case head — plan.ts).
  *
  * All probes are new-style `git merge-tree` (git.ts) — never single-base
  * `--merge-base=`, never cherry-pick.
  */
-import { DEFAULT_STACK_CAP } from './config.js';
 import { deriveCoverage, shaAtHeight, type Chain } from './heights.js';
-import { ancestryPath, blobOidAt, firstParentChain, git, newStyleMergeTree, overlayTreePaths, revParse } from './git.js';
+import { ancestryPath, blobOidAt, git, newStyleMergeTree, overlayTreePaths, pendingCommits, revParse } from './git.js';
 import { inSurface, type Surface } from './surface.js';
+import type { WalkPrefixStep } from './types.js';
 
 export interface EligibleLine {
   branch: string;
@@ -128,27 +118,23 @@ export async function withheldByCut(
  *  - entry model: candidates are the trunk chain commits above the branch's
  *    coverage (the shas ARE trunk commits, so the chain index is exact and the
  *    cut is an index comparison — free).
- *  - parents model: candidates are the PARENT branch's own first-parent commits
- *    that the branch has NOT yet absorbed — EVERY such commit. If the parent
- *    advanced in one big merge, intermediate heights simply do not exist; the
- *    commits that DO exist are all offered (relevant to DEFERRED).
+ *  - parents model: candidates are the parent's WHOLE PENDING DAG — every
+ *    commit reachable from the parent tip and not from the branch tip, merges
+ *    included, in topological order. A parent that advanced by one big
+ *    propagation merge still has every commit that merge dragged in offered
+ *    individually, so the walk can stop at the finest cut that exists instead
+ *    of taking the whole merge or nothing. Merges stay candidates in their own
+ *    right: an author's recorded integration tree can exist in no non-merge
+ *    commit, and only taking the merge itself can land it.
  *
- * ENUMERATION IS AT COMMIT GRAIN. Fork-side commits advance no upstream
- * coverage, so a whole run of them derives ONE height; keeping only the newest
- * commit per height collapses that run to the parent's tip, and a one-head line
- * has no clean prefix to merge and no older head to sweep. The branch then takes
- * nothing, the case head is the tip, and the held fix ref carries the parent's
- * whole tip instead of the commits the pass actually verified.
- *
- * ABSORPTION IS ANCESTRY, NOT HEIGHT. The walk excludes what the branch already
- * contains (`^branchTip`), which is also the exact bound of the unabsorbed
- * window — a shorter walk than one to the chain base. A height filter cannot
- * say this: heights repeat along a fork-side run, so `h <= coverage` would drop
- * commits the branch does not have, and it can express no intra-run progress at
- * all. This is also what carries fork-only parent content down: a parent whose
- * only new work is fork-side has that work enumerated as ordinary candidates, so
- * a fork fix merged into a parent reaches descendants without waiting for
- * upstream to advance.
+ * ENUMERATION IS AT COMMIT GRAIN and ABSORPTION IS ANCESTRY, NOT HEIGHT. The
+ * walk excludes what the branch already contains (`^branchTip`), which is the
+ * exact bound of the unabsorbed window; heights repeat across fork-side
+ * commits and are minted only where a commit is load-bearing. This is also
+ * what carries fork-only parent content down: a parent whose only new work is
+ * fork-side has that work enumerated as ordinary candidates, so a fork fix
+ * merged into a parent reaches descendants without waiting for upstream to
+ * advance.
  */
 export async function buildEligibleLine(args: BuildEligibleLineArgs): Promise<EligibleLine> {
   const { repo, branch, branchTip, parent, model, chain } = args;
@@ -162,164 +148,17 @@ export async function buildEligibleLine(args: BuildEligibleLineArgs): Promise<El
     return { branch, parent, model, heads, ...(heads.length < above.length ? { trimmedAt: trim } : {}) };
   }
 
-  // parents model: walk the parent's own first-parent line, oldest -> newest,
+  // parents model: the whole pending DAG of the parent, oldest -> newest,
   // over exactly what the branch has not absorbed.
   const parentTip = await revParse(repo, args.parentRef ?? parent);
-  const lineShas = await firstParentChain(repo, parentTip, branchTip);
+  const lineShas = await pendingCommits(repo, parentTip, branchTip);
   const withheld = await withheldByCut(repo, chain, trim, parentTip, new Set(lineShas));
   const heads = lineShas.filter((sha) => !withheld.has(sha));
   return { branch, parent, model, heads, ...(withheld.size > 0 ? { trimmedAt: trim } : {}) };
 }
 
-export interface HeadProbe {
-  sha: string;
-  clean: boolean;
-  conflictFiles: string[];
-  treeOid: string;
-}
-
-export interface MergePointResult {
-  branch: string;
-  parent: string;
-  model: 'entry' | 'parents';
-  /** No eligible candidates — nothing to merge from this parent. */
-  upToDate: boolean;
-  /** The full-range probe against the newest candidate was clean (one probe total). */
-  cleanFullRange: boolean;
-  /** Largest clean candidate (§3 step 3); null when even the oldest conflicts. */
-  mergePoint: string | null;
-  /**
-   * The stacked conflict run ABOVE the merge point (§3 step 4; DRIVER.md §4.4):
-   * starts at the first conflicting candidate above it, extends over consecutive
-   * path-intersecting conflicting candidates, capped. `head` is the run's TOP;
-   * paths/tree are the top probe's.
-   */
-  firstConflict: {
-    head: string;
-    run: string[];
-    conflictedPaths: string[];
-    automergeTree: string;
-    reproduction: { command: string };
-  } | null;
-  probes: HeadProbe[];
-  probeCount: number;
-}
-
 function reproCommand(branch: string, headSha: string): { command: string } {
   return { command: `git merge-tree --write-tree --name-only ${branch} ${headSha}` };
-}
-
-/**
- * Linear merge-point sweep over an eligible line (§3). One full-range probe;
- * on conflict a linear oldest->newest sweep. Returns the largest clean head as
- * the merge point and the stacked conflict run above it as the case (DRIVER.md §4.4):
- * the run starts at the first conflicting head above the merge point and
- * extends over consecutive path-intersecting conflicting heads up to `stackCap`.
- */
-export async function mergePointSweep(
-  repo: string,
-  branchRef: string,
-  line: EligibleLine,
-  stackCap: number = DEFAULT_STACK_CAP,
-): Promise<MergePointResult> {
-  const { branch, parent, model, heads } = line;
-  const base = { branch, parent, model } as const;
-  if (heads.length === 0) {
-    return {
-      ...base,
-      upToDate: true,
-      cleanFullRange: true,
-      mergePoint: null,
-      firstConflict: null,
-      probes: [],
-      probeCount: 0,
-    };
-  }
-
-  // Step 1: probe the full range (newest head) first.
-  const last = heads[heads.length - 1];
-  const fullProbe = await newStyleMergeTree(repo, branchRef, last);
-  const lastHeadProbe: HeadProbe = {
-    sha: last,
-    clean: fullProbe.clean,
-    conflictFiles: fullProbe.conflictFiles,
-    treeOid: fullProbe.treeOid,
-  };
-  if (fullProbe.clean) {
-    return {
-      ...base,
-      upToDate: false,
-      cleanFullRange: true,
-      mergePoint: last,
-      firstConflict: null,
-      probes: [lastHeadProbe],
-      probeCount: 1,
-    };
-  }
-
-  // Step 2: linear oldest->newest sweep (reusing the full-range probe for the tip).
-  const probes: HeadProbe[] = [];
-  for (let i = 0; i < heads.length - 1; i++) {
-    const mt = await newStyleMergeTree(repo, branchRef, heads[i]);
-    probes.push({ sha: heads[i], clean: mt.clean, conflictFiles: mt.conflictFiles, treeOid: mt.treeOid });
-  }
-  probes.push(lastHeadProbe);
-
-  // Step 3: merge at the largest clean head — the LAST clean probe in line
-  // order.
-  //
-  // ORDER IS THE POSITION IN THE LINE, NEVER THE HEIGHT. `probes` is in
-  // eligible-line order (oldest -> newest) and coverage is non-decreasing along
-  // that order, so position subsumes height and is exact where consecutive
-  // heads share one height. Under the entry model heights strictly increase, so
-  // this picks exactly what a height comparison picks. Under the parents model
-  // a fork-side run shares one height, and a height comparison there fails
-  // twice: it names an arbitrary member of the tied group as the merge point,
-  // and it then hides every conflicting head at that same height from step 4 —
-  // which comes back with no case while the branch stops dead below the cut.
-  let mergeIndex = -1;
-  for (let i = 0; i < probes.length; i++) if (probes[i].clean) mergeIndex = i;
-  const mergePoint: string | null = mergeIndex >= 0 ? probes[mergeIndex].sha : null;
-
-  // Step 4 (DRIVER.md §4.4): the case run. It STARTS at the first conflicting
-  // head ABOVE the merge point — the cut — and STACKS consecutive conflicting
-  // heads whose path sets intersect the run's accumulated set, breaking at a
-  // clean head (defensive — above the LAST clean probe every head conflicts by
-  // construction), at a disjoint-path conflict (its own case later), and at the
-  // cap. Nothing above the run's top is in the case, so nothing above it enters
-  // the held fix ref either.
-  const above = probes.slice(mergeIndex + 1);
-  let firstConflict: MergePointResult['firstConflict'] = null;
-  const start = above.findIndex((p) => !p.clean);
-  if (start >= 0) {
-    const runProbes: HeadProbe[] = [above[start]];
-    const runPaths = new Set(above[start].conflictFiles);
-    for (let i = start + 1; i < above.length && runProbes.length < stackCap; i++) {
-      const p = above[i];
-      if (p.clean) break; // never stack across a clean height
-      if (!p.conflictFiles.some((f) => runPaths.has(f))) break; // disjoint -> own case later
-      runProbes.push(p);
-      for (const f of p.conflictFiles) runPaths.add(f);
-    }
-    const top = runProbes[runProbes.length - 1];
-    firstConflict = {
-      head: top.sha,
-      run: runProbes.map((p) => p.sha),
-      conflictedPaths: top.conflictFiles,
-      automergeTree: top.treeOid,
-      reproduction: reproCommand(branchRef, top.sha),
-    };
-  }
-
-  return {
-    ...base,
-    upToDate: false,
-    cleanFullRange: false,
-    mergePoint,
-    firstConflict,
-    probes,
-    probeCount: probes.length,
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -392,10 +231,19 @@ async function decidedPaths(repo: string, commit: string): Promise<Set<string> |
  *    blob, or its absence): the branch has nothing of its own there, so the
  *    collision is between two states the source's author already integrated —
  *    at a merge commit those blobs ARE the author's own integration.
- *  - IN-SURFACE members at a MERGE commit auto-resolve where the branch
- *    already AGREES with the author's decision (`tree(branchTip)`'s blob equals
- *    `tree(C)`'s at a path the author decided): the question was answered by
- *    both sides identically, so there is nothing to ask.
+ *  - IN-SURFACE members auto-resolve BY EQUIVALENCE, where the question is
+ *    already answered and both endpoints hold the same answer:
+ *      - the branch tip and the SOURCE ANCHOR agree on the path — the source's
+ *        author, whatever route their history took, ended where the branch
+ *        already is, so an intermediate commit's disagreement is history
+ *        noise, not a question (without this, a sibling commit a later merge
+ *        in the same window resolves raises a case on an edge whose
+ *        endpoint-level merge is clean);
+ *      - at a MERGE commit, the branch already carries the author's DECISION
+ *        (`tree(branchTip)` equals `tree(C)` at a path the author decided).
+ *    Either way the resolution is content the branch ALREADY HAS or the author
+ *    recorded — never new content, so a cut above the line cannot leak
+ *    through it.
  *  - anything left is the owner's question: the step STOPS.
  */
 export async function walkStep(
@@ -404,6 +252,7 @@ export async function walkStep(
   candidate: string,
   surface: Surface,
   branchTipSha: string,
+  sourceAnchor: string,
 ): Promise<
   | { kind: 'advance'; tree: string; autoResolved: string[] }
   | { kind: 'stop'; conflict: WalkConflict }
@@ -413,20 +262,25 @@ export async function walkStep(
   const inS = probe.conflictFiles.filter((p) => inSurface(surface, p));
   const outS = probe.conflictFiles.filter((p) => !inSurface(surface, p));
   const decided = inS.length > 0 ? await decidedPaths(repo, candidate) : null;
-  const agreed: string[] = [];
-  if (decided) {
-    for (const p of inS) {
-      if (!decided.has(p)) continue;
-      const branchBlob = await blobOidAt(repo, branchTipSha, p);
-      const candidateBlob = await blobOidAt(repo, candidate, p);
-      if (branchBlob !== null && branchBlob === candidateBlob) agreed.push(p);
+  /** In-surface members settled by equivalence -> the side to take the blob from. */
+  const agreed = new Map<string, string>();
+  for (const p of inS) {
+    const branchBlob = await blobOidAt(repo, branchTipSha, p);
+    if ((await blobOidAt(repo, sourceAnchor, p)) === branchBlob) {
+      agreed.set(p, branchTipSha); // both endpoints agree — take the shared answer
+      continue;
+    }
+    if (decided?.has(p) && branchBlob !== null && branchBlob === (await blobOidAt(repo, candidate, p))) {
+      agreed.set(p, candidate); // the branch already carries the author's decision
     }
   }
-  const agreedSet = new Set(agreed);
-  const autoResolved = [...outS, ...agreed].sort();
-  const remaining = inS.filter((p) => !agreedSet.has(p));
-  const resolvedTree =
-    autoResolved.length > 0 ? await overlayTreePaths(repo, probe.treeOid, candidate, autoResolved) : probe.treeOid;
+  const autoResolved = [...outS, ...agreed.keys()].sort();
+  const remaining = inS.filter((p) => !agreed.has(p));
+  let resolvedTree = probe.treeOid;
+  if (outS.length > 0) resolvedTree = await overlayTreePaths(repo, resolvedTree, candidate, outS);
+  for (const [p, from] of agreed) {
+    resolvedTree = await overlayTreePaths(repo, resolvedTree, from, [p]);
+  }
   if (remaining.length === 0) return { kind: 'advance', tree: resolvedTree, autoResolved };
   return {
     kind: 'stop',
@@ -478,9 +332,9 @@ export async function reconcileToAnchor(
  *
  * The walk stops at the FIRST conflict the engine cannot resolve itself
  * (`walkStep`); the case is that single candidate, and everything below it is
- * the landed prefix. There is no merge-past-a-conflict and no case stacking:
- * what lands is exactly what was probed in sequence, and what is asked is
- * exactly one commit's in-surface question.
+ * the landed prefix. What lands is exactly what was probed in sequence, and
+ * what is asked is exactly one commit's in-surface question — nothing above
+ * the stop is probed, landed or exhibited.
  */
 export async function pendingWalk(
   repo: string,
@@ -501,7 +355,7 @@ export async function pendingWalk(
   let probeCount = 0;
   for (const candidate of heads) {
     probeCount++;
-    const step = await walkStep(repo, hyp, candidate, surface, tipSha);
+    const step = await walkStep(repo, hyp, candidate, surface, tipSha, sourceAnchor);
     if (step.kind === 'stop') {
       conflict = step.conflict;
       break;
@@ -519,12 +373,6 @@ export async function pendingWalk(
   return { ...base, upToDate: false, steps, landTree, reconciled, conflict, probeCount };
 }
 
-/** A step-file merge row's landed prefix entry (steps.ts). */
-export interface PrefixStep {
-  sha: string;
-  autoResolved: string[];
-}
-
 /**
  * Re-verify a recorded prefix FROM FIRST PRINCIPLES (steps.ts): replay the
  * walk engine over exactly the recorded candidates and require every step to
@@ -535,7 +383,7 @@ export interface PrefixStep {
 export async function replayPrefix(
   repo: string,
   branchTip: string,
-  prefix: readonly PrefixStep[],
+  prefix: readonly WalkPrefixStep[],
   surface: Surface,
   sourceAnchor: string,
 ): Promise<{ ok: boolean; tree: string | null; errors: string[] }> {
@@ -544,7 +392,7 @@ export async function replayPrefix(
   let hyp = tipSha;
   let tree: string | null = null;
   for (const p of prefix) {
-    const step = await walkStep(repo, hyp, p.sha, surface, tipSha);
+    const step = await walkStep(repo, hyp, p.sha, surface, tipSha, sourceAnchor);
     if (step.kind === 'stop') {
       errors.push(
         `prefix step ${p.sha.slice(0, 12)} does not fully resolve (unresolved: ${step.conflict.conflictedPaths.join(', ')})`,

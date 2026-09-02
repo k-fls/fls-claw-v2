@@ -310,25 +310,25 @@ async function setupEscalatedHeldCase(): Promise<{
 
 // --- Pre-PR height check (DRIVER.md §10.4) + the PR machine block (§5.5) ---------
 
-describe('publish — a fork-side parent run is held at the run TOP, never at the parent tip', () => {
+describe('publish — a fork-side parent line is held at the STOP commit, never at the parent tip', () => {
   /**
    * WHAT THE OWNER IS ASKED TO REVIEW IS WHAT THE PASS VERIFIED, and no more.
    *
    * The parent's whole advance is fork-side, so its nine commits share one
-   * height: p1 merges clean and p2 is the cut. The branch takes the clean prefix
-   * and the case covers the stacked run above it, capped at five — so p7…p9 were
-   * never probed in combination with anything the branch will carry, and the
-   * held ref must not contain them. The fix ref's diff is the whole of the
-   * question: content past the cut appearing there is content nobody verified,
-   * offered for review as if it had been.
+   * height: p1 merges clean and p2 is the stop. The branch takes the clean
+   * prefix and the case is p2 ALONE — p3…p9 were never probed in combination
+   * with anything the branch will carry, and the held ref must not contain
+   * them. The fix ref's diff is the whole of the question: content past the
+   * stop appearing there is content nobody verified, offered for review as if
+   * it had been.
    */
-  it('the DRAFT head carries the clean prefix plus the run, and nothing above the run top', async () => {
+  it('the DRAFT head carries the clean prefix plus the stop commit, and nothing above it', async () => {
     const { repo, base, cleanHead, conflicting } = makeForkRunFixture();
     cleanups.push(() => repo.destroy());
     const bareDir = repo.attachBareOrigin();
     repo.git('push', 'origin', 'main_patched');
     repo.git('push', 'origin', 'feat/child');
-    const runTop = conflicting[4]; // p6 — the fifth conflicting commit (stack_cap 5)
+    const stop = conflicting[0]; // p2 — the first conflicting commit
 
     const ws = mkWorkspace();
     const inv = writeInventory([{ id: 'child', branch: 'feat/child', parents: ['main_patched'] }]);
@@ -343,32 +343,31 @@ describe('publish — a fork-side parent run is held at the run TOP, never at th
     expect((merge.head as { sha: string }).sha).toBe(cleanHead);
     const landed = repo.git('ls-tree', '-r', '--name-only', repo.sha('feat/child')).split('\n');
     expect(landed).toContain('docs/p1.md');
-    // …and nothing above it: the branch is capped at the processed height.
+    // …and nothing above it: the branch is capped at the stop.
     for (const i of [2, 3, 4, 5, 6, 7, 8, 9]) expect(landed).not.toContain(`src/p${i}.ts`);
 
-    // The case is the stacked run above the cut, topped at p6 — not the tip.
+    // The case is the stop commit alone — not the tip, and nothing stacked.
     const caseRow = readJournal(dir).find((e) => e.action === 'case' && e.branch === 'feat/child')!;
-    expect((caseRow.head as { sha: string }).sha).toBe(runTop);
-    expect((caseRow.run as Array<{ sha: string }>).map((h) => h.sha)).toEqual(conflicting.slice(0, 5));
-    expect(caseId).toBe(`feat__child--main_patched-h0-${runTop.slice(0, 8)}`);
+    expect((caseRow.head as { sha: string }).sha).toBe(stop);
+    expect(caseId).toBe(`feat__child--main_patched-h0-${stop.slice(0, 8)}`);
 
     // Freeze pristine and publish: the DRAFT head is the automerge tree at the
-    // run top, parented on the branch tip and the run top.
+    // stop, parented on the branch tip and the stop commit.
     expect(await cmdSweepReportCase(cli({ cmd: 'report-case', tier: 'held', execute: true }), neverInvoked)).toBe(0);
     repo.git('push', 'origin', 'feat/child'); // simulated target push -> ERR14 passes
     writeText(join(dir, caseId, 'pr'), FORK_RUN_TITLE, FORK_RUN_BODY);
     const out = join(ws, 'out.json');
     expect(await cmdPublish(cli({ cmd: 'publish', caseId, out }), fakeGithub().factory)).toBe(0);
     const head = readOut(out).head!.commit;
-    expect(repo.git('rev-parse', `${head}^2`)).toBe(runTop);
+    expect(repo.git('rev-parse', `${head}^2`)).toBe(stop);
 
-    // THE DIFF THE OWNER SEES: the conflicted files and the run's own additions,
-    // and nothing p7…p9 brought.
+    // THE DIFF THE OWNER SEES: the conflicted files and the stop's own
+    // addition, and nothing p3…p9 brought.
     const changed = repo.git('diff', '--name-only', repo.sha('feat/child'), head).split('\n').filter(Boolean);
     expect(changed).toContain('src/a.ts');
     expect(changed).toContain('src/b.ts');
-    for (const i of [2, 3, 4, 5, 6]) expect(changed).toContain(`src/p${i}.ts`);
-    for (const i of [7, 8, 9]) expect(changed).not.toContain(`src/p${i}.ts`);
+    expect(changed).toContain('src/p2.ts');
+    for (const i of [3, 4, 5, 6, 7, 8, 9]) expect(changed).not.toContain(`src/p${i}.ts`);
     expect(repo.git('-C', bareDir, 'for-each-ref', 'refs/heads/fix')).toBe(''); // dry run: nothing pushed
   });
 });

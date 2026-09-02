@@ -45,7 +45,7 @@ scripts/sweep/
     fork-registry@<hash>/    the committed inventory snapshot (loader default)
   registry/
     schema/feature-entry.schema.json
-    routing.yaml             global driver levers (scope_guard_mode, stack_cap)
+    routing.yaml             global driver lever (scope_guard_mode)
     scope.yaml               scope policy: exclusions, extra_edges
     prompts/                 overlap-check.md, catch-all-triage.md
   test-cases/

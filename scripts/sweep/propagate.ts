@@ -66,7 +66,6 @@ import { homedir, tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 
 import {
-  DEFAULT_STACK_CAP,
   DEFAULT_UPSTREAM_REF,
   FORK_POINT,
   RR_CACHE_DIRNAME,
@@ -80,6 +79,7 @@ import {
   commitTreeMerge,
   git,
   gitPush,
+  independentCommits,
   isAncestor,
   localBranchExists,
   replayCommitOnto,
@@ -818,7 +818,7 @@ export function directParentEdges(cli: Cli): Map<string, string[]> {
 /** A pending urge for a still-PR_ID-blocked branch (§8; posted by `push`, §14.4). */
 interface PendingUrge {
   branch: string;
-  /** The pending run's top = the newest pending trunk head (a blocked branch lands no merges). */
+  /** The newest pending trunk head (a blocked branch lands no merges). */
   head: string;
   pending: Head[];
   fixBranch: string;
@@ -914,7 +914,6 @@ async function derive(
     scope: registry.scope,
     held,
     mergeStatusOf: statusView,
-    stackCap: registry.routing.stackCap, // stacked-run cap lever (per-feature override in derivePlan)
   });
 }
 
@@ -1531,6 +1530,45 @@ async function journaledMerge(
     throw new DriverHalt(
       'merge-failed',
       `merge into '${branch}' failed: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+}
+
+/**
+ * Land a WALKED PREFIX (§4.3) as ONE merge commit: the walk's landed tree,
+ * parented on the branch tip and the prefix's MAXIMAL candidates — every
+ * landed candidate becomes an ancestor of the new tip, with no redundant
+ * parent edges. The tree is the walk's own (auto-resolutions and the final
+ * reconciliation included), so the commit records exactly what the sequence of
+ * probes verified; re-probing a single head here would ask a different
+ * question than the walk answered. Same N1 checked-out safety as every other
+ * ref writer; compare-and-swap on the expected tip.
+ */
+async function journaledWalkMerge(
+  repo: string,
+  branch: string,
+  prefixShas: string[],
+  landTree: string,
+  message: string,
+  scope: Set<string>,
+): Promise<string> {
+  guardRef(branch, scope);
+  const wt = await checkedOutWorktree(repo, branch); // B6/N1: dirty -> DriverHalt
+  try {
+    const tip = await revParse(repo, branch);
+    const maximals = await independentCommits(repo, prefixShas);
+    const args = ['commit-tree', landTree, '-p', tip];
+    for (const m of maximals) args.push('-p', m);
+    args.push('-m', message);
+    const commit = (await git(repo, args)).stdout.trim();
+    await git(repo, ['update-ref', `refs/heads/${branch}`, commit, tip]);
+    if (wt) await git(repo, ['reset', '--hard', commit], { cwd: wt }); // clean-verified above
+    return commit;
+  } catch (e) {
+    if (e instanceof DriverHalt) throw e;
+    throw new DriverHalt(
+      'merge-failed',
+      `walk merge into '${branch}' failed: ${e instanceof Error ? e.message : String(e)}`,
     );
   }
 }
@@ -4728,7 +4766,6 @@ export async function cmdRun(
           alwaysMerge: snap.alwaysMerge,
           cut: effectiveCut(parentBranches, blockHeightOf),
           blockHeightOf,
-          stackCap: snap.stackCap, // effective cap resolved at plan derivation
           mergeBlocked,
         });
 
@@ -4901,17 +4938,17 @@ export async function cmdRun(
             branch: bp.branch,
             parent: pp.parent,
             head: pp.case!.head,
-            detail: 'the live re-derivation offers no case here — the merge window closed above it',
+            detail:
+              'the live re-derivation offers no case here — the window closed above it, or the walk now resolves it',
           });
           return false;
         }
         const caseFile: CaseFile = {
           schemaVersion: 1,
-          id: caseId(bp.branch, pp.parent, live.head.height, live.head.sha), // B8: branch+PARENT+height+sha8 (run TOP)
+          id: caseId(bp.branch, pp.parent, live.head.height, live.head.sha), // B8: branch+PARENT+height+sha8
           branch: bp.branch,
           parent: pp.parent,
-          head: live.head, // the run's TOP commit (stacked-run model)
-          run: live.run,
+          head: live.head, // the walk's stop commit
           tierFloor: bp.tierFloor,
           conflictedPaths: live.conflictedPaths,
           automergeTree: live.automergeTree,
@@ -4948,7 +4985,6 @@ export async function cmdRun(
           caseId: caseFile.id,
           head: caseFile.head, // sha recorded for the B5i crash-heal ancestry check
           height: caseFile.head.height,
-          run: caseFile.run, // the stacked run
           conflictedPaths: caseFile.conflictedPaths,
         });
         return true;
@@ -4959,31 +4995,32 @@ export async function cmdRun(
         for (let pi = 0; pi < bp.parents.length; pi++) {
           let pp = bp.parents[pi];
           if (branchGated) break; // halt at first case needing judgment per branch
-          // Execution re-probe (§3/§8): each per-parent verdict above
-          // was probed against the branch tip AT DERIVATION, but parents merge
-          // SEQUENTIALLY — once an earlier parent's merge advances the tip, a
-          // later parent's clean `merge` verdict is stale (executing it blind
-          // crashes the run mid-merge). Re-probe against the CURRENT tip
-          // (pinned SHAs, §3 determinism); on staleness re-derive the parent row
-          // live and demote as found: conflicted → case (conflict set + automerge
-          // tree recomputed from the current tip), tree-equal → skip (§6 no-op).
-          // Forced (empty) merges are exempt: they exist only when every parent
-          // no-op'd, so the tip has not moved (§6).
-          if (pp.verdict === 'merge' && !pp.forced && pp.mergePoint) {
+          // Execution re-derivation (§3/§8): each per-parent verdict above was
+          // derived against the branch tip AT DERIVATION, but parents merge
+          // SEQUENTIALLY — once an earlier parent's merge advances the tip,
+          // every later verdict is a statement about a tree that no longer
+          // exists. The walk is a function of the tip, so a moved tip means
+          // the WHOLE ROW is re-derived live — a merge's prefix as much as a
+          // case's stop — and the fresh verdict dispatches below. A merge that
+          // stops being one is journaled as a demotion. Forced (empty) merges
+          // are exempt: they exist only when every parent no-op'd, so the tip
+          // has not moved (§6).
+          if ((pp.verdict === 'merge' || pp.verdict === 'case') && !pp.forced) {
             const nowTip = await revParse(cli.repo, bp.branch);
-            const reprobe = await newStyleMergeTree(cli.repo, nowTip, pp.mergePoint.sha);
-            if (!reprobe.clean || reprobe.treeOid === (await treeOf(cli.repo, nowTip))) {
+            if (nowTip !== tipAtDerive) {
               const repp = (await deriveLive()).parents.find((p) => p.parent === pp.parent);
               if (repp) {
-                appendJournal(dir, {
-                  action: 'demoted',
-                  branch: bp.branch,
-                  parent: pp.parent,
-                  from: 'merge',
-                  to: repp.verdict,
-                  staleHead: pp.mergePoint,
-                  conflictedPaths: reprobe.clean ? [] : reprobe.conflictFiles,
-                });
+                if (pp.verdict === 'merge' && (repp.verdict !== 'merge' || repp.mergePoint?.sha !== pp.mergePoint?.sha)) {
+                  appendJournal(dir, {
+                    action: 'demoted',
+                    branch: bp.branch,
+                    parent: pp.parent,
+                    from: 'merge',
+                    to: repp.verdict,
+                    staleHead: pp.mergePoint,
+                    conflictedPaths: repp.case?.conflictedPaths ?? [],
+                  });
+                }
                 bp.parents[pi] = repp;
                 pp = repp; // dispatch the FRESH verdict below (merge/case/defer/skip)
               }
@@ -4993,12 +5030,30 @@ export async function cmdRun(
             const label = pp.model === 'entry' ? `main@height${pp.mergePoint!.height}` : pp.parent;
             const msg = `Merge ${label} into ${bp.branch} (propagation${pp.forced ? ', forced no-op' : ''})`;
             await recordPreRef(cli, dir, preReffed, bp.branch);
-            const newRef = await journaledMerge(cli.repo, bp.branch, pp.mergePoint!.sha, msg, scope);
+            // A forced merge is an EMPTY merge of the parent tip (§6). A real
+            // one lands the walked prefix: the walk's own tree, parented on
+            // the prefix's maximal candidates (journaledWalkMerge).
+            const newRef = pp.forced
+              ? await journaledMerge(cli.repo, bp.branch, pp.mergePoint!.sha, msg, scope)
+              : await journaledWalkMerge(
+                  cli.repo,
+                  bp.branch,
+                  pp.prefix!.map((ps) => ps.sha),
+                  pp.landTree!,
+                  msg,
+                  scope,
+                );
             appendJournal(dir, {
               action: 'merge',
               branch: bp.branch,
               parent: pp.parent,
               head: pp.mergePoint,
+              ...(pp.prefix && !pp.forced
+                ? {
+                    prefixCount: pp.prefix.length,
+                    autoResolved: [...new Set(pp.prefix.flatMap((ps) => ps.autoResolved))].sort(),
+                  }
+                : {}),
               forced: pp.forced ?? false,
               newRef,
             });
@@ -5477,10 +5532,8 @@ interface ResolvedCase {
   branch: string;
   parent: string;
   model: 'entry' | 'parents';
-  /** The case run's TOP head (stacked-run model). */
+  /** The stop commit — the single candidate the case is about. */
   head: { sha: string; height: number };
-  /** The stacked run (ascending); run[run.length - 1] === head. */
-  run: Head[];
   conflictedPaths: string[];
   /** Pending-and-in-scope reach re-seeded from a published resolution (CaseFile). */
   carriedPaths?: string[];
@@ -5541,7 +5594,6 @@ async function reverifyGateFixCase(
       parent: GATE_FIX_PARENT,
       model: 'parents',
       head,
-      run: [head], // the run invariant: run[run.length - 1] === head
       conflictedPaths: files,
       // The BRANCH TIP's tree stands in for the automerge tree, and that is
       // load-bearing rather than incidental: everything downstream reads this
@@ -5607,8 +5659,6 @@ async function reverifyCase(
   const feat = registry.features.find((f) => f.branch === caseFile.branch);
   const floor = tierFloor(caseFile.branch, feat);
   const scopeGuardMode: ScopeGuardMode = feat?.scope_guard ?? registry.routing.scopeGuardMode ?? 'same-files';
-  // Stacked-run cap lever, re-derived from config exactly like the tier floor above.
-  const stackCap = feat?.stack_cap ?? registry.routing.stackCap ?? DEFAULT_STACK_CAP;
 
   // (N2) AUTHORITY for parent legality + pass scope: the branch's kind/model/
   // parents/ancestors and the pass's scope set are re-derived from the
@@ -5673,7 +5723,6 @@ async function reverifyCase(
     alwaysMerge: feat?.always_merge === true,
     cut: effectiveCut(parents, cutOf),
     blockHeightOf: cutOf,
-    stackCap,
   });
   const pp = bp.parents.find((p) => p.parent === caseFile.parent);
   if (!pp)
@@ -5727,7 +5776,6 @@ async function reverifyCase(
       parent: caseFile.parent,
       model,
       head: rc.head,
-      run: rc.run,
       conflictedPaths: rc.conflictedPaths,
       automergeTree: rc.automergeTree,
       reproduction: rc.reproduction,
@@ -5745,7 +5793,7 @@ async function reverifyCase(
  * commented resolution). `reverifyCase` cannot apply: it re-derives the case
  * from the live plan sweep, but a reissue branch is PR_ID-blocked (empty
  * interval — the sweep never probes it) and the recorded head may sit below a
- * since-advanced upstream run top. The trust anchor here is the JOURNAL row
+ * since-advanced upstream stop. The trust anchor here is the JOURNAL row
  * the DRIVER wrote at `start` from the origin fix ref (agent-unwritable), and
  * the conflict is re-probed DIRECTLY against the live branch tip — the same
  * staleness model as `publishHead`'s held path. case.json stays a pointer:
@@ -5827,7 +5875,6 @@ async function reverifyReissueCase(
       parent: caseFile.parent,
       model,
       head: rowHead,
-      run: [rowHead],
       conflictedPaths: probe.conflictFiles,
       // Carried through the re-derivation: they are pending in the worktree and
       // in scope, and a guard that forgot them would charge the agent for the
@@ -5956,7 +6003,7 @@ function fixBranchName(id: string, rc: Pick<ResolvedCase, 'branch' | 'parent' | 
  * materials) and writes pr/title.txt + pr/body.md itself, then runs
  * `propagate publish --case <id>` — the ONLY sanctioned PR-creation path.
  * No fix/sweep ref is created here either: publish pushes the ref at the REAL
- * head (HELD: the run's top commit; JUDGED: the merge commit). Returns
+ * head (HELD: the case's stop commit; JUDGED: the merge commit). Returns
  * the deterministic fix branch NAME for urge bookkeeping.
  */
 /** Where the case's PR template is written — the ONE template the agent may use. */
@@ -6080,7 +6127,6 @@ async function prepareCaseMaterials(cli: Cli, dir: string, rc: ResolvedCase, tie
     ...rc.conflictedPaths.map((p) => `- ${p}`),
     '',
     `Branch: ${rc.branch}   Parent: ${rc.parent}   Head: ${rc.head.sha.slice(0, 12)} (height ${rc.head.height})`,
-    `Case run (${rc.run.length} height(s)): ${rc.run.map((h) => `h${h.height} ${h.sha.slice(0, 12)}`).join(', ')}`,
     `Pending upstream commits above this point: ${rc.pendingAbove}`,
     '',
     `## Reproduction`,
@@ -8930,7 +8976,6 @@ async function materializeReissueCase(
     branch: args.branch,
     parent,
     head,
-    run: [head],
     tierFloor: tierFloor(args.branch, feat),
     conflictedPaths: probe.conflictFiles,
     ...(carried.length ? { carriedPaths: carried } : {}),
@@ -8969,7 +9014,6 @@ async function materializeReissueCase(
     caseId: cid,
     head,
     height,
-    run: caseFile.run,
     conflictedPaths: caseFile.conflictedPaths,
     ...(carried.length ? { carriedPaths: carried } : {}),
     reissue: true,
@@ -10760,7 +10804,6 @@ export async function cmdSweepNextCase(
     // Pending too, and in scope — the agent's report should not read them as
     // files it wandered into.
     ...(caseFile.carriedPaths?.length ? { carriedPaths: caseFile.carriedPaths } : {}),
-    run: caseFile.run ?? [caseFile.head],
     ...(isReissue ? { reissue: true, prNumber: caseRow!.prNumber ?? null } : {}),
     ...(activeGates.length ? { activeGates } : {}),
     ...(loopWarning ? { serves, warning: loopWarning } : {}),
@@ -14531,18 +14574,14 @@ async function materializeGateFixCases(
       id: caseId,
       branch: g.branch,
       head,
-      // `run[run.length - 1] === head` is the run invariant (types.ts). A gate fix
-      // stacks nothing, so its run is the head alone — NOT the empty array, which
-      // breaks the invariant and prints "0 height(s)" into the case materials.
-      run: [head],
       parent: GATE_FIX_PARENT,
       tierFloor: 'judged',
       conflictedPaths: g.files,
       automergeTree: await treeOf(cli.repo, tip),
       reproduction: { command: commandNames.join(' && ') },
-      // firstConflictHeight is documented as "the run's TOP height" — that is
-      // `head.height`, whatever kind of case this is. (Nothing reads a gate fix's
-      // DEFERRED inputs: it has no transitive ancestors to defer against.)
+      // firstConflictHeight is `head.height`, whatever kind of case this is.
+      // (Nothing reads a gate fix's DEFERRED inputs: it has no transitive
+      // ancestors to defer against.)
       deferredCheck: { firstConflictHeight: head.height, transitiveAncestors: [] },
     };
     mkdirSync(join(dir, caseId), { recursive: true });
@@ -14573,7 +14612,6 @@ async function materializeGateFixCases(
       gateFix: true,
       head,
       height: head.height,
-      run: caseFile.run,
       conflictedPaths: g.files,
       // On the `case` row because `gateFixCaseMaterials` is handed THAT row —
       // a character written only to the `gate-fix` row never reaches the agent.

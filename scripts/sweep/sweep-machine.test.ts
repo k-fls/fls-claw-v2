@@ -2020,12 +2020,14 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     repo.commit('mp: trunk files', { 'src/p.ts': 'p\n', 'src/s.ts': 's\n' });
     repo.checkout('module/cg', { create: true, at: 'main_patched' });
     repo.commit('cg: x = cg', { 'src/x.ts': 'cg\n' });
+    // TWO conflicting parent commits, so the child's walk stops at the first
+    // while the parent tip sits one commit above it — the case head carries the
+    // parent's own files and is NOT the parent tip.
+    repo.checkout('main_patched');
+    repo.commit('mp: x = up1', { 'src/x.ts': 'up1\n' });
+    repo.commit('mp: x = up2', { 'src/x.ts': 'up2\n' });
     repo.checkout('main');
-    // TWO conflicting heads, so the trunk takes them as two cases and carries a
-    // commit at each height — a child that stops at the first has a merge point
-    // one commit below the trunk tip.
-    repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' });
-    repo.commit('U2: x = up2', { 'src/x.ts': 'up2\n' });
+    repo.commit('U0: pass progress', { 'src/u0.ts': 'u\n' });
     cleanups.push(() => repo.destroy());
     return repo;
   }
@@ -2046,34 +2048,13 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
     const cmds = ['tsc --noEmit', 'tsc --build'];
     const green: ChecksRunner = async () => ({ ok: true, failedNames: [], output: '' });
-    // ONE HEAD PER CASE. Without the cap a case stacks the whole run, the trunk
-    // lands both heights in one commit, and no child can stop below its tip.
-    const routing = join(ws, 'routing.yaml');
-    writeFileSync(routing, 'stack_cap: 1\n');
-    const cli = (over: Partial<Cli> = {}): Cli => baseCli(repo, ws, inv, { routingFile: routing, ...over });
+    const cli = (over: Partial<Cli> = {}): Cli => baseCli(repo, ws, inv, over);
     await cmdSweepStart(cli({ checksFile: checksFile(ws, { typecheck: cmds }) }));
-    // The trunk's own conflicts, one per height, resolved mechanically so they land
-    // with no PR. The height-0 commit is the head `module/cg` will stop at.
     const dir = dirOf(repo, ws);
-    const trunkCases: string[] = [];
-    for (const resolution of ['R1\n', 'R2\n']) {
-      await cmdSweepNextCase(cli(), green);
-      const id = currentCaseId(dir);
-      trunkCases.push(id);
-      resolveWorktree(dir, id, { 'src/x.ts': resolution });
-      expect(
-        await cmdSweepReportCase(
-          cli({ cmd: 'report-case', tier: 'mechanical', execute: true }),
-          confirm,
-          green,
-          fakeInstall,
-        ),
-      ).toBe(0);
-    }
-    // Now `module/cg` gets its case, at the height it conflicts on.
+    // `module/cg` gets its case at the FIRST conflicting parent commit — the
+    // walk's stop, one commit below the parent tip.
     await cmdSweepNextCase(cli(), green);
     const caseId = currentCaseId(dir);
-    expect(trunkCases).not.toContain(caseId);
     resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
     seedPriorFailure(dir, caseId, 'typecheck', cmds);
     const wtPath = join(dir, caseId, 'worktree');
@@ -6725,17 +6706,17 @@ describe('next-case — a participating branch that is RED before any merge', ()
  * The rule these pin: content that propagates arrives green, or it does not
  * arrive.
  */
-describe('run — a fork-side parent run is taken commit by commit', () => {
+describe('run — a fork-side parent line is taken commit by commit', () => {
   /**
    * ONE HEIGHT, TWO CASES, IN ONE PASS. The parent's advance is entirely
-   * fork-side, so its nine commits share a height and the stack cap splits them
-   * across two cases: resolving the first reopens the branch, and the
-   * re-derivation offers the bucket's REMAINDER — same branch, same parent, same
-   * height. The two cases are told apart by their conflict head, which is why
-   * the id carries it: a second case wearing the first's id inherits its
-   * `resolved` disposition, drops out of `openCases`, and can never be served.
+   * fork-side, so its nine commits share a height and the walk stops at each
+   * conflicting commit in turn: resolving the first reopens the branch, and the
+   * re-derivation stops at the NEXT — same branch, same parent, same height.
+   * The two cases are told apart by their conflict head, which is why the id
+   * carries it: a second case wearing the first's id inherits its `resolved`
+   * disposition, drops out of `openCases`, and can never be served.
    */
-  it('resolving the first run reopens the branch and the remainder is served as a second case at the same height', async () => {
+  it('resolving the first stop reopens the branch and the next commit is served as a second case at the same height', async () => {
     const { repo, base, conflicting } = makeForkRunFixture();
     cleanups.push(() => repo.destroy());
     const ws = mkWorkspace();
@@ -6746,7 +6727,7 @@ describe('run — a fork-side parent run is taken commit by commit', () => {
     expect(await cmdSweepStart(cli())).toBe(0);
     expect(await cmdSweepNextCase(cli(), greenPreMerge)).toBe(0);
     const first = currentCaseId(dir);
-    expect(first).toBe(`feat__child--main_patched-h0-${conflicting[4].slice(0, 8)}`); // run top = p6
+    expect(first).toBe(`feat__child--main_patched-h0-${conflicting[0].slice(0, 8)}`); // the stop = p2
 
     resolveWorktree(dir, first, { 'src/a.ts': 'RESOLVED-a\n', 'src/b.ts': 'RESOLVED-b\n' });
     expect(await cmdSweepReportCase(cli({ cmd: 'report-case', tier: 'mechanical', execute: true }), confirm)).toBe(0);
@@ -6757,12 +6738,11 @@ describe('run — a fork-side parent run is taken commit by commit', () => {
     expect(await cmdSweepNextCase(cli(), greenPreMerge)).toBe(0);
     const second = currentCaseId(dir);
     // Same branch, same parent, same HEIGHT — a different conflict head.
-    expect(second).toBe(`feat__child--main_patched-h0-${conflicting[7].slice(0, 8)}`); // run top = p9
+    expect(second).toBe(`feat__child--main_patched-h0-${conflicting[1].slice(0, 8)}`); // the next stop = p3
     expect(second).not.toBe(first);
     const journal = readJournal(dir);
     const secondRow = journal.find((e) => e.action === 'case' && e.caseId === second)!;
-    expect((secondRow.head as { sha: string; height: number })).toMatchObject({ sha: conflicting[7], height: 0 });
-    expect((secondRow.run as Array<{ sha: string }>).map((h) => h.sha)).toEqual(conflicting.slice(5));
+    expect(secondRow.head as { sha: string; height: number }).toMatchObject({ sha: conflicting[1], height: 0 });
     // Served, not swallowed: the first case's disposition is its own.
     expect(openCases(journal).map((c) => c.caseId)).toContain(second);
     expect(openCases(journal).map((c) => c.caseId)).not.toContain(first);
@@ -6812,7 +6792,7 @@ describe('run — a fork-side parent run is taken commit by commit', () => {
     // The prefix merged, the case above it was emitted, and the landing measured red.
     expect((journal.find((e) => e.action === 'merge' && e.branch === 'feat/child')!.head as { sha: string }).sha).toBe(cleanHead);
     const conflictCase = journal.find((e) => e.action === 'case' && e.branch === 'feat/child')!;
-    expect((conflictCase.head as { sha: string }).sha).toBe(conflicting[4]);
+    expect((conflictCase.head as { sha: string }).sha).toBe(conflicting[0]);
     expect(journal.find((e) => e.action === 'landing-check' && e.branch === 'feat/child')!.ok).toBe(false);
     // The gate ran for a branch that had already gated, and its reopen won.
     expect(supersededCaseIds(journal)).toContain(conflictCase.caseId as string);
@@ -8322,7 +8302,7 @@ describe('sweep finish — gate-fix on an unattributable red', () => {
    * (branch + failing-file digest) and the N5 guard accepts that shape AS
    * ITSELF; the head carries its real height.
    */
-  it('the gate-fix case file states the truth: identity id, real height, run invariant, tip tree', async () => {
+  it('the gate-fix case file states the truth: identity id, real height, tip tree', async () => {
     const repo = gateFixRepo();
     const ws = mkWorkspace();
     const inv = writeInventory([{ id: 'cg', branch: 'module/cg', owned: ['src/x.ts'] }]);
@@ -8336,7 +8316,6 @@ describe('sweep finish — gate-fix on an unattributable red', () => {
     expect(caseId).not.toContain('-h-'); // no invented height, of any sign
     const cf = JSON.parse(readFileSync(join(dir, caseId, 'case.json'), 'utf8')) as {
       head: { sha: string; height: number };
-      run: Array<{ sha: string; height: number }>;
       automergeTree: string;
       deferredCheck: { firstConflictHeight: number };
     };
@@ -8348,7 +8327,6 @@ describe('sweep finish — gate-fix on an unattributable red', () => {
     // real chain index — never a -1 placeholder.
     expect(Number(repo.git('rev-list', '--count', 'module/cg..main').trim())).toBe(0);
     expect(cf.head.height).toBeGreaterThanOrEqual(0);
-    expect(cf.run).toEqual([cf.head]); // run[run.length - 1] === head (types.ts)
     expect(cf.deferredCheck.firstConflictHeight).toBe(cf.head.height);
     // LOAD-BEARING, not incidental: the "automerge" tree is the branch tip's
     // tree because everything downstream reads this field as "the tree the

@@ -2697,13 +2697,13 @@ describe('propagate run — a freeze that arrives after the plan was written', (
 });
 
 describe('propagate run — a case is emitted against the tip it will be resolved on', () => {
-  it('the run, head and height come from ONE live derivation after an earlier parent moved the tip', async () => {
+  it('the head and height come from ONE live derivation after an earlier parent moved the tip', async () => {
     // Parents merge SEQUENTIALLY, so by the time the second parent's case is
     // emitted the tip is not the tip the plan was probed against. Here feat/a
     // carries feat/b's older commits, so merging feat/a into feat/c absorbs the
-    // bottom of feat/b's line — the conflicting run that plan time measured as
-    // three commits is, live, feat/b's top commit alone. A case that keeps the
-    // plan-time run describes commits its own conflict no longer spans.
+    // bottom of feat/b's line — the stop that plan time measured at the bottom
+    // of feat/b's line is, live, feat/b's top commit. A case that keeps the
+    // plan-time head describes a commit its own conflict no longer spans.
     const repo = initFixtureRepo();
     repo.commit('base: x', { 'src/x.ts': 'orig\n' });
     repo.checkout('main_patched', { create: true, at: 'main' });
@@ -2747,25 +2747,28 @@ describe('propagate run — a case is emitted against the tip it will be resolve
     const dir = passDir(ws, repo.sha('main').slice(0, 12));
     const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, o);
     await cmdPlan(cli({ cmd: 'plan' }));
-    // The PLAN measures the run against feat/c's pre-merge tip: heights 0 and 1.
+    // The PLAN measures the stop against feat/c's pre-merge tip: the bottom of
+    // feat/b's line (its own fork commit, coverage -1).
     const planned = (
       JSON.parse(readFileSync(join(dir, 'plan.json'), 'utf8')) as {
-        branches: Array<{ branch: string; parents: Array<{ parent: string; case: { run: Array<{ height: number }> } | null }> }>;
+        branches: Array<{ branch: string; parents: Array<{ parent: string; case: { head: { height: number } } | null }> }>;
       }
     ).branches.find((b) => b.branch === 'feat/c')!.parents.find((p) => p.parent === 'feat/b')!;
-    expect(planned.case!.run.map((h) => h.height)).toEqual([-1, 0, 1]);
+    expect(planned.case!.head.height).toBe(-1);
 
     expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
     const row = readJournal(dir).find((e) => e.action === 'case' && e.branch === 'feat/c')!;
     const head = row.head as { sha: string; height: number };
-    const run = row.run as Array<{ height: number }>;
-    // ONE derivation: the run is what the moved tip actually offers…
-    expect(run.map((h) => h.height)).toEqual([1]);
-    // …and the head, the height and the id all name the same thing.
-    expect(head.sha).toBe(bTip);
+    // ONE derivation: the stop is what the moved tip actually offers. With
+    // feat/b's lower line absorbed via feat/a, the pending DAG holds the trunk
+    // commit U1 and feat/b's top; U1 is the first stop — the finest cut that
+    // exists, not feat/b's whole tip — and the head, the height and the id all
+    // name the same thing.
+    expect(head.sha).toBe(u1);
     expect(head.height).toBe(1);
     expect(row.height).toBe(1);
-    expect(row.caseId).toBe(`feat__c--feat__b-h1-${bTip.slice(0, 8)}`);
+    expect(row.caseId).toBe(`feat__c--feat__b-h1-${u1.slice(0, 8)}`);
+    void bTip;
   });
 });
 

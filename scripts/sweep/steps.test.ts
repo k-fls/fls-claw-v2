@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { initFixtureRepo, makePropagationFixture } from './fixtures.js';
+import { newStyleMergeTree } from './git.js';
 import { enumerateChain, type Chain } from './heights.js';
 import { allParentsSkipped, deriveBranch, type DeriveBranchArgs } from './plan.js';
 import { buildStepFile, verifyStepFile } from './steps.js';
@@ -10,11 +11,13 @@ import { WHOLE_RANGE_BLOCK, type BranchPlan } from './types.js';
 const { repo, base, chain } = makePropagationFixture();
 let c: Chain;
 let ctx: StepVerifyContext;
+let goodTree: string;
 afterAll(() => repo.destroy());
 
 beforeAll(async () => {
   c = await enumerateChain(repo.dir, 'upstream-main', base);
   ctx = { chain: c, branchTip: repo.sha('fork'), arrivedParents: new Set(), passHasProgress: true };
+  goodTree = (await newStyleMergeTree(repo.dir, repo.sha('fork'), chain[0])).treeOid;
 });
 
 function goodStep(): StepFile {
@@ -27,7 +30,17 @@ function goodStep(): StepFile {
     isLeaf: false,
     alwaysMerge: false,
     // Height 0 (U0 adds util.ts) is a clean, real merge into fork.
-    merges: [{ parent: 'main', model: 'entry', action: 'merge', head: { sha: chain[0], height: 0 }, skipReason: null }],
+    merges: [
+      {
+        parent: 'main',
+        model: 'entry',
+        action: 'merge',
+        head: { sha: chain[0], height: 0 },
+        prefix: [{ sha: chain[0], autoResolved: [] }],
+        tree: goodTree,
+        skipReason: null,
+      },
+    ],
   };
 }
 
@@ -43,9 +56,34 @@ describe('verifyStepFile — rejects forged / hand-edited inputs (§7)', () => {
   it('rejects a forged head sha that does not match the claimed height', async () => {
     const step = goodStep();
     step.merges[0].head = { sha: chain[1], height: 0 }; // sha at height 1, claimed 0
+    step.merges[0].prefix = [{ sha: chain[1], autoResolved: [] }];
     const r = await verifyStepFile(repo.dir, step, ctx);
     expect(r.ok).toBe(false);
-    expect(r.errors.join('\n')).toMatch(/!= trunk commit at height 0/);
+    expect(r.errors.join('\n')).toMatch(/chain index != claimed height 0/);
+  });
+
+  it('rejects a merge row with no landed prefix', async () => {
+    const step = goodStep();
+    delete step.merges[0].prefix;
+    const r = await verifyStepFile(repo.dir, step, ctx);
+    expect(r.ok).toBe(false);
+    expect(r.errors.join('\n')).toMatch(/names no landed prefix/);
+  });
+
+  it('rejects a forged landed tree — the replay recomputes it from first principles', async () => {
+    const step = goodStep();
+    step.merges[0].tree = '0'.repeat(40);
+    const r = await verifyStepFile(repo.dir, step, ctx);
+    expect(r.ok).toBe(false);
+    expect(r.errors.join('\n')).toMatch(/claimed tree 000000000000 != replayed tree/);
+  });
+
+  it('rejects a prefix commit that is not a trunk chain commit (entry model)', async () => {
+    const step = goodStep();
+    step.merges[0].prefix = [{ sha: ctx.branchTip, autoResolved: [] }, { sha: chain[0], autoResolved: [] }];
+    const r = await verifyStepFile(repo.dir, step, ctx);
+    expect(r.ok).toBe(false);
+    expect(r.errors.join('\n')).toMatch(/is not a trunk chain commit/);
   });
 
   it('rejects a forged parent not in the legal parent set', async () => {
@@ -149,7 +187,9 @@ describe('buildStepFile — the skip reason is the parent-level answer', () => {
     const chain = await enumerateChain(repo.dir, 'main', base);
     const bp = await deriveBranch(leafArgs(chain));
     const p1 = bp.parents.find((p) => p.parent === 'feat/p1')!;
-    expect(p1.mergePoint).not.toBeNull(); // the tree-identical commit IS the merge point
+    // The tree-identical prefix is a no-op: nothing lands, and the parent's
+    // answer is the conflict above it.
+    expect(p1.mergePoint).toBeNull();
     expect(p1.case?.conflictedPaths).toEqual(['src/x.ts']);
     expect(p1.verdict).toBe('case');
 

@@ -88,11 +88,6 @@
       ],
       "description": "Per-feature scope-guard override (\u00a77 lever); beats the global default."
     },
-    "stack_cap": {
-      "type": "integer",
-      "minimum": 1,
-      "description": "Per-feature case-stacking cap override (MERGE-POLICY \u00a72 lever)."
-    },
     "tier_floor": {
       "const": "judged",
       "description": "Floors every merge of this branch at JUDGED (MERGE-POLICY \u00a71)."

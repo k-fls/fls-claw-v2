@@ -51,7 +51,6 @@ const ENTRY_KEYS: Record<string, (v: unknown) => boolean> = {
   design_docs: isStrArray,
   test_anchors: isStrArray,
   scope_guard: (v) => v === 'same-files' || v === 'conflict-hunks',
-  stack_cap: (v) => typeof v === 'number' && Number.isInteger(v) && v >= 1,
   tier_floor: (v) => v === 'judged',
   always_merge: (v) => typeof v === 'boolean',
   routing: (v) =>
@@ -109,14 +108,10 @@ export function loadRoutingConfig(routingFile: string = DEFAULT_ROUTING_FILE): {
   const routing: RoutingConfig = {};
   if (existsSync(routingFile)) {
     try {
-      const doc = parse(readFileSync(routingFile, 'utf8')) as
-        | { scope_guard_mode?: string; stack_cap?: number }
-        | null;
+      const doc = parse(readFileSync(routingFile, 'utf8')) as { scope_guard_mode?: string } | null;
       if (doc && typeof doc === 'object') {
         if (doc.scope_guard_mode === 'same-files' || doc.scope_guard_mode === 'conflict-hunks')
           routing.scopeGuardMode = doc.scope_guard_mode;
-        if (typeof doc.stack_cap === 'number' && Number.isInteger(doc.stack_cap) && doc.stack_cap >= 1)
-          routing.stackCap = doc.stack_cap;
       }
     } catch (err) {
       warnings.push(`${routingFile}: parse error, using defaults: ${(err as Error).message}`);

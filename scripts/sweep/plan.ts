@@ -8,15 +8,16 @@
  * breadth-wise over the inventory DAG (a branch only after ALL its inventory
  * parents), which scope.ts already produces as a topological order (and throws
  * on a cycle). Per (branch, parent) we build the eligible line (interval.ts) and
- * run the linear merge-point sweep (interval.ts), then classify the verdict and,
- * for own conflicts, run the DEFERRED check (deferred.ts).
+ * run the pending walk (interval.ts), then classify the verdict and, for own
+ * conflicts, run the DEFERRED check (deferred.ts).
  */
-import { DEFAULT_STACK_CAP, EXCLUDED_BRANCH_GLOBS } from './config.js';
+import { EXCLUDED_BRANCH_GLOBS } from './config.js';
 import { checkDeferred, type BlockedParent } from './deferred.js';
 import { globMatchAny } from './globs.js';
-import { buildEligibleLine, mergePointSweep } from './interval.js';
+import { buildEligibleLine, pendingWalk } from './interval.js';
 import { deriveCoverage, enumerateChain, mintHead, type Chain } from './heights.js';
 import { git, newStyleMergeTree, revParse } from './git.js';
+import { computeSurface } from './surface.js';
 import { resolveScope, type ScopeResult } from './scope.js';
 import { tierFloor } from './tiers.js';
 import type { BranchPlan, FeatureEntry, HeldRecord, ParentPlan, PropagationPlan, SweepScope } from './types.js';
@@ -192,8 +193,6 @@ export interface DerivePlanOptions {
    * every parent is NONE (the "re-merge fresh" view — `run` commits the clear).
    */
   mergeStatusOf?: Map<string, 'PR_ID' | 'DEFERRED'>;
-  /** Global case-stacking cap (routing.yaml `stack_cap`; DRIVER.md §4.4); per-feature `stack_cap` overrides. */
-  stackCap?: number;
 }
 
 async function analyzeParent(
@@ -207,7 +206,6 @@ async function analyzeParent(
   chain: Chain,
   cut: BranchCut | null,
   blockedParents: BlockedParent[],
-  stackCap: number,
 ): Promise<ParentPlan> {
   // THE CUT CLOSES THE WINDOW (§5.2), AND IT IS A CUT ON CONTENT.
   //
@@ -237,23 +235,36 @@ async function analyzeParent(
   });
   // Probe from the pinned branch TIP sha, not the ref name: deterministic
   // (§3 probe determinism) and valid for remote-only branches (§13).
-  const sweep = await mergePointSweep(repo, branchTip, line, stackCap);
+  //
+  // THE SURFACE IS ANCHORED ONCE PER EDGE (surface.ts): the parent tip for a
+  // parents line, the watermark for an entry line — the commit whose content
+  // the walk absorbs. Anchoring per step would let the walk's own
+  // auto-resolutions leak paths into the surface.
+  const anchor = model === 'entry' ? chain.watermark : await revParse(repo, parentRef);
+  const surface =
+    line.heads.length > 0 ? await computeSurface(repo, anchor, branchTip) : { paths: new Set<string>() };
+  const walk = await pendingWalk(repo, branchTip, line, surface, anchor);
 
-  // MINT A HEIGHT ONLY WHERE THE COMMIT IS LOAD-BEARING. The sweep answers in
-  // shas — the walk needs no projection onto the trunk and buys nothing by
-  // computing one per candidate. What DOES need a height is the merge head this
-  // row records and the case head the DEFERRED check, the case id and the step
-  // row all read; those are two commits per parent row, and a chain commit's
+  // MINT A HEIGHT ONLY WHERE THE COMMIT IS LOAD-BEARING. The walk answers in
+  // shas — it needs no projection onto the trunk and buys nothing by computing
+  // one per candidate. What DOES need a height is the merge head this row
+  // records and the case head the DEFERRED check, the case id and the step row
+  // all read; those are two commits per parent row, and a chain commit's
   // height is its index, so the entry model pays nothing.
+  const topStep = walk.steps.length > 0 ? walk.steps[walk.steps.length - 1] : null;
   const pp: ParentPlan = {
     parent,
     model,
-    mergePoint: sweep.mergePoint === null ? null : await mintHead(repo, chain, sweep.mergePoint),
+    mergePoint: topStep === null ? null : await mintHead(repo, chain, topStep.sha),
     verdict: 'up-to-date',
     case: null,
     deferredTo: null,
     skipReason: null,
   };
+  if (topStep !== null) {
+    pp.prefix = walk.steps.map((st) => ({ sha: st.sha, autoResolved: st.autoResolved }));
+    pp.landTree = walk.landTree!;
+  }
 
   // TRIMMED CONTENT IS DEFERRED, NOT ABSENT. The branch takes nothing at or
   // above the block, but content IS waiting for it — say so, or a branch held
@@ -264,31 +275,33 @@ async function analyzeParent(
     pp.deferHeight = line.trimmedAt;
   }
 
-  if (sweep.upToDate) {
+  if (walk.upToDate) {
     if (pp.deferredTo) pp.verdict = 'defer';
     return pp;
   }
 
   let realMerge = false;
-  // The merge point's own shape is held in a LOCAL, not in the reason slot: the
-  // slot carries the PARENT-LEVEL answer, and at this point the parent's answer
-  // is still open. A no-op merge point below a conflict makes the parent a
+  // The landed prefix's own shape is held in a LOCAL, not in the reason slot:
+  // the slot carries the PARENT-LEVEL answer, and at this point the parent's
+  // answer is still open. A no-op prefix below a conflict makes the parent a
   // `case` (or a `defer`), and writing 'no-op' here would spend the slot on the
-  // merge point and hide that.
+  // prefix and hide that.
   let mergeNoOp = false;
-  if (sweep.mergePoint) {
-    const probe = sweep.probes.find((p) => p.sha === sweep.mergePoint);
-    if (probe && probe.clean && probe.treeOid === branchTree) {
+  if (walk.landTree !== null) {
+    if (walk.landTree === branchTree) {
+      // The line's content is already in the branch tree (a squash, an
+      // equivalent edit): nothing to land, the parent no-op'd.
       mergeNoOp = true;
+      pp.mergePoint = null;
+      delete pp.prefix;
+      delete pp.landTree;
     } else {
       realMerge = true;
     }
   }
 
-  if (sweep.firstConflict) {
-    const fc = sweep.firstConflict;
-    const run = await Promise.all(fc.run.map((sha) => mintHead(repo, chain, sha)));
-    const head = run[run.length - 1];
+  if (walk.conflict) {
+    const head = await mintHead(repo, chain, walk.conflict.head);
     // DEFERRED = pure height-MIN over X's blocked DIRECT parents: defer
     // iff any direct parent is blocked and this conflict is at/above the lowest
     // blocked parent's height. No path/window/ancestor-set test.
@@ -299,10 +312,9 @@ async function analyzeParent(
     } else {
       pp.case = {
         head,
-        run,
-        conflictedPaths: fc.conflictedPaths,
-        automergeTree: fc.automergeTree,
-        reproduction: fc.reproduction,
+        conflictedPaths: walk.conflict.conflictedPaths,
+        automergeTree: walk.conflict.automergeTree,
+        reproduction: walk.conflict.reproduction,
       };
     }
   }
@@ -339,8 +351,6 @@ export interface DeriveBranchArgs {
   /** Block-height of each currently-blocked branch (merge_status != NONE), for the
    * height-MIN DEFER over this branch's blocked DIRECT parents. */
   blockHeightOf?: Map<string, number>;
-  /** Effective case-stacking cap (DRIVER.md §4.4 lever); DEFAULT_STACK_CAP when omitted. */
-  stackCap?: number;
   /**
    * This branch's own merge_status when blocked (omitted = NONE):
    *  - `{state:'PR_ID'}`: blocked on its own PR — empty interval, skip rows.
@@ -392,7 +402,6 @@ export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> 
     .map((p) => ({ branch: p, height: blockHeightOf.get(p)! }));
   const refOf = args.refOf ?? ((b: string) => b);
   const materialize = args.materialize === true;
-  const stackCap = args.stackCap ?? DEFAULT_STACK_CAP;
   // merge_status PR_ID: blocked on its own PR — no merges this pass
   // (barrier satisfied by an empty interval).
   if (mergeBlocked?.state === 'PR_ID') {
@@ -412,7 +421,6 @@ export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> 
       isLeaf,
       alwaysMerge,
       ancestors,
-      stackCap,
       parents: parentPlans,
       ...(materialize ? { materialize: true } : {}),
     };
@@ -434,7 +442,6 @@ export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> 
         chain,
         cut,
         blockedParents,
-        stackCap,
       ),
     );
   }
@@ -454,6 +461,8 @@ export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> 
       if (pp.verdict === 'merge' || pp.verdict === 'case') {
         pp.verdict = pp.deferredTo ? 'defer' : 'skip';
         pp.mergePoint = null; // the suppressed clean prefix does NOT land while sticky
+        delete pp.prefix;
+        delete pp.landTree;
         if (!pp.deferredTo) pp.skipReason = 'deferred';
       }
     }
@@ -465,7 +474,6 @@ export async function deriveBranch(args: DeriveBranchArgs): Promise<BranchPlan> 
     isLeaf,
     alwaysMerge,
     ancestors,
-    stackCap,
     parents: parentPlans,
     ...(materialize ? { materialize: true } : {}),
   };
@@ -589,8 +597,6 @@ export async function derivePlan(opts: DerivePlanOptions): Promise<PropagationPl
       alwaysMerge: feat?.always_merge === true,
       cut,
       blockHeightOf,
-      // DRIVER.md §4.4 lever: per-feature `stack_cap` beats the routing.yaml global.
-      stackCap: feat?.stack_cap ?? opts.stackCap ?? DEFAULT_STACK_CAP,
       mergeBlocked,
       materialize: entry.materialize === true,
       refOf,

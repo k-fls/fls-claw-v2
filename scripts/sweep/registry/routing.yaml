@@ -4,11 +4,6 @@
 
 schemaVersion: 1
 
-# Case stacking (DRIVER.md §4.4): a case is the maximal run of consecutive
-# path-intersecting conflicting heights, capped here. Per-feature override:
-# `stack_cap:` on the inventory entry (mirrors the scope-guard lever).
-stack_cap: 5
-
 # Global scope-guard mode (DRIVER.md §7.4 lever): `same-files` (the default
 # when this key is absent) or `conflict-hunks` (strict). Per-feature override:
 # `scope_guard:` on the inventory entry.
