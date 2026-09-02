@@ -87,10 +87,10 @@ A **pass** is one driver run over the whole in-scope DAG.
   because content reaches them only through parents.
 - **A height is a projection onto the trunk, not an identity.** Several
   parents-model heads can share one: a parent's fork-side commits advance no
-  upstream coverage, so a whole run of them projects to the same index. Anything
-  that has to tell such heads apart — the order of the merge-point sweep, a case
-  id, a fix ref name — carries the head's sha as well, and the sweep walks its
-  line by POSITION rather than by height.
+  upstream coverage, so many of them project to the same index. Anything
+  that has to tell such heads apart — the order of the walk, a case id, a fix
+  ref name — carries the head's sha as well, and the walk orders its line by
+  POSITION rather than by height.
 - **Coverage** (derived): a branch's covered height is the highest chain index
   whose commit is an ancestor of the branch tip. Ancestry along a first-parent
   chain is monotonic, so this is a binary search with
@@ -190,7 +190,7 @@ Required fields: `id`, `name`, `kind` (`module` | `feat` | `edition` | `fix` |
 `planned`). `branch` is optional: present means the entry is swept, absent means
 planned. Legal optional fields: `parents`, `dependents`, `summary`,
 `owned_paths`, `key_symbols`, `design_docs`, `test_anchors`, `scope_guard`
-(`same-files` | `conflict-hunks`), `stack_cap` (integer ≥ 1), `tier_floor`
+(`same-files` | `conflict-hunks`), `tier_floor`
 (`judged` only), `always_merge` (boolean) and `routing` (`keywords` /
 `always_check_on` string lists). Any other key is an entry error: the inventory
 carries no prose addressed to the agent and no record of a decision.
@@ -419,23 +419,23 @@ For entry-point branches (`main_patched`, edition-composition branches merging
 `main`) the eligible line is the trunk first-parent chain up to the watermark;
 heads are trunk commits.
 
-For parents-model branches it is the **parent branch's own first-parent
-history**: candidate heads are the parent's first-parent commits the branch has
-not yet absorbed — `git rev-list --first-parent --reverse <parentTip>
-^<branchTip>` — each carrying a derivable covered height. Absorption is decided
-by ancestry, and the walk stops at the branch tip, so the line is exactly the
-unabsorbed window. If the parent advanced in one big merge, intermediate heights
-simply do not exist; the commits that do exist are all offered.
+For parents-model branches it is the parent's **whole pending DAG**: every
+commit reachable from the parent tip and not from the branch tip — `git
+rev-list --topo-order --reverse <parentTip> ^<branchTip>` — merges included,
+in topological order. A parent that advanced by one big propagation merge
+still has every commit that merge dragged in offered individually, so the walk
+can stop at the finest cut that exists instead of taking the whole merge or
+nothing. Merges stay candidates in their own right: an author's recorded
+integration tree can exist in no non-merge commit, and only taking the merge
+itself can land it.
 
-**Every unabsorbed commit is a candidate**, not one per height. A parent's
-fork-side commits advance no upstream coverage, so a run of them derives one
-height; keeping only the newest of each height collapses that run to the parent's
-tip, and a one-head line has no clean prefix to merge and no older head to sweep.
-The branch then takes nothing it could have taken, the case names the parent's
-tip, and the fix ref carries the parent's whole tip for review. This is also what
-carries fork-only parent content down: a parent whose only new work is fork-side
-has that work enumerated as ordinary heads, so a fork fix merged into a parent
-reaches descendants without waiting for upstream to advance.
+**Every unabsorbed commit is a candidate**, not one per height. Absorption is
+decided by ancestry (`^branchTip` bounds the window exactly), heights repeat
+across fork-side commits and are minted only where a commit is load-bearing.
+This is also what carries fork-only parent content down: a parent whose only
+new work is fork-side has that work enumerated as ordinary candidates, so a
+fork fix merged into a parent reaches descendants without waiting for upstream
+to advance.
 
 **The cut applies by CONTAINMENT** (§5.2): a candidate is withheld exactly when
 it contains the trunk commit at the cut — the cut commit itself and a blocked
@@ -444,34 +444,61 @@ is inherited, so the withheld set is closed under descent and the eligible set i
 ancestor-closed: skipping a withheld candidate IS trimming, and nothing above it
 can slip through.
 
-### 4.3 Merge-point selection — linear sweep, never bisect
+### 4.3 The walk — an advancing tip, a surface filter, a one-commit stop
 
-"Merging up to height k conflicts" is NOT monotonic in k: a later upstream commit
-can rewrite a disputed region so the tip-level three-way merge is clean again. So
-merge-point selection is a linear sweep, never a stop-point bisection, which
-would embed the monotonicity assumption.
+"Merging up to height k conflicts" is NOT monotonic in k, and merge-point
+selection never bisects. Per branch and per parent, the eligible line is walked
+oldest → newest by a HYPOTHETICAL TIP THAT ADVANCES ON EVERY STEP, clean ones
+included: each candidate is probed with `merge-tree(hypotheticalTip, C)`, and a
+clean or auto-resolved step advances the tip with a ref-less merge commit
+(commit-tree — real ancestry, no ref moves). Probing candidates against the
+unmoved branch tip instead reports conflicts the executed sequence never meets,
+even on a linear chain — each later probe would merge a candidate against a tip
+missing what the walk already took.
 
-Per branch and per parent, over the parent's eligible line:
+**The SURFACE filters what is a question.** Per edge, `S` = the paths where the
+branch differs from the merge base it shares with the source, computed WITH
+RENAME DETECTION on the branch side and CLOSED under source-side renames
+between the merge base and the source tip (`surface.ts`) — the merge machinery
+is rename-aware, and a surface that does not follow a source rename reads a
+conflict on fork content as out-of-surface and silently deletes it. The anchor
+is fixed once per edge (the parent tip; the watermark for an entry line), so
+the walk's own auto-resolutions cannot leak paths into the surface.
 
-1. Probe the full range first — one in-memory `merge-tree` against the parent's
-   eligible tip. Clean → done (the common case, one probe total).
-2. On conflict, sweep the eligible line linearly (one probe per candidate head,
-   oldest → newest), recording clean/conflicted per head.
-3. Merge at the LARGEST clean head — the last clean probe in line order, which
-   may lie beyond intermediate conflicting heads whose content then lands
-   cleanly at tip level.
-4. Report the case starting at the first conflicting head above the merge point,
-   stacked per §4.4.
+A conflicted step resolves what is nobody's question and stops on what is:
 
-The sweep orders by POSITION in the line, never by height. Coverage is
-non-decreasing along a first-parent line, so position subsumes height and is
-exact where consecutive heads share one — which is the ordinary parents-model
-case. A height comparison there names an arbitrary member of the tied group as
-the merge point and then hides every conflicting head at that height from step 4,
-returning no case at all while the branch stops dead below the cut.
+- OUT-OF-SURFACE members auto-resolve to the INCOMING side (`tree(C)`'s blob,
+  or its absence): the branch has nothing of its own there, so the collision is
+  between two states the source's author already integrated — at a merge
+  commit those blobs ARE the author's own integration.
+- IN-SURFACE members auto-resolve BY EQUIVALENCE, where both endpoints already
+  hold the same answer: the branch tip and the source anchor agree on the path
+  (the author ended where the branch already is — an intermediate commit's
+  disagreement is history noise), or, at a MERGE commit, the branch already
+  carries the author's DECISION — the path is among those where the merge's
+  recorded tree differs from the automerge of its own parents, and the
+  branch's blob equals the author's. Either way the resolution is content the
+  branch already has or the author recorded — never new content, so a cut
+  above the line cannot leak through it.
+- Anything left is the owner's question: the walk STOPS. The case is that ONE
+  candidate (§4.4), the landed prefix is everything below it, and nothing
+  above it is probed.
 
-Probes are checkout-free and cost milliseconds; upstream deltas are tens of
-commits, so linear cost is negligible and correctness beats O(log n).
+**The FINAL RECONCILIATION**: when the walk absorbs the source anchor itself,
+out-of-surface paths that still differ from the anchor take the anchor's blobs
+— mid-walk auto-resolutions can leave residue, and the source's author already
+integrated those paths, so the endpoint agrees with them.
+
+The walk orders by POSITION in the line, never by height: coverage repeats
+across fork-side candidates, and only position can say which of two same-height
+candidates lands and which stops the walk.
+
+Landing is ONE merge commit per parent segment: the walk's landed tree
+(reconciliation included), parented on the branch tip and the prefix's MAXIMAL
+candidates (`merge-base --independent`) — every landed candidate becomes an
+ancestor of the new tip, and the commit records exactly the tree the sequence
+of probes verified. Probes are checkout-free and cost milliseconds; the
+advance's commit-tree writes are ref-less objects.
 
 **Detection invariant.** Conflict detection is per-branch NEW-STYLE
 `git merge-tree --write-tree` (full ort, virtual multi-base). NEVER
@@ -487,50 +514,44 @@ pinned SHAs, never ref names, and forces `-c merge.conflictStyle=merge`, so
 recorded automerge trees are reproducible across clones and user configs and the
 resolve-time drift halt fires only on genuine movement.
 
-**Execution re-probe.** Plan-time probes are computed against the branch tip at
-derivation time, but a branch's parents are merged SEQUENTIALLY: once parent #1's
-merge advances the tip, parent #2's clean verdict is stale. Every non-forced merge
-is therefore re-probed against the branch's CURRENT tip immediately before
-execution, and on staleness that parent row is re-derived live — conflicted → an
-ordinary case at that point (conflict set and automerge tree recomputed from the
-current tip; the branch's remaining parent merges halt for this run and continue
-through the reopen machinery once the case resolves, siblings unaffected);
-tree-equal → a journaled no-op skip. Forced (empty) merges are exempt: they exist
+**Execution re-derivation.** Plan-time walks are computed against the branch
+tip at derivation time, but a branch's parents are merged SEQUENTIALLY: once
+parent #1's merge advances the tip, every later verdict is a statement about a
+tree that no longer exists. The walk is a function of the tip, so a moved tip
+re-derives the WHOLE parent row live — the fresh verdict dispatches (a merge
+lands its fresh prefix; a case is emitted at the fresh stop; the branch's
+remaining parent merges halt on a case and continue through the reopen
+machinery once it resolves, siblings unaffected), and a merge that stops being
+one is journaled as a demotion. Forced (empty) merges are exempt: they exist
 only when every parent no-op'd, so the tip cannot have moved. A failure in the
 merge plumbing halts THAT BRANCH, journaled (`ERR21_MERGE_FAILED`), never the
 process.
 
-### 4.4 The case unit — commit stacking
+### 4.4 The case unit — one commit
 
-A case is the MAXIMAL RUN of consecutive conflicting HEADS whose conflicted path
-sets intersect — one logical decision — capped by `stack_cap` (default 5; global
-lever in `registry/routing.yaml`, per-entry override on the inventory entry). The
-run breaks at a clean head, at a disjoint-path conflict (its own case later), and
-at the cap. Never stack disjoint-path conflicts; never stack across a clean head.
+A case is EXACTLY ONE COMMIT: the walk's stop — the first candidate whose
+in-surface conflict the driver cannot resolve itself (§4.3). Its
+`conflictedPaths` are the unresolved in-surface members alone, and its
+`automergeTree` is the EXHIBIT: the automerge with every auto-resolvable member
+already resolved, so conflict markers exist only at the case's own paths. The
+DEFERRED height check and urge tracking are computed against the stop.
 
-The case's `head` is the run's TOP commit, and `conflictedPaths` / `automergeTree`
-are computed at the top, so resolving the case resolves the whole run under ONE
-cold read. This applies to all conflict tiers: MECHANICAL/JUDGED resolve the run
-as one case; a HELD PR's head is the run's top commit, so its diff is the whole
-run. The DEFERRED height check and urge tracking are computed against the run's
-top.
-
-**The run top is also the ceiling of what leaves the pass.** Content above it was
+**The stop is also the ceiling of what leaves the pass.** Content above it was
 never probed in combination with anything the branch is taking, so it stays out
 of the branch, out of the case and out of the fix ref: the owner is asked to
-review what the pass verified and nothing else. The remainder is offered again
+review one commit's question and nothing else. The remainder is offered again
 after the case resolves — the resolution reopens the branch, and the
-re-derivation serves the rest of the window as its own case, in the same pass.
+re-derivation walks on to the next stop, in the same pass.
 
 ### 4.5 No-op skips and the leaf must-merge rule
 
-- A parent merge whose merge-tree result tree equals the branch's current tree is
+- A parent whose walked line lands a tree equal to the branch's current tree is
   a no-op: journaled `skip`, no merge commit. Merge-base consequences are benign
   — the next real merge covers the gap.
-- A skip row names the PARENT'S answer, never the merge point's shape. A window
-  is a run of commits, so a no-op merge point and a conflict above it is the
-  ordinary shape of a parent: that parent's answer is `conflict-pending` (or
-  `deferred`), and the branch is BLOCKED, not idle. `no-op` names a parent that
+- A skip row names the PARENT'S answer, never the prefix's shape. A window is
+  many commits, so a no-op prefix and a conflict above it is an ordinary shape
+  of a parent: that parent's answer is `conflict-pending` (or `deferred`), and
+  the branch is BLOCKED, not idle. `no-op` names a parent that
   has nothing left to give, `up-to-date` one that never had anything — the two
   reasons the un-skip pass acts on.
 - Leaves and entries flagged `always_merge: true` must land at least one real
@@ -545,11 +566,14 @@ re-derivation serves the rest of the window as its own case, in the same pass.
 
 `step-<branch>.json` is the per-branch contract the merge executor accepts. The
 executor re-verifies from first principles and never trusts the file's author:
-the parent is an inventory parent (or `main` for entry-point branches); the head
-sha matches the claimed height and lies on the parent's eligible line; the height
-is ≤ the watermark; all parents arrived this pass (journal); skip claims are
-recomputed via merge-tree; the leaf rule is honored. A verification failure is a
-hard halt, journaled.
+the parent is an inventory parent (or `main` for entry-point branches); every
+prefix commit is legal (entry: a trunk chain commit, in ascending order;
+parents: pending — reachable from the parent tip and not from the branch tip);
+the head is the prefix's top and its sha matches the claimed height, ≤ the
+watermark; the prefix REPLAYS through the walk engine to exactly the claimed
+tree, with exactly the claimed auto-resolutions; all parents arrived this pass
+(journal); skip claims are recomputed via merge-tree; the leaf rule is honored.
+A verification failure is a hard halt, journaled.
 
 The leaf rule reads skip reasons alone, so the reason vocabulary is CLOSED and
 the file's AUTHOR keeps it that way. An all-skip step for a leaf or an
@@ -711,7 +735,7 @@ covered it.
 
 DEFERRED is a PURE HEIGHT-MIN over the branch's BLOCKED DIRECT PARENTS
 (`deferred.ts`). When branch X hits its own conflict at height `conflictHeight`
-(the run TOP, §4.4):
+(the walk's stop, §4.4):
 
     defer  ⇔  blockedParents ≠ ∅  ∧  conflictHeight ≥ MIN(blockedParents.height)
 
@@ -2535,10 +2559,10 @@ up-to-date, verify re-gates, and pushes and PR-creates never redo.
 PR heads are REAL commits pushed by the driver, never synthetic constructions and
 never API ref fabrication:
 
-- **HELD** — the fix/sweep ref is pushed at the case run's TOP commit verbatim
+- **HELD** — the fix/sweep ref is pushed at the case's stop commit verbatim
   (§4.4). Held PRs are created AFTER the pass's target pushes, so the origin base
-  already carries the clean prefix and the diff is the run's real changes only, with
-  no pending-range bloat. A pristine-conflict draft head is ONE commit — the
+  already carries the clean prefix and the diff is the stop's real changes only,
+  with no pending-range bloat. A pristine-conflict draft head is ONE commit — the
   automerge tree parented on the branch tip and the conflict head — because the
   driver-shape walk (§5.6) needs `parents[0]` to BE the base tip to tell whether
   anyone else has pushed to the ref. The PR's diff against its base is that tree
@@ -2575,8 +2599,8 @@ Each part of a conflict id answers a collision that would be fatal rather than
 cosmetic, because a second case wearing the first's id inherits its `resolved`
 disposition, drops out of the open-case set and can never be served. The parent
 slug: two parents of one branch conflicting at the same height are distinct
-cases. The head sha8: one height covers a whole run of a parent's commits, so
-resolving the first run and re-deriving the remainder produces a second case at
+cases. The head sha8: one height covers many of a parent's commits, so
+resolving the first stop and walking on to the next produces a second case at
 the same branch, parent and height.
 
 If a publish crashed between creating the PR and journaling it, an open PR found
@@ -2775,7 +2799,8 @@ the vitest scripts glob.
 | `sweep-machine.ts` | the six-command agent-facing CLI |
 | `propagate.ts` | the six commands' implementations + the internal plan/run/publish/push/verify/report stages, journal, worktree and PR-materials preparation, pass pushes, the case gate |
 | `heights.ts` | watermark pinning, chain enumeration, height↔sha, coverage derivation (§2.2) |
-| `interval.ts` | eligible-line construction (§4.2) + the linear merge-point sweep and case stacking (§4.3, §4.4) |
+| `interval.ts` | eligible-line construction (§4.2) + the pending walk and its step engine (§4.3, §4.4) |
+| `surface.ts` | the per-edge surface: rename-closed branch-own paths (§4.3) |
 | `plan.ts` | DAG validation, breadth-wise plan derivation, no-op/skip + leaf un-skip logic (§4.1, §4.5) |
 | `tiers.ts` | tier types, floors, the legal demotions (§8.1) |
 | `deferred.ts` | the DEFERRED height-MIN rule (§5.2) |
@@ -2823,8 +2848,8 @@ Committed with the code:
 
 - `scripts/sweep/inventory/<id>.yaml` and the bootstrap snapshot under
   `scripts/sweep/bootstrap/` — the inventory (§3.1);
-- `scripts/sweep/registry/routing.yaml` — the two global driver levers
-  (`scope_guard_mode`, `stack_cap`);
+- `scripts/sweep/registry/routing.yaml` — the global driver lever
+  (`scope_guard_mode`);
 - `scripts/sweep/registry/scope.yaml` — scope policy: `exclude` and
   `extra_edges`;
 - `scripts/sweep/registry/schema/feature-entry.schema.json` and
