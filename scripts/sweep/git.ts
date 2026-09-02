@@ -9,7 +9,7 @@
 import { execFile } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileP = promisify(execFile);
@@ -435,4 +435,100 @@ export async function addTempWorktree(
 export async function gitCommonDir(repo: string): Promise<string> {
   const res = await git(repo, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
   return res.stdout.trim();
+}
+
+/**
+ * The PENDING SET of `tip` over `not`, oldest-first: every commit reachable
+ * from `tip` and not from `not`, across the WHOLE DAG — merges included, both
+ * parents followed. This is the parents-model candidate enumeration (DRIVER.md
+ * §4.2): a parent that advanced by one big propagation merge still has every
+ * commit that merge dragged in listed individually, so the walk can land the
+ * finest prefix that exists instead of the whole merge or nothing.
+ *
+ * `--topo-order` is REQUIRED here, not defensive: the traversal follows second
+ * parents, so date order can put a rebased commit ahead of commits it depends
+ * on (see `firstParentChain`). A merge always lists AFTER both of its parents.
+ */
+export async function pendingCommits(repo: string, tip: string, not: string): Promise<string[]> {
+  const res = await git(repo, ['rev-list', '--topo-order', '--reverse', tip, `^${not}`]);
+  return res.stdout.split('\n').filter(Boolean);
+}
+
+/**
+ * The commits in `shas` not reachable from any other member — the MAXIMAL
+ * elements (`merge-base --independent`). A landed walk segment records exactly
+ * these as merge parents: together with the branch tip they make every landed
+ * candidate an ancestor of the new tip, with no redundant parent edges.
+ */
+export async function independentCommits(repo: string, shas: string[]): Promise<string[]> {
+  if (shas.length <= 1) return [...shas];
+  const res = await git(repo, ['merge-base', '--independent', ...shas]);
+  return res.stdout.split('\n').filter(Boolean);
+}
+
+/** The merge base of two commits, or null when their histories are unrelated. */
+export async function mergeBase(repo: string, a: string, b: string): Promise<string | null> {
+  const res = await git(repo, ['merge-base', a, b], { allowCodes: [1, 128] });
+  return res.code === 0 ? res.stdout.trim() : null;
+}
+
+export interface RenameAwareChange {
+  status: string; // A / M / D / T / R<score> / C<score>
+  path: string;
+  /** Rename/copy source (R/C rows only). */
+  oldPath?: string;
+}
+
+/** Name-status diff WITH rename detection (R rows carry both names). */
+export async function diffNameStatusRenamed(repo: string, from: string, to: string): Promise<RenameAwareChange[]> {
+  const res = await git(repo, ['diff', '--name-status', '-M', from, to]);
+  return res.stdout
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => {
+      const [status, ...rest] = line.split('\t');
+      if (status.startsWith('R') || status.startsWith('C')) {
+        return { status, oldPath: rest[0], path: rest[1] };
+      }
+      return { status, path: rest[rest.length - 1] };
+    });
+}
+
+/**
+ * `baseTree` with `paths` spliced in from `fromTreeish` — each path takes the
+ * blob (and mode) `fromTreeish` carries, or is REMOVED when absent there.
+ * Built in a throwaway index; nothing touches the repo index or any worktree.
+ */
+export async function overlayTreePaths(
+  repo: string,
+  baseTree: string,
+  fromTreeish: string,
+  paths: readonly string[],
+): Promise<string> {
+  if (paths.length === 0) return (await git(repo, ['rev-parse', `${baseTree}^{tree}`])).stdout.trim();
+  const idxFile = join(mkdtempSync(join(tmpdir(), 'sweep-idx-')), 'index');
+  const env = { GIT_INDEX_FILE: idxFile };
+  try {
+    await git(repo, ['read-tree', baseTree], { env });
+    for (const p of paths) {
+      const ls = await git(repo, ['ls-tree', fromTreeish, '--', p], { allowCodes: [1, 128] });
+      const line = ls.code === 0 ? ls.stdout.trim() : '';
+      if (line) {
+        const [meta] = line.split('\t');
+        const [mode, , sha] = meta.split(/\s+/);
+        await git(repo, ['update-index', '--add', '--cacheinfo', `${mode},${sha},${p}`], { env });
+      } else {
+        await git(repo, ['update-index', '--force-remove', p], { env });
+      }
+    }
+    return (await git(repo, ['write-tree'], { env })).stdout.trim();
+  } finally {
+    rmSync(dirname(idxFile), { recursive: true, force: true });
+  }
+}
+
+/** Blob oid of `path` inside `treeish`, or null when absent. */
+export async function blobOidAt(repo: string, treeish: string, path: string): Promise<string | null> {
+  const res = await git(repo, ['rev-parse', '--verify', '--quiet', `${treeish}:${path}`], { allowCodes: [1, 128] });
+  return res.code === 0 ? res.stdout.trim() : null;
 }
