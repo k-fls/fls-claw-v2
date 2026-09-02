@@ -3096,6 +3096,81 @@ describe('derived merge_status — blocked view from origin rows + journal', () 
     expect(journal.some((e) => e.action === 'defer' && e.branch === 'feat/c')).toBe(true);
     expect(journal.some((e) => e.action === 'case' && e.branch === 'feat/c')).toBe(false);
   });
+
+  it("a this-pass hold cuts AT its recorded conflict head, whatever shape that commit has", async () => {
+    // C = A + B, and A is HELD this pass on a conflict head that is ITSELF a
+    // merge commit — the ordinary shape of a parent-branch tip that has taken
+    // an owner topic branch, and of better than half of upstream's own trunk
+    // commits. That head's second parent forks at the pinned base, so it has
+    // NO trunk coverage: measuring it instead of the head reads the block as
+    // unmeasurable-and-below-the-window, drops the row, and leaves C free to
+    // take the very content A is blocked on.
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    const base = repo.sha('main'); // pinned fork point
+    repo.checkout('mp/topic', { create: true, at: 'main' }); // forks AT the base: no trunk coverage
+    repo.commit('topic: own file', { 'src/topic.ts': 't\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.checkout('feat/a', { create: true, at: 'main_patched' });
+    repo.checkout('feat/b', { create: true, at: 'main_patched' });
+    repo.checkout('feat/c', { create: true, at: 'main_patched' });
+    repo.commit('c: x = cfork', { 'src/x.ts': 'cfork\n' });
+    repo.checkout('main');
+    const u0 = repo.commit('U0: util', { 'src/util.ts': 'u\n' }); // h0 — clean
+    const u1 = repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' }); // h1 — the disputed height
+    // main_patched carries the trunk to h1 and then merges the owner topic:
+    // its tip covers h1, its SECOND PARENT covers nothing.
+    repo.checkout('main_patched');
+    repo.git('merge', '--no-edit', '-m', 'mp takes U0', u0);
+    repo.git('merge', '--no-edit', '-m', 'mp takes U1', u1);
+    const conflictHead = repo.merge('mp/topic', 'mp merges the owner topic branch');
+    repo.checkout('feat/a');
+    repo.git('merge', '--no-edit', '-m', 'a merges U0', u0); // A stops at h0
+    repo.checkout('feat/b');
+    repo.git('merge', '--no-edit', '-m', 'b merges U0', u0);
+    repo.git('merge', '--no-edit', '-m', 'b merges U1', u1); // B carries x = up1 down to C
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+    // The premise, asserted rather than assumed.
+    const headInfo = await commitInfo(repo.dir, conflictHead);
+    expect(headInfo.parents.length).toBe(2);
+    expect(await isAncestor(repo.dir, u1, conflictHead)).toBe(true); // the head covers h1
+    expect(await isAncestor(repo.dir, u0, headInfo.parents[1])).toBe(false); // its 2nd parent covers nothing
+
+    const ws = mkWorkspace();
+    const inv = writeInventory([
+      { id: 'a', branch: 'feat/a', parents: ['main_patched'] },
+      { id: 'b', branch: 'feat/b', parents: ['main_patched'] },
+      { id: 'c', branch: 'feat/c', parents: ['feat/a', 'feat/b'] },
+    ]);
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, { base, ...o });
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const caseId = 'feat__a--main_patched-h1-abcdef12';
+    appendJournal(dir, {
+      action: 'case',
+      branch: 'feat/a',
+      parent: 'main_patched',
+      caseId,
+      head: { sha: conflictHead, height: 1 },
+      height: 1,
+      conflictedPaths: ['src/x.ts'],
+    });
+    appendJournal(dir, { action: 'held', branch: 'feat/a', caseId, height: 1, headSha: conflictHead });
+
+    await cmdPlan(cli({ cmd: 'plan' }));
+    expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
+
+    const journal = readJournal(dir);
+    // The cut is h1, so C defers behind its blocked DIRECT parent instead of
+    // opening its own case on content nobody has integrated.
+    const defer = journal.find((e) => e.action === 'defer' && e.branch === 'feat/c');
+    expect(defer).toBeTruthy();
+    expect(defer!.deferredTo).toBe('feat/a');
+    expect(journal.some((e) => e.action === 'case' && e.branch === 'feat/c')).toBe(false);
+    // Below the cut nothing is withheld: the clean prefix still lands.
+    expect(repo.git('show', 'feat/c:src/util.ts')).toBe('u');
+    expect(repo.git('show', 'feat/c:src/x.ts')).toBe('cfork');
+  });
 });
 
 // --- STAY rule over ALL direct parents (journal fixpoint view) ---------------

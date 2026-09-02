@@ -529,14 +529,21 @@ interface BlockedRow {
    */
   kind: 'merge' | 'fix';
   /**
-   * The commit whose TRUNK COVERAGE is the cut. For a merge proposal that is
-   * the head, from which the cut point is recovered (a driver-built PR head is
-   * `[branch tip, conflict head]`, and the conflict head is the cut; a
-   * this-pass hold carries the conflict head itself, which is already it).
-   * Null when nothing measurable was recorded — which cuts the whole range,
-   * since an unmeasurable block is a total one, not an absent one.
+   * The commit the cut is recovered from. Null when nothing measurable was
+   * recorded — which cuts the whole range, since an unmeasurable block is a
+   * total one, not an absent one.
    */
   headSha: string | null;
+  /**
+   * WHAT `headSha` NAMES, which is the only thing that says where the cut is
+   * measured. The commit's own SHAPE cannot say it: a conflict head is a commit
+   * off another branch's line, and such a commit is a merge as often as not.
+   *  - `proposal` — a driver-built PR head read off origin, `[branch tip,
+   *    conflict head]`. The cut is its SECOND PARENT, the conflict head.
+   *  - `conflict` — the conflict head itself, as a hold records it. The cut is
+   *    that commit.
+   */
+  headIs: 'proposal' | 'conflict';
   /**
    * The proposal PREDATES this pass (it was read off origin at `start`), so the
    * branch has been held back for as long as the owner has taken with it. That
@@ -585,6 +592,7 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
         caseId: typeof e.caseId === 'string' ? e.caseId : 'origin',
         kind: e.kind === 'fix' ? 'fix' : 'merge',
         headSha: typeof e.headSha === 'string' ? e.headSha : null,
+        headIs: 'proposal', // the origin ref head `start` classified
         carriedOver: true,
         fixBranch: typeof e.fixBranch === 'string' ? e.fixBranch : null,
         prNumber: typeof e.prNumber === 'number' ? e.prNumber : null,
@@ -600,6 +608,7 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
         // origin can show the driver that shape.
         kind: e.reason === 'gate' ? 'fix' : 'merge',
         headSha: jc?.head.sha ?? null,
+        headIs: 'conflict', // the case head: the commit the branch could not merge
         carriedOver: false,
         fixBranch: null, // no PR until `finish` publishes
         prNumber: null,
@@ -617,6 +626,7 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
         caseId: typeof e.caseId === 'string' ? e.caseId : 'env-blocked',
         kind: e.gateFix === true ? 'fix' : 'merge',
         headSha: jc?.head.sha ?? (typeof e.headSha === 'string' ? e.headSha : null),
+        headIs: 'conflict', // the case head, as the hold rows record it
         carriedOver: false,
         fixBranch: null, // there is no proposal: nothing was verified
         prNumber: null,
@@ -724,8 +734,11 @@ function passStatusView(cli: Cli, journal: JournalEntry[]): Map<string, 'PR_ID' 
  * the window closes — the head's OWN coverage is the max of the two sides, so
  * once the branch tip moves past the conflict (an owner commit, another
  * parent's merge) it reads high and hands descendants content nobody has
- * integrated. A row whose sha is already the cut commit (a this-pass hold
- * carries the conflict head itself) is its own second parent.
+ * integrated. A hold records the conflict head ITSELF, and that commit is
+ * already the cut: what the row says its sha is (`headIs`) decides which,
+ * never the commit's shape. A conflict head is routinely a merge in its own
+ * right — an upstream trunk commit landing a pull request, a parent tip that
+ * took a topic branch — and its second parent is a line this cut is not on.
  *
  * A FIX proposal is the BOTTOM of the lattice (`-Infinity`): the branch is red,
  * not red-above-height-k, so no prefix of it is proven clean and nothing from
@@ -748,8 +761,11 @@ async function prBlockedRecords(cli: Cli, journal: JournalEntry[], chain: Chain)
       if (row.kind === 'fix' || !row.headSha || !(await refExists(cli.repo, row.headSha))) {
         height = WHOLE_RANGE_BLOCK;
       } else {
-        const head = await commitInfo(cli.repo, row.headSha);
-        const cutSha = head.parents.length >= 2 ? head.parents[1] : row.headSha;
+        let cutSha = row.headSha;
+        if (row.headIs === 'proposal') {
+          const head = await commitInfo(cli.repo, row.headSha);
+          if (head.parents.length >= 2) cutSha = head.parents[1];
+        }
         height = (await deriveCoverage(cli.repo, chain, cutSha)).height;
         if (height < 0) continue; // the cut is below this pass's window
       }

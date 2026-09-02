@@ -657,6 +657,13 @@ the objects are in hand — and journals the kind:
   window closes. The head's OWN coverage is the maximum of the two sides, so
   once the branch tip moves past the conflict (an owner commit, another parent's
   merge) it reads high and would hand descendants content nobody integrated.
+  This reach into the second parent belongs to the PROPOSAL head and nothing
+  else. A hold journaled during a pass records the conflict head ITSELF, which
+  is already the cut; that commit is a merge in its own right whenever the line
+  it sits on has taken one — an upstream trunk commit landing a pull request, a
+  parent tip that took a topic branch — and its second parent is a line the cut
+  is not on. Every block row therefore says what its sha NAMES, and the cut is
+  read from that, never from the commit's shape.
 - A head with ONE PARENT proposes a FIX to the branch's own content, so the
   branch is RED. It FREEZES the branch and every transitive descendant: they
   take nothing from any parent, through the same empty-interval, all-skip path a
