@@ -4585,6 +4585,16 @@ export async function cmdRun(
         branches: drift,
         drift: driftRows,
       });
+      // THE HALT IS LOUD, NOT STICKY. `plan.json` takes the fresh derivation —
+      // the same value the clean path writes — so the halt names ONE movement
+      // and the next invocation measures against where git actually is. Leaving
+      // the pre-movement snapshot in place would re-halt on the same drift
+      // forever, and the only way out would be `propagate plan`, which rewrites
+      // the snapshot with no journal record of the movement at all.
+      //
+      // JOURNAL FIRST: a crash between the two leaves the halt visible, which is
+      // the direction that fails safe.
+      writeJsonFile(planPath, plan);
       console.error(`HALT [ERR24_PLAN_DRIFT]: ${detail}`);
       emit(cli, { ok: false, issues: [{ id: 'ERR24_PLAN_DRIFT', detail }] });
       return 1;

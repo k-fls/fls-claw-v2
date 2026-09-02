@@ -3704,3 +3704,66 @@ describe('propagate run — a leaf whose conflict sits above a tree-identical me
     expect(step.merges.find((m) => m.parent === 'feat/p2')!.skipReason).toBe('up-to-date');
   });
 });
+
+describe('propagate run — the ERR24 plan-drift halt is loud, not sticky', () => {
+  /**
+   * Two independent entry-model branches and one upstream commit. `plan` writes
+   * the pass's plan.json; nothing has been processed yet, so a branch that moves
+   * before `run` reaches it is exactly the "git moved under us" case the guard
+   * exists to catch.
+   */
+  function driftFixture(): { repo: FixtureRepo; base: string; inv: string } {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    const base = repo.sha('main');
+    repo.checkout('feat/a', { create: true, at: 'main' });
+    repo.commit('a: own file', { 'src/a.ts': 'a\n' });
+    repo.checkout('feat/b', { create: true, at: 'main' });
+    repo.commit('b: own file', { 'src/b.ts': 'b\n' });
+    repo.checkout('main');
+    repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+    cleanups.push(() => repo.destroy());
+    return { repo, base, inv: writeInventory([{ id: 'a', branch: 'feat/a' }, { id: 'b', branch: 'feat/b' }]) };
+  }
+
+  it('halts once on the movement, then measures against where git actually is', async () => {
+    const { repo, base, inv } = driftFixture();
+    const ws = mkWorkspace();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const outFile = join(ws, 'run.json');
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, { base, internal: true, out: outFile, ...o });
+    expect(await cmdPlan(cli({ cmd: 'plan' }))).toBe(0);
+
+    // feat/b moves before the run reaches it, and the movement changes what it
+    // derives: its new commit conflicts with the upstream head it was going to
+    // merge, so `merge` becomes `case`.
+    repo.checkout('feat/b');
+    repo.commit('b: conflicts with U0', { 'src/util.ts': 'bfork\n' });
+    repo.checkout('main');
+
+    const before = readJournal(dir).length;
+    expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(1);
+    const added = readJournal(dir).slice(before);
+    const halt = added.find((e) => e.action === 'halt' && e.id === 'ERR24_PLAN_DRIFT')!;
+    expect(halt).toBeTruthy();
+    expect(halt.branches).toEqual(['feat/b']);
+    // The halt carries WHAT CHANGED, not just who.
+    const rows = halt.drift as Array<{ branch: string; before: string; after: string }>;
+    expect(rows[0].branch).toBe('feat/b');
+    expect(rows[0].before).not.toBe(rows[0].after);
+    const out = JSON.parse(readFileSync(outFile, 'utf8')) as { issues: Array<{ id: string; detail: string }> };
+    expect(out.issues.find((i) => i.id === 'ERR24_PLAN_DRIFT')!.detail).toContain('feat/b');
+    // NOTHING EXECUTES IN THE HALTING INVOCATION.
+    expect(added.some((e) => e.action === 'merge' || e.action === 'case')).toBe(false);
+    expect(added.some((e) => e.action === 'arrived')).toBe(false);
+
+    // The halt named ONE movement. With git unmoved since, the next call
+    // measures against where git actually is and proceeds.
+    const before2 = readJournal(dir).length;
+    expect(await cmdRun(cli({ cmd: 'run', execute: true }))).toBe(0);
+    const added2 = readJournal(dir).slice(before2);
+    expect(added2.some((e) => e.action === 'halt' && e.id === 'ERR24_PLAN_DRIFT')).toBe(false);
+    expect(added2.some((e) => e.action === 'arrived' && e.branch === 'feat/a')).toBe(true);
+    expect(added2.some((e) => e.action === 'merge' && e.branch === 'feat/a')).toBe(true);
+  });
+});
