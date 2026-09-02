@@ -118,7 +118,7 @@ import { malformedCutPointExceptionsIssue, resolveCutPointExceptions, staleWarni
 import { installRrCache } from './merge.js';
 import { appendObservation } from './observations.js';
 import { loadFeatures, loadRegistry } from './registry.js';
-import { resolveScope } from './scope.js';
+import { declaredEdges, resolveScope } from './scope.js';
 import { scopeGuard } from './scope-guard.js';
 import {
   advisoryTextIssues,
@@ -789,18 +789,14 @@ function passCutMap(plan: PropagationPlan, held: HeldRecord[]): Map<string, numb
 }
 
 /**
- * Direct-parent edges from the registry (features + scope extra_edges): the
- * DEFERRED stay-condition is a function of the DIRECT parents, never a stored
- * flag or a journaled defer pointer.
+ * The registry's declared direct-parent edges (`declaredEdges`): the DEFERRED
+ * stay-condition is a function of the DIRECT parents, never a stored flag or a
+ * journaled defer pointer. Same builder `buildScope` seeds from, so an edge
+ * declared through `dependents` reaches every ancestor map the pass reads.
  */
-function directParentEdges(cli: Cli): Map<string, string[]> {
+export function directParentEdges(cli: Cli): Map<string, string[]> {
   const registry = loadRegistry({ inventoryDir: cli.inventory, scopeFile: cli.scopeFile, routingFile: cli.routingFile });
-  const parentsOf = new Map<string, string[]>();
-  for (const f of registry.features) if (f.branch && f.parents?.length) parentsOf.set(f.branch, [...f.parents]);
-  for (const [child, ps] of Object.entries(registry.scope.extra_edges ?? {})) {
-    parentsOf.set(child, [...(parentsOf.get(child) ?? []), ...ps]);
-  }
-  return parentsOf;
+  return new Map(Object.entries(declaredEdges(registry.features, registry.scope)));
 }
 
 /** A pending urge for a still-PR_ID-blocked branch (§8; posted by `push`, §14.4). */

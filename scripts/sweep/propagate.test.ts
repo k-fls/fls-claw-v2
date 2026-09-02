@@ -38,6 +38,7 @@ import {
   cmdSweepStart,
   cmdVerify,
   coldReadWithRetry,
+  directParentEdges,
   conflictHunks,
   openCases,
   owedRedTrees,
@@ -75,6 +76,7 @@ function writeInventory(
     branch?: string;
     kind?: string;
     parents?: string[];
+    dependents?: string[];
     scope_guard?: string;
     summary?: string;
     owned_paths?: string[];
@@ -91,6 +93,7 @@ function writeInventory(
       ...(e.summary ? [`summary: ${JSON.stringify(e.summary)}`] : []),
       ...(e.scope_guard ? [`scope_guard: ${e.scope_guard}`] : []),
       ...(e.parents ? ['parents:', ...e.parents.map((p) => `  - ${p}`)] : []),
+      ...(e.dependents ? ['dependents:', ...e.dependents.map((d) => `  - ${d}`)] : []),
       ...(e.owned_paths ? ['owned_paths:', ...e.owned_paths.map((p) => `  - ${JSON.stringify(p)}`)] : []),
     ].join('\n');
     writeFileSync(join(dir, `${e.id}.yaml`), yaml + '\n');
@@ -626,6 +629,57 @@ describe('run — resume idempotence + window trimming (reached via next-case)',
       expect(journal.some((e) => e.action === 'merge' && e.branch === b)).toBe(false);
       expect(journal.some((e) => e.action === 'pre-ref' && e.branch === b)).toBe(false);
     }
+  });
+
+  /**
+   * `dependents` declares the SAME edge as `parents`, from the other end. An
+   * ancestor map that reads only `parents` is narrower than the DAG the pass
+   * plans against, and the branch below a red one is then handed work it cannot
+   * complete.
+   */
+  it('a freeze reaches a descendant declared through the ancestor’s `dependents`', async () => {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    const base = repo.sha('main');
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.checkout('feat/c', { create: true, at: 'main_patched' });
+    repo.checkout('feat/d', { create: true, at: 'feat/c' });
+    repo.checkout('main');
+    repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+    repo.checkout('main_patched');
+    repo.git('merge', '--no-edit', '-m', 'main_patched merges U0', 'main');
+    repo.checkout('gate-fix', { create: true, at: 'feat/c' });
+    repo.commit('fix the failing check', { 'src/util.ts': 'fixed\n' });
+    const fixHead = repo.sha('gate-fix');
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+
+    const ws = mkWorkspace();
+    // feat/d declares NOTHING; feat/c names it as a dependent.
+    const inv = writeInventory([
+      { id: 'c', branch: 'feat/c', parents: ['main_patched'], dependents: ['feat/d'] },
+      { id: 'd', branch: 'feat/d' },
+    ]);
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, { base, ...o });
+    expect(directParentEdges(cli({ cmd: 'run' })).get('feat/d')).toEqual(['feat/c']);
+
+    expect(await cmdSweepStart(cli({ cmd: 'sweep-start' }))).toBe(0);
+    appendJournal(dir, {
+      action: 'origin-blocked',
+      branch: 'feat/c',
+      caseId: 'origin:fix/sweep/feat/c--gate-fix-feat-c-deadbeef',
+      fixBranch: 'fix/sweep/feat/c--gate-fix-feat-c-deadbeef',
+      kind: 'fix',
+      headSha: fixHead,
+      prNumber: 21,
+    });
+    const dTip = repo.sha('feat/d');
+    expect(await cmdRun(cli({ cmd: 'run', execute: true, internal: true }))).toBe(0);
+    const journal = readJournal(dir);
+    expect(repo.sha('feat/d')).toBe(dTip);
+    expect(journal.some((e) => e.action === 'skip' && e.branch === 'feat/d' && e.reason === 'held')).toBe(true);
+    expect(journal.some((e) => e.action === 'merge' && e.branch === 'feat/d')).toBe(false);
   });
 });
 

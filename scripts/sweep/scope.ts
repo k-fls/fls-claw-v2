@@ -172,6 +172,45 @@ export async function editionCompositionBranches(
   return [...members].filter((b) => !/^edition\//.test(b) && b !== 'main_patched').sort();
 }
 
+/**
+ * THE DECLARED DAG, from the inventory alone: entry `parents`, entry
+ * `dependents` INVERTED, and `scope.extra_edges`, with the exclusion globs
+ * applied to both ends of every edge. Pure — no repo, no git.
+ *
+ * `dependents` is an edge declaration like `parents` is, written from the other
+ * end; a builder that reads only `parents` produces a DAG narrower than the one
+ * the sweep plans against, and every ancestor map built on it silently loses
+ * whole branches.
+ *
+ * DECLARATION GRAIN IS DELIBERATE. An edge through a branch the repo does not
+ * carry appears here but not in the plan, and that is safe for every consumer:
+ * an ancestor map is read to FREEZE, to EXCLUDE from a recipe and to EXCUSE
+ * drift, and each of those errs correctly when it covers more.
+ */
+export function declaredEdges(features: FeatureEntry[], scope: SweepScope): Record<string, string[]> {
+  const exclude = [...EXCLUDED_BRANCH_GLOBS, ...(scope.exclude ?? [])];
+  const excluded = (b: string) => globMatchAny(exclude, b);
+  const edges: Record<string, string[]> = {};
+  const addEdge = (child: string, parent: string) => {
+    const parents = (edges[child] ??= []);
+    if (!parents.includes(parent)) parents.push(parent);
+  };
+  const byBranch = new Map<string, FeatureEntry>();
+  for (const e of features) {
+    if (!e.branch) continue;
+    byBranch.set(e.branch, e);
+  }
+  for (const [branch, e] of byBranch) {
+    if (excluded(branch)) continue;
+    for (const p of e.parents ?? []) if (!excluded(p)) addEdge(branch, p);
+    for (const d of e.dependents ?? []) if (!excluded(d)) addEdge(d, branch);
+  }
+  for (const [child, parents] of Object.entries(scope.extra_edges ?? {})) {
+    for (const p of parents) if (!excluded(child) && !excluded(p)) addEdge(child, p);
+  }
+  return edges;
+}
+
 export function buildScope(
   features: FeatureEntry[],
   scope: SweepScope,
@@ -192,11 +231,10 @@ export function buildScope(
   const materialize = new Set<string>();
 
   // --- inventory branches + DAG edges ---
+  // The PLAN's DAG narrows the declared one: an entry whose branch the repo
+  // does not carry is dropped outright, so it declares nothing.
   const inventory = new Set<string>();
-  const edges: Record<string, Set<string>> = {};
-  const addEdge = (child: string, parent: string) => {
-    (edges[child] ??= new Set()).add(parent);
-  };
+  const present: FeatureEntry[] = [];
   const byBranch = new Map<string, FeatureEntry>();
   for (const e of features) {
     if (!e.branch) continue;
@@ -215,12 +253,9 @@ export function buildScope(
       }
     }
     inventory.add(branch);
-    for (const p of e.parents ?? []) if (!excluded(p)) addEdge(branch, p);
-    for (const d of e.dependents ?? []) if (!excluded(d)) addEdge(d, branch);
+    present.push(e);
   }
-  for (const [child, parents] of Object.entries(scope.extra_edges ?? {})) {
-    for (const p of parents) if (!excluded(child) && !excluded(p)) addEdge(child, p);
-  }
+  const edges = declaredEdges(present, scope);
 
   const hasMainPatched = (repoSet.has('main_patched') || originSet.has('main_patched')) && !excluded('main_patched');
   if (hasMainPatched && !repoSet.has('main_patched')) materialize.add('main_patched');
@@ -229,7 +264,7 @@ export function buildScope(
   // branches (or main_patched); roots default to [main_patched].
   const parentOf: Record<string, string[]> = {};
   for (const b of inventory) {
-    const raw = [...(edges[b] ?? [])];
+    const raw = edges[b] ?? [];
     const usable = raw.filter((p) => inventory.has(p) || (p === 'main_patched' && hasMainPatched)).sort();
     for (const p of raw) {
       if (!usable.includes(p) && (repoSet.has(p) || originSet.has(p))) {

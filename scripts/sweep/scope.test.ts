@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { initFixtureRepo } from './fixtures.js';
-import { buildScope, editionCompositionBranches } from './scope.js';
+import { buildScope, declaredEdges, editionCompositionBranches } from './scope.js';
 import type { FeatureEntry, ScopeEntry } from './types.js';
 
 function entry(partial: Partial<FeatureEntry> & { id: string }): FeatureEntry {
@@ -239,5 +239,47 @@ describe('exclusion beats the composition closure (buildScope level)', () => {
     const scope = buildScope(features, { exclude: ['fix/qualified'] }, repoBranches, ['fix/qualified']);
     expect(scope.ordered.map((e) => e.branch)).not.toContain('fix/qualified');
     expect(scope.ignored).not.toContain('fix/qualified');
+  });
+});
+
+describe('declaredEdges — one edge builder for the plan and for every ancestor map', () => {
+  it('inverts `dependents` into the child’s parent list', () => {
+    const features: FeatureEntry[] = [
+      entry({ id: 'module.a', kind: 'module', branch: 'module/a', dependents: ['module/b'] }),
+      entry({ id: 'module.b', kind: 'module', branch: 'module/b' }),
+    ];
+    // `dependents` is the same edge as `parents`, written from the other end.
+    expect(declaredEdges(features, {})).toEqual({ 'module/b': ['module/a'] });
+  });
+
+  it('carries `parents`, inverted `dependents` and `extra_edges`, minus the exclusions', () => {
+    const features: FeatureEntry[] = [
+      entry({ id: 'module.a', kind: 'module', branch: 'module/a', parents: ['main_patched'] }),
+      entry({ id: 'module.b', kind: 'module', branch: 'module/b', dependents: ['module/c', 'wip/scratch'] }),
+      entry({ id: 'module.c', kind: 'module', branch: 'module/c' }),
+      entry({ id: 'planned.x', kind: 'planned' }), // no branch -> declares nothing
+    ];
+    expect(declaredEdges(features, { extra_edges: { 'module/c': ['module/a'] } })).toEqual({
+      'module/a': ['main_patched'],
+      'module/c': ['module/b', 'module/a'],
+    });
+  });
+
+  it('buildScope’s edges are declaredEdges under its own narrowing', () => {
+    const features: FeatureEntry[] = [
+      entry({ id: 'module.a', kind: 'module', branch: 'module/a', parents: ['main_patched'] }),
+      entry({ id: 'module.b', kind: 'module', branch: 'module/b', parents: ['module/a'], dependents: ['module/c'] }),
+      entry({ id: 'module.c', kind: 'module', branch: 'module/c' }),
+    ];
+    const scope = { extra_edges: { 'module/c': ['module/a'] } };
+    const repoBranches = ['main', 'main_patched', 'module/a', 'module/b', 'module/c'];
+    const built = buildScope(features, scope, repoBranches);
+    // Everything declared is present and in scope, so the narrowing removes
+    // nothing and only sorts.
+    const narrowed = Object.fromEntries(
+      Object.entries(declaredEdges(features, scope)).map(([child, parents]) => [child, [...parents].sort()]),
+    );
+    expect(built.edges).toEqual(narrowed);
+    expect(built.warnings).toEqual([]);
   });
 });
