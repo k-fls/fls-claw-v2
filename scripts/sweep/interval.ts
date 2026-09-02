@@ -336,6 +336,9 @@ export async function reconcileToAnchor(
  * what is asked is exactly one commit's in-surface question — nothing above
  * the stop is probed, landed or exhibited.
  */
+const WALK_MEMO_CAP = 256;
+const walkMemo = new Map<string, WalkResult>();
+
 export async function pendingWalk(
   repo: string,
   branchTip: string,
@@ -349,6 +352,13 @@ export async function pendingWalk(
     return { ...base, upToDate: true, steps: [], landTree: null, reconciled: [], conflict: null, probeCount: 0 };
   }
   const tipSha = await revParse(repo, branchTip);
+  // The walk is a pure function of the object graph reachable from the tip,
+  // the candidates and the anchor, so identical inputs give identical answers
+  // and a run that re-derives one branch several times (verify, emission, the
+  // moved-tip re-derivation of its siblings) pays for the walk once.
+  const memoKey = [repo, tipSha, sourceAnchor, heads.join(',')].join('\0');
+  const memoized = walkMemo.get(memoKey);
+  if (memoized) return { ...memoized, ...base };
   let hyp = tipSha;
   const steps: WalkStep[] = [];
   let conflict: WalkConflict | null = null;
@@ -370,7 +380,10 @@ export async function pendingWalk(
     landTree = rec.tree;
     reconciled = rec.reconciled;
   }
-  return { ...base, upToDate: false, steps, landTree, reconciled, conflict, probeCount };
+  const result: WalkResult = { ...base, upToDate: false, steps, landTree, reconciled, conflict, probeCount };
+  if (walkMemo.size >= WALK_MEMO_CAP) walkMemo.clear();
+  walkMemo.set(memoKey, result);
+  return result;
 }
 
 /**
