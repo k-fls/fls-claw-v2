@@ -1,6 +1,8 @@
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { initFixtureRepo } from './fixtures.js';
+import { isAncestor } from './git.js';
+import { enumerateChain } from './heights.js';
 import {
   allParentsSkipped,
   derivePlan,
@@ -391,5 +393,57 @@ describe('derivePlan — a clean merge THROUGH a blocked-ancestor height is TRIM
     expect(c.parents[0].verdict).toBe('defer');
     expect(c.parents[0].deferredTo).toBe('main_patched');
     expect(c.parents[0].mergePoint).toBeNull();
+    // The block is announced at the coordinate it closes at — the bottom of the
+    // lattice — so a descendant inherits a total block, not an absent one.
+    expect(c.parents[0].deferHeight).toBe(WHOLE_RANGE_BLOCK);
+    expect(c.parents[0].case).toBeNull();
+  });
+});
+
+// --- the cut is inherited down the DAG (§5.2 cut inheritance) --------------
+describe('derivePlan — a grandparent block cuts the child AND the grandchild', () => {
+  const repo = initFixtureRepo();
+  repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+  const base = repo.sha('main');
+  repo.checkout('main_patched', { create: true, at: 'main' });
+  repo.checkout('feat/a', { create: true, at: 'main_patched' });
+  repo.checkout('feat/b', { create: true, at: 'feat/a' }); // cut before feat/a takes anything
+  repo.checkout('main');
+  repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+  repo.commit('U1: more', { 'src/more.ts': 'm\n' });
+  repo.checkout('main_patched');
+  repo.git('merge', '--no-edit', '-m', 'main_patched merges U0', 'main~1');
+  repo.checkout('feat/a');
+  repo.git('merge', '--no-edit', '-m', 'feat/a merges main_patched', 'main_patched');
+  repo.checkout('main_patched');
+  repo.git('merge', '--no-edit', '-m', 'main_patched merges U1', 'main');
+  repo.checkout('main');
+  afterAll(() => repo.destroy());
+
+  const features: FeatureEntry[] = [
+    { id: 'a', name: 'a', kind: 'feat', branch: 'feat/a', parents: ['main_patched'] },
+    { id: 'b', name: 'b', kind: 'feat', branch: 'feat/b', parents: ['feat/a'] },
+  ];
+
+  it('both generations carry the grandparent’s cut height and neither takes the cut commit', async () => {
+    const held = [{ branch: 'main_patched', height: 0, conflictedPaths: ['src/x.ts'], caseId: 'mp' }];
+    const plan = await derivePlan({ repo: repo.dir, upstreamRef: 'main', base, features, scope: {}, held });
+    const chain = await enumerateChain(repo.dir, 'main', base);
+    const cutSha = chain.heads[0].sha;
+
+    const a = plan.branches.find((x) => x.branch === 'feat/a')!;
+    const b = plan.branches.find((x) => x.branch === 'feat/b')!;
+    // A cut is a statement about content nobody has integrated, and content does
+    // not become integrable by travelling one more edge down.
+    expect(a.parents[0].deferHeight).toBe(0);
+    expect(b.parents[0].deferHeight).toBe(0);
+    expect(a.parents[0].verdict).toBe('defer');
+    expect(b.parents[0].verdict).toBe('defer');
+    // Nothing either generation could land contains the commit at the cut.
+    for (const row of [a, b]) {
+      const mp = row.parents[0].mergePoint;
+      if (mp) expect(await isAncestor(repo.dir, cutSha, mp.sha)).toBe(false);
+    }
+    expect(b.parents[0].mergePoint).toBeNull();
   });
 });

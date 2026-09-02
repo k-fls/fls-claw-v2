@@ -15,7 +15,7 @@ import { DEFAULT_STACK_CAP, EXCLUDED_BRANCH_GLOBS } from './config.js';
 import { checkDeferred, type BlockedParent } from './deferred.js';
 import { globMatchAny } from './globs.js';
 import { buildEligibleLine, mergePointSweep } from './interval.js';
-import { deriveCoverage, enumerateChain, type Chain } from './heights.js';
+import { deriveCoverage, enumerateChain, mintHead, type Chain } from './heights.js';
 import { git, newStyleMergeTree, revParse } from './git.js';
 import { resolveScope, type ScopeResult } from './scope.js';
 import { tierFloor } from './tiers.js';
@@ -239,10 +239,16 @@ async function analyzeParent(
   // (§3 probe determinism) and valid for remote-only branches (§13).
   const sweep = await mergePointSweep(repo, branchTip, line, stackCap);
 
+  // MINT A HEIGHT ONLY WHERE THE COMMIT IS LOAD-BEARING. The sweep answers in
+  // shas — the walk needs no projection onto the trunk and buys nothing by
+  // computing one per candidate. What DOES need a height is the merge head this
+  // row records and the case head the DEFERRED check, the case id and the step
+  // row all read; those are two commits per parent row, and a chain commit's
+  // height is its index, so the entry model pays nothing.
   const pp: ParentPlan = {
     parent,
     model,
-    mergePoint: sweep.mergePoint,
+    mergePoint: sweep.mergePoint === null ? null : await mintHead(repo, chain, sweep.mergePoint),
     verdict: 'up-to-date',
     case: null,
     deferredTo: null,
@@ -271,11 +277,7 @@ async function analyzeParent(
   // merge point and hide that.
   let mergeNoOp = false;
   if (sweep.mergePoint) {
-    // BY SHA, never by height: parents-model heads are the parent's own
-    // commits and a fork-side run of them shares one derived height, so a
-    // height lookup can answer with a DIFFERENT commit's probe and call a real
-    // merge a no-op (or the reverse).
-    const probe = sweep.probes.find((p) => p.head.sha === sweep.mergePoint!.sha);
+    const probe = sweep.probes.find((p) => p.sha === sweep.mergePoint);
     if (probe && probe.clean && probe.treeOid === branchTree) {
       mergeNoOp = true;
     } else {
@@ -285,17 +287,19 @@ async function analyzeParent(
 
   if (sweep.firstConflict) {
     const fc = sweep.firstConflict;
+    const run = await Promise.all(fc.run.map((sha) => mintHead(repo, chain, sha)));
+    const head = run[run.length - 1];
     // DEFERRED = pure height-MIN over X's blocked DIRECT parents: defer
     // iff any direct parent is blocked and this conflict is at/above the lowest
     // blocked parent's height. No path/window/ancestor-set test.
-    const decision = checkDeferred(fc.head.height, blockedParents);
+    const decision = checkDeferred(head.height, blockedParents);
     if (decision.deferred) {
       pp.deferredTo = decision.blockedBy;
-      pp.deferHeight = fc.head.height;
+      pp.deferHeight = head.height;
     } else {
       pp.case = {
-        head: fc.head,
-        run: fc.run,
+        head,
+        run,
         conflictedPaths: fc.conflictedPaths,
         automergeTree: fc.automergeTree,
         reproduction: fc.reproduction,

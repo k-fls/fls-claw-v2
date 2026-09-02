@@ -19,8 +19,9 @@
  * Height convention: chain.txt line N == mining height N (1-based). For coverage
  * we build a Chain with 0-based `height` indices (the code's convention), so a
  * mining coverage of K maps to a derived 0-based height of K-1 (-1 == none).
- * For the p7 merge-point sweep we label heads with the 1-based mining heights so
- * the assertions read 61/62 exactly as the case file records them.
+ * The p7 merge-point sweep works in shas, so its candidates are named by the
+ * 1-based mining height (`heightSha`) and the assertions read 61/62 exactly as
+ * the case file records them, with no projection in between.
  */
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -163,27 +164,22 @@ describe.skipIf(!AVAILABLE)('propagation real-DAG cases (mined from the live for
       branch,
       parent: 'main',
       model: 'entry',
-      coverage: -1,
-      heads: P7_HEIGHTS.map((h) => ({ sha: heightSha(h), height: h })),
+      heads: P7_HEIGHTS.map((h) => heightSha(h)),
     };
     // Sanity: chain.txt indexing matches the case's pinned SHAs.
     expect(heightSha(61)).toBe(c.expected.largest_clean_sha);
     expect(heightSha(62)).toBe(c.expected.smallest_conflicting_sha);
 
     return mergePointSweep(REPO, branch, line).then((res) => {
-      expect(res.mergePoint).toEqual({ sha: c.expected.largest_clean_sha, height: c.expected.largest_clean_height });
+      expect(res.mergePoint).toBe(c.expected.largest_clean_sha);
       // DRIVER.md §4.4 stacking: the real profile conflicts on the SAME single path
       // from 62 to the watermark, so on this sparse line the run stacks over
       // all three conflicting candidate heads (62, 80, 98; below the cap of 5)
       // and the case head is the run's TOP. The run still STARTS at the
       // smallest conflicting height above the merge point.
-      expect(res.firstConflict?.run[0]).toEqual({
-        sha: c.expected.smallest_conflicting_sha,
-        height: c.expected.smallest_conflicting_height_above,
-      });
-      expect(res.firstConflict?.run.map((h) => h.height)).toEqual([62, 80, 98]);
-      expect(res.firstConflict?.head.height).toBe(98);
-      expect(res.firstConflict?.head.sha).toBe(heightSha(98));
+      expect(res.firstConflict?.run[0]).toBe(c.expected.smallest_conflicting_sha);
+      expect(res.firstConflict?.run).toEqual([62, 80, 98].map((h) => heightSha(h)));
+      expect(res.firstConflict?.head).toBe(heightSha(98));
       // Constant single-path profile: the top's conflict set is the case's.
       expect(res.firstConflict?.conflictedPaths).toEqual(c.expected.case_conflicted_paths);
     });
@@ -212,16 +208,15 @@ describe.skipIf(!AVAILABLE)('propagation real-DAG cases (mined from the live for
       branch,
       parent: 'main',
       model: 'entry',
-      coverage: -1,
-      heads: heights.map((h) => ({ sha: heightSha(h), height: h })),
+      heads: heights.map((h) => heightSha(h)),
     };
     return mergePointSweep(REPO, branch, line).then((res) => {
-      expect(res.mergePoint).toEqual({ sha: c.expected.largest_clean_sha, height: 61 });
+      expect(res.mergePoint).toBe(c.expected.largest_clean_sha);
       // DRIVER.md §4.4: run starts at 62 and stacks over the sparse line's other
       // conflicting head (98, same single-path conflict set).
-      expect(res.firstConflict?.run[0]).toEqual({ sha: c.expected.smallest_conflicting_sha, height: 62 });
-      expect(res.firstConflict?.run.map((h) => h.height)).toEqual([62, 98]);
-      expect(res.firstConflict?.head.height).toBe(98);
+      expect(res.firstConflict?.run[0]).toBe(c.expected.smallest_conflicting_sha);
+      expect(res.firstConflict?.run).toEqual([62, 98].map((h) => heightSha(h)));
+      expect(res.firstConflict?.head).toBe(heightSha(98));
       expect(res.firstConflict?.conflictedPaths).toEqual(c.expected.case_conflicted_paths);
     });
   });

@@ -437,9 +437,12 @@ carries fork-only parent content down: a parent whose only new work is fork-side
 has that work enumerated as ordinary heads, so a fork fix merged into a parent
 reaches descendants without waiting for upstream to advance.
 
-**The cut still applies at height grain** (§5.2): heads at or above the block are
-withheld and the removal is announced (`trimmedAt`), a blocked parent's tip
-included.
+**The cut applies by CONTAINMENT** (§5.2): a candidate is withheld exactly when
+it contains the trunk commit at the cut — the cut commit itself and a blocked
+parent's tip included — and the removal is announced (`trimmedAt`). Containment
+is inherited, so the withheld set is closed under descent and the eligible set is
+ancestor-closed: skipping a withheld candidate IS trimming, and nothing above it
+can slip through.
 
 ### 4.3 Merge-point selection — linear sweep, never bisect
 
@@ -638,9 +641,12 @@ is the upper CUT-OFF of the merge window — for the branch itself and for every
 descendant. A cut-off exists iff the PR is open and its head is not reachable
 from the branch tip; GitHub squash- and rebase-merges land content without
 ancestry, so the PR's own state is the authority and reachability is
-corroboration. Heights are a comparable projection onto the trunk, used to place
-the cut INSIDE an eligible line; they never decide whether a cut-off exists, and
-they are not what orders the line (§4.3).
+corroboration. A cut is placed INSIDE an eligible line by containment: the
+withheld candidates are the ones that contain the trunk commit at the cut, the
+cut commit itself and a blocked parent's tip among them. Heights are a
+comparable projection onto the trunk; they never decide whether a cut-off
+exists, they are not what orders the line (§4.3), and the enumeration spends
+none of them.
 
 **Two kinds of proposal, told apart by the HEAD'S SHAPE, never by the ref name.**
 `start` classifies each open sweep PR when it reads it — that is the only moment

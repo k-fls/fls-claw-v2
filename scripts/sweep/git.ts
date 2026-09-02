@@ -235,6 +235,20 @@ export async function firstParentChain(repo: string, ref: string, not: string): 
   return res.stdout.split('\n').filter(Boolean);
 }
 
+/**
+ * Commits in `from..to` that have `from` as an ancestor — the descendants of
+ * `from` on the way up to `to`. `from` ITSELF IS EXCLUDED (`A..B` is `B --not
+ * A`), so a caller asking "which of these commits CONTAIN `from`" must add
+ * `from` back for itself.
+ *
+ * `from` not being an ancestor of `to` is an ANSWER, not an error: the range is
+ * empty and git exits 0 — nothing on the way to `to` contains `from`.
+ */
+export async function ancestryPath(repo: string, from: string, to: string): Promise<string[]> {
+  const res = await git(repo, ['rev-list', '--ancestry-path', `${from}..${to}`]);
+  return res.stdout.split('\n').filter(Boolean);
+}
+
 export async function isAncestor(repo: string, ancestor: string, descendant: string): Promise<boolean> {
   const res = await git(repo, ['merge-base', '--is-ancestor', ancestor, descendant], { allowCodes: [1] });
   return res.code === 0;

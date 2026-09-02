@@ -61,6 +61,23 @@ export function heightOfSha(chain: Chain, sha: string): number {
 }
 
 /**
+ * Coverage derivations spent since the last reset. A derivation is the unit of
+ * cost that matters: each one is an O(log n) burst of `--is-ancestor` probes,
+ * and the enumeration that walks a line must spend NONE of them — heights are
+ * minted only where a commit is load-bearing. The counter is what holds that
+ * open to assertion; nothing but tests reads it.
+ */
+let derivations = 0;
+
+export function coverageDerivations(): number {
+  return derivations;
+}
+
+export function resetCoverageDerivations(): void {
+  derivations = 0;
+}
+
+/**
  * DERIVED coverage (§2): the largest chain height whose commit is an
  * ancestor of `branchTip`, or -1 when even the oldest chain commit is not yet
  * reached. Binary search over the monotone ancestry predicate — O(log n)
@@ -71,6 +88,7 @@ export async function deriveCoverage(
   chain: Chain,
   branchTip: string,
 ): Promise<{ height: number; probes: number }> {
+  derivations++;
   const heads = chain.heads;
   if (heads.length === 0) return { height: -1, probes: 0 };
   let probes = 0;
@@ -88,4 +106,19 @@ export async function deriveCoverage(
     else hi = mid - 1;
   }
   return { height: lo, probes };
+}
+
+/**
+ * Mint a `{sha, height}` for a commit that has become LOAD-BEARING — a merge
+ * point, a case head. Enumeration never mints: a height is a projection onto
+ * the trunk, and projecting every candidate buys nothing the walk uses.
+ *
+ * A chain commit carries its index already, so minting one is free and exact —
+ * `chain[i]`'s derived coverage IS `i`, because ancestry along the first-parent
+ * chain is monotonic. Off-chain commits cost one derivation.
+ */
+export async function mintHead(repo: string, chain: Chain, sha: string): Promise<Head> {
+  const index = heightOfSha(chain, sha);
+  if (index >= 0) return { sha, height: index };
+  return { sha, height: (await deriveCoverage(repo, chain, sha)).height };
 }

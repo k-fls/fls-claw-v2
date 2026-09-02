@@ -18,32 +18,28 @@
  * the top, so resolving the case resolves the whole run, and content above the
  * top is left out of the branch, the case and the fix ref alike.
  *
- * The line is walked by POSITION, not by height: parents-model heads are the
- * parent's own commits, and a run of fork-side commits shares one derived
- * height. Heights remain projections onto the trunk — what the trim, the
- * DEFERRED check and the machine block read — and are never the sweep's order.
+ * The line is walked by POSITION, not by height: parents-model candidates are
+ * the parent's own commits, and a run of fork-side commits shares one derived
+ * height. THE WALK IS HEIGHT-FREE — candidates are shas, the cut is a
+ * containment test, and a `{sha, height}` is minted only where a commit becomes
+ * load-bearing (the merge point, the case head — plan.ts).
  *
  * All probes are new-style `git merge-tree` (git.ts) — never single-base
  * `--merge-base=`, never cherry-pick.
  */
 import { DEFAULT_STACK_CAP } from './config.js';
-import { deriveCoverage, type Chain } from './heights.js';
-import { firstParentChain, newStyleMergeTree, revParse } from './git.js';
-import type { Head } from './types.js';
+import { deriveCoverage, shaAtHeight, type Chain } from './heights.js';
+import { ancestryPath, firstParentChain, newStyleMergeTree, revParse } from './git.js';
 
 export interface EligibleLine {
   branch: string;
   parent: string;
   model: 'entry' | 'parents';
   /**
-   * Candidate heads the branch has not absorbed, oldest -> newest. Coverage is
-   * non-decreasing along that order, so heights are non-decreasing too — but
-   * they REPEAT wherever a parent's commits are fork-side, so order is the
-   * position in this array and never the height.
+   * Candidate commit shas the branch has not absorbed, oldest -> newest. Order
+   * is the position in this array; nothing here carries a height.
    */
-  heads: Head[];
-  /** Branch's derived coverage at build time (§2). */
-  coverage: number;
+  heads: string[];
   /**
    * Set when the trim actually removed candidates: there IS content waiting for
    * this branch and it is held back by an unresolved conflict above.
@@ -86,14 +82,55 @@ export interface BuildEligibleLineArgs {
 }
 
 /**
+ * THE CUT AS CONTAINMENT (§5.2). A pending commit is withheld exactly when it
+ * CONTAINS the trunk commit at the cut:
+ *
+ *     withheld(c)  <=>  chain[trim] is an ancestor-or-equal of c
+ *
+ * That is a statement about content, so it needs no height and no order. The
+ * blocked parent's own TIP is caught by it — precisely the state that cannot
+ * integrate — while a parent's fork-only work, which contains nothing at the
+ * cut, flows.
+ *
+ * THE WITHHELD SET IS CLOSED UNDER DESCENT within the pending set: containment
+ * is inherited, so a descendant of a withheld commit is withheld too. The
+ * eligible set is therefore ANCESTOR-CLOSED — an eligible commit has no
+ * withheld pending ancestor — and skipping a withheld commit IS trimming.
+ * Nothing above it can slip through, with no bookkeeping.
+ *
+ * `A..B` EXCLUDES A, so the cut commit is added back when it is itself pending;
+ * omitting it lands the branch exactly at the blocked coordinate.
+ *
+ * A cut BELOW the chain (`WHOLE_RANGE_BLOCK`, or a conflict that derives -1)
+ * has no chain commit to contain, and every pending commit is above it:
+ * everything is withheld. A cut past the watermark has no chain commit either
+ * and nothing is above it: nothing is withheld.
+ */
+export async function withheldByCut(
+  repo: string,
+  chain: Chain,
+  trim: number,
+  sourceTip: string,
+  pending: Set<string>,
+): Promise<Set<string>> {
+  if (trim === Infinity) return new Set();
+  const cutSha = shaAtHeight(chain, trim);
+  if (cutSha === null) return trim < 0 ? new Set(pending) : new Set();
+  const withheld = new Set<string>();
+  for (const sha of await ancestryPath(repo, cutSha, sourceTip)) if (pending.has(sha)) withheld.add(sha);
+  if (pending.has(cutSha)) withheld.add(cutSha);
+  return withheld;
+}
+
+/**
  * Eligible line for one (branch, parent) pair (§4):
- *  - entry model: candidate heads are the trunk chain commits above the
- *    branch's coverage (heads' shas ARE trunk commits).
- *  - parents model: candidate heads are the PARENT branch's own first-parent
- *    commits that the branch has NOT yet absorbed — EVERY such commit, each
- *    carrying its DERIVED covered height. If the parent advanced in one big
- *    merge, intermediate heights simply do not exist; the commits that DO exist
- *    are all offered (relevant to DEFERRED).
+ *  - entry model: candidates are the trunk chain commits above the branch's
+ *    coverage (the shas ARE trunk commits, so the chain index is exact and the
+ *    cut is an index comparison — free).
+ *  - parents model: candidates are the PARENT branch's own first-parent commits
+ *    that the branch has NOT yet absorbed — EVERY such commit. If the parent
+ *    advanced in one big merge, intermediate heights simply do not exist; the
+ *    commits that DO exist are all offered (relevant to DEFERRED).
  *
  * ENUMERATION IS AT COMMIT GRAIN. Fork-side commits advance no upstream
  * coverage, so a whole run of them derives ONE height; keeping only the newest
@@ -108,48 +145,33 @@ export interface BuildEligibleLineArgs {
  * say this: heights repeat along a fork-side run, so `h <= coverage` would drop
  * commits the branch does not have, and it can express no intra-run progress at
  * all. This is also what carries fork-only parent content down: a parent whose
- * only new work is fork-side has that work enumerated as ordinary heads, so a
- * fork fix merged into a parent reaches descendants without waiting for upstream
- * to advance.
+ * only new work is fork-side has that work enumerated as ordinary candidates, so
+ * a fork fix merged into a parent reaches descendants without waiting for
+ * upstream to advance.
  */
 export async function buildEligibleLine(args: BuildEligibleLineArgs): Promise<EligibleLine> {
   const { repo, branch, branchTip, parent, model, chain } = args;
-  const coverage = (await deriveCoverage(repo, chain, branchTip)).height;
   const trim = args.blockedAtHeight ?? Infinity;
 
   if (model === 'entry') {
+    const coverage = (await deriveCoverage(repo, chain, branchTip)).height;
     const above = chain.heads.filter((h) => h.height > coverage);
-    const heads = above.filter((h) => h.height < trim);
-    return { branch, parent, model, heads, coverage, ...(heads.length < above.length ? { trimmedAt: trim } : {}) };
+    const eligible = above.filter((h) => h.height < trim);
+    const heads = eligible.map((h) => h.sha);
+    return { branch, parent, model, heads, ...(heads.length < above.length ? { trimmedAt: trim } : {}) };
   }
 
   // parents model: walk the parent's own first-parent line, oldest -> newest,
-  // over exactly what the branch has not absorbed, deriving each commit's trunk
-  // coverage.
+  // over exactly what the branch has not absorbed.
   const parentTip = await revParse(repo, args.parentRef ?? parent);
   const lineShas = await firstParentChain(repo, parentTip, branchTip);
-  const heads: Head[] = [];
-  let trimmed = false;
-  for (const sha of lineShas) {
-    const h = (await deriveCoverage(repo, chain, sha)).height;
-    // THE TRIM STAYS HEIGHT-GRAIN: it is a statement about trunk content nobody
-    // has integrated, so it withholds every head at or above the block —
-    // including a blocked parent's TIP, which is precisely the state that cannot
-    // integrate. Without it descendants merge that tip cleanly, advance on it,
-    // and meet the trunk for the first time in the integration rebuild, which
-    // blames THEM. Coverage is non-decreasing along a first-parent line, so the
-    // withheld heads are a suffix.
-    if (h >= trim) {
-      trimmed = true;
-      continue;
-    }
-    heads.push({ sha, height: h });
-  }
-  return { branch, parent, model, heads, coverage, ...(trimmed ? { trimmedAt: trim } : {}) };
+  const withheld = await withheldByCut(repo, chain, trim, parentTip, new Set(lineShas));
+  const heads = lineShas.filter((sha) => !withheld.has(sha));
+  return { branch, parent, model, heads, ...(withheld.size > 0 ? { trimmedAt: trim } : {}) };
 }
 
 export interface HeadProbe {
-  head: Head;
+  sha: string;
   clean: boolean;
   conflictFiles: string[];
   treeOid: string;
@@ -159,21 +181,21 @@ export interface MergePointResult {
   branch: string;
   parent: string;
   model: 'entry' | 'parents';
-  /** No eligible heads above coverage — nothing to merge from this parent. */
+  /** No eligible candidates — nothing to merge from this parent. */
   upToDate: boolean;
-  /** The full-range probe against the newest head was clean (one probe total). */
+  /** The full-range probe against the newest candidate was clean (one probe total). */
   cleanFullRange: boolean;
-  /** Largest clean head (§3 step 3); null when even the oldest head conflicts. */
-  mergePoint: Head | null;
+  /** Largest clean candidate (§3 step 3); null when even the oldest conflicts. */
+  mergePoint: string | null;
   /**
    * The stacked conflict run ABOVE the merge point (§3 step 4; DRIVER.md §4.4):
-   * starts at the first conflicting head above it, extends over consecutive
-   * path-intersecting conflicting heads, capped. `head` is the run's TOP;
+   * starts at the first conflicting candidate above it, extends over consecutive
+   * path-intersecting conflicting candidates, capped. `head` is the run's TOP;
    * paths/tree are the top probe's.
    */
   firstConflict: {
-    head: Head;
-    run: Head[];
+    head: string;
+    run: string[];
     conflictedPaths: string[];
     automergeTree: string;
     reproduction: { command: string };
@@ -215,9 +237,9 @@ export async function mergePointSweep(
 
   // Step 1: probe the full range (newest head) first.
   const last = heads[heads.length - 1];
-  const fullProbe = await newStyleMergeTree(repo, branchRef, last.sha);
+  const fullProbe = await newStyleMergeTree(repo, branchRef, last);
   const lastHeadProbe: HeadProbe = {
-    head: last,
+    sha: last,
     clean: fullProbe.clean,
     conflictFiles: fullProbe.conflictFiles,
     treeOid: fullProbe.treeOid,
@@ -237,8 +259,8 @@ export async function mergePointSweep(
   // Step 2: linear oldest->newest sweep (reusing the full-range probe for the tip).
   const probes: HeadProbe[] = [];
   for (let i = 0; i < heads.length - 1; i++) {
-    const mt = await newStyleMergeTree(repo, branchRef, heads[i].sha);
-    probes.push({ head: heads[i], clean: mt.clean, conflictFiles: mt.conflictFiles, treeOid: mt.treeOid });
+    const mt = await newStyleMergeTree(repo, branchRef, heads[i]);
+    probes.push({ sha: heads[i], clean: mt.clean, conflictFiles: mt.conflictFiles, treeOid: mt.treeOid });
   }
   probes.push(lastHeadProbe);
 
@@ -256,7 +278,7 @@ export async function mergePointSweep(
   // which comes back with no case while the branch stops dead below the cut.
   let mergeIndex = -1;
   for (let i = 0; i < probes.length; i++) if (probes[i].clean) mergeIndex = i;
-  const mergePoint: Head | null = mergeIndex >= 0 ? probes[mergeIndex].head : null;
+  const mergePoint: string | null = mergeIndex >= 0 ? probes[mergeIndex].sha : null;
 
   // Step 4 (DRIVER.md §4.4): the case run. It STARTS at the first conflicting
   // head ABOVE the merge point — the cut — and STACKS consecutive conflicting
@@ -280,11 +302,11 @@ export async function mergePointSweep(
     }
     const top = runProbes[runProbes.length - 1];
     firstConflict = {
-      head: top.head,
-      run: runProbes.map((p) => p.head),
+      head: top.sha,
+      run: runProbes.map((p) => p.sha),
       conflictedPaths: top.conflictFiles,
       automergeTree: top.treeOid,
-      reproduction: reproCommand(branchRef, top.head.sha),
+      reproduction: reproCommand(branchRef, top.sha),
     };
   }
 
