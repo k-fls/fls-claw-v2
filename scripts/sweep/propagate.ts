@@ -90,6 +90,8 @@ import {
   worktreeBranches,
 } from './git.js';
 import { CANDIDATE_STANDING_INSTRUCTION, candidateSectionLines, deriveCandidates } from './candidates.js';
+import { walkStep } from './interval.js';
+import { computeSurface } from './surface.js';
 import {
   attributeFailure,
   blameCandidates,
@@ -5484,7 +5486,8 @@ async function staleHeal(cli: Cli, dir: string, journal: JournalEntry[]): Promis
       } catch {
         continue; // unreadable pointer: nothing to compare, and nothing to heal from
       }
-      stale = (await newStyleMergeTree(cli.repo, liveTip, jc.head.sha)).treeOid !== recordedTree;
+      const fp = await exhibitProbe(cli.repo, liveTip, jc.head.sha, jc.parent);
+      stale = fp.clean || fp.automergeTree !== recordedTree;
     }
     if (!stale) continue;
     // DIVERGENCE GUARD. Heal only FORWARD movement — the recorded tip an
@@ -5852,16 +5855,16 @@ async function reverifyReissueCase(
       errors: [...errors, `branch tip already contains head ${rowHead.sha.slice(0, 12)} — the resolution landed`],
     };
   }
-  const probe = await newStyleMergeTree(cli.repo, tip, rowHead.sha);
+  const probe = await exhibitProbe(cli.repo, tip, rowHead.sha, caseFile.parent);
   if (probe.clean) {
     return {
       ok: false,
       errors: [...errors, `no live conflict for '${caseFile.branch}' <- ${rowHead.sha.slice(0, 12)} (healed)`],
     };
   }
-  if (!samePathSet(probe.conflictFiles, caseFile.conflictedPaths)) {
+  if (!samePathSet(probe.conflictedPaths, caseFile.conflictedPaths)) {
     errors.push(
-      `conflicted-paths drift: recorded [${caseFile.conflictedPaths.join(', ')}] != recomputed [${probe.conflictFiles.join(', ')}]`,
+      `conflicted-paths drift: recorded [${caseFile.conflictedPaths.join(', ')}] != recomputed [${probe.conflictedPaths.join(', ')}]`,
     );
   }
 
@@ -5875,12 +5878,12 @@ async function reverifyReissueCase(
       parent: caseFile.parent,
       model,
       head: rowHead,
-      conflictedPaths: probe.conflictFiles,
+      conflictedPaths: probe.conflictedPaths,
       // Carried through the re-derivation: they are pending in the worktree and
       // in scope, and a guard that forgot them would charge the agent for the
       // resolution it was handed.
       ...(caseFile.carriedPaths?.length ? { carriedPaths: caseFile.carriedPaths } : {}),
-      automergeTree: probe.treeOid,
+      automergeTree: probe.automergeTree,
       reproduction: caseFile.reproduction,
       tierFloor: floor,
       scopeGuardMode,
@@ -5889,6 +5892,36 @@ async function reverifyReissueCase(
       descendants,
     },
   };
+}
+
+/**
+ * Re-derive what a case EXHIBITS at `tip` for conflict head `head`, under the
+ * walk's own resolution rules (§4.3): the raw probe with every
+ * auto-resolvable member already resolved, exactly as emission resolves it —
+ * so a recorded automerge tree and a recomputed one compare like for like,
+ * and "clean" means "no question left for anyone", auto-resolutions included.
+ * `parentRef` anchors the surface; with no resolvable parent the probe stays
+ * raw and every conflicted path is the question.
+ */
+async function exhibitProbe(
+  repo: string,
+  tip: string,
+  head: string,
+  parentRef: string | null,
+): Promise<{ clean: boolean; conflictedPaths: string[]; automergeTree: string }> {
+  if (parentRef && (await refExists(repo, parentRef))) {
+    const anchor = await revParse(repo, parentRef);
+    const surface = await computeSurface(repo, anchor, tip);
+    const step = await walkStep(repo, tip, head, surface, tip, anchor);
+    if (step.kind === 'advance') return { clean: true, conflictedPaths: [], automergeTree: step.tree };
+    return {
+      clean: false,
+      conflictedPaths: step.conflict.conflictedPaths,
+      automergeTree: step.conflict.automergeTree,
+    };
+  }
+  const probe = await newStyleMergeTree(repo, tip, head);
+  return { clean: probe.clean, conflictedPaths: probe.conflictFiles, automergeTree: probe.treeOid };
 }
 
 /**
@@ -6644,7 +6677,7 @@ async function publishHead(
         },
       };
     }
-    const probe = isGateFix ? null : await newStyleMergeTree(cli.repo, tip, jc.head.sha);
+    const probe = isGateFix ? null : await exhibitProbe(cli.repo, tip, jc.head.sha, jc.parent);
     if (probe?.clean) {
       return {
         issue: {
@@ -6653,11 +6686,11 @@ async function publishHead(
         },
       };
     }
-    if (probe && !samePathSet(probe.conflictFiles, jc.conflictedPaths)) {
+    if (probe && !samePathSet(probe.conflictedPaths, jc.conflictedPaths)) {
       return {
         issue: {
           id: 'ERR02_CASE_STALE',
-          detail: `conflict set drifted: recorded [${jc.conflictedPaths.join(', ')}] != live [${probe.conflictFiles.join(', ')}]`,
+          detail: `conflict set drifted: recorded [${jc.conflictedPaths.join(', ')}] != live [${probe.conflictedPaths.join(', ')}]`,
         },
       };
     }
@@ -6790,7 +6823,7 @@ async function publishHead(
     // load-bearing: it is what makes `git status` show exactly the conflict.
     const headSha = await deterministicCommit(
       cli.repo,
-      probe.treeOid,
+      probe.automergeTree,
       [tip, jc.head.sha],
       `Pristine conflict for ${jc.caseId} (conflict markers in place — resolve fresh)`,
     );
@@ -8938,7 +8971,7 @@ async function materializeReissueCase(
     return escalateOnce(`origin/${args.branch} does not exist — cannot probe the conflict`);
   }
   const tip = await revParse(cli.repo, `origin/${args.branch}`);
-  const probe = await newStyleMergeTree(cli.repo, tip, conflictHead);
+  const probe = await exhibitProbe(cli.repo, tip, conflictHead, parent);
   if (probe.clean) {
     return escalateOnce(
       `no live conflict remains for '${args.branch}' <- ${conflictHead.slice(0, 12)} (healed) — the PR may be obsolete`,
@@ -8961,8 +8994,8 @@ async function materializeReissueCase(
     (await git(cli.repo, ['diff', '--name-only', a, b])).stdout.split('\n').filter(Boolean);
   const priorBase = (await git(cli.repo, ['merge-base', args.refSha, tip], { allowCodes: [1] })).stdout.trim();
   const movedSince = new Set(priorBase ? await namesOf(priorBase, tip) : []);
-  const conflicting = new Set(probe.conflictFiles);
-  const carried = (await namesOf(probe.treeOid, args.refSha)).filter(
+  const conflicting = new Set(probe.conflictedPaths);
+  const carried = (await namesOf(probe.automergeTree, args.refSha)).filter(
     (p) => !conflicting.has(p) && !movedSince.has(p),
   );
   // The ref name's sha8 IS the conflict head's, so the reissue's id is the one
@@ -8977,9 +9010,9 @@ async function materializeReissueCase(
     parent,
     head,
     tierFloor: tierFloor(args.branch, feat),
-    conflictedPaths: probe.conflictFiles,
+    conflictedPaths: probe.conflictedPaths,
     ...(carried.length ? { carriedPaths: carried } : {}),
-    automergeTree: probe.treeOid,
+    automergeTree: probe.automergeTree,
     reproduction: { command: `git merge-tree --write-tree --name-only ${tip} ${conflictHead}` },
     deferredCheck: { firstConflictHeight: height, transitiveAncestors: args.ancestors },
   };
@@ -9337,6 +9370,11 @@ async function deriveOriginMergeStatus(
       parentCandidates.push({ branch: 'main', slug: slug('main') });
     }
     parentCandidates.sort((a, b) => b.slug.length - a.slug.length);
+    /** The parent branch a fix/sweep ref NAMES, or null (gate-fix / unparsable). */
+    const parentOfRef = (ref: string, branch: string): string | null => {
+      const rest = ref.slice('fix/sweep/'.length).slice(slug(branch).length + 2);
+      return parentCandidates.find((c) => rest.startsWith(`${c.slug}-h`))?.branch ?? null;
+    };
     const ancestorsOf = transitiveAncestors(scopeResult.edges);
     const scopeSet = new Set(scopeResult.ordered.map((e) => e.branch));
     const preReffed = preReffedSet(readJournal(dir));
@@ -9468,10 +9506,15 @@ async function deriveOriginMergeStatus(
       const exhibited = shape === 'driver' ? await exhibitedConflict(cli.repo, u.sha) : [];
       let relation: ConflictRelation | null = null;
       if (exhibited.length > 0 && conflictHead) {
-        const now = await newStyleMergeTree(cli.repo, targetTip, conflictHead);
+        // The CURRENT side goes through the same exhibit rules as emission
+        // (surface + equivalence pre-resolution): the recorded exhibit carries
+        // hunks only for the owner's question, so comparing it against a raw
+        // probe would read every auto-resolvable member as a new hunk and
+        // rebuild a ref whose question never moved.
+        const now = await exhibitProbe(cli.repo, targetTip, conflictHead, parentOfRef(u.ref, u.branch));
         relation = classifyConflict(
           exhibited,
-          now.clean ? [] : await conflictAt(cli.repo, now.treeOid, now.conflictFiles),
+          now.clean ? [] : await conflictAt(cli.repo, now.automergeTree, now.conflictedPaths),
         );
       }
 

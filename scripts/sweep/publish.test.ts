@@ -1515,3 +1515,69 @@ describe('publish — a held gate fix with no resolution publishes a report PR',
     expect((post!.body as { draft?: boolean }).draft).toBe(true);
   });
 });
+
+describe('publish — a mixed conflict publishes on its IN-SURFACE question alone', () => {
+  /**
+   * The case records only the in-surface conflicted paths and an exhibit tree
+   * whose out-of-surface members are already resolved (§4.3). The publish-time
+   * staleness probe re-derives through the SAME rules: a raw probe would see
+   * the auto-resolved member as a conflicted path the record lacks and refuse a
+   * case whose question never moved (ERR02).
+   */
+  it('the held DRAFT ships with the out-of-surface member resolved and ERR02 stays quiet', async () => {
+    const repo = initFixtureRepo();
+    cleanups.push(() => repo.destroy());
+    repo.commit('base', { 'src/f_in.ts': 'i0\n', 'src/f_out.ts': 'o0\n' });
+    const base = repo.sha('main');
+    repo.checkout('main_patched', { create: true, at: base });
+    const x = repo.commit('mp: f_out = oX', { 'src/f_out.ts': 'oX\n' });
+    repo.checkout('side', { create: true, at: base });
+    const z = repo.commit('side: touches both', { 'src/f_in.ts': 'iZ\n', 'src/f_out.ts': 'oZ\n' });
+    repo.checkout('main_patched');
+    // The parent's author integrates the side lineage with his own answers.
+    repo.git('merge', '-s', 'ours', '--no-commit', '--no-ff', z);
+    repo.write('src/f_in.ts', 'iZ\n');
+    repo.write('src/f_out.ts', 'oM\n');
+    repo.git('add', '-A');
+    repo.git('commit', '-m', 'mp: integrate side');
+    repo.checkout('feat/child', { create: true, at: base });
+    repo.commit('child: f_in = iB', { 'src/f_in.ts': 'iB\n' });
+    repo.checkout('main');
+    repo.commit('U0: pass progress', { 'src/u0.ts': 'u\n' });
+    void x;
+
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    repo.git('push', 'origin', 'feat/child');
+
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'child', branch: 'feat/child', parents: ['main_patched'] }]);
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, { base, ...o });
+    expect(await cmdSweepStart(cli({ cmd: 'sweep-start' }))).toBe(0);
+    expect(await cmdSweepNextCase(cli({ cmd: 'next-case' }))).toBe(0);
+    const caseId = currentCaseId(dir);
+
+    // The stop is the side commit; the case is the in-surface path alone.
+    const caseRow = readJournal(dir).find((e) => e.action === 'case' && e.branch === 'feat/child')!;
+    expect((caseRow.head as { sha: string }).sha).toBe(z);
+    expect(caseRow.conflictedPaths).toEqual(['src/f_in.ts']);
+    // The prefix landed, so the tip carries oX — which makes the publish-time
+    // RAW probe at z conflict on f_out too. The record must still verify.
+    expect(readFileSync(join(repo.dir, 'src/f_in.ts'), 'utf8')).toBe('i0\n'); // main untouched
+
+    expect(await cmdSweepReportCase(cli({ cmd: 'report-case', tier: 'held', execute: true }), neverInvoked)).toBe(0);
+    repo.git('push', 'origin', 'feat/child'); // simulated target push -> ERR14 passes
+    writeText(join(dir, caseId, 'pr'), 'freeze: feat/child keeps src/f_in.ts', 'Owner question: src/f_in.ts only.');
+    const out = join(ws, 'out-mixed.json');
+    expect(await cmdPublish(cli({ cmd: 'publish', caseId, out }), fakeGithub().factory)).toBe(0);
+    const res = readOut(out);
+    expect(res.issues.filter((i) => i.id === 'ERR02_CASE_STALE')).toEqual([]);
+    const head = res.head!.commit;
+    // The DRAFT exhibits markers at the in-surface path…
+    const exhibited = repo.git('cat-file', 'blob', `${head}:src/f_in.ts`);
+    expect(exhibited).toContain('<<<<<<<');
+    // …and the out-of-surface member arrives already resolved to the incoming side.
+    expect(repo.git('rev-parse', `${head}:src/f_out.ts`)).toBe(repo.git('rev-parse', `${z}:src/f_out.ts`));
+  });
+});
