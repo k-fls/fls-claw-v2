@@ -6300,11 +6300,17 @@ function lastDisposition(journal: JournalEntry[], caseId: string): JournalEntry 
     // and the pass has no legal move — and it is NOT `held`, so the finish
     // held-publish phase (which filters action==='held') correctly skips it:
     // nothing about the tree was verified, so nothing about it is proposed.
+    // `gate-fix-stale` IS a terminal disposition: the check the case was minted
+    // for passes on the tree the gate measured, and the mint's red was never
+    // confirmed on those bytes, so there is no failure to fix and nothing to
+    // propose. It drains from openCases for the same ERR34 reason, and unlike
+    // `env-blocked` it puts NO block on the branch: nothing is wrong with it.
     if (
       (e.action === 'held' ||
         e.action === 'resolved' ||
         e.action === 'held-duplicate' ||
-        e.action === 'env-blocked') &&
+        e.action === 'env-blocked' ||
+        e.action === 'gate-fix-stale') &&
       e.caseId === caseId
     )
       last = e;
@@ -12449,6 +12455,95 @@ async function adjudicateNotMyBug(p: {
   }
 }
 
+/**
+ * WHAT A HELD GATE FIX MEASURED, taken BEFORE the hold is frozen.
+ *
+ * A hold is the escape hatch for a failure nobody can fix inside the case's
+ * named files, so it is never gated on green. But a hold that measured NOTHING
+ * publishes a claim about a tree no gate ever ran: the owner is handed a pull
+ * request and asked to run the checks themselves, which is the one thing the
+ * driver is for.
+ *
+ * The battery is the one 5a runs, minus every mechanism that exists to send the
+ * agent back around the fix loop — no narrowing, no `--not-my-bug` adjudication,
+ * no attempt counter, no refusal. The disposition does not turn on the answer;
+ * only what the pull request can say about the tree does.
+ */
+interface HeldGateFixVerdict {
+  /** The battery RAN. False when nothing is configured, or the environment refused it. */
+  measured: boolean;
+  /** Measured, and every configured command passed. */
+  green: boolean;
+  /** Per kind: what failed, which files it named, and where the output is. */
+  failures: Array<{ kind: 'typecheck' | 'test'; failed: string[]; files: string[]; outFile: string }>;
+  /** Why nothing was measured, when that is the answer. */
+  unmeasured: string | null;
+}
+
+/**
+ * Run the configured checks over a held gate fix's worktree and journal the
+ * verdict. Failures are journaled as ordinary `checks-fail` rows: the counter
+ * they feed is read by paths this one never reaches, and the rows are what the
+ * cold read and the next pass read the failure off.
+ */
+async function measureHeldGateFix(
+  cli: Cli,
+  dir: string,
+  caseId: string,
+  caseDir: string,
+  wtPath: string,
+  resolvedTree: string,
+  checks: ChecksConfig | null,
+  runChecks: ChecksRunner,
+  runInstall: InstallRunner | undefined,
+): Promise<HeldGateFixVerdict> {
+  const none = { measured: false, green: false, failures: [] as HeldGateFixVerdict['failures'] };
+  if (!checks || checks.typecheck.length + checks.test.length === 0) {
+    return { ...none, unmeasured: 'no checks are configured' };
+  }
+  // The same install 5a pays for, and for the same reason: the manifests in the
+  // worktree are the ones the verdict is about.
+  const install = await installDeps(cli, wtPath, runInstall);
+  if (!install.ok) {
+    const f = install.failure;
+    const detail = `dependencies would not install into ${wtPath}: \`${f.command}\` (in ${f.cwd}) failed`;
+    appendJournal(dir, { action: 'warning', caseId, id: ERR_ENVIRONMENT_UNUSABLE, message: detail, install: f });
+    return { ...none, unmeasured: detail };
+  }
+  const failures: HeldGateFixVerdict['failures'] = [];
+  for (const kind of ['typecheck', 'test'] as const) {
+    const list = checks[kind];
+    if (list.length === 0) continue;
+    const r = await runChecks(list, wtPath);
+    if (r.ok) continue;
+    const outFile = join(caseDir, `${kind}-output.txt`);
+    const fullFile = join(caseDir, `${kind}-output.full.txt`);
+    writeFileSync(fullFile, r.output);
+    writeFileSync(outFile, boundedChecksOutput(r, fullFile));
+    const rooted = rootChecksOutput(r.output, list);
+    const files = parseFailingFiles(rooted);
+    appendJournal(dir, {
+      action: 'checks-fail',
+      caseId,
+      resolvedTree,
+      kind,
+      failed: r.failedNames,
+      files,
+      fingerprints: fingerprintKeys(parseFailureFingerprints(rooted)),
+    });
+    failures.push({ kind, failed: r.failedNames, files, outFile });
+  }
+  if (failures.length === 0) appendJournal(dir, { action: 'checks-pass', caseId, resolvedTree });
+  return { measured: true, green: failures.length === 0, failures, unmeasured: null };
+}
+
+/** The clause a held gate fix's verdict contributes to its escalation prefix. */
+function heldGateFixVerdictNote(v: HeldGateFixVerdict): string {
+  if (!v.measured) return `checks NOT RUN — ${v.unmeasured}`;
+  if (v.green) return 'checks PASS on this tree';
+  return v.failures.map((f) => `${f.kind} failing: ${f.failed.join(', ')}`).join('; ');
+}
+
 // --------------------------------------------------------------------------
 // `report-case --tier mechanical|judged|held` (DRIVER.md §6.4).
 // --------------------------------------------------------------------------
@@ -12459,6 +12554,11 @@ async function adjudicateNotMyBug(p: {
  * (first match wins, DRIVER.md §6.4):
  *   1. held-duplicate → consolidate into the topmost held twin.
  *   2. adequacy block (ERR06 duplicate).
+ *   2a. gate fix + claim held → the checks battery runs on the worktree FIRST,
+ *      then a HELD PR carrying the diagnosis (never gated on green). An
+ *      UNCHANGED tree that measures GREEN is the one exception: a green the
+ *      mint's red does not cover concludes the case `gate-fix-stale` with no
+ *      PR; one it does cover is an instability and is held with that finding.
  *   3. conflicts present + claim ≠ held → ERR32 (resolve first).
  *   4. claim == held + conflicts present (PRISTINE) → reset the worktree to the
  *      pristine conflict, freeze HELD DRAFT, "provide PR description (pristine)";
@@ -12700,32 +12800,172 @@ export async function cmdSweepReportCase(
   // dead-ends and the agent burns attempts until the container is reaped. The
   // escalation IS the outcome: the owner gets a PR carrying the diagnosis,
   // which is exactly what a fix nobody can make in scope should produce.
+  //
+  // THE BATTERY RUNS FIRST, ON WHATEVER TREE IS THERE. The checks gate at 5a
+  // sits ~190 lines below this arm, so a hold taken here freezes and publishes
+  // a tree the driver never measured — and both shapes of that are wrong in
+  // their own way:
+  //
+  //   A NON-EMPTY tree carries an attempted fix. Unmeasured, the pull request
+  //   asks the owner to review code the driver could have typechecked and
+  //   tested, and a fix that compiles while dropping a forwarded field or
+  //   declaring a binding it never reads reads as finished work.
+  //
+  //   An EMPTY tree is the diagnosis PR, and it is only a diagnosis if the
+  //   failure is still there. When it is not, the premise the case rests on has
+  //   expired and the owner is being asked to run the tests themselves on an
+  //   empty commit.
+  //
+  // THE HOLD IS NOT GATED ON GREEN. This arm exists for the failure nobody can
+  // fix in scope, and refusing the hold until the tree is green would close the
+  // only exit that case has. The verdict changes what the pull request SAYS,
+  // never whether there is one — except on the one reading where there is
+  // nothing left to say (below).
   if (isGateFixCase && claimed === 'held') {
-    await freezeHeld(cli, dir, rc, ['gate fix: agent declared cannot-fix-in-scope (--tier held)'], {
+    const verdict = await measureHeldGateFix(
+      cli,
+      dir,
+      caseId,
+      caseDir,
+      wtPath,
+      resolvedTree,
+      checksConfig,
+      runChecks,
+      runInstall,
+    );
+    // AN EMPTY TREE THAT MEASURES GREEN HAS NO DIAGNOSIS IN IT, and the two
+    // reasons a green can appear here have opposite dispositions.
+    if (emptyResolution && verdict.green) {
+      // The commands the MINT recorded as failing, resolved against the pass's
+      // checks config exactly as the PR machine block resolves them.
+      const gateRow = journal.find((e) => e.action === 'gate-fix' && e.caseId === caseId);
+      const mintNames = new Set(Array.isArray(gateRow?.failedCommands) ? (gateRow.failedCommands as string[]) : []);
+      const mintCommands = [...(checksConfig?.typecheck ?? []), ...(checksConfig?.test ?? [])].filter((c) =>
+        mintNames.has(c.cmd),
+      );
+      // DOES THE MINT'S RED COVER THE TREE THAT JUST CAME BACK GREEN? A red is
+      // identified by the SUBTREE the command ran in, so this is the same
+      // question `materializeGateFixCases` asks before it mints, asked again at
+      // the tree the gate actually measured. A case rooted at a branch tip whose
+      // red was confirmed at a ceiling ref has no confirmation here at all, and
+      // that is the whole difference between the two readings.
+      const covers = await redObservationUsable(journal, cli.repo, rc.branch, rc.head.sha, mintCommands, {
+        attributedCeiling: true,
+      });
+      if (covers.usable) {
+        // SAME BYTES, BOTH ANSWERS. The mint confirmed this exact subtree red
+        // and the gate just measured it green with nothing changed between, so
+        // the finding is an INSTABILITY and not a stale premise. Closing the
+        // case on the green would file the contradiction as "fixed": an
+        // order-dependent failure that a run in another environment masks is
+        // exactly this shape, and it comes back.
+        //
+        // The green is journaled in the shape the pass's own contested-check
+        // machinery reads (`greenChecks` over `branch-check` rows), so
+        // `unstableEvidence` pairs it with the mint's confirmed red — the PR
+        // carries the `sweep-contested` line, the finish report names it, and a
+        // later mint on the same key inherits `environment-conditional`.
+        appendJournal(dir, {
+          action: 'branch-check',
+          branch: rc.branch,
+          caseId,
+          sha: rc.head.sha,
+          checks: covers.observed.map((v) => ({ cmd: v.cmd, ...(v.cwd ? { cwd: v.cwd } : {}), subtree: v.subtree, ok: true })),
+        });
+        const detail =
+          `${rc.branch}: the failing check(s) (${[...mintNames].join(', ')}) were CONFIRMED RED and now measure ` +
+          `GREEN on the identical subtree — the code is the same object in both runs, so the difference is not in ` +
+          `it. The case is held with that finding rather than closed on the green.`;
+        appendJournal(dir, {
+          action: 'checks-nondeterministic',
+          id: 'WARN21_CHECKS_FLAKY',
+          caseId,
+          branch: rc.branch,
+          headSha: rc.head.sha,
+          commands: [...mintNames],
+          detail,
+        });
+        progress(`gate fix: the failing check answers BOTH ways on the same bytes — held with the instability`);
+        console.error(`report-case [WARN21_CHECKS_FLAKY]: ${detail}`);
+        issues.push({ id: 'WARN21_CHECKS_FLAKY', detail });
+      } else {
+        // A DIFFERENT TREE. The mint's red was never confirmed on the bytes this
+        // gate just ran, and those bytes pass — the branch moved past the
+        // failure the case was minted for. There is nothing to diagnose and
+        // nothing to publish: an empty commit whose stated subject is a failure
+        // that is not there costs the owner a review and a pull request number
+        // every pass, because the next pass derives the same case again.
+        //
+        // The case CONCLUDES: a terminal disposition drains it from `openCases`
+        // (without one `finish` refuses on ERR34_CASES_REMAIN and the pass has
+        // no legal move) and it is not a `held` row, so `finish` publishes
+        // nothing for it and nothing blocks the branch — the merges an open gate
+        // fix suppressed run again for the rest of the pass.
+        const detail =
+          `${rc.branch} PASSES the check(s) this case was minted for (${[...mintNames].join(', ')}) at ` +
+          `${rc.head.sha.slice(0, 12)}, and the mint's red was never confirmed on these bytes ` +
+          `(${covers.reasons.join('; ')}). The premise expired: no fix is owed, so no PR is opened and the branch ` +
+          `is released.`;
+        appendJournal(dir, {
+          action: 'gate-fix-stale',
+          caseId,
+          branch: rc.branch,
+          headSha: rc.head.sha,
+          commands: [...mintNames],
+          subtrees: covers.observed.map((v) => ({ cmd: v.cmd, ...(v.cwd ? { cwd: v.cwd } : {}), subtree: v.subtree })),
+          detail,
+        });
+        reopen(dir, reopenTargets);
+        writeMachineState(dir, { ...st, phase: 'open', currentCase: null });
+        progress(`gate fix concluded — the premise is stale: ${rc.branch}`);
+        console.error(`report-case: ${caseId} concluded stale (no PR) — ${detail}`);
+        result(cli, {
+          instruction:
+            `this case is CONCLUDED and nothing is published: ${detail} Do NOT write a PR description. Take the ` +
+            `next case.`,
+          tier: 'held',
+          issues: [...issues, { id: 'WARN22_RED_UNCONFIRMED', detail }],
+        });
+        return 0;
+      }
+    }
+    const measuredNote = heldGateFixVerdictNote(verdict);
+    await freezeHeld(cli, dir, rc, [`gate fix: agent declared cannot-fix-in-scope (--tier held) — ${measuredNote}`], {
       // An unchanged tree publishes no diff — the PR is the DIAGNOSIS. A tree
       // with edits keeps them: a partial or wrong attempt the owner can read
       // beats an empty exhibit.
       resolvedTree: emptyResolution ? null : resolvedTree,
       escalation: {
         tag: ESCALATE_CHECKS,
-        feedback: `cannot be fixed within the case's named files (${rc.conflictedPaths.join(', ')})`.slice(
-          0,
-          COLDREAD_FEEDBACK_CAP,
-        ),
+        // The VERDICT travels with the escalation, above the agent's prose. A
+        // hold that names what the tree does is a different object to review
+        // from one that names only what the agent could not do.
+        feedback:
+          `cannot be fixed within the case's named files (${rc.conflictedPaths.join(', ')}) — ${measuredNote}`.slice(
+            0,
+            COLDREAD_FEEDBACK_CAP,
+          ),
       },
     });
     reopen(dir, reopenTargets);
     writeMachineState(dir, { ...st, phase: 'awaiting-pr', currentCase: { caseId, branch: rc.branch, tier: 'held' } });
-    progress(`gate fix held (cannot fix in scope): ${rc.branch}`);
-    console.error(`report-case: held ${caseId} (gate fix, cannot fix in scope)`);
+    progress(`gate fix held (cannot fix in scope): ${rc.branch} — ${measuredNote}`);
+    console.error(`report-case: held ${caseId} (gate fix, cannot fix in scope; ${measuredNote})`);
     result(cli, {
       instruction: prHandoff(
         dir,
         caseId,
         `provide PR description — you could not fix this within ${rc.conflictedPaths.join(', ')}. State WHAT fails, ` +
-          `WHY it cannot be fixed in those files, and WHERE you believe the fix belongs. That diagnosis IS the deliverable`,
+          `WHY it cannot be fixed in those files, and WHERE you believe the fix belongs. That diagnosis IS the ` +
+          `deliverable. The driver ran the checks on your worktree: ${measuredNote} — say so in the description` +
+          (verdict.failures.length > 0
+            ? ` and name the failing command(s) (${verdict.failures.flatMap((f) => f.failed).join(', ')})`
+            : ''),
       ),
       tier: 'held',
+      ...(verdict.failures.length > 0
+        ? { checks: verdict.failures.map((f) => ({ kind: f.kind, failed: f.failed, files: f.files, output: f.outFile })) }
+        : {}),
       issues,
     });
     return 0;

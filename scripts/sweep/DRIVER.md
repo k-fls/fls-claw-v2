@@ -1162,6 +1162,40 @@ Branch order, first match wins:
    (§8.2), then the cold read (§7.5). This is the ONLY stage that runs checks or a
    cold read, and it runs for ALL THREE tiers — judged and held included.
 
+**A GATE FIX claiming `held`** is decided between 2 and 3, because
+reproducible-but-unfixable-in-scope has nowhere else to go: the failure
+reproduces, it is genuinely pre-existing, and no edit inside the files the
+failure was REPORTED in can fix it. It escalates to a HELD PR carrying the
+diagnosis. It is NEVER gated on green — refusing the hold until the tree passes
+closes the only exit this shape of case has.
+
+THE CHECKS BATTERY RUNS THERE, on whatever tree the worktree holds, BEFORE the
+freeze. A hold that measured nothing publishes a claim about a tree no gate ran,
+and asks the owner to run the checks themselves. Failing checks are journaled
+`checks-fail` and named on the escalation prefix above the agent's prose; the
+disposition is unchanged by the answer, with one exception.
+
+THE EXCEPTION IS AN UNCHANGED WORKTREE THAT MEASURES GREEN, and the two readings
+of that green have opposite dispositions. They are told apart by the only
+identity a red has — the SUBTREE the command ran in (§10.2) — asked at the tree
+the gate just measured:
+
+- **The mint's red does NOT cover these bytes.** The case was rooted at a commit
+  the confirmation was never taken on, and that commit passes: the premise
+  expired. The case CONCLUDES on the terminal `gate-fix-stale` disposition — no
+  PR, nothing published, drained from `openCases` so `finish` has a legal move —
+  and it puts NO block on the branch, so the merges an open gate-fix case
+  suppressed (§6.2) run again for the rest of the pass.
+- **The mint's red DOES cover these bytes.** One oid, both answers, nothing
+  changed between: that is an instability and not a stale premise. The green is
+  journaled in the shape `greenChecks` reads, so the pass's own contested-check
+  machinery pairs it with the confirmed red — `WARN21_CHECKS_FLAKY`, the
+  `sweep-contested` line on the PR, the finish report, and
+  `environment-conditional` on a later mint over the same key. The hold stands
+  and the PR carries the finding. It is never closed on the green: an
+  order-dependent failure that a run in another environment masks looks exactly
+  like this.
+
 Deterministic checks run before the gate: the worktree tree is snapshotted, the
 empty/uncommitted check runs, and the scope guard (§7.4) is evaluated — a
 violation does NOT demote here; `scopeExceeded` is carried forward to the cold

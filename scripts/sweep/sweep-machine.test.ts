@@ -48,6 +48,7 @@ import {
   reportDriverHalt,
   RESOLVE_COLDREAD_CAP,
   supersededCaseIds,
+  unstableEvidence,
   type Cli,
   type ChecksRunner,
   type ColdReadInvoker,
@@ -3426,11 +3427,14 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     expect(currentCaseId(dir)).toBe(caseId);
 
     // The agent edits NOTHING — the fix is not in the named files — and escalates.
+    // The failure REPRODUCES on the unchanged tree, which is what makes this a
+    // diagnosis rather than an expired premise.
     const out = join(ws, 'rc.json');
     expect(
       await cmdSweepReportCase(
         baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', checksFile: checks, execute: true, out }),
         neverInvoked,
+        runner(['vitest run']).fn,
       ),
     ).toBe(0);
     const res = JSON.parse(readFileSync(out, 'utf8')) as { tier: string; instruction: string };
@@ -3443,6 +3447,202 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     expect(held).toBeTruthy();
     // Nothing was fixed, so nothing is published as a resolution — the PR is prose.
     expect(held.resolution ?? null).toBeNull();
+    expect(machineState(dir).phase).toBe('awaiting-pr');
+  });
+
+  /**
+   * A driver-minted gate-fix case as the mint leaves it: the journal rows, the
+   * case pointer, the captured failing output and a worktree detached at the
+   * root. `materializeGateFixCases` is bypassed so each test can seed exactly
+   * the evidence it is about.
+   */
+  function seedGateFixCase(
+    repo: FixtureRepo,
+    dir: string,
+    opts: { branch?: string; files?: string[]; commands?: string[] } = {},
+  ): { caseId: string; tip: string } {
+    const branch = opts.branch ?? 'main_patched';
+    const files = opts.files ?? ['src/x.test.ts'];
+    const commands = opts.commands ?? ['vitest run'];
+    const caseId = 'gate-fix-main_patched-deadbeef';
+    const tip = repo.sha(branch);
+    appendFileSync(
+      join(dir, 'journal.jsonl'),
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        action: 'gate-fix',
+        key: `${branch}::${files.join(',')}`,
+        caseId,
+        branch,
+        files,
+        failedCommands: commands,
+        rootAt: tip,
+        reason: 'pre-existing failure',
+      }) +
+        '\n' +
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          action: 'case',
+          caseId,
+          branch,
+          parent: '(gate-fix)',
+          gateFix: true,
+          head: { sha: tip, height: 1 },
+          conflictedPaths: files,
+        }) +
+        '\n',
+    );
+    mkdirSync(join(dir, caseId), { recursive: true });
+    writeFileSync(join(dir, caseId, 'gate-fix-output.txt'), `${files[0]} > times out\n`);
+    writeFileSync(
+      join(dir, caseId, 'case.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        id: caseId,
+        branch,
+        parent: '(gate-fix)',
+        head: { sha: tip, height: 1 },
+        run: [{ sha: tip, height: 1 }],
+        tierFloor: 'judged',
+        conflictedPaths: files,
+        automergeTree: repo.git('rev-parse', `${branch}^{tree}`),
+        reproduction: { command: commands.join(' && ') },
+        deferredCheck: { firstConflictHeight: 1, transitiveAncestors: [] },
+      }) + '\n',
+    );
+    repo.git('worktree', 'add', '--detach', join(dir, caseId, 'worktree'), tip);
+    return { caseId, tip };
+  }
+
+  it('a held gate fix that KEPT an attempted fix is MEASURED before it freezes, and the red travels with it', async () => {
+    // The arm that publishes a cannot-fix-in-scope hold sits ~190 lines above
+    // the checks gate, so the tree it freezes has been measured by nothing. A
+    // gate fix that reimplements code, declares a parameter it never forwards
+    // and a binding it never reads passes `tsc` and fails the suite — and the
+    // owner is handed it as a reviewed proposal with no verdict attached.
+    //
+    // The battery runs on the tree the hold is about, the failure is journaled,
+    // and it rides the escalation prefix above the agent's prose. The hold is
+    // NOT gated on the answer: this is still the escape hatch for a failure
+    // nobody can fix inside the named files.
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = checksFile(ws);
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
+    const { caseId } = seedGateFixCase(repo, dir);
+    await cmdSweepNextCase(baseCli(repo, ws, inv, { checksFile: checks }), greenPreMerge);
+    expect(currentCaseId(dir)).toBe(caseId);
+
+    // The agent WRITES something into the named file and then concedes.
+    writeFileSync(join(dir, caseId, 'worktree', 'src/x.test.ts'), 'an attempted fix\n');
+    const out = join(ws, 'rc.json');
+    const r = runner(['vitest run']);
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', checksFile: checks, execute: true, out }),
+        neverInvoked,
+        r.fn,
+      ),
+    ).toBe(0);
+    // MEASURED: both kinds ran, in order, over the worktree.
+    expect(r.ran).toEqual([['tsc --noEmit'], ['vitest run']]);
+    const journal = readJournal(dir);
+    const fail = journal.find((e) => e.action === 'checks-fail' && e.caseId === caseId)!;
+    expect(fail.kind).toBe('test');
+    expect(fail.failed).toEqual(['vitest run']);
+    // HELD ANYWAY, with the attempt kept and the verdict on the escalation.
+    const held = journal.find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect(held.resolution).not.toBeNull();
+    expect(String((held.escalation as { feedback: string }).feedback)).toContain('vitest run');
+    expect(machineState(dir).phase).toBe('awaiting-pr');
+  });
+
+  it('a held gate fix whose UNCHANGED worktree PASSES concludes with no PR and releases the branch', async () => {
+    // The empty-worktree hold publishes a DIAGNOSIS, and a diagnosis of a
+    // failure that is not there is an empty commit asking the owner to run the
+    // tests themselves. The mint confirmed its red somewhere else — a ceiling
+    // ref, an integration tree — and the branch moved past it, so nothing on
+    // these bytes was ever measured red.
+    //
+    // The case CONCLUDES on a terminal disposition (no PR, and `finish` does not
+    // wedge on ERR34) and the branch is released: an open gate-fix case stops
+    // every merge in the pass, and there is no defect to stop them for.
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = checksFile(ws);
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
+    const { caseId } = seedGateFixCase(repo, dir);
+    await cmdSweepNextCase(baseCli(repo, ws, inv, { checksFile: checks }), greenPreMerge);
+
+    const out = join(ws, 'rc.json');
+    const r = runner([]); // everything green on the tree the case is rooted at
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', checksFile: checks, execute: true, out }),
+        neverInvoked,
+        r.fn,
+      ),
+    ).toBe(0);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
+    const stale = journal.find((e) => e.action === 'gate-fix-stale' && e.caseId === caseId)!;
+    expect(stale).toBeTruthy();
+    expect(String(stale.detail)).toContain('vitest run');
+    // Terminal: it drains from openCases, so `finish` has a legal move.
+    expect(openCases(journal).map((c) => c.caseId)).not.toContain(caseId);
+    expect(machineState(dir).phase).toBe('open');
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string };
+    expect(res.instruction).toContain('CONCLUDED');
+  });
+
+  it('a green on the bytes a CONFIRMED red was measured on is held as an instability, never closed', async () => {
+    // The other reading of the same green, and the opposite disposition. The
+    // mint confirmed THIS subtree red; the gate measures it green with nothing
+    // changed between. That is a check answering both ways over one oid, and
+    // closing the case on the green files a contradiction as a fix — an
+    // order-dependent failure a run in another environment masks looks exactly
+    // like this and comes back.
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = checksFile(ws);
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
+    const { caseId, tip } = seedGateFixCase(repo, dir);
+    // The confirmation the mint rested on, taken on THESE bytes.
+    appendJournal(dir, {
+      action: 'red-confirm',
+      branch: 'main_patched',
+      cmd: 'vitest run',
+      subtree: repo.git('rev-parse', `${tip}^{tree}`),
+      reproduced: true,
+    });
+    await cmdSweepNextCase(baseCli(repo, ws, inv, { checksFile: checks }), greenPreMerge);
+
+    const out = join(ws, 'rc.json');
+    const r = runner([]);
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', checksFile: checks, execute: true, out }),
+        neverInvoked,
+        r.fn,
+      ),
+    ).toBe(0);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'gate-fix-stale')).toBe(false);
+    expect(journal.find((e) => e.action === 'checks-nondeterministic' && e.caseId === caseId)?.id).toBe(
+      'WARN21_CHECKS_FLAKY',
+    );
+    // It reaches the owner through the pass's OWN contested-check machinery:
+    // the green is journaled in the shape `greenChecks` reads, so the PR machine
+    // block and the finish report both carry it.
+    expect(unstableEvidence(journal).map((c) => c.cmd)).toContain('vitest run');
+    // Held, not closed: the case still goes to the owner with the finding.
+    expect(journal.some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
     expect(machineState(dir).phase).toBe('awaiting-pr');
   });
 
