@@ -117,6 +117,7 @@ import {
   type SubsetProbe,
 } from './not-my-bug.js';
 import { malformedCutPointExceptionsIssue, resolveCutPointExceptions, staleWarnings } from './cut-points.js';
+import { globMatchAny } from './globs.js';
 import { installRrCache } from './merge.js';
 import { appendObservation } from './observations.js';
 import { loadFeatures, loadRegistry } from './registry.js';
@@ -1693,6 +1694,21 @@ const COLD_READ_QUESTIONS = [
 ];
 
 /**
+ * THE FOURTH QUESTION, asked only of a resolution that edited a test file.
+ *
+ * The scope guard admits a test edit by predicate — it cannot tell a test
+ * brought into step with the merged behaviour from one bent until it stops
+ * complaining. Nothing else in the pass can either: the checks gate runs the
+ * edited test and a weakened test passes it, and so does `finish`'s verify. The
+ * cold read is the only place the question gets asked, so it is asked here,
+ * about the named files, and a `reject` routes the ordinary two-strike path.
+ */
+const TEST_EDIT_QUESTION =
+  '4. For each edited test file: is the edit required by this resolution — the test now asserts the merged behavior — ' +
+  'and does it keep asking the same question? Name any test edit that is unrelated to this resolution, or that skips, ' +
+  'deletes or weakens an assertion.';
+
+/**
  * A GATE FIX is judged on different questions, because it is not a merge.
  *
  * The shared set asks about "the conflicted hunks" and "the two sides/base". A
@@ -1738,7 +1754,7 @@ const COLD_READ_PREAMBLE = [
   'Judge ONLY from the materials in this request. Do NOT explore the repository or search',
   'beyond them. If something cannot be judged from the request, answer',
   'UNVERIFIABLE-FROM-REQUEST for that point instead of researching — the driver will treat',
-  'it as a reject reason only if it concerns questions 1-3.',
+  'it as a reject reason only if it concerns one of the numbered questions below.',
 ];
 
 /**
@@ -2063,10 +2079,17 @@ export const CASE_SERVE_LIMIT = 4;
  * its single quality gate (RESOLVED cases) and `finish` runs on the publishable
  * set. Shipped in the repo (`scripts/sweep/checks.json`); each list is command +
  * clone-root-relative cwd. A missing/empty list → that gate is skipped.
+ *
+ * `testPaths` is the repo's own answer to "which files are tests" — the globs
+ * that decide whether an edit outside the conflicted set is a test kept in step
+ * with the resolution or a scope violation. Only the repo can answer it, and it
+ * is answered ONCE, here, next to the commands that run those files. Empty (the
+ * key absent) means no path is a test path, so nothing is admitted.
  */
 export interface ChecksConfig {
   typecheck: VerifyCommand[];
   test: VerifyCommand[];
+  testPaths: string[];
 }
 
 /**
@@ -2074,7 +2097,7 @@ export interface ChecksConfig {
  * — or unparseable, which is why every caller asks `malformedChecksIssue` FIRST:
  * that is the only thing that tells the two apart.
  */
-function loadChecksConfig(checksFile: string | undefined): ChecksConfig | null {
+export function loadChecksConfig(checksFile: string | undefined): ChecksConfig | null {
   if (!checksFile || !existsSync(checksFile)) return null;
   let raw: unknown;
   try {
@@ -2082,10 +2105,14 @@ function loadChecksConfig(checksFile: string | undefined): ChecksConfig | null {
   } catch {
     return null;
   }
-  const r = (raw ?? {}) as { typecheck?: unknown; test?: unknown };
+  const r = (raw ?? {}) as { typecheck?: unknown; test?: unknown; testPaths?: unknown };
   const norm = (v: unknown): VerifyCommand[] =>
     Array.isArray(v) ? (v.filter((c) => c && typeof (c as VerifyCommand).cmd === 'string') as VerifyCommand[]) : [];
-  return { typecheck: norm(r.typecheck), test: norm(r.test) };
+  // FAIL-CLOSED on a key that is absent, not a list, or holds anything but
+  // strings: an empty glob set admits no path, which is the behaviour of a repo
+  // that never named its tests.
+  const globs = Array.isArray(r.testPaths) ? r.testPaths.filter((g): g is string => typeof g === 'string') : [];
+  return { typecheck: norm(r.typecheck), test: norm(r.test), testPaths: globs };
 }
 
 /**
@@ -3613,6 +3640,21 @@ const INSTABILITY_RESOLUTION_RULE =
   'chance-dependent but less likely to fail — a wider timeout, a higher retry count, a sleep, a longer poll ' +
   'interval — or that stops the question being asked — a skipped, deleted or weakened assertion — contradicts ' +
   'this record.';
+
+/**
+ * THE RECORD A TEST EDIT IS JUDGED AGAINST — the same instrument as the
+ * instability rule, aimed at the same failure mode.
+ *
+ * It states a criterion rather than a list, because the ways a test can stop
+ * asking its question are not enumerable: a `skip`, a deleted case and a
+ * loosened matcher all leave a green suite and a defect nobody is looking for.
+ * Saying it as a RECORD is what lets the reader answer it — a diff that
+ * contradicts a record in the request is a reject, on the same footing as any
+ * other.
+ */
+const TEST_EDIT_RESOLUTION_RULE =
+  'a test edit is justified only by this resolution — the test now asserts the merged behavior. An edit that stops ' +
+  'a question being asked — a skipped, deleted or weakened assertion — contradicts this record.';
 
 type ReproductionCharacter =
   /** Narrowed to its own files it does not reproduce: it needs the whole suite. */
@@ -6116,6 +6158,7 @@ function prTemplateFor(rc: ResolvedCase, tier: Tier): string {
         '',
         '## Scope',
         `Everything outside these ${rc.conflictedPaths.length} file(s) is verbatim upstream, already reviewed upstream.`,
+        '<name every TEST file you edited and why this resolution required it; write "none" if you edited none>',
         '',
         '## Verification',
         '<which checks you ran and their result; name any gate that could NOT run here and why>',
@@ -8305,7 +8348,7 @@ export interface MachineVerdict {
    * to a hard blocking halt (ERR35_COLDREAD_UNAVAILABLE) at the call sites.
    */
   verdict: 'confirm' | 'reject' | 'error';
-  answers?: Partial<Record<'q1' | 'q2' | 'q3', string>>;
+  answers?: Partial<Record<'q1' | 'q2' | 'q3' | 'q4', string>>;
   notes: string;
   /**
    * Short (1-2 line) reviewer feedback for the RESOLVING AGENT: why
@@ -8427,13 +8470,16 @@ export const defaultColdReadInvoker: ColdReadInvoker = (prompt) =>
 
 /**
  * Fail-closed reduction shared by both cold reads: an overall
- * `reject`, OR an `UNVERIFIABLE-FROM-REQUEST` answer on any of Q1-Q3, is a
- * reject. Returns the unverifiable question list for the notes.
+ * `reject`, OR an `UNVERIFIABLE-FROM-REQUEST` answer on any question that was
+ * ASKED, is a reject. Returns the unverifiable question list for the notes.
+ *
+ * Q4 counts only where the request carried the test-edit block. An unasked
+ * question has no answer to be unverifiable, and folding it in unconditionally
+ * would reject every ordinary resolution whose reader answered three questions.
  */
-function coldReadRejected(v: MachineVerdict): { rejected: boolean; unverifiable: string[] } {
-  const unverifiable = (['q1', 'q2', 'q3'] as const).filter((q) =>
-    /UNVERIFIABLE-FROM-REQUEST/i.test(String(v.answers?.[q] ?? '')),
-  );
+function coldReadRejected(v: MachineVerdict, askedQ4 = false): { rejected: boolean; unverifiable: string[] } {
+  const asked = askedQ4 ? (['q1', 'q2', 'q3', 'q4'] as const) : (['q1', 'q2', 'q3'] as const);
+  const unverifiable = asked.filter((q) => /UNVERIFIABLE-FROM-REQUEST/i.test(String(v.answers?.[q] ?? '')));
   return { rejected: v.verdict === 'reject' || unverifiable.length > 0, unverifiable };
 }
 
@@ -8464,8 +8510,18 @@ function machineColdReadPrompt(opts: {
    * case to HELD for doing exactly what the driver instructed.
    */
   widenedPaths?: { files: string[]; reason: string } | null;
+  /**
+   * Test files this resolution edited. They are in scope by predicate
+   * (`checks.json`'s `testPaths`) and resolve no markers, so without saying so
+   * the reader sees the standard reject shape — a diff touching files it was
+   * told are not part of the conflict. Naming them turns that into the fourth
+   * question, which is the one the driver actually wants answered.
+   */
+  testEditPaths?: string[] | null;
 }): string {
   const gf = opts.gateFix ?? null;
+  const testEdits = opts.testEditPaths ?? [];
+  const asksQ4 = !gf && testEdits.length > 0;
   const lines: string[] = [
     `# Cold-read request — ${opts.id} (state-machine path)`,
     '',
@@ -8490,6 +8546,17 @@ function machineColdReadPrompt(opts: {
           '',
         ]
       : []),
+    ...(asksQ4
+      ? [
+          `TEST FILES EDITED BY THIS RESOLUTION: ${testEdits.join(', ')}`,
+          'The repository names those paths as tests. They are IN SCOPE for this case and',
+          'resolve no conflict markers: a test that asserts the pre-merge behaviour has to',
+          'move with the merge. Judge them under question 4, not as a scope violation.',
+          '',
+          `RECORD: ${TEST_EDIT_RESOLUTION_RULE}`,
+          '',
+        ]
+      : []),
     ...opts.contextLines,
     '',
     ...(gf
@@ -8507,13 +8574,14 @@ function machineColdReadPrompt(opts: {
     '',
     '## Cold-reader questions',
     ...(gf ? GATE_FIX_COLD_READ_QUESTIONS : COLD_READ_QUESTIONS),
+    ...(asksQ4 ? [TEST_EDIT_QUESTION] : []),
     '',
     '## Output',
     'Print ONLY a JSON object on the final line — no prose around it:',
     '```json',
-    '{"verdict":"confirm|reject","answers":{"q1":"...","q2":"...","q3":"..."},"notes":"...","feedback":"..."}',
+    `{"verdict":"confirm|reject","answers":{"q1":"...","q2":"...","q3":"..."${asksQ4 ? ',"q4":"..."' : ''}},"notes":"...","feedback":"..."}`,
     '```',
-    '- `reject` if any of Q1-Q3 fails, or answer `UNVERIFIABLE-FROM-REQUEST` for a point you cannot judge (fail-closed).',
+    `- \`reject\` if any of Q1-Q${asksQ4 ? '4' : '3'} fails, or answer \`UNVERIFIABLE-FROM-REQUEST\` for a point you cannot judge (fail-closed).`,
     '- `feedback`: 1-2 lines for the RESOLVING AGENT — why the reject / what is off (omit when nothing is).',
   );
   return lines.join('\n');
@@ -12283,13 +12351,23 @@ export async function cmdSweepReportCase(
 
   // Scope guard (recomputed automerge/paths + config-derived mode).
   //
+  // TWO ROUTES REACH A NON-CONFLICTED FILE, and the guard admits both.
+  //
   // WIDENED PATHS (`--not-my-bug`, owner = interaction): when both sides of the
   // merge are green in isolation and only the merged tree is red, no upstream
   // branch owns the failure — it is this merge's own, and the fix lives in files
   // that are not conflicted. The driver journals the widening; the guard reads it
-  // back so those edits pass instead of reading as a scope violation. This is
-  // the one owner-sanctioned special case: let the agent edit
-  // non-conflicted files, and let the cold read accept it.
+  // back so those edits pass instead of reading as a scope violation.
+  //
+  // TEST FILES (`checks.json`'s `testPaths`): a resolution changes what the
+  // merged code does, and a test asserting the old behaviour has to move with
+  // it. Admitted by PREDICATE and not by a list — the driver cannot name the
+  // test in advance, and an agent that updates the test TOGETHER with the
+  // resolution never produces a red run naming it, so anything conditional on a
+  // failure would forbid the very behaviour the case wants.
+  //
+  // Both are file-level admissions with no markers to bound edits by, and the
+  // cold read is what judges the content in either case.
   const widenRows = journal.filter(
     (e) => e.action === 'scope-widened' && e.caseId === caseId && Array.isArray(e.files),
   );
@@ -12303,11 +12381,22 @@ export async function cmdSweepReportCase(
   // widened file has no markers, so every edit in it would be a hunk violation
   // and the widening would be inert — the extra-file violation simply renamed.
   // They are exempt from the hunk check and file-level allowed instead.
+  // The repo's own answer to "which files are tests", read once and reused by
+  // the gate below. A GATE FIX is untouched: its scope is the failing files plus
+  // whatever fixing them forces, measured as reach, and there is no merged
+  // behaviour for a test to be brought into step with.
+  const checksConfig = loadChecksConfig(checksFile);
+  const testPaths = isGateFixCase ? [] : (checksConfig?.testPaths ?? []);
   const guard = await scopeGuard(cli.repo, rc.automergeTree, resolvedTree, allowedPaths, rc.scopeGuardMode, {
     // A carried path holds the prior resolution, not an automerge blob, so it
     // has no marker spans to bound edits by — file-level allowed, like a widening.
     hunkExempt: [...widenedPaths, ...(rc.carriedPaths ?? [])],
+    allowedGlobs: testPaths,
   });
+  /** Test files this resolution edited that nothing else already had it in scope for. */
+  const testEditPaths = guard.changedPaths.filter(
+    (p) => globMatchAny(testPaths, p) && !allowedPaths.includes(p),
+  );
 
   // Adequacy: duplicate detection (ERR06) — mechanical.
   // (Skipped for a REISSUE: its PR already exists — adequacy was settled at the
@@ -12346,9 +12435,13 @@ export async function cmdSweepReportCase(
   // Effective tier: a claim of `held`, a reissue revision (never merges
   // in place — republished to the existing review PR at finish), or a checks/cap
   // demotion (5a/5b) all force HELD; otherwise the claim under its floor.
+  // A TEST EDIT FLOORS THE CASE AT JUDGED. The edit reaches a file no conflict
+  // named, on the agent's own reading of what the merge now asserts — which is
+  // a judgement, and `mechanical` is the claim that no judgement was needed.
+  // Parity with the driver-widened paths, which merge judged in place already.
   let effectiveTier: Tier = applyFloor(
     claimed === 'held' ? 'judged' : claimed,
-    rc.tierFloor === 'judged' ? 'judged' : 'clean',
+    rc.tierFloor === 'judged' || testEditPaths.length > 0 ? 'judged' : 'clean',
   );
   if (claimed === 'held') effectiveTier = 'held';
   if (isReissue) effectiveTier = 'held';
@@ -12459,6 +12552,11 @@ export async function cmdSweepReportCase(
     return 0;
   }
 
+  // The test edit is on the record BEFORE anything judges it: which tests a
+  // resolution moved is a fact about the pass, and the cold read's verdict on
+  // it is a separate row.
+  if (testEditPaths.length > 0) appendJournal(dir, { action: 'test-edit', caseId, files: testEditPaths });
+
   // ---- 4. claim == held + conflicts present → PRISTINE HELD DRAFT -----------
   // The agent could not resolve (held) and left the conflict pristine. Reset the
   // worktree to the pristine conflict (already pristine — no agent edits to
@@ -12511,7 +12609,7 @@ export async function cmdSweepReportCase(
     result(cli, { instruction: badChecks.detail, tier: claimed, issues: [...issues, badChecks] });
     return 1;
   }
-  const checks = loadChecksConfig(checksFile);
+  const checks = checksConfig;
   if (checks) {
     // THE ENVIRONMENT THE CHECKS RUN IN COMES FROM THE RESOLVED MANIFESTS.
     //
@@ -12969,6 +13067,7 @@ export async function cmdSweepReportCase(
     conflictedPaths: rc.conflictedPaths,
     contextLines: await caseContextLines(cli, rc, caseRow?.reproduction),
     widenedPaths: widenedPaths.length > 0 ? { files: widenedPaths, reason: widenedReason } : null,
+    testEditPaths,
     conflictDiff: conflictDiff.slice(0, 60000),
     resolutionDiff: resolutionDiff.slice(0, 60000),
     // A gate fix is judged on the FAILING CHECK, not on conflict hunks it has
@@ -12998,7 +13097,7 @@ export async function cmdSweepReportCase(
     result(cli, { instruction: detail, tier: effectiveTier, issues: [...issues, { id: 'ERR35_COLDREAD_UNAVAILABLE', detail }] });
     return 1;
   }
-  const { rejected, unverifiable } = coldReadRejected(verdict);
+  const { rejected, unverifiable } = coldReadRejected(verdict, !isGateFixCase && testEditPaths.length > 0);
   const feedback = boundedFeedback(verdict);
   appendJournal(dir, {
     action: 'coldread',

@@ -177,6 +177,18 @@ one signature, or fields to one type, the right resolution unions them and updat
 call sites, and the call sites usually live outside the pending files. Make those edits
 anyway, expect the case to end HELD, and explain the reach in the pull-request text.
 
+TEST FILES ARE IN SCOPE, ALWAYS, in a conflict or reissue case. A resolution changes
+what the merged code does, and the test that asserts the pre-merge behavior has to
+change with it — so update it in the same pass, before the gate ever reports it, and do
+not wait to be told. That is the point: a test you fix together with the resolution
+never shows up red, and the permission does not depend on it having failed. Say in the
+pull-request text which tests you edited and why. What you may NOT do is make a test
+stop asking its question: a skip, a deletion, a loosened assertion, or a test edited for
+anything other than this resolution. The reviewer is told which test files you touched
+and asks exactly that (§9), and nothing else in the pass will catch it — the checks gate
+and the finish build both run a weakened test and both pass it. Editing a test also
+means the case cannot land as `mechanical`; `judged` is the floor.
+
 The driver can also widen your scope itself: a result with `status: "scope-widened"`
 (or the id `WARN12_SCOPE_WIDENED`) names files that now count as in scope for this
 case. Fix the failure there and re-run `report-case`; the reviewer is told those files
@@ -322,6 +334,13 @@ the surrounding code depends on. Resolve so those three answers are yes, yes, no
 questions become: does the change plausibly make the named check pass, and is every
 hunk explained by that failure alone — a gate-fix case is the one place an unrelated
 "improvement" is most tempting and most reliably rejected.
+
+When you edited a test file, the reviewer is given the list and asked a FOURTH
+question: is each edit required by this resolution — does the test now assert the
+merged behavior — and does it keep asking the same question? A test edit that is
+unrelated to the resolution, or that skips, deletes or weakens an assertion, is
+rejected on that question alone. It is an ordinary content rejection and follows the
+two-strike path below.
 
 A first rejection returns the reviewer's short feedback: revise the resolution in the
 worktree and run `report-case` again. A second rejection ends the retrying — the case

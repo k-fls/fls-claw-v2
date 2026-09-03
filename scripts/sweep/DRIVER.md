@@ -1631,7 +1631,29 @@ driver itself widened (§7.2) are allowed at file level and exempt from the hunk
 check — a widened file has no markers, so every edit in it would otherwise read as
 a hunk violation and the widening would be inert.
 
-The widening is the ONLY path extension the driver computes. A resolution that
+TEST FILES are the second admission, and the only one decided by PREDICATE: a
+path matching `checks.json`'s `testPaths` is in scope for every conflict and
+reissue case, hunk-exempt for the same reason a widened file is. A resolution
+changes what the merged code does and the test asserting the pre-merge behaviour
+has to move with it — and the driver cannot name that test in advance, which is
+why the rule is a predicate and not a list. It is UNCONDITIONAL, never
+conditional on the test having already failed: an agent that updates the test
+together with the resolution never produces a red run naming it, so a
+failure-gated rule would forbid exactly the behaviour the case wants. An empty or
+absent `testPaths` admits nothing. Gate-fix cases are untouched — their scope is
+measured as reach, and there is no merged behaviour for a test to be brought into
+step with.
+
+A test edit FLOORS the case at `judged`: reaching a file no conflict named, on
+the agent's reading of what the merge now asserts, is a judgement, and
+`mechanical` is the claim that none was needed. The edited paths are journaled
+`test-edit` and named to the cold read, which asks the fourth question about them
+(§7.5). NOTHING ELSE ASKS IT: the checks gate runs the edited test, and a
+weakened test passes it; `finish`'s integration verify runs the same suite and
+passes it too. A test bent until it stops complaining is green everywhere except
+in the cold read, so the cold read is where it is caught or not at all.
+
+Those two are the only path extensions the driver computes. A resolution that
 unions parameters or fields and must therefore touch call sites outside the
 conflicted files trips the guard like any other extra file, and is carried to the
 cold read as scope-exceeded (below).
@@ -1685,6 +1707,14 @@ verdict's content is journaled on the `resolved` entry for the audit trail.
   is retried on a backoff (auth auto-refreshes into the credentials file) and then
   hard-halts as `ERR35_COLDREAD_UNAVAILABLE`: the case is neither rejected nor
   frozen, and the command is re-runnable once the tooling is restored.
+- **A FOURTH QUESTION, when the resolution edited a test file.** The request
+  names the edited paths, states the record a test edit is judged against — the
+  edit is justified only by this resolution, and one that stops a question being
+  asked contradicts it — and asks whether each edit is required by the resolution
+  and still asks the same question. An `UNVERIFIABLE-FROM-REQUEST` on it is a
+  reject like any other. A rejected test edit is a CONTENT reject on the ordinary
+  two-strike path, never a scope escalation: the file was in scope, and what was
+  refused is what the edit did to it.
 - **Rejections are COUNTED per case.** The 1st reject does NOT freeze — the
   reviewer's short feedback is returned for a revise-and-retry. The 2nd
   (`COLDREAD_REJECT_LIMIT`) stops the retrying and passes the case HELD as a

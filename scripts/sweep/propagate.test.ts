@@ -23,6 +23,7 @@ import {
   failureSummary,
   firstRedParticipant,
   guardRef,
+  loadChecksConfig,
   type InstallResult,
   type InstallRunner,
 } from './propagate.js';
@@ -1464,6 +1465,49 @@ describe('the checks runner — a command that never ran is not a failing check'
     expect(res.ok).toBe(false);
     expect(res.environmentFault).toBeUndefined();
     expect(res.output).toContain('boom');
+  });
+});
+
+describe('the checks config — testPaths is the repo\'s own answer to "which files are tests"', () => {
+  function write(json: string): string {
+    const f = join(mkdtempSync(join(tmpdir(), 'checks-')), 'checks.json');
+    writeFileSync(f, json);
+    return f;
+  }
+
+  it('parses the globs and normalizes away anything that is not a string', () => {
+    const f = write(
+      JSON.stringify({
+        typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }],
+        test: [{ cmd: 'vitest run', cwd: '.' }],
+        testPaths: ['**/*.test.ts', 42, null, '**/*.spec.ts', { glob: 'no' }],
+      }),
+    );
+    expect(loadChecksConfig(f)!.testPaths).toEqual(['**/*.test.ts', '**/*.spec.ts']);
+  });
+
+  /**
+   * FAIL-CLOSED, and by exactly the same route in every direction it can be
+   * wrong: absent, the wrong type, or a list of the wrong things. An empty glob
+   * set admits no path, so a repo that never named its tests keeps the rule it
+   * has today — the test file is an extra file and the case is held.
+   */
+  it('an absent, mistyped or empty key all yield no globs', () => {
+    const absent = write(JSON.stringify({ typecheck: [], test: [] }));
+    expect(loadChecksConfig(absent)!.testPaths).toEqual([]);
+    const mistyped = write(JSON.stringify({ typecheck: [], test: [], testPaths: '**/*.test.ts' }));
+    expect(loadChecksConfig(mistyped)!.testPaths).toEqual([]);
+    const empty = write(JSON.stringify({ typecheck: [], test: [], testPaths: [] }));
+    expect(loadChecksConfig(empty)!.testPaths).toEqual([]);
+  });
+
+  it('the commands are untouched by the new key, and an unreadable file is still null', () => {
+    const f = write(JSON.stringify({ typecheck: [{ cmd: 'tsc' }], test: [{ cmd: 'vitest' }], testPaths: ['**/*.test.ts'] }));
+    const c = loadChecksConfig(f)!;
+    expect(c.typecheck).toEqual([{ cmd: 'tsc' }]);
+    expect(c.test).toEqual([{ cmd: 'vitest' }]);
+    expect(loadChecksConfig(write('{ not json'))).toBeNull();
+    expect(loadChecksConfig(undefined)).toBeNull();
   });
 });
 

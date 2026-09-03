@@ -16,6 +16,7 @@
  * agent-writable case file.
  */
 import { git } from './git.js';
+import { globMatchAny } from './globs.js';
 import type { ScopeGuardMode } from './types.js';
 
 export interface ScopeGuardResult {
@@ -111,16 +112,33 @@ export async function scopeGuard(
      * File-level allowed is the entire point for these.
      */
     hunkExempt?: string[];
+    /**
+     * Globs whose matching paths are IN SCOPE without being named: the repo's
+     * own `testPaths`. A resolution changes what the merged code does, and the
+     * test that asserts the old behaviour has to move with it — so the test file
+     * is admitted by PREDICATE rather than by a list nobody could write in
+     * advance. Admitted paths carry no conflict markers, so they are hunk-exempt
+     * for the same reason a driver-widened file is: every edit in them would
+     * otherwise read as a hunk violation and the admission would be inert.
+     *
+     * The cold read is what judges them — the guard only says they are allowed
+     * to be there.
+     */
+    allowedGlobs?: string[];
   } = {},
 ): Promise<ScopeGuardResult> {
   const allowed = new Set(conflictedPaths);
   const exempt = new Set(opts.hunkExempt ?? []);
+  const allowedGlobs = opts.allowedGlobs ?? [];
+  const admitted = (p: string): boolean => allowed.has(p) || globMatchAny(allowedGlobs, p);
   const changedPaths = await diffNameOnly(repo, automergeTree, resolvedTree);
-  const extraPaths = changedPaths.filter((p) => !allowed.has(p));
+  const extraPaths = changedPaths.filter((p) => !admitted(p));
   const hunkViolations: string[] = [];
   if (mode === 'conflict-hunks') {
     for (const p of changedPaths) {
-      if (!allowed.has(p) || exempt.has(p)) continue; // extra-file violation already, or driver-widened
+      // Extra-file violation already, or admitted without markers to bound by
+      // (driver-widened, carried, or glob-admitted).
+      if (!allowed.has(p) || exempt.has(p)) continue;
       if (!(await hunkWithinMarkers(repo, automergeTree, resolvedTree, p))) hunkViolations.push(p);
     }
   }

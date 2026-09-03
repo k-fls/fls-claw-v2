@@ -6,5 +6,6 @@
   "test": [
     { "cmd": "pnpm test", "cwd": ".", "filter": "pnpm test {files}" },
     { "cmd": "bun test", "cwd": "container/agent-runner", "filter": "bun test {files}" }
-  ]
+  ],
+  "testPaths": ["**/*.test.ts", "**/*.test.tsx", "**/*.spec.ts"]
 }

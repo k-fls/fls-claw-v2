@@ -10232,3 +10232,199 @@ describe('run — a swept branch that MOVED under the open pass (the stale-case 
     expect(journal.filter((e) => e.action === 'case' && e.caseId === caseId).length).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// TEST FILES ARE IN SCOPE, and the cold read is the only thing that judges them.
+// The predicate comes from the repo (`checks.json`'s `testPaths`); the guard
+// admits the path, the tier floors at judged, and the fourth question asks
+// whether the edit is this resolution's and still asks its question.
+// ---------------------------------------------------------------------------
+
+describe('sweep report-case — a resolution that brings its test along', () => {
+  /** A checks file that names test paths and configures NO commands: the gate
+   * is skipped, so these fixtures exercise the scope/tier/cold-read path alone. */
+  function testPathsChecks(ws: string, testPaths: string[] = ['**/*.test.ts']): string {
+    const f = join(ws, 'checks.json');
+    writeFileSync(f, JSON.stringify({ typecheck: [], test: [], testPaths }));
+    return f;
+  }
+
+  async function caseWithTestEdit(
+    repo: FixtureRepo,
+    ws: string,
+    inv: string,
+    testPaths?: string[],
+  ): Promise<{ dir: string; caseId: string }> {
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: testPathsChecks(ws, testPaths) }));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
+    const dir = dirOf(repo, ws);
+    const caseId = currentCaseId(dir);
+    // The agent resolves the conflict AND moves the test that asserted the
+    // pre-merge behaviour — in one pass, so no red run ever names the test.
+    resolveWorktree(dir, caseId, {
+      'src/x.ts': 'RESOLVED\n',
+      'src/x.test.ts': 'expect(x).toBe("RESOLVED")\n',
+    });
+    return { dir, caseId };
+  }
+
+  it('a test edit is IN SCOPE, journaled, and floors a mechanical claim at judged', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const { dir, caseId } = await caseWithTestEdit(repo, ws, inv);
+    const beforeTip = repo.sha('main_patched');
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true, out }),
+        confirm,
+      ),
+    ).toBe(0);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { tier: string };
+    // Not a scope violation…
+    expect(readJournal(dir).some((e) => e.action === 'scope-violation' && e.caseId === caseId)).toBe(false);
+    expect(readJournal(dir).find((e) => e.action === 'test-edit' && e.caseId === caseId)!.files).toEqual([
+      'src/x.test.ts',
+    ]);
+    // …and not mechanical either: the edit reaches a file no conflict named, on
+    // the agent's reading of what the merge now asserts. That is a judgement.
+    expect(res.tier).toBe('judged');
+    expect(machineState(dir).currentCase?.tier).toBe('judged');
+    expect(repo.sha('main_patched')).toBe(beforeTip); // judged lands at report-pr, not here
+  });
+
+  it('with no testPaths configured the same edit is an ordinary scope violation', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const { dir, caseId } = await caseWithTestEdit(repo, ws, inv, []);
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true }),
+        confirm,
+      ),
+    ).toBe(0);
+    const violation = readJournal(dir).find((e) => e.action === 'scope-violation' && e.caseId === caseId)!;
+    expect(violation.extraPaths).toEqual(['src/x.test.ts']);
+    expect(readJournal(dir).some((e) => e.action === 'test-edit')).toBe(false);
+    const held = readJournal(dir).find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect((held.escalation as { tag: string }).tag).toBe('[AUTO-ESCALATED: scope exceeded]');
+  });
+
+  it('the cold-read request names the edited tests, carries the record, and asks the fourth question', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const { dir, caseId } = await caseWithTestEdit(repo, ws, inv);
+    let prompt = '';
+    const capture: ColdReadInvoker = async (p) => {
+      prompt = p;
+      return { verdict: 'confirm', answers: { q1: 'ok', q2: 'ok', q3: 'ok', q4: 'ok' }, notes: '' };
+    };
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true }),
+        capture,
+      ),
+    ).toBe(0);
+    expect(prompt).toContain('TEST FILES EDITED BY THIS RESOLUTION: src/x.test.ts');
+    expect(prompt).toContain('Judge them under question 4, not as a scope violation.');
+    expect(prompt).toContain('RECORD: a test edit is justified only by this resolution');
+    expect(prompt).toContain('a skipped, deleted or weakened assertion — contradicts this record');
+    expect(prompt).toContain('4. For each edited test file');
+    expect(prompt).toContain('"q4":"..."');
+    expect(prompt).toContain('`reject` if any of Q1-Q4 fails');
+    expect(caseId).toBeTruthy();
+    expect(readJournal(dir).some((e) => e.action === 'coldread' && e.rejected === false)).toBe(true);
+  });
+
+  /** No block, no question — an ordinary resolution's reader is asked three. */
+  it('a resolution that edits no test file is asked three questions and no more', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: testPathsChecks(ws) }));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
+    const dir = dirOf(repo, ws);
+    resolveWorktree(dir, currentCaseId(dir), { 'src/x.ts': 'RESOLVED\n' });
+    let prompt = '';
+    const capture: ColdReadInvoker = async (p) => {
+      prompt = p;
+      return { verdict: 'confirm', answers: { q1: 'ok', q2: 'ok', q3: 'ok' }, notes: '' };
+    };
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true }),
+        capture,
+      ),
+    ).toBe(0);
+    expect(prompt).not.toContain('TEST FILES EDITED BY THIS RESOLUTION');
+    expect(prompt).not.toContain('4. For each edited test file');
+    expect(prompt).toContain('`reject` if any of Q1-Q3 fails');
+  });
+
+  /**
+   * AN UNRELATED OR WEAKENED TEST EDIT IS A CONTENT REJECT, on the ordinary
+   * two-strike path — NOT a scope escalation. The file was in scope; what was
+   * refused is what the edit did to it, and the agent gets one revision.
+   */
+  it('a q4 rejection revises once, then holds with the two-strike escalation — never a scope tag', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const { dir, caseId } = await caseWithTestEdit(repo, ws, inv);
+    const rejectQ4: ColdReadInvoker = async () => ({
+      verdict: 'reject',
+      answers: { q1: 'ok', q2: 'ok', q3: 'ok', q4: 'src/x.test.ts drops the assertion entirely — unrelated to this merge' },
+      notes: 'the test edit stops the question being asked',
+      feedback: 'src/x.test.ts no longer asserts anything — restore the assertion against the merged behaviour',
+    });
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true, out }),
+        rejectQ4,
+      ),
+    ).toBe(1);
+    const first = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string };
+    expect(first.instruction).toContain('revise the resolution');
+    expect(first.instruction).toContain('no longer asserts anything');
+    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
+    expect(machineState(dir).phase).toBe('case-ready');
+    // SECOND: the retrying stops. The file was IN SCOPE, so the tag is the
+    // two-strike one and not `scope exceeded`.
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true, out }),
+        rejectQ4,
+      ),
+    ).toBe(0);
+    const held = readJournal(dir).find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect((held.escalation as { tag: string }).tag).toBe('[AUTO-ESCALATED: cold read rejected 2x]');
+    expect(readJournal(dir).some((e) => e.action === 'scope-violation' && e.caseId === caseId)).toBe(false);
+  });
+
+  /** Fail-closed on the fourth question too: a reader that cannot judge the
+   * test edit from the request has not cleared it. */
+  it('UNVERIFIABLE-FROM-REQUEST on q4 is a rejection under an overall confirm', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const { dir, caseId } = await caseWithTestEdit(repo, ws, inv);
+    const blind: ColdReadInvoker = async () => ({
+      verdict: 'confirm',
+      answers: { q1: 'ok', q2: 'ok', q3: 'ok', q4: 'UNVERIFIABLE-FROM-REQUEST' },
+      notes: 'I cannot tell what the test asserted before',
+    });
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', execute: true }),
+        blind,
+      ),
+    ).toBe(1);
+    const row = readJournal(dir).find((e) => e.action === 'coldread' && e.caseId === caseId)!;
+    expect(row.rejected).toBe(true);
+    expect(row.unverifiable).toEqual(['q4']);
+  });
+});

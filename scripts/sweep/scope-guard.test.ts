@@ -88,3 +88,63 @@ describe('scopeGuard — conflict-hunks mode', () => {
     expect(strict.hunkViolations).toEqual([]);
   });
 });
+
+// --- allowedGlobs: paths admitted by predicate (the repo's own testPaths) ----
+
+describe('scopeGuard — allowedGlobs', () => {
+  const g = initFixtureRepo();
+  afterAll(() => g.destroy());
+  g.commit('base', { 'src/app.ts': 'a\nb\nMID\nd\ne\n', 'src/app.test.ts': 'assert(1)\n' });
+  g.checkout('ours', { create: true, at: 'main' });
+  g.commit('ours: MID -> FORK', { 'src/app.ts': 'a\nb\nFORK\nd\ne\n' });
+  g.checkout('main');
+  g.checkout('theirs', { create: true, at: 'main' });
+  g.commit('theirs: MID -> UP1', { 'src/app.ts': 'a\nb\nUP1\nd\ne\n' });
+  g.checkout('main');
+
+  /** The automerge tree with the conflict resolved AND the test updated with it. */
+  async function resolvedWithTestEdit(automergeTree: string): Promise<string> {
+    const amCommit = g.git('commit-tree', automergeTree, '-m', 'am');
+    const wt = await addTempWorktree(g.dir, amCommit);
+    try {
+      writeFileSync(join(wt.path, 'src/app.ts'), 'a\nb\nMERGED\nd\ne\n');
+      writeFileSync(join(wt.path, 'src/app.test.ts'), 'assert(MERGED)\n');
+      g.git('-C', wt.path, 'add', '-A');
+      g.git('-C', wt.path, 'commit', '-m', 'resolve + move the test with it');
+      return g.git('-C', wt.path, 'rev-parse', 'HEAD^{tree}');
+    } finally {
+      await wt.remove();
+    }
+  }
+
+  it('admits a changed path matching a glob, and holds it when no glob is configured', async () => {
+    const mt = await newStyleMergeTree(g.dir, 'ours', 'theirs');
+    expect(mt.conflictFiles).toEqual(['src/app.ts']);
+    const resolved = await resolvedWithTestEdit(mt.treeOid);
+    // No globs: the test file is an extra file like any other — today's rule,
+    // and what an absent `testPaths` key still buys.
+    const closed = await scopeGuard(g.dir, mt.treeOid, resolved, ['src/app.ts']);
+    expect(closed.ok).toBe(false);
+    expect(closed.extraPaths).toEqual(['src/app.test.ts']);
+    // With the repo's own test globs, the same edit is in scope.
+    const open = await scopeGuard(g.dir, mt.treeOid, resolved, ['src/app.ts'], 'same-files', {
+      allowedGlobs: ['**/*.test.ts'],
+    });
+    expect(open.ok).toBe(true);
+    expect(open.extraPaths).toEqual([]);
+    expect(open.changedPaths).toContain('src/app.test.ts');
+  });
+
+  it('a glob-admitted path is HUNK-EXEMPT: it carries no markers to bound edits by', async () => {
+    const mt = await newStyleMergeTree(g.dir, 'ours', 'theirs');
+    const resolved = await resolvedWithTestEdit(mt.treeOid);
+    // The conflicted file is still hunk-checked (this resolution stays inside
+    // its markers), while the admitted test file — every line of which is
+    // outside any marker span, there being none — is not checked at all.
+    const strict = await scopeGuard(g.dir, mt.treeOid, resolved, ['src/app.ts'], 'conflict-hunks', {
+      allowedGlobs: ['**/*.test.ts'],
+    });
+    expect(strict.ok).toBe(true);
+    expect(strict.hunkViolations).toEqual([]);
+  });
+});
