@@ -886,11 +886,16 @@ cannot make a probe look healed.
 
 **"Mergeable"** is a local `merge-tree` probe against the target as it stands on
 origin. **"Checks green"** is the DRIVER'S OWN checks gate — the one
-`report-case` runs — on the MERGED tree; never GitHub check-runs, never
-`mergeable` polling. No configured checks and no usable environment both mean NO
-VERDICT, and no verdict reads as green: every consequence of red here is an
-intervention on somebody's pull request, and the driver does not intervene on a
-measurement it did not take.
+`report-case` runs, TYPECHECK THEN TEST — on the MERGED tree; never GitHub
+check-runs, never `mergeable` polling. The whole battery, because this is that
+gate asked about a different tree: a probe that measured half of it would call a
+tree green that the driver's own gate refuses, and then act on the word — an
+owner's pull request left alone as passing, a driver answer landed on an
+approval. The cheap kind runs first and the walk stops at the first kind that is
+red; the answer is decided and the second kind buys nothing. No configured checks
+and no usable environment both mean NO VERDICT, and no verdict reads as green:
+every consequence of red here is an intervention on somebody's pull request, and
+the driver does not intervene on a measurement it did not take.
 
 **A RED IS RE-RUN BEFORE IT IS BELIEVED, because DELETE is the one row the next
 pass cannot walk back.** Rebase, rebuild, leave and draft-and-report all
@@ -912,6 +917,7 @@ tree was not measured, so there is no verdict to act on.
 | driver | same conflict, base moved | rebase the ref; keep the PR and its body |
 | driver | conflict changed or superset | rebuild the ref; the body no longer matches |
 | driver | answer, mergeable + checks green | approved → land it (verify-gated); else rebase if the base moved |
+| driver | answer, mergeable, red on the check its body documents | hold: the red is what the PR reports |
 | driver | answer, not mergeable or checks red | delete the ref (the PR closes); proceed as a fresh case |
 | OWNER | mergeable + checks green | leave it alone entirely |
 | OWNER | not mergeable or checks red | convert to draft + comment ONCE; report at finish |
@@ -923,6 +929,28 @@ deleted and reported, never force-rebuilt. A rebase or rebuild pushes onto the
 SAME ref under a lease against the head this pass classified; deriving a fresh
 name from a changed conflict would mint a second ref and a second PR for one
 case.
+
+A DIAGNOSIS IS RED BY CONSTRUCTION, and the delete row does not reach it. A
+gate-fix hold that could not be fixed inside the case's named files reports the
+failure instead of repairing it, so it fails the checks it was opened about for
+as long as the defect stands. Deleting it for that red closes the review thread
+where the decision lives and buys the owner a new pull request number for the
+same finding every pass: the case derives again, the agent reaches the same
+conclusion, and a second diagnosis is published. It is HELD instead. Both bounds
+are checked — the head must still MERGE (a diagnosis that no longer applies is a
+stale answer like any other), and EVERY command failing now must be one the
+head's OWN machine block records, so a head that documents one failure and now
+fails a different one goes down the ordinary row.
+
+WHAT IS MATCHED IS THE `(command, cwd)` PAIR, and the subtree deliberately is
+not. The exact identity of a failure is `(command, cwd, subtree oid)` (§10.2),
+but that triple is NOT derivable across passes here: the body records the subtree
+at the head the driver published, while the question is about the MERGED tree,
+which changes every time the target moves under an open pull request. A subtree
+gate would hold on the pass that opened the PR and silently stop holding on every
+pass after it. The pair is weaker and the weakness is spent in the safe
+direction, because this decides HOLD versus DELETE and delete is the one row the
+next pass cannot walk back. The files digest decides nothing, here or anywhere.
 
 A DRIVER-shaped answer whose checks are red is deleted and re-derived WHATEVER
 its draft flag says. The flag records how the last pass could offer the head; the

@@ -129,6 +129,7 @@ import {
   convertPullRequestToDraft,
   hasMachineLine,
   parseMachineLines,
+  parseSweepFailures,
   renderSweepContested,
   renderSweepFailure,
   renderSweepTwin,
@@ -3778,6 +3779,46 @@ async function machineFactLines(cli: Cli, dir: string, caseId: string, headSha: 
     if (c) lines.push(renderSweepContested({ cmd: c.cmd, subtree: c.subtree, greenOn: c.greenOn }));
   }
   return lines;
+}
+
+/**
+ * IS THIS RED THE PULL REQUEST'S OWN SUBJECT MATTER?
+ *
+ * A gate-fix hold that could not be fixed inside the case's named files
+ * DOCUMENTS a failure instead of repairing it, so it fails the checks it was
+ * opened about — by construction, and for as long as the defect stands. The
+ * ordinary disposition for a driver answer that no longer passes is to delete
+ * the ref, and applied here that mints a fresh pull request number for the same
+ * finding every pass and closes the review thread each time.
+ *
+ * WHAT IS MATCHED, AND WHY IT IS NOT THE EXACT ONE. The exact identity of a
+ * failure is `(command, cwd, subtree oid)` (`renderSweepFailure`), and the
+ * subtree in it is NOT derivable across passes here: the body records the
+ * subtree at the head the driver published, while the question being asked is
+ * about the MERGED tree, which changes every time the target moves under an open
+ * pull request. A subtree gate would therefore hold on the pass that opened the
+ * PR and silently stop holding on every pass after it — exactly backwards. So
+ * the match is the `(command, cwd)` PAIR, which the body carries verbatim and
+ * which nothing about a moving base can change.
+ *
+ * That pair is weaker than the triple, and the weakness is spent in the safe
+ * direction: this decides HOLD versus DELETE, and delete is the one row the next
+ * pass cannot walk back. It is also bounded on both sides — the ref must be a
+ * gate-fix ref, and EVERY command failing now must be one the body records, so a
+ * head that documents one failure and now fails another is a stale answer like
+ * any other and goes down the ordinary row. The files digest decides nothing
+ * here, as its own contract requires.
+ */
+function diagnosisOwnsRed(ref: string, branch: string, body: string, failed: VerifyCommand[]): boolean {
+  const prefix = 'fix/sweep/';
+  if (!ref.startsWith(prefix)) return false;
+  const rest = ref.slice(prefix.length).slice(slug(branch).length + 2); // past '<slug(branch)>--'
+  if (!isGateFixCaseId(rest)) return false;
+  if (failed.length === 0) return false;
+  const at = (cwd: string | undefined): string => (cwd && cwd !== '.' ? cwd : '.');
+  const documented = new Set(parseSweepFailures(body).map((f) => `${at(f.cwd)} :: ${f.cmd}`));
+  if (documented.size === 0) return false;
+  return failed.every((c) => documented.has(`${at(c.cwd)} :: ${c.cmd}`));
 }
 
 /** Trees whose landing verdict CHANGED on the identical tree — measured, and still unanswered. */
@@ -9474,12 +9515,28 @@ async function exhibitedConflict(repo: string, head: string): Promise<ConflictHu
 interface MergedChecksVerdict {
   green: boolean;
   undecided: { id: string; detail: string } | null;
+  /**
+   * The commands that failed on BOTH runs — the red, with the directory each
+   * ran in, because a command name alone does not identify a check.
+   *
+   * Empty on green and on every undecided verdict, because neither of those is
+   * a red and a reader that acts on this list must not be handed one.
+   */
+  failed: VerifyCommand[];
 }
 
 /**
  * "Checks green" is the DRIVER'S OWN gate — the one `report-case` runs — on the
  * MERGED tree, never GitHub's check-runs: the sweep judges by the checks it
  * ships with, on the tree the merge would actually produce.
+ *
+ * THE WHOLE BATTERY, TYPECHECK THEN TEST, because that is what `report-case`
+ * runs and this is the same gate asked about a different tree. A probe that
+ * measured half of it would call a tree green that the driver's own gate
+ * refuses, and then act on the word: an owner's pull request left alone as
+ * passing, a driver answer landed on an approval. The order is the cheap half
+ * first, and the walk stops at the first kind that is red — the answer is
+ * already decided and the second kind buys nothing.
  *
  * No configured checks and no usable environment both mean NO VERDICT, and no
  * verdict reads as green: every consequence of red here is an intervention on
@@ -9502,34 +9559,34 @@ async function mergedChecksGreen(
   mergedTree: string,
   parents: string[],
 ): Promise<MergedChecksVerdict> {
-  const green: MergedChecksVerdict = { green: true, undecided: null };
+  const green: MergedChecksVerdict = { green: true, undecided: null, failed: [] };
+  const undecided = (id: string, detail: string): MergedChecksVerdict => ({
+    green: false,
+    undecided: { id, detail },
+    failed: [],
+  });
   const checks = loadChecksConfig(checksFile);
-  if (!checks || checks.typecheck.length === 0) return green;
+  if (!checks || checks.typecheck.length + checks.test.length === 0) return green;
   const probe = await deterministicCommit(cli.repo, mergedTree, parents, 'sweep: checks probe on the merged tree');
   const wt = await addTempWorktree(cli.repo, probe);
   try {
     if (!(await installDeps(cli, wt.path)).ok) return green;
-    const first = await runChecks(checks.typecheck, wt.path);
-    if (first.environmentFault) {
-      return { green: false, undecided: { id: 'WARN14_ENVIRONMENT_FAULT', detail: first.environmentFault.detail } };
+    for (const kind of ['typecheck', 'test'] as const) {
+      const list = checks[kind];
+      if (list.length === 0) continue;
+      const first = await runChecks(list, wt.path);
+      if (first.environmentFault) return undecided('WARN14_ENVIRONMENT_FAULT', first.environmentFault.detail);
+      if (first.ok) continue;
+      const failedCommands = list.filter((c) => first.failedNames.includes(c.cmd));
+      const again = await runChecks(failedCommands, wt.path);
+      if (again.environmentFault) return undecided('WARN14_ENVIRONMENT_FAULT', again.environmentFault.detail);
+      const flaky = first.failedNames.filter((c) => !again.failedNames.includes(c));
+      if (flaky.length > 0) {
+        return undecided('WARN17_VERIFY_FLAKY', `${flaky.join(', ')} failed and then PASSED on a re-run of the same tree`);
+      }
+      return { green: false, undecided: null, failed: failedCommands };
     }
-    if (first.ok) return green;
-    const failed = checks.typecheck.filter((c) => first.failedNames.includes(c.cmd));
-    const again = await runChecks(failed, wt.path);
-    if (again.environmentFault) {
-      return { green: false, undecided: { id: 'WARN14_ENVIRONMENT_FAULT', detail: again.environmentFault.detail } };
-    }
-    const flaky = first.failedNames.filter((c) => !again.failedNames.includes(c));
-    if (flaky.length > 0) {
-      return {
-        green: false,
-        undecided: {
-          id: 'WARN17_VERIFY_FLAKY',
-          detail: `${flaky.join(', ')} failed and then PASSED on a re-run of the same tree`,
-        },
-      };
-    }
-    return { green: false, undecided: null };
+    return green;
   } finally {
     await wt.remove();
   }
@@ -9806,6 +9863,8 @@ async function deriveOriginMergeStatus(
       // exhibit's disposition turns on the conflict alone.
       let mergeable = false;
       let checksGreen = false;
+      /** The head's red is the failure its own body says it exists to document. */
+      let documentsItsRed = false;
       if (relation === null) {
         const probe = await newStyleMergeTree(cli.repo, targetTip, u.sha);
         mergeable = probe.clean;
@@ -9832,14 +9891,17 @@ async function deriveOriginMergeStatus(
             return 'blocked';
           }
           checksGreen = verdict.green;
+          documentsItsRed = !verdict.green && diagnosisOwnsRed(u.ref, u.branch, open.body, verdict.failed);
         }
       }
 
-      const action = disposeProposal({ shape, relation, mergeable, checksGreen, approved: false, baseMoved });
+      const action = disposeProposal({ shape, relation, mergeable, checksGreen, approved: false, baseMoved, documentsItsRed });
       const why =
         relation !== null
           ? `the conflict it exhibits is ${relation}`
-          : `it ${mergeable ? 'merges' : 'no longer merges'} and ${checksGreen ? 'passes' : 'does not pass'}`;
+          : documentsItsRed
+            ? `it merges, and the check(s) it fails are the ones it was opened to document`
+            : `it ${mergeable ? 'merges' : 'no longer merges'} and ${checksGreen ? 'passes' : 'does not pass'}`;
 
       if (action === 'leave' || action === 'hold') return 'blocked';
 

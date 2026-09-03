@@ -79,6 +79,7 @@ describe('disposeProposal — the disposition table, by consequence', () => {
     checksGreen: true,
     approved: false,
     baseMoved: false,
+    documentsItsRed: false,
     ...over,
   });
 
@@ -110,6 +111,24 @@ describe('disposeProposal — the disposition table, by consequence', () => {
     expect(disposeProposal(state({ mergeable: false }))).toBe('delete');
     expect(disposeProposal(state({ checksGreen: false }))).toBe('delete');
     expect(disposeProposal(state({ mergeable: false, approved: true }))).toBe('delete');
+  });
+
+  it('a DIAGNOSIS that still merges is HELD on the red it documents, never deleted', () => {
+    // The pull request exists to report a failure nobody could fix in the case's
+    // scope, so it fails the checks it was opened about for as long as the defect
+    // stands. Deleting it for that red closes the review thread and buys the
+    // owner a new PR number for the same finding every pass.
+    expect(disposeProposal(state({ checksGreen: false, documentsItsRed: true }))).toBe('hold');
+    // Approval does not land a red one — there is nothing to land.
+    expect(disposeProposal(state({ checksGreen: false, documentsItsRed: true, approved: true }))).toBe('hold');
+    // A moved base does not turn it into a rebase either: the exhibit is prose.
+    expect(disposeProposal(state({ checksGreen: false, documentsItsRed: true, baseMoved: true }))).toBe('hold');
+  });
+
+  it('a DIAGNOSIS that no longer MERGES is deleted like any other stale answer', () => {
+    // The red being its subject says nothing about whether the head still
+    // applies; an unmergeable head answers a question about a tree that is gone.
+    expect(disposeProposal(state({ mergeable: false, checksGreen: false, documentsItsRed: true }))).toBe('delete');
   });
 
   it('an OWNER head that merges and passes is left completely alone', () => {

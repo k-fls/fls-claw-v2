@@ -243,6 +243,40 @@ export function parseMachineLines(body: string): Map<string, string[]> {
   return out;
 }
 
+/** One failure a PR body records, read back from its `sweep-failure` line. */
+export interface SweepFailureFact {
+  cmd: string;
+  /** `.` at the repo root — never undefined, so a reader never has to normalize. */
+  cwd: string;
+  /** The 12-char prefix the line carries, not a full oid. */
+  subtree: string;
+  /** The 8-char prefix the line carries. Labels the failing set; decides nothing. */
+  filesDigest: string;
+}
+
+/**
+ * The failures a PR body RECORDS, the read-back partner of `renderSweepFailure`.
+ *
+ * THE BODY IS THE ONLY CROSS-PASS CARRIER. A pass journal lives and dies with its
+ * pass directory, so a question asked about a pull request the driver opened
+ * earlier can be answered from the pull request or not at all.
+ *
+ * The command is greedy and the tail is fixed, because a command may contain
+ * spaces and `=` while `cwd`, `subtree` and `files` may not. A line that does not
+ * match the whole shape is somebody's prose and is dropped.
+ */
+const SWEEP_FAILURE_RE = /^cmd=(.+) cwd=(\S+) subtree=([0-9a-f]+) files=([0-9a-f]+)$/;
+
+export function parseSweepFailures(body: string): SweepFailureFact[] {
+  const out: SweepFailureFact[] = [];
+  for (const rest of parseMachineLines(body).get('sweep-failure') ?? []) {
+    const m = SWEEP_FAILURE_RE.exec(rest);
+    if (!m) continue;
+    out.push({ cmd: m[1], cwd: m[2], subtree: m[3], filesDigest: m[4] });
+  }
+  return out;
+}
+
 /**
  * Body with the machine block set: replaces an existing delimited block, else
  * appends one below the (agent-written) body. Idempotent on the same block.

@@ -56,7 +56,7 @@ import {
   type JournalEntry,
 } from './propagate.js';
 import { DRIVER_COMMIT_ENV } from './proposal.js';
-import { parseMachineLines, type GithubTransport } from './publish.js';
+import { parseMachineLines, renderSweepFailure, type GithubTransport } from './publish.js';
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -5100,6 +5100,137 @@ describe('sweep start — origin-derived merge_status', () => {
     // Red twice on the same tree IS a red: the probe confirms it and the delete
     // goes ahead.
     expect(runs.length).toBe(2);
+    const journal = readJournal(dirOf(repo, ws));
+    expect(journal.find((e) => e.action === 'proposal-dropped')!.reason).toContain('does not pass');
+    expect(repo.git('-C', bare, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep')).toBe('');
+  });
+
+  /**
+   * A DRIVER-shaped DIAGNOSIS on a gate-fix ref: one empty commit on the branch
+   * tip, no markers and no merge, whose whole content is the PR body. It is an
+   * ANSWER by shape and it is RED by construction — the failure it reports is
+   * the one nobody could fix inside the case's named files.
+   */
+  function pushDriverDiagnosis(repo: FixtureRepo): { fixBranch: string; fixHead: string } {
+    const mpTip = repo.sha('main_patched');
+    const tree = repo.git('rev-parse', 'main_patched^{tree}');
+    const fixHead = execFileSync(
+      'git',
+      ['-C', repo.dir, 'commit-tree', tree, '-p', mpTip, '-m', 'Decision needed: where the fix belongs'],
+      { encoding: 'utf8', env: { ...process.env, ...DRIVER_COMMIT_ENV } },
+    ).trim();
+    const fixBranch = 'fix/sweep/main_patched--gate-fix-main_patched-deadbeef';
+    repo.git('push', 'origin', `${fixHead}:refs/heads/${fixBranch}`);
+    return { fixBranch, fixHead };
+  }
+  /** An open PR on that ref whose machine block records the failures named. */
+  function diagnosisPr(failures: Array<{ cmd: string; cwd?: string }>): { status: number; body: unknown } {
+    return {
+      status: 200,
+      body: [
+        {
+          html_url: 'https://github.com/k-fls/fixture/pull/12',
+          number: 12,
+          state: 'open',
+          body: [
+            'The check below fails and the fix does not belong in the files it names.',
+            '',
+            ...failures.map((f) => renderSweepFailure({ cmd: f.cmd, cwd: f.cwd ?? '.', subtree: 'a'.repeat(40), filesDigest: 'b'.repeat(8) })),
+          ].join('\n'),
+        },
+      ],
+    };
+  }
+
+  it('a gate-fix DIAGNOSIS is HELD on the red it was opened to document, never deleted', async () => {
+    // The pull request IS the report of a failure nobody could fix in scope, so
+    // its checks are red for as long as the defect stands. Deleting it for that
+    // closes the review thread and buys the owner a new PR number for the same
+    // finding every pass — the case derives again, the agent reaches the same
+    // conclusion, and a second diagnosis is published.
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const { fixBranch, fixHead } = pushDriverDiagnosis(repo);
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const alwaysRed: ChecksRunner = async (commands) => ({
+      ok: false,
+      failedNames: commands.map((c) => c.cmd),
+      output: 'boom\n',
+    });
+    const gh = fakeGithub({ 'GET /pulls?': diagnosisPr([{ cmd: 'tsc --noEmit' }]) });
+    expect(
+      await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile, checksFile: answerChecks(ws) }), gh.factory, alwaysRed),
+    ).toBe(0);
+    const journal = readJournal(dirOf(repo, ws));
+    expect(journal.some((e) => e.action === 'proposal-dropped')).toBe(false);
+    // The ref stands and the branch stays blocked on its open proposal.
+    expect(repo.git('-C', bare, 'rev-parse', `refs/heads/${fixBranch}`)).toBe(fixHead);
+    expect(journal.some((e) => e.action === 'origin-blocked' && e.branch === 'main_patched')).toBe(true);
+  });
+
+  it('a diagnosis failing a check its own body does NOT record is deleted like any stale answer', async () => {
+    // The exemption is bounded by what the pull request says it is about. A head
+    // that documents one failure and now fails a different one is answering a
+    // question nobody asked, which is the ordinary stale-answer row.
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    pushDriverDiagnosis(repo);
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const alwaysRed: ChecksRunner = async (commands) => ({
+      ok: false,
+      failedNames: commands.map((c) => c.cmd),
+      output: 'boom\n',
+    });
+    // The body records a check in another directory; the red is at the root.
+    const gh = fakeGithub({ 'GET /pulls?': diagnosisPr([{ cmd: 'tsc --noEmit', cwd: 'container/agent-runner' }]) });
+    expect(
+      await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile, checksFile: answerChecks(ws) }), gh.factory, alwaysRed),
+    ).toBe(0);
+    const journal = readJournal(dirOf(repo, ws));
+    expect(journal.find((e) => e.action === 'proposal-dropped')!.reason).toContain('does not pass');
+    expect(repo.git('-C', bare, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep')).toBe('');
+  });
+
+  it('the merged-tree probe runs the TESTS too, not the typecheck alone', async () => {
+    // "Checks green" is the driver's OWN gate — the one `report-case` runs — and
+    // that gate is typecheck THEN test. A probe that measured half of it calls a
+    // tree green that the driver's own gate refuses, and then acts on the word:
+    // an owner's PR left alone as passing, a driver answer landed on approval.
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    pushDriverAnswer(repo);
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const checks = join(ws, 'both-checks.json');
+    writeFileSync(
+      checks,
+      JSON.stringify({ typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }], test: [{ cmd: 'vitest run', cwd: '.' }] }),
+    );
+    const ran: string[][] = [];
+    const testsRed: ChecksRunner = async (commands) => {
+      const names = commands.map((c) => c.cmd);
+      ran.push(names);
+      const failedNames = names.filter((n) => n === 'vitest run');
+      return { ok: failedNames.length === 0, failedNames, output: failedNames.length ? 'boom\n' : '' };
+    };
+    const gh = fakeGithub({ 'GET /pulls?': openPr });
+    expect(
+      await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile, checksFile: checks }), gh.factory, testsRed),
+    ).toBe(0);
+    // Typecheck first (green, so the walk continues), then the tests, then the
+    // determinism re-run of the one that failed.
+    expect(ran).toEqual([['tsc --noEmit'], ['vitest run'], ['vitest run']]);
     const journal = readJournal(dirOf(repo, ws));
     expect(journal.find((e) => e.action === 'proposal-dropped')!.reason).toContain('does not pass');
     expect(repo.git('-C', bare, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep')).toBe('');

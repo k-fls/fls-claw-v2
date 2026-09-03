@@ -94,6 +94,16 @@ export interface ProposalState {
   approved: boolean;
   /** The target moved since the head was built. */
   baseMoved: boolean;
+  /**
+   * THE RED IS THE PULL REQUEST'S SUBJECT MATTER. A gate-fix hold that could not
+   * be fixed inside the case's named files documents the failure instead of
+   * repairing it, so the checks it fails are the ones it was opened about.
+   *
+   * Read off the head's own body — the failures it records — and never assumed
+   * from the ref name: a head that documents one failure and now fails a
+   * different one is a stale answer like any other.
+   */
+  documentsItsRed: boolean;
 }
 
 /**
@@ -115,11 +125,20 @@ export interface ProposalState {
  * A DRIVER-shaped ANSWER that no longer merges or no longer passes is deleted
  * rather than rebuilt: the resolution it carries is not salvageable against the
  * current tree, and a fresh case derives the real question again.
+ *
+ * EXCEPT WHERE THE RED IS THE ANSWER. A diagnosis is a hold that documents a
+ * failure nobody could fix in the case's scope, so it fails the checks it was
+ * opened about — by construction, and for as long as the defect stands. Deleting
+ * it for that red closes the review thread where the decision lives and buys the
+ * owner a new pull request number for the same finding every pass, forever. It
+ * still has to MERGE, and the red still has to be the one it documents: a
+ * diagnosis that fails something else is a stale answer like any other.
  */
 export function disposeProposal(state: ProposalState): ProposalAction {
   const usable = state.mergeable && state.checksGreen;
   if (state.shape === 'owner') return usable ? 'leave' : 'draft-and-report';
   if (state.relation === null) {
+    if (state.mergeable && !state.checksGreen && state.documentsItsRed) return 'hold';
     if (!usable) return 'delete';
     if (state.approved) return 'land';
     return state.baseMoved ? 'rebase' : 'hold';
