@@ -1311,11 +1311,9 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     expect(gateFix).toBeTruthy();
     expect(gateFix!.branch).toBe('main_patched');
     expect(supersededCaseIds(journal).has(caseId)).toBe(true);
-    // ...and the GATE FIX itself is NOT superseded. When the owner is this same
-    // branch, journaling the gate-fix case BEFORE the `reopened` row superseded it
-    // the instant it was created: `next-case` would never serve it, the conflict
-    // case would be re-emitted, and the pass would re-adjudicate (bisect included)
-    // every round until the ten-strike backstop — the 08-01 deadlock, restored.
+    // ...and the GATE FIX itself is NOT superseded. The owner here IS the branch
+    // being reopened, and a gate-fix case is exempt from supersede: it stands
+    // until it is concluded, so `next-case` has one to serve.
     expect(supersededCaseIds(journal).has(gateFix!.caseId as string)).toBe(false);
     expect(openCases(journal).map((c) => c.caseId)).toContain(gateFix!.caseId);
     // The agent's resolution is DISCARDED and the loss recorded: it was never
@@ -1500,8 +1498,8 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     // will actually serve first in DAG order.
     expect(res.gateFix.branch).toBe('main_patched');
     expect(res.notMyBug.owners.map((o) => o.owner)).toEqual(['parent', 'branch']);
-    // Every reopen precedes every mint: a gate fix journaled before its branch's
-    // `reopened` row would be superseded the instant it was created.
+    // Every reopen is journaled before every mint, and the gate fixes stand
+    // whatever the order: a gate-fix case is exempt from supersede.
     const firstMint = journal.findIndex((e) => e.action === 'gate-fix');
     const lastReopen = journal.map((e) => e.action).lastIndexOf('reopened');
     expect(lastReopen).toBeLessThan(firstMint);
@@ -2707,8 +2705,8 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     // A mintable owner exists, so the merge IS aborted and the resolution goes.
     expect(journal.some((e) => e.action === 'not-my-bug-discarded')).toBe(true);
     expect(supersededCaseIds(journal).has(caseId)).toBe(true);
-    // ORDER IS LOAD-BEARING: every reopen still precedes every mint, or the fix
-    // is superseded the instant it is created.
+    // Every reopen is journaled before every mint, and the fix is exempt from
+    // supersede, so it stands.
     const firstMint = journal.findIndex((e) => e.action === 'gate-fix');
     const lastReopen = journal.map((e) => e.action).lastIndexOf('reopened');
     expect(lastReopen).toBeLessThan(firstMint);
@@ -6889,6 +6887,137 @@ describe('next-case — a participating branch that is RED before any merge', ()
     expect(await cmdSweepStart(baseCli(repo, ws, inv))).toBe(0);
     await cmdSweepNextCase(baseCli(repo, ws, inv), spy);
     expect(called).toBe(false);
+  });
+
+  /** main_patched conflicts with upstream; module/cq hangs off it and goes red. */
+  function parentConflictChildRedRepo(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: x = fork', { 'src/x.ts': 'fork\n' });
+    repo.checkout('module/cq', { create: true, at: 'main_patched' });
+    repo.commit('cq: queue', { 'src/queue.ts': 'green\n' });
+    repo.checkout('main_patched');
+    repo.commit('mp: helper', { 'src/helper.ts': 'h\n' });
+    repo.checkout('main');
+    repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+    repo.commit('U1: x = up1', { 'src/x.ts': 'up1\n' });
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+  /** Red exactly where `src/queue.ts` says so — a per-tree fact, like a real suite. */
+  const queueRunner: ChecksRunner = async (commands, cwd) => {
+    const f = join(cwd, 'src/queue.ts');
+    const red = existsSync(f) && readFileSync(f, 'utf8').includes('BROKEN');
+    return {
+      ok: !red,
+      failedNames: red ? commands.map((c) => c.cmd) : [],
+      output: red ? 'src/queue.ts(1,1): error TS2345: the queue is broken.\n' : '',
+    };
+  };
+
+  /**
+   * P has an open conflict case; X, a branch beneath it, has a gate fix minted
+   * on it and not yet served. Resolving P's case reopens P and everything under
+   * it, X included — and the gate fix is then the only case left to serve.
+   */
+  it('a resolve above does not void the gate-fix case minted below it', async () => {
+    const repo = parentConflictChildRedRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cq', branch: 'module/cq', parents: ['main_patched'], owned: ['src/queue.ts'] }]);
+    const dir = dirOf(repo, ws);
+    const checks = join(ws, 'checks.json');
+    writeFileSync(checks, JSON.stringify({ typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }], test: [] }));
+    const cli = (o: Partial<Cli> = {}): Cli => baseCli(repo, ws, inv, { checksFile: checks, ...o });
+    const out = join(ws, 'nc.json');
+
+    expect(await cmdSweepStart(cli())).toBe(0);
+    expect(await cmdSweepNextCase(cli({ out }), queueRunner)).toBe(0);
+    const conflictCaseId = currentCaseId(dir);
+
+    // module/cq goes red under the open pass. The next call mints its gate fix
+    // and goes on serving the conflict case first — DAG order, which is right.
+    repo.checkout('module/cq');
+    repo.commit('cq: goes red', { 'src/queue.ts': 'BROKEN\n' });
+    repo.checkout('main');
+    expect(await cmdSweepNextCase(cli({ out }), queueRunner)).toBe(0);
+    const gateFixId = readJournal(dir).find((e) => e.action === 'gate-fix' && e.branch === 'module/cq')!
+      .caseId as string;
+    expect(currentCaseId(dir)).toBe(conflictCaseId);
+
+    // The conflict resolves, and its reopen covers main_patched AND module/cq.
+    resolveWorktree(dir, conflictCaseId, { 'src/x.ts': 'RESOLVED\n' });
+    expect(
+      await cmdSweepReportCase(cli({ cmd: 'report-case', tier: 'mechanical', execute: true }), confirm, queueRunner),
+    ).toBe(0);
+    const afterResolve = readJournal(dir);
+    expect(afterResolve.some((e) => e.action === 'reopened' && e.branch === 'module/cq')).toBe(true);
+    expect(supersededCaseIds(afterResolve).has(gateFixId)).toBe(false);
+    // The gate fix is still the branch's OPEN case, which is what keeps module/cq
+    // out of the publishable set (`openCaseBranches` reads exactly this).
+    expect(openCases(afterResolve).map((c) => [c.caseId, c.branch])).toEqual([[gateFixId, 'module/cq']]);
+
+    // And `next-case` SERVES it. Voided instead, it is gone before anyone sees
+    // it: the red is re-detected, the mint hits its per-pass anti-loop key, and
+    // the pass stops with a fix nobody was given.
+    expect(await cmdSweepNextCase(cli({ out }), queueRunner)).toBe(0);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; caseId?: string };
+    expect(res.status).toBe('case-ready');
+    expect(res.caseId).toBe(gateFixId);
+    expect(readJournal(dir).some((e) => e.action === 'case-served' && e.caseId === gateFixId)).toBe(true);
+  });
+
+  /** module/cq is red at its own tip before anything merges. */
+  function childRedRepo(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base: x', { 'src/x.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: helper', { 'src/helper.ts': 'h\n' });
+    repo.checkout('module/cq', { create: true, at: 'main_patched' });
+    repo.commit('cq: queue', { 'src/queue.ts': 'BROKEN\n' });
+    repo.checkout('main');
+    repo.commit('U0: util', { 'src/util.ts': 'u\n' });
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+
+  /**
+   * The anti-loop guard the exemption leaves standing: one mint per
+   * (branch, file-set) per pass. A CONCLUDED attempt whose files are red again
+   * is the loop it stops — `next-case` says so and halts rather than minting a
+   * second case over the same key.
+   */
+  it('a CONCLUDED gate fix whose files go red again stops the pass, never a second mint', async () => {
+    const repo = childRedRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cq', branch: 'module/cq', parents: ['main_patched'], owned: ['src/queue.ts'] }]);
+    const dir = dirOf(repo, ws);
+    const checks = join(ws, 'checks.json');
+    writeFileSync(checks, JSON.stringify({ typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }], test: [] }));
+    const cli = (o: Partial<Cli> = {}): Cli => baseCli(repo, ws, inv, { checksFile: checks, ...o });
+    const out = join(ws, 'nc.json');
+
+    expect(await cmdSweepStart(cli())).toBe(0);
+    expect(await cmdSweepNextCase(cli({ out }), queueRunner)).toBe(0);
+    const gateFixId = (JSON.parse(readFileSync(out, 'utf8')) as { caseId: string }).caseId;
+
+    // The fix is written, judged and landed on the branch.
+    resolveWorktree(dir, gateFixId, { 'src/queue.ts': 'green\n' });
+    expect(
+      await cmdSweepReportCase(cli({ cmd: 'report-case', tier: 'judged', execute: true }), confirm, queueRunner),
+    ).toBe(0);
+    writePr(dir, gateFixId, 'fix: the queue', 'Decision needed: the build was red on src/queue.ts.');
+    expect(await cmdSweepReportPr(cli({ cmd: 'report-pr', execute: true, out }), confirm)).toBe(0);
+
+    // And the same files are red again.
+    repo.checkout('module/cq');
+    repo.commit('cq: red again', { 'src/queue.ts': 'BROKEN\n' });
+    repo.checkout('main');
+    expect(await cmdSweepNextCase(cli({ out }), queueRunner)).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { status: string; instruction: string };
+    expect(res.status).toBe('stopped');
+    expect(res.instruction).toContain('a gate fix was already attempted for module/cq over these files');
+    expect(readJournal(dir).filter((e) => e.action === 'gate-fix').length).toBe(1);
   });
 });
 

@@ -1899,8 +1899,9 @@ them and pure loss when the mint then refuses. With the red usable, the branch a
 its transitive descendants are REOPENED — a conflict case on a red tree is
 unjudgeable, and the descendants' cases for the same reason — and then a gate-fix
 case is minted on the branch (§9), rooted there because that is the branch now
-carrying the defect. Reopen strictly BEFORE the mint, or the mint supersedes
-itself. `run` then STOPS: the branch does not arrive, so the next run re-derives
+carrying the defect. The reopen does not touch the mint: a gate-fix case is exempt
+from supersede and stands until it is concluded. `run` then STOPS: the branch does
+not arrive, so the next run re-derives
 it, and no other branch merges while a red is outstanding — the branches below it
 would be taking the content this gate just refused, and the pass cannot complete
 until the fix lands in any case. The result carries `WARN09_GATE_FIX_SERVED` and
@@ -2246,7 +2247,9 @@ upstream commit.
 ### 9.4 Anti-loop and duplicates
 
 - One attempt per (branch, file-set) per pass: `gateFixKey` is `branch::files`. A
-  second red over the same set is not re-served and falls through to the stop path.
+  minted case that has not been concluded is SERVED — never re-minted, and no reopen
+  voids it. Only a CONCLUDED attempt followed by a fresh red over the same set falls
+  through to the stop path.
 - Across passes the anti-loop is the fix's own PR (§5.4).
 - Two more mint refusals: a branch gated by an active gate-fix ref whose digest
   does NOT match the current failing files (`WARN19_GATE_COVERS_OTHER_DEFECT` —
@@ -2286,10 +2289,11 @@ full adjudication, each hitting the anti-loop and falling back to held — junk 
 PRs for one defect. Superseding them means the gate fix is the only case left, so
 no service-priority rule is needed.
 
-**ALL reopens are journaled BEFORE ALL gate-fix mints.** When an owner is a branch
-a fix was already minted on, the reverse order supersedes that fix the instant it is
-created and the pass loops through a full re-adjudication every round instead of
-serving it. With several owners this is one reopen over the union, then the mints.
+**A REOPEN VOIDS CONFLICT CASES ONLY.** A gate-fix case survives every reopen —
+its own branch's, an ancestor's resolve, the stale-case heal — and is served when
+`next-case` reaches it: its identity is the branch tip and the failing files, which
+no reopen moves. Reopens are still journaled before the mints, one reopen over the
+union of the owners' subtrees and then the mints.
 The agent's resolution is DISCARDED and the loss journaled (`not-my-bug-discarded`,
 plus an observation): the reopen rebuilds the worktree from the automerge tree and
 nothing else references the resolved tree (the driver commits by plumbing, so rerere

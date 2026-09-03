@@ -1614,6 +1614,28 @@ describe('reopen-superseded cases (bug #63/#64 — every open-case reader)', () 
     ]);
     expect(openCases(journal)).toEqual([]);
   });
+
+  it('a GATE-FIX case is EXEMPT: a reopen of its branch does not supersede it', () => {
+    // A gate-fix case's identity is the branch tip and the failing files, and a
+    // reopen moves neither — `reverifyGateFixCase` re-derives it against live git
+    // whenever it is judged. Superseded, it would be dropped from `openCases`
+    // before `next-case` could serve it, the branch's red would be re-detected,
+    // and the mint would hit its per-pass anti-loop key with nothing to hand over.
+    const journal = j([
+      {
+        action: 'case',
+        branch: 'module/x',
+        parent: 'main_patched',
+        caseId: 'gate-fix-module__x-deadbeef',
+        head: { sha: 'a', height: 3 },
+        conflictedPaths: ['src/x.test.ts'],
+        gateFix: true,
+      },
+      { action: 'reopened', branch: 'module/x' },
+    ]);
+    expect(supersededCaseIds(journal)).toEqual(new Set());
+    expect(openCases(journal).map((c) => c.caseId)).toEqual(['gate-fix-module__x-deadbeef']);
+  });
 });
 
 describe('propagate verify — publishable set', () => {

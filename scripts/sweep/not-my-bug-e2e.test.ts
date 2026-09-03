@@ -17,10 +17,10 @@
  * network `pnpm install`) are stubbed. The unit tests script probe outcomes;
  * this one is the check that the pieces agree with each other and with git.
  *
- * It also pins the ordering that makes the mechanism useful at all:
- * `next-case` MUST serve the gate-fix case. Journaling it before the abort's
- * `reopened` row would supersede it the instant it was created — every
- * assertion in the unit tests could pass and the pass still could not move.
+ * It also pins the thing that makes the mechanism useful at all: `next-case`
+ * MUST serve the gate-fix case. The abort's `reopened` row does not void it — a
+ * gate-fix case is exempt from supersede — and without that every assertion in
+ * the unit tests could pass while the pass still could not move.
  */
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -177,8 +177,8 @@ describe('the not-my-bug deadlock, end to end (real checks, real commits)', () =
     expect(introducer).toBeTruthy(); // fixture sanity: the introducer exists, it is just below the floor
 
     const afterAbort = readJournal(dir);
-    // The conflict case is superseded; the gate fix is NOT (the defect that made
-    // the whole mechanism serve nothing), and the discard is recorded.
+    // The conflict case is superseded; the gate fix is NOT — it is exempt, which
+    // is what leaves the mechanism something to serve — and the discard is recorded.
     expect(supersededCaseIds(afterAbort).has(conflictCaseId)).toBe(true);
     expect(supersededCaseIds(afterAbort).has(adjudicated.gateFix.caseId)).toBe(false);
     const discarded = afterAbort.find((e: JournalEntry) => e.action === 'not-my-bug-discarded')!;

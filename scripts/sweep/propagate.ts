@@ -5546,8 +5546,11 @@ async function staleHeal(cli: Cli, dir: string, journal: JournalEntry[]): Promis
     // (or the driver's rooted point) and a fresh probe against `origin/<branch>`
     // — instead of comparing a recomputed automerge against one pinned to the
     // tip at emission. A moved tip simply produces a different, still-valid
-    // derivation there, so there is nothing to heal and a reopen would only
-    // supersede a case the driver deliberately manufactured.
+    // derivation there, so there is nothing to heal, and the reopen would be
+    // pure loss: it voids the REISSUE case the driver deliberately
+    // manufactured, and a GATE-FIX case it cannot void at all
+    // (`supersededCaseIds` exempts gate fixes), leaving the branch reopened
+    // around a case that is still open.
     if (row?.gateFix === true || row?.reissue === true) continue;
     if (!(await refExists(cli.repo, jc.branch))) continue; // a deleted branch is ERR02's, not this heal's
     const liveTip = await revParse(cli.repo, jc.branch);
@@ -9068,17 +9071,32 @@ async function reissueCaseMaterials(
  * caseId), but a branch whose own TIP moved keeps both, and the re-emission
  * reuses the id it superseded. A reopen that re-emits nothing (branch healed /
  * merged clean / deferred) simply leaves the branch with no open case — right.
+ *
+ * A GATE-FIX CASE IS EXEMPT. Its identity is its branch tip and its failing file
+ * set, and no reopen moves either: `reverifyGateFixCase` re-derives the case
+ * against LIVE git every time it is judged, so a reopen has nothing to void. It
+ * stands until it is concluded, whoever reopens its branch and whenever — the
+ * resolve of an ANCESTOR's case reopens the whole subtree, and a fix minted on a
+ * descendant is not that resolve's business. Without the exemption the fix is
+ * dropped from `openCases` before `next-case` ever serves it, the branch's red is
+ * re-detected, the mint hits its per-pass anti-loop key, and the pass halts with
+ * a fix nobody was given.
  */
 export function supersededCaseIds(journal: JournalEntry[]): Set<string> {
   const lastReopened = new Map<string, number>();
   const lastCase = new Map<string, { branch: string; idx: number }>();
+  const gateFixIds = new Set<string>();
   journal.forEach((e, i) => {
     if (typeof e.branch !== 'string') return;
     if (e.action === 'reopened') lastReopened.set(e.branch, i);
-    else if (e.action === 'case' && typeof e.caseId === 'string') lastCase.set(e.caseId, { branch: e.branch, idx: i });
+    else if (e.action === 'case' && typeof e.caseId === 'string') {
+      lastCase.set(e.caseId, { branch: e.branch, idx: i });
+      if (e.gateFix === true) gateFixIds.add(e.caseId);
+    }
   });
   const out = new Set<string>();
   for (const [caseId, { branch, idx }] of lastCase) {
+    if (gateFixIds.has(caseId)) continue;
     // Only an UNDISPOSED case can be superseded. A resolved/held case's
     // disposition STANDS — the `reopened` it triggers re-processes the branch's
     // DESCENDANTS (§8), not the case itself, and a held case remains a valid
@@ -12236,14 +12254,12 @@ async function adjudicateNotMyBug(p: {
     // undispositioned case (`supersededCaseIds`) and drops it out of
     // `openCases` so `next-case` re-derives the branch once the fix has landed.
     //
-    // ORDER IS LOAD-BEARING, and it is ALL reopens before ALL mints.
-    // `supersededCaseIds` supersedes every undispositioned case whose `case` row
-    // PRECEDES its branch's last `reopened`. When an owner is a branch a gate fix
-    // was already minted on, reopening after that mint would supersede the fix
-    // TOO, the instant it was created: `next-case` would never serve it, the
-    // conflict case would be re-emitted, and the pass would loop through a full
-    // re-adjudication (bisect included) until the ten-strike backstop. Reopen
-    // first and every gate fix's rows land after it, untouched.
+    // THE GATE FIXES MINTED BELOW ARE NOT AT RISK FROM THIS REOPEN, or from any
+    // other. A gate-fix case is exempt from supersede (`supersededCaseIds`): its
+    // identity is the branch tip and the failing files, which no reopen moves,
+    // and it stands until it is concluded. What this reopen voids is the
+    // undispositioned CONFLICT cases — this one and the descendants' — and that
+    // is the whole of its job here.
     //
     // DESCENDANTS TOO — every other path that blocks a branch does this
     // (`freezeHeld`'s callers, the crash-heal, the resolve path), and reopening
@@ -14880,6 +14896,13 @@ async function materializeGateFixCases(
       );
       continue;
     }
+    // ONE MINT PER (branch, file-set) PER PASS. A prior row for this key means
+    // the case it minted is either still OPEN — `next-case` serves it, so a
+    // second mint would only clobber the worktree it is being worked in — or
+    // CONCLUDED, which makes it a real attempt: the same files are red AGAIN
+    // after a fix was written for them, and that is the loop this stops. No
+    // reopen ever voids that case (`supersededCaseIds` exempts gate fixes), so
+    // the row and the case it stands for always agree.
     const key = gateFixKey(g.branch, g.files);
     if (journal.some((e) => e.action === 'gate-fix' && e.key === key)) {
       looping.push(g.branch);
