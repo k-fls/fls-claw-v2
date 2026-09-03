@@ -1582,8 +1582,11 @@ describe('publish — a mixed conflict publishes on its IN-SURFACE question alon
     // The DRAFT exhibits markers at the in-surface path…
     const exhibited = repo.git('cat-file', 'blob', `${head}:src/f_in.ts`);
     expect(exhibited).toContain('<<<<<<<');
-    // …and the out-of-surface member arrives already resolved to the incoming side.
-    expect(repo.git('rev-parse', `${head}:src/f_out.ts`)).toBe(repo.git('rev-parse', `${z}:src/f_out.ts`));
+    // …and the out-of-surface member arrives already RESOLVED — at the oX the
+    // prefix landed, since z's f_out.ts is a sibling revision of it and neither
+    // side is ahead of the other.
+    expect(repo.git('cat-file', 'blob', `${head}:src/f_out.ts`)).not.toContain('<<<<<<<');
+    expect(repo.git('rev-parse', `${head}:src/f_out.ts`)).toBe(repo.git('rev-parse', `${x}:src/f_out.ts`));
   });
 });
 

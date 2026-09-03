@@ -467,10 +467,19 @@ the walk's own auto-resolutions cannot leak paths into the surface.
 
 A conflicted step resolves what is nobody's question and stops on what is:
 
-- OUT-OF-SURFACE members auto-resolve to the INCOMING side (`tree(C)`'s blob,
-  or its absence): the branch has nothing of its own there, so the collision is
-  between two states the source's author already integrated — at a merge
-  commit those blobs ARE the author's own integration.
+- OUT-OF-SURFACE members auto-resolve without asking: the branch has nothing of
+  its own there, so the collision is between two states the source's author
+  already integrated — at a merge commit those blobs ARE the author's own
+  integration. **A STEP NEVER MOVES A PATH BACKWARDS**: the side taken is the
+  INCOMING one (`tree(C)`'s blob, or its absence) only where it stands AHEAD of
+  what the walk holds, and the HELD one otherwise. Blobs carry no parents, so
+  "ahead" is the path's REVISION SET in the candidate's own ancestry
+  (`pathBlobRevisions`) — the incoming side is ahead exactly when the held blob
+  is a revision the candidate has already moved past. The surface says the
+  branch changed nothing there RELATIVE TO THE MERGE BASE; it does not say the
+  branch holds nothing newer, and a branch that took the source's final answer
+  at a path is out-of-surface there. Without the direction test, every older
+  revision of that path still offered as a candidate takes it away again.
 - IN-SURFACE members auto-resolve BY EQUIVALENCE, where both endpoints already
   hold the same answer: the branch tip and the source anchor agree on the path
   (the author ended where the branch already is — an intermediate commit's

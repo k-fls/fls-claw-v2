@@ -18,7 +18,16 @@
  * `--merge-base=`, never cherry-pick.
  */
 import { deriveCoverage, shaAtHeight, type Chain } from './heights.js';
-import { ancestryPath, blobOidAt, git, newStyleMergeTree, overlayTreePaths, pendingCommits, revParse } from './git.js';
+import {
+  ancestryPath,
+  blobOidAt,
+  git,
+  newStyleMergeTree,
+  overlayTreePaths,
+  pathBlobRevisions,
+  pendingCommits,
+  revParse,
+} from './git.js';
 import { inSurface, type Surface } from './surface.js';
 import type { WalkPrefixStep } from './types.js';
 
@@ -223,14 +232,44 @@ async function decidedPaths(repo: string, commit: string): Promise<Set<string> |
 }
 
 /**
+ * A WALK STEP NEVER MOVES A PATH BACKWARDS. An auto-resolution may take the
+ * incoming side only where the incoming side stands AHEAD of what the walk
+ * already holds there — never an ancestor of it, never an unrelated older
+ * revision.
+ *
+ * Blobs carry no parents, so "ahead" is decided by the path's REVISION SET in
+ * the candidate's own ancestry (`pathBlobRevisions`): the incoming side is
+ * ahead exactly when the held blob is one of the revisions the candidate has
+ * already moved past (or the two sides agree, or the walk holds nothing there).
+ * When it is not — when the candidate is an INTERMEDIATE commit of a line whose
+ * newer answer the branch already carries — the held side stays, and the newer
+ * content survives the step.
+ *
+ * Absent this test the incoming rule reads "the branch has nothing of its own
+ * here" off the SURFACE alone, which is a statement about the merge base, not
+ * about what the branch holds now: a branch that took a source's final answer
+ * at a path is out-of-surface there and would hand it back to any older
+ * revision of the same path that the line still offers as a candidate.
+ */
+async function incomingIsAhead(repo: string, hyp: string, candidate: string, path: string): Promise<boolean> {
+  const held = await blobOidAt(repo, hyp, path);
+  if (held === null) return true; // nothing held here — nothing to lose
+  if ((await blobOidAt(repo, candidate, path)) === held) return true; // same content either way
+  return (await pathBlobRevisions(repo, candidate, path)).has(held);
+}
+
+/**
  * One step of the walk engine, shared by `pendingWalk` and `replayPrefix` so
  * derivation and re-verification cannot disagree about what a step does.
  *
  * Probe `merge-tree(hyp, C)`; on conflict, partition the conflicted paths:
- *  - OUT-OF-SURFACE members auto-resolve to the INCOMING side (`tree(C)`'s
- *    blob, or its absence): the branch has nothing of its own there, so the
- *    collision is between two states the source's author already integrated —
- *    at a merge commit those blobs ARE the author's own integration.
+ *  - OUT-OF-SURFACE members auto-resolve without asking: the branch has nothing
+ *    of its own there, so the collision is between two states the source's
+ *    author already integrated — at a merge commit those blobs ARE the author's
+ *    own integration. The side taken is the INCOMING one (`tree(C)`'s blob, or
+ *    its absence) where it stands ahead of what the walk holds, and the HELD one
+ *    otherwise (`incomingIsAhead`), so an intermediate candidate can never hand
+ *    a path back to an older revision.
  *  - IN-SURFACE members auto-resolve BY EQUIVALENCE, where the question is
  *    already answered and both endpoints hold the same answer:
  *      - the branch tip and the SOURCE ANCHOR agree on the path — the source's
@@ -274,10 +313,15 @@ export async function walkStep(
       agreed.set(p, candidate); // the branch already carries the author's decision
     }
   }
+  /** Out-of-surface members split by direction: the incoming side, or the held one. */
+  const takeIncoming: string[] = [];
+  const keepHeld: string[] = [];
+  for (const p of outS) ((await incomingIsAhead(repo, hyp, candidate, p)) ? takeIncoming : keepHeld).push(p);
   const autoResolved = [...outS, ...agreed.keys()].sort();
   const remaining = inS.filter((p) => !agreed.has(p));
   let resolvedTree = probe.treeOid;
-  if (outS.length > 0) resolvedTree = await overlayTreePaths(repo, resolvedTree, candidate, outS);
+  if (takeIncoming.length > 0) resolvedTree = await overlayTreePaths(repo, resolvedTree, candidate, takeIncoming);
+  if (keepHeld.length > 0) resolvedTree = await overlayTreePaths(repo, resolvedTree, hyp, keepHeld);
   for (const [p, from] of agreed) {
     resolvedTree = await overlayTreePaths(repo, resolvedTree, from, [p]);
   }

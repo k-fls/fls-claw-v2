@@ -985,14 +985,79 @@ describe('pendingWalk — the advancing walk (§4.3)', () => {
       expect(res.conflict?.head).toBe(z);
       // The case is the in-surface question only...
       expect(res.conflict?.conflictedPaths).toEqual(['src/f_in.ts']);
-      // ...and the exhibit resolved the out-of-surface member to the incoming side.
+      // ...and the exhibit carries the out-of-surface member RESOLVED. z's
+      // f_out.ts is a sibling revision of the oX the prefix already landed —
+      // neither side is ahead of the other — so the step keeps what it holds
+      // rather than handing the path to an unrelated revision.
       expect(await blobOidAt(r.dir, res.conflict!.automergeTree, 'src/f_out.ts')).toBe(
-        await blobOidAt(r.dir, z, 'src/f_out.ts'),
+        await blobOidAt(r.dir, x, 'src/f_out.ts'),
       );
+      expect(
+        (await git(r.dir, ['cat-file', 'blob', `${res.conflict!.automergeTree}:src/f_out.ts`])).stdout,
+      ).not.toContain('<<<<<<<');
       const exhibited = (
         await git(r.dir, ['cat-file', 'blob', `${res.conflict!.automergeTree}:src/f_in.ts`])
       ).stdout;
       expect(exhibited).toContain('<<<<<<<');
+    } finally {
+      r.destroy();
+    }
+  });
+
+  /**
+   * A WALK STEP NEVER MOVES A PATH BACKWARDS.
+   *
+   * `src/held.ts`: the branch already carries the source's newest revision
+   * (v3), and the line still offers INTERMEDIATE commits that predate it (v1,
+   * v2) as candidates, because those commits are not in the branch's ancestry.
+   * They are out-of-surface — the branch changed nothing there relative to its
+   * merge base — and taking the incoming side hands a 3-revision-old blob back
+   * to a branch that holds the newest one. The step keeps v3.
+   *
+   * `src/taken.ts`: the same rule must not freeze the path. The candidate merge
+   * has already ABSORBED the wT the branch holds, so its recorded answer wM
+   * stands ahead of it and lands.
+   */
+  it('a candidate older than what the branch holds cannot move the path backwards', async () => {
+    const r = initFixtureRepo();
+    try {
+      r.commit('base', { 'src/in.ts': 'i0\n', 'src/held.ts': 'v0\n', 'src/taken.ts': 'w0\n' });
+      const base = r.sha('main');
+      // A side lineage the branch never absorbed, holding OLD revisions.
+      r.checkout('T', { create: true, at: base });
+      const t1 = r.commit('t1', { 'src/taken.ts': 'wT\n' });
+      r.checkout('S', { create: true, at: base });
+      const s1 = r.commit('s1: old held revision', { 'src/held.ts': 'v1\n', 'src/taken.ts': 'wS\n' });
+      // The parent's own line, and the branch cut from it: the branch holds the
+      // NEWEST held.ts and the wT that s2 absorbs below, and edits only src/in.ts.
+      r.checkout('P', { create: true, at: base });
+      const m1 = r.commit('m1: newest held revision', { 'src/held.ts': 'v3\n', 'src/taken.ts': 'wT\n' });
+      r.checkout('B', { create: true, at: m1 });
+      r.commit('fork edit', { 'src/in.ts': 'iB\n' });
+      // s2 INTEGRATES t1 — it has moved past wT and records its own answer.
+      const s2 = await authoredMerge(r, 'S', t1, { 'src/taken.ts': 'wM\n' }, 's2 integrates t1');
+      const mS = await authoredMerge(r, 'P', s2, { 'src/in.ts': 'iM\n' }, 'P integrates s2');
+      r.checkout('main');
+      const bTip = await revParse(r.dir, 'B');
+      const surface = await computeSurface(r.dir, mS, bTip);
+      expect(inSurface(surface, 'src/in.ts')).toBe(true);
+      expect(inSurface(surface, 'src/held.ts')).toBe(false);
+      expect(inSurface(surface, 'src/taken.ts')).toBe(false);
+
+      const line: EligibleLine = { branch: 'B', parent: 'P', model: 'parents', heads: [t1, s1, s2, mS] };
+      const res = await pendingWalk(r.dir, bTip, line, surface, mS);
+      // The walk stops on the in-surface question, so no final reconciliation
+      // runs — the landed tree is exactly what the steps decided.
+      expect(res.conflict?.head).toBe(mS);
+      expect(res.conflict?.conflictedPaths).toEqual(['src/in.ts']);
+      expect(res.steps.map((s) => s.sha)).toEqual([t1, s1, s2]);
+      // Both out-of-surface members were resolved without asking…
+      expect(res.steps.flatMap((s) => s.autoResolved)).toContain('src/held.ts');
+      // …and the older revision did not win.
+      expect(await blobOidAt(r.dir, res.landTree!, 'src/held.ts')).toBe(await blobOidAt(r.dir, bTip, 'src/held.ts'));
+      expect(await blobOidAt(r.dir, res.landTree!, 'src/held.ts')).not.toBe(await blobOidAt(r.dir, s1, 'src/held.ts'));
+      // The absorbing merge's own answer still lands.
+      expect(await blobOidAt(r.dir, res.landTree!, 'src/taken.ts')).toBe(await blobOidAt(r.dir, s2, 'src/taken.ts'));
     } finally {
       r.destroy();
     }

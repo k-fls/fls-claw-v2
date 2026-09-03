@@ -532,3 +532,34 @@ export async function blobOidAt(repo: string, treeish: string, path: string): Pr
   const res = await git(repo, ['rev-parse', '--verify', '--quiet', `${treeish}:${path}`], { allowCodes: [1, 128] });
   return res.code === 0 ? res.stdout.trim() : null;
 }
+
+/**
+ * Every blob oid `path` has held anywhere in `commit`'s ancestry, `commit`
+ * itself included — the path's REVISION SET. It answers "is this content
+ * something `commit` has already moved past?", which is the closest thing to
+ * blob-level ancestry git offers: blobs carry no parents, so a revision is
+ * ordered only by the commits that hold it.
+ *
+ * `--full-history` is load-bearing. Default history simplification prunes a
+ * merge's side branch wherever the merge is TREESAME to its first parent, which
+ * drops exactly the revisions that only ever existed on that side — and a
+ * dropped revision reads as "unrelated content" rather than "already
+ * superseded", which is the opposite answer.
+ *
+ * Two processes regardless of how long the path's history is: one `rev-list`
+ * naming the commits that touch it, one batched `cat-file` resolving the blob
+ * at each. A revision where the path is absent resolves to `missing` and is
+ * skipped.
+ */
+export async function pathBlobRevisions(repo: string, commit: string, path: string): Promise<Set<string>> {
+  const revs = (await git(repo, ['rev-list', '--full-history', commit, '--', path])).stdout.split('\n').filter(Boolean);
+  const oids = new Set<string>();
+  if (revs.length === 0) return oids;
+  const input = `${revs.map((r) => `${r}:${path}`).join('\n')}\n`;
+  const res = await git(repo, ['cat-file', '--batch-check=%(objectname) %(objecttype)'], { input });
+  for (const line of res.stdout.split('\n')) {
+    const [oid, type] = line.split(' ');
+    if (type === 'blob') oids.add(oid);
+  }
+  return oids;
+}
