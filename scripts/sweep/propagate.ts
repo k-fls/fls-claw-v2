@@ -15525,12 +15525,30 @@ export async function cmdSweepFinish(
     // "no clean attribution" for a failure that is fully attributed — to
     // branches that are named, with the paths each of them collided on.
     const exclusions = verifyExclusions(readJournal(dir).slice(verifyLenBefore));
+    // TWO KINDS OF EXCLUSION, AND THEY MEAN DIFFERENT THINGS TO THE OWNER. A
+    // branch that would not MERGE lags the trunk and carries no defect: the
+    // paths it collided on are the whole story. A branch that merged and then
+    // failed a CHECK is a red the rebuild really saw, and saying nothing about
+    // it is broken would be false. The cue names each by what happened to it.
+    const cannotMerge = exclusions.filter((x) => x.unresolved.length > 0);
+    const checkRed = exclusions.filter((x) => x.unresolved.length === 0);
     const exclusionCue = exclusions.length
-      ? `verify RED — ${exclusions.length} branch(es) this pass did not mutate were EXCLUDED from the ` +
-        `integration rebuild: ${exclusions
-          .map((x) => `${x.branch}${x.unresolved.length ? ` (${x.unresolved.join(', ')})` : ''}`)
-          .join('; ')}. They were not rolled back and nothing about them is broken — they lag the trunk and ` +
-        `cannot be merged into it yet. What remains red is separate: report it and the exclusions together`
+      ? [
+          `verify RED — ${exclusions.length} branch(es) this pass did not mutate were EXCLUDED from the integration rebuild.`,
+          cannotMerge.length
+            ? `Cannot merge into the trunk yet (nothing about them is broken — they lag it): ${cannotMerge
+                .map((x) => `${x.branch} (${x.unresolved.join(', ')})`)
+                .join('; ')}.`
+            : '',
+          checkRed.length
+            ? `Merged, then failed a check — the rebuild saw a real red on each: ${checkRed
+                .map((x) => `${x.branch}${x.detail ? ` (${x.detail})` : ''}`)
+                .join('; ')}.`
+            : '',
+          'What remains red after the exclusions is separate: report it and the exclusions together',
+        ]
+          .filter((l) => l !== '')
+          .join(' ')
       : null;
 
     // An UNATTRIBUTABLE red is a build defect nobody in this pass

@@ -546,6 +546,12 @@ export async function blobOidAt(repo: string, treeish: string, path: string): Pr
  * dropped revision reads as "unrelated content" rather than "already
  * superseded", which is the opposite answer.
  *
+ * REVISION IDENTITY IS PER PATH NAME. A rename starts a new set, so content
+ * this line once held under another name reads as unrelated rather than
+ * superseded. That errs toward keeping what a branch already has, and a
+ * completed walk heals it: reconciliation takes the anchor's answer at every
+ * out-of-surface path regardless of what the steps decided.
+ *
  * Two processes regardless of how long the path's history is: one `rev-list`
  * naming the commits that touch it, one batched `cat-file` resolving the blob
  * at each. A revision where the path is absent resolves to `missing` and is
