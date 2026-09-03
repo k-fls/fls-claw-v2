@@ -9,9 +9,10 @@ import path from 'path';
 import { backfillContainerConfigs } from './backfill-container-configs.js';
 import { DATA_DIR } from './config.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
+import { adoptRunningSessions } from './container-runner.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
-import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
+import { getSessionDriver } from './drivers/index.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { startHostModules, stopHostModules } from './host-lifecycle.js';
@@ -80,9 +81,11 @@ async function main(): Promise<void> {
   // Idempotent — skips groups that already have a config row.
   backfillContainerConfigs();
 
-  // 2. Container runtime
-  ensureContainerRuntimeRunning();
-  cleanupOrphans();
+  // 2. Session runtime: prove it is reachable, then reconcile what survived a
+  // restart. Adoption replaces the old reap-everything cleanup — a session that
+  // is still running keeps running, and only true orphans are stopped.
+  await getSessionDriver().ensureReady?.();
+  await adoptRunningSessions();
 
   // 3. Channel adapters
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {

@@ -48,7 +48,7 @@ function emptyResult(): ReconcileResult {
  * Conservative shape for a tag we're willing to hand to `docker rmi`. The value
  * is already constrained (it has to equal a string we built ourselves), but an
  * argv element beginning with `-` would be read as a flag, so gate it the same
- * way `stopContainer` gates container names.
+ * way runtime names are gated (`validateRuntimeName`).
  */
 const SAFE_IMAGE_REF = /^[a-zA-Z0-9][a-zA-Z0-9_.\-/]*:[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 

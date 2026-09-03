@@ -181,7 +181,7 @@ console.log(`✓ Container status: ${session.container_status}`);
 import { execSync } from 'child_process';
 const checkContainerLogs = () => {
   try {
-    const containers = execSync('docker ps -a --filter name=nanoclaw-v2-test-channel --format "{{.Names}}"')
+    const containers = execSync('docker ps -a --filter label=nanoclaw-group-folder=test-channel --format "{{.Names}}"')
       .toString()
       .trim();
     for (const name of containers.split('\n').filter(Boolean)) {

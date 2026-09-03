@@ -21,6 +21,7 @@ import { createAgentGroup, getAgentGroup, getAgentGroupByFolder } from '../../db
 import { getContainerConfig } from '../../db/container-configs.js';
 import { getSession } from '../../db/sessions.js';
 import { wakeContainer } from '../../container-runner.js';
+import { groupFolderExistsOnDisk } from '../../group-folder.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
@@ -126,10 +127,14 @@ async function performCreateAgent(
     return;
   }
 
-  // Derive a safe folder name, deduplicated globally across agent_groups.folder
+  // Derive a safe folder name, deduplicated globally across
+  // agent_groups.folder AND the on-disk groups/ dir: a folder present on disk
+  // with no claiming DB row is deleted-group residue, and adopting it would
+  // silently re-scope the old group's data under the new agent's identity —
+  // skip to the next suffix instead (templates/create-agent.ts precedent).
   let folder = localName;
   let suffix = 2;
-  while (getAgentGroupByFolder(folder)) {
+  while (getAgentGroupByFolder(folder) || groupFolderExistsOnDisk(folder)) {
     folder = `${localName}-${suffix}`;
     suffix++;
   }

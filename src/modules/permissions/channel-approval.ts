@@ -50,6 +50,7 @@ import { createAgentGroup, getAgentGroup, getAgentGroupByFolder, getAllAgentGrou
 import { getChannelAdapter } from '../../channels/channel-registry.js';
 import { getMessagingGroup, updateMessagingGroup } from '../../db/messaging-groups.js';
 import { getDeliveryAdapter } from '../../delivery.js';
+import { groupFolderExistsOnDisk } from '../../group-folder.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { log } from '../../log.js';
 import type { InboundEvent } from '../../channels/adapter.js';
@@ -360,7 +361,11 @@ export function createNewAgentGroup(name: string): AgentGroup {
   let folder = toFolder(name);
   const baseFolder = folder;
   let suffix = 2;
-  while (getAgentGroupByFolder(folder)) {
+  // Disk-aware dedupe (A4): a folder present on disk with no claiming DB row
+  // is deleted-group residue — adopting it would silently re-scope the old
+  // group's data under the new agent's identity. Skip to the next suffix
+  // instead (templates/create-agent.ts precedent).
+  while (getAgentGroupByFolder(folder) || groupFolderExistsOnDisk(folder)) {
     folder = `${baseFolder}-${suffix}`;
     suffix++;
   }

@@ -14,10 +14,12 @@
  *  - No agent groups configured: no card, no row
  */
 import fs from 'fs';
+import path from 'path';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
 import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
+import { createNewAgentGroup } from './channel-approval.js';
 import { createMessagingGroup, getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
 import { registerChannelAdapter } from '../../channels/channel-registry.js';
 import type { ChannelDefaults } from '../../channels/adapter.js';
@@ -722,5 +724,23 @@ describe('no-owner / no-agent failure modes', () => {
     expect(deliverMock).not.toHaveBeenCalled();
     const count = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }).c;
     expect(count).toBe(0);
+  });
+});
+
+describe('createNewAgentGroup — disk-aware folder dedupe (A4)', () => {
+  it('skips deleted-group residue on disk and mints the next suffix', () => {
+    // groups/my-agent exists on disk but no DB row claims it — exactly the
+    // state `ncl groups delete` leaves behind. The dedupe loop must treat
+    // disk presence as taken (matching templates/create-agent.ts) and mint
+    // my-agent-2, never adopt the residue.
+    const residue = path.join(TEST_DIR, 'groups', 'my-agent');
+    fs.mkdirSync(residue, { recursive: true });
+    fs.writeFileSync(path.join(residue, 'memory.md'), 'old group memory\n');
+
+    const ag = createNewAgentGroup('My Agent');
+
+    expect(ag.folder).toBe('my-agent-2');
+    // Residue untouched.
+    expect(fs.readFileSync(path.join(residue, 'memory.md'), 'utf8')).toBe('old group memory\n');
   });
 });

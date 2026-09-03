@@ -26,7 +26,11 @@ vi.mock('../../container-runner.js', () => ({
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-cli-groups-create' };
+  return {
+    ...actual,
+    DATA_DIR: '/tmp/nanoclaw-test-cli-groups-create',
+    GROUPS_DIR: '/tmp/nanoclaw-test-cli-groups-create/groups',
+  };
 });
 
 const TEST_DIR = '/tmp/nanoclaw-test-cli-groups-create';
@@ -47,7 +51,7 @@ function count(sql: string, ...params: unknown[]): number {
 describe('groups CLI create provisions a container_configs row (#4)', () => {
   beforeEach(() => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
-    fs.mkdirSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(`${TEST_DIR}/groups`, { recursive: true });
 
     const db = initTestDb();
     runMigrations(db);
