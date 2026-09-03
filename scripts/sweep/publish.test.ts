@@ -43,10 +43,12 @@ import {
   cmdSweepReportPr,
   cmdSweepStart,
   duplicateCaseIssue,
+  RESOLVE_COLDREAD_CAP,
   journaledCases,
   passDir,
   appendJournal,
   readJournal,
+  type ChecksRunner,
   type Cli,
   type ColdReadInvoker,
   type InstallRunner,
@@ -1073,7 +1075,10 @@ describe('propagate publish — dry-run makes no pushes/network; execute pushes 
     const tokenFile = join(ws, 'token.txt');
     writeFileSync(tokenFile, 'substitute-token\n');
     const gh = fakeGithub({
-      '/pulls?': { status: 200, body: [{ html_url: 'https://github.com/k-fls/fixture/pull/9', number: 9 }] },
+      '/pulls?': {
+        status: 200,
+        body: [{ html_url: 'https://github.com/k-fls/fixture/pull/9', number: 9, draft: true }],
+      },
       '/pulls/9': { status: 200, body: { html_url: 'https://github.com/k-fls/fixture/pull/9', number: 9 } },
     });
     const out = join(ws, 'out.json');
@@ -1579,5 +1584,257 @@ describe('publish — a mixed conflict publishes on its IN-SURFACE question alon
     expect(exhibited).toContain('<<<<<<<');
     // …and the out-of-surface member arrives already resolved to the incoming side.
     expect(repo.git('rev-parse', `${head}:src/f_out.ts`)).toBe(repo.git('rev-parse', `${z}:src/f_out.ts`));
+  });
+});
+
+// --- The draft flag: what the owner is being asked to do with the head -------
+//
+// A held PR is ACTIVE only when the driver can stand behind the owner merging
+// it AS-IS. Every fixture below reaches its freeze through the ordinary path —
+// the disposition publish reads is the one the driver wrote — because a
+// hand-journaled escalation would prove nothing about which escalations the
+// driver reaches with a mergeable head.
+
+describe('publish — a held head the driver cannot stand behind goes out as a DRAFT', () => {
+  /** A checks-file the injected runner keys off (the cmd strings are labels). */
+  function checksFileFor(ws: string): string {
+    const f = join(ws, 'checks.json');
+    writeFileSync(
+      f,
+      JSON.stringify({
+        typecheck: [{ cmd: 'tsc --noEmit', cwd: '.' }],
+        test: [{ cmd: 'vitest run', cwd: '.' }],
+      }),
+    );
+    return f;
+  }
+  /** Fails exactly the named commands, naming a file the output can be parsed for. */
+  function runner(failing: string[]): ChecksRunner {
+    return async (commands) => {
+      const names = commands.map((c) => c.cmd);
+      const failedNames = names.filter((n) => failing.includes(n));
+      return {
+        ok: failedNames.length === 0,
+        failedNames,
+        output: failedNames.map((n) => `$ ${n}\nsrc/x.ts: boom\n`).join(''),
+      };
+    };
+  }
+  const greenPreMerge: ChecksRunner = async () => ({ ok: true, failedNames: [], output: '' });
+  const rejecting: ColdReadInvoker = async () => ({
+    verdict: 'reject',
+    notes: 'the fork-side guard is gone',
+    feedback: 'restore the fork-side guard',
+  });
+
+  /**
+   * A held case whose head is a REAL resolution, frozen by `drive` through the
+   * ordinary `report-case` path, then pushed and published.
+   */
+  async function heldThen(
+    drive: (ctx: { dir: string; caseId: string; cli: (o: Partial<Cli>) => Cli; ws: string }) => Promise<void>,
+    withChecks = false,
+  ): Promise<{ repo: FixtureRepo; dir: string; caseId: string; gh: ReturnType<typeof fakeGithub>; ws: string }> {
+    const repo = heldCaseRepo();
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, o);
+    const checks = withChecks ? checksFileFor(ws) : undefined;
+    expect(await cmdSweepStart(cli({ cmd: 'sweep-start', ...(checks ? { checksFile: checks } : {}) }))).toBe(0);
+    expect(await cmdSweepNextCase(cli({ cmd: 'next-case' }), greenPreMerge)).toBe(0);
+    const caseId = currentCaseId(dir);
+    await drive({ dir, caseId, cli, ws });
+    repo.git('push', 'origin', 'main_patched'); // simulated target push -> ERR14 passes
+    writeText(join(dir, caseId, 'pr'), GOOD_TITLE, GOOD_BODY);
+    const tokenFile = join(ws, 'token.txt');
+    writeFileSync(tokenFile, 'substitute-token\n');
+    const gh = fakeGithub();
+    expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, tokenFile }), gh.factory)).toBe(0);
+    return { repo, dir, caseId, gh, ws };
+  }
+
+  /** The `draft` the PR was actually opened with, read off the create call. */
+  function createdDraft(gh: ReturnType<typeof fakeGithub>): boolean {
+    const post = gh.calls.find((c) => c.method === 'POST' && c.path.endsWith('/pulls'))!;
+    expect(post).toBeTruthy();
+    return (post.body as { draft: boolean }).draft;
+  }
+
+  it('held BY CLAIM with the checks red publishes a DRAFT carrying the resolution', async () => {
+    const { dir, caseId, gh } = await heldThen(async ({ dir, caseId, cli }) => {
+      resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+      expect(
+        await cmdSweepReportCase(
+          cli({ cmd: 'report-case', tier: 'held', execute: true }),
+          neverInvoked,
+          runner(['vitest run']),
+          fakeInstall,
+        ),
+      ).toBe(0);
+    }, true);
+    const held = readJournal(dir).find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect((held.escalation as { tag: string }).tag).toBe('[AUTO-ESCALATED: checks failing]');
+    // The work is KEPT — this is not the pristine exhibit…
+    expect(held.resolution).toMatchObject({ markerClean: true });
+    // …and it is still a draft, because the gate is red on the very tree the PR
+    // carries: the owner has to finish it, not merge it.
+    expect(createdDraft(gh)).toBe(true);
+    expect(readJournal(dir).find((e) => e.action === 'pr-published')!.draft).toBe(true);
+  });
+
+  it('cold-read rejected 2x publishes a DRAFT — the reviewer rejected the tree the PR carries', async () => {
+    const { dir, caseId, gh } = await heldThen(async ({ dir, caseId, cli }) => {
+      resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+      expect(await cmdSweepReportCase(cli({ cmd: 'report-case', tier: 'judged', execute: true }), rejecting)).toBe(1);
+      expect(await cmdSweepReportCase(cli({ cmd: 'report-case', tier: 'judged', execute: true }), rejecting)).toBe(0);
+    });
+    const held = readJournal(dir).find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect((held.escalation as { tag: string }).tag).toBe('[AUTO-ESCALATED: cold read rejected 2x]');
+    expect(held.resolution).toMatchObject({ markerClean: true });
+    expect(createdDraft(gh)).toBe(true);
+  });
+
+  it('a resolution that never converged publishes a DRAFT — no one of its trees is the answer', async () => {
+    const { dir, caseId, gh } = await heldThen(async ({ dir, caseId, cli }) => {
+      const jp = join(dir, 'journal.jsonl');
+      for (let n = 1; n <= RESOLVE_COLDREAD_CAP; n++) {
+        appendFileSync(
+          jp,
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            action: 'report-attempt',
+            caseId,
+            branch: 'main_patched',
+            tier: 'mechanical',
+            resolvedTree: `seed-tree-${n}`,
+          }) + '\n',
+        );
+      }
+      resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED distinct final\n' });
+      expect(await cmdSweepReportCase(cli({ cmd: 'report-case', tier: 'judged', execute: true }), confirm)).toBe(0);
+    });
+    const held = readJournal(dir).find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect((held.escalation as { tag: string }).tag).toBe('[AUTO-ESCALATED: resolution did not converge]');
+    expect(createdDraft(gh)).toBe(true);
+  });
+
+  /**
+   * THE PIN. These two are the whole reason the rule is a tag set and not "held
+   * with an escalation": both ship a green, cold-read-confirmed tree, and both
+   * must keep going out ACTIVE. A rule that drafted every escalation would take
+   * the sweep's best outcomes out of the owner's review queue.
+   */
+  it('scope exceeded and an unescalated held resolution both publish ACTIVE', async () => {
+    const scoped = await heldThen(async ({ dir, caseId, cli }) => {
+      resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n', 'src/extra.ts': 'reached\n' });
+      expect(await cmdSweepReportCase(cli({ cmd: 'report-case', tier: 'mechanical', execute: true }), confirm)).toBe(0);
+    });
+    const scopedHeld = readJournal(scoped.dir).find((e) => e.action === 'held' && e.caseId === scoped.caseId)!;
+    expect((scopedHeld.escalation as { tag: string }).tag).toBe('[AUTO-ESCALATED: scope exceeded]');
+    expect(createdDraft(scoped.gh)).toBe(false);
+
+    const plain = await heldThen(async ({ dir, caseId, cli }) => {
+      resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+      expect(await cmdSweepReportCase(cli({ cmd: 'report-case', tier: 'held', execute: true }), confirm)).toBe(0);
+    });
+    const plainHeld = readJournal(plain.dir).find((e) => e.action === 'held' && e.caseId === plain.caseId)!;
+    expect(plainHeld.escalation ?? null).toBeNull();
+    expect(createdDraft(plain.gh)).toBe(false);
+  });
+
+  /**
+   * A REPUBLISH RECONCILES THE FLAG. The PATCH that refreshes title and body
+   * carries no `draft` — REST has no such field — so without this the PR keeps
+   * exhibiting whatever answer it was opened with while its head changes
+   * underneath. The mutation is GraphQL's alone, so the call is the proof.
+   */
+  it('a republish flips a stale live draft flag through the GraphQL mutation', async () => {
+    const { repo, ws, dir, caseId, prDir, cli } = await setupHeldCase();
+    writeText(prDir, GOOD_TITLE, GOOD_BODY);
+    const tokenFile = join(ws, 'token.txt');
+    writeFileSync(tokenFile, 'substitute-token\n');
+    // The PR on this case's head ref is live and NOT a draft; the case is the
+    // pristine conflict, which publishes draft.
+    const gh = fakeGithub({
+      '/pulls?': {
+        status: 200,
+        body: [{ html_url: 'https://github.com/k-fls/fixture/pull/9', number: 9, draft: false }],
+      },
+      '/pulls/9': {
+        status: 200,
+        body: { html_url: 'https://github.com/k-fls/fixture/pull/9', number: 9, node_id: 'PR_node9' },
+      },
+      '/graphql': { status: 200, body: { data: { convertPullRequestToDraft: { pullRequest: { isDraft: true } } } } },
+    });
+    expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, tokenFile }), gh.factory)).toBe(0);
+    const mutation = gh.calls.find((c) => c.path === '/graphql');
+    expect(mutation).toBeTruthy();
+    expect((mutation!.body as { query: string }).query).toContain('convertPullRequestToDraft');
+    expect((mutation!.body as { variables: { pullRequestId: string } }).variables.pullRequestId).toBe('PR_node9');
+    const row = readJournal(dir).find((e) => e.action === 'draft-reconciled')!;
+    expect(row).toMatchObject({ caseId, prNumber: 9, to: true });
+    expect(repo.sha('main_patched')).toBeTruthy();
+  });
+
+  /** The inverse, and the reason the reconciliation is two-way: a live DRAFT
+   * whose republished head is one the driver stands behind is taken out of
+   * draft, so a resolution that came back green stops looking unfinished. */
+  it('a republish takes a live draft out of draft when the new head is mergeable', async () => {
+    const repo = heldCaseRepo();
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = passDir(ws, repo.sha('main').slice(0, 12));
+    const cli = (o: Partial<Cli>): Cli => baseCli(repo, ws, inv, o);
+    expect(await cmdSweepStart(cli({ cmd: 'sweep-start' }))).toBe(0);
+    expect(await cmdSweepNextCase(cli({ cmd: 'next-case' }))).toBe(0);
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    expect(await cmdSweepReportCase(cli({ cmd: 'report-case', tier: 'held', execute: true }), confirm)).toBe(0);
+    repo.git('push', 'origin', 'main_patched');
+    writeText(join(dir, caseId, 'pr'), GOOD_TITLE, GOOD_BODY);
+    const tokenFile = join(ws, 'token.txt');
+    writeFileSync(tokenFile, 'substitute-token\n');
+    const gh = fakeGithub({
+      '/pulls?': {
+        status: 200,
+        body: [{ html_url: 'https://github.com/k-fls/fixture/pull/11', number: 11, draft: true }],
+      },
+      '/pulls/11': {
+        status: 200,
+        body: { html_url: 'https://github.com/k-fls/fixture/pull/11', number: 11, node_id: 'PR_node11' },
+      },
+      '/graphql': {
+        status: 200,
+        body: { data: { markPullRequestReadyForReview: { pullRequest: { isDraft: false } } } },
+      },
+    });
+    expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, tokenFile }), gh.factory)).toBe(0);
+    const mutation = gh.calls.find((c) => c.path === '/graphql')!;
+    expect((mutation.body as { query: string }).query).toContain('markPullRequestReadyForReview');
+    expect(readJournal(dir).find((e) => e.action === 'draft-reconciled')).toMatchObject({ prNumber: 11, to: false });
+  });
+
+  /** No mutation when the live flag already agrees — the reconciliation is a
+   * repair, not a write on every republish. */
+  it('a republish whose live flag already agrees issues no mutation', async () => {
+    const { ws, dir, caseId, prDir, cli } = await setupHeldCase();
+    writeText(prDir, GOOD_TITLE, GOOD_BODY);
+    const tokenFile = join(ws, 'token.txt');
+    writeFileSync(tokenFile, 'substitute-token\n');
+    const gh = fakeGithub({
+      '/pulls?': {
+        status: 200,
+        body: [{ html_url: 'https://github.com/k-fls/fixture/pull/9', number: 9, draft: true }],
+      },
+      '/pulls/9': { status: 200, body: { html_url: 'https://github.com/k-fls/fixture/pull/9', number: 9 } },
+    });
+    expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, tokenFile }), gh.factory)).toBe(0);
+    expect(gh.calls.some((c) => c.path === '/graphql')).toBe(false);
+    expect(readJournal(dir).some((e) => e.action === 'draft-reconciled')).toBe(false);
   });
 });

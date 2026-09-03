@@ -652,7 +652,7 @@ describe('sweep report-case (SWEEP-STATE-MACHINE.md §2)', () => {
     const held = readJournal(dir).find((e) => e.action === 'held' && e.caseId === caseId)!;
     expect(held.escalation).toMatchObject({ tag: '[AUTO-ESCALATED: cold read rejected 2x]' });
     expect((held.escalation as { feedback: string }).feedback).toContain('restore the fork-side guard');
-    expect(held.resolution).toMatchObject({ markerClean: true }); // active review PR at publish
+    expect(held.resolution).toMatchObject({ markerClean: true }); // the work is kept for the owner
     expect(machineState(dir).currentCase?.tier).toBe('held');
   });
 
@@ -701,7 +701,7 @@ describe('sweep report-case (SWEEP-STATE-MACHINE.md §2)', () => {
     // report-attempt is recorded POST-CHECKS, so the cap counts only
     // cold-read-reaching (RESOLVED, checks-passing) trees. Seed CAP prior
     // report-attempt rows with distinct trees, then report ONE more distinct
-    // RESOLVED tree: 5b sees >CAP distinct and force-freezes HELD ACTIVE with the
+    // RESOLVED tree: 5b sees >CAP distinct and force-freezes HELD with the
     // convergence escalation, BEFORE the cold read runs.
     const jp = join(dir, 'journal.jsonl');
     for (let n = 1; n <= RESOLVE_COLDREAD_CAP; n++) {
@@ -2329,6 +2329,57 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     // way wherever it appears.
     expect(lines[0]).toBe(`cmd=tsc --noEmit cwd=. subtree=${oid.slice(0, 12)} files=${gateCase.slice(-8)}`);
     expect(caseId).toBeTruthy();
+  });
+
+  /**
+   * A GATE FIX FROZEN WITH THE FIX KEPT IS A DRAFT. There is no pristine
+   * exhibit to fall back on, so the head is always the attempted fix — and the
+   * agent reached this freeze by saying the fix cannot be made in scope. The
+   * work still reaches the owner, and the flag is what stops it being offered
+   * as mergeable.
+   */
+  it('a held gate fix that KEEPS its attempted fix publishes a DRAFT', async () => {
+    const repo = inheritedRedFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    repo.attachBareOrigin();
+    for (const b of ['main', 'main_patched', 'module/cg']) repo.git('push', 'origin', b);
+    const { dir, ceilingTip } = await inheritedCase(repo, ws, inv);
+    seedConfirmedRed(dir, repo, 'module/elsewhere', ceilingTip);
+    const r = namingRunner(['tsc --noEmit'], 'src/shared.ts');
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'judged', notMyBug: true, execute: true }),
+      neverInvoked,
+      r.fn,
+      fakeInstall,
+    );
+    const gateCase = readJournal(dir).find((e) => e.action === 'gate-fix')!.caseId as string;
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge)).toBe(0);
+    // The agent ATTEMPTED the fix and then concluded it cannot be completed
+    // here: the tree carries real edits, so the freeze keeps them.
+    resolveWorktree(dir, gateCase, { 'src/shared.ts': 'half a fix\n' });
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true }),
+        confirm,
+        greenPreMerge,
+        fakeInstall,
+      ),
+    ).toBe(0);
+    const held = readJournal(dir).find((e) => e.action === 'held' && e.caseId === gateCase)!;
+    expect((held.escalation as { tag: string }).tag).toBe('[AUTO-ESCALATED: checks failing]');
+    expect(held.resolution).toBeTruthy(); // the attempt is KEPT — not an empty report
+    writePr(dir, gateCase, 'fix(sweep): a partial fix for the shared defect', '# Diagnosis\n\nHalf of it.\n');
+    repo.git('push', 'origin', 'main_patched');
+    const tokenFile = join(ws, 'token.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const gh = fakeGithub();
+    expect(
+      await cmdPublish(baseCli(repo, ws, inv, { cmd: 'publish', caseId: gateCase, execute: true, tokenFile }), gh.factory),
+    ).toBe(0);
+    const post = gh.calls.find((c) => c.method === 'POST' && c.path.endsWith('/pulls'))!;
+    expect((post.body as { draft: boolean }).draft).toBe(true);
+    expect(readJournal(dir).find((e) => e.action === 'pr-published' && e.caseId === gateCase)!.draft).toBe(true);
   });
 
   /**

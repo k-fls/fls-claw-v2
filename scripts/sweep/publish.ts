@@ -509,7 +509,12 @@ export interface RemotePublishResult {
 
 /**
  * Create the PR on GitHub for a head branch the DRIVER ALREADY PUSHED via
- * `git push` (DRIVER.md §2.5 — the API never moves refs). HELD PRs are drafts;
+ * `git push` (DRIVER.md §2.5 — the API never moves refs).
+ *
+ * `draft` is the CALLER'S decision and this surface does not second-guess it: a
+ * held PR is a draft when the driver cannot stand behind the owner merging it
+ * as-is (a pristine-conflict exhibit, a diagnosis with no diff, a red gate, a
+ * twice-rejected tree, a resolution that never converged) and active otherwise.
  * JUDGED PRs are non-draft history that the target push auto-flips to merged.
  */
 export async function createPullRequest(
@@ -532,14 +537,17 @@ export async function getOpenPrByHead(
   transport: GithubTransport,
   slug: { owner: string; repo: string },
   headBranch: string,
-): Promise<{ url: string; number: number } | null> {
+): Promise<{ url: string; number: number; draft: boolean } | null> {
   const res = await transport.request(
     'GET',
     `/repos/${slug.owner}/${slug.repo}/pulls?head=${encodeURIComponent(`${slug.owner}:${headBranch}`)}&state=open`,
   );
   if (res.status === 200 && Array.isArray(res.body) && res.body.length > 0) {
-    const pr = res.body[0] as { html_url?: string; number?: number };
-    return { url: String(pr.html_url ?? ''), number: Number(pr.number ?? 0) };
+    const pr = res.body[0] as { html_url?: string; number?: number; draft?: boolean };
+    // The LIVE draft flag travels with the PR: a republish updates title and
+    // body through REST, which cannot write `draft` at all, so the caller needs
+    // to know what the PR carries now to decide whether to reconcile it.
+    return { url: String(pr.html_url ?? ''), number: Number(pr.number ?? 0), draft: pr.draft === true };
   }
   return null;
 }

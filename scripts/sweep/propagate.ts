@@ -145,6 +145,7 @@ import {
   listIssueComments,
   listReviewComments,
   listReviews,
+  markPullRequestReadyForReview,
   maxRealReviewId,
   parseGithubSlug,
   postSweepAddressed,
@@ -1994,6 +1995,21 @@ const ESCALATE_SCOPE = '[AUTO-ESCALATED: scope exceeded]';
 const ESCALATE_CAP = '[AUTO-ESCALATED: resolution did not converge]';
 /** The checks gate (typecheck/tests) kept failing CHECKS_FAIL_LIMIT times. */
 const ESCALATE_CHECKS = '[AUTO-ESCALATED: checks failing]';
+
+/**
+ * The escalations whose HELD pull request goes out as a DRAFT.
+ *
+ * A held PR is ACTIVE only when the driver can stand behind the owner merging
+ * it AS-IS: the merged tree passes the checks gate and the cold read confirmed
+ * the shipped tree, or the red is adjudicated pre-existing and owned by nothing
+ * this case can hand it to. These three tags say the opposite — the gate is red
+ * on the tree being shipped, the reviewer rejected that tree twice, or the
+ * resolution never converged on one — so the PR is work the owner has to
+ * FINISH, and a draft is what says so. The remaining tags (scope exceeded,
+ * unstable check, red owned by no branch) all ship a tree the driver stands
+ * behind, and stay active.
+ */
+const DRAFT_HELD_TAGS = new Set([ESCALATE_CHECKS, ESCALATE_REJECTED_2X, ESCALATE_CAP]);
 
 /**
  * How many times a case's checks gate (typecheck OR tests) may fail before
@@ -6420,7 +6436,7 @@ export async function publishGateFixTwins(
       // it is not a case's prose — there is no agent behind it — it is a pointer
       // to the review that already exists, and the machine line is what a reader
       // (and the next pass) follows back.
-      let pr = await getOpenPrByHead(transport, slugParts, twin.twinRef);
+      let pr: { url: string; number: number } | null = await getOpenPrByHead(transport, slugParts, twin.twinRef);
       if (!pr) {
         const body = withMachineLine(
           `The fix on \`${twin.originalRef}\` is needed at \`${twin.ceiling}\` as well, and it is the SAME ` +
@@ -6783,9 +6799,10 @@ async function publishHead(
         // outright — silently dropping the escalation. Transplant the
         // resolution onto origin's ACTUAL tip so
         // the PR's diff is the case's own work and nothing else.
+        const draftHeld = escalation !== null && DRAFT_HELD_TAGS.has(escalation.tag);
         const transplant = await transplantOntoOrigin(cli, dir, jc, tip, localHead);
-        if (transplant) return { ...transplant, mode: 'held', draft: transplant.draft, escalation };
-        return { headSha: localHead, mode: 'held', draft: false, escalation };
+        if (transplant) return { ...transplant, mode: 'held', draft: transplant.draft || draftHeld, escalation };
+        return { headSha: localHead, mode: 'held', draft: draftHeld, escalation };
       }
     }
     // A GATE FIX HAS NO PRISTINE CONFLICT TO FALL BACK ON. It never had a
@@ -7145,12 +7162,12 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
   // then the republish is SKIPPED (journaled), never a clobber of the owner's
   // action and never a second PR (the next start re-derives the truth).
   const transport = (makeTransport ?? realGithubTransport)(token!);
-  let reissueTarget: { url: string; number: number } | null = null;
+  let reissueTarget: { url: string; number: number; draft: boolean } | null = null;
   try {
     if (reissue && typeof caseRow!.prNumber === 'number') {
       const live = await getPullRequest(transport, slugParts!, caseRow!.prNumber as number);
       if (live.state === 'open' && !live.merged) {
-        reissueTarget = { url: live.url, number: live.number };
+        reissueTarget = { url: live.url, number: live.number, draft: live.draft };
       } else {
         const liveState = live.merged ? 'merged' : live.state;
         appendJournal(dir, {
@@ -7267,6 +7284,24 @@ export async function cmdPublish(cli: Cli, makeTransport?: (token: string) => Gi
         title,
         body: finalBody,
       });
+      // RECONCILE THE DRAFT FLAG. The PATCH above carries title and body and
+      // nothing else — REST cannot write `draft` at all — so a PR that was
+      // opened under one answer to "can the owner merge this as-is" would keep
+      // showing that answer forever while the head underneath it changes. The
+      // flag is the owner's read on the PR, so it follows the head: a
+      // republished case whose live flag disagrees with the one this publish
+      // computed is flipped through the GraphQL mutation that owns it.
+      //
+      // BOTH DIRECTIONS. A resolution that came back green must stop looking
+      // like unfinished work, exactly as a resolution that went red must stop
+      // looking mergeable; a one-way reconciliation would only ever be right
+      // about half the cases. The journal row is what makes the flip visible.
+      if (reissueTarget.draft !== draft) {
+        if (draft) await convertPullRequestToDraft(transport, slugParts!, reissueTarget.number);
+        else await markPullRequestReadyForReview(transport, slugParts!, reissueTarget.number);
+        appendJournal(dir, { action: 'draft-reconciled', caseId: jc.caseId, prNumber: reissueTarget.number, to: draft });
+        console.error(`publish: PR #${reissueTarget.number} draft flag reconciled to ${draft}`);
+      }
       result = reissueTarget;
     } else {
       result = await createPullRequest(transport, slugParts!, {

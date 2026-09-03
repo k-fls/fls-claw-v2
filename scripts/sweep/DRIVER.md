@@ -915,6 +915,19 @@ SAME ref under a lease against the head this pass classified; deriving a fresh
 name from a changed conflict would mint a second ref and a second PR for one
 case.
 
+A DRIVER-shaped answer whose checks are red is deleted and re-derived WHATEVER
+its draft flag says. The flag records how the last pass could offer the head; the
+table decides on the head's state now, and a red held answer the driver published
+as a draft is still an answer that no longer passes. It goes down the same row —
+delete the ref, proceed as a fresh case — and the next pass derives the case
+again from the branch. The flag never buys a head another pass.
+
+On a republish the flag is RECONCILED: the PATCH that refreshes title and body
+cannot write `draft` (REST has no such field), so a republished PR whose head
+changed answer would keep exhibiting the old one. The driver reads the live flag
+and flips it through the GraphQL mutation in either direction, journaling
+`draft-reconciled`.
+
 The draft flag is the "already told you" marker, so an owner PR is converted and
 commented on ONCE and a PR the owner opened as a draft gets neither. The
 conversion and the comment are a courtesy on the transition and never stop the
@@ -1166,9 +1179,10 @@ On pass, by tier — RECORD PR INTENT, PUBLISH NOTHING (§10.1):
 - `judged` — merge the resolution in place on the branch, then record the PR
   intent. The history PR is created at `finish`, before the target push that
   auto-flips it to merged.
-- `held` — record the held intent. Active-vs-draft is decided by whether a
-  MARKER-CLEAN resolution exists (§8.1). Escalated holds prepend their
-  `[AUTO-ESCALATED: …]` prefix and the reviewer feedback to the description.
+- `held` — record the held intent. Active-vs-draft is decided by whether the
+  driver can stand behind the owner merging the head as-is (§8.1). Escalated
+  holds prepend their `[AUTO-ESCALATED: …]` prefix and the reviewer feedback to
+  the description.
 - **gate fix** — see §9.3.
 
 Then the next case.
@@ -1250,7 +1264,8 @@ resets the worktree to the PRISTINE conflict and freezes a HELD DRAFT tagged
 `[AUTO-ESCALATED: checks failing]`, so a failing resolution is never published. A
 failed reset is `ERR44_WORKTREE_RESET_FAILED`, never a "pristine" exhibit built
 from a tree nobody reset. For a gate fix the same limit KEEPS the attempted fix
-and freezes HELD ACTIVE instead (§9.3).
+and freezes it as a HELD DRAFT instead (§9.3) — the fix is the deliverable, the
+red gate is why the owner finishes it rather than merges it.
 
 A re-run after a failure is NARROWED to the files that failed, through each
 command's `filter` (`bun test {files}`) — for cost, and for nothing else. A
@@ -1624,7 +1639,9 @@ cold read as scope-exceeded (below).
 A violation does NOT demote to HELD before the cold read. `scopeExceeded` is
 carried forward, the cold read judges the RESOLUTION, and confirm + scope-exceeded
 becomes HELD publishing that resolution as an ACTIVE PR tagged
-`[AUTO-ESCALATED: scope exceeded]` (the owner merges; never auto-merged). Scope OK
+`[AUTO-ESCALATED: scope exceeded]` (the owner merges; never auto-merged). It is
+ACTIVE because the tree it ships is green and cold-read-confirmed — the
+escalation is about the REACH of a resolution the driver stands behind. Scope OK
 + confirm → the claimed tier; a reject follows the two-strike path (§7.5).
 
 For a GATE FIX the guard measures BLAST RADIUS rather than legality: the file a
@@ -1670,10 +1687,11 @@ verdict's content is journaled on the `resolved` entry for the audit trail.
   frozen, and the command is re-runnable once the tooling is restored.
 - **Rejections are COUNTED per case.** The 1st reject does NOT freeze — the
   reviewer's short feedback is returned for a revise-and-retry. The 2nd
-  (`COLDREAD_REJECT_LIMIT`) stops the retrying and passes the case HELD with
-  `[AUTO-ESCALATED: cold read rejected 2x]` plus the feedback prepended to the PR
-  description. The cold reader never sees PR prose — there is none yet — so every
-  reject is a resolution reject.
+  (`COLDREAD_REJECT_LIMIT`) stops the retrying and passes the case HELD as a
+  DRAFT with `[AUTO-ESCALATED: cold read rejected 2x]` plus the feedback
+  prepended to the PR description — the reviewer rejected the very tree the PR
+  carries, so it is not a tree to merge as-is. The cold reader never sees PR
+  prose — there is none yet — so every reject is a resolution reject.
 - **Outcome routing.** Confirm + in scope, by tier: `mechanical` → merge in place
   → "merged, take next case"; `judged` → "provide PR description" (the merge
   itself lands at `report-pr`); `held` → freeze HELD ACTIVE → "provide PR
@@ -1882,7 +1900,7 @@ its own ruling.
 | CLEAN | no textual conflict (merge-tree) | bulk direct merge | none | none |
 | MECHANICAL | conflict the agent may resolve, resolved | direct merge | cold-read confirm required | none — journal + cold-read artifact only |
 | JUDGED | non-obvious conflict, agent-resolved | merge; the same commit pushed to the target auto-marks the PR merged | cold-read confirm required | yes (history) |
-| HELD | unresolved / cold-read reject ×2 / scope-guard trip / red verify gate / non-convergence cap / checks limit / reissue / escalation | clean prefix merges first; PR head = the resolved merge commit if marker-clean, else the pristine conflict | **owner** — the only review state | ACTIVE PR (marker-clean resolution, owner merges) or DRAFT PR (pristine conflict), real diff |
+| HELD | unresolved / cold-read reject ×2 / scope-guard trip / red verify gate / non-convergence cap / checks limit / reissue / escalation | clean prefix merges first; PR head = the resolved merge commit if marker-clean, else the pristine conflict | **owner** — the only review state | ACTIVE PR when the driver stands behind merging the head as-is, else DRAFT PR; real diff either way |
 | DEFERRED | own conflict at height ≥ MIN(blocked direct parents' heights) (§5.2) | clean prefix committed; STOP — no merge above, NO PR | none | none |
 
 - CLEAN vs conflict is COMPUTED (merge-tree). MECHANICAL vs JUDGED is
@@ -1894,13 +1912,25 @@ its own ruling.
 - HELD is the ONLY review state: anything review-worthy at any tier is ESCALATED
   to HELD and inherits ALL HELD rules. The driver NEVER auto-merges a HELD PR —
   auto-merge stays JUDGED.
-- **HELD publish is UNIFIED on one key**: does a MARKER-CLEAN resolution exist?
-  Marker-clean (the agent actually resolved) → an ACTIVE (non-draft) PR at the
-  resolved merge commit, which the owner reviews and merges. Markers remain, or
-  `--tier held` with no valid resolution → a DRAFT PR built from the PRISTINE
-  conflict (clean-prefix commit + the original upstream-vs-ours automerge tree,
-  ZERO agent edits), so the owner resolves fresh rather than from an invalid
-  attempt.
+- **HELD publish is UNIFIED on one key**: CAN THE OWNER MERGE THIS HEAD AS-IS?
+  A marker-clean resolution whose merged tree passed the checks gate and whose
+  shipped tree the cold read confirmed — or whose red is adjudicated pre-existing
+  and owned by nothing this case can hand it to — is an ACTIVE (non-draft) PR at
+  the resolved merge commit, which the owner reviews and merges. Everything else
+  is a DRAFT: markers remain or `--tier held` left no valid resolution (the PR is
+  built from the PRISTINE conflict — clean-prefix commit + the original
+  upstream-vs-ours automerge tree, ZERO agent edits — so the owner resolves fresh
+  rather than from an invalid attempt), or the head is a real resolution the
+  driver cannot stand behind: `[AUTO-ESCALATED: checks failing]`,
+  `[AUTO-ESCALATED: cold read rejected 2x]` and
+  `[AUTO-ESCALATED: resolution did not converge]` each publish DRAFT with the
+  work kept. `[AUTO-ESCALATED: scope exceeded]`, `[AUTO-ESCALATED: check
+  unstable]` and `[AUTO-ESCALATED: red owned by no branch]` ship a tree the
+  driver does stand behind and stay ACTIVE.
+- **A DRAFT held PR is still the case's whole answer.** The draft flag says
+  "finish this", not "ignore this": the resolution, the escalation prefix and the
+  reviewer feedback are all on it, and the owner's next move is to complete the
+  work rather than to re-derive it.
 - A red verify gate demotes any already-executed tier to HELD(gate) with rollback
   to the journaled pre-ref (§10.2). Textual cleanliness ≠ correctness; demotion is
   a first-class transition, not an exception path.
@@ -1924,8 +1954,9 @@ feedback when there is one: `[AUTO-ESCALATED: scope exceeded]`,
 
 The report-attempt is recorded AFTER the checks gate, so `RESOLVE_COLDREAD_CAP`
 counts only trees that actually reached the reviewer. A resolution whose tree keeps
-CHANGING beyond that cap is force-HELD ACTIVE with the non-convergence prefix —
-the driver never loops.
+CHANGING beyond that cap is force-HELD as a DRAFT with the non-convergence prefix
+— no one of those trees is the answer, so none of them is offered as mergeable —
+and the driver never loops.
 
 ### 8.3 Noise minimization
 
@@ -2118,13 +2149,16 @@ markers, so every gate fix would be scope-flagged).
   commit, machinery specific to a propagation merge, so claiming one would promise
   a PR that is never created. The commit IS the record and reaches origin with the
   ordinary target push.
-- **`held`** → a `fix/sweep/<slug(branch)>--<caseId>` ref plus an ACTIVE PR at a
-  likewise SINGLE-PARENT commit, created at `finish` like every other PR, which
-  BLOCKS the next sweep until the owner merges it (§5.4). There is no
-  pristine-conflict DRAFT fallback — a gate fix has no conflict exhibit to build
-  one from. At `CHECKS_FAIL_LIMIT` the attempted fix is KEPT and frozen HELD
-  ACTIVE (`[AUTO-ESCALATED: checks failing]`), never reset: a failing fix the owner
-  can read beats an empty exhibit.
+- **`held`** → a `fix/sweep/<slug(branch)>--<caseId>` ref plus a PR at a likewise
+  SINGLE-PARENT commit, created at `finish` like every other PR, which BLOCKS the
+  next sweep until the owner merges it (§5.4). There is no pristine-conflict
+  fallback — a gate fix has no conflict exhibit to build one from — so the head is
+  always the attempted fix, and the draft flag is what carries the difference
+  between a fix the owner can merge and one they must finish. At
+  `CHECKS_FAIL_LIMIT` the attempted fix is KEPT and frozen as a HELD DRAFT
+  (`[AUTO-ESCALATED: checks failing]`), never reset: a failing fix the owner can
+  read beats an empty exhibit, and a draft is how it is offered without claiming
+  it is mergeable.
 
 **Red base.** `start` never judges the build (§6.1). A red base produces one
 gate-fix case ROOTED ON THE BASE ANCHOR carrying every failing file — a commit on
@@ -2510,8 +2544,8 @@ completes.
    closure pushes (the same merge commit, which flips those PRs to merged) +
    closure checks + urge comments on frozen branches with new pending heads
    (§5.5).
-4. **Create the HELD PRs** — active (marker-clean resolution, owner merges) or
-   draft (pristine conflict, owner resolves) — from the recorded intent, AFTER the
+4. **Create the HELD PRs** — active where the driver stands behind merging the
+   head as-is, draft otherwise (§8.1) — from the recorded intent, AFTER the
    target pushes so the bases are current, the HELD diff is the case run only, and
    the base-height check holds for every held PR. A held case whose signature
    matches an already-published PR is journaled `held-duplicate` and skipped rather
