@@ -943,14 +943,28 @@ function lastPreRef(journal: JournalEntry[], branch: string): string | null {
   return ref;
 }
 
-/** Branches with an OPEN case this pass (a `case` not yet `resolved`/`held`). */
-function openCaseBranches(journal: JournalEntry[]): Set<string> {
+/**
+ * Branches with an OPEN case this pass (a `case` not yet `resolved`/`held`).
+ *
+ * `gate-fix-stale` closes one too, and it is the only terminal disposition that
+ * HAS to be named here: the others leave the branch blocked by other means —
+ * `env-blocked` writes a `blockedRows` entry, a `held-duplicate` is a frozen
+ * descendant of the twin that holds it — while a stale premise puts no block on
+ * anything, because nothing is wrong with the branch. Left out, the branch it
+ * releases goes on merging while the recipe (`blockedForRecipe`) cuts it and
+ * everything above it from the finish build, and the report calls it an open
+ * case: released and excluded at once.
+ */
+export function openCaseBranches(journal: JournalEntry[]): Set<string> {
   const branchOf = new Map<string, string>(); // caseId -> branch
   const closed = new Set<string>();
   for (const e of journal) {
     if (e.action === 'case' && typeof e.caseId === 'string' && typeof e.branch === 'string') {
       branchOf.set(e.caseId, e.branch);
-    } else if ((e.action === 'resolved' || e.action === 'held') && typeof e.caseId === 'string') {
+    } else if (
+      (e.action === 'resolved' || e.action === 'held' || e.action === 'gate-fix-stale') &&
+      typeof e.caseId === 'string'
+    ) {
       closed.add(e.caseId);
     }
   }
@@ -1420,7 +1434,7 @@ async function subtreeOf(repo: string, treeish: string, cwd?: string): Promise<s
  * cannot disagree about it, and neither can two commands that measure different
  * bytes.
  */
-function checkKey(subtree: string, cmd: string): string {
+export function checkKey(subtree: string, cmd: string): string {
   return `${subtree} :: ${cmd}`;
 }
 
@@ -3566,7 +3580,7 @@ type LandingVerdict =
  * nothing, while still paying for the commands whose subtrees it does not
  * share. Rows are written by every gate that runs the configured commands.
  */
-function greenChecks(journal: JournalEntry[]): Map<string, string> {
+export function greenChecks(journal: JournalEntry[]): Map<string, string> {
   const out = new Map<string, string>();
   for (const e of journal) {
     if (e.action !== 'landing-check' && e.action !== 'branch-check') continue;
@@ -3723,9 +3737,32 @@ export interface ContestedCheck {
  * outside it need have run at all, and the second source is that row — the green
  * lives on the `red-confirm` row alone, because a green row anywhere else would
  * be inherited as a measured verdict.
+ *
+ * THE THIRD SOURCE IS THE CONTESTED ROW, and it is here for that same reason. A
+ * gate that measures green on a key the pass has a confirmed red on has found
+ * the contradiction outside a `red-confirm` probe; its green is carried on the
+ * `checks-nondeterministic` row it writes, NOT as a `branch-check` row, so
+ * `greenChecks` — which the landing gate and the pre-merge check read as a
+ * skip-measurement memo — never learns a contested key as settled.
  */
+function contestedGreens(journal: JournalEntry[]): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const e of journal) {
+    if (e.action !== 'checks-nondeterministic' || !Array.isArray(e.greenSubtrees)) continue;
+    const branch = typeof e.branch === 'string' ? e.branch : '';
+    if (!branch) continue;
+    for (const v of e.greenSubtrees as Array<{ cmd?: unknown; subtree?: unknown }>) {
+      if (typeof v.cmd !== 'string' || typeof v.subtree !== 'string') continue;
+      const k = checkKey(v.subtree, v.cmd);
+      if (!out.has(k)) out.set(k, branch);
+    }
+  }
+  return out;
+}
+
 export function unstableEvidence(journal: JournalEntry[]): ContestedCheck[] {
   const green = greenChecks(journal);
+  const contested = contestedGreens(journal);
   const out = new Map<string, ContestedCheck>();
   for (const e of journal) {
     if (e.action !== 'red-confirm' || e.reproduced !== true) continue;
@@ -3733,7 +3770,8 @@ export function unstableEvidence(journal: JournalEntry[]): ContestedCheck[] {
     const key = checkKey(e.subtree, e.cmd);
     // A green measured ELSEWHERE names the branch it was measured on and wins:
     // it is the stronger coordinate, and the alone re-run is the fallback.
-    const greenOn = green.get(key) ?? (e.aloneGreen === true ? `${e.branch} (alone re-run)` : undefined);
+    const greenOn =
+      green.get(key) ?? contested.get(key) ?? (e.aloneGreen === true ? `${e.branch} (alone re-run)` : undefined);
     if (greenOn === undefined || out.has(key)) continue;
     out.set(key, {
       cmd: e.cmd,
@@ -3804,10 +3842,15 @@ async function machineFactLines(cli: Cli, dir: string, caseId: string, headSha: 
  * That pair is weaker than the triple, and the weakness is spent in the safe
  * direction: this decides HOLD versus DELETE, and delete is the one row the next
  * pass cannot walk back. It is also bounded on both sides — the ref must be a
- * gate-fix ref, and EVERY command failing now must be one the body records, so a
- * head that documents one failure and now fails another is a stale answer like
- * any other and goes down the ordinary row. The files digest decides nothing
+ * gate-fix ref, and EVERY command the probe SAW fail must be one the body
+ * records, so a head that documents one failure and now fails another is a stale
+ * answer like any other and goes down the ordinary row. The files digest decides nothing
  * here, as its own contract requires.
+ *
+ * The probe stops at the first KIND that is red (`mergedChecksGreen`), so
+ * `failed` is what it SAW fail, not everything that would. An undocumented
+ * failure of a later kind is therefore not seen and the head holds — the safe
+ * direction, because a red the driver did not measure is not one it acts on.
  */
 function diagnosisOwnsRed(ref: string, branch: string, body: string, failed: VerifyCommand[]): boolean {
   const prefix = 'fix/sweep/';
@@ -8398,12 +8441,24 @@ export async function cmdReport(cli: Cli): Promise<number> {
 
   const resolved: Array<{ caseId: string; branch: string; tier: string }> = [];
   const held: Array<{ caseId: string; branch: string; reason: string }> = [];
+  const concluded: Array<{ caseId: string; branch: string; reason: string }> = [];
   const open: Array<{ caseId: string; branch: string }> = [];
   for (const jc of [...journaledCases(journal).values()].sort((a, b) => a.firstIndex - b.firstIndex)) {
     const disp = lastDisposition(journal, jc.caseId);
     if (!disp) open.push({ caseId: jc.caseId, branch: jc.branch });
     else if (disp.action === 'resolved')
       resolved.push({ caseId: jc.caseId, branch: jc.branch, tier: (disp.tier as string) ?? 'unknown' });
+    // A CASE THAT PUBLISHED NOTHING IS NOT HELD. Every other terminal
+    // disposition here stands for a pull request the owner is about to read;
+    // `gate-fix-stale` stands for a premise that expired, and reporting it as
+    // held sends the owner looking for a PR that was never opened. Its reason
+    // is on `detail`, not `notes`, so the held bucket would also render it blank.
+    else if (disp.action === 'gate-fix-stale')
+      concluded.push({
+        caseId: jc.caseId,
+        branch: jc.branch,
+        reason: typeof disp.detail === 'string' ? disp.detail : '',
+      });
     else
       held.push({
         caseId: jc.caseId,
@@ -8430,6 +8485,9 @@ export async function cmdReport(cli: Cli): Promise<number> {
     `resolved: ${resolved.length}${resolved.length ? ` — ${resolved.map((r) => `${r.caseId} [${r.tier}]`).join(', ')}` : ''}`,
   );
   console.log(`held:     ${held.length}${held.length ? ` — ${held.map((h) => h.caseId).join(', ')}` : ''}`);
+  console.log(
+    `concluded (no PR): ${concluded.length}${concluded.length ? ` — ${concluded.map((c) => c.caseId).join(', ')}` : ''}`,
+  );
   console.log(`open:     ${open.length}${open.length ? ` — ${open.map((o) => o.caseId).join(', ')}` : ''}`);
   console.log(`pushed:   ${pushes.length}${pushedBranches.length ? ` (${pushedBranches.join(', ')})` : ''}`);
   if (diverged.length) console.log(`diverged (owner escalation): ${diverged.join(', ')}`);
@@ -8444,6 +8502,7 @@ export async function cmdReport(cli: Cli): Promise<number> {
     mergedCount: merged.length,
     resolved,
     held,
+    concluded,
     openCases: open,
     pushed: pushedBranches,
     diverged,
@@ -12884,6 +12943,21 @@ export async function cmdSweepReportCase(
   // never whether there is one — except on the one reading where there is
   // nothing left to say (below).
   if (isGateFixCase && claimed === 'held') {
+    // A DRY RUN MEASURES NOTHING AND DECIDES NOTHING, the same guard the
+    // held-duplicate arm above carries. This arm freezes, journals, and — on the
+    // stale reading — takes a TERMINAL disposition and releases the branch; a
+    // `--dry-run` that concluded a case would not be one. It also now pays an
+    // install and the whole battery, which is not a cost a preview should ask
+    // for.
+    if (!cli.execute) {
+      result(cli, {
+        dryRun: true,
+        instruction: `would run the checks on this worktree and freeze a HELD gate-fix PR for ${caseId}`,
+        tier: 'held',
+        issues,
+      });
+      return 0;
+    }
     const verdict = await measureHeldGateFix(
       cli,
       dir,
@@ -12922,18 +12996,16 @@ export async function cmdSweepReportCase(
         // order-dependent failure that a run in another environment masks is
         // exactly this shape, and it comes back.
         //
-        // The green is journaled in the shape the pass's own contested-check
-        // machinery reads (`greenChecks` over `branch-check` rows), so
-        // `unstableEvidence` pairs it with the mint's confirmed red — the PR
-        // carries the `sweep-contested` line, the finish report names it, and a
-        // later mint on the same key inherits `environment-conditional`.
-        appendJournal(dir, {
-          action: 'branch-check',
-          branch: rc.branch,
-          caseId,
-          sha: rc.head.sha,
-          checks: covers.observed.map((v) => ({ cmd: v.cmd, ...(v.cwd ? { cwd: v.cwd } : {}), subtree: v.subtree, ok: true })),
-        });
+        // THE GREEN IS CARRIED ON THE CONTESTED ROW AND NOWHERE ELSE, because a
+        // `branch-check` row would put this key into `greenChecks` — the pass's
+        // INHERITANCE MEMO, which the landing gate and the pre-merge branch
+        // check both read as "already measured, do not run". A key the pass
+        // holds a CONFIRMED RED on may never enter it: a sibling carrying the
+        // identical subtree would then be stamped green and merge without any
+        // run, and the contradiction this arm exists to preserve would be filed
+        // as a settled green everywhere else in the pass. `unstableEvidence`
+        // reads the subtrees off this row instead — the same route the alone
+        // re-run's green already takes, and for the same reason.
         const detail =
           `${rc.branch}: the failing check(s) (${[...mintNames].join(', ')}) were CONFIRMED RED and now measure ` +
           `GREEN on the identical subtree — the code is the same object in both runs, so the difference is not in ` +
@@ -12945,6 +13017,7 @@ export async function cmdSweepReportCase(
           branch: rc.branch,
           headSha: rc.head.sha,
           commands: [...mintNames],
+          greenSubtrees: covers.observed.map((v) => ({ cmd: v.cmd, ...(v.cwd ? { cwd: v.cwd } : {}), subtree: v.subtree })),
           detail,
         });
         progress(`gate fix: the failing check answers BOTH ways on the same bytes — held with the instability`);

@@ -264,13 +264,25 @@ export interface SweepFailureFact {
  * The command is greedy and the tail is fixed, because a command may contain
  * spaces and `=` while `cwd`, `subtree` and `files` may not. A line that does not
  * match the whole shape is somebody's prose and is dropped.
+ *
+ * READ FROM INSIDE THE MACHINE BLOCK, COMMENT FORM ONLY — narrower than
+ * `parseMachineLines`, and deliberately. That reader accepts the bare form so a
+ * body a human tidied still DISPLAYS, which is why its contract says nothing may
+ * trust a value from it; these facts are GATED on (`diagnosisOwnsRed`), and a
+ * prose line beginning `sweep-failure:` above the block would then choose a
+ * pull request's disposition. The delimited block is the region the driver
+ * writes and rewrites, so it is the region a decision may be read from.
  */
-const SWEEP_FAILURE_RE = /^cmd=(.+) cwd=(\S+) subtree=([0-9a-f]+) files=([0-9a-f]+)$/;
+const SWEEP_FAILURE_LINE_RE =
+  /^<!--\s*sweep-failure:\s*cmd=(.+) cwd=(\S+) subtree=([0-9a-f]+) files=([0-9a-f]+)\s*-->$/;
 
 export function parseSweepFailures(body: string): SweepFailureFact[] {
+  const begin = body.indexOf(MACHINE_BLOCK_BEGIN);
+  const end = body.indexOf(MACHINE_BLOCK_END);
+  if (begin < 0 || end <= begin) return [];
   const out: SweepFailureFact[] = [];
-  for (const rest of parseMachineLines(body).get('sweep-failure') ?? []) {
-    const m = SWEEP_FAILURE_RE.exec(rest);
+  for (const raw of body.slice(begin, end).split('\n')) {
+    const m = SWEEP_FAILURE_LINE_RE.exec(raw.trim());
     if (!m) continue;
     out.push({ cmd: m[1], cwd: m[2], subtree: m[3], filesDigest: m[4] });
   }

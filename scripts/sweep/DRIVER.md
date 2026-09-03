@@ -938,9 +938,12 @@ where the decision lives and buys the owner a new pull request number for the
 same finding every pass: the case derives again, the agent reaches the same
 conclusion, and a second diagnosis is published. It is HELD instead. Both bounds
 are checked — the head must still MERGE (a diagnosis that no longer applies is a
-stale answer like any other), and EVERY command failing now must be one the
-head's OWN machine block records, so a head that documents one failure and now
-fails a different one goes down the ordinary row.
+stale answer like any other), and EVERY command the probe SAW fail must be one
+the head's OWN machine block records, so a head that documents one failure and
+now fails a different one goes down the ordinary row. The probe stops at the
+first KIND that is red, so an undocumented failure of a later kind is not seen
+and the head holds — the safe direction, because a red the driver did not
+measure is not one it acts on.
 
 WHAT IS MATCHED IS THE `(command, cwd)` PAIR, and the subtree deliberately is
 not. The exact identity of a failure is `(command, cwd, subtree oid)` (§10.2),
@@ -951,6 +954,11 @@ gate would hold on the pass that opened the PR and silently stop holding on ever
 pass after it. The pair is weaker and the weakness is spent in the safe
 direction, because this decides HOLD versus DELETE and delete is the one row the
 next pass cannot walk back. The files digest decides nothing, here or anywhere.
+
+The lines are read from INSIDE the delimited machine block, comment form only.
+The general body reader accepts a bare `sweep-…:` line so a body a human tidied
+still displays, which is why its values may never be trusted; these ones choose a
+pull request's disposition, and the block is the region the driver writes.
 
 A DRIVER-shaped answer whose checks are red is deleted and re-derived WHATEVER
 its draft flag says. The flag records how the last pass could offer the head; the

@@ -31,9 +31,13 @@ import {
   cmdSweepFinish,
   cmdSweepNextCase,
   cmdSweepReportCase,
+  cmdReport,
   cmdSweepReportPr,
   cmdSweepStart,
+  checkKey,
   DriverHalt,
+  greenChecks,
+  openCaseBranches,
   openCases,
   parseCli,
   parseMachineVerdict,
@@ -56,7 +60,13 @@ import {
   type JournalEntry,
 } from './propagate.js';
 import { DRIVER_COMMIT_ENV } from './proposal.js';
-import { parseMachineLines, renderSweepFailure, type GithubTransport } from './publish.js';
+import {
+  MACHINE_BLOCK_BEGIN,
+  MACHINE_BLOCK_END,
+  parseMachineLines,
+  renderSweepFailure,
+  type GithubTransport,
+} from './publish.js';
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -3594,9 +3604,92 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     expect(String(stale.detail)).toContain('vitest run');
     // Terminal: it drains from openCases, so `finish` has a legal move.
     expect(openCases(journal).map((c) => c.caseId)).not.toContain(caseId);
+    // AND THE BRANCH IS ACTUALLY RELEASED. `openCaseBranches` feeds the recipe
+    // (`blockedForRecipe`) and the coverage report; a stale case left in it cuts
+    // the branch and everything above it from the finish build while its merges
+    // go on running — released and excluded at once.
+    expect([...openCaseBranches(journal)]).not.toContain('main_patched');
     expect(machineState(dir).phase).toBe('open');
     const res = JSON.parse(readFileSync(out, 'utf8')) as { instruction: string };
     expect(res.instruction).toContain('CONCLUDED');
+  });
+
+  it('a stale-concluded gate fix is reported as CONCLUDED, never as held', async () => {
+    // The owner summary is the one artifact this case produces, and every other
+    // terminal disposition in it stands for a pull request somebody is about to
+    // read. Reporting a stale premise as held sends them looking for a PR that
+    // was never opened — and its reason lives on `detail`, not `notes`, so the
+    // held bucket renders it blank as well.
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = checksFile(ws);
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
+    const { caseId } = seedGateFixCase(repo, dir);
+    await cmdSweepNextCase(baseCli(repo, ws, inv, { checksFile: checks }), greenPreMerge);
+    const r = runner([]);
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, {
+          cmd: 'report-case',
+          tier: 'held',
+          checksFile: checks,
+          execute: true,
+          out: join(ws, 'rc.json'),
+        }),
+        neverInvoked,
+        r.fn,
+      ),
+    ).toBe(0);
+
+    const out = join(ws, 'report.json');
+    expect(await cmdReport(baseCli(repo, ws, inv, { cmd: 'report', out }))).toBe(0);
+    const summary = JSON.parse(readFileSync(out, 'utf8')) as {
+      held: Array<{ caseId: string }>;
+      concluded: Array<{ caseId: string; reason: string }>;
+      openCases: Array<{ caseId: string }>;
+    };
+    expect(summary.held.map((h) => h.caseId)).not.toContain(caseId);
+    expect(summary.openCases.map((o) => o.caseId)).not.toContain(caseId);
+    const row = summary.concluded.find((c) => c.caseId === caseId)!;
+    expect(row).toBeTruthy();
+    expect(row.reason).toContain('vitest run');
+  });
+
+  it('a DRY-RUN held gate fix measures nothing, freezes nothing and concludes nothing', async () => {
+    // This arm now pays an install and the whole battery, and on the stale
+    // reading it takes a TERMINAL disposition and releases the branch. A preview
+    // that did any of that would not be a preview — the same guard the
+    // held-duplicate arm above it has carried all along.
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const checks = checksFile(ws);
+    const dir = dirOf(repo, ws);
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
+    const { caseId } = seedGateFixCase(repo, dir);
+    await cmdSweepNextCase(baseCli(repo, ws, inv, { checksFile: checks }), greenPreMerge);
+    const before = readJournal(dir).length;
+
+    const out = join(ws, 'rc.json');
+    const r = runner([]);
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', checksFile: checks, out }),
+        neverInvoked,
+        r.fn,
+      ),
+    ).toBe(0);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { dryRun?: boolean };
+    expect(res.dryRun).toBe(true);
+    // Nothing ran and nothing was written: no battery, no freeze, no disposition.
+    expect(r.ran).toEqual([]);
+    const journal = readJournal(dir);
+    expect(journal.length).toBe(before);
+    expect(journal.some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
+    expect(journal.some((e) => e.action === 'gate-fix-stale')).toBe(false);
+    expect(openCases(journal).map((c) => c.caseId)).toContain(caseId);
   });
 
   it('a green on the bytes a CONFIRMED red was measured on is held as an instability, never closed', async () => {
@@ -3637,10 +3730,14 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     expect(journal.find((e) => e.action === 'checks-nondeterministic' && e.caseId === caseId)?.id).toBe(
       'WARN21_CHECKS_FLAKY',
     );
-    // It reaches the owner through the pass's OWN contested-check machinery:
-    // the green is journaled in the shape `greenChecks` reads, so the PR machine
-    // block and the finish report both carry it.
+    // It reaches the owner through the pass's OWN contested-check machinery, so
+    // the PR machine block and the finish report both carry it.
     expect(unstableEvidence(journal).map((c) => c.cmd)).toContain('vitest run');
+    // AND THE CONTESTED KEY NEVER ENTERS THE GREEN MEMO. `greenChecks` is read
+    // by the landing gate and the pre-merge branch check as "already measured,
+    // do not run" — a sibling carrying this identical subtree would be stamped
+    // green and merge without any run, filing the contradiction as settled.
+    expect(greenChecks(journal).has(checkKey(repo.git('rev-parse', `${tip}^{tree}`), 'vitest run'))).toBe(false);
     // Held, not closed: the case still goes to the owner with the finding.
     expect(journal.some((e) => e.action === 'held' && e.caseId === caseId)).toBe(true);
     expect(machineState(dir).phase).toBe('awaiting-pr');
@@ -5124,7 +5221,18 @@ describe('sweep start — origin-derived merge_status', () => {
     return { fixBranch, fixHead };
   }
   /** An open PR on that ref whose machine block records the failures named. */
-  function diagnosisPr(failures: Array<{ cmd: string; cwd?: string }>): { status: number; body: unknown } {
+  /**
+   * A diagnosis PR as `publish` actually writes one: the agent's prose, then the
+   * failures INSIDE the delimited machine block. `inProse` puts them above it
+   * instead — the forged shape, which is prose and decides nothing.
+   */
+  function diagnosisPr(
+    failures: Array<{ cmd: string; cwd?: string }>,
+    opts: { inProse?: boolean } = {},
+  ): { status: number; body: unknown } {
+    const lines = failures.map((f) =>
+      renderSweepFailure({ cmd: f.cmd, cwd: f.cwd ?? '.', subtree: 'a'.repeat(40), filesDigest: 'b'.repeat(8) }),
+    );
     return {
       status: 200,
       body: [
@@ -5135,7 +5243,10 @@ describe('sweep start — origin-derived merge_status', () => {
           body: [
             'The check below fails and the fix does not belong in the files it names.',
             '',
-            ...failures.map((f) => renderSweepFailure({ cmd: f.cmd, cwd: f.cwd ?? '.', subtree: 'a'.repeat(40), filesDigest: 'b'.repeat(8) })),
+            ...(opts.inProse ? lines : []),
+            MACHINE_BLOCK_BEGIN,
+            ...(opts.inProse ? [] : lines),
+            MACHINE_BLOCK_END,
           ].join('\n'),
         },
       ],
@@ -5191,6 +5302,35 @@ describe('sweep start — origin-derived merge_status', () => {
     });
     // The body records a check in another directory; the red is at the root.
     const gh = fakeGithub({ 'GET /pulls?': diagnosisPr([{ cmd: 'tsc --noEmit', cwd: 'container/agent-runner' }]) });
+    expect(
+      await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile, checksFile: answerChecks(ws) }), gh.factory, alwaysRed),
+    ).toBe(0);
+    const journal = readJournal(dirOf(repo, ws));
+    expect(journal.find((e) => e.action === 'proposal-dropped')!.reason).toContain('does not pass');
+    expect(repo.git('-C', bare, 'for-each-ref', '--format=%(refname)', 'refs/heads/fix/sweep')).toBe('');
+  });
+
+  it('a diagnosis whose failure line is only in the PROSE is deleted — the block decides', async () => {
+    // The exemption is read from inside the delimited block, comment form only.
+    // The general body reader accepts a bare `sweep-…:` line so a body a human
+    // tidied still DISPLAYS — which is exactly why a disposition may not be read
+    // through it: the agent writes the prose above the block, and a PR that
+    // could never be deleted for red is a PR that writes its own verdict.
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    pushDriverDiagnosis(repo);
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const alwaysRed: ChecksRunner = async (commands) => ({
+      ok: false,
+      failedNames: commands.map((c) => c.cmd),
+      output: 'boom\n',
+    });
+    // The SAME failure the held test records — above the block, not in it.
+    const gh = fakeGithub({ 'GET /pulls?': diagnosisPr([{ cmd: 'tsc --noEmit' }], { inProse: true }) });
     expect(
       await cmdSweepStart(baseCli(repo, ws, inv, { tokenFile, checksFile: answerChecks(ws) }), gh.factory, alwaysRed),
     ).toBe(0);

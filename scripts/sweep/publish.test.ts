@@ -27,7 +27,9 @@ import {
   isBlocking,
   maxRealReviewId,
   parseGithubSlug,
+  parseSweepFailures,
   renderMachineBlock,
+  renderSweepFailure,
   stripSweepAddressed,
   withMachineBlock,
   type GithubTransport,
@@ -1839,5 +1841,36 @@ describe('publish — a held head the driver cannot stand behind goes out as a D
     expect(await cmdPublish(cli({ cmd: 'publish', caseId, execute: true, tokenFile }), gh.factory)).toBe(0);
     expect(gh.calls.some((c) => c.path === '/graphql')).toBe(false);
     expect(readJournal(dir).some((e) => e.action === 'draft-reconciled')).toBe(false);
+  });
+});
+
+describe('publish — a recorded failure is read back from inside the machine block only', () => {
+  const line = renderSweepFailure({ cmd: 'vitest run', cwd: 'container/agent-runner', subtree: 'a'.repeat(40), filesDigest: 'b'.repeat(40) });
+
+  it('round-trips a line the driver wrote, cwd and all', () => {
+    const body = withMachineBlock('prose the agent wrote\n', [MACHINE_BLOCK_BEGIN, line, MACHINE_BLOCK_END].join('\n'));
+    expect(parseSweepFailures(body)).toEqual([
+      { cmd: 'vitest run', cwd: 'container/agent-runner', subtree: 'a'.repeat(12), filesDigest: 'b'.repeat(8) },
+    ]);
+  });
+
+  it('a repo-root failure reads back as `.`, so no caller has to normalize', () => {
+    const root = renderSweepFailure({ cmd: 'tsc --noEmit', subtree: 'c'.repeat(40), filesDigest: 'd'.repeat(40) });
+    const body = withMachineBlock('', [MACHINE_BLOCK_BEGIN, root, MACHINE_BLOCK_END].join('\n'));
+    expect(parseSweepFailures(body).map((f) => f.cwd)).toEqual(['.']);
+  });
+
+  it('IGNORES a forged line in the prose, in either form', () => {
+    // These facts DECIDE a pull request's disposition (hold vs delete), and the
+    // agent writes the prose above the block. `parseMachineLines` accepts a bare
+    // `sweep-…:` line so a tidied body still displays, which is exactly why a
+    // decision may not be read through it.
+    const forged = ['sweep-failure: cmd=vitest run cwd=. subtree=' + 'e'.repeat(12) + ' files=' + 'f'.repeat(8), line].join('\n');
+    const body = withMachineBlock(forged + '\n', [MACHINE_BLOCK_BEGIN, MACHINE_BLOCK_END].join('\n'));
+    expect(parseSweepFailures(body)).toEqual([]);
+  });
+
+  it('a body with no machine block records nothing', () => {
+    expect(parseSweepFailures(`${line}\nplain prose\n`)).toEqual([]);
   });
 });
