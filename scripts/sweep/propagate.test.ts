@@ -36,6 +36,7 @@ import {
   cmdRun,
   cmdSweepNextCase,
   cmdSweepReportCase,
+  cmdSweepFinish,
   cmdSweepStart,
   cmdVerify,
   coldReadWithRetry,
@@ -1702,6 +1703,152 @@ describe('propagate verify — publishable set', () => {
     expect(journal.some((e) => e.action === 'held' && e.branch === 'module/held')).toBe(false); // not frozen
     expect(journal.some((e) => e.action === 'pre-ref-rollback')).toBe(false); // nothing to roll back
     expect(repo.sha('module/held')).toBe(laggingTip);
+  });
+
+  /**
+   * THE EXCLUSION RUNS TO A FIXPOINT, AND EACH ONE RECORDS ITS OWN EVIDENCE.
+   *
+   * Branches the pass never mutated lag the trunk independently of one another,
+   * so several of them collide with it — often on the same file. Excluding the
+   * first and stopping leaves the rebuild red on the second and reports a red
+   * the gate could have resolved. And each exclusion's row has to carry THAT
+   * branch's conflict: `module/lag-b` collides on one more path than
+   * `module/lag-a`, so a row repeating the first failure's file list is
+   * visibly an accusation against the wrong evidence.
+   */
+  it('every non-mutated conflicting branch is excluded, each row naming its own branch and paths', async () => {
+    const repo = initFixtureRepo();
+    cleanups.push(() => repo.destroy());
+    repo.commit('base', { 'src/x.ts': 'a\nb\nMID\nd\ne\n' });
+    const baseSha = repo.sha('main');
+    repo.checkout('module/lag-a', { create: true, at: baseSha });
+    repo.commit('lag-a: x line3 -> A', { 'src/x.ts': 'a\nb\nA\nd\ne\n' });
+    repo.checkout('module/lag-b', { create: true, at: baseSha });
+    // lag-b collides on x AND brings a second colliding path of its own.
+    repo.commit('lag-b: x line3 -> B, adds y', { 'src/x.ts': 'a\nb\nB\nd\ne\n', 'src/y.ts': 'yB\n' });
+    repo.checkout('main');
+    repo.commit('main advances: x line3 -> UP1, adds y', { 'src/x.ts': 'a\nb\nUP1\nd\ne\n', 'src/y.ts': 'yUP\n' });
+    repo.checkout('module/good', { create: true, at: 'main' });
+    repo.commit('good: adds good', { 'src/good.ts': 'export const good = 1;\n' });
+    repo.checkout('main');
+    const lagATip = repo.sha('module/lag-a');
+    const lagBTip = repo.sha('module/lag-b');
+
+    const ws = mkWorkspace();
+    const { wm12 } = seedVerifyPass(
+      ws,
+      repo,
+      ['module/lag-a', 'module/lag-b', 'module/good'],
+      [{ branch: 'module/good', ref: repo.sha('module/good') }],
+    );
+    const cmds = join(ws, 'cmds.json');
+    writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }])); // every check is GREEN: only the merges fail
+    const res = join(ws, 'res.json');
+    expect(
+      await cmdVerify(baseCli(repo, ws, null, { cmd: 'verify', execute: true, pass: wm12, commandsFile: cmds, out: res })),
+    ).toBe(0); // the build that remains after both exclusions is verified
+
+    const journal = readJournal(passDir(ws, wm12));
+    const obs = journal.filter((e) => e.action === 'verify-observation');
+    expect(obs.map((e) => e.offender)).toEqual(['module/lag-a', 'module/lag-b']);
+    // Each row's paths are the ones ITS branch collided on — not the first
+    // failure's list copied forward.
+    expect(obs[0].unresolved).toEqual(['src/x.ts']);
+    expect(obs[1].unresolved).toEqual(['src/x.ts', 'src/y.ts']);
+    expect(obs[0].conflictBranch).toBe('module/lag-a');
+    expect(obs[1].conflictBranch).toBe('module/lag-b');
+    expect(obs[1].detail).toContain('module/lag-b');
+    expect(obs[1].detail).not.toContain('module/lag-a');
+
+    const verdict = journal.filter((e) => e.action === 'verify').pop()!;
+    expect(verdict.ok).toBe(true);
+    expect(verdict.nonBlocking).toBe(true);
+    expect(verdict.excluded).toEqual(['module/lag-a', 'module/lag-b']);
+    expect(JSON.parse(readFileSync(res, 'utf8'))).toMatchObject({
+      ok: true,
+      nonBlocking: true,
+      excluded: ['module/lag-a', 'module/lag-b'],
+    });
+    // Neither was frozen or rolled back — nothing about them is broken.
+    expect(journal.some((e) => e.action === 'held')).toBe(false);
+    expect(journal.some((e) => e.action === 'pre-ref-rollback')).toBe(false);
+    expect(repo.sha('module/lag-a')).toBe(lagATip);
+    expect(repo.sha('module/lag-b')).toBe(lagBTip);
+  });
+
+  /**
+   * FINISH READS THE VOCABULARY THE EXCLUSION ARM WRITES.
+   *
+   * An excluded branch is not rolled back: there is no `held` row, no
+   * `rolledBackFor` and no `attributionFailed`. A report that knows only the
+   * rollback words then narrates a fully attributed red — named branches, named
+   * paths — as "no clean attribution", and tells the owner to investigate a
+   * failure the driver already explained.
+   */
+  it('finish reports what verify excluded instead of calling the red unattributed', async () => {
+    const repo = initFixtureRepo();
+    cleanups.push(() => repo.destroy());
+    repo.commit('base', { 'src/x.ts': 'a\nb\nMID\nd\ne\n' });
+    const baseSha = repo.sha('main');
+    repo.checkout('module/lag-a', { create: true, at: baseSha });
+    repo.commit('lag-a: x line3 -> A', { 'src/x.ts': 'a\nb\nA\nd\ne\n' });
+    repo.checkout('module/lag-b', { create: true, at: baseSha });
+    repo.commit('lag-b: x line3 -> B', { 'src/x.ts': 'a\nb\nB\nd\ne\n' });
+    repo.checkout('main');
+    repo.commit('main advances: x line3 -> UP1', { 'src/x.ts': 'a\nb\nUP1\nd\ne\n' });
+    repo.checkout('module/good', { create: true, at: 'main' });
+    repo.commit('good: adds good', { 'src/good.ts': 'export const good = 1;\n' });
+    repo.checkout('main');
+    const lagATip = repo.sha('module/lag-a');
+
+    const ws = mkWorkspace();
+    const { dir, wm12 } = seedVerifyPass(
+      ws,
+      repo,
+      ['module/lag-a', 'module/lag-b', 'module/good'],
+      [{ branch: 'module/good', ref: repo.sha('module/good') }],
+    );
+    writeFileSync(join(dir, 'machine-state.json'), JSON.stringify({ phase: 'open', currentCase: null }));
+    const cmds = join(ws, 'cmds.json');
+    // Both lagging branches collide; what remains then fails a check of its own,
+    // so finish takes the halt — the arm this report used to mislabel.
+    writeFileSync(cmds, JSON.stringify([{ cmd: 'echo boom; exit 1' }]));
+    const out = join(ws, 'finish.json');
+    expect(
+      await cmdSweepFinish(
+        baseCli(repo, ws, null, { cmd: 'sweep-finish', execute: true, pass: wm12, commandsFile: cmds, out }),
+        fakePushGithub().factory,
+      ),
+    ).toBe(1);
+
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      halted?: string;
+      excludedBranches?: Array<{ branch: string; unresolved?: string[] }>;
+      issues: Array<{ id: string; detail: string }>;
+    };
+    expect(res.halted).toBe('verify');
+    expect(res.excludedBranches?.map((x) => x.branch)).toEqual(['module/lag-a', 'module/lag-b']);
+    expect(res.excludedBranches?.[0].unresolved).toEqual(['src/x.ts']);
+    const detail = res.issues.find((i) => i.id === 'ERR18_VERIFY_PENDING')!.detail;
+    expect(detail).toContain('module/lag-a');
+    expect(detail).toContain('module/lag-b');
+    expect(detail).toContain('src/x.ts');
+    expect(detail).not.toContain('no clean attribution');
+    // Nothing was rolled back, so the report must not say a branch was frozen.
+    expect(repo.sha('module/lag-a')).toBe(lagATip);
+    expect(readJournal(dir).some((e) => e.action === 'pre-ref-rollback')).toBe(false);
+  });
+
+  /**
+   * A branch the gate dropped from the rebuild is NOT a built branch. It
+   * entered the recipe and was tried, so nothing upstream marks it out — and a
+   * coverage line that counts it as built claims a verification that never
+   * happened.
+   */
+  it('coverage names a verify-excluded branch as excluded, not as built', () => {
+    const cov = recipeCoverage(['a', 'b', 'c'], new Map(), { a: [], b: [], c: [] }, [], ['b']);
+    expect(cov.built).toEqual(['a', 'c']);
+    expect(cov.excluded).toEqual([{ branch: 'b', reason: 'verify-excluded' }]);
   });
 
   /**

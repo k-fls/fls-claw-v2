@@ -2606,6 +2606,33 @@ completes.
      proceeds, and the gate re-verifies without it. There is nothing to roll it
      back to and no merge of ours to blame it for. The blocking rollback+freeze
      path fires ONLY for a branch that would be pushed this pass.
+
+     **THE EXCLUSION RUNS TO A FIXPOINT.** Branches the pass never mutated lag
+     the trunk independently of each other, so several of them collide with it —
+     often on the same paths. Excluding the first and stopping leaves the
+     rebuild red on the second and reports a red the gate could have resolved.
+     The gate keeps excluding non-mutated offenders until the build is clean or
+     there is nothing left to exclude, bounded by the recipe length (each turn
+     drops one distinct branch from a finite recipe). The loop excludes only
+     what this arm is for: an offender the pass DID mutate belongs to the
+     blocking gate and an unattributable red belongs to nobody, so either one
+     ends it and the remaining red is reported with its own evidence.
+
+     **EVERY EXCLUSION RECORDS ITS OWN EVIDENCE.** Each one journals a
+     `verify-observation` naming THAT branch and THAT branch's conflict; the
+     verdict row carries the full `excluded` list and per-branch `exclusions`,
+     never one flattened `unresolved` that labels them all with the first
+     failure's paths. A re-verify's own conflict is journaled too
+     (`reverifyConflictBranch`, `reverifyUnresolved`) — a build that stops on a
+     merge runs no command, so its failing-command list is empty by
+     construction and the branch and paths are the only thing there is to name.
+
+     **THE REPORT SAYS WHAT WAS LEFT OUT.** `finish` reads this vocabulary:
+     excluded branches appear in `coverage.excluded` with reason
+     `verify-excluded` on a green pass, and in `excludedBranches` plus the halt
+     text on a red one. Nothing was rolled back and no branch is broken, so a
+     report that knows only the rollback words would narrate a fully attributed
+     red — named branches, named paths — as "no clean attribution".
 2. **Create the JUDGED history PRs** (non-draft), before the target push. JUDGED
    GATE FIXES ARE EXCLUDED: selection is by disposition, and a gate fix's
    disposition is `resolved`/`judged` like any other, so without the exclusion
@@ -2774,7 +2801,9 @@ needs the owner is the unstable check.
 
 `coverage` says what the integration build actually covered: `built` (the recipe)
 and `excluded`, one entry per branch with the reason it was left out — cut this
-pass, blocked before it, under repair, or carrying an open case. A partial build
+pass, blocked before it, under repair, carrying an open case, or dropped by the
+gate because it would not merge and the pass never mutated it
+(`verify-excluded`, §9). A partial build
 is a valid pass, so `ok` stays true; what the owner must not have to infer is
 WHICH branches shipped without one. `pushedUnbuilt` names the branches whose
 merges landed on origin while sitting outside the build — every branch pushed at

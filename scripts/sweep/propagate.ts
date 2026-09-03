@@ -185,7 +185,7 @@ import {
   type ConflictHunk,
   type ConflictRelation,
 } from './conflict-identity.js';
-import { verifyEverything, type VerifyCommand } from './verify.js';
+import { verifyEverything, type VerifyCommand, type VerifyResult } from './verify.js';
 import { WHOLE_RANGE_BLOCK } from './types.js';
 import type {
   BranchPlan,
@@ -999,7 +999,8 @@ export type ExclusionReason =
   | 'under-repair'
   | 'open-case'
   | 'blocked-above'
-  | 'no-local-ref';
+  | 'no-local-ref'
+  | 'verify-excluded';
 
 /** One branch the build left out, and why — `via` names the block above it. */
 export interface RecipeExclusion {
@@ -1060,16 +1061,24 @@ function blockedForRecipe(cli: Cli, journal: JournalEntry[]): Set<string> {
  *
  * `unresolvable` are recipe members with no local ref: dropped loudly at the
  * gate, and dropped here for the same reason rather than counted as built.
+ *
+ * `verifyExcluded` are branches the gate dropped from the rebuild because they
+ * would not merge into it and the pass never mutated them. They entered the
+ * recipe and were tried, so nothing upstream marks them out — but the build the
+ * pass reports green does not contain them, and a coverage line that counts
+ * them as built claims a verification that never happened.
  */
 export function recipeCoverage(
   order: string[],
   direct: Map<string, ExclusionReason>,
   ancestorsOf: Record<string, string[]>,
   unresolvable: readonly string[] = [],
+  verifyExcluded: readonly string[] = [],
 ): { built: string[]; excluded: RecipeExclusion[] } {
   const built: string[] = [];
   const excluded: RecipeExclusion[] = [];
   const noRef = new Set(unresolvable);
+  const dropped = new Set(verifyExcluded);
   for (const branch of order) {
     const own = direct.get(branch);
     if (own) {
@@ -1079,6 +1088,7 @@ export function recipeCoverage(
     const via = (ancestorsOf[branch] ?? []).find((a) => direct.has(a));
     if (via) excluded.push({ branch, reason: 'blocked-above', via });
     else if (noRef.has(branch)) excluded.push({ branch, reason: 'no-local-ref' });
+    else if (dropped.has(branch)) excluded.push({ branch, reason: 'verify-excluded' });
     else built.push(branch);
   }
   return { built, excluded };
@@ -1164,7 +1174,26 @@ function passCoverage(
     directExclusions(cli, journal),
     transitiveAncestors(Object.fromEntries(directParentEdges(cli))),
     noRef,
+    verifyExclusions(journal).map((x) => x.branch),
   );
+}
+
+/**
+ * THE BRANCHES THE GATE DROPPED FROM THE REBUILD, and the conflict each one
+ * hit. Every exclusion writes its own `verify-observation` row naming the
+ * branch it excluded and THAT branch's unresolved paths, so the list is read
+ * per row and never flattened onto the first failure's evidence.
+ */
+function verifyExclusions(
+  journal: JournalEntry[],
+): Array<{ branch: string; unresolved: string[]; detail: string }> {
+  return journal
+    .filter((e) => e.action === 'verify-observation' && typeof e.offender === 'string')
+    .map((e) => ({
+      branch: e.offender as string,
+      unresolved: Array.isArray(e.unresolved) ? (e.unresolved as string[]) : [],
+      detail: typeof e.detail === 'string' ? e.detail : '',
+    }));
 }
 
 /**
@@ -7770,6 +7799,62 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
   return ok ? 0 : 1;
 }
 
+/**
+ * The one sentence that says what actually happened when a rebuild hit a
+ * CONFLICT, reused by every arm that reports an offender — the first failure,
+ * every exclusion in the fixpoint loop and every re-verify. Without it a
+ * build-shaped failure is narrated in the checks-red wording — "red, fix the
+ * tests, investigate the diff" — for a failure where no test ever ran, and the
+ * reader goes looking for evidence that does not exist. Null when the build
+ * merged clean and the red is the commands'.
+ */
+function conflictSentence(v: VerifyResult): string | null {
+  if (v.build.ok) return null;
+  return (
+    `${v.build.conflictBranch ?? '(unknown branch)'} could not be merged into the integration rebuild; ` +
+    `unresolved conflicts in ${(v.build.unresolved ?? []).join(', ') || '(no paths reported)'}` +
+    (v.build.merged.length ? ` — merged ahead of it: ${v.build.merged.join(', ')}` : ' — nothing merged ahead of it')
+  );
+}
+
+/**
+ * What a RE-VERIFY's red actually was, in the record and in the sentence.
+ *
+ * `buildAndTest` returns `commands: []` when the recipe does not merge, so a
+ * re-verify that conflicts has no failing command to name and a report built
+ * from command names alone says "STILL RED (no command named)" — a red with no
+ * stated cause. The conflict IS the cause; the branch and the paths are in
+ * `build`, and both go into the row and the sentence.
+ */
+function reverifyEvidence(re: VerifyResult): Record<string, unknown> {
+  return {
+    reverifyFailedCommands: re.commands.filter((c) => c.code !== 0).map((c) => c.cmd),
+    ...(re.build.ok
+      ? {}
+      : {
+          ...(re.build.conflictBranch ? { reverifyConflictBranch: re.build.conflictBranch } : {}),
+          reverifyUnresolved: re.build.unresolved ?? [],
+          reverifyDetail: conflictSentence(re),
+        }),
+  };
+}
+
+/** How a still-red re-verify reads in one clause — a conflict names itself. */
+function reverifyRedPhrase(re: VerifyResult): string {
+  if (!re.build.ok) {
+    return (
+      `merge conflict on ${re.build.conflictBranch ?? '(unknown branch)'} in ` +
+      `${(re.build.unresolved ?? []).join(', ') || '(no paths reported)'}`
+    );
+  }
+  return (
+    re.commands
+      .filter((c) => c.code !== 0)
+      .map((c) => c.cmd)
+      .join(', ') || 'no command named'
+  );
+}
+
 export async function cmdVerify(cli: Cli): Promise<number> {
   const { dir } = await passContext(cli); // attaches to the open pass
   const journal = readJournal(dir);
@@ -7902,18 +7987,7 @@ export async function cmdVerify(cli: Cli): Promise<number> {
         }),
     ...(first.nonDeterministic ? { nonDeterministic: true, flakyCommands: first.flakyCommands ?? [] } : {}),
   });
-  // The one sentence that says what actually happened when the rebuild hit a
-  // CONFLICT, reused by every arm that reports the offender. Without it a
-  // build-shaped failure is narrated in the checks-red wording — "red, fix the
-  // tests, investigate the diff" — for a failure where no test ever ran, and
-  // the reader goes looking for evidence that does not exist.
-  const conflictDetail = buildConflict
-    ? `${first.build.conflictBranch ?? '(unknown branch)'} could not be merged into the integration rebuild; ` +
-      `unresolved conflicts in ${(first.build.unresolved ?? []).join(', ') || '(no paths reported)'}` +
-      (first.build.merged.length
-        ? ` — merged ahead of it: ${first.build.merged.join(', ')}`
-        : ' — nothing merged ahead of it')
-    : null;
+  const conflictDetail = conflictSentence(first);
   // A NON-DETERMINISTIC red belongs to no branch, so there is nothing to
   // attribute, roll back or gate-fix. Say that plainly instead of the generic
   // "investigate" — the agent's next move is completely different (report the
@@ -8022,43 +8096,108 @@ export async function cmdVerify(cli: Cli): Promise<number> {
   // OBSERVATION instead, re-verify the publishable set without it, and let the
   // rest proceed. ERR18 fires ONLY for a branch that WOULD be pushed this pass.
   if (!preRef) {
-    appendJournal(dir, {
-      action: 'verify-observation',
-      ok: false,
-      offender,
-      ...(conflictDetail ? { failureKind: 'merge-conflict', detail: conflictDetail } : {}),
-      note: 'offender has no pre-ref — non-blocking (not mutated this pass)',
-    });
-    const reduced = recipe.filter((b) => b !== offender);
-    const re = reduced.length > 0 ? await verifyEverything(cli.repo, { recipe: reduced, ...verifyOpts }) : null;
+    // EXCLUDING ONE BRANCH DOES NOT REACH A VERDICT. Branches this pass never
+    // mutated lag the trunk independently of each other, so several of them can
+    // collide with it on the SAME paths; dropping the first and stopping leaves
+    // the rebuild red on the second, and the pass reports a red it could have
+    // resolved. The exclusion runs to a FIXPOINT — keep dropping non-mutated
+    // offenders until the build is clean or there is nothing left to drop.
+    //
+    // BOUND: `recipe.length` turns. Every turn removes one branch, and only a
+    // branch still IN the reduced recipe can be its offender, so each turn's
+    // exclusion is distinct and the recipe is empty after at most that many.
+    // The bound is a loop guard, not a policy: reaching it is impossible.
+    //
+    // EACH EXCLUSION IS ITS OWN OBSERVATION. The row names the branch it
+    // excluded and the conflict THAT branch hit; carrying the first failure's
+    // paths onto a later row records an accusation against the wrong evidence.
+    const exclusions: Array<{ branch: string; unresolved: string[]; detail: string | null }> = [];
+    let cur = first;
+    let curOffender = offender;
+    let re: VerifyResult | null = null;
+    let reduced = recipe;
+    for (let turn = 0; turn < recipe.length; turn++) {
+      const detail = conflictSentence(cur);
+      exclusions.push({ branch: curOffender, unresolved: cur.build.unresolved ?? [], detail });
+      appendJournal(dir, {
+        action: 'verify-observation',
+        ok: false,
+        offender: curOffender,
+        ...(detail
+          ? {
+              failureKind: 'merge-conflict',
+              detail,
+              ...(cur.build.conflictBranch ? { conflictBranch: cur.build.conflictBranch } : {}),
+              unresolved: cur.build.unresolved ?? [],
+            }
+          : {}),
+        note: 'offender has no pre-ref — non-blocking (not mutated this pass)',
+      });
+      reduced = reduced.filter((b) => b !== curOffender);
+      if (reduced.length === 0) {
+        re = null;
+        break;
+      }
+      re = await verifyEverything(cli.repo, { recipe: reduced, ...verifyOpts });
+      if (re.ok) break;
+      // The loop only ever excludes what this arm is FOR. An offender the pass
+      // DID mutate belongs to the blocking gate, and an unattributable red
+      // belongs to nobody: neither is excludable here, so the reduced build's
+      // red stands and is reported with its own evidence.
+      const next = re.offender;
+      if (!next || lastPreRef(journal, next)) break;
+      cur = re;
+      curOffender = next;
+    }
     const reOk = re ? re.ok : true;
+    const excluded = exclusions.map((x) => x.branch);
+    const anyConflict = exclusions.some((x) => x.detail !== null);
     appendJournal(dir, {
       action: 'verify',
       ok: reOk,
       offender,
-      excluded: offender,
+      excluded,
+      exclusions,
       nonBlocking: true,
-      // Same naming as the blocking arm: this row's `ok` is the re-verify's
-      // verdict, so what the EXCLUSION was for goes in its own field.
-      ...(conflictDetail ? { excludedFor: 'merge-conflict', unresolved: first.build.unresolved ?? [] } : {}),
+      // Same naming as the blocking arm: this row's `ok` is the LAST
+      // re-verify's verdict, so what the EXCLUSIONS were for goes in its own
+      // field — and each one's own paths stay in `exclusions`, never flattened
+      // onto a single `unresolved` that would label them all with the first.
+      ...(anyConflict ? { excludedFor: 'merge-conflict' } : {}),
+      // The re-verify's OWN red, with the conflict it hit. Without it the only
+      // record of the remaining failure is `ok: false` and a command list that
+      // a conflicting build never produces.
+      ...(re && !re.ok ? reverifyEvidence(re) : {}),
     });
     console.error(
-      `verify: RED offender ${offender} was not mutated this pass — non-blocking; ` +
-        `${conflictDetail ? `${conflictDetail}; ` : ''}` +
-        `${re ? `re-verify without it ${reOk ? 'green' : 'STILL RED'}` : 'no publishable branches remain'}`,
+      `verify: RED — ${excluded.length} branch(es) not mutated this pass excluded (non-blocking): ` +
+        `${exclusions.map((x) => `${x.branch}${x.detail ? ` [${x.detail}]` : ''}`).join('; ')}; ` +
+        `${re ? `re-verify without them ${reOk ? 'green' : `STILL RED (${reverifyRedPhrase(re)})`}` : 'no publishable branches remain'}`,
     );
     emit(cli, {
       ok: reOk,
       offender,
       nonBlocking: true,
-      excluded: offender,
+      excluded,
+      exclusions,
       // `excludedFor`, not `failureKind`: `ok` here is the RE-VERIFY's verdict,
       // and naming the conflict as this result's failure kind labels a GREEN
       // answer a merge conflict — the same mistake the blocking arm fixes.
-      ...(conflictDetail
-        ? { excludedFor: 'merge-conflict', unresolved: first.build.unresolved ?? [], detail: conflictDetail }
-        : {}),
-      reverify: { ok: reOk },
+      ...(anyConflict ? { excludedFor: 'merge-conflict' } : {}),
+      reverify: {
+        ok: reOk,
+        ...(re && !re.ok
+          ? {
+              failedCommands: re.commands.filter((c) => c.code !== 0).map((c) => c.cmd),
+              ...(re.build.ok
+                ? {}
+                : {
+                    ...(re.build.conflictBranch ? { conflictBranch: re.build.conflictBranch } : {}),
+                    unresolved: re.build.unresolved ?? [],
+                  }),
+            }
+          : {}),
+      },
     });
     return reOk ? 0 : 1;
   }
@@ -8143,9 +8282,12 @@ export async function cmdVerify(cli: Cli): Promise<number> {
   // conflict as its cause. `rolledBackFor` says what the rollback was for and
   // leaves the verdict to `ok`.
   //
-  // The re-verify's own failing commands are journaled too: this red belongs to
-  // the branches that remain, the conflict did not cause it, and without them
-  // the only record of it is an `ok: false` with no evidence at all.
+  // The re-verify's own failure is journaled too: this red belongs to the
+  // branches that remain, the conflict did not cause it, and without it the
+  // only record is an `ok: false` with no evidence at all. Its CONFLICT counts
+  // as evidence — a re-verify that stops on a merge runs no command, so the
+  // failing-command list is empty by construction and the branch and paths are
+  // the only thing there is to name.
   const reFailed = re.commands.filter((c) => c.code !== 0).map((c) => c.cmd);
   appendJournal(dir, {
     action: 'verify',
@@ -8155,11 +8297,11 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     ...(conflictDetail
       ? { rolledBackFor: 'merge-conflict', unresolved: first.build.unresolved ?? [], detail: conflictDetail }
       : {}),
-    ...(re.ok ? {} : { reverifyFailedCommands: reFailed }),
+    ...(re.ok ? {} : reverifyEvidence(re)),
   });
   console.error(
     `verify: ${conflictDetail ?? 'RED'} -> rolled back ${offender} to ${preRef.slice(0, 12)}, HELD(gate); ` +
-      `re-verify ${re.ok ? 'green' : `STILL RED (${reFailed.join(', ') || 'no command named'})`}`,
+      `re-verify ${re.ok ? 'green' : `STILL RED (${reverifyRedPhrase(re)})`}`,
   );
   emit(cli, {
     ok: re.ok,
@@ -8168,7 +8310,20 @@ export async function cmdVerify(cli: Cli): Promise<number> {
     ...(conflictDetail
       ? { rolledBackFor: 'merge-conflict', unresolved: first.build.unresolved ?? [], detail: conflictDetail }
       : {}),
-    reverify: { ok: re.ok, ...(re.ok ? {} : { failedCommands: reFailed }) },
+    reverify: {
+      ok: re.ok,
+      ...(re.ok
+        ? {}
+        : {
+            failedCommands: reFailed,
+            ...(re.build.ok
+              ? {}
+              : {
+                  ...(re.build.conflictBranch ? { conflictBranch: re.build.conflictBranch } : {}),
+                  unresolved: re.build.unresolved ?? [],
+                }),
+          }),
+    },
   });
   return re.ok ? 0 : 1;
 }
@@ -15360,6 +15515,23 @@ export async function cmdSweepFinish(
     const reverifyFailed = Array.isArray(conflictRow?.reverifyFailedCommands)
       ? (conflictRow!.reverifyFailedCommands as string[])
       : [];
+    // A conflicting re-verify runs no command, so its failing-command list is
+    // empty by construction; the branch it stopped on is what there is to name.
+    const reverifyConflict =
+      typeof conflictRow?.reverifyDetail === 'string' ? (conflictRow.reverifyDetail as string) : null;
+    // THE EXCLUSION VOCABULARY. A branch this pass never mutated is dropped from
+    // the rebuild rather than rolled back: no `held` row, no `rolledBackFor`, no
+    // `attributionFailed`. Reading only the rollback words over that red reports
+    // "no clean attribution" for a failure that is fully attributed — to
+    // branches that are named, with the paths each of them collided on.
+    const exclusions = verifyExclusions(readJournal(dir).slice(verifyLenBefore));
+    const exclusionCue = exclusions.length
+      ? `verify RED — ${exclusions.length} branch(es) this pass did not mutate were EXCLUDED from the ` +
+        `integration rebuild: ${exclusions
+          .map((x) => `${x.branch}${x.unresolved.length ? ` (${x.unresolved.join(', ')})` : ''}`)
+          .join('; ')}. They were not rolled back and nothing about them is broken — they lag the trunk and ` +
+        `cannot be merged into it yet. What remains red is separate: report it and the exclusions together`
+      : null;
 
     // An UNATTRIBUTABLE red is a build defect nobody in this pass
     // caused — dead-ending it in an ERR18/ERR40 whose message asks a
@@ -15496,19 +15668,23 @@ export async function cmdSweepFinish(
           `integration rebuild, not a failing check; the conflict itself is the owner's to place. ` +
           (reverifyStillRed
             ? `A SECOND, separate failure remains: without the offender the rebuild is STILL RED — ` +
-              `${reverifyFailed.join(', ') || 'no command named'} failed, which the conflict did not cause. ` +
-              `Report both; re-running \`finish\` will not clear the red one.`
+              `${reverifyConflict ?? (reverifyFailed.join(', ') || 'no command named')}, which the conflict did not ` +
+              `cause. Report both; re-running \`finish\` will not clear the red one.`
             : `Nothing else failed: no command ran on the conflicting build, and the re-verify without the ` +
               `offender is green. Re-run \`finish\` (the frozen offender drops out of the publishable set).`)
-        : verifyRc !== 0
-          ? 'verify RED (no clean attribution) — investigate, fix, then re-run `finish` from the verify phase'
+        : exclusionCue
+          ? `${exclusionCue} — investigate the remaining red, then re-run \`finish\` from the verify phase`
+          : verifyRc !== 0
+            ? 'verify RED (no clean attribution) — investigate, fix, then re-run `finish` from the verify phase'
           : 'verify RED — offender rolled back + HELD(gate); re-run `finish` (the frozen offender drops out of the publishable set)') +
       (haltHeld > 0 ? ` — ${haltEscalated}/${haltHeld} held PR(s) published for the owner` : '') +
       twinCue(haltTwins);
     progress(
       conflictRow
         ? `verify: MERGE CONFLICT ${offender} — rolled back`
-        : `verify: RED ${offender ?? '(unattributed)'} — rolled back`,
+        : exclusions.length
+          ? `verify: RED — ${exclusions.map((x) => x.branch).join(', ')} excluded (not mutated this pass)`
+          : `verify: RED ${offender ?? '(unattributed)'} — rolled back`,
     );
     console.error(`finish: ${detail}`);
     finishResult({
@@ -15527,9 +15703,22 @@ export async function cmdSweepFinish(
             // A second failure the conflict did not cause, if there is one. The
             // report is assembled from this object, so a red that survives the
             // rollback has to be IN it or it is not reported at all.
-            reverify: { ok: !reverifyStillRed, ...(reverifyStillRed ? { failedCommands: reverifyFailed } : {}) },
+            reverify: {
+              ok: !reverifyStillRed,
+              ...(reverifyStillRed
+                ? {
+                    failedCommands: reverifyFailed,
+                    ...(reverifyConflict ? { conflictDetail: reverifyConflict } : {}),
+                  }
+                : {}),
+            },
           }
         : {}),
+      // WHAT WAS EXCLUDED AND WHY, in the object the report is assembled from.
+      // Nothing was rolled back and no branch is broken, so a report that names
+      // only the surviving red leaves the owner unable to see that the rebuild
+      // this pass calls its verdict is missing branches.
+      ...(exclusions.length ? { excludedBranches: exclusions } : {}),
       heldPublished: haltEscalated,
     });
     return 1;
