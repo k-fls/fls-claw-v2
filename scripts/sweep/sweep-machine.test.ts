@@ -6986,6 +6986,73 @@ describe('sweep finish — push resilience: per-branch, categorized, resumable',
     expect(f1.instruction).toContain('ERR16_CLOSURE_FAILED');
     expect(readJournal(dir).some((e) => e.action === 'push-issue' && e.id === 'ERR16_CLOSURE_FAILED')).toBe(true);
   });
+
+  it('a judged PR whose head LANDED is closed by git, whatever GitHub has flagged yet', async () => {
+    // GitHub marks a pull request merged asynchronously once its head becomes
+    // reachable from the base, and the closure check runs SECONDS after the push
+    // that made it so. Read once, the flag answers "has GitHub noticed", which
+    // is not the question — and on 2026-09-03 that raced in production: PR #130
+    // was flagged open 1s after the push and MERGED moments later, so the pass
+    // reported a blocking ERR16 telling the owner to investigate an already
+    // merged PR. A head contained in the pushed target is closed as a fact of
+    // git, and that is what the driver judges by.
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    const bare = repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main_patched');
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    await cmdSweepStart(baseCli(repo, ws, inv));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    await cmdSweepReportCase(
+      baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'mechanical', execute: true }),
+      confirm,
+    );
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge); // finalize
+
+    // A judged PR whose head is the branch tip this pass is about to push —
+    // exactly the shape the real closure has the instant after the push lands.
+    const head = repo.git('rev-parse', 'main_patched');
+    appendFileSync(
+      join(dir, 'journal.jsonl'),
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        action: 'pr-published',
+        caseId: 'landed',
+        branch: 'main_patched',
+        mode: 'judged',
+        number: 22,
+        head,
+      }) + '\n',
+    );
+    // GitHub has NOT flipped it yet.
+    const gh = fakeGithub({
+      'GET /pulls/22': { status: 200, body: { number: 22, merged: false, state: 'open', body: 'x' } },
+    });
+    const cmdsFile = join(ws, 'cmds-true.json');
+    writeFileSync(cmdsFile, JSON.stringify([{ cmd: 'true' }]));
+    const out = join(ws, 'f.json');
+    expect(
+      await cmdSweepFinish(
+        baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, tokenFile, commandsFile: cmdsFile, out }),
+        gh.factory,
+      ),
+    ).toBe(0);
+    // A COMPLETE payload carries no blockingIssues field at all — the pass is
+    // not partial, which is itself the point: the false ERR16 made it partial.
+    const f = JSON.parse(readFileSync(out, 'utf8')) as { status: string; blockingIssues?: Array<{ id: string }> };
+    expect(f.status).toBe('complete');
+    expect((f.blockingIssues ?? []).some((i) => i.id === 'ERR16_CLOSURE_FAILED')).toBe(false);
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'push-issue' && e.id === 'ERR16_CLOSURE_FAILED')).toBe(false);
+    // The gap is RECORDED, not silently swallowed: the flip is owed.
+    expect(journal.find((e) => e.action === 'closure-pending' && e.number === 22)?.branch).toBe('main_patched');
+    void bare;
+  });
 });
 
 describe('sweep start — canonical pass location + clean-slate boundary', () => {

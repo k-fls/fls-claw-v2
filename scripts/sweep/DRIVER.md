@@ -2716,6 +2716,17 @@ completes.
    closure pushes (the same merge commit, which flips those PRs to merged) +
    closure checks + urge comments on frozen branches with new pending heads
    (§5.5).
+
+   GIT DECIDES THE CLOSURE, NOT THE FLAG. GitHub marks a pull request merged
+   asynchronously once its head becomes reachable from the base, and the check
+   runs seconds after the push that made it so — read once, `merged` answers
+   "has GitHub noticed yet", which is not the question. A head CONTAINED in the
+   target the pass just pushed is closed as a fact of git: the flip is owed, it
+   is journaled `closure-pending`, and no issue is raised. Only a head the push
+   did NOT carry is `ERR16_CLOSURE_FAILED`. This is the rule §5.6 already applies
+   to checks — the driver judges by what it can measure, never by GitHub's
+   bookkeeping — and without it a pass reports a blocking issue telling the owner
+   to investigate a pull request that is already merged.
 4. **Create the HELD PRs** — active where the driver stands behind merging the
    head as-is, draft otherwise (§8.1) — from the recorded intent, AFTER the
    target pushes so the bases are current, the HELD diff is the case run only, and
@@ -2945,7 +2956,7 @@ escalation's publish issues are written to `publish-<case>.json` and quoted into
 | `ERR41_TOKEN_REJECTED` | `start`, publish, push | the same call answered 401/403; the detail names the token's SOURCE, never the token |
 | `ERR14_BASE_BEHIND` | publish | pre-PR height check: no `origin/<branch>`, origin diverged, held mode with origin behind the local tip (outside a red-finish escalation), or judged mode where origin already contains the merge commit |
 | `ERR15_PUSH_FAILED` | publish (hard), push (per-branch) | `git push` failed — for the fix/sweep PR head it stops that publish; for a target branch it is a per-branch label and the loop continues (§10.3) |
-| `ERR16_CLOSURE_FAILED` | push | a JUDGED PR did not flip to merged after its target push, or the closure lookup threw |
+| `ERR16_CLOSURE_FAILED` | push | a JUDGED PR is not flagged merged AND its head is not contained in the pushed target, or the closure lookup threw |
 | `ERR17_URGE_FAILED` | push | posting the urge comment / refreshing the machine block threw; the last-urged head is NOT advanced |
 | `ERR18_VERIFY_PENDING` | push, `finish` | no green `verify` journal entry after the pass's last mutation; or finish's verify was red and the offender was rolled back to HELD(gate) |
 | `ERR20_BRANCH_DIVERGED` | run | a branch (or a push target) has diverged from origin — that branch is skipped, siblings continue |

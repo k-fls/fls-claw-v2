@@ -7742,6 +7742,20 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
   // (2) JUDGED closure check: every judged PR must have auto-flipped.
   // PRs whose target push FAILED this run are skipped (their flip is pending
   // the retried push — an ERR16 for them would be noise, not signal).
+  //
+  // GIT DECIDES THE CLOSURE, NOT THE FLAG. GitHub marks a pull request merged
+  // asynchronously once its head becomes reachable from the base, and this read
+  // happens seconds after the push that made it so — so the flag answers "has
+  // GitHub noticed yet", which is not the question. The question is whether the
+  // head LANDED, and the branch this pass just pushed is the record of that. A
+  // head contained in the target tip is closed as a fact of git: the flip is
+  // owed and will arrive, and raising a BLOCKING issue over the gap tells the
+  // owner to investigate a pull request that is already merged. That is the same
+  // rule §5.6 applies to checks — the driver judges by what it can measure, not
+  // by GitHub's bookkeeping.
+  //
+  // A head that is NOT contained is the real ERR16: the push did not carry it,
+  // so nothing about the closure is owed and the resolution needs an owner.
   const failedBranches = new Set(pushFailed.map((f) => f.branch));
   const closures: Array<{ number: number; merged: boolean }> = [];
   if (transport && slugParts) {
@@ -7750,12 +7764,25 @@ export async function cmdPush(cli: Cli, makeTransport?: (token: string) => Githu
       if (typeof e.branch === 'string' && failedBranches.has(e.branch)) continue;
       try {
         const pr = await ghExpect(transport, 'GET', `${api}/pulls/${e.number}`);
-        const merged = pr.merged === true;
-        closures.push({ number: Number(e.number), merged });
-        if (!merged) {
+        const landed =
+          pr.merged === true ||
+          (typeof e.head === 'string' &&
+            typeof e.branch === 'string' &&
+            (await refExists(cli.repo, e.branch)) &&
+            (await isAncestor(cli.repo, e.head, await revParse(cli.repo, e.branch))));
+        closures.push({ number: Number(e.number), merged: landed });
+        if (!landed) {
           issues.push({
             id: 'ERR16_CLOSURE_FAILED',
-            detail: `JUDGED PR #${e.number} did not flip to merged after the target push — the base tip and the PR head should be the same commit; investigate before publishing more`,
+            detail: `JUDGED PR #${e.number} did not flip to merged after the target push, and its head is NOT contained in ${e.branch} — the base tip and the PR head should be the same commit; investigate before publishing more`,
+          });
+        } else if (pr.merged !== true) {
+          appendJournal(dir, {
+            action: 'closure-pending',
+            number: Number(e.number),
+            branch: e.branch,
+            head: e.head,
+            detail: `PR #${e.number} is not flagged merged yet, but its head is contained in ${e.branch} — the closure landed and GitHub's flag is owed`,
           });
         }
       } catch (err) {
