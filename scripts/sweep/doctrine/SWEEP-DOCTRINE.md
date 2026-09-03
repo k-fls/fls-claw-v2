@@ -284,7 +284,13 @@ your work. Failures come back as follows.
   counter — the moment you conclude a failure is not yours to fix, claim `--tier held`
   explicitly. An explicit held claim while checks fail is honored with your resolution
   kept and published for the owner; the text must say plainly that the checks still
-  fail and name what you could not fix.
+  fail and name what you could not fix. It is REFUSED ONCE when the driver can show
+  the failure is inside your own reach — every failing file is a test file, which you
+  may edit, or the driver's own comparison proves the failure is your resolution's or
+  belongs to this merge alone. You get the reason and the named files; fix them, or
+  re-run with `--not-my-bug` if the failure is not yours. A SECOND `--tier held` is
+  honored whatever it says, so you are never stuck. Never write the remedy for a
+  failing check into the pull-request text instead of applying it.
 
 When you believe a reported failure is not caused by your resolution, re-run
 `report-case` with `--not-my-bug` in addition to your `--tier` — the tier describes

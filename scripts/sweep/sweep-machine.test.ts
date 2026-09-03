@@ -2897,6 +2897,151 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     return { dir, caseId, out, code, fn, fixed: () => (red = false) };
   }
 
+  // --- THE PULL REQUEST CARRIES THE FIX, NOT THE INSTRUCTIONS FOR IT --------
+  //
+  // An agent that resolves the conflict, works out the exact remedy for the red
+  // it leaves behind, and writes that remedy into the PR body because the file
+  // read as out of scope has done the work and shipped the description of it.
+  // The claim is refused ONCE where the driver can show the red is inside the
+  // claim's own reach.
+
+  it('a held claim whose failures are ALL test files is refused once, then honored', async () => {
+    const repo = conflictFixture();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    // The repo names its tests, which is what puts them in the claim's reach.
+    const f = join(ws, 'checks.json');
+    writeFileSync(
+      f,
+      JSON.stringify({
+        typecheck: [],
+        test: [{ cmd: 'vitest run', cwd: '.' }],
+        testPaths: ['**/*.test.ts'],
+      }),
+    );
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: f }));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
+    const dir = dirOf(repo, ws);
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    const red: ChecksRunner = async (commands) => ({
+      ok: false,
+      failedNames: commands.map((c) => c.cmd),
+      output: commands
+        .map((c) => `$ ${c.cmd}\n FAIL  src/x.test.ts > x is fork\n   -> expected 'RESOLVED' to be 'fork'\n`)
+        .join(''),
+    });
+    const out = join(ws, 'rc.json');
+    // FIRST claim: refused. The failing file is a test, tests are in scope, and
+    // the agent is told to fix it rather than to describe fixing it.
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true, out }),
+        neverInvoked,
+        red,
+        fakeInstall,
+      ),
+    ).toBe(1);
+    const first = JSON.parse(readFileSync(out, 'utf8')) as {
+      instruction: string;
+      issues: Array<{ id: string }>;
+      heldClaimRefused: { kind: string; files: string[] };
+    };
+    expect(first.issues.some((i) => i.id === 'ERR40_TESTS_FAILED')).toBe(true);
+    expect(first.heldClaimRefused).toEqual({ kind: 'test-in-scope', files: ['src/x.test.ts'] });
+    expect(first.instruction).toContain('src/x.test.ts');
+    expect(first.instruction).toContain('INSIDE your edit scope');
+    expect(first.instruction).toContain('asserts the MERGED behavior');
+    expect(first.instruction).toContain('--not-my-bug');
+    expect(readJournal(dir).find((e) => e.action === 'held-claim-refused' && e.caseId === caseId)).toMatchObject({
+      kind: 'test-in-scope',
+      files: ['src/x.test.ts'],
+    });
+    // Nothing is frozen and the case is still the agent's.
+    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
+    expect(machineState(dir).phase).toBe('case-ready');
+
+    // SECOND claim: honored unconditionally. An agent shown the reach and still
+    // unable to close it is exactly what HELD is for — and the head is a draft,
+    // because the gate is red on the tree the pull request carries.
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true, out }),
+        neverInvoked,
+        red,
+        fakeInstall,
+      ),
+    ).toBe(0);
+    const held = readJournal(dir).find((e) => e.action === 'held' && e.caseId === caseId)!;
+    expect((held.escalation as { tag: string }).tag).toBe('[AUTO-ESCALATED: checks failing]');
+    expect(held.resolution).toMatchObject({ markerClean: true });
+    expect(machineState(dir).currentCase?.tier).toBe('held');
+    // ONE refusal, ever.
+    expect(readJournal(dir).filter((e) => e.action === 'held-claim-refused' && e.caseId === caseId)).toHaveLength(1);
+  });
+
+  it('a held claim over a red the MERGE itself produced is answered with the widening, no flag needed', async () => {
+    // The same shape `--not-my-bug` adjudicates, asked by the DRIVER: both sides
+    // are green alone and only the merged tree is red, so nobody upstream owns
+    // it and the fix is inside this case's reach. No agent flag, and no
+    // second-failure bar — the claim is being made now, so the question is asked
+    // now.
+    const repo = twoOwnerFixture();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'cg', branch: 'module/cg', parents: ['main_patched'] }]);
+    const checks = checksFile(ws, { typecheck: ['true'], test: ['true'] });
+    await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checks }));
+    await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge);
+    const dir = dirOf(repo, ws);
+    const caseId = currentCaseId(dir);
+    resolveWorktree(dir, caseId, { 'src/x.ts': 'RESOLVED\n' });
+    const wtPath = join(dir, caseId, 'worktree');
+    const tipSha = execFileSync('git', ['-C', wtPath, 'rev-parse', 'HEAD^'], { encoding: 'utf8' }).trim();
+    const parentHead = (JSON.parse(readFileSync(join(dir, caseId, 'case.json'), 'utf8')) as { head: { sha: string } })
+      .head.sha;
+    const fn: ChecksRunner = async (commands, baseDir) => {
+      const names = commands.map((c) => c.cmd);
+      const at =
+        baseDir && baseDir !== wtPath
+          ? execFileSync('git', ['-C', baseDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+          : '';
+      if (at === tipSha || at === parentHead) return { ok: true, failedNames: [], output: '' };
+      return {
+        ok: false,
+        failedNames: names,
+        output: names.map((n) => `$ ${n}\nsrc/c.ts(1,1): error TS2345: boom\n`).join(''),
+      };
+    };
+    const out = join(ws, 'rc.json');
+    expect(
+      await cmdSweepReportCase(
+        baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true, out }),
+        neverInvoked,
+        fn,
+        fakeInstall,
+      ),
+    ).toBe(1);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      status: string;
+      widenedPaths: string[];
+      issues: Array<{ id: string }>;
+    };
+    expect(res.status).toBe('scope-widened');
+    expect(res.widenedPaths).toEqual(['src/c.ts']);
+    expect(res.issues.some((i) => i.id === 'WARN12_SCOPE_WIDENED')).toBe(true);
+    expect(readJournal(dir).find((e) => e.action === 'scope-widened' && e.caseId === caseId)!.files).toEqual([
+      'src/c.ts',
+    ]);
+    expect(readJournal(dir).find((e) => e.action === 'held-claim-refused' && e.caseId === caseId)).toMatchObject({
+      kind: 'scope-widened',
+    });
+    // Nothing minted, nothing frozen, nothing aborted: the case comes back to
+    // the agent with a wider scope.
+    expect(readJournal(dir).some((e) => e.action === 'gate-fix')).toBe(false);
+    expect(readJournal(dir).some((e) => e.action === 'held' && e.caseId === caseId)).toBe(false);
+    expect(machineState(dir).phase).toBe('case-ready');
+  });
+
   it('a remainder nobody owns is carried on the FINISH result, not only mid-pass', async () => {
     // The agent assembles its end-of-pass report from the finish result alone,
     // so a failure the pass proved real and minted nothing for has to be IN that
@@ -2915,8 +3060,9 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
     expect(res.widenedPaths).toEqual(['src/c.ts']);
     expect(readJournal(dir).some((e) => e.action === 'gate-fix')).toBe(false);
 
-    // The agent gives up on the widened file and hands the case over as HELD;
-    // src/c.ts is still red when the pass ends.
+    // The agent gives up on the widened file and hands the case over as HELD.
+    // The widening already showed it the reach, so the claim is honoured at
+    // once and not refused a second time; src/c.ts is red when the pass ends.
     expect(
       await cmdSweepReportCase(
         baseCli(repo, ws, inv, { cmd: 'report-case', tier: 'held', execute: true }),
@@ -2925,6 +3071,7 @@ describe('sweep report-case — the checks gate (typecheck THEN tests)', () => {
         fakeInstall,
       ),
     ).toBe(0);
+    expect(readJournal(dir).some((e) => e.action === 'held-claim-refused' && e.caseId === caseId)).toBe(false);
     writePr(dir, caseId, 'held x', 'Decision needed: resolution of src/x.ts — study before merge.');
     expect(await cmdSweepReportPr(baseCli(repo, ws, inv, { cmd: 'report-pr', execute: true }), confirm)).toBe(0);
     await cmdSweepNextCase(baseCli(repo, ws, inv), greenPreMerge); // finalize

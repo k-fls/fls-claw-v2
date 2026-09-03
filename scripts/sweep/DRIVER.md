@@ -1267,6 +1267,38 @@ from a tree nobody reset. For a gate fix the same limit KEEPS the attempted fix
 and freezes it as a HELD DRAFT instead (§9.3) — the fix is the deliverable, the
 red gate is why the owner finishes it rather than merges it.
 
+An EXPLICIT `--tier held` while checks fail is honoured with the resolution kept
+— it is the agent saying it cannot make this green, which is what the counter
+above infers after ten tries — but it is REFUSED ONCE where the driver can SHOW
+the red is inside the claim's own reach. Two shapes qualify, both on a conflict
+case (gate-fix and reissue cases are exempt for the reasons they are exempt from
+`--not-my-bug`):
+
+- **Test-shaped**, and free: every file in this run's `checks-fail.files` matches
+  `testPaths`, so every failing file is one the agent may edit (§7.4). The
+  refusal names them and says to make the test assert the merged behaviour.
+- **Otherwise**, the ownership comparison, run on the DRIVER'S OWN BEHALF —
+  without the agent's flag and without the second-failure bar, because the claim
+  is being made now. It consumes two answers and no others: `interaction` (both
+  sides green alone, so the red is this merge's own) widens the scope and
+  re-serves exactly as `--not-my-bug` does; `caused-by-case` refuses with the
+  named files that pass without the resolution. Every other answer — flaky,
+  undecidable, a provable upstream owner, an environment fault — is an answer to
+  a claim the agent did not make, so the driver never mints, aborts or freezes on
+  it and the held claim stands with its ordinary tag.
+
+The refusal is journaled `held-claim-refused` and that row BOUNDS THE LOOP: a
+second explicit `--tier held` is honoured whatever it says, because an agent
+shown the reach and still unable to close it is what HELD exists for. A widening
+that already covers this run's failing files is the same notice already spent,
+so it is not repeated. No new result codes: the refusal rides the ordinary
+ERR36/ERR40 payload.
+
+WHY IT IS WORTH A REFUSAL: an agent that resolves the conflict, works out the
+exact remedy for the red it leaves behind, and then writes that remedy into the
+PR body because the file read as out of scope has done the work and shipped the
+description of it. The pull request carries the fix, not the instructions for it.
+
 A re-run after a failure is NARROWED to the files that failed, through each
 command's `filter` (`bun test {files}`) — for cost, and for nothing else. A
 narrow run that is RED is the whole answer, since the check is failing either

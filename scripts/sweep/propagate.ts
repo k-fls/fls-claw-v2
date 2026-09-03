@@ -11015,6 +11015,18 @@ async function adjudicateNotMyBug(p: {
   failingOutput: string;
   runChecks: ChecksRunner;
   runInstall?: InstallRunner;
+  /**
+   * WIDEN-ONLY. The driver runs this adjudication ITSELF, before honouring a
+   * held claim, and it consumes exactly two answers: `interaction` (nobody
+   * upstream owns the red, so the fix is in this case's reach — widen and
+   * re-serve) and `caused-by-case` (the red is the resolution's own). Every
+   * other answer belongs to the agent's own `--not-my-bug`, which is a claim the
+   * agent makes; the driver asking on its own behalf must not abort the merge,
+   * mint a case on someone else's branch or freeze the case out from under the
+   * claim it was about to honour. Those endings return unhandled and the claim
+   * proceeds.
+   */
+  widenOnly?: boolean;
 }): Promise<NotMyBugOutcome> {
   const { cli, ctx, dir, caseId, rc, wtPath, kind, failedCommands, failingOutput } = p;
   const branch = rc.branch;
@@ -11137,6 +11149,7 @@ async function adjudicateNotMyBug(p: {
     // assertions. Checked here, before any routing decision.
     const envFault = classifyEnvironmentFault(failingOutput);
     if (envFault.isEnvironment) {
+      if (p.widenOnly) return { handled: false, note: envFault.detail };
       appendJournal(dir, {
         action: 'not-my-bug-environment',
         caseId,
@@ -11170,6 +11183,7 @@ async function adjudicateNotMyBug(p: {
       return { handled: false, note: verdict.detail };
     }
     if (verdict.verdict === 'flaky') {
+      if (p.widenOnly) return { handled: false, note: verdict.detail };
       // Nobody's defect: it did not reproduce on either tree. There is no owner
       // to root a fix on and no reason to make the agent keep trying, so the
       // case goes to the owner with its resolution INTACT and the instability
@@ -11350,6 +11364,7 @@ async function adjudicateNotMyBug(p: {
         return { handled: false, note: `${verdict.detail}; but ${rest.detail}` };
       }
       if (rest.kind === 'flaky' || rest.kind === 'shared') {
+        if (p.widenOnly) return { handled: false, note: rest.detail };
         // A SIDE THAT NAMES NEITHER AN OWNER NOR A COMMIT ENDS THE CASE HERE. The
         // failure is real on the merged tree and it is not the agent's — the
         // adjudication proved that — but the tip that would be blamed is red once
@@ -11421,6 +11436,12 @@ async function adjudicateNotMyBug(p: {
       });
       return { handled: true, code: 1 };
     }
+
+    // A PROVEN OWNER WAS PLACED, so this red is not the merge's own — and
+    // everything past this point mints a case on someone else's branch and
+    // aborts this one. That is an answer to the agent's claim, never to the
+    // driver's own question, so widen-only stops here and the held claim stands.
+    if (p.widenOnly) return { handled: false, note: verdict.detail };
 
     /** One branch a fix will be rooted on, and the files that go with it. */
     interface MintTarget {
@@ -12792,13 +12813,14 @@ export async function cmdSweepReportCase(
       // journal, and a derivation kept only in this frame would cost a whole
       // checks run to recover.
       const rootedOutput = rootChecksOutput(r.output, gated.used);
+      const failingFiles = parseFailingFiles(rootedOutput);
       appendJournal(dir, {
         action: 'checks-fail',
         caseId,
         resolvedTree,
         kind,
         failed: r.failedNames,
-        files: parseFailingFiles(rootedOutput),
+        files: failingFiles,
         fingerprints: fingerprintKeys(parseFailureFingerprints(rootedOutput)),
         ...(gated.narrow ? { narrowedTo: gated.narrow.files, narrowRed: gated.narrow.red } : {}),
       });
@@ -12825,6 +12847,8 @@ export async function cmdSweepReportCase(
       // (there was no merge), and the failure it is fixing is by construction
       // not the agent's — that is the whole premise of the case.
       let notMyBug: NotMyBugOutcome = { handled: false };
+      /** The comparison has been PAID FOR this run — it is not bought twice. */
+      let adjudicated = false;
       // A REISSUE is exempt for the same reason a gate fix is: it is a revision of
       // an ALREADY PUBLISHED resolution against an open PR, and the abort path
       // (reopen + phase `open`) would supersede the driver-manufactured reissue
@@ -12839,6 +12863,7 @@ export async function cmdSweepReportCase(
           progress('not-my-bug: ignored on the first failure — nothing had been reported to you yet');
         } else {
           const failedCmds = list.filter((c) => r.failedNames.includes(c.cmd));
+          adjudicated = true;
           notMyBug = await adjudicateNotMyBug({
             cli,
             ctx,
@@ -12884,6 +12909,105 @@ export async function cmdSweepReportCase(
       // `resolvedTree`.
       // The limit path keeps its real purpose: an agent that kept failing and
       // never conceded, where an empty exhibit is the honest thing to ship.
+      const failId = kind === 'typecheck' ? 'ERR36_TYPECHECK_FAILED' : 'ERR40_TESTS_FAILED';
+
+      // ---- THE PULL REQUEST CARRIES THE FIX, NOT THE INSTRUCTIONS FOR IT ----
+      //
+      // An agent that resolves the conflict correctly, works out the exact
+      // remedy for the red it leaves behind, and then writes that remedy into
+      // the PR body because the file was out of scope has done the work and
+      // shipped the description of it. The claim is REFUSED ONCE, with the
+      // remedy named, and only for a red the driver can show belongs inside the
+      // claim's own reach:
+      //
+      //  - TEST-SHAPED: every failing file is a test file, which is IN SCOPE
+      //    (§7.4). Free — it is a predicate over the failing-file list.
+      //  - OTHERWISE: the ownership comparison, run on the DRIVER'S behalf, to
+      //    separate a red this merge itself produced (widen and re-serve) and
+      //    one the resolution caused (name it) from everything else.
+      //
+      // ONCE. The refusal row bounds the loop: a second explicit `--tier held`
+      // is honoured whatever it says, because an agent that has been shown the
+      // reach and still cannot close it is exactly the case HELD exists for.
+      const refusedBefore = afterFail.some((e) => e.action === 'held-claim-refused' && e.caseId === caseId);
+      // A WIDENING ALREADY COVERING THIS RED IS THE SAME NOTICE, spent. The
+      // driver told the agent it may edit those files and why; asking the
+      // question again re-serves an identical widening and buys a second full
+      // probe run for it.
+      const alreadyWidened = failingFiles.length > 0 && failingFiles.every((f) => widenedPaths.includes(f));
+      if (claimed === 'held' && !isGateFixCase && !isReissue && !refusedBefore && !alreadyWidened) {
+        const testShaped = failingFiles.length > 0 && failingFiles.every((f) => globMatchAny(testPaths, f));
+        if (testShaped) {
+          appendJournal(dir, { action: 'held-claim-refused', caseId, kind: 'test-in-scope', files: failingFiles });
+          const detail = `${kind} failed: ${r.failedNames.join(', ')} (see ${outFile})`;
+          progress(`held claim refused once — the failing files are tests, and tests are in your scope`);
+          console.error(`report-case [${failId}]: held claim refused once (test-in-scope): ${failingFiles.join(', ')}`);
+          result(cli, {
+            instruction:
+              `Every failing file is a TEST FILE (${failingFiles.join(', ')}), and test files are INSIDE your edit ` +
+              `scope for this case. Fix them so each test asserts the MERGED behavior — never by skipping, deleting ` +
+              `or weakening an assertion — then re-run report-case. If the failure is not this resolution's, re-run ` +
+              `with \`--not-my-bug\` and the driver will PROVE it against the pre-conflict tree. Read ${outFile}. ` +
+              `If you try and still cannot make it green, run \`report-case --tier held\` again and the claim is honored.`,
+            tier: claimed,
+            heldClaimRefused: { kind: 'test-in-scope', files: failingFiles },
+            issues: [...issues, { id: failId, detail }],
+          });
+          return 1;
+        }
+        // The comparison, on the driver's own behalf: no agent flag, and no
+        // second-failure bar — the claim is being made NOW, so the question is
+        // being asked now. Never bought twice in one run.
+        if (!adjudicated) {
+          const failedCmds = list.filter((c) => r.failedNames.includes(c.cmd));
+          adjudicated = true;
+          notMyBug = await adjudicateNotMyBug({
+            cli,
+            ctx,
+            dir,
+            caseId,
+            caseDir,
+            rc,
+            wtPath,
+            resolvedTree,
+            kind,
+            failedCommands: failedCmds,
+            failingOutput: r.output,
+            runChecks,
+            runInstall,
+            widenOnly: true,
+          });
+        }
+        // `interaction`: the merge itself produced the red, the scope is widened
+        // and the case is re-served. The claim is refused by that re-serve.
+        if (notMyBug.handled) {
+          appendJournal(dir, { action: 'held-claim-refused', caseId, kind: 'scope-widened' });
+          return notMyBug.code ?? 1;
+        }
+        // `caused-by-case`: the driver can NAME the files that pass without this
+        // resolution, so the claim is refused once with that proof in hand.
+        if (notMyBug.yours?.length) {
+          appendJournal(dir, { action: 'held-claim-refused', caseId, kind: 'yours', files: notMyBug.yours });
+          const detail = `${kind} failed: ${r.failedNames.join(', ')} (see ${outFile}) — ${notMyBug.note ?? ''}`.trim();
+          progress('held claim refused once — the driver proved these failures are this resolution\'s');
+          console.error(`report-case [${failId}]: held claim refused once (yours): ${notMyBug.yours.join(', ')}`);
+          result(cli, {
+            instruction:
+              `These failures are YOURS — the driver ran the same checks on the tree WITHOUT your resolution and ` +
+              `they passed there: ${notMyBug.yours.join(', ')}. ${notMyBug.note ?? ''} Fix them and re-run ` +
+              `report-case. Read ${outFile}. If you try and still cannot make it green, run ` +
+              `\`report-case --tier held\` again and the claim is honored.`,
+            tier: claimed,
+            heldClaimRefused: { kind: 'yours', files: notMyBug.yours },
+            notMyBug: { verdict: 'refused', detail: notMyBug.note ?? '', files: notMyBug.yours },
+            issues: [...issues, { id: failId, detail }],
+          });
+          return 1;
+        }
+        // Anything else the comparison said is not an answer to this question.
+        // The claim is honoured with its ordinary tag.
+      }
+
       const heldByClaim = claimed === 'held';
       if (n >= CHECKS_FAIL_LIMIT || heldByClaim) {
         // Backstop: stop asking the agent to fix and escalate to the owner.
@@ -12982,7 +13106,6 @@ export async function cmdSweepReportCase(
         });
         return 0;
       }
-      const id = kind === 'typecheck' ? 'ERR36_TYPECHECK_FAILED' : 'ERR40_TESTS_FAILED';
       // The dead end rides on the ORDINARY failure payload and nowhere else. It
       // is one more thing the agent knows on its way back into the fix loop —
       // the id, the tier, the attempt count and the limit are all exactly what
@@ -12990,7 +13113,7 @@ export async function cmdSweepReportCase(
       // "look somewhere else", and the agent is the one that can.
       const stuck = deadEnd ? deadEndNote(deadEnd) : '';
       const detail = `${kind} failed: ${r.failedNames.join(', ')} (see ${outFile})${notMyBug.note ? ` — ${notMyBug.note}` : ''}${stuck}`;
-      console.error(`report-case [${id}]: ${detail}`);
+      console.error(`report-case [${failId}]: ${detail}`);
       // The escape hatch is ADVERTISED HERE, in the same message that reports the
       // failure. This is the only moment the agent learns a check failed at all,
       // so an escape it has to remember from a doctrine row is one it will not
@@ -13025,7 +13148,7 @@ export async function cmdSweepReportCase(
           stuck,
         tier: claimed,
         ...(notMyBug.note ? { notMyBug: { verdict: 'refused', detail: notMyBug.note, files: notMyBug.yours ?? [] } } : {}),
-        issues: [...issues, { id, detail }],
+        issues: [...issues, { id: failId, detail }],
       });
       return 1;
     }
