@@ -52,7 +52,7 @@ export interface DepsMissingVerdict {
   errorKeys: string[];
   /** The paths the matched diagnostics name — the advance's pathspec. */
   files: string[];
-  /** The matched lines themselves, for the journal and the draft PR body. */
+  /** The matched lines themselves, for the journal and the owner's report. */
   lines: string[];
   /** Why this is (or is not) a deps-missing red, in one sentence. */
   reason: string;
@@ -113,7 +113,7 @@ export function missingDeclPattern(cmd: VerifyCommand): RegExp | null {
  * lines below the missing declaration in the SAME one. A per-command "at least
  * one match" test cannot tell those apart: it would let a single unreached
  * import send a tree full of agent-fixable errors down a ten-commit walk and
- * then park it on a draft for the owner, with the fixable errors unserved.
+ * then report it to the owner as a dead end, with the fixable errors unserved.
  *
  * "An error" is what `parseFailureFingerprints` yields, so the comparison is
  * over the same items the error set below is built from — a line the parser
@@ -176,7 +176,7 @@ export function classifyDepsMissing(failed: readonly VerifyCommand[], output: st
     errorKeys: [...new Set(fps.map((f) => f.key))].sort(),
     files,
     lines: matched,
-    reason: `every failure every failing command reports is a missing declaration in ${files.join(', ')}`,
+    reason: `every failure the failing commands report is a missing declaration in ${files.join(', ')}`,
   };
 }
 
@@ -371,7 +371,7 @@ export async function advanceThroughDepsMissing(opts: {
  * named in every file and every commit that ever used it, so it floods the
  * candidate set with commits that cannot possibly carry the declaration, spends
  * the advance's bound on them, lands merges that raise the odds of a conflict
- * stop, and puts a claim in the owner's draft that those commits "declare" a
+ * stop, and puts a claim in the owner's report that those commits "declare" a
  * symbol nothing was missing.
  *
  * So only the first sentence is read. That is a fact about DIAGNOSTIC PROSE,

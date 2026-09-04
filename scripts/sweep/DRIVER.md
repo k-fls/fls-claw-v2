@@ -115,7 +115,10 @@ values (§2.2).
 - **DEFERRED** — computed, sticky (§5.2).
 - Within a pass the view is derived from the journal (`origin-blocked` / `held` /
   `env-blocked` / `defer` rows, cleared by an `unfrozen` row); across passes it is
-  derived from ORIGIN (§5.1). It is never read from a local store. An
+  derived from ORIGIN (§5.1) — the open `fix/sweep` refs, and the open issues
+  that carry a missing-declaration finding (`origin-deps-missing`, §7.7), which
+  block WHOLE because a branch red for a declaration nothing supplies has no
+  proven prefix. It is never read from a local store. An
   `env-blocked` row blocks like a `held` one and proposes nothing: no fix ref, no
   PR — a case the environment made unjudgeable reached no verdict to publish, so
   the block lasts the pass and nothing carries across (§7.1).
@@ -649,6 +652,15 @@ and by the time the plan reads the journal it would be all that survived.
   case yields a new PR at `finish`.
 - **slug matching no scope branch** → journaled `origin-ref-unknown` and left
   alone.
+
+THE OPEN ISSUES ARE READ THE SAME WAY, for the same reason: a missing-declaration
+finding (§7.7) proposes no change, so it has no ref and no PR to be found by, and
+its OPEN ISSUE is the only record that the owner already has the decision. Every
+open issue whose body carries `<!-- sweep-deps-missing: <branch> -->` on its own
+line journals an `origin-deps-missing` row that blocks that branch whole; pull
+requests come back from the same endpoint and are dropped. With no token the
+driver can neither read nor open issues, so it journals `deps-missing-issues-unread`
+and latches nothing rather than latching half.
 
 Every lookup and write is fail-closed. A missing token while unmerged refs exist
 is `ERR11_TOKEN_MISSING`; an unusable origin URL is `ERR12_ORIGIN_UNRESOLVED`; a
@@ -2065,12 +2077,25 @@ its own ruling.
 A MISSING-SYMBOL ERROR MEANS THE DECLARATION IS ELSEWHERE IN THE CHAIN, so the
 driver advances the walk toward it rather than asking anyone to write it.
 
-**BOTH RED ENTRY POINTS TAKE IT.** A branch turns red under the landing gate
-(§7.6) after a merge lands, and a branch can be red BEFORE any merge, caught by
-the pre-merge branch check (§6.2). The second is where this shape usually
-arrives: a branch already resting inside an unmerged upstream feature branch is
-red AT ITS OWN TIP on every pass, so it never reaches a landing gate at all. Both
-classify first and advance the same way, with the same bound, the same stop
+**THE WALK IS FOR A RED THAT SURVIVES THE BRANCH'S OWN PROPAGATION.** A branch
+that is merely BEHIND reports a missing declaration for the plainest reason there
+is: the declaration is in the content it has not merged yet. That is ordinary
+propagation — a clean merge, or a conflict case this sweep serves every pass —
+and the missing symbol is a symptom of it, not a separate condition. So on the
+PRE-MERGE branch check (§6.2), which measures a branch BEFORE the pass attempts
+any of its pending work, the classification is not even ASKED while the branch
+has commits pending over the lines it takes content from (`merge`/`case`
+parents — the same range the candidate search runs over). Propagation goes first;
+what is still red afterwards is this rule's business. The LANDING GATE (§7.6) sits
+after those merges by construction and needs no such test.
+
+**BOTH RED ENTRY POINTS TAKE IT, under that ordering.** A branch turns red under
+the landing gate after a merge lands, and a branch can be red BEFORE any merge
+with NOTHING pending — a branch resting inside an unmerged upstream feature
+branch that has taken everything its parents offer is red AT ITS OWN TIP on every
+pass, so it never reaches a landing gate at all, and no merge this pass could make
+would change the answer. That red is classified rather than minted to an agent.
+Both entry points then advance the same way, with the same bound, the same stop
 conditions and the same terminal outcomes; on both, the classification is asked
 BEFORE ceiling attribution and before any destructive step, because attribution
 is the first move of handing a red to somebody and this red is handed to nobody.
@@ -2098,8 +2123,8 @@ sits in a second command's output or three lines below the missing declaration i
 the same one. "An error" is what `parseFailureFingerprints` yields, so the test is
 over the same items the error set is built from. A per-command "at least one
 match" test cannot tell the two apart: it would send a tree full of
-agent-fixable errors down a ten-commit walk and park it on an owner's draft with
-those errors unserved. The pattern itself must name ONLY codes that cannot mean
+agent-fixable errors down a ten-commit walk and report it to an owner as a dead
+end with those errors unserved. The pattern itself must name ONLY codes that cannot mean
 anything else — `TS2339` ("Property X does not exist on type Y") fires on
 ordinary property typos and semantic merge skew, and is not one of them. The
 ORIGINAL ERROR SET is the fingerprint keys of the matched lines
@@ -2140,7 +2165,7 @@ definition a symbol that already exists and was never missing. Searching for one
 names every file and every commit that ever used it, so it floods the candidate
 set with commits that cannot carry the declaration, spends the bound on them,
 lands merges that raise the odds of a conflict stop, and claims in the owner's
-draft that those commits declare a symbol nothing was missing. Only the first
+report that those commits declare a symbol nothing was missing. Only the first
 sentence is read — a fact about diagnostic prose, with no message text, error
 code or product name in the driver. The limitation is stated where it bites: a
 checker that names the missing symbol only in a LATER sentence yields no symbol
@@ -2190,40 +2215,49 @@ question this walk has no standing to keep answering. Three outcomes:
   independently of that argument, and AT THE CAP THE STANDING RED IS STILL
   CLASSIFIED, not walked: still a missing declaration ⇒ held with nothing minted,
   anything else ⇒ the ordinary path, exactly as it would have been.
-- **Still present when the walk ends** (bound reached, source exhausted, conflict,
-  unmeasured) ⇒ the branch is ROLLED BACK to THE COMMIT THE WALK STARTED ON and a
-  DRAFT gate-fix PR is prepared for the owner, with NO agent involved; `finish`
-  publishes it. That commit is read straight off the walk, with nothing bisected
-  — every step reported the original errors, so the walk establishes nothing
+- **STOPPED ON A CONFLICT** ⇒ the walk ends and NOTHING ELSE HAPPENS: no
+  rollback, no case, no report, no pull request, no fix ref. The declaration is
+  one merge away, behind a conflict — which is this sweep's core work item, and
+  the resolution IS the code that was missing. That conflict is served as an
+  ordinary conflict case on the branch's own parent line, and the red left
+  standing is a PRE-EXISTING red under it, which `--not-my-bug` and the owed-red
+  machinery already adjudicate. The reopen the other stops take is skipped here
+  for the same reason: superseding the branch's own conflict case would destroy
+  the one move that reaches the declaration.
+- **Still present when the walk ends with nothing left to reach** (bound reached,
+  source exhausted, unmeasured) ⇒ the branch is ROLLED BACK to THE COMMIT THE
+  WALK STARTED ON, its descendants are reopened as the ordinary red path reopens
+  them, and an ISSUE is written for the owner with NO agent involved; `finish`
+  opens it. That commit is read straight off the walk, with nothing bisected —
+  every step reported the original errors, so the walk establishes nothing
   earlier than its own start, and the body says exactly that rather than claiming
   the errors first appeared there. The advanced tip is a state nothing verified
   and nobody asked for; the commit the finding is ABOUT is what the branch stands
-  at and what the PR is headed at.
+  at and what the issue is about.
 
-The draft PR is the one place the driver writes PR prose. Everywhere else that
-rule exists to stop the driver paraphrasing work an agent did; here there is no
-work, and the deliverable IS the driver's measurement — the classification, the
-candidate set and its bound, each step's verdict, and how the walk ended. It goes
-out under `[AUTO-ESCALATED: missing declaration not reached]`, which is a
-`DRAFT_HELD_TAG`: there is nothing in the PR to merge, only a decision to report.
-The case is frozen HELD at the mint, so `next-case` never offers it.
+**AN ISSUE, NOT A PULL REQUEST.** A pull request proposes a diff, and this
+finding has none: there is nothing to write and nobody to write it. What there IS
+is the driver's measurement — the classification, the candidate set and its
+bound, each step's verdict, and how the walk ended — and an issue is the shape
+that carries a measurement. The rule that the driver never generates PR prose
+(§10.5) is untouched, because this is not a pull request. The decision the body
+offers is the one the stop left, and every stop that gets here leaves the same
+one: the declaration is out of reach from where the branch stands, so either a
+later pass merges the reconciliation once it is reachable, or the branch is cut
+below the state it came to rest on.
 
-**THE DECISION THE BODY OFFERS IS THE ONE THE STOP LEFT.** On a bounded or
-exhausted walk the declaration is out of reach from here, and the options are to
-wait for the walk or to cut the branch. ON A CONFLICT STOP IT IS NOT OUT OF
-REACH: the reconciliation is in this repository, behind a conflict a person can
-resolve. So the conflict stop names the conflicting commit and offers that third
-option, and it is the one stop that does NOT reopen the branch — superseding an
-open conflict case there would destroy the move that reaches the declaration, in
-the name of not judging it on a red tree. Every other stop reopens as the
-ordinary red path does.
-
-WHETHER THE BRANCH HAS SUCH A CASE IS ASKED, NOT ASSUMED. The pre-merge check
-can stop on a conflict on the first `next-case` call of a pass, before anything
-has been minted, and cases do not survive a pass — so the body names the open
-conflict case only when the branch has one, and otherwise says there is none and
-the conflict is resolved by hand. Pointing an owner at a case that does not exist
-makes the one move that reaches the declaration read as already available.
+**THE OPEN ISSUE IS THE LATCH, and it is the whole of it.** The branch must not
+be re-walked and re-reported on every pass, and no local state may carry that
+across one (§2.1) — so the fact lives on GitHub: the body carries
+`<!-- sweep-deps-missing: <branch> -->` as its own line, `start` reads every open
+issue back (pull requests come back from that endpoint too and are dropped — a PR
+is latched by its own ref), and each marked issue journals an `origin-deps-missing`
+row that blocks its branch WHOLE, exactly as an open fix ref does: nothing on a
+branch red for a declaration nothing supplies is proven, so it takes no content
+and is propagated from by nobody. The owner closes the issue and the next `start`
+finds the branch free, with nothing to clean up. Without a token the driver can
+neither read nor open issues, so the mechanism is inert rather than half-applied,
+and the pass journals that it ran unlatched.
 
 **A LANDED STEP IS A MUTATION, and is journaled as one.** The advance merges
 git-only and writes no `merge` row — the pass's merge rows are the plan's parent
@@ -2240,8 +2274,8 @@ present on the branch's OWN side of the merge that brought the failing file in
 (the merge's first parent contains the symbol and does not contain the file),
 the body says so. That is the "the source is not testable here" shape and it
 reads differently to an owner than "upstream has not reconciled yet". It is
-determined from git or not claimed at all — a guess in a PR body an owner reads
-is worse than a shorter body.
+determined from git or not claimed at all — a guess in a body an owner reads is
+worse than a shorter body.
 
 **ONE WALK PER BRANCH PER PASS.** The walk is bounded, but the pass re-enters
 `run` after every gate, and a branch left standing on the red it reported would
@@ -2257,11 +2291,17 @@ but a lift onto an in-pass ancestor mints under a FRESH key — the same breach
 through a side door.
 
 **The evidence is the journal**, in rows that read as facts:
+`deps-missing-propagation-first` (a pre-merge red the classifier was not asked
+about, with the sources and the pending count that answer why),
 `deps-missing-classified` (the verdict, the commands, the files, the error keys
 and the matched lines), `deps-missing-step` (one per step, with its verdict and
 the surviving keys), `deps-missing-repaired` / `deps-missing-changed` /
 `deps-missing-exhausted` (the candidate set, the effective bound, every step and
-how it ended), `deps-missing-rolled-back`, `deps-missing-walk-spent` for a branch
+how it ended), `deps-missing-rolled-back`, `deps-missing-report` (the owner's
+report, where it was written and which commit it is about),
+`deps-missing-issue-opened` / `deps-missing-issue-exists` /
+`deps-missing-issue-failed` at `finish`, `origin-deps-missing` and
+`deps-missing-issues-unread` at `start`, `deps-missing-walk-spent` for a branch
 whose walk this pass already took, and `deps-missing-reentry-capped` for a
 re-entry loop that stopped at its cap. A hold also writes a `warning` row
 carrying `WARN23_DEPS_MISSING_HELD`, on both entry points, because `run`'s own
@@ -2389,10 +2429,10 @@ set is the failing files, and its height is derived like any other.
 A MISSING-DECLARATION RED IS NOT ONE. The checker says a symbol does not exist,
 and the only move a case leaves an agent is to write it — a second implementation
 that nothing calls, which the real one collides with when the walk reaches it. A
-red the landing gate classifies `deps-missing` (§7.7) never mints a case for an
-agent: the driver advances the walk toward the declaration, and where the walk
-ends with the errors still there it mints a case only to carry a DRAFT report to
-the owner, frozen HELD at the mint so `next-case` never offers it.
+red the landing gate classifies `deps-missing` (§7.7) never mints a case at all:
+the driver advances the walk toward the declaration, and where the walk ends with
+the errors still there it writes the owner an ISSUE, which proposes nothing and
+serves nobody.
 
 Four things mint one: finish's integration verify (§10.2), a `--not-my-bug`
 adjudication (§7.2), the pre-merge branch check (§6.2), and the landing gate
@@ -3259,7 +3299,7 @@ escalation's publish issues are written to `publish-<case>.json` and quoted into
 | `WARN19_GATE_COVERS_OTHER_DEFECT` | gate-fix minting | an active gate ref on the branch has a different failing-file digest |
 | `WARN20_ANCESTOR_GATED` | gate-fix minting | the branch descends from an ancestor that took a gate fix this pass and is still red |
 | `WARN21_CHECKS_FLAKY` | `report-case`, `run`, `next-case`, gate-fix minting | a check gave BOTH answers on the same tree: passed after a prior failure and failed again on the confirming re-run, or failed and then passed on the confirming re-run of an accusing path (landing gate, pre-merge check, ownership probe). Nothing is minted and no branch is blamed |
-| `WARN23_DEPS_MISSING_HELD` | `next-case`, `run` | a missing-declaration red is HELD for the owner (§7.7): the walk ended with the original errors still present, or the branch's walk this pass was already spent. Where a walk ran to its own end, the branch is rolled back to the commit it started on and a DRAFT PR is prepared, which `finish` publishes; a re-entry loop stopped at its cap holds without one. No agent was asked to fix that red — and where a case IS served on the same call, this issue says which part of the red is not that case's |
+| `WARN23_DEPS_MISSING_HELD` | `next-case`, `run` | a missing-declaration red is HELD (§7.7): the walk ended with the original errors still present, or the branch's walk this pass was already spent. Where the walk ran out of anything to reach, the branch is rolled back to the commit it started on and an ISSUE is written for the owner, which `finish` opens; where it stopped on a CONFLICT, that conflict is served as an ordinary case and nothing is minted or reported; a re-entry loop stopped at its cap holds with neither. No agent was asked to fix that red — and where a case IS served on the same call, this issue says which part of the red is not that case's |
 | `WARN46_CASE_LOOPING` | `next-case` | the serve count reached the warning threshold (3); emitted as the LOOP WARNING section of the case materials, not as an issue |
 
 **Reserved numbers — never reassign**: ERR03, ERR04, ERR09, ERR10, ERR19, ERR26,

@@ -599,6 +599,88 @@ export async function getOpenPrByHead(
 }
 
 // ---------------------------------------------------------------------------
+// ISSUES — the transport for a finding that proposes no change (DRIVER.md §7.7).
+//
+// A pull request proposes a diff. A missing declaration the walk cannot reach
+// is a DECISION with no diff to propose, so it goes out as an ISSUE, and the
+// OPEN ISSUE IS THE WHOLE RECORD that it was reported: the driver stores
+// nothing locally about it (§2.1), so the marker below is what a later pass
+// reads the fact back from.
+// ---------------------------------------------------------------------------
+
+/** The branch a deps-missing issue is about, recognized ONLY as its own line. */
+export const SWEEP_DEPS_MISSING_LINE_RE = /^<!--\s*sweep-deps-missing:\s*(\S+)\s*-->$/;
+
+/** The marker that makes an issue body machine-readable as this driver's. */
+export function renderDepsMissingMarker(branch: string): string {
+  return `<!-- sweep-deps-missing: ${branch} -->`;
+}
+
+/**
+ * The branch an issue body claims, or null. Own-line only, for the reason the
+ * review markers are: a quote-reply that embeds the marker is a person talking
+ * about the issue, not the driver's record of one.
+ */
+export function depsMissingBranch(body: string): string | null {
+  for (const line of body.split('\n')) {
+    const m = SWEEP_DEPS_MISSING_LINE_RE.exec(line.trim());
+    if (m) return m[1];
+  }
+  return null;
+}
+
+/** Open an issue. `title`/`body` are the driver's own measurement — there is no diff to review. */
+export async function createIssue(
+  transport: GithubTransport,
+  slug: { owner: string; repo: string },
+  issue: { title: string; body: string },
+): Promise<RemotePublishResult> {
+  const created = await ghExpect(transport, 'POST', `/repos/${slug.owner}/${slug.repo}/issues`, {
+    title: issue.title,
+    body: issue.body,
+  });
+  return { url: String(created.html_url), number: Number(created.number) };
+}
+
+/**
+ * EVERY OPEN ISSUE CARRYING THE MARKER, read back off origin — the latch a
+ * later pass derives from GitHub instead of from anything local.
+ *
+ * FAIL-CLOSED and PAGINATED, like every other origin read `start` makes: a
+ * failed lookup throws rather than reading as "no issues", because an unread
+ * latch is a branch re-walked and a duplicate issue opened.
+ *
+ * `GET /issues` returns PULL REQUESTS as well as issues — every PR is an issue
+ * on this API — so anything carrying `pull_request` is dropped: a PR is latched
+ * by its own ref, and counting one here would block a branch twice.
+ */
+export async function openDepsMissingIssues(
+  transport: GithubTransport,
+  slug: { owner: string; repo: string },
+): Promise<Array<{ number: number; url: string; branch: string; title: string }>> {
+  const raw = await ghPaginated(transport, `/repos/${slug.owner}/${slug.repo}/issues?state=open`);
+  const out: Array<{ number: number; url: string; branch: string; title: string }> = [];
+  for (const item of raw as Array<{
+    number?: number;
+    html_url?: string;
+    title?: string;
+    body?: string;
+    pull_request?: unknown;
+  }>) {
+    if (item.pull_request !== undefined) continue;
+    const branch = depsMissingBranch(String(item.body ?? ''));
+    if (!branch) continue;
+    out.push({
+      number: Number(item.number ?? 0),
+      url: String(item.html_url ?? ''),
+      branch,
+      title: String(item.title ?? ''),
+    });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Interactive PR review loop primitives (REVIEW-trigger model, DRIVER.md §5.3).
 //
 // The `sweep-addressed` marker is the STATELESS record of the review loop

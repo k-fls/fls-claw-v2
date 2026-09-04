@@ -259,6 +259,8 @@ function fakeGithub(overrides: Record<string, { status: number; body: unknown }>
           return { status: 200, body: { number: 7, node_id: 'PR_fake', merged: true, body: 'x' } };
         if (method === 'PATCH' && /\/pulls\/\d+$/.test(path)) return { status: 200, body: {} };
         if (method === 'GET' && /\/issues\/\d+\/comments/.test(path)) return { status: 200, body: [] }; // review-loop comments
+        // `start` reads the open issues for the missing-declaration latch (§7.7).
+        if (method === 'GET' && /\/issues\?/.test(path)) return { status: 200, body: [] };
         if (method === 'POST' && path.includes('/comments')) return { status: 201, body: {} };
         return { status: 404, body: null };
       },
@@ -8544,9 +8546,14 @@ describe('run — the missing-declaration advance', () => {
   }
 
   /**
-   * A branch that is RED AT ITS OWN TIP, before this pass merges anything into
-   * it — the shape a branch parked inside an unmerged upstream feature branch
-   * has on EVERY pass, and the one the pre-merge check meets first.
+   * A branch that is RED AT ITS OWN TIP with NOTHING PENDING over the lines it
+   * takes content from — the shape a branch parked inside an unmerged upstream
+   * feature branch has once it has taken everything its parents offer, and the
+   * only shape the pre-merge check may classify: nothing this pass could merge
+   * will change the answer.
+   *
+   * It is checked at all because it is a SOURCE — `module/leaf` is behind it —
+   * which is exactly the red-and-static branch the pre-merge check exists for.
    */
   function redBeforeAnyMergeRepo(): FixtureRepo {
     const repo = initFixtureRepo();
@@ -8554,13 +8561,21 @@ describe('run — the missing-declaration advance', () => {
     repo.checkout('main_patched', { create: true, at: 'main' });
     repo.commit('mp: own file + own edit', { 'src/mp.ts': 'fork\n', 'src/shared.ts': 'fork\n' });
     repo.checkout('module/dep', { create: true, at: 'main_patched' });
+    repo.checkout('module/leaf', { create: true, at: 'module/dep' });
+    repo.checkout('module/dep');
+    // dep's own content, which leaf has not taken: dep is a SOURCE this pass.
     repo.commit('dep came to rest on the half-split state', { 'src/request.ts': SPLIT_REQUEST });
-    repo.checkout('main_patched');
-    // Something pending, so the branch PARTICIPATES and is checked at all.
-    repo.commit('mp: unrelated work', { 'src/mp2.ts': 'more\n' });
     repo.checkout('main');
     cleanups.push(() => repo.destroy());
     return repo;
+  }
+
+  /** dep is red and static; leaf is behind it, which is what makes dep a participant. */
+  function redStaticInventory(): string {
+    return writeInventory([
+      { id: 'dep', branch: 'module/dep', parents: ['main_patched'] },
+      { id: 'leaf', branch: 'module/leaf', parents: ['module/dep'] },
+    ]);
   }
 
   /**
@@ -8727,7 +8742,7 @@ describe('run — the missing-declaration advance', () => {
     expect(openCases(journal).map((c) => c.caseId)).toContain(String(gate.caseId));
   });
 
-  it('a walk with nowhere to go publishes a DRAFT hold headed at the first errored commit, and serves nobody', async () => {
+  it('a walk with nowhere to go reports a DECISION headed at the first errored commit, and serves nobody', async () => {
     const repo = unreachedRepo();
     const ws = mkWorkspace();
     const inv = branchlessInventory();
@@ -8746,18 +8761,24 @@ describe('run — the missing-declaration advance', () => {
     expect(walked.candidates).toEqual([]);
     const landing = journal.find((e) => e.action === 'landing-check' && e.confirmed === true)!;
     expect(walked.firstErrored).toBe(landing.sha);
-    // The branch stands where the errors first appeared, and the PR is headed there.
+    // The branch stands where the errors first appeared, and the report is about
+    // that commit.
     expect(repo.sha('main_patched')).toBe(landing.sha);
-    const held = journal.find((e) => e.action === 'held')!;
-    expect(held.headSha).toBe(landing.sha);
-    expect((held.escalation as { tag: string }).tag).toBe('[AUTO-ESCALATED: missing declaration not reached]');
-    // NO AGENT. The case exists to carry the report; it is never offered.
-    expect(openCases(journal).map((c) => c.caseId)).not.toContain(String(held.caseId));
-    // The driver wrote the PR text itself — there is no agent to write it.
-    const body = readFileSync(join(dir, String(held.caseId), 'pr', 'body.md'), 'utf8');
-    expect(readFileSync(join(dir, String(held.caseId), 'pr', 'title.txt'), 'utf8').trim()).not.toBe('');
+    const report = journal.find((e) => e.action === 'deps-missing-report')!;
+    expect(report.at).toBe(landing.sha);
+    expect(report.stop).toBe('source-exhausted');
+    // NO CASE AND NO PULL REQUEST. There is no change to propose, so nothing is
+    // minted, nothing is frozen, and no head is pushed anywhere.
+    expect(journal.some((e) => e.action === 'held')).toBe(false);
+    expect(journal.some((e) => e.action === 'case')).toBe(false);
+    expect(openCases(journal)).toHaveLength(0);
+    // The driver wrote the text itself — there is no agent to write it — and it
+    // carries the marker a later pass reads the latch back from.
+    const body = readFileSync(join(String(report.dir), 'body.md'), 'utf8');
+    expect(readFileSync(join(String(report.dir), 'title.txt'), 'utf8').trim()).not.toBe('');
     expect(body).toContain('handleAddMcpServer');
     expect(body).toContain('src/request.ts');
+    expect(body.split('\n')[0]).toBe('<!-- sweep-deps-missing: main_patched -->');
     const res = JSON.parse(readFileSync(out, 'utf8')) as { issues?: Array<{ id: string }> };
     expect((res.issues ?? []).map((i) => i.id)).toContain('WARN23_DEPS_MISSING_HELD');
   });
@@ -8778,34 +8799,48 @@ describe('run — the missing-declaration advance', () => {
     expect(step.conflictedPaths).toEqual(['src/shared.ts']);
     const walked = journal.find((e) => e.action === 'deps-missing-exhausted')!;
     expect(walked.stop).toBe('conflict');
-    expect(journal.find((e) => e.action === 'held')).toBeTruthy();
-    // THE ROUTE TO THE DECLARATION SURVIVES. The walk stopped because the
-    // reconciliation is behind a conflict, and the branch's own conflict case
-    // is the way through it — superseding that case would take away the one
-    // move that reaches the symbol.
+    // A CONFLICT IS THE SWEEP'S ORDINARY WORK, so the walk simply ends: nothing
+    // is frozen, nothing is rolled back, and no decision is put to an owner —
+    // the declaration is one merge away, behind a conflict a person resolves.
+    expect(journal.some((e) => e.action === 'held')).toBe(false);
+    expect(journal.some((e) => e.action === 'deps-missing-report')).toBe(false);
+    expect(journal.some((e) => e.action === 'deps-missing-rolled-back')).toBe(false);
+    // THE ROUTE TO THE DECLARATION SURVIVES. The branch's own conflict case is
+    // the way through it — superseding that case would take away the one move
+    // that reaches the symbol.
     expect(journal.some((e) => e.action === 'reopened' && e.branch === 'main_patched')).toBe(false);
     expect(openCases(journal).map((c) => c.branch)).toEqual(['main_patched']);
   });
 
-  it('the conflict stop tells the owner the declaration is REACHABLE, behind a conflict', async () => {
+  it('the conflict stop proposes NOTHING to the owner — a reachable declaration is not a decision', async () => {
     const repo = reconciliationBehindConflictRepo();
     const ws = mkWorkspace();
     const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     const t = declRunner();
+    const out = join(ws, 'nc.json');
 
     expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
-    await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn);
+    await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), t.fn);
 
     const journal = readJournal(dir);
-    const held = journal.find((e) => e.action === 'held')!;
-    const body = readFileSync(join(dir, String(held.caseId), 'pr', 'body.md'), 'utf8');
-    // The reconciliation IS in this repository — saying otherwise sends the
-    // owner looking upstream for something that is one conflict away.
-    expect(body).not.toContain('Nothing in this repository can supply the declaration');
-    expect(body).toContain('behind a MERGE CONFLICT');
-    expect(body).toContain('src/shared.ts');
-    expect(body).toContain('IS in this repository');
+    expect(journal.find((e) => e.action === 'deps-missing-exhausted')!.stop).toBe('conflict');
+    // The reconciliation IS in this repository, one conflict away — there is no
+    // decision to put to an owner and no artifact to carry one, so none is made.
+    expect(existsSync(join(dir, 'deps-missing'))).toBe(false);
+    expect(journal.some((e) => e.action === 'deps-missing-report')).toBe(false);
+    // What the call DOES say is that the red is nobody's to fix — the conflict
+    // case is served on this very call, and the agent is told which red is not
+    // part of it.
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      status: string;
+      issues?: Array<{ id: string; detail: string }>;
+    };
+    expect(res.status).toBe('case-ready');
+    expect((res.issues ?? []).map((i) => i.id)).toContain('WARN23_DEPS_MISSING_HELD');
+    const detail = (res.issues ?? []).find((i) => i.id === 'WARN23_DEPS_MISSING_HELD')!.detail;
+    expect(detail).toContain('src/shared.ts');
+    expect(detail).toContain('served as an ordinary case');
   });
 
   it('a command with NO missingDeclRe never takes the advance — the same red mints an ordinary gate fix', async () => {
@@ -8857,7 +8892,7 @@ describe('run — the missing-declaration advance', () => {
   it('a branch RED BEFORE ANY MERGE takes the walk too — the pre-merge check never mints for this red', async () => {
     const repo = redBeforeAnyMergeRepo();
     const ws = mkWorkspace();
-    const inv = writeInventory([{ id: 'dep', branch: 'module/dep', parents: ['main_patched'] }]);
+    const inv = redStaticInventory();
     const dir = dirOf(repo, ws);
     const t = declRunner();
     const out = join(ws, 'nc.json');
@@ -8866,6 +8901,10 @@ describe('run — the missing-declaration advance', () => {
     await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), t.fn);
 
     const journal = readJournal(dir);
+    // NOTHING IS PENDING INTO THIS BRANCH, so no merge this pass could make
+    // will supply the declaration — which is the one condition under which the
+    // pre-merge check may ask this question at all.
+    expect(journal.some((e) => e.action === 'deps-missing-propagation-first')).toBe(false);
     // The red was CLASSIFIED before anything was attributed or minted.
     expect(journal.some((e) => e.action === 'deps-missing-classified')).toBe(true);
     const cls = journal.find((e) => e.action === 'deps-missing-classified')!;
@@ -8874,20 +8913,19 @@ describe('run — the missing-declaration advance', () => {
     const walked = journal.find((e) => e.action === 'deps-missing-exhausted')!;
     expect(walked.branch).toBe('module/dep');
     expect(walked.stop).toBe('source-exhausted');
-    // NOBODY WAS SERVED. The one thing an agent could do here is author the
-    // symbol, and this whole rule exists to stop that.
-    const held = journal.find((e) => e.action === 'held')!;
-    expect(held.branch).toBe('module/dep');
-    expect((held.escalation as { tag: string }).tag).toBe('[AUTO-ESCALATED: missing declaration not reached]');
+    // NOBODY WAS SERVED, and nothing was minted: the one thing an agent could
+    // do here is author the symbol, and this whole rule exists to stop that.
+    // What the owner gets is a report — a decision, with no change to propose.
+    const report = journal.find((e) => e.action === 'deps-missing-report')!;
+    expect(report.branch).toBe('module/dep');
+    expect(journal.some((e) => e.action === 'held')).toBe(false);
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
     expect(openCases(journal)).toHaveLength(0);
-    expect(readFileSync(join(dir, String(held.caseId), 'pr', 'body.md'), 'utf8')).toContain('handleAddMcpServer');
+    const body = readFileSync(join(String(report.dir), 'body.md'), 'utf8');
+    expect(body).toContain('handleAddMcpServer');
+    expect(body).toContain('<!-- sweep-deps-missing: module/dep -->');
     const res = JSON.parse(readFileSync(out, 'utf8')) as { issues?: Array<{ id: string }> };
     expect((res.issues ?? []).map((i) => i.id)).toContain('WARN23_DEPS_MISSING_HELD');
-    // ORDERING: the classification is asked BEFORE anything attributes or mints
-    // — ceiling attribution is the first step of handing a red to somebody.
-    expect(journal.findIndex((e) => e.action === 'deps-missing-classified')).toBeLessThan(
-      journal.findIndex((e) => e.action === 'gate-fix'),
-    );
     // And no merge was made anywhere: a red branch merges nothing.
     expect(journal.some((e) => e.action === 'merge')).toBe(false);
   });
@@ -8913,33 +8951,32 @@ describe('run — the missing-declaration advance', () => {
     expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
   });
 
-  it('an advance that lands with NO merge of its own is still rollable and still pushed', async () => {
-    const repo = preMergeRepairableRepo();
+  it('an advance that lands is a mutation like any other — pre-reffed before its first write, and pushed', async () => {
+    const repo = sourceOnlyReconciliationRepo();
     const ws = mkWorkspace();
-    const inv = writeInventory([{ id: 'dep', branch: 'module/dep', parents: ['main_patched'] }]);
+    const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
-    const before = repo.sha('module/dep');
+    const before = repo.sha('main_patched');
 
     expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
     await cmdSweepNextCase(baseCli(repo, ws, inv), sourceOnlyRunner());
 
     const journal = readJournal(dir);
-    // The advance repaired a red the pass never merged into, so there is no
-    // `merge` row for this branch to hide behind.
-    expect(journal.some((e) => e.action === 'deps-missing-repaired')).toBe(true);
-    expect(journal.find((e) => e.action === 'deps-missing-repaired')!.branch).toBe('module/dep');
-    expect(journal.some((e) => e.action === 'merge' && e.branch === 'module/dep')).toBe(false);
-    expect(repo.git('show', 'module/dep:src/split.ts')).toContain('handleAddMcpServer');
-    // THE ROLLBACK TARGET `abort` and `verify` read.
-    const preRefs = journal.filter((e) => e.action === 'pre-ref' && e.branch === 'module/dep');
+    expect(journal.find((e) => e.action === 'deps-missing-repaired')!.branch).toBe('main_patched');
+    expect(repo.git('show', 'main_patched:src/split.ts')).toContain('handleAddMcpServer');
+    // THE ROLLBACK TARGET `abort` and `verify` read — recorded ONCE, at the
+    // branch's pre-pass tip, and BEFORE the first write of any kind.
+    const preRefs = journal.filter((e) => e.action === 'pre-ref' && e.branch === 'main_patched');
     expect(preRefs).toHaveLength(1);
     expect(preRefs[0].ref).toBe(before);
-    // AND THE PUSH SET, which is otherwise derived from `merge`/`resolved` rows
-    // alone and would ship this branch's advance nowhere.
-    expect(journal.some((e) => e.action === 'deps-missing-step' && e.branch === 'module/dep' && e.landed === true)).toBe(
-      true,
+    const landed = journal.findIndex(
+      (e) => e.action === 'deps-missing-step' && e.branch === 'main_patched' && e.landed === true,
     );
-    expect(mutatedBranches(journal).has('module/dep')).toBe(true);
+    expect(landed).toBeGreaterThan(journal.findIndex((e) => e.action === 'pre-ref' && e.branch === 'main_patched'));
+    // AND THE PUSH SET: an advance writes no `merge` row, so the `landed` flag
+    // is the only record that says this branch moved.
+    expect(landed).toBeGreaterThan(-1);
+    expect(mutatedBranches(journal).has('main_patched')).toBe(true);
   });
 
   it('a CHANGED red that is ANOTHER missing declaration re-enters the walk — the landing gate mints nothing', async () => {
@@ -8966,7 +9003,7 @@ describe('run — the missing-declaration advance', () => {
     ]);
   });
 
-  it('a CHANGED red that is ANOTHER missing declaration re-enters the walk on the PRE-MERGE path too', async () => {
+  it('a red measured before a branch takes its pending work is NEVER classified — propagation owns it', async () => {
     const repo = chainedPreMergeRepo();
     const ws = mkWorkspace();
     const inv = writeInventory([{ id: 'dep', branch: 'module/dep', parents: ['main_patched'] }]);
@@ -8976,15 +9013,22 @@ describe('run — the missing-declaration advance', () => {
     await cmdSweepNextCase(baseCli(repo, ws, inv), chainRunner());
 
     const journal = readJournal(dir);
-    // Nobody was handed a missing symbol to author, on either red.
-    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
-    expect(journal.some((e) => e.action === 'held')).toBe(false);
-    expect(journal.find((e) => e.action === 'deps-missing-changed')!.branch).toBe('module/dep');
-    expect(journal.find((e) => e.action === 'deps-missing-repaired')!.branch).toBe('module/dep');
-    expect(repo.git('show', 'module/dep:src/split.ts')).toContain('escapeInvisibles');
+    // The declarations this branch is missing arrive in the two commits it has
+    // not taken from its parent. That is a branch being BEHIND, not a dead end:
+    // the walk is for a red that survives the branch's own propagation, and
+    // this red was measured before any of it was attempted.
+    const first = journal.find((e) => e.action === 'deps-missing-propagation-first')!;
+    expect(first.branch).toBe('module/dep');
+    expect(Number(first.pending)).toBe(2);
+    expect(journal.some((e) => e.action === 'deps-missing-classified')).toBe(false);
+    expect(journal.some((e) => e.action === 'deps-missing-step')).toBe(false);
+    // Nothing was walked, so nothing was advanced and nothing was rolled back:
+    // the branch stands exactly where the pass found it.
+    expect(journal.some((e) => e.action === 'deps-missing-rolled-back')).toBe(false);
+    expect(journal.some((e) => e.action === 'deps-missing-report')).toBe(false);
   });
 
-  it('a conflict stop with NO conflict case on the branch does not point the owner at one', async () => {
+  it('a pre-merge red whose declaration is behind pending work is left to propagation, not walked', async () => {
     const repo = conflictStopWithNoCaseRepo();
     const ws = mkWorkspace();
     const inv = writeInventory([{ id: 'dep', branch: 'module/dep', parents: ['main_patched'] }]);
@@ -8995,32 +9039,44 @@ describe('run — the missing-declaration advance', () => {
     await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn);
 
     const journal = readJournal(dir);
-    expect(journal.find((e) => e.action === 'deps-missing-exhausted')!.stop).toBe('conflict');
-    // The pre-merge check catches this red before `run` mints anything, and
-    // cases do not survive a pass — so there is no case to resolve.
-    expect(openCases(journal).filter((c) => c.branch === 'module/dep')).toHaveLength(0);
-    const held = journal.find((e) => e.action === 'held')!;
-    const body = readFileSync(join(dir, String(held.caseId), 'pr', 'body.md'), 'utf8');
-    expect(body).toContain('behind a MERGE CONFLICT');
-    expect(body).toContain('this pass has no open conflict case on this branch');
-    expect(body).not.toContain("this branch's own conflict case");
+    // THE DECLARATION IS IN THE CONTENT THIS BRANCH HAS NOT TAKEN YET, behind a
+    // conflict the sweep serves as an ordinary case. Walking it one commit at a
+    // time would preempt that case and report a dead end that is not one — so
+    // the classifier is not even asked while the branch is behind.
+    const first = journal.find((e) => e.action === 'deps-missing-propagation-first')!;
+    expect(first.branch).toBe('module/dep');
+    expect(Number(first.pending)).toBeGreaterThan(0);
+    expect(first.sources).toEqual(['main_patched']);
+    expect(journal.some((e) => e.action === 'deps-missing-classified')).toBe(false);
+    expect(journal.some((e) => e.action === 'deps-missing-step')).toBe(false);
+    expect(journal.some((e) => e.action === 'deps-missing-exhausted')).toBe(false);
+    expect(journal.some((e) => e.action === 'deps-missing-report')).toBe(false);
   });
 
-  it('a conflict stop WITH a conflict case names it, so the owner can find the route', async () => {
+  it('a conflict stop leaves the conflict to the ordinary case that already covers it', async () => {
     const repo = reconciliationBehindConflictRepo();
     const ws = mkWorkspace();
     const inv = branchlessInventory();
     const dir = dirOf(repo, ws);
     const t = declRunner();
+    const out = join(ws, 'nc.json');
 
     expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
-    await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn);
+    await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), t.fn);
 
     const journal = readJournal(dir);
+    const step = journal.filter((e) => e.action === 'deps-missing-step').at(-1)!;
     const conflictCase = openCases(journal).find((c) => c.branch === 'main_patched')!;
-    const held = journal.find((e) => e.action === 'held')!;
-    const body = readFileSync(join(dir, String(held.caseId), 'pr', 'body.md'), 'utf8');
-    expect(body).toContain(conflictCase.caseId);
+    // THE CASE IS THE ROUTE THE WALK STOPPED ON: its head is an ancestor of the
+    // commit the step could not land, so resolving it is what carries the
+    // branch toward the declaration. It is served the ordinary way — no second
+    // artifact proposes the same move, and no fix ref is minted for the red
+    // standing behind it.
+    expect(repo.git('merge-base', '--is-ancestor', conflictCase.head.sha, String(step.sha))).toBe('');
+    const served = JSON.parse(readFileSync(out, 'utf8')) as { caseId?: string };
+    expect(served.caseId).toBe(conflictCase.caseId);
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    expect(journal.some((e) => e.action === 'held')).toBe(false);
   });
 
   it('a case served on the same call as a hold is TOLD which red is not its to fix', async () => {
@@ -9070,6 +9126,94 @@ describe('run — the missing-declaration advance', () => {
     expect((res.issues ?? []).map((i) => i.id)).toContain('WARN23_DEPS_MISSING_HELD');
   });
 
+  it('a genuine exhaustion opens an ISSUE at finish, carrying the report and the branch marker', async () => {
+    const repo = unreachedRepo();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main');
+    repo.git('push', 'origin', 'main_patched');
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const t = declRunner();
+    const gh = fakeGithub({
+      'POST /issues': { status: 201, body: { html_url: 'https://github.com/k-fls/fixture/issues/77', number: 77 } },
+    });
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws), tokenFile }), gh.factory)).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv, { tokenFile }), t.fn);
+    expect(readJournal(dir).some((e) => e.action === 'deps-missing-report')).toBe(true);
+
+    const cmds = join(ws, 'cmds.json');
+    writeFileSync(cmds, JSON.stringify([{ cmd: 'true' }]));
+    await cmdSweepFinish(
+      baseCli(repo, ws, inv, { cmd: 'sweep-finish', execute: true, tokenFile, commandsFile: cmds }),
+      gh.factory,
+    );
+
+    // AN ISSUE, NOT A PULL REQUEST: there is no diff to propose, so nothing was
+    // pushed to a fix ref and no PR was created for this finding.
+    const posted = gh.calls.filter((c) => c.method === 'POST' && c.path.endsWith('/issues'));
+    expect(posted).toHaveLength(1);
+    const body = String((posted[0].body as { body: string }).body);
+    expect(String((posted[0].body as { title: string }).title)).toContain('main_patched');
+    expect(body).toContain('<!-- sweep-deps-missing: main_patched -->');
+    expect(body).toContain('handleAddMcpServer');
+    expect(body).toContain('## The decision');
+    const opened = readJournal(dir).find((e) => e.action === 'deps-missing-issue-opened')!;
+    expect(opened.branch).toBe('main_patched');
+    expect(opened.number).toBe(77);
+  });
+
+  it('the latch is re-read from GitHub: an open issue blocks its branch, and nothing is re-walked', async () => {
+    const repo = unreachedRepo();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    repo.attachBareOrigin();
+    repo.git('push', 'origin', 'main');
+    repo.git('push', 'origin', 'main_patched');
+    const tokenFile = join(ws, 'tok.txt');
+    writeFileSync(tokenFile, 'tok\n');
+    const t = declRunner();
+    // A pass dir is wiped at every `start`, so the ONLY record that this branch
+    // was already reported is the open issue on origin.
+    const gh = fakeGithub({
+      'GET /issues?': {
+        status: 200,
+        body: [
+          {
+            number: 77,
+            html_url: 'https://github.com/k-fls/fixture/issues/77',
+            title: 'Decision needed: main_patched rests on a state whose declarations it has not reached',
+            body: 'Decision needed.\n<!-- sweep-deps-missing: main_patched -->\n',
+          },
+          // A PULL REQUEST comes back from this endpoint too, and is not a latch.
+          { number: 78, html_url: 'x', title: 'a PR', body: '<!-- sweep-deps-missing: main -->', pull_request: {} },
+        ],
+      },
+    });
+    const before = repo.sha('main_patched');
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws), tokenFile }), gh.factory)).toBe(0);
+    const journalAfterStart = readJournal(dir);
+    const latch = journalAfterStart.find((e) => e.action === 'origin-deps-missing')!;
+    expect(latch.branch).toBe('main_patched');
+    expect(latch.number).toBe(77);
+    expect(journalAfterStart.filter((e) => e.action === 'origin-deps-missing')).toHaveLength(1); // the PR is not one
+
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv, { tokenFile }), t.fn)).toBe(0);
+    const journal = readJournal(dir);
+    // THE DEAD END IS NOT RE-DERIVED: nothing is classified, nothing is walked,
+    // nothing is reported a second time, and the branch takes no content while
+    // the owner still has the decision.
+    expect(journal.some((e) => e.action === 'deps-missing-classified')).toBe(false);
+    expect(journal.some((e) => e.action === 'deps-missing-report')).toBe(false);
+    expect(journal.some((e) => e.action === 'merge' && e.branch === 'main_patched')).toBe(false);
+    expect(repo.sha('main_patched')).toBe(before);
+  });
+
   it('the walk is taken ONCE per branch per pass — a second call re-walks nothing and mints nothing more', async () => {
     const repo = unreachedRepo();
     const ws = mkWorkspace();
@@ -9084,8 +9228,12 @@ describe('run — the missing-declaration advance', () => {
     const journal = readJournal(dir);
     expect(journal.filter((e) => e.action === 'deps-missing-exhausted')).toHaveLength(1);
     expect(journal.filter((e) => e.action === 'deps-missing-step')).toHaveLength(0);
-    expect(journal.filter((e) => e.action === 'gate-fix')).toHaveLength(1);
-    expect(journal.filter((e) => e.action === 'held')).toHaveLength(1);
+    // The second call re-measures the same red, finds the walk spent, and holds:
+    // one report, one rollback, and nothing minted on either call.
+    expect(journal.filter((e) => e.action === 'deps-missing-walk-spent')).toHaveLength(1);
+    expect(journal.filter((e) => e.action === 'deps-missing-report')).toHaveLength(1);
+    expect(journal.filter((e) => e.action === 'gate-fix')).toHaveLength(0);
+    expect(journal.filter((e) => e.action === 'held')).toHaveLength(0);
   });
 });
 
@@ -11079,6 +11227,8 @@ describe('gate-fix twins — the same commit, offered at the ceiling', () => {
           created.push({ head: b.head, base: b.base, body: b.body, title: b.title });
           return { status: 201, body: asApi(prs.get(n)!) };
         }
+        // `start` reads the open issues for the missing-declaration latch (§7.7).
+        if (method === 'GET' && /\/issues\?/.test(path)) return { status: 200, body: [] };
         const num = Number(/\/(?:pulls|issues)\/(\d+)/.exec(path)?.[1] ?? 0);
         if (method === 'GET' && /\/pulls\/\d+\/reviews/.test(path)) return { status: 200, body: [] };
         if (method === 'GET' && /\/pulls\/\d+\/comments/.test(path)) return { status: 200, body: [] };

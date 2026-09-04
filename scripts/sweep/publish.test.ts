@@ -19,11 +19,14 @@ import {
   classifyComments,
   classifyReviewTrigger,
   convertPullRequestToDraft,
+  createIssue,
+  depsMissingBranch,
   extractSweepAddressed,
   ghGraphql,
   ghPaginated,
   markPullRequestReadyForReview,
   haltIdFor,
+  openDepsMissingIssues,
   isBlocking,
   maxRealReviewId,
   parseGithubSlug,
@@ -585,6 +588,56 @@ describe('review-loop primitives (hardened tag, review trigger, pagination)', ()
       },
     };
     await expect(ghPaginated(flaky, '/repos/o/r/pulls/12/reviews')).rejects.toThrow(/HTTP 502/);
+  });
+});
+
+describe('issues — the transport for a finding that proposes no change', () => {
+  const slug = { owner: 'k-fls', repo: 'fixture' };
+
+  it('the branch marker is read ONLY as its own line — a quote-reply that embeds it stays a person talking', () => {
+    expect(depsMissingBranch('<!-- sweep-deps-missing: module/dep -->')).toBe('module/dep');
+    expect(depsMissingBranch('why this happened\n<!-- sweep-deps-missing: module/dep -->\nmore')).toBe('module/dep');
+    expect(depsMissingBranch('> <!-- sweep-deps-missing: module/dep -->')).toBeNull();
+    expect(depsMissingBranch('see <!-- sweep-deps-missing: module/dep --> above')).toBeNull();
+    expect(depsMissingBranch('no marker at all')).toBeNull();
+  });
+
+  it('the read-back drops PULL REQUESTS and unmarked issues, and a failed list throws rather than reading empty', async () => {
+    const pages: Record<number, unknown> = {
+      1: [
+        { number: 1, html_url: 'u1', title: 'latched', body: '<!-- sweep-deps-missing: module/dep -->' },
+        // Every PR is an issue on this endpoint; a PR is latched by its own ref.
+        { number: 2, html_url: 'u2', title: 'a PR', body: '<!-- sweep-deps-missing: main_patched -->', pull_request: {} },
+        { number: 3, html_url: 'u3', title: 'someone else\u2019s issue', body: 'unrelated' },
+      ],
+    };
+    const transport: GithubTransport = {
+      async request(_m, path) {
+        const page = Number(/[?&]page=(\d+)/.exec(path)?.[1] ?? 1);
+        return { status: 200, body: pages[page] ?? [] };
+      },
+    };
+    expect(await openDepsMissingIssues(transport, slug)).toEqual([
+      { number: 1, url: 'u1', branch: 'module/dep', title: 'latched' },
+    ]);
+
+    const broken: GithubTransport = { async request() { return { status: 500, body: null }; } };
+    await expect(openDepsMissingIssues(broken, slug)).rejects.toThrow(/HTTP 500/);
+  });
+
+  it('createIssue posts title + body to the ISSUES endpoint and returns what GitHub minted', async () => {
+    const calls: Array<{ method: string; path: string; body?: unknown }> = [];
+    const transport: GithubTransport = {
+      async request(method, path, body) {
+        calls.push({ method, path, body });
+        return { status: 201, body: { html_url: 'https://github.com/k-fls/fixture/issues/9', number: 9 } };
+      },
+    };
+    expect(await createIssue(transport, slug, { title: 'T', body: 'B' })).toEqual({
+      url: 'https://github.com/k-fls/fixture/issues/9',
+      number: 9,
+    });
+    expect(calls).toEqual([{ method: 'POST', path: '/repos/k-fls/fixture/issues', body: { title: 'T', body: 'B' } }]);
   });
 });
 

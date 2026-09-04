@@ -147,6 +147,7 @@ import {
   withMachineLine,
   classifyComments,
   classifyReviewTrigger,
+  createIssue,
   createPullRequest,
   getOpenPrByHead,
   getPrsByHead,
@@ -159,9 +160,11 @@ import {
   listReviews,
   markPullRequestReadyForReview,
   maxRealReviewId,
+  openDepsMissingIssues,
   parseGithubSlug,
   postSweepAddressed,
   realGithubTransport,
+  renderDepsMissingMarker,
   renderMachineBlock,
   renderSweepAddressed,
   renderSweepUrge,
@@ -585,9 +588,10 @@ interface BlockedRow {
  * SEVERAL concurrent blocks (one per held case / origin fix ref), and every
  * one matters — collapsing to one row weakens the descendants' DEFER
  * height-MIN whenever the survivor is the HIGHER block.
- * `origin-blocked` (start) and `held` (this pass) add a row, a later manual
- * `unfrozen` clears the branch's rows, and a `pr-published` (mode held)
- * enriches its case's row with the fix branch + PR number.
+ * `origin-blocked` and `origin-deps-missing` (start) and `held` (this pass) add
+ * a row, a later manual `unfrozen` clears the branch's rows, and a
+ * `pr-published` (mode held) enriches its case's row with the fix branch + PR
+ * number.
  */
 function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
   const cases = journaledCases(journal);
@@ -612,6 +616,26 @@ function blockedRows(journal: JournalEntry[]): Map<string, BlockedRow[]> {
         fixBranch: typeof e.fixBranch === 'string' ? e.fixBranch : null,
         prNumber: typeof e.prNumber === 'number' ? e.prNumber : null,
         markerId: typeof e.markerId === 'number' ? e.markerId : null,
+      });
+    } else if (e.action === 'origin-deps-missing') {
+      /**
+       * AN OPEN MISSING-DECLARATION ISSUE IS A TOTAL BLOCK (§7.7). The branch
+       * is red on a declaration nothing in reach supplies, so no prefix of it
+       * is proven and nothing may be taken from it or merged into it until the
+       * owner answers and closes the issue. `fix` is that statement, and the
+       * whole-range cut it implies is what keeps the branch and its
+       * descendants out of the pass instead of re-deriving the same dead end.
+       */
+      put({
+        branch: e.branch,
+        caseId: typeof e.number === 'number' ? `issue:${e.number}` : 'issue',
+        kind: 'fix',
+        headSha: null,
+        headIs: 'conflict',
+        carriedOver: true,
+        fixBranch: null,
+        prNumber: null,
+        markerId: null,
       });
     } else if (e.action === 'held') {
       const jc = typeof e.caseId === 'string' ? cases.get(e.caseId) : undefined;
@@ -2128,14 +2152,7 @@ const ESCALATE_SCOPE = '[AUTO-ESCALATED: scope exceeded]';
 const ESCALATE_CAP = '[AUTO-ESCALATED: resolution did not converge]';
 /** The checks gate (typecheck/tests) kept failing CHECKS_FAIL_LIMIT times. */
 const ESCALATE_CHECKS = '[AUTO-ESCALATED: checks failing]';
-/**
- * The missing-declaration walk ended with the errors still there (§7.7). No
- * agent was served this case and none will be: the declaration is not in this
- * repository yet, so there is no work to hand out — only a decision to report.
- */
-const ESCALATE_DEPS_MISSING = '[AUTO-ESCALATED: missing declaration not reached]';
-
-/** How many matched diagnostic lines the classification row and the PR body keep verbatim. */
+/** How many matched diagnostic lines the classification row and the issue body keep verbatim. */
 const DEPS_MISSING_JOURNALED_LINES = 20;
 
 /**
@@ -2150,12 +2167,8 @@ const DEPS_MISSING_JOURNALED_LINES = 20;
  * FINISH, and a draft is what says so. The remaining tags (scope exceeded,
  * unstable check, red owned by no branch) all ship a tree the driver stands
  * behind, and stay active.
- *
- * The missing-declaration tag joins them for the same reason and one more: its
- * PR carries no change at all, only the walk's report, so there is nothing an
- * owner could merge even if they wanted to.
  */
-const DRAFT_HELD_TAGS = new Set([ESCALATE_CHECKS, ESCALATE_REJECTED_2X, ESCALATE_CAP, ESCALATE_DEPS_MISSING]);
+const DRAFT_HELD_TAGS = new Set([ESCALATE_CHECKS, ESCALATE_REJECTED_2X, ESCALATE_CAP]);
 
 /**
  * How many times a case's checks gate (typecheck OR tests) may fail before
@@ -4791,6 +4804,26 @@ function advanceSources(bp: BranchPlan, chain: Chain): string[] {
   return [...new Set(refs)];
 }
 
+/**
+ * HAS THIS BRANCH GOT ORDINARY WORK PENDING OVER THE LINES IT TAKES CONTENT
+ * FROM? — the question that decides whether a red measured BEFORE any merge is
+ * the advance's business at all (DRIVER.md §7.7).
+ *
+ * The range is `<advance sources> ^branch`: the commits the branch has not
+ * reached over the parents whose content it is actually taking this pass. That
+ * is the SAME range the advance's own candidate search runs over, which is why
+ * it is the right predicate and not merely a plausible one — a branch with
+ * commits pending there has propagation to do, and the walk would be doing that
+ * propagation one commit at a time under another name.
+ */
+async function pendingFromSources(repo: string, branch: string, refs: readonly string[]): Promise<number> {
+  const sources: string[] = [];
+  for (const ref of refs) if (await refExists(repo, ref)) sources.push(ref);
+  if (sources.length === 0) return 0;
+  const res = await git(repo, ['rev-list', '--count', ...sources, `^${branch}`], { allowCodes: [128] });
+  return res.code === 0 ? Number(res.stdout.trim() || '0') : 0;
+}
+
 /** Move a branch ref back to an earlier commit it contains, through the ref-scope guard. */
 async function journaledRollback(
   cli: Cli,
@@ -4834,13 +4867,17 @@ type DepsMissingAdvance =
  * driver walks toward it instead of minting a case, because the only thing an
  * agent can do with a missing symbol is write a second one.
  *
- * BOTH RED ENTRY POINTS COME HERE. A branch turns red under the landing gate
- * (§7.6) after a merge lands, and a branch can be red BEFORE any merge, caught
- * by the pre-merge branch check. The second is the likelier one for this shape:
- * a branch already resting inside an unmerged upstream feature branch is red at
- * its tip on every pass, so it never reaches a landing gate at all. The two
- * differ only in what they hand in — a landing verdict, or a pre-merge red — so
- * they hand in the same three facts and share one algorithm.
+ * BOTH RED ENTRY POINTS COME HERE, ON A RED THAT SURVIVED THE BRANCH'S OWN
+ * PROPAGATION. A branch turns red under the landing gate (§7.6) after a merge
+ * lands; a branch can also be red BEFORE any merge with NOTHING pending over
+ * the lines it takes from, caught by the pre-merge branch check — a branch
+ * resting inside an unmerged upstream feature branch that has taken everything
+ * its parents offer is red at its tip on every pass and never reaches a landing
+ * gate at all. A branch that is merely BEHIND is neither, and its caller does
+ * not bring it here: the declaration is in the content it has not merged yet,
+ * which is propagation's to deliver. The two entry points differ only in what
+ * they hand in — a landing verdict, or a pre-merge red — so they hand in the
+ * same three facts and share one algorithm.
  *
  * Returns `not-deps-missing` when the red is NOT this shape — every other red
  * keeps the ordinary gate-fix path exactly as it was — and `spent` when it IS
@@ -5060,63 +5097,58 @@ async function symbolOnOwnSide(
 }
 
 /**
- * The DRAFT PR for a walk that ended with the errors still there — written by
- * the driver, worked by nobody.
- *
- * Every other PR in this driver carries an agent's prose, and the rule that
- * produces it ("the driver never generates PR prose") is about work the agent
- * did. Here there is no work: the deliverable IS the driver's measurement — a
- * classification, a bounded walk and each step's verdict — and an agent asked
- * to write it up could only paraphrase the journal. So the driver writes it,
- * and the PR is a DRAFT because there is nothing in it to merge.
+ * THE STOPS THAT LEAVE A DECISION AND NO CHANGE TO PROPOSE. A `conflict` is not
+ * one of them — its declaration is one merge away, behind a conflict this sweep
+ * serves as an ordinary case — so it never reaches the owner's issue, and this
+ * type is what says so where the body is written.
  */
-async function holdDepsMissingDraft(
+type ReportedStop = Exclude<AdvanceStop, 'conflict'>;
+
+/**
+ * THE OWNER'S ISSUE for a walk that ended with the errors still there — a
+ * decision to take, with no change to propose (DRIVER.md §7.7).
+ *
+ * A pull request proposes a diff and this finding has none: the declaration is
+ * not in reach, so there is nothing to write and nobody to write it. What there
+ * IS, is a measurement — the classification, the candidate set and its bound,
+ * each step's verdict, and how the walk ended — and an ISSUE is the shape that
+ * carries a measurement. The rule that the driver never generates PR prose is
+ * untouched: this is not a pull request.
+ *
+ * The text is written here and OPENED AT FINISH, next to every other origin
+ * write the pass makes. The body carries the machine marker, which is how a
+ * later pass reads the fact back off GitHub (`openDepsMissingIssues`) and
+ * latches the branch without storing anything locally.
+ *
+ * A CONFLICT STOP NEVER GETS HERE. Its declaration is reachable — behind a
+ * conflict this sweep serves as an ordinary case — so there is no decision to
+ * put to an owner, and the type says so.
+ */
+async function writeDepsMissingReport(
   cli: Cli,
   dir: string,
   branch: string,
-  cases: GateFixCaseSummary[],
-  found: { verdict: DepsMissingVerdict; outcome: AdvanceOutcome },
+  found: {
+    verdict: DepsMissingVerdict;
+    outcome: Extract<AdvanceOutcome, { kind: 'exhausted' }> & { stop: ReportedStop };
+  },
 ): Promise<void> {
-  if (found.outcome.kind !== 'exhausted') return;
   const { verdict, outcome } = found;
   const symbols = namedSymbols(verdict.lines);
   const ownSide = await symbolOnOwnSide(cli.repo, outcome.firstErrored, verdict.files, symbols);
-  const stopSentence: Record<AdvanceStop, string> = {
+  const stopSentence: Record<ReportedStop, string> = {
     'bound-reached': `the walk stopped at its ${DEPS_MISSING_ADVANCE_LIMIT}-commit bound with ${outcome.candidates.length} candidate(s) taken`,
     'source-exhausted': 'the parent lines carry no further commit that could declare these symbols',
-    conflict: 'a step conflicted, and a resolution cannot be validated on a red tree',
     unmeasured: 'a step could not be measured, so the walk established nothing beyond it',
   };
-  const blocked = outcome.steps.find((s) => s.verdict === 'conflict');
-  const journal = readJournal(dir);
   /**
-   * THE BRANCH'S OWN OPEN CONFLICT CASE, IF IT HAS ONE — asked, not assumed.
-   *
-   * The conflict stop's decision offers resolving that case as the route to the
-   * declaration, and on the pre-merge entry point there may be no such case: the
-   * walk can stop on the first `next-case` call of a pass, before `cmdRun` has
-   * minted anything, and cases do not survive a pass. Pointing an owner at a
-   * case that does not exist is worse than not naming one — the one move that
-   * reaches the declaration reads as already available, and it is not.
-   *
-   * A GATE-FIX CASE IS NOT ONE. The frozen case this hold has just minted is on
-   * the same branch and is not a conflict anybody can resolve.
+   * WHAT THE OWNER IS ACTUALLY CHOOSING BETWEEN, which the stop decides. Each
+   * of these ends with the declaration out of reach from where the branch
+   * stands, so each offers the same two moves — wait for the walk to reach the
+   * reconciliation, or cut the branch below the state it came to rest on — and
+   * says which fact leads there.
    */
-  const gateFixCaseIds = new Set(
-    journal.filter((e) => e.action === 'case' && e.gateFix === true).map((e) => String(e.caseId)),
-  );
-  const conflictCase = openCases(journal).find((c) => c.branch === branch && !gateFixCaseIds.has(c.caseId));
-  /**
-   * WHAT THE OWNER IS ACTUALLY CHOOSING BETWEEN, which the stop decides.
-   *
-   * On a bounded or exhausted walk the declaration is out of reach from here
-   * and the options are to wait for the walk or to cut the branch. ON A
-   * CONFLICT IT IS NOT OUT OF REACH: the reconciliation is in this repository,
-   * behind a conflict a person can resolve, and the branch's own conflict case
-   * is the route to it. Telling that owner "nothing here can supply the
-   * declaration" is false, and it hides the one move that works.
-   */
-  const decision: Record<AdvanceStop, string[]> = {
+  const decision: Record<ReportedStop, string[]> = {
     'bound-reached': [
       `The declaration is not within the ${DEPS_MISSING_ADVANCE_LIMIT} commits the walk was allowed to take.`,
       'Either the reconciling commit upstream is merged here (which a later pass takes once it is',
@@ -5127,84 +5159,65 @@ async function holdDepsMissingDraft(
       'Either the reconciling commit upstream is merged here (which the next pass takes once it is',
       'reachable), or this branch is cut below the state it came to rest on.',
     ],
-    conflict: [
-      `The declaration is behind a MERGE CONFLICT at \`${(blocked?.sha ?? '').slice(0, 12)}\`` +
-        `${blocked?.conflictedPaths?.length ? ` (${blocked.conflictedPaths.join(', ')})` : ''}, which cannot be`,
-      'resolved here: the checks that would judge a resolution are the ones already failing, so any',
-      'resolution at this height is unfalsifiable. It IS in this repository. Three options: resolve',
-      ...(conflictCase
-        ? [
-            `that conflict (this branch's own conflict case \`${conflictCase.caseId}\` is open, and it is the`,
-            'route to the declaration), wait for a pass that reaches the reconciliation without the conflict,',
-            'or cut this branch below the state it came to rest on.',
-          ]
-        : [
-            'that conflict by hand — this pass has no open conflict case on this branch, so there is no case',
-            'to work and the reconciliation is reached by resolving the conflict directly — wait for a pass',
-            'that reaches the reconciliation without the conflict, or cut this branch below the state it came',
-            'to rest on.',
-          ]),
-    ],
     unmeasured: [
       'The walk could not measure the tree past its last step, so whether the declaration lies beyond',
       'it is unknown. Either the environment fault is fixed and the branch re-swept, or this branch',
       'is cut below the state it came to rest on.',
     ],
   };
-  for (const c of cases) {
-    const prDir = join(dir, c.caseId, 'pr');
-    mkdirSync(prDir, { recursive: true });
-    // The head the MINT recorded. A hold names the same commit the case does, or
-    // the two records disagree about what this PR is at.
-    const caseRow = journal.find((e) => e.action === 'case' && e.caseId === c.caseId);
-    const head = (caseRow?.head ?? { sha: outcome.firstErrored, height: 0 }) as Head;
-    const title = `Decision needed: ${branch} rests on a state whose declarations it has not reached`;
-    const body = [
-      `\`${branch}\` is red on ${verdict.files.join(', ')} with a MISSING-DECLARATION failure, and the`,
-      'declaration is not on this branch. No fix was authored and no agent was asked to write one:',
-      'a symbol the checker says does not exist belongs somewhere the walk has not reached.',
-      '',
-      '## What the checker reports',
-      '```',
-      ...verdict.lines.slice(0, DEPS_MISSING_JOURNALED_LINES),
-      '```',
-      '',
-      '## What the driver walked',
-      `Candidates (pending commits touching ${verdict.files.join(', ')}` +
-        `${symbols.length ? ` or declaring ${symbols.join(', ')}` : ''}): ${outcome.candidates.length}` +
-        `${outcome.bounded ? ` — bounded to ${DEPS_MISSING_ADVANCE_LIMIT}` : ''}.`,
-      ...outcome.steps.map((s) => `- \`${s.sha.slice(0, 12)}\` — ${s.verdict}`),
-      '',
-      `The walk ended because ${stopSentence[outcome.stop]}. The original errors were still`,
-      'present at every step it took, so the branch is rolled back to the commit the walk started on',
-      `(\`${outcome.firstErrored.slice(0, 12)}\`) and this PR is headed there.`,
-      ...(ownSide
-        ? [
-            '',
-            '## The source is not testable here',
-            `\`${ownSide.symbol}\` IS present on this branch's own side of the merge (\`${ownSide.side.slice(0, 12)}\`),`,
-            `while ${verdict.files.join(', ')} arrived with the merge and does not find it. The merge took a file`,
-            'from a state its own source had not finished.',
-          ]
-        : []),
-      '',
-      '## The decision',
-      ...decision[outcome.stop],
-    ].join('\n');
-    writeFileSync(join(prDir, 'title.txt'), title + '\n');
-    writeFileSync(join(prDir, 'body.md'), body + '\n');
-    appendJournal(dir, {
-      action: 'held',
-      branch,
-      caseId: c.caseId,
-      height: head.height,
-      headSha: head.sha,
-      conflictedPaths: c.files,
-      notes: [`missing-declaration walk ${outcome.stop}; no agent was served this case`],
-      resolution: null,
-      escalation: { tag: ESCALATE_DEPS_MISSING, feedback: verdict.reason.slice(0, COLDREAD_FEEDBACK_CAP) },
-    });
-  }
+  const title = `Decision needed: ${branch} rests on a state whose declarations it has not reached`;
+  const body = [
+    renderDepsMissingMarker(branch),
+    '',
+    `\`${branch}\` is red on ${verdict.files.join(', ')} with a MISSING-DECLARATION failure, and the`,
+    'declaration is not on this branch. No fix was authored and no agent was asked to write one:',
+    'a symbol the checker says does not exist belongs somewhere the walk has not reached.',
+    '',
+    '## What the checker reports',
+    '```',
+    ...verdict.lines.slice(0, DEPS_MISSING_JOURNALED_LINES),
+    '```',
+    '',
+    '## What the driver walked',
+    `Candidates (pending commits touching ${verdict.files.join(', ')}` +
+      `${symbols.length ? ` or declaring ${symbols.join(', ')}` : ''}): ${outcome.candidates.length}` +
+      `${outcome.bounded ? ` — bounded to ${DEPS_MISSING_ADVANCE_LIMIT}` : ''}.`,
+    ...outcome.steps.map((s) => `- \`${s.sha.slice(0, 12)}\` — ${s.verdict}`),
+    '',
+    `The walk ended because ${stopSentence[outcome.stop]}. The original errors were still`,
+    'present at every step it took, so the branch stands at the commit the walk started on',
+    `(\`${outcome.firstErrored.slice(0, 12)}\`), which is what this issue is about.`,
+    ...(ownSide
+      ? [
+          '',
+          '## The source is not testable here',
+          `\`${ownSide.symbol}\` IS present on this branch's own side of the merge (\`${ownSide.side.slice(0, 12)}\`),`,
+          `while ${verdict.files.join(', ')} arrived with the merge and does not find it. The merge took a file`,
+          'from a state its own source had not finished.',
+        ]
+      : []),
+    '',
+    '## The decision',
+    ...decision[outcome.stop],
+  ].join('\n');
+  const reportDir = join(dir, 'deps-missing', slug(branch));
+  mkdirSync(reportDir, { recursive: true });
+  writeFileSync(join(reportDir, 'title.txt'), title + '\n');
+  writeFileSync(join(reportDir, 'body.md'), body + '\n');
+  /**
+   * THE ROW IS THE PUBLISH ORDER `finish` reads, and the record that this
+   * branch's finding was made. What holds the branch for the REST OF THIS PASS
+   * is the one-walk-per-branch rule (`deps-missing-walk-spent`); what holds it
+   * across passes is the open issue this becomes.
+   */
+  appendJournal(dir, {
+    action: 'deps-missing-report',
+    branch,
+    stop: outcome.stop,
+    at: outcome.firstErrored,
+    files: verdict.files,
+    dir: reportDir,
+  });
 }
 
 /**
@@ -5212,10 +5225,18 @@ async function holdDepsMissingDraft(
  * a pre-merge red and a red landing end the same way or the difference is a
  * defect nobody chose.
  *
- * Roll back, then mint the case FROZEN, then write the owner's draft. The
- * rollback comes first because the advanced tip is a state nothing verified and
- * nobody asked for; the commit the walk started on is the one the finding is
- * about, so that is what the branch stands at and what the PR is headed at.
+ * Roll back, reopen, then write the owner's report. The rollback comes first
+ * because the advanced tip is a state nothing verified and nobody asked for;
+ * the commit the walk started on is the one the finding is about, so that is
+ * what the branch stands at and what the issue is about. The reopen is the one
+ * the ordinary red path takes, and for the same reason: a conflict case on a
+ * red tree is unjudgeable, and its checks would fail on a defect that has
+ * nothing to do with the resolution.
+ *
+ * NOTHING IS MINTED. A case exists to be worked, and there is nothing here an
+ * agent could do that would not be authoring the missing symbol; the deliverable
+ * is the issue `finish` opens, and the journaled report row holds the branch for
+ * the rest of the pass.
  *
  * Returns the WARN23 detail — the caller decides where an issue of that id
  * belongs in its own result.
@@ -5223,59 +5244,27 @@ async function holdDepsMissingDraft(
 async function holdDepsMissingWalk(
   cli: Cli,
   dir: string,
-  chain: Chain,
   branch: string,
-  /** The confirmed red the walk started from — a landing verdict, or a pre-merge one. */
-  red: { output: string; failed: VerifyCommand[] },
   found: { verdict: DepsMissingVerdict; outcome: AdvanceOutcome },
   scope: Set<string>,
 ): Promise<string> {
-  if (found.outcome.kind !== 'exhausted') return '';
   const { outcome } = found;
+  if (outcome.kind !== 'exhausted' || outcome.stop === 'conflict') return '';
+  const stop = outcome.stop;
   await journaledRollback(
     cli,
     dir,
     branch,
     outcome.firstErrored,
     scope,
-    `the missing-declaration walk ended ${outcome.stop} with the original errors still present`,
+    `the missing-declaration walk ended ${stop} with the original errors still present`,
   );
-  // REOPEN BEFORE MINTING, for the same reason the ordinary red path does it: a
-  // conflict case on a red tree is unjudgeable, and its checks would fail on a
-  // defect that has nothing to do with the resolution.
-  //
-  // EXCEPT ON THE CONFLICT STOP, where that reopen destroys the answer. The
-  // walk stopped because the commit carrying the declaration is behind a
-  // conflict, and the branch's own open conflict case is the route THROUGH it —
-  // supersede that case and the one move that reaches the declaration is gone,
-  // in the name of not judging it. The draft says so and offers it; nothing
-  // here takes it away.
-  if (outcome.stop !== 'conflict') {
-    reopen(dir, [branch, ...transitiveDescendants(planEdgesOf(dir), branch)]);
-  }
-  const gate = await materializeGateFixCases(
-    cli,
-    dir,
-    chain,
-    rootChecksOutput(red.output, red.failed),
-    red.failed,
-    null,
-    {
-      rootBranch: branch,
-      rootAt: outcome.firstErrored,
-      ownedFiles: found.verdict.files,
-      redOn: { at: outcome.firstErrored, commands: red.failed },
-    },
-  );
-  // FROZEN AT THE MINT, so `next-case` never offers it: the case exists to
-  // carry a report to the owner, and there is nothing in it an agent could do
-  // that would not be authoring the missing symbol.
-  await holdDepsMissingDraft(cli, dir, branch, gate.cases, found);
+  reopen(dir, [branch, ...transitiveDescendants(planEdgesOf(dir), branch)]);
+  await writeDepsMissingReport(cli, dir, branch, { verdict: found.verdict, outcome: { ...outcome, stop } });
   return (
     `${branch} rests on content whose declarations it has not reached (${found.verdict.files.join(', ')}) — ` +
-    (gate.cases.length
-      ? `rolled back to ${outcome.firstErrored.slice(0, 12)}; DRAFT PR(s) for the owner: ${gate.cases.map((c) => c.caseId).join(', ')}`
-      : gate.reason)
+    `rolled back to ${outcome.firstErrored.slice(0, 12)}; nothing was minted and nobody was served. ` +
+    `\`finish\` opens the owner's issue, and the branch takes no content until that issue is closed`
   );
 }
 
@@ -5286,7 +5275,12 @@ type DepsMissingSettled<R> =
    * caller serves by its ordinary path, or null when nothing is red any more.
    */
   | { kind: 'ordinary'; red: R | null }
-  /** HELD FOR THE OWNER. Nothing is served, nothing is merged, WARN23 is raised. */
+  /**
+   * HELD: NOTHING IS SERVED FOR THIS RED and nothing is merged, and WARN23 says
+   * so. The call can still serve a case of its own — a conflict stop leaves the
+   * branch's own conflict case standing and that case is offered on the same
+   * call — but no case is ever minted from this red.
+   */
   | { kind: 'held'; branch: string; detail: string };
 
 /**
@@ -5328,7 +5322,7 @@ async function settleDepsMissing<R extends { output: string; failed: VerifyComma
   advance: (red: R) => Promise<DepsMissingAdvance>;
   /** What is red now, after the walk moved the branch; null when nothing is. */
   remeasure: (previous: R) => Promise<R | null>;
-  /** The terminal hold for an exhausted walk — rollback, frozen case, owner draft. */
+  /** The terminal hold for a walk with nothing left to reach — rollback, reopen, owner report. */
   hold: (red: R, found: { verdict: DepsMissingVerdict; outcome: AdvanceOutcome }) => Promise<string>;
   /** Rounds allowed before the loop stops re-entering. */
   cap: number;
@@ -5379,6 +5373,29 @@ async function settleDepsMissing<R extends { output: string; failed: VerifyComma
       };
     }
     if (found.outcome.kind === 'exhausted') {
+      /**
+       * A CONFLICT STOP IS THE SWEEP'S ORDINARY WORK, NOT AN OWNER'S DECISION.
+       * The commit that carries the declaration is one merge away, behind a
+       * conflict — which is the thing this sweep exists to serve, and it serves
+       * it as an ordinary conflict case on the branch's own parent line. So
+       * nothing is rolled back, nothing is minted, no report is written and no
+       * pull request is proposed: the walk simply ends. The red the branch is
+       * left standing on is then a PRE-EXISTING red under that case, which
+       * `--not-my-bug` and the owed-red machinery already adjudicate; the
+       * warning below is what tells the agent it is not its to fix.
+       */
+      if (found.outcome.stop === 'conflict') {
+        const blocked = found.outcome.steps.find((st) => st.verdict === 'conflict');
+        return {
+          kind: 'held',
+          branch,
+          detail:
+            `${branch} is red on declarations it has not reached (${found.verdict.files.join(', ')}), and the ` +
+            `commit that carries them (\`${(blocked?.sha ?? '').slice(0, 12)}\`) conflicts` +
+            `${blocked?.conflictedPaths?.length ? ` at ${blocked.conflictedPaths.join(', ')}` : ''} — the conflict is ` +
+            `served as an ordinary case, and nothing is minted for this red`,
+        };
+      }
       return { kind: 'held', branch, detail: await opts.hold(red, found) };
     }
     red = await opts.remeasure(red);
@@ -6050,7 +6067,7 @@ export async function cmdRun(
               runChecks,
               runInstall,
             ),
-          hold: (red, found) => holdDepsMissingWalk(cli, dir, ctx.chain, bp.branch, red, found, scope),
+          hold: (_red, found) => holdDepsMissingWalk(cli, dir, bp.branch, found, scope),
           // The walk moved the branch, so the verdict that stands is the one
           // this tip earns. A repair lands and the pass continues; anything
           // still red is asked the same question again.
@@ -11105,6 +11122,64 @@ async function deriveOriginMergeStatus(
 }
 
 /**
+ * THE MISSING-DECLARATION LATCH, READ BACK OFF ORIGIN (DRIVER.md §7.7).
+ *
+ * A walk that ended with nothing left to reach reports a decision to the owner
+ * as an ISSUE, and that OPEN ISSUE IS THE WHOLE RECORD of it: the driver keeps
+ * no local state across passes, so the latch has to be a fact on GitHub or it
+ * is not a latch at all. Every open issue carrying the marker journals an
+ * `origin-deps-missing` row, which blocks its branch exactly as an open fix ref
+ * blocks one — so the next pass does not re-walk, re-report and re-open the
+ * same dead end. The owner closes the issue; the branch is free on the next
+ * `start`, with nothing to clean up.
+ *
+ * FAIL-CLOSED WHERE IT CAN BE. With a token, a failed lookup halts (ERR13):
+ * reading "no issues" off a broken API would unlatch every branch and open
+ * duplicates. WITHOUT a token the driver can neither read nor open issues, so
+ * the whole mechanism is inert rather than half-applied — journaled, so a pass
+ * that ran unlatched says so.
+ */
+async function deriveOpenDepsMissingIssues(
+  cli: Cli,
+  dir: string,
+  makeTransport?: (token: string) => GithubTransport,
+): Promise<{ ok: boolean; issues: Issue[]; latched: string[] }> {
+  const token = resolveGithubToken(cli);
+  const slugParts = token ? await originSlug(cli) : null;
+  if (!token || !slugParts) {
+    const detail = token
+      ? "origin's URL yields no owner/repo"
+      : 'no GitHub token is present, so open missing-declaration issues cannot be read';
+    appendJournal(dir, { action: 'deps-missing-issues-unread', reason: detail });
+    console.error(`sweep start: ${detail} — no missing-declaration issue was read, so no branch is latched by one`);
+    return { ok: true, issues: [], latched: [] };
+  }
+  let open: Awaited<ReturnType<typeof openDepsMissingIssues>>;
+  try {
+    open = await openDepsMissingIssues((makeTransport ?? realGithubTransport)(token), slugParts);
+  } catch (e) {
+    const detail =
+      `could not list open issues: ${e instanceof Error ? e.message : String(e)} — the missing-declaration ` +
+      `latch is derived from them, and reading none would re-walk and re-report every branch an owner is ` +
+      `already deciding on`;
+    return { ok: false, issues: [{ id: 'ERR13_API_FAILED', detail }], latched: [] };
+  }
+  const latched: string[] = [];
+  for (const issue of open) {
+    appendJournal(dir, {
+      action: 'origin-deps-missing',
+      branch: issue.branch,
+      number: issue.number,
+      url: issue.url,
+      title: issue.title,
+    });
+    latched.push(issue.branch);
+    console.error(`sweep start: ${issue.branch} is latched by open issue #${issue.number} (missing declaration)`);
+  }
+  return { ok: true, issues: [], latched };
+}
+
+/**
  * `sweep start` — open a pass and pin its watermark. Refuses if a pass is
  * already open (a machine state that is not `complete`): the agent must
  * `finish` or `abort` first — never blind-wipe an in-flight pass (that strands
@@ -11359,6 +11434,18 @@ export async function cmdSweepStart(
   }
   if (originDerive.blocked.length) {
     progress(`origin-derived blocked: ${originDerive.blocked.join(', ')}`);
+  }
+  // THE SAME RECONSTRUCTION FOR FINDINGS THAT PROPOSE NO CHANGE: an open
+  // missing-declaration issue latches its branch (§7.7), and the issue on
+  // origin is the only record there is.
+  const depsMissingDerive = await deriveOpenDepsMissingIssues(cli, canonicalDir, makeTransport);
+  if (!depsMissingDerive.ok) {
+    console.error(`sweep start [${depsMissingDerive.issues[0]?.id}]: ${depsMissingDerive.issues[0]?.detail}`);
+    result(cli, { ok: false, issues: depsMissingDerive.issues });
+    return 1;
+  }
+  if (depsMissingDerive.latched.length) {
+    progress(`latched by an open missing-declaration issue: ${depsMissingDerive.latched.join(', ')}`);
   }
 
   // Pin the watermark + open the pass (only `plan` opens a pass, §2).
@@ -11756,10 +11843,21 @@ export async function cmdSweepNextCase(
   let depsMissingHeld: { branch: string; detail: string } | null = null;
   if (redBranch) {
     // A MISSING DECLARATION IS NOT A DEFECT TO HAND OUT (§7.7), and THIS is the
-    // path such a red normally arrives on. A branch resting inside an unmerged
-    // upstream feature branch is red AT ITS OWN TIP, on every pass, so it never
-    // reaches a landing gate — the pre-merge check catches it first, and
+    // path a red that survives its branch's propagation arrives on. A branch
+    // resting inside an unmerged upstream feature branch with nothing left to
+    // take is red AT ITS OWN TIP, on every pass, so it never reaches a landing
+    // gate — the pre-merge check is the only place that red is ever seen, and
     // without this the same branch mints an agent-served case forever.
+    //
+    // BUT PROPAGATION GOES FIRST. This check measures the branch BEFORE the
+    // pass attempts any of its pending work, and a branch that is merely BEHIND
+    // reports a missing declaration for the plainest reason there is: the
+    // declaration is in the content it has not merged yet. That is ordinary
+    // propagation — a clean merge or a conflict case the sweep serves every
+    // pass — and walking it one commit at a time instead preempts the case,
+    // spends the branch's budget on merges the plan was going to make, and
+    // reports a dead end that was never one. So the classification is not even
+    // ASKED while the branch has content pending over the lines it takes from.
     //
     // Asked BEFORE the lift below, for the reason the landing gate asks before
     // its own lift and reopen: ceiling attribution is the first step of handing
@@ -11790,11 +11888,27 @@ export async function cmdSweepNextCase(
       advance: async (red) => {
         if (!scope.has(red.branch)) return { kind: 'not-deps-missing' };
         const bp = planBranchOf(dir, red.branch);
+        const sources = bp ? advanceSources(bp, ctx.chain) : [];
+        const pending = await pendingFromSources(cli.repo, red.branch, sources);
+        if (pending > 0) {
+          // PROPAGATION FIRST. The row says why the classifier was not asked,
+          // because "no classification" and "classified as something else" are
+          // different facts about the same red and a reader has to be able to
+          // tell them apart.
+          appendJournal(dir, {
+            action: 'deps-missing-propagation-first',
+            branch: red.branch,
+            sha: red.sha,
+            sources,
+            pending,
+          });
+          return { kind: 'not-deps-missing' };
+        }
         return depsMissingAdvance(
           cli,
           dir,
           red.branch,
-          bp ? advanceSources(bp, ctx.chain) : [],
+          sources,
           { output: red.output, failed: red.failed, sha: red.sha },
           scope,
           preReffedSet(readJournal(dir)),
@@ -11802,7 +11916,7 @@ export async function cmdSweepNextCase(
           runInstall,
         );
       },
-      hold: (red, found) => holdDepsMissingWalk(cli, dir, ctx.chain, red.branch, red, found, scope),
+      hold: (red, found) => holdDepsMissingWalk(cli, dir, red.branch, found, scope),
       // THE WALK MOVED THE BRANCH, so the verdict that stands is the one its new
       // tip earns — the same re-measure the landing gate takes. A repair leaves
       // this branch green and the check moves on to the next participant.
@@ -16625,6 +16739,80 @@ async function collectPassPullRequests(
   return [...byNumber.values()].sort((a, b) => a.number - b.number);
 }
 
+/**
+ * OPEN THE OWNER'S ISSUE for every missing-declaration report this pass wrote
+ * (DRIVER.md §7.7) — the pass's one origin write that is not a pull request.
+ *
+ * WHY HERE. The finding is made mid-pass, where the driver takes no network
+ * write at all; `finish` is where the pass's conclusions reach origin, and this
+ * is one of them. It runs before the verify gate on purpose: the report is
+ * about a branch nothing landed on, so it does not depend on how the rest of
+ * the pass ends, and every exit door from finish has already passed here.
+ *
+ * IDEMPOTENT AGAINST ORIGIN, not against local bookkeeping: the open issues are
+ * READ first and a branch that already has one is left alone, so a re-run
+ * finish (or a pass that ran with the latch unread) adds nothing. A failure to
+ * read or to open is journaled and does not fail the pass — the branch is
+ * simply not latched, and the next pass re-derives the same finding and tries
+ * again, which is the one direction that cannot lose the owner's decision.
+ */
+async function publishDepsMissingIssues(
+  cli: Cli,
+  dir: string,
+  makeTransport?: (token: string) => GithubTransport,
+): Promise<void> {
+  const journal = readJournal(dir);
+  const reports = new Map<string, string>();
+  for (const e of journal) {
+    if (e.action === 'deps-missing-report' && typeof e.branch === 'string' && typeof e.dir === 'string') {
+      reports.set(e.branch, e.dir);
+    }
+  }
+  if (reports.size === 0) return;
+  const token = resolveGithubToken(cli);
+  const slugParts = token ? await originSlug(cli) : null;
+  if (!token || !slugParts) {
+    const detail = `no GitHub token or origin slug — ${[...reports.keys()].join(', ')} reported nothing to the owner`;
+    appendJournal(dir, { action: 'deps-missing-issue-failed', reason: detail });
+    console.error(`finish: ${detail}`);
+    return;
+  }
+  const transport = (makeTransport ?? realGithubTransport)(token);
+  let open: Awaited<ReturnType<typeof openDepsMissingIssues>>;
+  try {
+    open = await openDepsMissingIssues(transport, slugParts);
+  } catch (e) {
+    const detail = `could not list open issues (${e instanceof Error ? e.message : String(e)}) — nothing was opened`;
+    appendJournal(dir, { action: 'deps-missing-issue-failed', reason: detail });
+    console.error(`finish [ERR13_API_FAILED]: ${detail}`);
+    return;
+  }
+  for (const [branch, reportDir] of reports) {
+    const already = open.find((i) => i.branch === branch);
+    if (already) {
+      appendJournal(dir, { action: 'deps-missing-issue-exists', branch, number: already.number, url: already.url });
+      console.error(`finish: ${branch} already has open issue #${already.number} — nothing opened`);
+      continue;
+    }
+    const titlePath = join(reportDir, 'title.txt');
+    const bodyPath = join(reportDir, 'body.md');
+    if (!existsSync(titlePath) || !existsSync(bodyPath)) continue;
+    try {
+      const created = await createIssue(transport, slugParts, {
+        title: readFileSync(titlePath, 'utf8').trim(),
+        body: readFileSync(bodyPath, 'utf8'),
+      });
+      appendJournal(dir, { action: 'deps-missing-issue-opened', branch, number: created.number, url: created.url });
+      progress(`opened issue #${created.number} for ${branch} (missing declaration)`);
+      console.error(`finish: opened issue #${created.number} for ${branch} — ${created.url}`);
+    } catch (e) {
+      const detail = `${branch}: could not open the issue (${e instanceof Error ? e.message : String(e)})`;
+      appendJournal(dir, { action: 'deps-missing-issue-failed', branch, reason: detail });
+      console.error(`finish [ERR13_API_FAILED]: ${detail}`);
+    }
+  }
+}
+
 export async function cmdSweepFinish(
   cli: Cli,
   makeTransport?: (token: string) => GithubTransport,
@@ -16756,6 +16944,11 @@ export async function cmdSweepFinish(
     });
     return 0;
   }
+
+  // THE OWNER'S MISSING-DECLARATION ISSUES, before anything else this command
+  // does: they are about branches the pass landed nothing on, so no verdict
+  // below changes them, and every exit door from here has passed this point.
+  await publishDepsMissingIssues(cli, dir, makeTransport);
 
   // (1) verify the publishable set (full rebuild, §9). A red verify either
   // fails attribution (verifyRc != 0) or rolls a publishable offender back to
