@@ -404,7 +404,9 @@ describe('armSessionLifecycle', () => {
     await armSessionLifecycle({
       handle,
       onTerminal: () => {},
-      afterStart: () => order.push('afterStart'),
+      afterStart: () => {
+        order.push('afterStart');
+      },
     });
 
     // A failure landing during startup must find a runtime that already knows
@@ -422,7 +424,9 @@ describe('armSessionLifecycle', () => {
       armSessionLifecycle({
         handle,
         onTerminal: () => {},
-        afterStart: () => order.push('afterStart'),
+        afterStart: () => {
+          order.push('afterStart');
+        },
       }),
     ).rejects.toThrow('image-unavailable');
 

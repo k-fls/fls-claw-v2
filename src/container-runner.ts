@@ -152,30 +152,36 @@ export function wakeContainer(session: Session): Promise<boolean> {
 }
 
 async function spawnContainer(session: Session): Promise<void> {
-  const agentGroup = getAgentGroup(session.agent_group_id);
+  const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
     log.error('Agent group not found', { agentGroupId: session.agent_group_id });
     return;
   }
 
   // Refresh the destination map and current-thread routing so any admin
-  // changes take effect on wake.
-  if (hasTable(getDb(), 'agent_destinations')) {
+  // changes take effect on wake. Destinations come from the agent-to-agent
+  // module — skip when the module isn't installed (table absent).
+  if (await hasTable(getDb(), 'agent_destinations')) {
     const { writeDestinations } = await import('./modules/agent-to-agent/write-destinations.js');
-    writeDestinations(agentGroup.id, session.id);
+    await writeDestinations(agentGroup.id, session.id);
   }
-  writeSessionRouting(agentGroup.id, session.id);
+  await writeSessionRouting(agentGroup.id, session.id);
 
-  const containerConfig = materializeContainerJson(agentGroup.id);
+  // Materialize container.json from DB — writes fresh file and returns
+  // the config object, threaded through provider resolution, buildMounts,
+  // and buildContainerArgs so we don't re-read.
+  const containerConfig = await materializeContainerJson(agentGroup.id);
 
   const providerName = resolveProviderName(session.agent_provider, containerConfig.provider);
-  initGroupFilesystem(agentGroup, { provider: providerName });
+  await initGroupFilesystem(agentGroup, { provider: providerName });
 
-  const { provider, contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
+  // Resolve the effective provider + any host-side contribution it declares
+  // (extra mounts, env passthrough). Computed once and threaded through both
+  // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
+  const { provider, contribution } = await resolveProviderContribution(session, agentGroup, containerConfig);
 
-  const mounts = buildMounts(agentGroup, session, containerConfig, provider, contribution);
+  const mounts = await buildMounts(agentGroup, session, containerConfig, provider, contribution);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
-
   const driver = getSessionDriver();
   // The gateway's per-session contribution — typed env and mounts (and, on a
   // driver that manages them, auxiliary containers), merged into the spec
@@ -226,7 +232,7 @@ async function spawnContainer(session: Session): Promise<void> {
         void finishAndResolve(session.id, failure);
       },
       afterStart: () => {
-        markContainerRunning(session.id);
+        return markContainerRunning(session.id);
       },
     });
   } catch (err) {
@@ -252,11 +258,11 @@ async function spawnContainer(session: Session): Promise<void> {
 export async function armSessionLifecycle(deps: {
   handle: Pick<SupervisedHandle, 'onTerminal' | 'start'>;
   onTerminal: (failure?: SessionFailure) => void;
-  afterStart?: () => void;
+  afterStart?: () => void | Promise<void>;
 }): Promise<void> {
   deps.handle.onTerminal(deps.onTerminal);
   await deps.handle.start();
-  deps.afterStart?.();
+  await deps.afterStart?.();
 }
 
 function registerRuntime(
@@ -298,7 +304,7 @@ async function finishAndResolve(sessionId: string, failure?: SessionFailure): Pr
 async function finish(sessionId: string, runtime: ActiveSessionRuntime, failure?: SessionFailure): Promise<void> {
   const { containerName } = runtime;
   try {
-    markContainerStopped(sessionId);
+    await markContainerStopped(sessionId);
   } catch (err) {
     log.error('Failed to record stopped container', { sessionId, containerName, err });
   }
@@ -377,7 +383,7 @@ export async function adoptRunningSessions(): Promise<{ adopted: number; stopped
   let adopted = 0;
   let stopped = 0;
   for (const { handle, phase } of snapshots) {
-    const session = handle.key.sessionId ? getSession(handle.key.sessionId) : undefined;
+    const session = handle.key.sessionId ? await getSession(handle.key.sessionId) : undefined;
     // The snapshot's phase is the listing's own truth: a corpse arrives as
     // 'terminal' (or not at all), so telling adoptable sessions apart needs
     // no per-handle status() round trip. `stop()` on a corpse is still full
@@ -392,7 +398,7 @@ export async function adoptRunningSessions(): Promise<{ adopted: number; stopped
     handle.onTerminal((failure) => {
       void finishAndResolve(session.id, failure);
     });
-    markContainerRunning(session.id);
+    await markContainerRunning(session.id);
     adopted += 1;
   }
 
@@ -420,15 +426,15 @@ export function resolveProviderName(
   return (sessionProvider || containerConfigProvider || 'claude').toLowerCase();
 }
 
-function resolveProviderContribution(
+async function resolveProviderContribution(
   session: Session,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
-): { provider: string; contribution: ProviderContainerContribution } {
+): Promise<{ provider: string; contribution: ProviderContainerContribution }> {
   const provider = resolveProviderName(session.agent_provider, containerConfig.provider);
   const fn = getProviderContainerConfig(provider);
   const contribution = fn
-    ? fn({
+    ? await fn({
         sessionDir: sessionDir(agentGroup.id, session.id),
         agentGroupId: agentGroup.id,
         groupDir: path.resolve(GROUPS_DIR, agentGroup.folder),
@@ -439,13 +445,13 @@ function resolveProviderContribution(
   return { provider, contribution };
 }
 
-export function buildMounts(
+export async function buildMounts(
   agentGroup: AgentGroup,
   session: Session,
   containerConfig: import('./container-config.js').ContainerConfig,
   provider: string,
   providerContribution: ProviderContainerContribution,
-): VolumeMount[] {
+): Promise<VolumeMount[]> {
   const projectRoot = process.cwd();
 
   // Default agent surfaces (composed project doc, skill links, provider state
@@ -455,7 +461,10 @@ export function buildMounts(
   const claudeDir = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.claude-shared');
   if (defaultSurfaces) {
     syncSkillSymlinks(claudeDir, containerConfig);
-    composeGroupClaudeMd(agentGroup);
+
+    // Compose CLAUDE.md fresh every spawn from the shared base, enabled skill
+    // fragments, and MCP server instructions. See `claude-md-compose.ts`.
+    await composeGroupClaudeMd(agentGroup);
   }
 
   const mounts: VolumeMount[] = [];
@@ -847,10 +856,10 @@ const execAsync = promisify(exec);
 
 /** Build a per-agent-group Docker image with custom packages. */
 export async function buildAgentGroupImage(agentGroupId: string): Promise<void> {
-  const agentGroup = getAgentGroup(agentGroupId);
+  const agentGroup = await getAgentGroup(agentGroupId);
   if (!agentGroup) throw new Error('Agent group not found');
 
-  const configRow = getContainerConfig(agentGroup.id);
+  const configRow = await getContainerConfig(agentGroup.id);
   if (!configRow) throw new Error('Container config not found');
   const aptPackages = JSON.parse(configRow.packages_apt) as string[];
   const npmPackages = JSON.parse(configRow.packages_npm) as string[];
@@ -919,7 +928,8 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
     fs.unlinkSync(tmpDockerfile);
   }
 
-  updateContainerConfigScalars(agentGroup.id, { image_tag: imageTag });
+  // Store the image tag in the DB
+  await updateContainerConfigScalars(agentGroup.id, { image_tag: imageTag });
 
   log.info('Per-agent-group image built', { agentGroupId, imageTag });
 }

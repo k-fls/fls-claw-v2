@@ -102,16 +102,20 @@ function toFolder(name: string): string {
 
 // ── Card builders ──
 
-function visibleAgentGroupsForApprover(
+async function visibleAgentGroupsForApprover(
   agentGroups: AgentGroup[],
   approverUserId: string | null | undefined,
-): AgentGroup[] {
+): Promise<AgentGroup[]> {
   if (!approverUserId) return agentGroups;
-  return agentGroups.filter((agentGroup) => hasAdminPrivilege(approverUserId, agentGroup.id));
+  const visible: AgentGroup[] = [];
+  for (const agentGroup of agentGroups) {
+    if (await hasAdminPrivilege(approverUserId, agentGroup.id)) visible.push(agentGroup);
+  }
+  return visible;
 }
 
-function buildApprovalOptions(agentGroups: AgentGroup[], approverUserId?: string | null): RawOption[] {
-  const visibleAgentGroups = visibleAgentGroupsForApprover(agentGroups, approverUserId);
+async function buildApprovalOptions(agentGroups: AgentGroup[], approverUserId?: string | null): Promise<RawOption[]> {
+  const visibleAgentGroups = await visibleAgentGroupsForApprover(agentGroups, approverUserId);
   const options: RawOption[] = [];
   if (visibleAgentGroups.length === 1) {
     options.push({
@@ -191,12 +195,12 @@ export interface RequestChannelApprovalInput {
 export async function requestChannelApproval(input: RequestChannelApprovalInput): Promise<void> {
   const { messagingGroupId, event } = input;
 
-  if (hasInFlightChannelApproval(messagingGroupId)) {
+  if (await hasInFlightChannelApproval(messagingGroupId)) {
     log.debug('Channel registration already in flight — dropping retry', { messagingGroupId });
     return;
   }
 
-  const originMg = getMessagingGroup(messagingGroupId);
+  const originMg = await getMessagingGroup(messagingGroupId);
 
   // Channel-module interceptor: consulted before any card work so a module
   // can auto-wire / decline / suppress for its own channel type. Runs after
@@ -217,7 +221,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     }
   }
 
-  const agentGroups = getAllAgentGroups();
+  const agentGroups = await getAllAgentGroups();
   if (agentGroups.length === 0) {
     log.warn('Channel registration skipped — no agent groups configured. Run /init-first-agent.', {
       messagingGroupId,
@@ -228,7 +232,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   // are returned regardless of which group we pass.
   const referenceGroup = agentGroups[0];
 
-  const approvers = pickApprover(referenceGroup.id);
+  const approvers = await pickApprover(referenceGroup.id);
   if (approvers.length === 0) {
     log.warn('Channel registration skipped — no owner or admin configured', {
       messagingGroupId,
@@ -247,7 +251,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
       try {
         const name = await channelAdapter.resolveChannelName(originMg.platform_id);
         if (name) {
-          updateMessagingGroup(originMg.id, { name });
+          await updateMessagingGroup(originMg.id, { name });
           originMg.name = name;
         }
       } catch {
@@ -287,9 +291,9 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     originChannelType,
   );
   const question = buildQuestionText(isGroup, senderName, channelName, originChannelType, ruleNote);
-  const options = normalizeOptions(buildApprovalOptions(agentGroups, delivery.userId));
+  const options = normalizeOptions(await buildApprovalOptions(agentGroups, delivery.userId));
 
-  createPendingChannelApproval({
+  await createPendingChannelApproval({
     messaging_group_id: messagingGroupId,
     agent_group_id: referenceGroup.id,
     original_message: JSON.stringify(event),
@@ -335,11 +339,11 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
 /**
  * Build normalized options for the agent-selection follow-up card.
  */
-export function buildAgentSelectionOptions(
+export async function buildAgentSelectionOptions(
   agentGroups: AgentGroup[],
   approverUserId?: string | null,
-): NormalizedOption[] {
-  const visibleAgentGroups = visibleAgentGroupsForApprover(agentGroups, approverUserId);
+): Promise<NormalizedOption[]> {
+  const visibleAgentGroups = await visibleAgentGroupsForApprover(agentGroups, approverUserId);
   const options: RawOption[] = visibleAgentGroups.map((ag) => ({
     label: ag.name,
     selectedLabel: `✅ Connected to ${ag.name}`,
@@ -357,7 +361,7 @@ export function buildAgentSelectionOptions(
  * Create a new agent group and initialize its filesystem. Handles
  * folder-name collisions with numeric suffixes.
  */
-export function createNewAgentGroup(name: string): AgentGroup {
+export async function createNewAgentGroup(name: string): Promise<AgentGroup> {
   let folder = toFolder(name);
   const baseFolder = folder;
   let suffix = 2;
@@ -365,13 +369,13 @@ export function createNewAgentGroup(name: string): AgentGroup {
   // is deleted-group residue — adopting it would silently re-scope the old
   // group's data under the new agent's identity. Skip to the next suffix
   // instead (templates/create-agent.ts precedent).
-  while (getAgentGroupByFolder(folder) || groupFolderExistsOnDisk(folder)) {
+  while ((await getAgentGroupByFolder(folder)) || groupFolderExistsOnDisk(folder)) {
     folder = `${baseFolder}-${suffix}`;
     suffix++;
   }
 
   const agId = `ag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  createAgentGroup({
+  await createAgentGroup({
     id: agId,
     name,
     folder,
@@ -379,11 +383,11 @@ export function createNewAgentGroup(name: string): AgentGroup {
     created_at: new Date().toISOString(),
   });
 
-  const ag = getAgentGroup(agId)!;
+  const ag = (await getAgentGroup(agId))!;
   // Channel-approved groups are created on the instance default provider
   // (DEFAULT_AGENT_PROVIDER, or claude when unset) — initGroupFilesystem stamps
   // it onto the fresh config row. The operator flips a group afterward with
   // `ncl groups config update --provider`.
-  initGroupFilesystem(ag);
+  await initGroupFilesystem(ag);
   return ag;
 }

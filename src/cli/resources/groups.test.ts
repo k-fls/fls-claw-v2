@@ -13,6 +13,7 @@
  */
 import fs from 'fs';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
+import { sqliteRaw } from '../../db/drivers/sqlite.js';
 
 vi.mock('../../container-runner.js', () => ({
   wakeContainer: vi.fn().mockResolvedValue(undefined),
@@ -20,6 +21,10 @@ vi.mock('../../container-runner.js', () => ({
   getActiveContainerCount: vi.fn().mockReturnValue(0),
   killContainer: vi.fn(),
   buildAgentGroupImage: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../../container-restart.js', () => ({
+  restartAgentGroupContainers: vi.fn().mockResolvedValue(0),
 }));
 
 vi.mock('../../config.js', async () => {
@@ -33,6 +38,7 @@ import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../
 import { createSession } from '../../db/sessions.js';
 import { dispatch } from '../dispatch.js';
 import { ensureContainerConfig, getContainerConfig } from '../../db/container-configs.js';
+import { restartAgentGroupContainers } from '../../container-restart.js';
 // Side-effect import: registers the `groups-*` commands (including delete).
 import './groups.js';
 
@@ -42,24 +48,35 @@ function now(): string {
 
 function count(sql: string, ...params: unknown[]): number {
   return (
-    getDb()
+    sqliteRaw(getDb())
       .prepare(sql)
       .get(...params) as { c: number }
   ).c;
 }
 
 describe('groups CLI delete cascades dependent rows (#2525)', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
 
-    const db = initTestDb();
-    runMigrations(db);
+    const db = await initTestDb();
+    await runMigrations(db);
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('waits for host-side group restarts and returns their resolved count', async () => {
+    vi.mocked(restartAgentGroupContainers).mockResolvedValueOnce(3);
+
+    const response = await dispatch(
+      { id: 'req-restart', command: 'groups-restart', args: { id: 'ag-restart' } },
+      { caller: 'host' },
+    );
+
+    expect(response).toEqual({ id: 'req-restart', ok: true, data: { restarted: 3, rebuilt: false } });
   });
 
   it('deletes a group with sessions, destinations, approvals, members, roles, and wirings', async () => {
@@ -68,8 +85,8 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
     const MGID = 'mg-1';
     const UID = 'tg:42';
 
-    createAgentGroup({ id: GID, name: 'victim', folder: 'victim', agent_provider: null, created_at: now() });
-    createSession({
+    await createAgentGroup({ id: GID, name: 'victim', folder: 'victim', agent_provider: null, created_at: now() });
+    await createSession({
       id: SID,
       agent_group_id: GID,
       messaging_group_id: null,
@@ -86,60 +103,77 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
     // Direct inserts for the dependent tables. Keeps the fixture minimal —
     // we only need rows that establish FK relationships, not full domain
     // entities.
-    db.prepare(`INSERT INTO users (id, kind, display_name, created_at) VALUES (?, 'telegram', 'someone', ?)`).run(
-      UID,
-      now(),
-    );
-    db.prepare(
-      `INSERT INTO messaging_groups (id, channel_type, platform_id, instance, name, is_group, unknown_sender_policy, created_at)
+    sqliteRaw(db)
+      .prepare(`INSERT INTO users (id, kind, display_name, created_at) VALUES (?, 'telegram', 'someone', ?)`)
+      .run(UID, now());
+    sqliteRaw(db)
+      .prepare(
+        `INSERT INTO messaging_groups (id, channel_type, platform_id, instance, name, is_group, unknown_sender_policy, created_at)
        VALUES (?, 'telegram', 'tg-1', 'telegram', 'chat', 1, 'strict', ?)`,
-    ).run(MGID, now());
+      )
+      .run(MGID, now());
 
-    db.prepare(
-      `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
+    sqliteRaw(db)
+      .prepare(
+        `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
        VALUES (?, 'chan', 'channel', ?, ?)`,
-    ).run(GID, MGID, now());
+      )
+      .run(GID, MGID, now());
 
-    db.prepare(
-      `INSERT INTO pending_questions (question_id, session_id, message_out_id, title, options_json, created_at)
+    sqliteRaw(db)
+      .prepare(
+        `INSERT INTO pending_questions (question_id, session_id, message_out_id, title, options_json, created_at)
        VALUES (?, ?, 'mout-1', 'q', '[]', ?)`,
-    ).run('q-1', SID, now());
+      )
+      .run('q-1', SID, now());
 
-    db.prepare(
-      `INSERT INTO pending_approvals (approval_id, session_id, request_id, action, payload, created_at, agent_group_id, status, title, options_json)
+    sqliteRaw(db)
+      .prepare(
+        `INSERT INTO pending_approvals (approval_id, session_id, request_id, action, payload, created_at, agent_group_id, status, title, options_json)
        VALUES (?, ?, 'req-1', 'cli_command', '{}', ?, ?, 'pending', '', '[]')`,
-    ).run('pa-1', SID, now(), GID);
+      )
+      .run('pa-1', SID, now(), GID);
 
-    db.prepare(
-      `INSERT INTO pending_sender_approvals (id, messaging_group_id, agent_group_id, sender_identity, sender_name, original_message, approver_user_id, created_at)
+    sqliteRaw(db)
+      .prepare(
+        `INSERT INTO pending_sender_approvals (id, messaging_group_id, agent_group_id, sender_identity, sender_name, original_message, approver_user_id, created_at)
        VALUES ('psa-1', ?, ?, 'tg:99', 'them', '{}', ?, ?)`,
-    ).run(MGID, GID, UID, now());
+      )
+      .run(MGID, GID, UID, now());
 
-    db.prepare(
-      `INSERT INTO pending_channel_approvals (messaging_group_id, agent_group_id, original_message, approver_user_id, created_at)
+    sqliteRaw(db)
+      .prepare(
+        `INSERT INTO pending_channel_approvals (messaging_group_id, agent_group_id, original_message, approver_user_id, created_at)
        VALUES (?, ?, '{}', ?, ?)`,
-    ).run(MGID, GID, UID, now());
+      )
+      .run(MGID, GID, UID, now());
 
-    db.prepare(
-      `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, engage_mode, sender_scope, ignored_message_policy, session_mode, priority, created_at)
+    sqliteRaw(db)
+      .prepare(
+        `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, engage_mode, sender_scope, ignored_message_policy, session_mode, priority, created_at)
        VALUES ('mga-1', ?, ?, 'mention', 'all', 'drop', 'shared', 0, ?)`,
-    ).run(MGID, GID, now());
+      )
+      .run(MGID, GID, now());
 
-    db.prepare(
-      `INSERT INTO agent_group_members (user_id, agent_group_id, added_by, added_at) VALUES (?, ?, NULL, ?)`,
-    ).run(UID, GID, now());
+    sqliteRaw(db)
+      .prepare(`INSERT INTO agent_group_members (user_id, agent_group_id, added_by, added_at) VALUES (?, ?, NULL, ?)`)
+      .run(UID, GID, now());
 
-    db.prepare(
-      `INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, 'admin', ?, NULL, ?)`,
-    ).run(UID, GID, now());
+    sqliteRaw(db)
+      .prepare(
+        `INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, 'admin', ?, NULL, ?)`,
+      )
+      .run(UID, GID, now());
 
     // Container config row exercises the ON DELETE CASCADE on container_configs.
-    db.prepare(
-      `INSERT INTO container_configs
+    sqliteRaw(db)
+      .prepare(
+        `INSERT INTO container_configs
          (agent_group_id, provider, model, effort, image_tag, assistant_name, max_messages_per_prompt,
           skills, mcp_servers, packages_apt, packages_npm, additional_mounts, cli_scope, updated_at)
        VALUES (?, NULL, NULL, NULL, NULL, NULL, NULL, '"all"', '{}', '[]', '[]', '[]', 'group', ?)`,
-    ).run(GID, now());
+      )
+      .run(GID, now());
 
     const resp = await dispatch({ id: 'req-del', command: 'groups-delete', args: { id: GID } }, { caller: 'host' });
 
@@ -183,18 +217,20 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
   it('removes polymorphic agent_destinations that point at the deleted group', async () => {
     const A = 'ag-a';
     const B = 'ag-b';
-    createAgentGroup({ id: A, name: 'a', folder: 'a', agent_provider: null, created_at: now() });
-    createAgentGroup({ id: B, name: 'b', folder: 'b', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: A, name: 'a', folder: 'a', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: B, name: 'b', folder: 'b', agent_provider: null, created_at: now() });
 
     const db = getDb();
 
     // B has a destination pointing at A. target_id is polymorphic — no FK
     // constraint enforces it, so without explicit cleanup the row would
     // dangle after A is deleted.
-    db.prepare(
-      `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
+    sqliteRaw(db)
+      .prepare(
+        `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
        VALUES (?, 'sibling', 'agent', ?, ?)`,
-    ).run(B, A, now());
+      )
+      .run(B, A, now());
 
     const resp = await dispatch({ id: 'req-del-a', command: 'groups-delete', args: { id: A } }, { caller: 'host' });
 
@@ -221,31 +257,31 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
 });
 
 describe('groups config add-mount / remove-mount (host-only)', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    runMigrations(initTestDb());
+    await runMigrations(await initTestDb());
   });
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 
   it('adds a mount idempotently and removes it (host caller)', async () => {
     const GID = 'ag-mount';
-    createAgentGroup({ id: GID, name: 'm', folder: 'm', agent_provider: null, created_at: now() });
-    ensureContainerConfig(GID);
+    await createAgentGroup({ id: GID, name: 'm', folder: 'm', agent_provider: null, created_at: now() });
+    await ensureContainerConfig(GID);
     const args = { id: GID, host: '/data/.gmail-mcp', container: '/home/node/.gmail-mcp', ro: true };
 
     const add = await dispatch({ id: 'r1', command: 'groups-config-add-mount', args }, { caller: 'host' });
     expect(add.ok).toBe(true);
-    expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toEqual([
+    expect(JSON.parse((await getContainerConfig(GID))!.additional_mounts)).toEqual([
       { hostPath: '/data/.gmail-mcp', containerPath: '/home/node/.gmail-mcp', readonly: true },
     ]);
 
     // idempotent: a second add does not duplicate
     await dispatch({ id: 'r2', command: 'groups-config-add-mount', args }, { caller: 'host' });
-    expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toHaveLength(1);
+    expect(JSON.parse((await getContainerConfig(GID))!.additional_mounts)).toHaveLength(1);
 
     const rm = await dispatch(
       {
@@ -256,27 +292,27 @@ describe('groups config add-mount / remove-mount (host-only)', () => {
       { caller: 'host' },
     );
     expect(rm.ok).toBe(true);
-    expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toEqual([]);
+    expect(JSON.parse((await getContainerConfig(GID))!.additional_mounts)).toEqual([]);
   });
 });
 
 describe('groups CLI MCP config', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    runMigrations(initTestDb());
-    createAgentGroup({
+    await runMigrations(await initTestDb());
+    await createAgentGroup({
       id: 'ag-mcp',
       name: 'mcp',
       folder: 'mcp',
       agent_provider: null,
       created_at: now(),
     });
-    ensureContainerConfig('ag-mcp');
+    await ensureContainerConfig('ag-mcp');
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 
@@ -300,7 +336,7 @@ describe('groups CLI MCP config', () => {
 
     expect(local.ok).toBe(true);
     expect(remote.ok).toBe(true);
-    expect(JSON.parse(getContainerConfig('ag-mcp')!.mcp_servers)).toEqual({
+    expect(JSON.parse((await getContainerConfig('ag-mcp'))!.mcp_servers)).toEqual({
       local: { command: 'pnpm', args: ['dlx', 'server'], env: {} },
       remote: { type: 'http', url: 'https://mcp.example.com/mcp' },
     });
@@ -342,6 +378,6 @@ describe('groups CLI MCP config', () => {
 
     expect(badName.ok).toBe(false);
     expect(badName.ok ? '' : badName.error.message).toMatch(/1-64 characters/);
-    expect(JSON.parse(getContainerConfig('ag-mcp')!.mcp_servers)).toEqual({});
+    expect(JSON.parse((await getContainerConfig('ag-mcp'))!.mcp_servers)).toEqual({});
   });
 });

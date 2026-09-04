@@ -43,14 +43,14 @@ import { dispatch } from '../dispatch.js';
 // Side-effect import: registers the `groups-*` commands (including create).
 import './groups.js';
 
-beforeEach(() => {
+beforeEach(async () => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(GROUPS_DIR, { recursive: true });
-  runMigrations(initTestDb());
+  await runMigrations(await initTestDb());
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
@@ -78,7 +78,7 @@ describe('groups-create — folder-reuse refusal (A4)', () => {
     expect(error.message).toContain('already exists on disk');
     expect(error.message).toContain('recycled');
     // No row minted, residue untouched.
-    expect(getDb().prepare('SELECT * FROM agent_groups WHERE folder = ?').get('recycled')).toBeUndefined();
+    expect(await getDb().get('SELECT * FROM agent_groups WHERE folder = ?', 'recycled')).toBeUndefined();
     expect(fs.readFileSync(path.join(GROUPS_DIR, 'recycled', 'memory.md'), 'utf8')).toBe('old group memory\n');
   });
 
@@ -94,17 +94,17 @@ describe('groups-create — folder-reuse refusal (A4)', () => {
     expect(resp.ok).toBe(false);
     const error = (resp as { ok: false; error: { message: string } }).error;
     expect(error.message).toContain('already exists on disk');
-    expect(getDb().prepare('SELECT * FROM agent_groups WHERE folder = ?').get('linked')).toBeUndefined();
+    expect(await getDb().get('SELECT * FROM agent_groups WHERE folder = ?', 'linked')).toBeUndefined();
   });
 
   it('allows creation when the folder is absent (scaffolds folder + config row)', async () => {
     const resp = await create('fresh', 'Fresh Group');
 
     expect(resp.ok).toBe(true);
-    const row = getDb().prepare('SELECT * FROM agent_groups WHERE folder = ?').get('fresh') as { id: string };
+    const row = (await getDb().get<{ id: string }>('SELECT * FROM agent_groups WHERE folder = ?', 'fresh'))!;
     expect(row).toBeDefined();
     expect(fs.existsSync(path.join(GROUPS_DIR, 'fresh'))).toBe(true);
-    expect(getDb().prepare('SELECT * FROM container_configs WHERE agent_group_id = ?').get(row.id)).toBeDefined();
+    expect(await getDb().get('SELECT * FROM container_configs WHERE agent_group_id = ?', row.id)).toBeDefined();
   });
 
   it('returns the SAME group when the folder is live — idempotency on --folder pinned', async () => {

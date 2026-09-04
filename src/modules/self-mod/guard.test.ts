@@ -44,46 +44,46 @@ function withoutImageBuild(): void {
 afterEach(() => resetSessionDriver(null));
 
 describe('install_packages gates on the imageBuild capability', () => {
-  it('holds for admin approval on a driver that declares imageBuild (docker)', () => {
+  it('holds for admin approval on a driver that declares imageBuild (docker)', async () => {
     withDocker();
-    const decision = guard(selfModInstallPackages, { actor: agent, payload: { apt: ['jq'] } });
+    const decision = await guard(selfModInstallPackages, { actor: agent, payload: { apt: ['jq'] } });
     expect(decision.effect).toBe('hold');
   });
 
-  it('DENIES at request time on a driver without imageBuild, naming the capability', () => {
+  it('DENIES at request time on a driver without imageBuild, naming the capability', async () => {
     withoutImageBuild();
-    const decision = guard(selfModInstallPackages, { actor: agent, payload: { apt: ['jq'] } });
+    const decision = await guard(selfModInstallPackages, { actor: agent, payload: { apt: ['jq'] } });
     expect(decision.effect).toBe('deny');
     // The refusal must name the capability so the agent can explain the
     // refusal instead of retrying a permanent condition.
     expect(decision.reason).toContain('imageBuild');
   });
 
-  it('an approved replay cannot resurrect it — a grant satisfies a hold, never a deny', () => {
+  it('an approved replay cannot resurrect it — a grant satisfies a hold, never a deny', async () => {
     withoutImageBuild();
     // The scenario the gate exists for: approved while the group ran on a
     // capable driver, replayed after the driver switch. The deny
     // short-circuits before any grant validation, so no DB is consulted and
     // nothing runs.
     const grant = { approval_id: 'appr-1', action: 'install_packages', payload: '{}' } as unknown as PendingApproval;
-    const decision = guard(selfModInstallPackages, { actor: agent, payload: { apt: ['jq'] }, grant });
+    const decision = await guard(selfModInstallPackages, { actor: agent, payload: { apt: ['jq'] }, grant });
     expect(decision.effect).toBe('deny');
   });
 
-  it('still refuses non-agent callers on a capable driver', () => {
+  it('still refuses non-agent callers on a capable driver', async () => {
     withDocker();
-    const decision = guard(selfModInstallPackages, { actor: { kind: 'host' }, payload: {} });
+    const decision = await guard(selfModInstallPackages, { actor: { kind: 'host' }, payload: {} });
     expect(decision.effect).toBe('deny');
   });
 });
 
 describe('add_mcp_server needs no rebuild and must not inherit the gate', () => {
-  it('still holds on a driver without imageBuild', () => {
+  it('still holds on a driver without imageBuild', async () => {
     withoutImageBuild();
     // Wiring an MCP server is a DB write + container kill; the next wake
     // realizes it with no image change. Gating it on imageBuild would
     // silently strip a real capability from every group on such a driver.
-    const decision = guard(selfModAddMcpServer, { actor: agent, payload: { name: 'srv' } });
+    const decision = await guard(selfModAddMcpServer, { actor: agent, payload: { name: 'srv' } });
     expect(decision.effect).toBe('hold');
   });
 });

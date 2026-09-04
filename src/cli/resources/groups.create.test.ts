@@ -36,29 +36,30 @@ vi.mock('../../config.js', async () => {
 const TEST_DIR = '/tmp/nanoclaw-test-cli-groups-create';
 
 import { initTestDb, closeDb, runMigrations, getDb } from '../../db/index.js';
+import { sqliteRaw } from '../../db/drivers/sqlite.js';
 import { dispatch } from '../dispatch.js';
 // Side-effect import: registers the `groups-*` commands (including create).
 import './groups.js';
 
 function count(sql: string, ...params: unknown[]): number {
   return (
-    getDb()
+    sqliteRaw(getDb())
       .prepare(sql)
       .get(...params) as { c: number }
   ).c;
 }
 
 describe('groups CLI create provisions a container_configs row (#4)', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(`${TEST_DIR}/groups`, { recursive: true });
 
-    const db = initTestDb();
-    runMigrations(db);
+    const db = await initTestDb();
+    await runMigrations(db);
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 

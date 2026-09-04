@@ -66,11 +66,11 @@ afterAll(() => {
   fs.rmSync(path.join(DATA_DIR, 'v2-sessions', GROUP_ID), { recursive: true, force: true });
 });
 
-function composedMounts() {
+async function composedMounts() {
   return buildMounts(agentGroup, session, containerConfig, 'claude', {});
 }
 
-function specFrom(mounts: ReturnType<typeof composedMounts>): SessionSpec {
+function specFrom(mounts: Awaited<ReturnType<typeof composedMounts>>): SessionSpec {
   return {
     key: { installSlug: INSTALL_SLUG, agentGroupId: GROUP_ID, sessionId: SESSION_ID },
     // composeSessionSpec always stamps this, and the mount policy joins the
@@ -87,8 +87,8 @@ function specFrom(mounts: ReturnType<typeof composedMounts>): SessionSpec {
 }
 
 describe('buildMounts against the policy the drivers enforce', () => {
-  it('emits the full mount list', () => {
-    const paths = composedMounts().map((m) => m.containerPath);
+  it('emits the full mount list', async () => {
+    const paths = (await composedMounts()).map((m) => m.containerPath);
     // If this list shrinks, the case below is proving less than it looks.
     expect(paths).toEqual(
       expect.arrayContaining([
@@ -104,14 +104,15 @@ describe('buildMounts against the policy the drivers enforce', () => {
     );
   });
 
-  it('classes every mount for a root it actually lives under', () => {
+  it('classes every mount for a root it actually lives under', async () => {
     // The bug this exists to catch: a class whose pinning rule the path cannot
     // satisfy. It passes validation or it denies every session.
-    expect(() => validateSpec(specFrom(composedMounts()), mountPolicy())).not.toThrow();
+    const spec = specFrom(await composedMounts());
+    expect(() => validateSpec(spec, mountPolicy())).not.toThrow();
   });
 
-  it('scopes every group-state mount to this group', () => {
-    const specs = toMountSpecs(composedMounts(), GROUP_ID);
+  it('scopes every group-state mount to this group', async () => {
+    const specs = toMountSpecs(await composedMounts(), GROUP_ID);
     for (const mount of specs.filter((m) => m.class === 'group-state')) {
       expect(mount.groupScope).toBe(GROUP_ID);
       // Pinned to this group's subtrees, under one root or the other.
@@ -121,8 +122,8 @@ describe('buildMounts against the policy the drivers enforce', () => {
     }
   });
 
-  it('classes shipped release surfaces, and only those, as install-surface', () => {
-    const specs = toMountSpecs(composedMounts(), GROUP_ID);
+  it('classes shipped release surfaces, and only those, as install-surface', async () => {
+    const specs = toMountSpecs(await composedMounts(), GROUP_ID);
     const surfaces = specs.filter((m) => m.class === 'install-surface');
     expect(surfaces.length).toBeGreaterThan(0);
     const pluginsDir = path.join(groupDir, 'plugins');
@@ -141,40 +142,40 @@ describe('buildMounts against the policy the drivers enforce', () => {
     }
   });
 
-  it('keeps the stamped plugins tree in the class that forces it read-only', () => {
+  it('keeps the stamped plugins tree in the class that forces it read-only', async () => {
     // Whole-plugin stamping puts code the agent EXECUTES inside the group
     // folder. `group-state` would pin it to the group but leave read-only a
     // composition choice, and `allowlisted-extra` is permitted unconditionally
     // with no ro rule at all — either one turns the read-only pin on executed
     // plugin code into a single word in a mount literal.
-    const byPath = new Map(toMountSpecs(composedMounts(), GROUP_ID).map((m) => [m.containerPath, m]));
+    const byPath = new Map(toMountSpecs(await composedMounts(), GROUP_ID).map((m) => [m.containerPath, m]));
     const plugins = byPath.get('/workspace/agent/plugins');
     expect(plugins?.class).toBe('install-surface');
     expect(plugins?.mode).toBe('ro');
   });
 
-  it('keeps the shipped surfaces in the class that forces them read-only', () => {
+  it('keeps the shipped surfaces in the class that forces them read-only', async () => {
     // Found by mutation: demoting one of these to 'allowlisted-extra' passed
     // every other case here, because that class is allowed unconditionally and
     // carries no ro rule. The runner source and the skills tree are the code the
     // agent executes; a writable mount of either is an escalation, so the class
     // itself has to be pinned, not just its pinning rule.
-    const byPath = new Map(toMountSpecs(composedMounts(), GROUP_ID).map((m) => [m.containerPath, m]));
+    const byPath = new Map(toMountSpecs(await composedMounts(), GROUP_ID).map((m) => [m.containerPath, m]));
     for (const containerPath of ['/app/src', '/app/CLAUDE.md']) {
       expect(byPath.get(containerPath)?.class, containerPath).toBe('install-surface');
       expect(byPath.get(containerPath)?.mode, containerPath).toBe('ro');
     }
   });
 
-  it('puts no identity material on the agent', () => {
-    const specs = toMountSpecs(composedMounts(), GROUP_ID);
+  it('puts no identity material on the agent', async () => {
+    const specs = toMountSpecs(await composedMounts(), GROUP_ID);
     expect(specs.some((m) => m.class === 'identity-material')).toBe(false);
   });
 
   // Negative controls, so the acceptance case above cannot pass by validating
   // nothing. Each is a real mistake someone could make in composition.
-  it('refuses a session directory belonging to another group', () => {
-    const spec = specFrom(composedMounts());
+  it('refuses a session directory belonging to another group', async () => {
+    const spec = specFrom(await composedMounts());
     spec.containers[0].mounts.push({
       class: 'group-state',
       hostPath: path.join(DATA_DIR, 'v2-sessions', 'ag-someone-else', 'sess-x'),
@@ -185,10 +186,10 @@ describe('buildMounts against the policy the drivers enforce', () => {
     expect(() => validateSpec(spec, mountPolicy())).toThrow(/denied-by-policy/);
   });
 
-  it("refuses another group's plugins tree claimed as this session's install surface", () => {
+  it("refuses another group's plugins tree claimed as this session's install surface", async () => {
     // The pin grants exactly the folder the session's own label names, so it
     // cannot be turned into a way to mount any group's plugins anywhere.
-    const spec = specFrom(composedMounts());
+    const spec = specFrom(await composedMounts());
     spec.containers[0].mounts.push({
       class: 'install-surface',
       hostPath: path.join(GROUPS_DIR, 'some-other-group', 'plugins'),
@@ -199,8 +200,8 @@ describe('buildMounts against the policy the drivers enforce', () => {
     expect(() => validateSpec(spec, mountPolicy())).toThrow(/denied-by-policy/);
   });
 
-  it('refuses the central DB dressed up as a release surface', () => {
-    const spec = specFrom(composedMounts());
+  it('refuses the central DB dressed up as a release surface', async () => {
+    const spec = specFrom(await composedMounts());
     spec.containers[0].mounts.push({
       class: 'install-surface',
       hostPath: path.join(DATA_DIR, 'v2.db'),

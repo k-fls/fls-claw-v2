@@ -2,10 +2,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { Migration, ModuleMigration, ModuleMigrationName } from './index.js';
 
-let closeCurrentDb: (() => void) | undefined;
+let closeCurrentDb: (() => Promise<void>) | undefined;
 
-afterEach(() => {
-  closeCurrentDb?.();
+afterEach(async () => {
+  await closeCurrentDb?.();
   closeCurrentDb = undefined;
 });
 
@@ -13,8 +13,8 @@ function testMigration(name: string, table = name.replace(/[^a-zA-Z0-9_]/g, '_')
   return {
     version,
     name,
-    up(db) {
-      db.exec(`CREATE TABLE ${table} (id TEXT PRIMARY KEY)`);
+    async up(db) {
+      await db.exec(`CREATE TABLE ${table} (id TEXT PRIMARY KEY)`);
     },
   };
 }
@@ -30,7 +30,7 @@ async function freshRegistry() {
 
 async function freshTestDb() {
   const connection = await import('../connection.js');
-  const db = connection.initTestDb();
+  const db = await connection.initTestDb();
   closeCurrentDb = connection.closeDb;
   return db;
 }
@@ -76,13 +76,13 @@ describe('module migration registry', () => {
     const db = await freshTestDb();
     registry.registerMigration(testModuleMigration('module:test-owner:applied', 'test_module_applied'));
 
-    registry.runMigrations(db);
+    await registry.runMigrations(db);
 
-    expect(db.prepare("SELECT name FROM schema_version WHERE name = 'module:test-owner:applied'").get()).toEqual({
+    expect(await db.get("SELECT name FROM schema_version WHERE name = 'module:test-owner:applied'")).toEqual({
       name: 'module:test-owner:applied',
     });
     expect(
-      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'test_module_applied'").get(),
+      await db.get("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'test_module_applied'"),
     ).toEqual({ name: 'test_module_applied' });
   });
 
@@ -92,13 +92,11 @@ describe('module migration registry', () => {
     const explicit = testMigration('test-explicit-only');
     registry.registerMigration(testModuleMigration('module:test-owner:not-selected', 'test_module_not_selected'));
 
-    registry.runMigrations(db, [explicit]);
+    await registry.runMigrations(db, [explicit]);
 
-    expect(db.prepare('SELECT name FROM schema_version ORDER BY version').all()).toEqual([
-      { name: 'test-explicit-only' },
-    ]);
+    expect(await db.all('SELECT name FROM schema_version ORDER BY version')).toEqual([{ name: 'test-explicit-only' }]);
     expect(
-      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'test_module_not_selected'").get(),
+      await db.get("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'test_module_not_selected'"),
     ).toBeUndefined();
   });
 });

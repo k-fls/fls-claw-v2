@@ -287,7 +287,7 @@ function dispatchMembership(event: MembershipEvent): void {
  * captured in the returned closure is naturally per-instance (= per bot
  * identity when several bridges share one platform).
  */
-export type BridgeInboundPolicy = (setup: ChannelSetup, instanceKey: string) => ChannelSetup;
+export type BridgeInboundPolicy = (setup: ChannelSetup, instanceKey: string) => ChannelSetup | Promise<ChannelSetup>;
 
 const bridgeInboundPolicies = new Map<string, BridgeInboundPolicy>();
 
@@ -600,7 +600,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // through — means one policy covers onSubscribedMessage, onNewMention,
       // onDirectMessage and onNewMessage alike.
       const inboundPolicy = bridgeInboundPolicies.get(adapter.name);
-      setupConfig = inboundPolicy ? inboundPolicy(hostConfig, instanceKey) : hostConfig;
+      setupConfig = inboundPolicy ? await inboundPolicy(hostConfig, instanceKey) : hostConfig;
 
       // State namespace: ONLY for a named non-default instance. A skill
       // that explicitly names the primary instance after the platform
@@ -725,7 +725,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const userId = event.user?.userId || '';
 
         // Resolve render metadata BEFORE dispatching onAction (which deletes the row).
-        const render = resolveQuestionRender(questionId);
+        const render = await resolveQuestionRender(questionId);
         // New format: button id/value is an integer index into options (kept
         // short to fit Telegram's 64-byte callback_data cap). Old format:
         // the full value is embedded in actionId/value directly.
@@ -1147,7 +1147,7 @@ async function handleForwardedEvent(
       const originalEmbeds =
         ((interaction.message as Record<string, unknown>)?.embeds as Array<Record<string, unknown>>) || [];
       const originalDescription = (originalEmbeds[0]?.description as string) || '';
-      const render = questionId ? resolveQuestionRender(questionId) : undefined;
+      const render = questionId ? await resolveQuestionRender(questionId) : undefined;
       // Discord custom_id mirrors the new index-based encoding (see Button
       // construction). Decode back to the real option value for downstream.
       const selectedOption = resolveSelectedOption(render, tail, tail);

@@ -8,7 +8,7 @@ import { backfillContainerConfigs } from './backfill-container-configs.js';
 import { CENTRAL_DB_PATH } from './config.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
 import { adoptRunningSessions } from './container-runner.js';
-import { initDb } from './db/connection.js';
+import { closeDb, initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { getSessionDriver } from './drivers/index.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
@@ -70,13 +70,13 @@ async function main(): Promise<void> {
   enforceUpgradeTripwire();
 
   // 1. Init central DB
-  const db = initDb(CENTRAL_DB_PATH);
-  runMigrations(db);
+  const db = await initDb(CENTRAL_DB_PATH);
+  await runMigrations(db);
   log.info('Central DB ready', { path: CENTRAL_DB_PATH });
 
   // 1b. Backfill container_configs from legacy container.json files.
   // Idempotent — skips groups that already have a config row.
-  backfillContainerConfigs();
+  await backfillContainerConfigs();
 
   // 2. Session runtime: prove it is reachable, then reconcile what survived a
   // restart. Adoption replaces the old reap-everything cleanup — a session that
@@ -178,6 +178,7 @@ async function shutdown(signal: string): Promise<void> {
   try {
     await teardownChannelAdapters();
   } finally {
+    await closeDb();
     // Always reset on graceful shutdown — even if teardown threw, we got here
     // via SIGTERM/SIGINT, not a crash, so the next start shouldn't be counted
     // as one.

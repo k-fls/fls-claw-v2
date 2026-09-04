@@ -3,32 +3,36 @@ import fs from 'fs';
 import path from 'path';
 
 import { log } from '../log.js';
+import type { DbDriver } from './driver.js';
+import { SqliteDriver } from './drivers/sqlite.js';
 
-let _db: Database.Database | null = null;
+let _db: DbDriver | null = null;
 
-export function getDb(): Database.Database {
+export function getDb(): DbDriver {
   if (!_db) throw new Error('Database not initialized. Call initDb() first.');
   return _db;
 }
 
-export function initDb(dbPath: string): Database.Database {
+export async function initDb(dbPath: string): Promise<DbDriver> {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-  _db = new Database(dbPath);
-  _db.pragma('journal_mode = WAL');
-  _db.pragma('foreign_keys = ON');
+  const raw = new Database(dbPath);
+  raw.pragma('journal_mode = WAL');
+  raw.pragma('foreign_keys = ON');
+  _db = new SqliteDriver(raw);
   log.info('Central DB initialized', { path: dbPath });
   return _db;
 }
 
 /** For tests only — creates an in-memory DB and runs migrations. */
-export function initTestDb(): Database.Database {
-  _db = new Database(':memory:');
-  _db.pragma('foreign_keys = ON');
+export async function initTestDb(): Promise<DbDriver> {
+  const raw = new Database(':memory:');
+  raw.pragma('foreign_keys = ON');
+  _db = new SqliteDriver(raw);
   return _db;
 }
 
-export function closeDb(): void {
-  _db?.close();
+export async function closeDb(): Promise<void> {
+  await _db?.close();
   _db = null;
 }
 
@@ -40,9 +44,6 @@ export function closeDb(): void {
  * table at runtime (next service start), and callers may run before
  * or after that boundary.
  */
-export function hasTable(db: Database.Database, name: string): boolean {
-  const row = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name = ? LIMIT 1`).get(name) as
-    | { '1': number }
-    | undefined;
-  return row !== undefined;
+export async function hasTable(db: DbDriver, name: string): Promise<boolean> {
+  return db.hasTable(name);
 }

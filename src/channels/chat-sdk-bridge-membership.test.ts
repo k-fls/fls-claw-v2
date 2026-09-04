@@ -52,12 +52,12 @@ async function dispatch(fire: (options: { waitUntil: (p: Promise<unknown>) => vo
 beforeEach(async () => {
   const { initTestDb } = await import('../db/connection.js');
   const { runMigrations } = await import('../db/migrations/index.js');
-  runMigrations(initTestDb());
+  await runMigrations(await initTestDb());
 });
 
 afterEach(async () => {
   const { closeDb } = await import('../db/connection.js');
-  closeDb();
+  await closeDb();
   vi.restoreAllMocks();
 });
 

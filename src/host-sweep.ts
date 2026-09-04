@@ -159,7 +159,7 @@ async function sweep(): Promise<void> {
   }
 
   try {
-    const sessions = getActiveSessions();
+    const sessions = await getActiveSessions();
     for (const session of sessions) {
       await sweepSession(session);
     }
@@ -192,7 +192,7 @@ export function shouldCloseTaskSession(
 }
 
 async function sweepSession(session: Session): Promise<void> {
-  const agentGroup = getAgentGroup(session.agent_group_id);
+  const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) return;
 
   const inPath = inboundDbPath(agentGroup.id, session.id);
@@ -272,7 +272,7 @@ async function sweepSession(session: Session): Promise<void> {
           .get() as { c: number }
       ).c;
       if (shouldCloseTaskSession(session.thread_id, isContainerRunning(session.id), liveTasks)) {
-        updateSession(session.id, { status: 'closed' });
+        await updateSession(session.id, { status: 'closed' });
         log.info('Closed spent task session', { sessionId: session.id, threadId: session.thread_id });
       }
     }

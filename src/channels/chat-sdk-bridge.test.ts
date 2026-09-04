@@ -9,6 +9,7 @@ import {
   splitForLimit,
   toPlainText,
 } from './chat-sdk-bridge.js';
+import { sqliteRaw } from '../db/drivers/sqlite.js';
 
 vi.mock('../webhook-server.js', () => ({
   registerWebhookAdapter: vi.fn(),
@@ -291,14 +292,14 @@ describe('createChatSdkBridge.setup — webhook route and state namespace', () =
   beforeEach(async () => {
     const { initTestDb } = await import('../db/connection.js');
     const { runMigrations } = await import('../db/migrations/index.js');
-    runMigrations(initTestDb());
+    await runMigrations(await initTestDb());
     const { registerWebhookAdapter } = await import('../webhook-server.js');
     vi.mocked(registerWebhookAdapter).mockClear();
   });
 
   afterEach(async () => {
     const { closeDb } = await import('../db/connection.js');
-    closeDb();
+    await closeDb();
   });
 
   const hostConfig = {
@@ -348,7 +349,9 @@ describe('createChatSdkBridge.setup — webhook route and state namespace', () =
     await def.setup(hostConfig);
     await def.subscribe!('slack:C1', 'slack:T1');
 
-    const rows = getDb().prepare('SELECT thread_id FROM chat_sdk_subscriptions ORDER BY thread_id').all() as Array<{
+    const rows = sqliteRaw(getDb())
+      .prepare('SELECT thread_id FROM chat_sdk_subscriptions ORDER BY thread_id')
+      .all() as Array<{
       thread_id: string;
     }>;
     expect(rows.map((r) => r.thread_id)).toEqual(['slack-tester:slack:T1', 'slack:T1']);
@@ -366,7 +369,7 @@ describe('createChatSdkBridge.setup — webhook route and state namespace', () =
     });
     await bridge.setup(hostConfig);
     await bridge.subscribe!('slack:C1', 'slack:T9');
-    const rows = getDb().prepare('SELECT thread_id FROM chat_sdk_subscriptions').all() as Array<{
+    const rows = sqliteRaw(getDb()).prepare('SELECT thread_id FROM chat_sdk_subscriptions').all() as Array<{
       thread_id: string;
     }>;
     expect(rows.map((r) => r.thread_id)).toEqual(['slack:T9']);

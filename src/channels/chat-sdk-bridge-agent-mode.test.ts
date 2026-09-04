@@ -55,12 +55,12 @@ const chatOf = (bridge: unknown): Chat => (bridge as any)._chat as Chat;
 beforeEach(async () => {
   const { initTestDb } = await import('../db/connection.js');
   const { runMigrations } = await import('../db/migrations/index.js');
-  runMigrations(initTestDb());
+  await runMigrations(await initTestDb());
 });
 
 afterEach(async () => {
   const { closeDb } = await import('../db/connection.js');
-  closeDb();
+  await closeDb();
   // Module-level singleton: leave no handler behind for the next test file.
   setAgentDmOpenedHandler(() => {});
 });

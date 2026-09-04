@@ -18,6 +18,7 @@ import path from 'path';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
 import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
+import { sqliteRaw } from '../../db/drivers/sqlite.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createNewAgentGroup } from './channel-approval.js';
 import { createMessagingGroup, getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
@@ -57,7 +58,7 @@ vi.mock('../../delivery.js', () => ({
 vi.mock('./user-dm.js', () => ({
   ensureUserDm: vi.fn(async (userId: string) => {
     const { getDb } = await import('../../db/connection.js');
-    const row = getDb()
+    const row = sqliteRaw(getDb())
       .prepare(
         `SELECT mg.* FROM messaging_groups mg
            JOIN user_dms ud ON ud.messaging_group_id = mg.id
@@ -86,16 +87,16 @@ function now() {
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  const db = initTestDb();
-  runMigrations(db);
+  const db = await initTestDb();
+  await runMigrations(db);
 
   await import('./index.js'); // register hooks
 
   // Base fixtures: one agent group + owner with a DM on 'telegram'.
-  createAgentGroup({ id: 'ag-1', name: 'Andy', folder: 'andy', agent_provider: null, created_at: now() });
+  await createAgentGroup({ id: 'ag-1', name: 'Andy', folder: 'andy', agent_provider: null, created_at: now() });
 
-  upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Owner', created_at: now() });
-  grantRole({
+  await upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Owner', created_at: now() });
+  await grantRole({
     user_id: 'telegram:owner',
     role: 'owner',
     agent_group_id: null,
@@ -104,7 +105,7 @@ beforeEach(async () => {
   });
 
   // Pre-seed owner's DM messaging group + user_dms mapping.
-  createMessagingGroup({
+  await createMessagingGroup({
     id: 'mg-dm-owner',
     channel_type: 'telegram',
     platform_id: 'dm-owner',
@@ -114,7 +115,7 @@ beforeEach(async () => {
     created_at: now(),
   });
   const { getDb } = await import('../../db/connection.js');
-  getDb()
+  sqliteRaw(getDb())
     .prepare(
       `INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
        VALUES (?, ?, ?, ?)`,
@@ -124,8 +125,8 @@ beforeEach(async () => {
   deliverMock.mockClear();
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
@@ -182,7 +183,7 @@ describe('unknown-channel registration flow', () => {
     expect(connectOption.label).toContain('Andy');
 
     const { getDb } = await import('../../db/connection.js');
-    const rows = getDb().prepare('SELECT * FROM pending_channel_approvals').all() as Array<{
+    const rows = sqliteRaw(getDb()).prepare('SELECT * FROM pending_channel_approvals').all() as Array<{
       messaging_group_id: string;
     }>;
     expect(rows).toHaveLength(1);
@@ -197,7 +198,9 @@ describe('unknown-channel registration flow', () => {
     const payload = JSON.parse(deliverMock.mock.calls[0][4] as string) as { question: string };
     expect(payload.question).toContain('will respond to all messages');
     const { getDb } = await import('../../db/connection.js');
-    const count = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }).c;
+    const count = (
+      sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }
+    ).c;
     expect(count).toBe(1);
   });
 
@@ -210,7 +213,9 @@ describe('unknown-channel registration flow', () => {
 
     expect(deliverMock).toHaveBeenCalledTimes(1);
     const { getDb } = await import('../../db/connection.js');
-    const count = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }).c;
+    const count = (
+      sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }
+    ).c;
     expect(count).toBe(1);
   });
 
@@ -224,7 +229,7 @@ describe('unknown-channel registration flow', () => {
     await new Promise((r) => setTimeout(r, 10));
 
     const { getDb } = await import('../../db/connection.js');
-    const pending = getDb().prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
+    const pending = sqliteRaw(getDb()).prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
       messaging_group_id: string;
     };
     expect(pending).toBeDefined();
@@ -243,7 +248,7 @@ describe('unknown-channel registration flow', () => {
     }
 
     // Wiring created with defaults.
-    const mga = getDb()
+    const mga = sqliteRaw(getDb())
       .prepare('SELECT * FROM messaging_group_agents WHERE messaging_group_id = ?')
       .get(pending.messaging_group_id) as {
       engage_mode: string;
@@ -261,14 +266,15 @@ describe('unknown-channel registration flow', () => {
 
     // Triggering sender auto-admitted so sender_scope='known' doesn't
     // bounce the replay into sender-approval.
-    const member = getDb()
+    const member = sqliteRaw(getDb())
       .prepare('SELECT 1 AS x FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?')
       .get('telegram:caller', 'ag-1');
     expect(member).toBeDefined();
 
     // Pending row cleared and container woken via replay.
-    const stillPending = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number })
-      .c;
+    const stillPending = (
+      sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }
+    ).c;
     expect(stillPending).toBe(0);
     expect(wakeContainer).toHaveBeenCalled();
   });
@@ -281,7 +287,7 @@ describe('unknown-channel registration flow', () => {
     await new Promise((r) => setTimeout(r, 10));
 
     const { getDb } = await import('../../db/connection.js');
-    const pending = getDb().prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
+    const pending = sqliteRaw(getDb()).prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
       messaging_group_id: string;
     };
 
@@ -297,7 +303,7 @@ describe('unknown-channel registration flow', () => {
       if (claimed) break;
     }
 
-    const mga = getDb()
+    const mga = sqliteRaw(getDb())
       .prepare('SELECT engage_mode, engage_pattern FROM messaging_group_agents WHERE messaging_group_id = ?')
       .get(pending.messaging_group_id) as { engage_mode: string; engage_pattern: string };
     expect(mga.engage_mode).toBe('pattern');
@@ -329,7 +335,7 @@ describe('unknown-channel registration flow', () => {
   async function approvePending(agentGroupId = 'ag-1') {
     const { getResponseHandlers } = await import('../../response-registry.js');
     const { getDb } = await import('../../db/connection.js');
-    const pending = getDb().prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
+    const pending = sqliteRaw(getDb()).prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
       messaging_group_id: string;
     };
     expect(pending).toBeDefined();
@@ -355,7 +361,7 @@ describe('unknown-channel registration flow', () => {
     const mgId = await approvePending();
 
     const { getDb } = await import('../../db/connection.js');
-    const mga = getDb()
+    const mga = sqliteRaw(getDb())
       .prepare('SELECT engage_mode, engage_pattern FROM messaging_group_agents WHERE messaging_group_id = ?')
       .get(mgId) as { engage_mode: string; engage_pattern: string | null };
     // Faithful fallback group default is mention-sticky, but with no live
@@ -376,7 +382,7 @@ describe('unknown-channel registration flow', () => {
     const mgId = await approvePending();
 
     const { getDb } = await import('../../db/connection.js');
-    const mga = getDb()
+    const mga = sqliteRaw(getDb())
       .prepare('SELECT engage_mode, engage_pattern FROM messaging_group_agents WHERE messaging_group_id = ?')
       .get(mgId) as { engage_mode: string; engage_pattern: string | null };
     expect(mga.engage_mode).toBe('pattern');
@@ -396,7 +402,7 @@ describe('unknown-channel registration flow', () => {
     // Path 2: new agent via free-text name reply.
     await routeInbound(groupMention('chat-path-newagent'));
     await new Promise((r) => setTimeout(r, 10));
-    const pending = getDb().prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
+    const pending = sqliteRaw(getDb()).prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
       messaging_group_id: string;
     };
     for (const handler of getResponseHandlers()) {
@@ -427,8 +433,8 @@ describe('unknown-channel registration flow', () => {
     const select =
       'SELECT engage_mode, engage_pattern, sender_scope, ignored_message_policy, session_mode, priority ' +
       'FROM messaging_group_agents WHERE messaging_group_id = ?';
-    const viaConnect = getDb().prepare(select).get(mgIdConnect);
-    const viaNewAgent = getDb().prepare(select).get(pending.messaging_group_id);
+    const viaConnect = sqliteRaw(getDb()).prepare(select).get(mgIdConnect);
+    const viaNewAgent = sqliteRaw(getDb()).prepare(select).get(pending.messaging_group_id);
     expect(viaNewAgent).toBeDefined();
     expect(viaNewAgent).toEqual(viaConnect);
   });
@@ -440,7 +446,7 @@ describe('unknown-channel registration flow', () => {
     await routeInbound(groupMention('chat-deny'));
     await new Promise((r) => setTimeout(r, 10));
     const { getDb } = await import('../../db/connection.js');
-    const pending = getDb().prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
+    const pending = sqliteRaw(getDb()).prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
       messaging_group_id: string;
     };
 
@@ -457,11 +463,11 @@ describe('unknown-channel registration flow', () => {
     }
 
     // denied_at set, pending row cleared, no wiring.
-    const mg = getMessagingGroupByPlatform('telegram', 'chat-deny');
+    const mg = await getMessagingGroupByPlatform('telegram', 'chat-deny');
     expect(mg?.denied_at).not.toBeNull();
     expect(mg?.denied_at).toBeTruthy();
     const mgaCount = (
-      getDb()
+      sqliteRaw(getDb())
         .prepare('SELECT COUNT(*) AS c FROM messaging_group_agents WHERE messaging_group_id = ?')
         .get(pending.messaging_group_id) as { c: number }
     ).c;
@@ -472,8 +478,9 @@ describe('unknown-channel registration flow', () => {
     await routeInbound(groupMention('chat-deny', '@bot please'));
     await new Promise((r) => setTimeout(r, 10));
     expect(deliverMock).not.toHaveBeenCalled();
-    const stillPending = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number })
-      .c;
+    const stillPending = (
+      sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }
+    ).c;
     expect(stillPending).toBe(0);
   });
 
@@ -484,7 +491,7 @@ describe('unknown-channel registration flow', () => {
     await routeInbound(groupMention('chat-unauth'));
     await new Promise((r) => setTimeout(r, 10));
     const { getDb } = await import('../../db/connection.js');
-    const pending = getDb().prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
+    const pending = sqliteRaw(getDb()).prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
       messaging_group_id: string;
     };
 
@@ -502,13 +509,14 @@ describe('unknown-channel registration flow', () => {
 
     // No wiring created, pending row preserved so a real approver can act on it.
     const mgaCount = (
-      getDb()
+      sqliteRaw(getDb())
         .prepare('SELECT COUNT(*) AS c FROM messaging_group_agents WHERE messaging_group_id = ?')
         .get(pending.messaging_group_id) as { c: number }
     ).c;
     expect(mgaCount).toBe(0);
-    const stillPending = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number })
-      .c;
+    const stillPending = (
+      sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }
+    ).c;
     expect(stillPending).toBe(1);
   });
 
@@ -517,16 +525,21 @@ describe('unknown-channel registration flow', () => {
     const { getResponseHandlers } = await import('../../response-registry.js');
     const { getDb } = await import('../../db/connection.js');
 
-    createAgentGroup({ id: 'ag-2', name: 'Betty', folder: 'betty', agent_provider: null, created_at: now() });
-    upsertUser({ id: 'telegram:scoped-admin', kind: 'telegram', display_name: 'Scoped Admin', created_at: now() });
-    grantRole({
+    await createAgentGroup({ id: 'ag-2', name: 'Betty', folder: 'betty', agent_provider: null, created_at: now() });
+    await upsertUser({
+      id: 'telegram:scoped-admin',
+      kind: 'telegram',
+      display_name: 'Scoped Admin',
+      created_at: now(),
+    });
+    await grantRole({
       user_id: 'telegram:scoped-admin',
       role: 'admin',
       agent_group_id: 'ag-1',
       granted_by: 'telegram:owner',
       granted_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-dm-scoped-admin',
       channel_type: 'telegram',
       platform_id: 'dm-scoped-admin',
@@ -535,7 +548,7 @@ describe('unknown-channel registration flow', () => {
       unknown_sender_policy: 'public',
       created_at: now(),
     });
-    getDb()
+    sqliteRaw(getDb())
       .prepare(
         `INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
        VALUES (?, ?, ?, ?)`,
@@ -545,7 +558,7 @@ describe('unknown-channel registration flow', () => {
     await routeInbound(groupMention('chat-scoped-cross-group'));
     await new Promise((r) => setTimeout(r, 10));
 
-    const pending = getDb().prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
+    const pending = sqliteRaw(getDb()).prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
       messaging_group_id: string;
     };
     expect(pending).toBeDefined();
@@ -583,13 +596,14 @@ describe('unknown-channel registration flow', () => {
     }
 
     const mgaCount = (
-      getDb()
+      sqliteRaw(getDb())
         .prepare('SELECT COUNT(*) AS c FROM messaging_group_agents WHERE messaging_group_id = ?')
         .get(pending.messaging_group_id) as { c: number }
     ).c;
     expect(mgaCount).toBe(0);
-    const stillPending = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number })
-      .c;
+    const stillPending = (
+      sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }
+    ).c;
     expect(stillPending).toBe(1);
   });
 
@@ -600,7 +614,7 @@ describe('unknown-channel registration flow', () => {
 
     await routeInbound(groupMention('chat-create-new'));
     await new Promise((r) => setTimeout(r, 10));
-    const pending = getDb().prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
+    const pending = sqliteRaw(getDb()).prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
       messaging_group_id: string;
     };
 
@@ -631,18 +645,19 @@ describe('unknown-channel registration flow', () => {
       },
     });
 
-    const created = getDb().prepare("SELECT id FROM agent_groups WHERE name = 'Newbie'").get() as
+    const created = sqliteRaw(getDb()).prepare("SELECT id FROM agent_groups WHERE name = 'Newbie'").get() as
       | { id: string }
       | undefined;
     expect(created).toBeDefined();
     const mgaCount = (
-      getDb()
+      sqliteRaw(getDb())
         .prepare('SELECT COUNT(*) AS c FROM messaging_group_agents WHERE messaging_group_id = ? AND agent_group_id = ?')
         .get(pending.messaging_group_id, created!.id) as { c: number }
     ).c;
     expect(mgaCount).toBe(1);
-    const stillPending = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number })
-      .c;
+    const stillPending = (
+      sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }
+    ).c;
     expect(stillPending).toBe(0);
   });
 
@@ -653,7 +668,7 @@ describe('unknown-channel registration flow', () => {
 
     await routeInbound(groupMention('chat-vanished'));
     await new Promise((r) => setTimeout(r, 10));
-    const pending = getDb().prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
+    const pending = sqliteRaw(getDb()).prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
       messaging_group_id: string;
     };
 
@@ -672,11 +687,13 @@ describe('unknown-channel registration flow', () => {
     // The registration disappears between the click and the reply (rejected
     // from another card, group delete cascade, …) — the interceptor no
     // longer finds a pending registration, so the reply must not create.
-    getDb()
+    sqliteRaw(getDb())
       .prepare('DELETE FROM pending_channel_approvals WHERE messaging_group_id = ?')
       .run(pending.messaging_group_id);
 
-    const agentGroupsBefore = (getDb().prepare('SELECT COUNT(*) AS c FROM agent_groups').get() as { c: number }).c;
+    const agentGroupsBefore = (
+      sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS c FROM agent_groups').get() as { c: number }
+    ).c;
     await routeInbound({
       channelType: 'telegram',
       platformId: 'dm-owner',
@@ -689,9 +706,13 @@ describe('unknown-channel registration flow', () => {
       },
     });
 
-    const agentGroupsAfter = (getDb().prepare('SELECT COUNT(*) AS c FROM agent_groups').get() as { c: number }).c;
+    const agentGroupsAfter = (
+      sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS c FROM agent_groups').get() as { c: number }
+    ).c;
     expect(agentGroupsAfter).toBe(agentGroupsBefore);
-    const mgaCount = (getDb().prepare('SELECT COUNT(*) AS c FROM messaging_group_agents').get() as { c: number }).c;
+    const mgaCount = (
+      sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS c FROM messaging_group_agents').get() as { c: number }
+    ).c;
     expect(mgaCount).toBe(0);
   });
 });
@@ -700,35 +721,39 @@ describe('no-owner / no-agent failure modes', () => {
   it('no owner → no card, no pending row (fresh-install bootstrap path)', async () => {
     // Wipe the owner grant set up in the outer beforeEach.
     const { getDb } = await import('../../db/connection.js');
-    getDb().prepare('DELETE FROM user_roles').run();
+    sqliteRaw(getDb()).prepare('DELETE FROM user_roles').run();
 
     const { routeInbound } = await import('../../router.js');
     await routeInbound(groupMention('chat-noowner'));
     await new Promise((r) => setTimeout(r, 10));
 
     expect(deliverMock).not.toHaveBeenCalled();
-    const count = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }).c;
+    const count = (
+      sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }
+    ).c;
     expect(count).toBe(0);
   });
 
   it('no agent groups → no card, no pending row', async () => {
     const { getDb } = await import('../../db/connection.js');
     // Drop foreign-key-dependent rows first, then the agent group itself.
-    getDb().prepare('DELETE FROM user_roles').run();
-    getDb().prepare('DELETE FROM agent_groups').run();
+    sqliteRaw(getDb()).prepare('DELETE FROM user_roles').run();
+    sqliteRaw(getDb()).prepare('DELETE FROM agent_groups').run();
 
     const { routeInbound } = await import('../../router.js');
     await routeInbound(groupMention('chat-noagent'));
     await new Promise((r) => setTimeout(r, 10));
 
     expect(deliverMock).not.toHaveBeenCalled();
-    const count = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }).c;
+    const count = (
+      sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }
+    ).c;
     expect(count).toBe(0);
   });
 });
 
 describe('createNewAgentGroup — disk-aware folder dedupe (A4)', () => {
-  it('skips deleted-group residue on disk and mints the next suffix', () => {
+  it('skips deleted-group residue on disk and mints the next suffix', async () => {
     // groups/my-agent exists on disk but no DB row claims it — exactly the
     // state `ncl groups delete` leaves behind. The dedupe loop must treat
     // disk presence as taken (matching templates/create-agent.ts) and mint
@@ -737,7 +762,7 @@ describe('createNewAgentGroup — disk-aware folder dedupe (A4)', () => {
     fs.mkdirSync(residue, { recursive: true });
     fs.writeFileSync(path.join(residue, 'memory.md'), 'old group memory\n');
 
-    const ag = createNewAgentGroup('My Agent');
+    const ag = await createNewAgentGroup('My Agent');
 
     expect(ag.folder).toBe('my-agent-2');
     // Residue untouched.

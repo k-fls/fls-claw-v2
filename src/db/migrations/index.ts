@@ -1,6 +1,8 @@
 import type Database from 'better-sqlite3';
 
 import { log } from '../../log.js';
+import type { DbDriver } from '../driver.js';
+import { sqliteRaw } from '../drivers/sqlite.js';
 import { migration001 } from './001-initial.js';
 import { migration002 } from './002-chat-sdk-state.js';
 import { moduleAgentToAgentDestinations } from './module-agent-to-agent-destinations.js';
@@ -22,11 +24,10 @@ import { migration020 } from './020-container-config-timezone.js';
 import { migration021 } from './021-approval-question.js';
 import { migration022 } from './022-messaging-group-detached.js';
 
-export interface Migration {
+interface MigrationBase {
   version: number;
   /** Permanent applied identity. Never rename a migration after release. */
   name: string;
-  up: (db: Database.Database) => void;
   /**
    * Run with foreign_keys=OFF. Required for table recreates (SQLite can't
    * drop a table-level UNIQUE without DROP+RENAME, and DROP fails FK
@@ -38,12 +39,26 @@ export interface Migration {
   disableForeignKeys?: boolean;
 }
 
+export interface PortableMigration extends MigrationBase {
+  sqliteOnly?: false;
+  up: (db: DbDriver) => void | Promise<void>;
+}
+
+export interface SqliteOnlyMigration extends MigrationBase {
+  sqliteOnly: true;
+  up: (db: Database.Database) => void | Promise<void>;
+}
+
+export type Migration = PortableMigration | SqliteOnlyMigration;
+
 /**
  * Public module migrations use a core-reserved, owner-qualified identity so
  * independent modules may reuse local migration names without colliding.
  */
 export type ModuleMigrationName = `module:${string}:${string}`;
-export type ModuleMigration = Omit<Migration, 'name'> & { name: ModuleMigrationName };
+export type ModuleMigration = (Omit<PortableMigration, 'name'> | Omit<SqliteOnlyMigration, 'name'>) & {
+  name: ModuleMigrationName;
+};
 
 export const migrations: Migration[] = [
   migration001,
@@ -108,8 +123,11 @@ interface FkViolation {
 const fkIdentity = (v: FkViolation): string =>
   JSON.stringify({ table: v.table, rowid: v.rowid, parent: v.parent, fkid: v.fkid });
 
-export function runMigrations(db: Database.Database, list: readonly Migration[] = getRegisteredMigrations()): void {
-  db.exec(`
+export async function runMigrations(
+  db: DbDriver,
+  list: readonly Migration[] = getRegisteredMigrations(),
+): Promise<void> {
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS schema_version (
       version INTEGER PRIMARY KEY,
       name    TEXT NOT NULL,
@@ -125,7 +143,7 @@ export function runMigrations(db: Database.Database, list: readonly Migration[] 
   // the stored `version` column is auto-assigned at insert time as an
   // applied-order number.
   const applied = new Set<string>(
-    (db.prepare('SELECT name FROM schema_version').all() as { name: string }[]).map((r) => r.name),
+    (await db.all<{ name: string }>('SELECT name FROM schema_version')).map((r) => r.name),
   );
   const pending = list.filter((m) => !applied.has(m.name));
   if (pending.length === 0) return;
@@ -133,13 +151,14 @@ export function runMigrations(db: Database.Database, list: readonly Migration[] 
   log.info('Running migrations', { count: pending.length });
 
   for (const m of pending) {
+    const raw = m.sqliteOnly || m.disableForeignKeys ? sqliteRaw(db) : null;
     // Table recreates need FK enforcement off for the DROP+RENAME window.
     // The pragma must be toggled OUTSIDE the transaction (it's a silent
     // no-op inside one); foreign_key_check runs INSIDE so a violating
     // recreate rolls back atomically with nothing committed.
-    if (m.disableForeignKeys) db.pragma('foreign_keys = OFF');
+    if (m.disableForeignKeys) raw!.pragma('foreign_keys = OFF');
     try {
-      db.transaction(() => {
+      await db.transaction(async () => {
         // Snapshot violations BEFORE up() runs: live DBs can carry latent
         // FK orphans (e.g. parents deleted through a FK-OFF sqlite3 CLI
         // session — ensureUserDm tolerates exactly this at runtime). The
@@ -147,11 +166,12 @@ export function runMigrations(db: Database.Database, list: readonly Migration[] 
         // on pre-existing ones would crash-loop the host at every boot
         // (runMigrations runs on startup) until manual DB surgery.
         const preexisting = m.disableForeignKeys
-          ? new Set((db.pragma('foreign_key_check') as FkViolation[]).map(fkIdentity))
+          ? new Set((raw!.pragma('foreign_key_check') as FkViolation[]).map(fkIdentity))
           : null;
-        m.up(db);
+        if (m.sqliteOnly) await m.up(raw!);
+        else await m.up(db);
         if (m.disableForeignKeys && preexisting) {
-          const violations = db.pragma('foreign_key_check') as FkViolation[];
+          const violations = raw!.pragma('foreign_key_check') as FkViolation[];
           const introduced = violations.filter((v) => !preexisting.has(fkIdentity(v)));
           const carried = violations.length - introduced.length;
           if (carried > 0) {
@@ -164,17 +184,16 @@ export function runMigrations(db: Database.Database, list: readonly Migration[] 
             throw new Error(`migration ${m.name} left FK violations: ${JSON.stringify(introduced.slice(0, 5))}`);
           }
         }
-        const next = (
-          db.prepare('SELECT COALESCE(MAX(version), 0) + 1 AS v FROM schema_version').get() as { v: number }
-        ).v;
-        db.prepare('INSERT INTO schema_version (version, name, applied) VALUES (?, ?, ?)').run(
+        const next = (await db.get<{ v: number }>('SELECT COALESCE(MAX(version), 0) + 1 AS v FROM schema_version'))!.v;
+        await db.run(
+          'INSERT INTO schema_version (version, name, applied) VALUES (?, ?, ?)',
           next,
           m.name,
           new Date().toISOString(),
         );
-      })();
+      });
     } finally {
-      if (m.disableForeignKeys) db.pragma('foreign_keys = ON');
+      if (m.disableForeignKeys) raw!.pragma('foreign_keys = ON');
     }
     log.info('Migration applied', { name: m.name });
   }

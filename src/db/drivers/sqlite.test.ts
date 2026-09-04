@@ -123,6 +123,26 @@ describe('SqliteDriver transactions', () => {
     expect(await driver.all<{ id: string }>('SELECT id FROM items ORDER BY id')).toEqual([{ id: 'after-timeout' }]);
   });
 
+  it('watchdog breaks a nested cross-context transaction wait', async () => {
+    const startOutside = deferred();
+    // Register this continuation outside the transaction scope. Once released,
+    // it competes for the driver mutex rather than inheriting the outer scope.
+    const outside = startOutside.promise.then(() =>
+      driver.transaction(async () => {
+        await driver.run('INSERT INTO items (id, value) VALUES (?, ?)', 'outside-after-watchdog', 'yes');
+      }),
+    );
+
+    const deadlocked = driver.transaction(async () => {
+      startOutside.resolve();
+      await outside;
+    });
+
+    await expect(deadlocked).rejects.toThrow('exceeded 25ms watchdog');
+    await outside;
+    expect(await driver.all<{ id: string }>('SELECT id FROM items')).toEqual([{ id: 'outside-after-watchdog' }]);
+  });
+
   it('rejects access after close', async () => {
     await driver.close();
     await expect(driver.get('SELECT 1')).rejects.toThrow('driver is closed');

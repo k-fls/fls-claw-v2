@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { sqliteRaw } from '../db/drivers/sqlite.js';
 
 // `groups.ts`'s postCreate calls `initGroupFilesystem`, which touches the
 // real filesystem (groups/<folder>, data/v2-sessions/<id>/.claude-shared).
@@ -9,9 +10,9 @@ const ensureContainerConfigSpy = vi.fn();
 vi.mock('../group-init.js', async () => {
   const { ensureContainerConfig } = await import('../db/container-configs.js');
   return {
-    initGroupFilesystem: vi.fn((group: { id: string }) => {
+    initGroupFilesystem: vi.fn(async (group: { id: string }) => {
       ensureContainerConfigSpy(group.id);
-      ensureContainerConfig(group.id);
+      await ensureContainerConfig(group.id);
     }),
   };
 });
@@ -85,12 +86,12 @@ registerResource({
   operations: { list: 'open' },
 });
 
-beforeEach(() => {
-  const db = initTestDb();
-  runMigrations(db);
+beforeEach(async () => {
+  const db = await initTestDb();
+  await runMigrations(db);
   ensureContainerConfigSpy.mockClear();
   writeDestinationsSpy.mockClear();
-  getDb().exec(
+  await getDb().exec(
     `CREATE TABLE listtest_rows (
       id TEXT PRIMARY KEY,
       enabled INTEGER NOT NULL,
@@ -103,7 +104,7 @@ beforeEach(() => {
 
 describe('genericList portable filters and ordering', () => {
   beforeEach(() => {
-    const insert = getDb().prepare(
+    const insert = sqliteRaw(getDb()).prepare(
       'INSERT INTO listtest_rows (id, enabled, score, payload, created_at) VALUES (?, ?, ?, ?, ?)',
     );
     insert.run('b', 1, 2, '{"kind":"match"}', '2026-08-17T10:00:00.000Z');
@@ -135,8 +136,8 @@ describe('genericList portable filters and ordering', () => {
   });
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
 });
 
 describe('genericCreate postCreate hook', () => {
@@ -152,21 +153,21 @@ describe('genericCreate postCreate hook', () => {
     // Visible side effect: container_configs row exists for the new group.
     // Without postCreate, this was empty and the first spawn threw
     // "Container config not found" — issue #2415.
-    const config = getContainerConfig(result.id);
+    const config = await getContainerConfig(result.id);
     expect(config).toBeDefined();
     expect(config!.agent_group_id).toBe(result.id);
   });
 
   it('wirings-create writes the companion agent_destinations row', async () => {
     // Seed the FKs that the wiring references.
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Agent One',
       folder: 'agent-one',
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-1',
       channel_type: 'discord',
       platform_id: 'channel-123',
@@ -185,7 +186,7 @@ describe('genericCreate postCreate hook', () => {
     // address this chat as a delivery target. Without postCreate, this was
     // empty and the agent's replies were silently dropped by the delivery
     // ACL — issue #2389.
-    const destinations = getDestinations('ag-1');
+    const destinations = await getDestinations('ag-1');
     expect(destinations).toHaveLength(1);
     expect(destinations[0].target_type).toBe('channel');
     expect(destinations[0].target_id).toBe('mg-1');
@@ -194,14 +195,14 @@ describe('genericCreate postCreate hook', () => {
 
 describe('genericCreate postCommit hook', () => {
   it('wirings-create projects the new destination into live sessions', async () => {
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Agent One',
       folder: 'agent-one',
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-1',
       channel_type: 'discord',
       platform_id: 'channel-123',
@@ -212,7 +213,7 @@ describe('genericCreate postCommit hook', () => {
     });
     // A container is already running for this agent — its session inbound.db
     // holds a stale destination projection.
-    createSession({
+    await createSession({
       id: 'sess-1',
       agent_group_id: 'ag-1',
       messaging_group_id: null,
@@ -234,14 +235,14 @@ describe('genericCreate postCommit hook', () => {
   });
 
   it('wirings-create projection is a no-op when no sessions are running', async () => {
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-2',
       name: 'Agent Two',
       folder: 'agent-two',
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-2',
       channel_type: 'discord',
       platform_id: 'channel-456',
@@ -261,8 +262,8 @@ describe('genericCreate postCommit hook', () => {
 });
 
 describe('genericCreate resolveDefaults hook (two-pass create)', () => {
-  beforeEach(() => {
-    getDb().exec(
+  beforeEach(async () => {
+    await getDb().exec(
       `CREATE TABLE hooktest_rows (id TEXT PRIMARY KEY, kind TEXT NOT NULL, mode TEXT, created_at TEXT NOT NULL)`,
     );
     hookCalls.length = 0;
@@ -291,7 +292,7 @@ describe('genericCreate resolveDefaults hook (two-pass create)', () => {
 
   it('a hook throw rejects the create and nothing is inserted', async () => {
     await expect(lookup('hooktests-create')!.handler({ kind: 'boom' }, hostCtx)).rejects.toThrow('hook rejected');
-    const count = getDb().prepare('SELECT COUNT(*) AS n FROM hooktest_rows').get() as { n: number };
+    const count = sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS n FROM hooktest_rows').get() as { n: number };
     expect(count.n).toBe(0);
   });
 });

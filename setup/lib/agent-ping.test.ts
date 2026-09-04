@@ -21,12 +21,8 @@ describe('classifyPingResult', () => {
   });
 
   it('detects Claude Code login banners printed as a chat reply', () => {
-    expect(
-      classifyPingResult(0, 'Invalid API key · Please run /login'),
-    ).toBe('auth_error');
-    expect(
-      classifyPingResult(0, 'Not logged in · Please run /login'),
-    ).toBe('auth_error');
+    expect(classifyPingResult(0, 'Invalid API key · Please run /login')).toBe('auth_error');
+    expect(classifyPingResult(0, 'Not logged in · Please run /login')).toBe('auth_error');
   });
 
   it('preserves socket errors', () => {

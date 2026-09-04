@@ -36,29 +36,27 @@ function parseArgs(): Args {
 
 const args = parseArgs();
 
-const db = initDb(CENTRAL_DB_PATH);
-runMigrations(db);
+const db = await initDb(CENTRAL_DB_PATH);
+await runMigrations(db);
 
-const ag = getAgentGroupByFolder(args.folder);
+const ag = await getAgentGroupByFolder(args.folder);
 if (!ag) {
   console.log(`No agent group with folder "${args.folder}" — nothing to delete.`);
   process.exit(0);
 }
 
-const cleanup = db.transaction(() => {
-  const tables = db
-    .prepare(
-      `SELECT DISTINCT m.name FROM sqlite_master m
-       JOIN pragma_table_info(m.name) p ON p.name = 'agent_group_id'
-       WHERE m.type = 'table' AND m.name != 'agent_groups'`,
-    )
-    .all() as { name: string }[];
+await db.transaction(async () => {
+  const tables = await db.all<{ name: string }>(
+    `SELECT DISTINCT m.name FROM sqlite_master m
+     JOIN pragma_table_info(m.name) p ON p.name = 'agent_group_id'
+     WHERE m.type = 'table' AND m.name != 'agent_groups'`,
+  );
   for (const { name } of tables) {
-    db.prepare(`DELETE FROM ${name} WHERE agent_group_id = ?`).run(ag.id);
+    const quotedName = `"${name.replaceAll('"', '""')}"`;
+    await db.run(`DELETE FROM ${quotedName} WHERE agent_group_id = ?`, ag.id);
   }
-  deleteAgentGroup(ag.id);
+  await deleteAgentGroup(ag.id);
 });
-cleanup();
 
 // Remove the groups/<folder>/ directory.
 const groupDir = path.join(process.cwd(), 'groups', args.folder);
