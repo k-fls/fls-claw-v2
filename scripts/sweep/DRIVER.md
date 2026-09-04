@@ -1301,6 +1301,19 @@ worktree, because a merge propagates content whether or not a case was involved.
 pinned `checks.json` (host + runner lists; a missing file or an empty list skips
 that gate silently, a malformed file is `ERR43_CHECKS_MALFORMED`, §6.1).
 
+A command entry is `{cmd, cwd}` plus two optional fields the driver reads
+elsewhere: `filter`, the `{files}` template that makes a re-probe affordable
+(§7.2), and `missingDeclRe`, the pattern that recognises a MISSING-DECLARATION
+diagnostic in this command's output (§7.7). Both belong to the COMMAND because
+only its own toolchain knows the shape of its output, and both belong in the
+repo's config because which diagnostics mean "the declaration is not here" is a
+fact about this codebase, not about the driver. A command that declares no
+`missingDeclRe` never takes the advance path: the driver cannot recognise the
+class and does not guess at one, and a value that is not a string is DROPPED at
+load rather than interpreted. The shipped file sets it on the host typecheck
+alone — a missing declaration is a COMPILE-class error, and a test runner's red
+says nothing about where a declaration lives.
+
 DEPENDENCIES ARE INSTALLED FIRST, into that same worktree. The prep install
 (§6.3) ran on the clean prefix, where a conflicted manifest was still the base
 commit's; by now the agent has resolved it, so a dependency the resolution adds,
@@ -1804,7 +1817,16 @@ every change in the resolution diff explained by the conflict — no content fro
 outside the two sides/base (name any unexplained hunk); (3) does the resolution
 contradict any record included in this request? Typecheck and tests are the checks
 and verify gates' job (§7.1, §10.2), never the reader's. Gate-fix cases get their
-own question set.
+own question set, and it has FOUR questions: the three above restated for a change
+that resolves no conflict, plus a REACHABILITY question that only a gate fix is
+asked. For each symbol the diff newly makes available to the failing file, is it
+reached by anything other than that file? A symbol referenced only by the file
+whose error prompted the fix satisfies the checker and changes no behaviour —
+that is a stub, and it is rejected as one. Q1 cannot catch it (the check really
+does pass) and Q2 cannot either (the hunk really is explained by the failure), so
+reachability is the only thing that separates a fix from a stub and it is asked
+directly. The question is phrased in terms of what refers to what, with no
+assumption about how a language spells a declaration or an import.
 
 The verdict must VALIDATE: overall `verdict` ∈ {`confirm`, `reject`}, non-empty
 `notes`, optional per-question `answers`, and optional 1-2-line `feedback` for the
@@ -1961,6 +1983,11 @@ its instruction is bounded — re-run once, because a stable answer (green or re
 completes the pass; on a second unstable measurement of the same tree, report to
 the owner and stop. Nothing here is the agent's to fix: no branch was blamed.
 
+**A RED THAT SAYS A DECLARATION IS MISSING IS ANSWERED BY THE WALK, NOT BY A
+CASE.** Asked FIRST, before the ceiling lift and before the reopen, because both
+are destructive and neither is wanted when the propagation itself repairs the
+red: §7.7.
+
 **A RED landing is a fix-shaped problem WHERE THERE IS A BRANCH TO HAND THE FIX
 TO**, and that is settled before anything is reopened: `redObservationUsable`
 (§9.1) is a journal read, and the reopen is not free — it supersedes this branch's
@@ -2032,6 +2059,107 @@ rows carry the same two fields for the run that DECIDED them. These are FORENSIC
 nothing reads them programmatically, `unstableEvidence`/`redConfirmations`/
 `owedRedTrees` are unchanged by them, and no gating consumer may be added without
 its own ruling.
+
+### 7.7 The missing-declaration advance
+
+A MISSING-SYMBOL ERROR MEANS THE DECLARATION IS ELSEWHERE IN THE CHAIN, so the
+driver advances the walk toward it rather than asking anyone to write it.
+
+The walk enumerates the whole DAG, both parents (§4.2), so a branch can come to
+rest on a commit INSIDE an unmerged upstream feature branch — a work-in-progress
+state upstream never intended to be consumable. Such a state can carry a file
+whose imports name declarations that arrive further along the same line: upstream
+split a function in one interior commit and reconciled the two lines in another,
+and a branch parked between them typechecks red with NO correct-and-green
+resolution at that height. Handed out as a gate fix, the only move available to
+an agent is to author the missing symbol — which manufactures a second
+implementation that nothing calls, and the real one collides with it when the
+walk reaches it. That is what this forecloses.
+
+**Classification is CONFIG, not compiler strings in the driver.** A red is
+`deps-missing` when EVERY failing command has at least one output line matching
+its own `missingDeclRe` (§7.1) and no failing command lacks such a match — one
+ordinary failure alongside them means the tree is broken in a way the advance
+cannot speak to. The ORIGINAL ERROR SET is the fingerprint keys of those matched
+lines (`parseFailureFingerprints`, the same signature blame and `--not-my-bug`
+compare on): file, code and normalized message, with NO line or column, so an
+unrelated edit above the import does not look like a different error. It is
+FAIL-CLOSED at every step where the answer would have to be guessed — a command
+with no pattern, a command whose output block cannot be found, matched lines that
+yield no fingerprints, fingerprints that name no file. Each of those leaves the
+red on the ordinary gate-fix path, which is where a red the driver cannot
+characterise belongs.
+
+**The candidate set is the pending commits that touch the FAILING PATHS**, over
+the parent lines the branch is actually taking content from (`merge` and `case`
+verdicts; a DEFERRED parent is excluded, because its content is cut and
+advancing onto it would put the branch on a state the trunk has never seen).
+Oldest-first, and bounded by `DEPS_MISSING_ADVANCE_LIMIT` — an unbounded advance
+lets a single compile error consume a pass, since every step is a merge plus a
+fresh worktree plus an install plus a check run.
+
+**One commit at a time, re-running ONLY the failing commands.** The whole battery
+would re-answer questions nobody asked, once per step; the advance's only
+question is whether the original errors are still there.
+
+**A CONFLICT ENDS THE ADVANCE.** A resolution cannot be validated while the tree
+is red: the checks that would judge it are the ones already failing, so any
+resolution at that height is unfalsifiable. A step that cannot be measured ends
+it too — no verdict is never green.
+
+**The ORIGINAL error set is the termination condition.** While it survives, the
+walk is still answering the question it started on. The moment it is empty the
+question has changed, and a red that has changed identity is a different
+question this walk has no standing to keep answering. Three outcomes:
+
+- **Empty and green** ⇒ the propagation repaired it. The advance lands, the
+  landing gate re-measures the branch where it now stands, and the pass continues
+  normally. No case, no PR, no agent.
+- **Empty with NEW errors** ⇒ an ordinary red. The landing gate re-measures and
+  the §7.6 path takes it from there, on evidence measured where the branch is now.
+- **Still present when the walk ends** (bound reached, source exhausted, conflict,
+  unmeasured) ⇒ the branch is ROLLED BACK to the FIRST commit carrying the error
+  and a DRAFT gate-fix PR is published for the owner, with NO agent involved. The
+  first errored commit is read off the walk — every step it took reported the
+  original errors, so the earliest tip carrying them is the one it started on, and
+  nothing is bisected. The advanced tip is a state nothing verified and nobody
+  asked for; the commit the finding is ABOUT is what the branch stands at and what
+  the PR is headed at.
+
+The draft PR is the one place the driver writes PR prose. Everywhere else that
+rule exists to stop the driver paraphrasing work an agent did; here there is no
+work, and the deliverable IS the driver's measurement — the classification, the
+candidate set and its bound, each step's verdict, and how the walk ended. It goes
+out under `[AUTO-ESCALATED: missing declaration not reached]`, which is a
+`DRAFT_HELD_TAG`: there is nothing in the PR to merge, only a decision to report.
+The case is frozen HELD at the mint, so `next-case` never offers it.
+
+One diagnostic is carried when git can establish it: if the missing symbol IS
+present on the branch's OWN side of the merge that brought the failing file in
+(the merge's first parent contains the symbol and does not contain the file),
+the body says so. That is the "the source is not testable here" shape and it
+reads differently to an owner than "upstream has not reconciled yet". It is
+determined from git or not claimed at all — a guess in a PR body an owner reads
+is worse than a shorter body.
+
+**ONE WALK PER BRANCH PER PASS.** The walk is bounded, but the pass re-enters
+`run` after every gate, and a branch left standing on the red it reported would
+re-walk the same commits on every call — paying for an answer already journaled
+and re-landing merges it just rolled back.
+
+**The evidence is the journal**, in rows that read as facts:
+`deps-missing-classified` (the verdict, the commands, the files, the error keys
+and the matched lines), `deps-missing-step` (one per step, with its verdict and
+the surviving keys), `deps-missing-repaired` / `deps-missing-changed` /
+`deps-missing-exhausted` (the candidate set, the bound, every step and how it
+ended), `deps-missing-rolled-back`, and `deps-missing-walk-spent` for a branch
+whose walk this pass already took.
+
+**And the agent is told the rule too**, as a backstop for whatever the classifier
+misses: the gate-fix SCOPE block states that a symbol the checker says does not
+exist is not the agent's to write, and that the move is `--tier held` naming the
+missing symbol and where it looked. No compensating licence is granted alongside
+it — the point is to remove one, not to trade it.
 
 ## 8. Tiers and enforcement
 
@@ -2133,6 +2261,14 @@ served on that branch: a worktree AT THE BLAMED BRANCH'S TIP (or at the bisect's
 root, §7.3), no merge, nothing pending, no conflict markers, the failing build as
 materials. The case's `parent` is the sentinel `(gate-fix)`, its conflicted-path
 set is the failing files, and its height is derived like any other.
+
+A MISSING-DECLARATION RED IS NOT ONE. The checker says a symbol does not exist,
+and the only move a case leaves an agent is to write it — a second implementation
+that nothing calls, which the real one collides with when the walk reaches it. A
+red the landing gate classifies `deps-missing` (§7.7) never mints a case for an
+agent: the driver advances the walk toward the declaration, and where the walk
+ends with the errors still there it mints a case only to carry a DRAFT report to
+the owner, frozen HELD at the mint so `next-case` never offers it.
 
 Four things mint one: finish's integration verify (§10.2), a `--not-my-bug`
 adjudication (§7.2), the pre-merge branch check (§6.2), and the landing gate
@@ -2999,6 +3135,7 @@ escalation's publish issues are written to `publish-<case>.json` and quoted into
 | `WARN19_GATE_COVERS_OTHER_DEFECT` | gate-fix minting | an active gate ref on the branch has a different failing-file digest |
 | `WARN20_ANCESTOR_GATED` | gate-fix minting | the branch descends from an ancestor that took a gate fix this pass and is still red |
 | `WARN21_CHECKS_FLAKY` | `report-case`, `run`, `next-case`, gate-fix minting | a check gave BOTH answers on the same tree: passed after a prior failure and failed again on the confirming re-run, or failed and then passed on the confirming re-run of an accusing path (landing gate, pre-merge check, ownership probe). Nothing is minted and no branch is blamed |
+| `WARN23_DEPS_MISSING_HELD` | `run` | the missing-declaration walk ended with the original errors still present (§7.7): the branch was rolled back to the first commit carrying them and a DRAFT PR was published for the owner. No case was served and no agent was asked for a fix |
 | `WARN46_CASE_LOOPING` | `next-case` | the serve count reached the warning threshold (3); emitted as the LOOP WARNING section of the case materials, not as an issue |
 
 **Reserved numbers — never reassign**: ERR03, ERR04, ERR09, ERR10, ERR19, ERR26,
@@ -3031,6 +3168,7 @@ the vitest scripts glob.
 | `steps.ts` | step/case JSON schemas + first-principles re-verification (§4.6) |
 | `not-my-bug.ts` | the `--not-my-bug` adjudication, ownership probe and bisect (§7.2, §7.3) |
 | `attribute.ts` | blame: failing-file parsing, per-file counts, branch candidates, attribution (§9.1) |
+| `deps-missing.ts` | missing-declaration classification + the bounded advance toward the declaration (§7.7) |
 | `cut-points.ts` | owner-approved cut-point exceptions: parse, re-verify, report (§9.2) |
 | `verify.ts` | the everything-rebuild + CI command runner with leave-one-out attribution (§10.2, §10.6) |
 | `publish.ts` | PR creation/push mechanics, the base-height check, mechanical text checks, the machine block, review/comment classification, the injectable GitHub transport (REST, plus the GraphQL draft transitions REST cannot express) |

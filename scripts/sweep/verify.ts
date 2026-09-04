@@ -42,6 +42,18 @@ export interface VerifyCommand {
    * full `cmd`.
    */
   filter?: string;
+  /**
+   * The regular expression that tells a MISSING DECLARATION apart from every
+   * other way this command can fail — `error TS(2305|2307|2339|2724):` for a
+   * TypeScript project, whatever names the same class for another toolchain.
+   *
+   * The mechanism (deps-missing.ts) is language-agnostic; WHICH diagnostics
+   * mean "the declaration is not here" is the repo's business, so the repo
+   * states it beside the command that emits them. A command with no pattern
+   * never takes the advance path: the driver cannot recognise the class and
+   * does not guess at one.
+   */
+  missingDeclRe?: string;
 }
 
 export interface CommandResult {

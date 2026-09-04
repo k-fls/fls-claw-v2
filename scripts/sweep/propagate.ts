@@ -90,6 +90,16 @@ import {
   worktreeBranches,
 } from './git.js';
 import { CANDIDATE_STANDING_INSTRUCTION, candidateSectionLines, deriveCandidates } from './candidates.js';
+import {
+  DEPS_MISSING_ADVANCE_LIMIT,
+  advanceThroughDepsMissing,
+  classifyDepsMissing,
+  namedSymbols,
+  type AdvanceOps,
+  type AdvanceOutcome,
+  type AdvanceStop,
+  type DepsMissingVerdict,
+} from './deps-missing.js';
 import { walkStep } from './interval.js';
 import { computeSurface } from './surface.js';
 import {
@@ -1753,6 +1763,23 @@ const TEST_EDIT_QUESTION =
   'deletes or weakens an assertion.';
 
 /**
+ * THE REACHABILITY QUESTION — the cold read's guard against a symbol written to
+ * satisfy the checker.
+ *
+ * A declaration that only the failing file reaches changes what the checker
+ * says and nothing about what the program does. Q1 cannot catch it: the check
+ * really does pass afterwards. Q2 cannot either: the hunk really is explained
+ * by the failure. Only reachability separates a fix from a stub, so it is
+ * asked directly, in terms of what refers to what — no assumption about how
+ * this language spells a declaration or an import.
+ */
+const GATE_FIX_REACH_QUESTION =
+  '4. For each symbol this diff newly makes available to the failing file: is it reached by anything other than ' +
+  'that file? If a symbol is referenced only by the file whose error prompted the fix, the change satisfies the ' +
+  'checker without changing program behaviour. That is a stub. Reject with: "test-only symbol — align the failing ' +
+  'file with the propagation source instead."';
+
+/**
  * A GATE FIX is judged on different questions, because it is not a merge.
  *
  * The shared set asks about "the conflicted hunks" and "the two sides/base". A
@@ -1764,12 +1791,16 @@ const TEST_EDIT_QUESTION =
  * What actually needs judging is: does this change fix the named failure, and
  * ONLY that. Q2 is deliberately the sharp one — a gate-fix case is the place an
  * agent is most tempted to smuggle in an unrelated fix, since it is the one case
- * kind that edits code the pass did not merge.
+ * kind that edits code the pass did not merge. Q4 is the reachability guard
+ * above: a gate fix is where a symbol gets written to silence a checker, and it
+ * is asked on every gate fix because that temptation does not depend on which
+ * diagnostic started it.
  */
 const GATE_FIX_COLD_READ_QUESTIONS = [
   '1. Does the change plausibly make the named failing check pass? Name anything that would still fail.',
   '2. Is every hunk explained by THAT failure — nothing unrelated fixed, cleaned up or refactored along the way? Name any unexplained hunk.',
   '3. Does the change contradict any record included in this request?',
+  GATE_FIX_REACH_QUESTION,
 ];
 
 /**
@@ -1999,12 +2030,12 @@ function coldReadRequest(
     'Write `coldread-verdict.json` next to this file:',
     '```json',
     '{"verdict": "confirm|reject",',
-    ' "answers": {"q1": "...", "q2": "...", "q3": "..."},',
+    ` "answers": {"q1": "...", "q2": "...", "q3": "..."${gateFix ? ', "q4": "..."' : ''}},`,
     ' "notes": "...",',
     ' "feedback": "1-2 lines for the resolving agent: why the reject / what is off (omit when nothing is)",',
     ' "resolvedTree": "<tree OID of the resolution this verdict attests to>"}',
     '```',
-    'An `UNVERIFIABLE-FROM-REQUEST` answer on any of q1-q3 is treated as a reject (fail-closed).',
+    `An \`UNVERIFIABLE-FROM-REQUEST\` answer on any of q1-q${gateFix ? '4' : '3'} is treated as a reject (fail-closed).`,
   ].join('\n');
 }
 
@@ -2057,6 +2088,15 @@ const ESCALATE_SCOPE = '[AUTO-ESCALATED: scope exceeded]';
 const ESCALATE_CAP = '[AUTO-ESCALATED: resolution did not converge]';
 /** The checks gate (typecheck/tests) kept failing CHECKS_FAIL_LIMIT times. */
 const ESCALATE_CHECKS = '[AUTO-ESCALATED: checks failing]';
+/**
+ * The missing-declaration walk ended with the errors still there (§7.7). No
+ * agent was served this case and none will be: the declaration is not in this
+ * repository yet, so there is no work to hand out — only a decision to report.
+ */
+const ESCALATE_DEPS_MISSING = '[AUTO-ESCALATED: missing declaration not reached]';
+
+/** How many matched diagnostic lines the classification row and the PR body keep verbatim. */
+const DEPS_MISSING_JOURNALED_LINES = 20;
 
 /**
  * The escalations whose HELD pull request goes out as a DRAFT.
@@ -2070,8 +2110,12 @@ const ESCALATE_CHECKS = '[AUTO-ESCALATED: checks failing]';
  * FINISH, and a draft is what says so. The remaining tags (scope exceeded,
  * unstable check, red owned by no branch) all ship a tree the driver stands
  * behind, and stay active.
+ *
+ * The missing-declaration tag joins them for the same reason and one more: its
+ * PR carries no change at all, only the walk's report, so there is nothing an
+ * owner could merge even if they wanted to.
  */
-const DRAFT_HELD_TAGS = new Set([ESCALATE_CHECKS, ESCALATE_REJECTED_2X, ESCALATE_CAP]);
+const DRAFT_HELD_TAGS = new Set([ESCALATE_CHECKS, ESCALATE_REJECTED_2X, ESCALATE_CAP, ESCALATE_DEPS_MISSING]);
 
 /**
  * How many times a case's checks gate (typecheck OR tests) may fail before
@@ -2131,6 +2175,12 @@ export const CASE_SERVE_LIMIT = 4;
  * with the resolution or a scope violation. Only the repo can answer it, and it
  * is answered ONCE, here, next to the commands that run those files. Empty (the
  * key absent) means no path is a test path, so nothing is admitted.
+ *
+ * A command may also carry `missingDeclRe` (`VerifyCommand`): the pattern that
+ * recognises a MISSING-DECLARATION diagnostic in its output. It belongs to the
+ * command because only the command's own toolchain knows what its diagnostics
+ * look like, and it belongs in the repo's config because which errors mean
+ * "the declaration is elsewhere in the chain" is a fact about this codebase.
  */
 export interface ChecksConfig {
   typecheck: VerifyCommand[];
@@ -2152,8 +2202,24 @@ export function loadChecksConfig(checksFile: string | undefined): ChecksConfig |
     return null;
   }
   const r = (raw ?? {}) as { typecheck?: unknown; test?: unknown; testPaths?: unknown };
-  const norm = (v: unknown): VerifyCommand[] =>
-    Array.isArray(v) ? (v.filter((c) => c && typeof (c as VerifyCommand).cmd === 'string') as VerifyCommand[]) : [];
+  const norm = (v: unknown): VerifyCommand[] => {
+    if (!Array.isArray(v)) return [];
+    const out: VerifyCommand[] = [];
+    for (const raw of v) {
+      const c = raw as VerifyCommand;
+      if (!c || typeof c.cmd !== 'string') continue;
+      // A `missingDeclRe` THAT IS NOT A STRING IS DROPPED, never carried
+      // through. The deps-missing classifier decides whether a red skips the
+      // agent entirely, and it must be handed either a pattern or nothing —
+      // a value it would have to interpret is the one input it cannot take.
+      if (typeof c.missingDeclRe === 'string') out.push(c);
+      else {
+        const { missingDeclRe: _unset, ...rest } = c;
+        out.push(rest);
+      }
+    }
+    return out;
+  };
   // FAIL-CLOSED on a key that is absent, not a list, or holds anything but
   // strings: an empty glob set admits no path, which is the behaviour of a repo
   // that never named its tests.
@@ -4667,6 +4733,282 @@ async function landingCheck(
   }
 }
 
+/**
+ * The refs the advance may walk toward — the parent lines this branch is
+ * actually taking content from.
+ *
+ * A DEFERRED parent is excluded and that is the whole point of the cut: its
+ * content is blocked by an unresolved conflict elsewhere, so advancing onto it
+ * would put this branch on a state the trunk has never seen. A parent that
+ * no-op'd or is up to date contributes nothing to walk toward. What is left is
+ * the lines the walk stopped part-way along, which is where a declaration this
+ * branch has not reached yet can be.
+ */
+function advanceSources(bp: BranchPlan, chain: Chain): string[] {
+  const refs = bp.parents
+    .filter((pp) => pp.verdict === 'merge' || pp.verdict === 'case')
+    .map((pp) => (pp.model === 'entry' ? chain.watermark : pp.parent));
+  return [...new Set(refs)];
+}
+
+/** Move a branch ref back to an earlier commit it contains, through the ref-scope guard. */
+async function journaledRollback(
+  cli: Cli,
+  dir: string,
+  branch: string,
+  to: string,
+  scope: Set<string>,
+  reason: string,
+): Promise<boolean> {
+  guardRef(branch, scope);
+  const tip = await revParse(cli.repo, branch);
+  if (tip === to) return false;
+  const wt = await checkedOutWorktree(cli.repo, branch); // dirty -> DriverHalt (N1)
+  await git(cli.repo, ['update-ref', `refs/heads/${branch}`, to, tip]);
+  if (wt) await git(cli.repo, ['reset', '--hard', to], { cwd: wt }); // clean-verified above
+  appendJournal(dir, { action: 'deps-missing-rolled-back', branch, from: tip, to, reason });
+  return true;
+}
+
+/**
+ * A RED THAT SAYS A DECLARATION IS MISSING IS NOT A FIX-SHAPED PROBLEM
+ * (DRIVER.md §7.7).
+ *
+ * The walk enumerates the whole DAG, so a branch can come to rest inside an
+ * unmerged upstream feature branch — a state that carries a file whose imports
+ * name declarations further along the same line. There is no correct-and-green
+ * resolution at that height: the declaration exists, and it is ahead. So the
+ * driver walks toward it instead of minting a case, because the only thing an
+ * agent can do with a missing symbol is write a second one.
+ *
+ * Returns null when the red is NOT this shape — every other red keeps the
+ * ordinary gate-fix path exactly as it was.
+ */
+async function depsMissingAdvance(
+  cli: Cli,
+  dir: string,
+  bp: BranchPlan,
+  chain: Chain,
+  landing: { output: string; failed: VerifyCommand[]; sha: string },
+  scope: Set<string>,
+  runChecks: ChecksRunner,
+  runInstall?: InstallRunner,
+): Promise<{ verdict: DepsMissingVerdict; outcome: AdvanceOutcome } | null> {
+  const branch = bp.branch;
+  // ONE WALK PER BRANCH PER PASS. The walk is bounded, but the pass re-enters
+  // `run` after every gate, and a branch left standing on the red it reported
+  // would re-walk the same ten commits on every call — paying for an answer
+  // already journaled, and re-landing merges it just rolled back.
+  if (readJournal(dir).some((e) => e.action === 'deps-missing-exhausted' && e.branch === branch)) {
+    appendJournal(dir, { action: 'deps-missing-walk-spent', branch, sha: landing.sha });
+    return null;
+  }
+  const rooted = rootChecksOutput(landing.output, landing.failed);
+  const verdict = classifyDepsMissing(landing.failed, rooted);
+  appendJournal(dir, {
+    action: 'deps-missing-classified',
+    branch,
+    sha: landing.sha,
+    depsMissing: verdict.depsMissing,
+    commands: landing.failed.map((c) => c.cmd),
+    files: verdict.files,
+    errorKeys: verdict.errorKeys,
+    lines: verdict.lines.slice(0, DEPS_MISSING_JOURNALED_LINES),
+    reason: verdict.reason,
+  });
+  if (!verdict.depsMissing) return null;
+  const sources: string[] = [];
+  for (const ref of advanceSources(bp, chain)) if (await refExists(cli.repo, ref)) sources.push(ref);
+  const ops: AdvanceOps = {
+    candidates: async (files) => {
+      if (sources.length === 0) return [];
+      const res = await git(cli.repo, ['rev-list', '--topo-order', '--reverse', ...sources, `^${branch}`, '--', ...files], {
+        allowCodes: [128],
+      });
+      return res.code === 0 ? res.stdout.split('\n').filter(Boolean) : [];
+    },
+    alreadyContained: (sha) => isAncestor(cli.repo, sha, branch),
+    // A landed step is recorded as a `deps-missing-step` row and NOT as a
+    // `merge`: the pass's merge rows are the plan's parent verdicts, and an
+    // advance is neither. The branch is in the pass's mutated set regardless —
+    // this runs only after a RED LANDING, and a landing is only measured on a
+    // tree the pass moved, so the merge that moved it is already journaled.
+    step: async (sha) => {
+      const probe = await newStyleMergeTree(cli.repo, branch, sha);
+      if (!probe.clean) return { conflictedPaths: probe.conflictFiles };
+      try {
+        const tip = await journaledMerge(
+          cli.repo,
+          branch,
+          sha,
+          `Merge ${sha.slice(0, 12)} into ${branch} (missing-declaration advance)`,
+          scope,
+        );
+        return { tip };
+      } catch (e) {
+        if (e instanceof DriverHalt && e.reason === 'merge-failed') return { conflictedPaths: [], detail: e.message };
+        throw e;
+      }
+    },
+    recheck: async (tip) => {
+      // THE FAILING COMMANDS ALONE. The whole battery would re-answer questions
+      // nobody asked, once per step; the advance's only question is whether the
+      // original errors are still there.
+      const out = await variedRerun(cli, tip, landing.failed, runChecks, runInstall);
+      if ('unprepared' in out || out.result.environmentFault) return null;
+      return { ok: out.result.ok, output: rootChecksOutput(out.result.output, landing.failed) };
+    },
+  };
+  const outcome = await advanceThroughDepsMissing({
+    startTip: landing.sha,
+    originalKeys: verdict.errorKeys,
+    files: verdict.files,
+    ops,
+    onStep: (step) => appendJournal(dir, { action: 'deps-missing-step', branch, ...step }),
+  });
+  const shape = { repaired: 'deps-missing-repaired', changed: 'deps-missing-changed', exhausted: 'deps-missing-exhausted' } as const;
+  appendJournal(dir, {
+    action: shape[outcome.kind],
+    branch,
+    from: landing.sha,
+    sources,
+    files: verdict.files,
+    errorKeys: verdict.errorKeys,
+    candidates: outcome.candidates,
+    limit: DEPS_MISSING_ADVANCE_LIMIT,
+    bounded: outcome.bounded,
+    steps: outcome.steps.map((s) => `${s.sha.slice(0, 12)} ${s.verdict}`),
+    ...(outcome.kind === 'exhausted'
+      ? { stop: outcome.stop, firstErrored: outcome.firstErrored }
+      : { tip: outcome.tip }),
+  });
+  return { verdict, outcome };
+}
+
+/**
+ * Is the missing symbol already on the branch's OWN side of the merge that
+ * brought the failing file in?
+ *
+ * The two shapes read completely differently to an owner. "Upstream has not
+ * reconciled these two lines yet" is a matter of waiting for the walk. "The
+ * symbol is right there on our side and the file that wants it arrived without
+ * it" says the SOURCE IS NOT TESTABLE HERE — the merge took a file from a state
+ * upstream never finished.
+ *
+ * Determined from git or not claimed at all: a merge commit, a failing file
+ * absent from its first parent, and a symbol that first parent does contain.
+ * Anything indeterminate returns null, because a guess in a PR body an owner
+ * reads is worse than a shorter body.
+ */
+async function symbolOnOwnSide(
+  repo: string,
+  mergeSha: string,
+  files: readonly string[],
+  symbols: readonly string[],
+): Promise<{ symbol: string; side: string } | null> {
+  if (symbols.length === 0 || files.length === 0) return null;
+  const info = await git(repo, ['rev-list', '--parents', '-n', '1', mergeSha], { allowCodes: [128] });
+  const parents = info.code === 0 ? info.stdout.trim().split(/\s+/).slice(1) : [];
+  if (parents.length < 2) return null; // not a merge: there is no "own side"
+  const ours = parents[0];
+  // The failing file must have ARRIVED with the merge; a file both sides carry
+  // says nothing about which side the symbol belongs to.
+  for (const f of files) {
+    if ((await git(repo, ['cat-file', '-e', `${ours}:${f}`], { allowCodes: [1, 128] })).code === 0) return null;
+  }
+  for (const symbol of symbols) {
+    const hit = await git(repo, ['grep', '-l', '-F', '--', symbol, ours], { allowCodes: [1, 128] });
+    if (hit.code === 0 && hit.stdout.trim() !== '') return { symbol, side: ours };
+  }
+  return null;
+}
+
+/**
+ * The DRAFT PR for a walk that ended with the errors still there — written by
+ * the driver, worked by nobody.
+ *
+ * Every other PR in this driver carries an agent's prose, and the rule that
+ * produces it ("the driver never generates PR prose") is about work the agent
+ * did. Here there is no work: the deliverable IS the driver's measurement — a
+ * classification, a bounded walk and each step's verdict — and an agent asked
+ * to write it up could only paraphrase the journal. So the driver writes it,
+ * and the PR is a DRAFT because there is nothing in it to merge.
+ */
+async function holdDepsMissingDraft(
+  cli: Cli,
+  dir: string,
+  branch: string,
+  cases: GateFixCaseSummary[],
+  found: { verdict: DepsMissingVerdict; outcome: AdvanceOutcome },
+): Promise<void> {
+  if (found.outcome.kind !== 'exhausted') return;
+  const { verdict, outcome } = found;
+  const symbols = namedSymbols(verdict.lines);
+  const ownSide = await symbolOnOwnSide(cli.repo, outcome.firstErrored, verdict.files, symbols);
+  const stopSentence: Record<AdvanceStop, string> = {
+    'bound-reached': `the walk stopped at its ${DEPS_MISSING_ADVANCE_LIMIT}-commit bound with ${outcome.candidates.length} candidate(s) taken`,
+    'source-exhausted': 'the parent lines carry no further commit touching these files',
+    conflict: 'a step conflicted, and a resolution cannot be validated on a red tree',
+    unmeasured: 'a step could not be measured, so the walk established nothing beyond it',
+  };
+  const journal = readJournal(dir);
+  for (const c of cases) {
+    const prDir = join(dir, c.caseId, 'pr');
+    mkdirSync(prDir, { recursive: true });
+    // The head the MINT recorded. A hold names the same commit the case does, or
+    // the two records disagree about what this PR is at.
+    const caseRow = journal.find((e) => e.action === 'case' && e.caseId === c.caseId);
+    const head = (caseRow?.head ?? { sha: outcome.firstErrored, height: 0 }) as Head;
+    const title = `Decision needed: ${branch} rests on a state whose declarations it has not reached`;
+    const body = [
+      `\`${branch}\` is red on ${verdict.files.join(', ')} with a MISSING-DECLARATION failure, and the`,
+      'declaration is not on this branch. No fix was authored and no agent was asked to write one:',
+      'a symbol the checker says does not exist belongs somewhere the walk has not reached.',
+      '',
+      '## What the checker reports',
+      '```',
+      ...verdict.lines.slice(0, DEPS_MISSING_JOURNALED_LINES),
+      '```',
+      '',
+      '## What the driver walked',
+      `Candidates (pending commits touching ${verdict.files.join(', ')}): ${outcome.candidates.length}` +
+        `${outcome.bounded ? ` — bounded to ${DEPS_MISSING_ADVANCE_LIMIT}` : ''}.`,
+      ...outcome.steps.map((s) => `- \`${s.sha.slice(0, 12)}\` — ${s.verdict}`),
+      '',
+      `The walk ended because ${stopSentence[outcome.stop]}. The original errors were still`,
+      'present at every step it took, so the branch is rolled back to where they first appeared',
+      `(\`${outcome.firstErrored.slice(0, 12)}\`) and this PR is headed there.`,
+      ...(ownSide
+        ? [
+            '',
+            '## The source is not testable here',
+            `\`${ownSide.symbol}\` IS present on this branch's own side of the merge (\`${ownSide.side.slice(0, 12)}\`),`,
+            `while ${verdict.files.join(', ')} arrived with the merge and does not find it. The merge took a file`,
+            'from a state its own source had not finished.',
+          ]
+        : []),
+      '',
+      '## The decision',
+      'Either the reconciling commit upstream is merged here (which the next pass takes once it is',
+      'reachable), or this branch is cut below the state it came to rest on. Nothing in this',
+      'repository can supply the declaration.',
+    ].join('\n');
+    writeFileSync(join(prDir, 'title.txt'), title + '\n');
+    writeFileSync(join(prDir, 'body.md'), body + '\n');
+    appendJournal(dir, {
+      action: 'held',
+      branch,
+      caseId: c.caseId,
+      height: head.height,
+      headSha: head.sha,
+      conflictedPaths: c.files,
+      notes: [`missing-declaration walk ${outcome.stop}; no agent was served this case`],
+      resolution: null,
+      escalation: { tag: ESCALATE_DEPS_MISSING, feedback: verdict.reason.slice(0, COLDREAD_FEEDBACK_CAP) },
+    });
+  }
+}
+
 export async function cmdRun(
   cli: Cli,
   /** The landing gate's checks runner — injected so a pass under test spawns nothing. */
@@ -5291,7 +5633,82 @@ export async function cmdRun(
       // its descendants take it below, `finish` pushes it to origin, and a cut
       // branch's prefix is pushed and then left OUT of the integration recipe.
       // Measure it here, once, before any of that happens.
-      const landing = await landingCheck(cli, dir, bp.branch, treeAtDerive, runChecks, runInstall);
+      let landing = await landingCheck(cli, dir, bp.branch, treeAtDerive, runChecks, runInstall);
+      if (landing.kind === 'red') {
+        // A MISSING DECLARATION IS NOT A DEFECT TO HAND OUT (§7.7). The walk
+        // came to rest below the commit that declares what the landed content
+        // imports; the driver advances toward it rather than minting a case
+        // whose only possible resolution is a second implementation.
+        //
+        // Asked BEFORE the lift and the reopen below, because both are
+        // destructive and neither is wanted when the propagation itself
+        // repairs the red.
+        const found = await depsMissingAdvance(
+          cli,
+          dir,
+          bp,
+          ctx.chain,
+          landing,
+          scope,
+          runChecks,
+          runInstall,
+        );
+        if (found && found.outcome.kind === 'exhausted') {
+          // ROLLED BACK TO WHERE THE ERRORS FIRST APPEARED. The advanced tip is
+          // a state nothing verified and nobody asked for; the commit the walk
+          // started on is the one the finding is about, so that is what the
+          // branch stands at and what the PR is headed at.
+          await journaledRollback(
+            cli,
+            dir,
+            bp.branch,
+            found.outcome.firstErrored,
+            scope,
+            `the missing-declaration walk ended ${found.outcome.stop} with the original errors still present`,
+          );
+          // REOPEN BEFORE MINTING, for the same reason the ordinary red path
+          // does it: a conflict case on a red tree is unjudgeable, and its
+          // checks would fail on a defect that has nothing to do with the
+          // resolution. The branch does not arrive, so its descendants take
+          // nothing from it, but their own cases are measured against a tip
+          // this pass has now moved back.
+          reopen(dir, [bp.branch, ...transitiveDescendants(planEdgesOf(dir), bp.branch)]);
+          const gate = await materializeGateFixCases(
+            cli,
+            dir,
+            ctx.chain,
+            rootChecksOutput(landing.output, landing.failed),
+            landing.failed,
+            null,
+            {
+              rootBranch: bp.branch,
+              rootAt: found.outcome.firstErrored,
+              ownedFiles: found.verdict.files,
+              redOn: { at: found.outcome.firstErrored, commands: landing.failed },
+            },
+          );
+          // FROZEN AT THE MINT, so `next-case` never offers it: the case exists
+          // to carry a report to the owner, and there is nothing in it an agent
+          // could do that would not be authoring the missing symbol.
+          await holdDepsMissingDraft(cli, dir, bp.branch, gate.cases, found);
+          gated = true;
+          const detail =
+            `${bp.branch} rests on content whose declarations it has not reached (${found.verdict.files.join(', ')}) — ` +
+            (gate.cases.length
+              ? `rolled back to ${found.outcome.firstErrored.slice(0, 12)}; DRAFT PR(s) for the owner: ${gate.cases.map((c) => c.caseId).join(', ')}`
+              : gate.reason);
+          issues.push({ id: 'WARN23_DEPS_MISSING_HELD', detail });
+          console.error(`run [WARN23_DEPS_MISSING_HELD]: ${detail}`);
+          break;
+        }
+        if (found) {
+          // The walk moved the branch, so the verdict that stands is the one
+          // this tip earns. A repair lands and the pass continues; a red that
+          // has changed identity is an ordinary red and takes the ordinary path
+          // below, on evidence measured where the branch now is.
+          landing = await landingCheck(cli, dir, bp.branch, landing.tree, runChecks, runInstall);
+        }
+      }
       if (landing.kind === 'flaky') {
         // A CHANGED VERDICT ACCUSES NOBODY, and it is not a green either.
         //
@@ -8766,9 +9183,11 @@ export const defaultColdReadInvoker: ColdReadInvoker = (prompt) =>
  * `reject`, OR an `UNVERIFIABLE-FROM-REQUEST` answer on any question that was
  * ASKED, is a reject. Returns the unverifiable question list for the notes.
  *
- * Q4 counts only where the request carried the test-edit block. An unasked
- * question has no answer to be unverifiable, and folding it in unconditionally
- * would reject every ordinary resolution whose reader answered three questions.
+ * Q4 counts only where the request ASKED one — every gate fix (the
+ * reachability guard) and a merge resolution that edited a test file. An
+ * unasked question has no answer to be unverifiable, and folding it in
+ * unconditionally would reject every ordinary resolution whose reader answered
+ * three questions.
  */
 function coldReadRejected(v: MachineVerdict, askedQ4 = false): { rejected: boolean; unverifiable: string[] } {
   const asked = askedQ4 ? (['q1', 'q2', 'q3', 'q4'] as const) : (['q1', 'q2', 'q3'] as const);
@@ -8814,7 +9233,13 @@ function machineColdReadPrompt(opts: {
 }): string {
   const gf = opts.gateFix ?? null;
   const testEdits = opts.testEditPaths ?? [];
-  const asksQ4 = !gf && testEdits.length > 0;
+  /** The TEST-EDIT fourth question, which only a merge resolution can be asked. */
+  const asksTestEditQ4 = !gf && testEdits.length > 0;
+  // A gate fix always carries a fourth question of its own (the reachability
+  // guard), so the JSON shape and the fail-closed range below cover q4 there
+  // too — a reader told to answer four questions and given a three-slot object
+  // has nowhere to put the answer that matters most.
+  const asksQ4 = asksTestEditQ4 || gf !== null;
   const lines: string[] = [
     `# Cold-read request — ${opts.id} (state-machine path)`,
     '',
@@ -8839,7 +9264,7 @@ function machineColdReadPrompt(opts: {
           '',
         ]
       : []),
-    ...(asksQ4
+    ...(asksTestEditQ4
       ? [
           `TEST FILES EDITED BY THIS RESOLUTION: ${testEdits.join(', ')}`,
           'The repository names those paths as tests. They are IN SCOPE for this case and',
@@ -8867,7 +9292,7 @@ function machineColdReadPrompt(opts: {
     '',
     '## Cold-reader questions',
     ...(gf ? GATE_FIX_COLD_READ_QUESTIONS : COLD_READ_QUESTIONS),
-    ...(asksQ4 ? [TEST_EDIT_QUESTION] : []),
+    ...(asksTestEditQ4 ? [TEST_EDIT_QUESTION] : []),
     '',
     '## Output',
     'Print ONLY a JSON object on the final line — no prose around it:',
@@ -13799,7 +14224,10 @@ export async function cmdSweepReportCase(
     result(cli, { instruction: detail, tier: effectiveTier, issues: [...issues, { id: 'ERR35_COLDREAD_UNAVAILABLE', detail }] });
     return 1;
   }
-  const { rejected, unverifiable } = coldReadRejected(verdict, !isGateFixCase && testEditPaths.length > 0);
+  // A gate fix is ALWAYS asked a fourth question (reachability), a merge
+  // resolution only when it edited a test file. The fail-closed reduction reads
+  // the questions that were asked, so it is told which set that was.
+  const { rejected, unverifiable } = coldReadRejected(verdict, isGateFixCase || testEditPaths.length > 0);
   const feedback = boundedFeedback(verdict);
   appendJournal(dir, {
     action: 'coldread',
@@ -14282,6 +14710,13 @@ function gateFixCaseMaterials(dir: string, jc: JournaledCase, caseRow: JournalEn
     'those files were touched, and the case caps at `held`, which means the OWNER',
     'approves your fix rather than you merging it. A held PR carrying a WORKING FIX',
     'is the best outcome this case type has.',
+    '',
+    'A symbol the checker says does not exist is not yours to write. `has no',
+    'exported member`, `cannot find module`, `is not exported` and their',
+    'equivalents mean the declaration lives somewhere this branch has not reached',
+    'yet. Authoring it here manufactures a second implementation that nothing',
+    'calls, and the real one will collide with it. Claim `--tier held` and name the',
+    'missing symbol and where you looked for it.',
     '',
     'Claim `--tier held` with an unchanged worktree only when the fix cannot be',
     'made here at all — it needs an owner decision, or it belongs to upstream, or',

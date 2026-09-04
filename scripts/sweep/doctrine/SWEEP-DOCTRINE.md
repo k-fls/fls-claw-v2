@@ -203,6 +203,12 @@ owner approves your fix instead of you merging it, and a held pull request carry
 working fix is the best outcome this case type has. A fix confined to the named files
 can land as `judged`.
 
+A symbol the checker says does not exist is not yours to write. `has no exported
+member`, `cannot find module`, `is not exported` and their equivalents mean the
+declaration lives somewhere this branch has not reached yet. Authoring it here
+manufactures a second implementation that nothing calls, and the real one will collide
+with it. Claim `held` and name the missing symbol and where you looked for it.
+
 Claim `held` with an unchanged worktree only when the fix cannot be made here at all:
 it needs an owner decision, it belongs to upstream, or it is outside this repository.
 Then your diagnosis is the deliverable.
@@ -337,9 +343,13 @@ your pull-request text. It answers three questions: is each side's behavior pres
 or its loss explicitly justified; is every change explained by the conflict, with
 nothing from outside the two sides and their base; does the resolution break something
 the surrounding code depends on. Resolve so those three answers are yes, yes, no. For a gate fix the
-questions become: does the change plausibly make the named check pass, and is every
+questions become: does the change plausibly make the named check pass, is every
 hunk explained by that failure alone — a gate-fix case is the one place an unrelated
-"improvement" is most tempting and most reliably rejected.
+"improvement" is most tempting and most reliably rejected — and, as a fourth question
+only a gate fix is asked, is each symbol the change newly makes available to the
+failing file reached by anything other than that file. A symbol only the failing file
+refers to satisfies the checker and changes no behaviour; that is a stub and it is
+rejected as one.
 
 When you edited a test file, the reviewer is given the list and asked a FOURTH
 question: is each edit required by this resolution — does the test now assert the

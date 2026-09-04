@@ -27,6 +27,7 @@ import {
   CHECKS_FAIL_LIMIT,
   DEAD_END_ATTEMPTS,
   cmdPublish,
+  cmdRun,
   cmdSweepAbort,
   cmdSweepFinish,
   cmdSweepNextCase,
@@ -8358,6 +8359,302 @@ describe('run — the landing gate', () => {
     expect(row!.tree).toBe(repo.git('rev-parse', 'feat/c^{tree}'));
   });
 });
+
+/**
+ * A red that says a DECLARATION IS MISSING is answered by the walk, not by a
+ * case (DRIVER.md §7.7). The checks runner reads the tree it is pointed at, so
+ * every verdict below is a fact about a real merge the driver performed.
+ */
+describe('run — the missing-declaration advance', () => {
+  /** `request.ts` with an independently editable top and bottom, so two sides merge clean. */
+  const requestFile = (top: string[], bottom: string[]): string =>
+    [...top, '', '// ---', '// ---', '// ---', '// ---', '// ---', '', ...bottom, ''].join('\n');
+  const BASE_REQUEST = requestFile(['export const alpha = 1;'], ['export const omega = 26;']);
+  /** Upstream's half-done split: one part of the pair exists, the other does not yet. */
+  const SPLIT_REQUEST = requestFile(
+    ['export const alpha = 1;', 'export const escapeInvisibles = 2;'],
+    ['export const omega = 26;'],
+  );
+  /** Upstream reconciled the two lines: both parts present. */
+  const RECONCILED_REQUEST = requestFile(
+    ['export const alpha = 1;', 'export const escapeInvisibles = 2;'],
+    ['export const handleAddMcpServer = 3;', 'export const omega = 26;'],
+  );
+
+  const MISSING_DECL_RE = 'error TS(2305|2307|2339|2724):';
+  function checksWithPattern(ws: string, pattern: string | null = MISSING_DECL_RE): string {
+    const f = join(ws, 'checks.json');
+    writeFileSync(
+      f,
+      JSON.stringify({
+        typecheck: [{ cmd: 'tsc --noEmit', cwd: '.', ...(pattern ? { missingDeclRe: pattern } : {}) }],
+        test: [{ cmd: 'vitest run', cwd: '.' }],
+      }),
+    );
+    return f;
+  }
+
+  /**
+   * The half-split state IN COMBINATION with the branch's own file. Upstream
+   * alone must stay green: `next-case` probes the upstream tip before it merges
+   * anything, and a red there stops the pass before any of this is reached.
+   */
+  const request = (cwd: string): string => {
+    const p = join(cwd, 'src/request.ts');
+    return existsSync(p) ? readFileSync(p, 'utf8') : '';
+  };
+  const onABranch = (cwd: string): boolean => existsSync(join(cwd, 'src/mp.ts'));
+  const halfSplit = (cwd: string): boolean =>
+    onABranch(cwd) && request(cwd).includes('escapeInvisibles') && !request(cwd).includes('handleAddMcpServer');
+
+  /**
+   * Red with a MISSING-DECLARATION diagnostic exactly while the tree is
+   * half-split; `whenReconciled` decides what a reconciled tree says.
+   */
+  function declRunner(whenReconciled: 'green' | 'other-red' = 'green'): { fn: ChecksRunner; ran: string[] } {
+    const ran: string[] = [];
+    const fn: ChecksRunner = async (commands, cwd) => {
+      const cmds = commands.map((c) => c.cmd);
+      ran.push(cmds.join('+'));
+      if (!cmds.includes('tsc --noEmit')) return { ok: true, failedNames: [], output: '' };
+      if (halfSplit(cwd)) {
+        return {
+          ok: false,
+          failedNames: ['tsc --noEmit'],
+          output:
+            `$ tsc --noEmit\nsrc/request.ts(2,14): error TS2305: ` +
+            `Module '"./split.js"' has no exported member 'handleAddMcpServer'.\n`,
+        };
+      }
+      if (whenReconciled === 'other-red' && onABranch(cwd) && request(cwd).includes('handleAddMcpServer')) {
+        return {
+          ok: false,
+          failedNames: ['tsc --noEmit'],
+          output: `$ tsc --noEmit\nsrc/request.ts(9,14): error TS2322: Type 'number' is not assignable to type 'string'.\n`,
+        };
+      }
+      return { ok: true, failedNames: [], output: '' };
+    };
+    return { fn, ran };
+  }
+
+  /** main_patched takes upstream's half-split; nothing above it reconciles the pair. */
+  function unreachedRepo(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base', { 'src/request.ts': BASE_REQUEST, 'src/shared.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: own file + own edit', { 'src/mp.ts': 'fork\n', 'src/shared.ts': 'fork\n' });
+    repo.checkout('main');
+    repo.commit('U0: upstream splits the function', { 'src/request.ts': SPLIT_REQUEST });
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+
+  /**
+   * The reconciliation sits BEHIND a conflicting commit on the same line, so
+   * merging it would drag the conflict in.
+   */
+  function reconciliationBehindConflictRepo(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base', { 'src/request.ts': BASE_REQUEST, 'src/shared.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: own file + own edit', { 'src/mp.ts': 'fork\n', 'src/shared.ts': 'fork\n' });
+    repo.checkout('main');
+    repo.commit('U0: upstream splits the function', { 'src/request.ts': SPLIT_REQUEST });
+    repo.commit('U1: upstream edits the shared file', { 'src/shared.ts': 'up\n' });
+    repo.commit('U2: upstream reconciles the pair', { 'src/request.ts': RECONCILED_REQUEST });
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+
+  /**
+   * The reconciliation is a DAG SIBLING of the conflicting commit, so the walk
+   * stops below both and the advance can still reach one of them.
+   */
+  function reconciliationBesideConflictRepo(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base', { 'src/request.ts': BASE_REQUEST, 'src/shared.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: own file + own edit', { 'src/mp.ts': 'fork\n', 'src/shared.ts': 'fork\n' });
+    repo.checkout('main');
+    const u0 = repo.commit('U0: upstream splits the function', { 'src/request.ts': SPLIT_REQUEST });
+    repo.checkout('upside', { create: true, at: u0 });
+    repo.commit('U2: upstream reconciles the pair', { 'src/request.ts': RECONCILED_REQUEST });
+    repo.checkout('main');
+    repo.commit('U1: upstream edits the shared file', { 'src/shared.ts': 'up\n' });
+    repo.merge('upside', 'U3: upstream merges the reconciliation');
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+
+  it('advances past the half-split state, lands GREEN, and mints nothing', async () => {
+    const repo = reconciliationBesideConflictRepo();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    const t = declRunner();
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn)).toBe(0);
+
+    const journal = readJournal(dir);
+    const cls = journal.find((e) => e.action === 'deps-missing-classified')!;
+    expect(cls.depsMissing).toBe(true);
+    expect(cls.files).toEqual(['src/request.ts']);
+    const done = journal.find((e) => e.action === 'deps-missing-repaired')!;
+    expect(done).toBeTruthy();
+    expect(done.branch).toBe('main_patched');
+    expect((done.steps as string[]).at(-1)).toMatch(/original-cleared$/);
+    // THE POINT: the propagation repaired it. Nobody was handed anything.
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    expect(journal.some((e) => e.action === 'held')).toBe(false);
+    // And the branch really carries the reconciliation now.
+    expect(repo.git('show', 'main_patched:src/request.ts')).toContain('handleAddMcpServer');
+    expect(journal.some((e) => e.action === 'landing-check' && e.branch === 'main_patched' && e.ok === true)).toBe(true);
+  });
+
+  it('an emptied original set with a NEW red is an ordinary red: the agent gets a gate fix', async () => {
+    const repo = reconciliationBesideConflictRepo();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    const t = declRunner('other-red');
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn);
+
+    const journal = readJournal(dir);
+    expect(journal.find((e) => e.action === 'deps-missing-changed')).toBeTruthy();
+    expect(journal.some((e) => e.action === 'deps-missing-exhausted')).toBe(false);
+    // The ordinary path took it from there — a case for the agent, not a hold.
+    const gate = journal.find((e) => e.action === 'gate-fix')!;
+    expect(gate.branch).toBe('main_patched');
+    expect(journal.some((e) => e.action === 'held')).toBe(false);
+    expect(openCases(journal).map((c) => c.caseId)).toContain(String(gate.caseId));
+  });
+
+  it('a walk with nowhere to go publishes a DRAFT hold headed at the first errored commit, and serves nobody', async () => {
+    const repo = unreachedRepo();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    const t = declRunner();
+    const out = join(ws, 'nc.json');
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
+    // `run` DIRECTLY: `next-case` suppresses an internal stage's issues (§11), so
+    // this id is only observable on the stage that raises it.
+    expect(await cmdRun(baseCli(repo, ws, inv, { cmd: 'run', execute: true, out }), t.fn)).toBe(0);
+
+    const journal = readJournal(dir);
+    const walked = journal.find((e) => e.action === 'deps-missing-exhausted')!;
+    expect(walked.stop).toBe('source-exhausted');
+    expect(walked.candidates).toEqual([]);
+    const landing = journal.find((e) => e.action === 'landing-check' && e.confirmed === true)!;
+    expect(walked.firstErrored).toBe(landing.sha);
+    // The branch stands where the errors first appeared, and the PR is headed there.
+    expect(repo.sha('main_patched')).toBe(landing.sha);
+    const held = journal.find((e) => e.action === 'held')!;
+    expect(held.headSha).toBe(landing.sha);
+    expect((held.escalation as { tag: string }).tag).toBe('[AUTO-ESCALATED: missing declaration not reached]');
+    // NO AGENT. The case exists to carry the report; it is never offered.
+    expect(openCases(journal).map((c) => c.caseId)).not.toContain(String(held.caseId));
+    // The driver wrote the PR text itself — there is no agent to write it.
+    const body = readFileSync(join(dir, String(held.caseId), 'pr', 'body.md'), 'utf8');
+    expect(readFileSync(join(dir, String(held.caseId), 'pr', 'title.txt'), 'utf8').trim()).not.toBe('');
+    expect(body).toContain('handleAddMcpServer');
+    expect(body).toContain('src/request.ts');
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues?: Array<{ id: string }> };
+    expect((res.issues ?? []).map((i) => i.id)).toContain('WARN23_DEPS_MISSING_HELD');
+  });
+
+  it('a step that would conflict ENDS the walk — a resolution cannot be validated on a red tree', async () => {
+    const repo = reconciliationBehindConflictRepo();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    const t = declRunner();
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn);
+
+    const journal = readJournal(dir);
+    const step = journal.filter((e) => e.action === 'deps-missing-step').at(-1)!;
+    expect(step.verdict).toBe('conflict');
+    expect(step.conflictedPaths).toEqual(['src/shared.ts']);
+    const walked = journal.find((e) => e.action === 'deps-missing-exhausted')!;
+    expect(walked.stop).toBe('conflict');
+    expect(journal.find((e) => e.action === 'held')).toBeTruthy();
+    // The branch's own conflict case was reopened with the hold: a conflict
+    // case on a red tree is unjudgeable, and nothing is left to serve.
+    expect(openCases(journal)).toHaveLength(0);
+  });
+
+  it('a command with NO missingDeclRe never takes the advance — the same red mints an ordinary gate fix', async () => {
+    const repo = unreachedRepo();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    const t = declRunner();
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws, null) }))).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn);
+
+    const journal = readJournal(dir);
+    expect(journal.find((e) => e.action === 'deps-missing-classified')!.depsMissing).toBe(false);
+    expect(journal.some((e) => e.action === 'deps-missing-exhausted')).toBe(false);
+    const gate = journal.find((e) => e.action === 'gate-fix')!;
+    expect(gate.branch).toBe('main_patched');
+    expect(journal.some((e) => e.action === 'held')).toBe(false);
+    expect(openCases(journal).map((c) => c.caseId)).toContain(String(gate.caseId));
+  });
+
+  it('an ordinary red under the SAME pattern still mints a gate fix for the agent', async () => {
+    const repo = unreachedRepo();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    // Same tree, same config — only the diagnostic class differs.
+    const fn: ChecksRunner = async (commands, cwd) => {
+      const cmds = commands.map((c) => c.cmd);
+      if (!cmds.includes('tsc --noEmit') || !halfSplit(cwd)) return { ok: true, failedNames: [], output: '' };
+      return {
+        ok: false,
+        failedNames: ['tsc --noEmit'],
+        output: `$ tsc --noEmit\nsrc/request.ts(2,14): error TS2345: Argument of type 'number' is not assignable.\n`,
+      };
+    };
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv), fn);
+
+    const journal = readJournal(dir);
+    expect(journal.find((e) => e.action === 'deps-missing-classified')!.depsMissing).toBe(false);
+    expect(journal.some((e) => e.action === 'deps-missing-step')).toBe(false);
+    const gate = journal.find((e) => e.action === 'gate-fix')!;
+    expect(gate.branch).toBe('main_patched');
+    expect(openCases(journal).map((c) => c.caseId)).toContain(String(gate.caseId));
+  });
+
+  it('the walk is taken ONCE per branch per pass — a second call re-walks nothing and mints nothing more', async () => {
+    const repo = unreachedRepo();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    const t = declRunner();
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn);
+    await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn);
+
+    const journal = readJournal(dir);
+    expect(journal.filter((e) => e.action === 'deps-missing-exhausted')).toHaveLength(1);
+    expect(journal.filter((e) => e.action === 'deps-missing-step')).toHaveLength(0);
+    expect(journal.filter((e) => e.action === 'gate-fix')).toHaveLength(1);
+    expect(journal.filter((e) => e.action === 'held')).toHaveLength(1);
+  });
+});
+
 
 /**
  * A check's verdict is a fact about the SUBTREE its `cwd` names, so branches
