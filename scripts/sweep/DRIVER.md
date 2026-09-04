@@ -2270,10 +2270,12 @@ issues are suppressed when it runs as an internal stage.
 **A CASE SERVED ALONGSIDE A HOLD CARRIES THE NOTICE.** A hold leaves its branch
 red on an error that is nobody's to fix, and the same call can still serve a
 case: the conflict stop deliberately does not reopen, so the branch's own
-conflict case is offered on that very call. Every `next-case` result that can end
-a call carrying a hold — a served case included — carries the
-`WARN23_DEPS_MISSING_HELD` issue, and a served case carries it in its materials
-as well. Without it the agent meets that red inside its case worktree, reads it
+conflict case is offered on that very call. The `next-case` results that serve or
+finalize work carry the `WARN23_DEPS_MISSING_HELD` issue, and a served case
+carries it in its materials as well. Two arms that end a call on a different
+finding of their own — a looping case, an unstable landing — report that finding
+alone; the hold is journaled either way and the next call re-raises it from the
+spent walk. Without it the agent meets that red inside its case worktree, reads it
 as its own resolution's, and starts fixing an error outside its case's scope —
 which for a missing declaration means authoring the symbol.
 
@@ -3257,7 +3259,7 @@ escalation's publish issues are written to `publish-<case>.json` and quoted into
 | `WARN19_GATE_COVERS_OTHER_DEFECT` | gate-fix minting | an active gate ref on the branch has a different failing-file digest |
 | `WARN20_ANCESTOR_GATED` | gate-fix minting | the branch descends from an ancestor that took a gate fix this pass and is still red |
 | `WARN21_CHECKS_FLAKY` | `report-case`, `run`, `next-case`, gate-fix minting | a check gave BOTH answers on the same tree: passed after a prior failure and failed again on the confirming re-run, or failed and then passed on the confirming re-run of an accusing path (landing gate, pre-merge check, ownership probe). Nothing is minted and no branch is blamed |
-| `WARN23_DEPS_MISSING_HELD` | `next-case`, `run` | a missing-declaration red is HELD for the owner (§7.7): the walk ended with the original errors still present, or the branch's walk this pass was already spent. Where a walk ran, the branch is rolled back to the commit it started on and a DRAFT PR is prepared, which `finish` publishes. No agent was asked to fix that red — and where a case IS served on the same call, this issue says which part of the red is not that case's |
+| `WARN23_DEPS_MISSING_HELD` | `next-case`, `run` | a missing-declaration red is HELD for the owner (§7.7): the walk ended with the original errors still present, or the branch's walk this pass was already spent. Where a walk ran to its own end, the branch is rolled back to the commit it started on and a DRAFT PR is prepared, which `finish` publishes; a re-entry loop stopped at its cap holds without one. No agent was asked to fix that red — and where a case IS served on the same call, this issue says which part of the red is not that case's |
 | `WARN46_CASE_LOOPING` | `next-case` | the serve count reached the warning threshold (3); emitted as the LOOP WARNING section of the case materials, not as an issue |
 
 **Reserved numbers — never reassign**: ERR03, ERR04, ERR09, ERR10, ERR19, ERR26,

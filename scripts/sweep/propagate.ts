@@ -5341,6 +5341,14 @@ async function settleDepsMissing<R extends { output: string; failed: VerifyComma
       // the half that protects the invariant: a red that still says a
       // declaration is missing is held with nothing minted, and a red that says
       // anything else is the ordinary path's, exactly as it would have been.
+      //
+      // THIS HOLD CARRIES NO OWNER DRAFT, and that is the one thing it is weaker
+      // at than the hold a spent budget produces — no rollback, no frozen case,
+      // no pull request, only the warning and this row. The cap is reached only
+      // by a branch that lands exactly one commit per round for the whole
+      // budget, which is a chain of single-commit reconciliation layers; the red
+      // still reaches the owner through the warning, and the next call re-raises
+      // it from the spent walk with the full terminal.
       const capped = classifyDepsMissing(red.failed, rootChecksOutput(red.output, red.failed));
       appendJournal(opts.dir, {
         action: 'deps-missing-reentry-capped',
@@ -11802,6 +11810,13 @@ export async function cmdSweepNextCase(
     });
     if (settled.kind === 'held') {
       depsMissingHeld = { branch: settled.branch, detail: settled.detail };
+      // THE PRE-WALK RED IS SPENT EVIDENCE. The loop can repair one branch and
+      // then hold on the NEXT one, and `redBranch` still names the branch the
+      // FIRST round measured — which the walk has since turned green. Every
+      // reader below reports it as the branch that is still red, so an owner is
+      // told a branch failed that this call just fixed. The hold carries its own
+      // branch and its own detail; nothing else here has a red to speak for.
+      redBranch = null;
       appendJournal(dir, {
         action: 'warning',
         id: 'WARN23_DEPS_MISSING_HELD',
