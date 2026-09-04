@@ -67,8 +67,9 @@ export function ensureContainerConfig(agentGroupId: string, provider?: string | 
   const stamped = normalized && normalized !== 'claude' ? normalized : null;
   getDb()
     .prepare(
-      `INSERT OR IGNORE INTO container_configs (agent_group_id, provider, updated_at)
-       VALUES (?, ?, ?)`,
+      `INSERT INTO container_configs (agent_group_id, provider, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT (agent_group_id) DO NOTHING`,
     )
     .run(agentGroupId, stamped, new Date().toISOString());
 }

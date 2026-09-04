@@ -1271,12 +1271,14 @@ describe('agent-to-agent routing', () => {
     // Wire bidirectional A2A destinations (table created by runMigrations)
     const db = getDb();
     db.prepare(
-      `INSERT OR IGNORE INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
-       VALUES ('ag-pa', 'researcher', 'agent', 'ag-researcher', ?)`,
+      `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
+       VALUES ('ag-pa', 'researcher', 'agent', 'ag-researcher', ?)
+       ON CONFLICT (agent_group_id, local_name) DO NOTHING`,
     ).run(now());
     db.prepare(
-      `INSERT OR IGNORE INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
-       VALUES ('ag-researcher', 'pa', 'agent', 'ag-pa', ?)`,
+      `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
+       VALUES ('ag-researcher', 'pa', 'agent', 'ag-pa', ?)
+       ON CONFLICT (agent_group_id, local_name) DO NOTHING`,
     ).run(now());
   });
 

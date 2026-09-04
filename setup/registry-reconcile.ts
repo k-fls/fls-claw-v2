@@ -16,12 +16,11 @@
  * Idempotent — a second run finds nothing pinned and nothing to remove.
  */
 import fs from 'fs';
-import path from 'path';
 import { spawnSync } from 'child_process';
 
 import type DatabaseType from 'better-sqlite3';
 
-import { CONTAINER_IMAGE_BASE, DATA_DIR } from '../src/config.js';
+import { CENTRAL_DB_PATH, CONTAINER_IMAGE_BASE } from '../src/config.js';
 import { CONTAINER_RUNTIME_BIN } from '../src/container-runtime.js';
 import { getAllContainerConfigs, updateContainerConfigScalars } from '../src/db/container-configs.js';
 import { getDb, hasTable, initDb } from '../src/db/connection.js';
@@ -63,7 +62,7 @@ const SAFE_IMAGE_REF = /^[a-zA-Z0-9][a-zA-Z0-9_.\-/]*:[a-zA-Z0-9][a-zA-Z0-9_.-]*
 export function reconcileDerivedImages(): ReconcileResult {
   const result = emptyResult();
 
-  const dbPath = path.join(DATA_DIR, 'v2.db');
+  const dbPath = CENTRAL_DB_PATH;
   if (!fs.existsSync(dbPath)) {
     // First install: no central DB, so no group has ever built a derived
     // image. Bail before initDb, which would create an empty file here.

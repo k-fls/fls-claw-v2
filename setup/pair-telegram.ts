@@ -18,8 +18,6 @@
  * excluded from the host tsconfig, so this file's import resolves only at
  * runtime — tsc won't complain on branches that haven't run add-telegram yet.
  */
-import path from 'path';
-
 import * as p from '@clack/prompts';
 
 import {
@@ -27,7 +25,7 @@ import {
   waitForPairing,
   type PairingIntent,
 } from '../src/channels/telegram-pairing.js';
-import { DATA_DIR } from '../src/config.js';
+import { CENTRAL_DB_PATH } from '../src/config.js';
 import { initDb } from '../src/db/connection.js';
 import { runMigrations } from '../src/db/migrations/index.js';
 
@@ -87,7 +85,7 @@ export async function run(args: string[]): Promise<void> {
   // pairing primitive itself, but the inbound interceptor running inside the
   // live service needs migrations applied. Touch it here so a fresh install
   // doesn't fail on the first code match.
-  const db = initDb(path.join(DATA_DIR, 'v2.db'));
+  const db = initDb(CENTRAL_DB_PATH);
   runMigrations(db);
 
   const MAX_REGENERATIONS = 5;

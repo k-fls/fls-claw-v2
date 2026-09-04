@@ -20,7 +20,7 @@ import { DockerSessionDriver } from './docker-driver.js';
 import { FakeCli } from './fake-cli.js';
 import { withSessionEvents, type SessionEventsDriver } from './session-events.js';
 import { FIXTURE_POLICY, fixtureSpec, fixtureSpecWithAux } from './spec-fixture.js';
-import { GROUP_FOLDER_LABEL, LABELS, validateSpec, type SessionDriver, type SessionSpec } from './types.js';
+import { GROUP_FOLDER_LABEL, LABELS, validateSpec, type SessionSpec } from './types.js';
 
 vi.mock('../log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },

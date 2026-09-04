@@ -18,13 +18,11 @@
  *     --display-name "Gavriel" \
  *     [--agent-name "Andy"]
  */
-import path from 'path';
-
 // Registration-only: makes the in-tree cli adapter's declared defaults
 // (pattern '.', no threads, 'public') resolvable below.
 import '../src/channels/index.js';
 import { resolveUnknownSenderPolicy, resolveWiringDefaults } from '../src/channels/channel-defaults.js';
-import { DATA_DIR } from '../src/config.js';
+import { CENTRAL_DB_PATH } from '../src/config.js';
 import { createAgentGroup, getAgentGroupByFolder } from '../src/db/agent-groups.js';
 import { initDb } from '../src/db/connection.js';
 import {
@@ -88,7 +86,7 @@ function generateId(prefix: string): string {
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
-  const db = initDb(path.join(DATA_DIR, 'v2.db'));
+  const db = initDb(CENTRAL_DB_PATH);
   runMigrations(db);
 
   const now = new Date().toISOString();

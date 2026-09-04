@@ -83,6 +83,9 @@ export interface ResourceDef {
     update?: Access;
     delete?: Access;
   };
+  /** Portable ORDER BY expression for list. Defaults to the first timestamp
+   * column descending, then the resource id for deterministic ties. */
+  listOrder?: string;
   /**
    * Columns forming a natural unique key. When set, generic `create` is
    * idempotent: if a row already matches on these columns it is returned
@@ -161,18 +164,43 @@ function visibleColumns(def: ResourceDef): string[] {
   return def.columns.map((c) => c.name);
 }
 
+function coerceListFilter(column: ColumnDef, value: unknown): unknown {
+  switch (column.type) {
+    case 'number': {
+      const number = Number(value);
+      if (Number.isNaN(number)) throw new Error(`--${column.name.replace(/_/g, '-')} must be a number`);
+      return number;
+    }
+    case 'boolean':
+      if (value === true || value === 'true' || value === '1' || value === 1) return 1;
+      if (value === false || value === 'false' || value === '0' || value === 0) return 0;
+      throw new Error(`--${column.name.replace(/_/g, '-')} must be true or false`);
+    case 'json':
+      return typeof value === 'string' ? value : JSON.stringify(value);
+    case 'string':
+      return String(value);
+  }
+}
+
+function listOrder(def: ResourceDef): string {
+  if (def.listOrder) return def.listOrder;
+  const timestamp = def.columns.find((column) => column.name.endsWith('_at'))?.name;
+  return timestamp ? `${timestamp} DESC, ${def.idColumn}` : def.idColumn;
+}
+
 function genericList(def: ResourceDef) {
   const cols = visibleColumns(def).join(', ');
-  const filterableNames = new Set(def.columns.filter((c) => !c.generated).map((c) => c.name));
+  const filterableColumns = new Map(def.columns.filter((c) => !c.generated).map((c) => [c.name, c]));
   return async (args: Record<string, unknown>) => {
     const limit = args.limit !== undefined ? Math.max(1, Number(args.limit)) : 200;
     const filters: string[] = [];
     const params: unknown[] = [];
     for (const [k, v] of Object.entries(args)) {
       if (k === 'id' || k === 'limit') continue;
-      if (filterableNames.has(k)) {
+      const column = filterableColumns.get(k);
+      if (column) {
         filters.push(`${k} = ?`);
-        params.push(v);
+        params.push(coerceListFilter(column, v));
       }
     }
     const where = filters.length > 0 ? ` WHERE ${filters.join(' AND ')}` : '';
@@ -181,7 +209,7 @@ function genericList(def: ResourceDef) {
     // recently inserted rows once a table outgrows it (bit `sessions list`
     // past 200 sessions — a just-created session was invisible).
     return getDb()
-      .prepare(`SELECT ${cols} FROM ${def.table}${where} ORDER BY rowid DESC LIMIT ?`)
+      .prepare(`SELECT ${cols} FROM ${def.table}${where} ORDER BY ${listOrder(def)} LIMIT ?`)
       .all(...params);
   };
 }
@@ -418,8 +446,8 @@ export function validateArgs(
         if (typeof v === 'string') {
           try {
             out[def.name] = JSON.parse(v);
-          } catch {
-            throw new Error(`${flag} must be valid JSON`);
+          } catch (err) {
+            throw new Error(`${flag} must be valid JSON`, { cause: err });
           }
         }
         break;
@@ -524,7 +552,7 @@ export function registerResource(def: ResourceDef): void {
               } catch (e) {
                 const usage = renderVerbHelp(def, verb);
                 const msg = e instanceof Error ? e.message : String(e);
-                throw new Error(usage ? `${msg}\n\n${usage}` : msg);
+                throw new Error(usage ? `${msg}\n\n${usage}` : msg, { cause: e });
               }
             }
           : (raw) => normalizeArgs(raw),

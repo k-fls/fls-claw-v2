@@ -40,8 +40,9 @@ registerResource({
         if (!groupId) throw new Error('--group is required');
         getDb()
           .prepare(
-            `INSERT OR IGNORE INTO agent_group_members (user_id, agent_group_id, added_by, added_at)
-             VALUES (?, ?, ?, ?)`,
+            `INSERT INTO agent_group_members (user_id, agent_group_id, added_by, added_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT (user_id, agent_group_id) DO NOTHING`,
           )
           .run(userId, groupId, addedBy, new Date().toISOString());
         return { user_id: userId, agent_group_id: groupId };

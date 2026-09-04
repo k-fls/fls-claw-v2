@@ -138,7 +138,7 @@ let running = false;
 export function startHostSweep(): void {
   if (running) return;
   running = true;
-  sweep();
+  void sweep();
 }
 
 export function stopHostSweep(): void {
@@ -179,7 +179,7 @@ async function sweep(): Promise<void> {
   }
   // MODULE-HOOK:approvals-reason-sweep:end
 
-  setTimeout(sweep, SWEEP_INTERVAL_MS);
+  setTimeout(() => void sweep(), SWEEP_INTERVAL_MS);
 }
 
 /** A per-task session with no live tasks and no running container is spent → close it. */

@@ -3,9 +3,7 @@
  *
  * Usage: pnpm exec tsx scripts/seed-discord.ts
  */
-import path from 'path';
-
-import { DATA_DIR } from '../src/config.js';
+import { CENTRAL_DB_PATH } from '../src/config.js';
 import { initDb } from '../src/db/connection.js';
 import { runMigrations } from '../src/db/migrations/index.js';
 import { createAgentGroup, getAgentGroup } from '../src/db/agent-groups.js';
@@ -15,7 +13,7 @@ import {
   getMessagingGroup,
 } from '../src/db/messaging-groups.js';
 
-const db = initDb(path.join(DATA_DIR, 'v2.db'));
+const db = initDb(CENTRAL_DB_PATH);
 runMigrations(db);
 
 const AGENT_GROUP_ID = 'ag-main';

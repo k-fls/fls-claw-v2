@@ -11,7 +11,7 @@ import path from 'path';
 
 import Database from 'better-sqlite3';
 
-import { DATA_DIR } from '../src/config.js';
+import { CENTRAL_DB_PATH } from '../src/config.js';
 import { readEnvFile } from '../src/env.js';
 import { log } from '../src/log.js';
 import { getLaunchdLabel, getSystemdUnit } from '../src/install-slug.js';
@@ -200,7 +200,7 @@ export async function run(_args: string[]): Promise<void> {
   //    partially migrated DB must not hide one behind the other's failure.
   let registeredGroups = 0;
   let derivedGroups = 0;
-  const dbPath = path.join(DATA_DIR, 'v2.db');
+  const dbPath = CENTRAL_DB_PATH;
   if (fs.existsSync(dbPath)) {
     let db: Database.Database | null = null;
     try {

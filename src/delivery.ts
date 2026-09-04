@@ -133,14 +133,14 @@ export function setDeliveryAdapter(adapter: ChannelDeliveryAdapter): void {
 export function startActiveDeliveryPoll(): void {
   if (activePolling) return;
   activePolling = true;
-  pollActive();
+  void pollActive();
 }
 
 /** Start the sweep poll loop (~60s). */
 export function startSweepDeliveryPoll(): void {
   if (sweepPolling) return;
   sweepPolling = true;
-  pollSweep();
+  void pollSweep();
 }
 
 async function pollActive(): Promise<void> {
@@ -155,7 +155,7 @@ async function pollActive(): Promise<void> {
     log.error('Active delivery poll error', { err });
   }
 
-  setTimeout(pollActive, ACTIVE_POLL_MS);
+  setTimeout(() => void pollActive(), ACTIVE_POLL_MS);
 }
 
 async function pollSweep(): Promise<void> {
@@ -170,7 +170,7 @@ async function pollSweep(): Promise<void> {
     log.error('Sweep delivery poll error', { err });
   }
 
-  setTimeout(pollSweep, SWEEP_POLL_MS);
+  setTimeout(() => void pollSweep(), SWEEP_POLL_MS);
 }
 
 export async function deliverSessionMessages(session: Session): Promise<void> {

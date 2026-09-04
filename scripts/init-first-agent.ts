@@ -43,7 +43,7 @@ import path from 'path';
 import '../src/channels/index.js';
 import { resolveUnknownSenderPolicy, resolveWiringDefaults } from '../src/channels/channel-defaults.js';
 import { hasDeclaredChannelDefaults } from '../src/channels/channel-registry.js';
-import { DATA_DIR, GROUPS_DIR } from '../src/config.js';
+import { CENTRAL_DB_PATH, DATA_DIR, GROUPS_DIR } from '../src/config.js';
 import { createAgentGroup, getAgentGroup, getAgentGroupByFolder } from '../src/db/agent-groups.js';
 import { initDb } from '../src/db/connection.js';
 import {
@@ -231,7 +231,7 @@ function wireIfMissing(mg: MessagingGroup, ag: AgentGroup, now: string, label: s
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
-  const db = initDb(path.join(DATA_DIR, 'v2.db'));
+  const db = initDb(CENTRAL_DB_PATH);
   runMigrations(db); // idempotent
 
   const now = new Date().toISOString();

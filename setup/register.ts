@@ -17,7 +17,7 @@ import {
   validateEngageAgainstChannel,
 } from '../src/channels/channel-defaults.js';
 import { hasDeclaredChannelDefaults } from '../src/channels/channel-registry.js';
-import { DATA_DIR } from '../src/config.js';
+import { CENTRAL_DB_PATH } from '../src/config.js';
 import { initDb } from '../src/db/connection.js';
 import { runMigrations } from '../src/db/migrations/index.js';
 import { createAgentGroup, getAgentGroupByFolder } from '../src/db/agent-groups.js';
@@ -181,8 +181,7 @@ export async function run(args: string[]): Promise<void> {
 
   // Init v2 central DB
   fs.mkdirSync(path.join(projectRoot, 'data'), { recursive: true });
-  const dbPath = path.join(DATA_DIR, 'v2.db');
-  const db = initDb(dbPath);
+  const db = initDb(CENTRAL_DB_PATH);
   runMigrations(db);
 
   // 1. Create or find agent group. The workspace is scaffolded at the first

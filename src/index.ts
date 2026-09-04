@@ -4,10 +4,8 @@
  * Thin orchestrator: init DB, run migrations, start channel adapters,
  * start delivery polls, start sweep, handle shutdown.
  */
-import path from 'path';
-
 import { backfillContainerConfigs } from './backfill-container-configs.js';
-import { DATA_DIR } from './config.js';
+import { CENTRAL_DB_PATH } from './config.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
 import { adoptRunningSessions } from './container-runner.js';
 import { initDb } from './db/connection.js';
@@ -72,10 +70,9 @@ async function main(): Promise<void> {
   enforceUpgradeTripwire();
 
   // 1. Init central DB
-  const dbPath = path.join(DATA_DIR, 'v2.db');
-  const db = initDb(dbPath);
+  const db = initDb(CENTRAL_DB_PATH);
   runMigrations(db);
-  log.info('Central DB ready', { path: dbPath });
+  log.info('Central DB ready', { path: CENTRAL_DB_PATH });
 
   // 1b. Backfill container_configs from legacy container.json files.
   // Idempotent — skips groups that already have a config row.
@@ -189,8 +186,8 @@ async function shutdown(signal: string): Promise<void> {
   }
 }
 
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
 
 main().catch((err) => {
   log.fatal('Startup failed', { err });

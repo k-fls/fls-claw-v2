@@ -41,7 +41,11 @@ const hostConfig = {
 /** Drive a Chat process* dispatcher and await its internal task. */
 async function dispatch(fire: (options: { waitUntil: (p: Promise<unknown>) => void }) => void): Promise<void> {
   let task: Promise<unknown> | undefined;
-  fire({ waitUntil: (p) => (task = p) });
+  fire({
+    waitUntil: (p) => {
+      task = p;
+    },
+  });
   await task;
 }
 

@@ -305,7 +305,7 @@ export function ensureAgentDestinationForWiring(mga: MessagingGroupAgent): void 
 
 export function getMessagingGroupAgents(messagingGroupId: string): MessagingGroupAgent[] {
   return getDb()
-    .prepare('SELECT * FROM messaging_group_agents WHERE messaging_group_id = ? ORDER BY priority DESC')
+    .prepare('SELECT * FROM messaging_group_agents WHERE messaging_group_id = ? ORDER BY priority DESC, id')
     .all(messagingGroupId) as MessagingGroupAgent[];
 }
 

@@ -15,7 +15,7 @@ import path from 'path';
 
 import Database from 'better-sqlite3';
 
-import { DATA_DIR } from '../../src/config.js';
+import { CENTRAL_DB_PATH, DATA_DIR } from '../../src/config.js';
 import { initDb, closeDb } from '../../src/db/connection.js';
 import { getAgentGroupByFolder } from '../../src/db/agent-groups.js';
 import { getMessagingGroupByPlatform } from '../../src/db/messaging-groups.js';
@@ -94,7 +94,7 @@ async function main(): Promise<void> {
   }
 
   // Init v2 central DB
-  const v2DbPath = path.join(DATA_DIR, 'v2.db');
+  const v2DbPath = CENTRAL_DB_PATH;
   if (!fs.existsSync(v2DbPath)) {
     console.error('v2.db not found — run db step first');
     process.exit(1);

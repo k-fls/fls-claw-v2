@@ -779,7 +779,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           const startedAt = Date.now();
           // Capture the long-running listener promise via waitUntil
           let listenerPromise: Promise<unknown> | undefined;
-          gatewayAdapter.startGatewayListener!(
+          void gatewayAdapter.startGatewayListener!(
             {
               waitUntil: (p: Promise<unknown>) => {
                 listenerPromise = p;
@@ -814,7 +814,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
               }
               setTimeout(startGateway, delayMs);
             };
-            listenerPromise.then(() => reschedule()).catch(reschedule);
+            void listenerPromise.then(() => reschedule()).catch(reschedule);
           });
         };
         startGateway();

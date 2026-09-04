@@ -12,7 +12,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { DATA_DIR } from '../src/config.js';
+import { CENTRAL_DB_PATH, DATA_DIR } from '../src/config.js';
 import { getAgentGroupByFolder, deleteAgentGroup } from '../src/db/agent-groups.js';
 import { initDb } from '../src/db/connection.js';
 import { runMigrations } from '../src/db/migrations/index.js';
@@ -36,7 +36,7 @@ function parseArgs(): Args {
 
 const args = parseArgs();
 
-const db = initDb(path.join(DATA_DIR, 'v2.db'));
+const db = initDb(CENTRAL_DB_PATH);
 runMigrations(db);
 
 const ag = getAgentGroupByFolder(args.folder);

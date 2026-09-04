@@ -153,8 +153,9 @@ export function deleteSession(id: string): void {
 export function createPendingQuestion(pq: PendingQuestion): boolean {
   const result = getDb()
     .prepare(
-      `INSERT OR IGNORE INTO pending_questions (question_id, session_id, message_out_id, platform_id, channel_type, thread_id, title, options_json, created_at)
-       VALUES (@question_id, @session_id, @message_out_id, @platform_id, @channel_type, @thread_id, @title, @options_json, @created_at)`,
+      `INSERT INTO pending_questions (question_id, session_id, message_out_id, platform_id, channel_type, thread_id, title, options_json, created_at)
+       VALUES (@question_id, @session_id, @message_out_id, @platform_id, @channel_type, @thread_id, @title, @options_json, @created_at)
+       ON CONFLICT (question_id) DO NOTHING`,
     )
     .run({
       question_id: pq.question_id,
@@ -199,14 +200,15 @@ export function createPendingApproval(
 ): boolean {
   const result = getDb()
     .prepare(
-      `INSERT OR IGNORE INTO pending_approvals
+      `INSERT INTO pending_approvals
          (approval_id, session_id, request_id, action, payload, created_at,
           agent_group_id, channel_type, platform_id, platform_message_id, expires_at, status,
           title, question, options_json, approver_user_id)
        VALUES
          (@approval_id, @session_id, @request_id, @action, @payload, @created_at,
           @agent_group_id, @channel_type, @platform_id, @platform_message_id, @expires_at, @status,
-          @title, @question, @options_json, @approver_user_id)`,
+          @title, @question, @options_json, @approver_user_id)
+       ON CONFLICT (approval_id) DO NOTHING`,
     )
     .run({
       session_id: null,

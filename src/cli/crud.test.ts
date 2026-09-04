@@ -69,11 +69,70 @@ registerResource({
   },
 });
 
+registerResource({
+  name: 'listtest',
+  plural: 'listtests',
+  table: 'listtest_rows',
+  description: 'Synthetic resource for portable list filtering and ordering.',
+  idColumn: 'id',
+  columns: [
+    { name: 'id', type: 'string', description: 'ID.', generated: true },
+    { name: 'enabled', type: 'boolean', description: 'Boolean filter.' },
+    { name: 'score', type: 'number', description: 'Numeric filter.' },
+    { name: 'payload', type: 'json', description: 'JSON filter.' },
+    { name: 'created_at', type: 'string', description: 'Timestamp.', generated: true },
+  ],
+  operations: { list: 'open' },
+});
+
 beforeEach(() => {
   const db = initTestDb();
   runMigrations(db);
   ensureContainerConfigSpy.mockClear();
   writeDestinationsSpy.mockClear();
+  getDb().exec(
+    `CREATE TABLE listtest_rows (
+      id TEXT PRIMARY KEY,
+      enabled INTEGER NOT NULL,
+      score INTEGER NOT NULL,
+      payload TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`,
+  );
+});
+
+describe('genericList portable filters and ordering', () => {
+  beforeEach(() => {
+    const insert = getDb().prepare(
+      'INSERT INTO listtest_rows (id, enabled, score, payload, created_at) VALUES (?, ?, ?, ?, ?)',
+    );
+    insert.run('b', 1, 2, '{"kind":"match"}', '2026-08-17T10:00:00.000Z');
+    insert.run('a', 1, 2, '{"kind":"match"}', '2026-08-17T10:00:00.000Z');
+    insert.run('c', 0, 3, '{"kind":"other"}', '2026-08-17T11:00:00.000Z');
+  });
+
+  it('coerces boolean, number, and JSON filters by column type', async () => {
+    const rows = (await lookup('listtests-list')!.handler(
+      { enabled: 'true', score: '2', payload: { kind: 'match' } },
+      hostCtx,
+    )) as Array<{ id: string }>;
+
+    expect(rows.map((row) => row.id)).toEqual(['a', 'b']);
+  });
+
+  it('orders by the first timestamp descending and the id as a stable tie-breaker', async () => {
+    const rows = (await lookup('listtests-list')!.handler({}, hostCtx)) as Array<{ id: string }>;
+    expect(rows.map((row) => row.id)).toEqual(['c', 'a', 'b']);
+  });
+
+  it('rejects invalid typed filters', async () => {
+    await expect(lookup('listtests-list')!.handler({ enabled: 'sometimes' }, hostCtx)).rejects.toThrow(
+      '--enabled must be true or false',
+    );
+    await expect(lookup('listtests-list')!.handler({ score: 'many' }, hostCtx)).rejects.toThrow(
+      '--score must be a number',
+    );
+  });
 });
 
 afterEach(() => {

@@ -52,7 +52,7 @@ export function restartAgentGroupContainers(agentGroupId: string, reason: string
       wakeMessage || hasPending
         ? () => {
             const s = getSession(session.id);
-            if (s) wakeContainer(s);
+            if (s) void wakeContainer(s);
           }
         : undefined,
     );

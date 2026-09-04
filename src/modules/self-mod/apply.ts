@@ -78,7 +78,7 @@ export async function applyInstallPackages(payload: Record<string, unknown>, ses
     });
     killContainer(session.id, 'rebuild applied', () => {
       const s = getSession(session.id);
-      if (s) wakeContainer(s);
+      if (s) void wakeContainer(s);
     });
     log.info('Container rebuild completed (bundled with install)', { agentGroupId: session.agent_group_id });
   } catch (e) {
@@ -152,7 +152,7 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
   });
   killContainer(session.id, 'mcp server added', () => {
     const s = getSession(session.id);
-    if (s) wakeContainer(s);
+    if (s) void wakeContainer(s);
   });
   log.info('MCP server add approved', { agentGroupId: session.agent_group_id });
 }

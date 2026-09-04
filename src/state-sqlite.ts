@@ -68,7 +68,10 @@ export class SqliteStateAdapter implements StateAdapter {
   async set<T = unknown>(key: string, value: T, ttlMs?: number): Promise<void> {
     const expiresAt = ttlMs ? Date.now() + ttlMs : null;
     this.db
-      .prepare('INSERT OR REPLACE INTO chat_sdk_kv (key, value, expires_at) VALUES (?, ?, ?)')
+      .prepare(
+        `INSERT INTO chat_sdk_kv (key, value, expires_at) VALUES (?, ?, ?)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at`,
+      )
       .run(this.k(key), JSON.stringify(value), expiresAt);
   }
 
@@ -82,7 +85,7 @@ export class SqliteStateAdapter implements StateAdapter {
     }
     const expiresAt = ttlMs ? Date.now() + ttlMs : null;
     const result = this.db
-      .prepare('INSERT OR IGNORE INTO chat_sdk_kv (key, value, expires_at) VALUES (?, ?, ?)')
+      .prepare('INSERT INTO chat_sdk_kv (key, value, expires_at) VALUES (?, ?, ?) ON CONFLICT (key) DO NOTHING')
       .run(k, JSON.stringify(value), expiresAt);
     return result.changes > 0;
   }
@@ -94,7 +97,12 @@ export class SqliteStateAdapter implements StateAdapter {
   // --- Subscriptions ---
 
   async subscribe(threadId: string): Promise<void> {
-    this.db.prepare('INSERT OR REPLACE INTO chat_sdk_subscriptions (thread_id) VALUES (?)').run(this.k(threadId));
+    this.db
+      .prepare(
+        `INSERT INTO chat_sdk_subscriptions (thread_id, subscribed_at) VALUES (?, ?)
+         ON CONFLICT (thread_id) DO UPDATE SET subscribed_at = excluded.subscribed_at`,
+      )
+      .run(this.k(threadId), new Date().toISOString());
   }
 
   async unsubscribe(threadId: string): Promise<void> {
@@ -117,7 +125,10 @@ export class SqliteStateAdapter implements StateAdapter {
     const k = this.k(threadId);
     this.db.prepare('DELETE FROM chat_sdk_locks WHERE thread_id = ? AND expires_at < ?').run(k, now);
     const result = this.db
-      .prepare('INSERT OR IGNORE INTO chat_sdk_locks (thread_id, token, expires_at) VALUES (?, ?, ?)')
+      .prepare(
+        `INSERT INTO chat_sdk_locks (thread_id, token, expires_at) VALUES (?, ?, ?)
+         ON CONFLICT (thread_id) DO NOTHING`,
+      )
       .run(k, token, expiresAt);
     if (result.changes === 0) return null;
     // The Lock carries the RAW threadId; release/extend re-apply k() at
@@ -152,10 +163,10 @@ export class SqliteStateAdapter implements StateAdapter {
   async appendToList(key: string, value: unknown, options?: { maxLength?: number; ttlMs?: number }): Promise<void> {
     const expiresAt = options?.ttlMs ? Date.now() + options.ttlMs : null;
     const k = this.k(key);
-    const maxRow = this.db.prepare('SELECT MAX(idx) as maxIdx FROM chat_sdk_lists WHERE key = ?').get(k) as
-      | { maxIdx: number | null }
+    const maxRow = this.db.prepare('SELECT MAX(idx) AS max_idx FROM chat_sdk_lists WHERE key = ?').get(k) as
+      | { max_idx: number | null }
       | undefined;
-    const nextIdx = (maxRow?.maxIdx ?? -1) + 1;
+    const nextIdx = (maxRow?.max_idx ?? -1) + 1;
     this.db
       .prepare('INSERT INTO chat_sdk_lists (key, idx, value, expires_at) VALUES (?, ?, ?, ?)')
       .run(k, nextIdx, JSON.stringify(value), expiresAt);
