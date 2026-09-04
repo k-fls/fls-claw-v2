@@ -2077,31 +2077,39 @@ its own ruling.
 A MISSING-SYMBOL ERROR MEANS THE DECLARATION IS ELSEWHERE IN THE CHAIN, so the
 driver advances the walk toward it rather than asking anyone to write it.
 
+**BOTH RED ENTRY POINTS CLASSIFY, ALWAYS.** A branch turns red under the landing
+gate (§7.6) after a merge lands, and a branch can be red BEFORE any merge, caught
+by the pre-merge branch check (§6.2) — a branch resting inside an unmerged
+upstream feature branch is red AT ITS OWN TIP on every pass, so it never reaches
+a landing gate at all. On both, the classification is asked BEFORE ceiling
+attribution and before any destructive step, because attribution is the first
+move of handing a red to somebody and this red is handed to nobody. A branch
+outside the pass's resolved scope keeps the ordinary path — the advance writes
+refs through the N1 guard, and a ref the pass only READS from is not the sweep's
+to move.
+
 **THE WALK IS FOR A RED THAT SURVIVES THE BRANCH'S OWN PROPAGATION.** A branch
 that is merely BEHIND reports a missing declaration for the plainest reason there
 is: the declaration is in the content it has not merged yet. That is ordinary
 propagation — a clean merge, or a conflict case this sweep serves every pass —
 and the missing symbol is a symptom of it, not a separate condition. So on the
-PRE-MERGE branch check (§6.2), which measures a branch BEFORE the pass attempts
-any of its pending work, the classification is not even ASKED while the branch
-has commits pending over the lines it takes content from (`merge`/`case`
-parents — the same range the candidate search runs over). Propagation goes first;
-what is still red afterwards is this rule's business. The LANDING GATE (§7.6) sits
-after those merges by construction and needs no such test.
+PRE-MERGE check, a red that classifies `deps-missing` on a branch with commits
+pending over the lines it takes content from (`merge`/`case` parents — the same
+range the candidate search runs over) GATES NOTHING: no mint, no walk, no report,
+and the pass merges into that branch normally. The LANDING GATE then re-measures
+it and owns whatever stands, which is where the walk belongs.
 
-**BOTH RED ENTRY POINTS TAKE IT, under that ordering.** A branch turns red under
-the landing gate after a merge lands, and a branch can be red BEFORE any merge
-with NOTHING pending — a branch resting inside an unmerged upstream feature
-branch that has taken everything its parents offer is red AT ITS OWN TIP on every
-pass, so it never reaches a landing gate at all, and no merge this pass could make
-would change the answer. That red is classified rather than minted to an agent.
-Both entry points then advance the same way, with the same bound, the same stop
-conditions and the same terminal outcomes; on both, the classification is asked
-BEFORE ceiling attribution and before any destructive step, because attribution
-is the first move of handing a red to somebody and this red is handed to nobody.
-A branch outside the pass's resolved scope keeps the ordinary path — the advance
-writes refs through the N1 guard, and a ref the pass only READS from is not the
-sweep's to move.
+THAT IS A DELIBERATE EXCEPTION to the rule the pre-merge check otherwise
+enforces, and it is narrow. The check refuses to merge into a red branch because
+the red would afterwards be indistinguishable from the damage the merge did. FOR
+THIS RED THE REASONING INVERTS: the branch is red BECAUSE it is behind, the
+pending content is what declares the missing symbol, and taking it is the cure
+rather than the risk. Both halves of the answer are required — the red classifies
+`deps-missing` AND the branch has pending work — and every other red still stops
+the pass exactly as before. What the pre-merge check is left holding is the case
+it alone can see: a red branch with NOTHING pending, where no merge this pass
+could make would change the answer, and which is classified rather than minted to
+an agent.
 
 The walk enumerates the whole DAG, both parents (§4.2), so a branch can come to
 rest on a commit INSIDE an unmerged upstream feature branch — a work-in-progress
@@ -2224,11 +2232,16 @@ question this walk has no standing to keep answering. Three outcomes:
   machinery already adjudicate. The reopen the other stops take is skipped here
   for the same reason: superseding the branch's own conflict case would destroy
   the one move that reaches the declaration.
+- **UNMEASURED** ⇒ no verdict was taken, so nothing is established and nothing is
+  reported: the branch is ROLLED BACK off the tip nothing verified, and that is
+  all. An environment fault is the WARN13/WARN14 shape — measure again later —
+  and latching a branch behind an owner's issue until a human closes it would
+  make a missing toolchain permanent. Nothing is reopened either: a reopen
+  supersedes live cases, and nothing replaces them here.
 - **Still present when the walk ends with nothing left to reach** (bound reached,
-  source exhausted, unmeasured) ⇒ the branch is ROLLED BACK to THE COMMIT THE
-  WALK STARTED ON, its descendants are reopened as the ordinary red path reopens
-  them, and an ISSUE is written for the owner with NO agent involved; `finish`
-  opens it. That commit is read straight off the walk, with nothing bisected —
+  source exhausted) ⇒ the branch is ROLLED BACK to THE COMMIT THE WALK STARTED
+  ON, its descendants are reopened as the ordinary red path reopens them, and an
+  ISSUE is written for the owner with NO agent involved; `finish` opens it. That commit is read straight off the walk, with nothing bisected —
   every step reported the original errors, so the walk establishes nothing
   earlier than its own start, and the body says exactly that rather than claiming
   the errors first appeared there. The advanced tip is a state nothing verified
@@ -2291,8 +2304,8 @@ but a lift onto an in-pass ancestor mints under a FRESH key — the same breach
 through a side door.
 
 **The evidence is the journal**, in rows that read as facts:
-`deps-missing-propagation-first` (a pre-merge red the classifier was not asked
-about, with the sources and the pending count that answer why),
+`deps-missing-propagation-first` (a classified `deps-missing` red the pass merges
+into instead of walking, with the sources and the pending count that say why),
 `deps-missing-classified` (the verdict, the commands, the files, the error keys
 and the matched lines), `deps-missing-step` (one per step, with its verdict and
 the surviving keys), `deps-missing-repaired` / `deps-missing-changed` /
@@ -3299,7 +3312,7 @@ escalation's publish issues are written to `publish-<case>.json` and quoted into
 | `WARN19_GATE_COVERS_OTHER_DEFECT` | gate-fix minting | an active gate ref on the branch has a different failing-file digest |
 | `WARN20_ANCESTOR_GATED` | gate-fix minting | the branch descends from an ancestor that took a gate fix this pass and is still red |
 | `WARN21_CHECKS_FLAKY` | `report-case`, `run`, `next-case`, gate-fix minting | a check gave BOTH answers on the same tree: passed after a prior failure and failed again on the confirming re-run, or failed and then passed on the confirming re-run of an accusing path (landing gate, pre-merge check, ownership probe). Nothing is minted and no branch is blamed |
-| `WARN23_DEPS_MISSING_HELD` | `next-case`, `run` | a missing-declaration red is HELD (§7.7): the walk ended with the original errors still present, or the branch's walk this pass was already spent. Where the walk ran out of anything to reach, the branch is rolled back to the commit it started on and an ISSUE is written for the owner, which `finish` opens; where it stopped on a CONFLICT, that conflict is served as an ordinary case and nothing is minted or reported; a re-entry loop stopped at its cap holds with neither. No agent was asked to fix that red — and where a case IS served on the same call, this issue says which part of the red is not that case's |
+| `WARN23_DEPS_MISSING_HELD` | `next-case`, `run` | a missing-declaration red is NOT BEING SERVED TO ANYBODY (§7.7), in one of two shapes. HELD: the walk ended with the original errors still present, or the branch's walk this pass was already spent — where the walk ran out of anything to reach the branch is rolled back and an ISSUE is written for the owner, which `finish` opens; where it stopped on a CONFLICT that conflict is served as an ordinary case; an unmeasured walk and a re-entry loop at its cap report neither. LEFT TO PROPAGATION: the branch is behind, so the pass merges the content that declares the symbol instead of serving the red. No agent was asked to fix it either way — and where a case IS served on the same call, this issue says which part of the red is not that case's |
 | `WARN46_CASE_LOOPING` | `next-case` | the serve count reached the warning threshold (3); emitted as the LOOP WARNING section of the case materials, not as an issue |
 
 **Reserved numbers — never reassign**: ERR03, ERR04, ERR09, ERR10, ERR19, ERR26,

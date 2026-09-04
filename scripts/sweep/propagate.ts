@@ -4851,6 +4851,14 @@ async function journaledRollback(
 type DepsMissingAdvance =
   /** Not this shape — the ordinary gate-fix path takes it, unchanged. */
   | { kind: 'not-deps-missing' }
+  /**
+   * THIS SHAPE, ON A BRANCH THAT IS SIMPLY BEHIND: the declaration is in the
+   * content it has not merged yet. Nothing is walked, nothing is minted and
+   * nothing is reported — the pass merges that content instead, and the landing
+   * gate measures whatever stands afterwards. Pre-merge only: after a merge
+   * there is nothing left to wait for.
+   */
+  | { kind: 'behind'; verdict: DepsMissingVerdict; pending: number; sources: string[] }
   /** This shape, on a branch whose walk this pass already took: a hold, never a mint. */
   | { kind: 'spent'; verdict: DepsMissingVerdict }
   /** The walk ran, and its outcome says what happens next. */
@@ -4867,17 +4875,21 @@ type DepsMissingAdvance =
  * driver walks toward it instead of minting a case, because the only thing an
  * agent can do with a missing symbol is write a second one.
  *
- * BOTH RED ENTRY POINTS COME HERE, ON A RED THAT SURVIVED THE BRANCH'S OWN
- * PROPAGATION. A branch turns red under the landing gate (§7.6) after a merge
- * lands; a branch can also be red BEFORE any merge with NOTHING pending over
- * the lines it takes from, caught by the pre-merge branch check — a branch
- * resting inside an unmerged upstream feature branch that has taken everything
- * its parents offer is red at its tip on every pass and never reaches a landing
- * gate at all. A branch that is merely BEHIND is neither, and its caller does
- * not bring it here: the declaration is in the content it has not merged yet,
- * which is propagation's to deliver. The two entry points differ only in what
- * they hand in — a landing verdict, or a pre-merge red — so they hand in the
- * same three facts and share one algorithm.
+ * BOTH RED ENTRY POINTS COME HERE, AND BOTH CLASSIFY. A branch turns red under
+ * the landing gate (§7.6) after a merge lands, and a branch can be red BEFORE
+ * any merge, caught by the pre-merge branch check — a branch resting inside an
+ * unmerged upstream feature branch is red at its tip on every pass and never
+ * reaches a landing gate at all. The two differ only in what they hand in — a
+ * landing verdict, or a pre-merge red — so they hand in the same three facts and
+ * share one algorithm.
+ *
+ * THE WALK IS FOR A RED THAT SURVIVES THE BRANCH'S OWN PROPAGATION. On the
+ * PRE-MERGE entry a branch that is merely BEHIND reports a missing declaration
+ * for the plainest reason there is: the declaration is in the content it has not
+ * merged yet. That is propagation's to deliver, so such a red returns `behind`
+ * and the caller lets the pass merge — no walk, no mint, no report. On the
+ * LANDING entry the merges have already happened and there is nothing left to
+ * wait for, so the question is not asked.
  *
  * Returns `not-deps-missing` when the red is NOT this shape — every other red
  * keeps the ordinary gate-fix path exactly as it was — and `spent` when it IS
@@ -4892,6 +4904,13 @@ async function depsMissingAdvance(
   advanceRefs: readonly string[],
   /** The confirmed red: a landing verdict, or a pre-merge branch check's. */
   red: { output: string; failed: VerifyCommand[]; sha: string },
+  /**
+   * WHICH GATE ASKED. `pre-merge` measures the branch before the pass attempts
+   * its pending work, so a `behind` answer is available there and nowhere else;
+   * `landing` is asked after the merges, where there is nothing left to wait
+   * for.
+   */
+  entry: 'pre-merge' | 'landing',
   scope: Set<string>,
   /** The pass's pre-ref bookkeeping — an advance that lands is a mutation like any other. */
   preReffed: Set<string>,
@@ -4912,6 +4931,29 @@ async function depsMissingAdvance(
     reason: verdict.reason,
   });
   if (!verdict.depsMissing) return { kind: 'not-deps-missing' };
+  /**
+   * IS THE BRANCH SIMPLY BEHIND? Asked on the pre-merge entry only, and asked
+   * AFTER the classification, because both halves of the answer matter: the
+   * red is a missing declaration (so it is never handed to an agent) AND the
+   * content that declares it is pending (so the pass merges it rather than
+   * walking it). The caller lets propagation run; the landing gate measures
+   * what stands afterwards, and that is where the walk belongs.
+   */
+  if (entry === 'pre-merge') {
+    const pending = await pendingFromSources(cli.repo, branch, advanceRefs);
+    if (pending > 0) {
+      const sources = [...advanceRefs];
+      appendJournal(dir, {
+        action: 'deps-missing-propagation-first',
+        branch,
+        sha: red.sha,
+        sources,
+        pending,
+        files: verdict.files,
+      });
+      return { kind: 'behind', verdict, pending, sources };
+    }
+  }
   // ONE WALK PER BRANCH PER PASS. The walk is bounded, but the pass re-enters
   // `run` after every gate, and a branch left standing on the red it reported
   // would re-walk the same ten commits on every call — paying for an answer
@@ -5097,12 +5139,18 @@ async function symbolOnOwnSide(
 }
 
 /**
- * THE STOPS THAT LEAVE A DECISION AND NO CHANGE TO PROPOSE. A `conflict` is not
- * one of them — its declaration is one merge away, behind a conflict this sweep
- * serves as an ordinary case — so it never reaches the owner's issue, and this
- * type is what says so where the body is written.
+ * THE STOPS THAT LEAVE A DECISION AND NO CHANGE TO PROPOSE — the walk reached
+ * the end of what it was allowed or able to look at, and the declaration is not
+ * there. Two stops are NOT decisions and never reach the owner's issue, and this
+ * type is what says so where the body is written:
+ *  - `conflict` — the declaration is one merge away, behind a conflict this
+ *    sweep serves as an ordinary case. Reachable, so nothing to decide.
+ *  - `unmeasured` — no verdict was taken at all. An environment fault is the
+ *    WARN13/WARN14 shape: nothing is established, nothing is reported, and the
+ *    tree is measured again later. Latching a branch behind an owner's issue
+ *    until a human closes it would make a missing toolchain permanent.
  */
-type ReportedStop = Exclude<AdvanceStop, 'conflict'>;
+type ReportedStop = Exclude<AdvanceStop, 'conflict' | 'unmeasured'>;
 
 /**
  * THE OWNER'S ISSUE for a walk that ended with the errors still there — a
@@ -5139,7 +5187,6 @@ async function writeDepsMissingReport(
   const stopSentence: Record<ReportedStop, string> = {
     'bound-reached': `the walk stopped at its ${DEPS_MISSING_ADVANCE_LIMIT}-commit bound with ${outcome.candidates.length} candidate(s) taken`,
     'source-exhausted': 'the parent lines carry no further commit that could declare these symbols',
-    unmeasured: 'a step could not be measured, so the walk established nothing beyond it',
   };
   /**
    * WHAT THE OWNER IS ACTUALLY CHOOSING BETWEEN, which the stop decides. Each
@@ -5158,11 +5205,6 @@ async function writeDepsMissingReport(
       'The declaration is not in the pending commits over the lines this branch takes content from.',
       'Either the reconciling commit upstream is merged here (which the next pass takes once it is',
       'reachable), or this branch is cut below the state it came to rest on.',
-    ],
-    unmeasured: [
-      'The walk could not measure the tree past its last step, so whether the declaration lies beyond',
-      'it is unknown. Either the environment fault is fixed and the branch re-swept, or this branch',
-      'is cut below the state it came to rest on.',
     ],
   };
   const title = `Decision needed: ${branch} rests on a state whose declarations it has not reached`;
@@ -5259,6 +5301,21 @@ async function holdDepsMissingWalk(
     scope,
     `the missing-declaration walk ended ${stop} with the original errors still present`,
   );
+  /**
+   * AN UNMEASURED WALK ESTABLISHED NOTHING, so it reports nothing. The tree got
+   * no verdict — the WARN13/WARN14 shape — and the answer to no verdict is to
+   * measure again later, not to put a decision to an owner and latch the branch
+   * behind it until a human closes it. The rollback above still stands: the
+   * advanced tip is a state nothing verified. Nothing is reopened either, since
+   * a reopen supersedes live cases and nothing replaces them here.
+   */
+  if (stop === 'unmeasured') {
+    return (
+      `${branch} is red on declarations it has not reached (${found.verdict.files.join(', ')}) and the walk ` +
+      `could not measure the tree past its last step — no verdict was taken, so nothing is minted, nothing is ` +
+      `reported and the branch is measured again on a later pass`
+    );
+  }
   reopen(dir, [branch, ...transitiveDescendants(planEdgesOf(dir), branch)]);
   await writeDepsMissingReport(cli, dir, branch, { verdict: found.verdict, outcome: { ...outcome, stop } });
   return (
@@ -5363,6 +5420,20 @@ async function settleDepsMissing<R extends { output: string; failed: VerifyComma
     }
     const found = await opts.advance(red);
     if (found.kind === 'not-deps-missing') return { kind: 'ordinary', red };
+    if (found.kind === 'behind') {
+      /**
+       * THE PASS MERGES INSTEAD OF WALKING, and this red gates nothing. The
+       * scan moves on to the participants BELOW this branch — the caller's
+       * `remeasure` skips the branch just answered, or the same red would come
+       * back for ever and nothing under it would ever be measured.
+       *
+       * A `behind` round lands no commit, so it spends none of the branch's
+       * step budget; what bounds the loop here is that each branch can answer
+       * `behind` once (the caller's skip set) over a finite participant list.
+       */
+      red = await opts.remeasure(red);
+      continue;
+    }
     if (found.kind === 'spent') {
       return {
         kind: 'held',
@@ -6062,6 +6133,7 @@ export async function cmdRun(
               bp.branch,
               advanceSources(bp, ctx.chain),
               red,
+              'landing',
               scope,
               preReffed,
               runChecks,
@@ -11624,6 +11696,13 @@ export async function firstRedParticipant(
   checksFile: string | undefined,
   runChecks: ChecksRunner,
   runInstall?: InstallRunner,
+  /**
+   * Branches whose red this call has already ANSWERED and must not answer
+   * twice — a missing-declaration red the pass is curing by merging (§7.7).
+   * Without it the scan returns the same branch for ever and the participants
+   * BELOW it are never measured at all.
+   */
+  skip: ReadonlySet<string> = new Set(),
 ): Promise<{ branch: string; sha: string; output: string; failed: VerifyCommand[]; failedNames: string[]; tree: string } | null> {
   // An ABSENT checks file is a deliberate skip (a repo without one skips the
   // gate). A CONFIGURED one that will not load is a silently disabled gate —
@@ -11661,6 +11740,7 @@ export async function firstRedParticipant(
   let wt: { path: string; remove: () => Promise<void> } | null = null;
   try {
     for (const branch of branches) {
+      if (skip.has(branch)) continue;
       if (!(await refExists(cli.repo, branch))) continue;
       const sha = await revParse(cli.repo, branch);
       const key = `${branch}@${sha}`;
@@ -11843,21 +11923,28 @@ export async function cmdSweepNextCase(
   let depsMissingHeld: { branch: string; detail: string } | null = null;
   if (redBranch) {
     // A MISSING DECLARATION IS NOT A DEFECT TO HAND OUT (§7.7), and THIS is the
-    // path a red that survives its branch's propagation arrives on. A branch
-    // resting inside an unmerged upstream feature branch with nothing left to
-    // take is red AT ITS OWN TIP, on every pass, so it never reaches a landing
-    // gate — the pre-merge check is the only place that red is ever seen, and
-    // without this the same branch mints an agent-served case forever.
+    // path such a red arrives on. A branch resting inside an unmerged upstream
+    // feature branch is red AT ITS OWN TIP, on every pass, so it never reaches
+    // a landing gate — the pre-merge check is the only place that red is ever
+    // seen, and without this the same branch mints an agent-served case forever.
+    // EVERY pre-merge red is classified here, before anything else is done with
+    // it, because the classification is the only thing standing between a
+    // missing symbol and an agent asked to write one.
     //
-    // BUT PROPAGATION GOES FIRST. This check measures the branch BEFORE the
-    // pass attempts any of its pending work, and a branch that is merely BEHIND
-    // reports a missing declaration for the plainest reason there is: the
-    // declaration is in the content it has not merged yet. That is ordinary
-    // propagation — a clean merge or a conflict case the sweep serves every
-    // pass — and walking it one commit at a time instead preempts the case,
-    // spends the branch's budget on merges the plan was going to make, and
-    // reports a dead end that was never one. So the classification is not even
-    // ASKED while the branch has content pending over the lines it takes from.
+    // AND A BEHIND BRANCH IS LET THROUGH TO MERGE — a deliberate exception to
+    // the rule this check otherwise enforces. `firstRedParticipant` refuses to
+    // merge into a red branch because the red would then be indistinguishable
+    // from the damage the merge did. FOR THIS RED THAT REASONING INVERTS: the
+    // branch is red BECAUSE it is behind, the pending content is what declares
+    // the missing symbol, and taking it is the cure rather than the risk. So a
+    // red that classifies `deps-missing` on a branch with content pending over
+    // the lines it takes from gates nothing: no mint, no walk, no report, and
+    // `cmdRun` merges into it normally. Propagation then either merges cleanly
+    // or emits an ordinary conflict case — the sweep's own work item — and the
+    // LANDING GATE re-measures the branch and owns whatever stands then, which
+    // is where the walk belongs. The exception is narrow by construction: it
+    // needs both halves of the answer, and every other red still stops the pass
+    // exactly as before.
     //
     // Asked BEFORE the lift below, for the reason the landing gate asks before
     // its own lift and reopen: ceiling attribution is the first step of handing
@@ -11880,6 +11967,14 @@ export async function cmdSweepNextCase(
      * classified, and a red that is still a missing declaration is still held.
      */
     const cap = DEPS_MISSING_ADVANCE_LIMIT * Math.max(1, participatingBranches(dir).length);
+    /**
+     * BRANCHES THIS CALL HAS ALREADY ANSWERED BY LETTING THE PASS MERGE. Their
+     * red is a missing declaration whose declaration is pending, so the cure is
+     * the merge and nothing is served for it — but the scan must not keep
+     * returning them, or the participants below them are never measured and the
+     * loop never ends.
+     */
+    const merging = new Set<string>();
     const settled = await settleDepsMissing<PreMergeRed>({
       dir,
       red: redBranch,
@@ -11888,39 +11983,46 @@ export async function cmdSweepNextCase(
       advance: async (red) => {
         if (!scope.has(red.branch)) return { kind: 'not-deps-missing' };
         const bp = planBranchOf(dir, red.branch);
-        const sources = bp ? advanceSources(bp, ctx.chain) : [];
-        const pending = await pendingFromSources(cli.repo, red.branch, sources);
-        if (pending > 0) {
-          // PROPAGATION FIRST. The row says why the classifier was not asked,
-          // because "no classification" and "classified as something else" are
-          // different facts about the same red and a reader has to be able to
-          // tell them apart.
-          appendJournal(dir, {
-            action: 'deps-missing-propagation-first',
-            branch: red.branch,
-            sha: red.sha,
-            sources,
-            pending,
-          });
-          return { kind: 'not-deps-missing' };
-        }
-        return depsMissingAdvance(
+        const found = await depsMissingAdvance(
           cli,
           dir,
           red.branch,
-          sources,
+          bp ? advanceSources(bp, ctx.chain) : [],
           { output: red.output, failed: red.failed, sha: red.sha },
+          'pre-merge',
           scope,
           preReffedSet(readJournal(dir)),
           runChecks,
           runInstall,
         );
+        if (found.kind === 'behind') {
+          // THE MERGE IS THE CURE, so this red gates nothing: the branch is not
+          // served, not minted for and not walked, and `cmdRun` merges into it
+          // below. The agent is told anyway — the same call can hand it a
+          // conflict case ON this branch, and the red it will meet in that
+          // worktree is still not its to write.
+          merging.add(red.branch);
+          const detail =
+            `${red.branch} is red on declarations it has not reached (${found.verdict.files.join(', ')}) and is ` +
+            `${found.pending} commit(s) behind ${found.sources.join(', ')} — the pass MERGES that content instead ` +
+            `of serving this red, and the landing gate measures what stands afterwards. Nothing is minted for it, ` +
+            `and a symbol the checker says does not exist is not yours to write`;
+          appendJournal(dir, {
+            action: 'warning',
+            id: 'WARN23_DEPS_MISSING_HELD',
+            branch: red.branch,
+            message: detail,
+          });
+          console.error(`next-case [WARN23_DEPS_MISSING_HELD]: ${detail}`);
+        }
+        return found;
       },
       hold: (red, found) => holdDepsMissingWalk(cli, dir, red.branch, found, scope),
       // THE WALK MOVED THE BRANCH, so the verdict that stands is the one its new
       // tip earns — the same re-measure the landing gate takes. A repair leaves
-      // this branch green and the check moves on to the next participant.
-      remeasure: () => firstRedParticipant(cli, dir, passChecksFile, runChecks, runInstall),
+      // this branch green and the check moves on to the next participant, as
+      // does a branch left to merge.
+      remeasure: () => firstRedParticipant(cli, dir, passChecksFile, runChecks, runInstall, merging),
     });
     if (settled.kind === 'held') {
       depsMissingHeld = { branch: settled.branch, detail: settled.detail };

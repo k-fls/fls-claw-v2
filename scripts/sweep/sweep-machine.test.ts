@@ -8674,11 +8674,12 @@ describe('run — the missing-declaration advance', () => {
   }
 
   /**
-   * A conflict stop reached on the PRE-MERGE check, on the first call of a
-   * pass — so the branch has no conflict case of its own and cannot be pointed
-   * at one.
+   * THE PRODUCTION SHAPE: a branch red at its own tip whose missing declaration
+   * sits in pending content that ALSO conflicts with its own edits. Merging the
+   * parent brings the reconciliation and the conflict together, which is an
+   * ordinary conflict case — the sweep's core work item — and not a dead end.
    */
-  function conflictStopWithNoCaseRepo(): FixtureRepo {
+  function behindThroughAConflictRepo(): FixtureRepo {
     const repo = initFixtureRepo();
     repo.commit('base', { 'src/request.ts': BASE_REQUEST, 'src/shared.ts': 'orig\n' });
     repo.checkout('main_patched', { create: true, at: 'main' });
@@ -9003,54 +9004,86 @@ describe('run — the missing-declaration advance', () => {
     ]);
   });
 
-  it('a red measured before a branch takes its pending work is NEVER classified — propagation owns it', async () => {
+  it('a red measured before a branch takes its pending work does not gate the pass — the merge is the cure', async () => {
     const repo = chainedPreMergeRepo();
     const ws = mkWorkspace();
     const inv = writeInventory([{ id: 'dep', branch: 'module/dep', parents: ['main_patched'] }]);
     const dir = dirOf(repo, ws);
 
     expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
-    await cmdSweepNextCase(baseCli(repo, ws, inv), chainRunner());
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), chainRunner())).toBe(0);
 
     const journal = readJournal(dir);
+    // CLASSIFIED FIRST, ALWAYS: the classification is the only thing standing
+    // between a missing symbol and an agent asked to write one.
+    const cls = journal.find((e) => e.action === 'deps-missing-classified')!;
+    expect(cls.branch).toBe('module/dep');
+    expect(cls.depsMissing).toBe(true);
     // The declarations this branch is missing arrive in the two commits it has
-    // not taken from its parent. That is a branch being BEHIND, not a dead end:
-    // the walk is for a red that survives the branch's own propagation, and
-    // this red was measured before any of it was attempted.
+    // not taken from its parent. That is a branch being BEHIND, not a dead end,
+    // so the pass merges rather than walking: the pre-merge red gates nothing.
     const first = journal.find((e) => e.action === 'deps-missing-propagation-first')!;
     expect(first.branch).toBe('module/dep');
     expect(Number(first.pending)).toBe(2);
-    expect(journal.some((e) => e.action === 'deps-missing-classified')).toBe(false);
     expect(journal.some((e) => e.action === 'deps-missing-step')).toBe(false);
-    // Nothing was walked, so nothing was advanced and nothing was rolled back:
-    // the branch stands exactly where the pass found it.
     expect(journal.some((e) => e.action === 'deps-missing-rolled-back')).toBe(false);
     expect(journal.some((e) => e.action === 'deps-missing-report')).toBe(false);
+    // NOBODY WAS ASKED TO WRITE THE SYMBOL. No ceiling was attributed and no
+    // gate fix was minted or even refused — the red never reached that path.
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    expect(journal.some((e) => e.action === 'gate-fix-ceiling')).toBe(false);
+    expect(journal.some((e) => e.action === 'gate-fix-refused')).toBe(false);
+    // AND THE MERGE CURED IT: the branch took its pending content and the
+    // landing gate — where the walk belongs — measured it green.
+    expect(journal.some((e) => e.action === 'merge' && e.branch === 'module/dep')).toBe(true);
+    expect(repo.git('show', 'module/dep:src/split.ts')).toContain('escapeInvisibles');
+    expect(journal.some((e) => e.action === 'landing-check' && e.branch === 'module/dep' && e.ok === true)).toBe(true);
   });
 
-  it('a pre-merge red whose declaration is behind pending work is left to propagation, not walked', async () => {
-    const repo = conflictStopWithNoCaseRepo();
+  it('a pre-merge red whose declaration is behind pending work yields an ORDINARY CONFLICT CASE, not a gate fix', async () => {
+    const repo = behindThroughAConflictRepo();
     const ws = mkWorkspace();
     const inv = writeInventory([{ id: 'dep', branch: 'module/dep', parents: ['main_patched'] }]);
     const dir = dirOf(repo, ws);
     const t = declRunner();
+    const out = join(ws, 'nc.json');
 
     expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
-    await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn);
+    await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), t.fn);
 
     const journal = readJournal(dir);
-    // THE DECLARATION IS IN THE CONTENT THIS BRANCH HAS NOT TAKEN YET, behind a
-    // conflict the sweep serves as an ordinary case. Walking it one commit at a
-    // time would preempt that case and report a dead end that is not one — so
-    // the classifier is not even asked while the branch is behind.
+    // THE SHAPE THIS RULE KEEPS GETTING WRONG: the branch is red at its own tip
+    // with the declaration sitting in pending content that ALSO conflicts. It
+    // is classified — the red is a missing declaration and is nobody's to write
+    // — and then left to propagation, which meets the conflict.
+    const cls = journal.find((e) => e.action === 'deps-missing-classified')!;
+    expect(cls.branch).toBe('module/dep');
+    expect(cls.depsMissing).toBe(true);
     const first = journal.find((e) => e.action === 'deps-missing-propagation-first')!;
     expect(first.branch).toBe('module/dep');
     expect(Number(first.pending)).toBeGreaterThan(0);
     expect(first.sources).toEqual(['main_patched']);
-    expect(journal.some((e) => e.action === 'deps-missing-classified')).toBe(false);
     expect(journal.some((e) => e.action === 'deps-missing-step')).toBe(false);
     expect(journal.some((e) => e.action === 'deps-missing-exhausted')).toBe(false);
     expect(journal.some((e) => e.action === 'deps-missing-report')).toBe(false);
+    // A CONFLICT CASE, WHICH IS THE SWEEP'S ORDINARY WORK — and the conflict
+    // carries the file that holds the missing declaration, so resolving it is
+    // what makes the branch green. No gate fix, nothing minted on the red.
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    expect(journal.some((e) => e.action === 'gate-fix-ceiling')).toBe(false);
+    const served = JSON.parse(readFileSync(out, 'utf8')) as {
+      status: string;
+      branch?: string;
+      conflictedPaths?: string[];
+      materials?: string;
+    };
+    expect(served.status).toBe('case-ready');
+    expect(served.branch).toBe('module/dep');
+    expect(served.conflictedPaths).toEqual(['src/shared.ts']);
+    // …and the agent working it is told that the red it will meet in that
+    // worktree is not part of its case.
+    expect(served.materials).toContain('WARN23_DEPS_MISSING_HELD');
+    expect(served.materials).toContain('do NOT write the');
   });
 
   it('a conflict stop leaves the conflict to the ordinary case that already covers it', async () => {
