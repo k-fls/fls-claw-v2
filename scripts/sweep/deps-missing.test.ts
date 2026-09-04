@@ -18,7 +18,7 @@ import {
   type AdvanceStep,
 } from './deps-missing.js';
 
-const TS_RE = 'error TS(2305|2307|2339|2724):';
+const TS_RE = 'error TS(2305|2307|2724):';
 const typecheck = { cmd: 'pnpm run typecheck', cwd: '.', missingDeclRe: TS_RE };
 const tests = { cmd: 'pnpm test', cwd: '.' };
 
@@ -57,6 +57,36 @@ describe('classifyDepsMissing', () => {
     const other = { cmd: 'bun test', cwd: 'container/agent-runner', missingDeclRe: TS_RE };
     const out = [`$ ${typecheck.cmd}`, MISSING, `$ ${other.cmd}`, '(fail) queue > drains [1.00ms]', ''].join('\n');
     expect(classifyDepsMissing([typecheck, other], out).depsMissing).toBe(false);
+  });
+
+  it('an ordinary error BELOW the missing declaration in the SAME block sinks it too', () => {
+    const ordinary = tsLine('src/request.ts', 40, 'TS2322', 'Type X is not assignable to type Y.');
+    const v = classifyDepsMissing([typecheck], [`$ ${typecheck.cmd}`, MISSING, ordinary, ''].join('\n'));
+    expect(v.depsMissing).toBe(false);
+    expect(v.errorKeys).toEqual([]);
+    expect(v.reason).toContain('not missing declarations');
+    // The offender is NAMED, so the journal says which error refused the walk.
+    expect(v.reason).toContain('TS2322');
+  });
+
+  it('an ordinary error ABOVE the missing declaration in the SAME block sinks it too', () => {
+    const ordinary = tsLine('src/other.ts', 3, 'TS2322', 'Type X is not assignable to type Y.');
+    const v = classifyDepsMissing([typecheck], [`$ ${typecheck.cmd}`, ordinary, MISSING, ''].join('\n'));
+    expect(v.depsMissing).toBe(false);
+    expect(v.reason).toContain('not missing declarations');
+  });
+
+  it('TWO missing declarations in one block still classify — the rule is per ERROR, not per line count', () => {
+    const second = tsLine('src/other.ts', 8, 'TS2307', `Cannot find module './split.js' or its corresponding type declarations.`);
+    const v = classifyDepsMissing([typecheck], [`$ ${typecheck.cmd}`, MISSING, second, ''].join('\n'));
+    expect(v.depsMissing).toBe(true);
+    expect(v.files).toEqual(['src/other.ts', 'src/request.ts']);
+    expect(v.errorKeys).toHaveLength(2);
+  });
+
+  it('a BROKEN pattern is journaled as broken, not as absent', () => {
+    const broken = { cmd: 'pnpm run typecheck', cwd: '.', missingDeclRe: 'error TS(2305' };
+    expect(classifyDepsMissing([broken], `$ ${broken.cmd}\n${MISSING}\n`).reason).toContain('does not compile');
   });
 
   it('the error set carries NO line or column, so an edit above the import is the same error', () => {
@@ -122,11 +152,15 @@ function stubOps(opts: {
   contained?: string[];
   /** What the re-run says at the tip produced by each step (keyed by candidate sha). */
   after: Record<string, { ok: boolean; output: string } | null>;
-}): { ops: AdvanceOps; landed: string[]; checked: string[] } {
+}): { ops: AdvanceOps; landed: string[]; checked: string[]; asked: Array<{ files: string[]; symbols: string[] }> } {
   const landed: string[] = [];
   const checked: string[] = [];
+  const asked: Array<{ files: string[]; symbols: string[] }> = [];
   const ops: AdvanceOps = {
-    candidates: async () => opts.candidates,
+    candidates: async (files, symbols) => {
+      asked.push({ files: [...files], symbols: [...symbols] });
+      return opts.candidates;
+    },
     alreadyContained: async (sha) => (opts.contained ?? []).includes(sha),
     step: async (sha) => {
       if ((opts.conflictsAt ?? []).includes(sha)) return { conflictedPaths: ['src/x.ts'] };
@@ -138,7 +172,7 @@ function stubOps(opts: {
       return opts.after[tip.replace(/^tip-/, '')] ?? null;
     },
   };
-  return { ops, landed, checked };
+  return { ops, landed, checked, asked };
 }
 
 const ORIGINAL = [`ts src/request.ts TS2305 Module '"./split.js"' has no exported member 'handleAddMcpServer'.`];
@@ -230,5 +264,42 @@ describe('advanceThroughDepsMissing', () => {
 
   it('the bound is a named constant, not a number spelled into the walk', () => {
     expect(DEPS_MISSING_ADVANCE_LIMIT).toBe(10);
+  });
+
+  it('the candidate query is asked for the SYMBOLS as well as the paths', async () => {
+    const { ops, asked } = stubOps({ candidates: ['c1'], after: { c1: green } });
+    await advanceThroughDepsMissing({
+      startTip: 'RED',
+      originalKeys: ORIGINAL,
+      files: ['src/request.ts'],
+      symbols: ['handleAddMcpServer'],
+      ops,
+    });
+    // The diagnostic reports at the USE site, so the paths alone cannot find a
+    // reconciliation that only touches the SOURCE module.
+    expect(asked).toEqual([{ files: ['src/request.ts'], symbols: ['handleAddMcpServer'] }]);
+  });
+
+  it('a step that MOVED THE REF says so, and one that moved nothing does not', async () => {
+    const { ops } = stubOps({
+      candidates: ['c0', 'c1', 'c2', 'c3'],
+      contained: ['c0'],
+      conflictsAt: ['c2'],
+      after: { c1: stillRed },
+    });
+    const out = await run(ops);
+    // `landed` is what the pass's rollback target and its push set are derived
+    // from — the advance writes no `merge` row for either to read.
+    expect(out.steps.map((s) => `${s.sha}:${s.landed === true}`)).toEqual([
+      'c0:false',
+      'c1:true',
+      'c2:false',
+    ]);
+  });
+
+  it('a step that landed but could not be MEASURED still moved the ref', async () => {
+    const { ops } = stubOps({ candidates: ['c1'], after: { c1: null } });
+    const out = await run(ops);
+    expect(out.steps.at(-1)).toMatchObject({ verdict: 'unmeasured', landed: true });
   });
 });

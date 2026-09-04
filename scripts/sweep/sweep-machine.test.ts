@@ -38,6 +38,7 @@ import {
   checkKey,
   DriverHalt,
   greenChecks,
+  mutatedBranches,
   openCaseBranches,
   openCases,
   parseCli,
@@ -8381,7 +8382,7 @@ describe('run — the missing-declaration advance', () => {
     ['export const handleAddMcpServer = 3;', 'export const omega = 26;'],
   );
 
-  const MISSING_DECL_RE = 'error TS(2305|2307|2339|2724):';
+  const MISSING_DECL_RE = 'error TS(2305|2307|2724):';
   function checksWithPattern(ws: string, pattern: string | null = MISSING_DECL_RE): string {
     const f = join(ws, 'checks.json');
     writeFileSync(
@@ -8438,6 +8439,81 @@ describe('run — the missing-declaration advance', () => {
     return { fn, ran };
   }
 
+  /**
+   * THE RECONCILIATION TOUCHES ONLY THE SOURCE MODULE. `TS2305` reports at the
+   * IMPORT, so the failing path is `src/request.ts` and a commit that adds the
+   * export to `src/split.ts` touches none of it.
+   */
+  const IMPORTER = ["import { handleAddMcpServer } from './split.js';", 'export const use = handleAddMcpServer;', ''].join('\n');
+  const SPLIT_PARTIAL = ['export const escapeInvisibles = 2;', ''].join('\n');
+  const SPLIT_RECONCILED = ['export const escapeInvisibles = 2;', 'export const handleAddMcpServer = 3;', ''].join('\n');
+  const splitModule = (cwd: string): string => {
+    const p = join(cwd, 'src/split.ts');
+    return existsSync(p) ? readFileSync(p, 'utf8') : '';
+  };
+  /** Red exactly while the source module is present and does not export the symbol. */
+  function sourceOnlyRunner(): ChecksRunner {
+    return async (commands, cwd) => {
+      const cmds = commands.map((c) => c.cmd);
+      if (!cmds.includes('tsc --noEmit')) return { ok: true, failedNames: [], output: '' };
+      if (!onABranch(cwd) || splitModule(cwd) === '' || splitModule(cwd).includes('handleAddMcpServer')) {
+        return { ok: true, failedNames: [], output: '' };
+      }
+      return {
+        ok: false,
+        failedNames: ['tsc --noEmit'],
+        output:
+          `$ tsc --noEmit\nsrc/request.ts(1,10): error TS2305: ` +
+          `Module '"./split.js"' has no exported member 'handleAddMcpServer'.\n`,
+      };
+    };
+  }
+
+  /**
+   * Upstream splits a module and reconciles it one commit later, in the SOURCE
+   * file only. The walk stops below the reconciliation because a sibling
+   * upstream commit conflicts with the fork's own edit.
+   */
+  function sourceOnlyReconciliationRepo(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base', { 'src/shared.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: own file + own edit', { 'src/mp.ts': 'fork\n', 'src/shared.ts': 'fork\n' });
+    repo.checkout('main');
+    const u0 = repo.commit('U0: upstream splits the module', {
+      'src/split.ts': SPLIT_PARTIAL,
+      'src/request.ts': IMPORTER,
+    });
+    repo.checkout('upside', { create: true, at: u0 });
+    // ONLY the source module — the importing file is untouched.
+    repo.commit('U2: upstream adds the missing export', { 'src/split.ts': SPLIT_RECONCILED });
+    repo.checkout('main');
+    repo.commit('U1: upstream edits the shared file', { 'src/shared.ts': 'up\n' });
+    repo.merge('upside', 'U3: upstream merges the reconciliation');
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+
+  /**
+   * A branch RED AT ITS OWN TIP whose declaration IS reachable one commit up
+   * its parent line — the pre-merge red the advance can actually repair, and
+   * the only path on which a landed advance is the branch's ONLY mutation.
+   */
+  function preMergeRepairableRepo(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base', { 'src/shared.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: own file', { 'src/mp.ts': 'fork\n' });
+    repo.commit('mp: takes upstream half-split', { 'src/split.ts': SPLIT_PARTIAL, 'src/request.ts': IMPORTER });
+    repo.checkout('module/dep', { create: true, at: 'main_patched' });
+    repo.commit('dep: its own edit', { 'src/dep.ts': 'dep\n' });
+    repo.checkout('main_patched');
+    repo.commit('mp: the missing export arrives', { 'src/split.ts': SPLIT_RECONCILED });
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+
   /** main_patched takes upstream's half-split; nothing above it reconciles the pair. */
   function unreachedRepo(): FixtureRepo {
     const repo = initFixtureRepo();
@@ -8463,6 +8539,26 @@ describe('run — the missing-declaration advance', () => {
     repo.commit('U0: upstream splits the function', { 'src/request.ts': SPLIT_REQUEST });
     repo.commit('U1: upstream edits the shared file', { 'src/shared.ts': 'up\n' });
     repo.commit('U2: upstream reconciles the pair', { 'src/request.ts': RECONCILED_REQUEST });
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+
+  /**
+   * A branch that is RED AT ITS OWN TIP, before this pass merges anything into
+   * it — the shape a branch parked inside an unmerged upstream feature branch
+   * has on EVERY pass, and the one the pre-merge check meets first.
+   */
+  function redBeforeAnyMergeRepo(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base', { 'src/request.ts': BASE_REQUEST, 'src/shared.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: own file + own edit', { 'src/mp.ts': 'fork\n', 'src/shared.ts': 'fork\n' });
+    repo.checkout('module/dep', { create: true, at: 'main_patched' });
+    repo.commit('dep came to rest on the half-split state', { 'src/request.ts': SPLIT_REQUEST });
+    repo.checkout('main_patched');
+    // Something pending, so the branch PARTICIPATES and is checked at all.
+    repo.commit('mp: unrelated work', { 'src/mp2.ts': 'more\n' });
+    repo.checkout('main');
     cleanups.push(() => repo.destroy());
     return repo;
   }
@@ -8585,9 +8681,33 @@ describe('run — the missing-declaration advance', () => {
     const walked = journal.find((e) => e.action === 'deps-missing-exhausted')!;
     expect(walked.stop).toBe('conflict');
     expect(journal.find((e) => e.action === 'held')).toBeTruthy();
-    // The branch's own conflict case was reopened with the hold: a conflict
-    // case on a red tree is unjudgeable, and nothing is left to serve.
-    expect(openCases(journal)).toHaveLength(0);
+    // THE ROUTE TO THE DECLARATION SURVIVES. The walk stopped because the
+    // reconciliation is behind a conflict, and the branch's own conflict case
+    // is the way through it — superseding that case would take away the one
+    // move that reaches the symbol.
+    expect(journal.some((e) => e.action === 'reopened' && e.branch === 'main_patched')).toBe(false);
+    expect(openCases(journal).map((c) => c.branch)).toEqual(['main_patched']);
+  });
+
+  it('the conflict stop tells the owner the declaration is REACHABLE, behind a conflict', async () => {
+    const repo = reconciliationBehindConflictRepo();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    const t = declRunner();
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn);
+
+    const journal = readJournal(dir);
+    const held = journal.find((e) => e.action === 'held')!;
+    const body = readFileSync(join(dir, String(held.caseId), 'pr', 'body.md'), 'utf8');
+    // The reconciliation IS in this repository — saying otherwise sends the
+    // owner looking upstream for something that is one conflict away.
+    expect(body).not.toContain('Nothing in this repository can supply the declaration');
+    expect(body).toContain('behind a MERGE CONFLICT');
+    expect(body).toContain('src/shared.ts');
+    expect(body).toContain('IS in this repository');
   });
 
   it('a command with NO missingDeclRe never takes the advance — the same red mints an ordinary gate fix', async () => {
@@ -8634,6 +8754,94 @@ describe('run — the missing-declaration advance', () => {
     const gate = journal.find((e) => e.action === 'gate-fix')!;
     expect(gate.branch).toBe('main_patched');
     expect(openCases(journal).map((c) => c.caseId)).toContain(String(gate.caseId));
+  });
+
+  it('a branch RED BEFORE ANY MERGE takes the walk too — the pre-merge check never mints for this red', async () => {
+    const repo = redBeforeAnyMergeRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'dep', branch: 'module/dep', parents: ['main_patched'] }]);
+    const dir = dirOf(repo, ws);
+    const t = declRunner();
+    const out = join(ws, 'nc.json');
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), t.fn);
+
+    const journal = readJournal(dir);
+    // The red was CLASSIFIED before anything was attributed or minted.
+    expect(journal.some((e) => e.action === 'deps-missing-classified')).toBe(true);
+    const cls = journal.find((e) => e.action === 'deps-missing-classified')!;
+    expect(cls.branch).toBe('module/dep');
+    expect(cls.depsMissing).toBe(true);
+    const walked = journal.find((e) => e.action === 'deps-missing-exhausted')!;
+    expect(walked.branch).toBe('module/dep');
+    expect(walked.stop).toBe('source-exhausted');
+    // NOBODY WAS SERVED. The one thing an agent could do here is author the
+    // symbol, and this whole rule exists to stop that.
+    const held = journal.find((e) => e.action === 'held')!;
+    expect(held.branch).toBe('module/dep');
+    expect((held.escalation as { tag: string }).tag).toBe('[AUTO-ESCALATED: missing declaration not reached]');
+    expect(openCases(journal)).toHaveLength(0);
+    expect(readFileSync(join(dir, String(held.caseId), 'pr', 'body.md'), 'utf8')).toContain('handleAddMcpServer');
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues?: Array<{ id: string }> };
+    expect((res.issues ?? []).map((i) => i.id)).toContain('WARN23_DEPS_MISSING_HELD');
+    // ORDERING: the classification is asked BEFORE anything attributes or mints
+    // — ceiling attribution is the first step of handing a red to somebody.
+    expect(journal.findIndex((e) => e.action === 'deps-missing-classified')).toBeLessThan(
+      journal.findIndex((e) => e.action === 'gate-fix'),
+    );
+    // And no merge was made anywhere: a red branch merges nothing.
+    expect(journal.some((e) => e.action === 'merge')).toBe(false);
+  });
+
+  it('the candidate set finds a reconciliation that touches ONLY the source module', async () => {
+    const repo = sourceOnlyReconciliationRepo();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), sourceOnlyRunner())).toBe(0);
+
+    const journal = readJournal(dir);
+    // The diagnostic names src/request.ts; the fix is in src/split.ts. A
+    // pathspec over the failing files alone comes back empty here.
+    expect(journal.find((e) => e.action === 'deps-missing-classified')!.files).toEqual(['src/request.ts']);
+    const done = journal.find((e) => e.action === 'deps-missing-repaired')!;
+    expect(done).toBeTruthy();
+    expect(done.candidates).toHaveLength(1);
+    expect(repo.git('show', 'main_patched:src/split.ts')).toContain('handleAddMcpServer');
+    expect(journal.some((e) => e.action === 'held')).toBe(false);
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+  });
+
+  it('an advance that lands with NO merge of its own is still rollable and still pushed', async () => {
+    const repo = preMergeRepairableRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'dep', branch: 'module/dep', parents: ['main_patched'] }]);
+    const dir = dirOf(repo, ws);
+    const before = repo.sha('module/dep');
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv), sourceOnlyRunner());
+
+    const journal = readJournal(dir);
+    // The advance repaired a red the pass never merged into, so there is no
+    // `merge` row for this branch to hide behind.
+    expect(journal.some((e) => e.action === 'deps-missing-repaired')).toBe(true);
+    expect(journal.find((e) => e.action === 'deps-missing-repaired')!.branch).toBe('module/dep');
+    expect(journal.some((e) => e.action === 'merge' && e.branch === 'module/dep')).toBe(false);
+    expect(repo.git('show', 'module/dep:src/split.ts')).toContain('handleAddMcpServer');
+    // THE ROLLBACK TARGET `abort` and `verify` read.
+    const preRefs = journal.filter((e) => e.action === 'pre-ref' && e.branch === 'module/dep');
+    expect(preRefs).toHaveLength(1);
+    expect(preRefs[0].ref).toBe(before);
+    // AND THE PUSH SET, which is otherwise derived from `merge`/`resolved` rows
+    // alone and would ship this branch's advance nowhere.
+    expect(journal.some((e) => e.action === 'deps-missing-step' && e.branch === 'module/dep' && e.landed === true)).toBe(
+      true,
+    );
+    expect(mutatedBranches(journal).has('module/dep')).toBe(true);
   });
 
   it('the walk is taken ONCE per branch per pass — a second call re-walks nothing and mints nothing more', async () => {

@@ -44,7 +44,7 @@ export interface VerifyCommand {
   filter?: string;
   /**
    * The regular expression that tells a MISSING DECLARATION apart from every
-   * other way this command can fail — `error TS(2305|2307|2339|2724):` for a
+   * other way this command can fail — `error TS(2305|2307|2724):` for a
    * TypeScript project, whatever names the same class for another toolchain.
    *
    * The mechanism (deps-missing.ts) is language-agnostic; WHICH diagnostics
@@ -52,6 +52,13 @@ export interface VerifyCommand {
    * states it beside the command that emits them. A command with no pattern
    * never takes the advance path: the driver cannot recognise the class and
    * does not guess at one.
+   *
+   * NAME ONLY CODES THAT CANNOT MEAN ANYTHING ELSE. A matching diagnostic sends
+   * its whole red down a bounded walk and, when the walk comes up empty, parks
+   * the branch on an owner's draft with no agent served — so a code that ALSO
+   * fires on ordinary defects buys that outcome for a typo. `TS2339` ("Property
+   * X does not exist on type Y") is the example that does not belong: a
+   * misspelled property and a semantic merge skew both report it.
    */
   missingDeclRe?: string;
 }

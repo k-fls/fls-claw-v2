@@ -1,6 +1,6 @@
 {
   "typecheck": [
-    { "cmd": "pnpm run typecheck", "cwd": ".", "missingDeclRe": "error TS(2305|2307|2339|2724):" },
+    { "cmd": "pnpm run typecheck", "cwd": ".", "missingDeclRe": "error TS(2305|2307|2724):" },
     { "cmd": "tsc -p container/agent-runner/tsconfig.json --noEmit", "cwd": "." }
   ],
   "test": [

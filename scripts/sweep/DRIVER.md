@@ -2065,6 +2065,19 @@ its own ruling.
 A MISSING-SYMBOL ERROR MEANS THE DECLARATION IS ELSEWHERE IN THE CHAIN, so the
 driver advances the walk toward it rather than asking anyone to write it.
 
+**BOTH RED ENTRY POINTS TAKE IT.** A branch turns red under the landing gate
+(§7.6) after a merge lands, and a branch can be red BEFORE any merge, caught by
+the pre-merge branch check (§6.2). The second is where this shape usually
+arrives: a branch already resting inside an unmerged upstream feature branch is
+red AT ITS OWN TIP on every pass, so it never reaches a landing gate at all. Both
+classify first and advance the same way, with the same bound, the same stop
+conditions and the same terminal outcomes; on both, the classification is asked
+BEFORE ceiling attribution and before any destructive step, because attribution
+is the first move of handing a red to somebody and this red is handed to nobody.
+A branch outside the pass's resolved scope keeps the ordinary path — the advance
+writes refs through the N1 guard, and a ref the pass only READS from is not the
+sweep's to move.
+
 The walk enumerates the whole DAG, both parents (§4.2), so a branch can come to
 rest on a commit INSIDE an unmerged upstream feature branch — a work-in-progress
 state upstream never intended to be consumable. Such a state can carry a file
@@ -2077,23 +2090,47 @@ implementation that nothing calls, and the real one collides with it when the
 walk reaches it. That is what this forecloses.
 
 **Classification is CONFIG, not compiler strings in the driver.** A red is
-`deps-missing` when EVERY failing command has at least one output line matching
-its own `missingDeclRe` (§7.1) and no failing command lacks such a match — one
-ordinary failure alongside them means the tree is broken in a way the advance
-cannot speak to. The ORIGINAL ERROR SET is the fingerprint keys of those matched
-lines (`parseFailureFingerprints`, the same signature blame and `--not-my-bug`
-compare on): file, code and normalized message, with NO line or column, so an
-unrelated edit above the import does not look like a different error. It is
-FAIL-CLOSED at every step where the answer would have to be guessed — a command
-with no pattern, a command whose output block cannot be found, matched lines that
-yield no fingerprints, fingerprints that name no file. Each of those leaves the
-red on the ordinary gate-fix path, which is where a red the driver cannot
-characterise belongs.
+`deps-missing` when EVERY ERROR EVERY FAILING COMMAND REPORTS matches that
+command's own `missingDeclRe` (§7.1) — not merely one of them. One ordinary
+failure alongside the missing declarations means the tree is broken in a way the
+advance cannot speak to, and it is broken that way whether the ordinary failure
+sits in a second command's output or three lines below the missing declaration in
+the same one. "An error" is what `parseFailureFingerprints` yields, so the test is
+over the same items the error set is built from. A per-command "at least one
+match" test cannot tell the two apart: it would send a tree full of
+agent-fixable errors down a ten-commit walk and park it on an owner's draft with
+those errors unserved. The pattern itself must name ONLY codes that cannot mean
+anything else — `TS2339` ("Property X does not exist on type Y") fires on
+ordinary property typos and semantic merge skew, and is not one of them. The
+ORIGINAL ERROR SET is the fingerprint keys of the matched lines
+(`parseFailureFingerprints`, the same signature blame and `--not-my-bug` compare
+on): file, code and normalized message, with NO line or column, so an unrelated
+edit above the import does not look like a different error. It is FAIL-CLOSED at
+every step where the answer would have to be guessed — a command with no pattern
+or a broken one, a command whose output block cannot be found, a block whose
+output yields no fingerprints at all, fingerprints that name no file. Each of
+those leaves the red on the ordinary gate-fix path, which is where a red the
+driver cannot characterise belongs.
 
-**The candidate set is the pending commits that touch the FAILING PATHS**, over
-the parent lines the branch is actually taking content from (`merge` and `case`
-verdicts; a DEFERRED parent is excluded, because its content is cut and
+**The candidate set is the pending commits that could carry the declaration**,
+over the parent lines the branch is actually taking content from (`merge` and
+`case` verdicts; a DEFERRED parent is excluded, because its content is cut and
 advancing onto it would put the branch on a state the trunk has never seen).
+
+THE FAILING PATHS ARE NOT ENOUGH ON THEIR OWN. A missing-declaration diagnostic
+reports at the USE site, so the failing files are the IMPORTING files, and a
+reconciliation that only adds or re-exports the symbol in the SOURCE module
+touches none of them — a candidate set built from paths alone comes back empty
+on exactly the case this exists for, and the driver publishes an owner draft one
+step short of green. So the SYMBOLS the diagnostics name widen the search, with
+NO module-specifier resolution of any kind: the paths that contain the symbol at
+each source tip join the pathspec, and a pickaxe over the same range catches a
+commit that touched the symbol in a file no longer at the tip. The union is
+ordered ONCE, by a single topological walk over the same range, so oldest-first
+still means oldest-first across both searches. With no symbol to search on there
+is nothing to widen with, and the pathspec answer stands rather than the whole
+pending set.
+
 Oldest-first, and bounded by `DEPS_MISSING_ADVANCE_LIMIT` — an unbounded advance
 lets a single compile error consume a pass, since every step is a merge plus a
 fresh worktree plus an install plus a check run.
@@ -2118,13 +2155,14 @@ question this walk has no standing to keep answering. Three outcomes:
 - **Empty with NEW errors** ⇒ an ordinary red. The landing gate re-measures and
   the §7.6 path takes it from there, on evidence measured where the branch is now.
 - **Still present when the walk ends** (bound reached, source exhausted, conflict,
-  unmeasured) ⇒ the branch is ROLLED BACK to the FIRST commit carrying the error
-  and a DRAFT gate-fix PR is published for the owner, with NO agent involved. The
-  first errored commit is read off the walk — every step it took reported the
-  original errors, so the earliest tip carrying them is the one it started on, and
-  nothing is bisected. The advanced tip is a state nothing verified and nobody
-  asked for; the commit the finding is ABOUT is what the branch stands at and what
-  the PR is headed at.
+  unmeasured) ⇒ the branch is ROLLED BACK to THE COMMIT THE WALK STARTED ON and a
+  DRAFT gate-fix PR is prepared for the owner, with NO agent involved; `finish`
+  publishes it. That commit is read straight off the walk, with nothing bisected
+  — every step reported the original errors, so the walk establishes nothing
+  earlier than its own start, and the body says exactly that rather than claiming
+  the errors first appeared there. The advanced tip is a state nothing verified
+  and nobody asked for; the commit the finding is ABOUT is what the branch stands
+  at and what the PR is headed at.
 
 The draft PR is the one place the driver writes PR prose. Everywhere else that
 rule exists to stop the driver paraphrasing work an agent did; here there is no
@@ -2133,6 +2171,26 @@ candidate set and its bound, each step's verdict, and how the walk ended. It goe
 out under `[AUTO-ESCALATED: missing declaration not reached]`, which is a
 `DRAFT_HELD_TAG`: there is nothing in the PR to merge, only a decision to report.
 The case is frozen HELD at the mint, so `next-case` never offers it.
+
+**THE DECISION THE BODY OFFERS IS THE ONE THE STOP LEFT.** On a bounded or
+exhausted walk the declaration is out of reach from here, and the options are to
+wait for the walk or to cut the branch. ON A CONFLICT STOP IT IS NOT OUT OF
+REACH: the reconciliation is in this repository, behind a conflict a person can
+resolve, and the branch's own open conflict case is the route THROUGH it. So the
+conflict stop names the conflicting commit and offers that third option, and it
+is the one stop that does NOT reopen the branch — superseding that case would
+destroy the only move that reaches the declaration, in the name of not judging
+it on a red tree. Every other stop reopens as the ordinary red path does.
+
+**A LANDED STEP IS A MUTATION, and is journaled as one.** The advance merges
+git-only and writes no `merge` row — the pass's merge rows are the plan's parent
+verdicts and an advance is neither — so each landed step carries `landed` on its
+`deps-missing-step` row, and that flag is what the pre-ref, the push target set
+and the plan-drift exemption read. The pre-ref is recorded before the first
+landed step, so `abort` can roll the advance back and `verify` does not read the
+branch as one the pass never touched. A synthetic `merge` row would do neither
+job better and would also feed `blockedRows`, `canComplete` and the progress
+counters, which the advance is no part of.
 
 One diagnostic is carried when git can establish it: if the missing symbol IS
 present on the branch's OWN side of the merge that brought the failing file in
@@ -3135,7 +3193,7 @@ escalation's publish issues are written to `publish-<case>.json` and quoted into
 | `WARN19_GATE_COVERS_OTHER_DEFECT` | gate-fix minting | an active gate ref on the branch has a different failing-file digest |
 | `WARN20_ANCESTOR_GATED` | gate-fix minting | the branch descends from an ancestor that took a gate fix this pass and is still red |
 | `WARN21_CHECKS_FLAKY` | `report-case`, `run`, `next-case`, gate-fix minting | a check gave BOTH answers on the same tree: passed after a prior failure and failed again on the confirming re-run, or failed and then passed on the confirming re-run of an accusing path (landing gate, pre-merge check, ownership probe). Nothing is minted and no branch is blamed |
-| `WARN23_DEPS_MISSING_HELD` | `run` | the missing-declaration walk ended with the original errors still present (§7.7): the branch was rolled back to the first commit carrying them and a DRAFT PR was published for the owner. No case was served and no agent was asked for a fix |
+| `WARN23_DEPS_MISSING_HELD` | `next-case`, `run` | the missing-declaration walk ended with the original errors still present (§7.7): the branch is rolled back to the commit the walk started on and a DRAFT PR is prepared for the owner, which `finish` publishes. No case was served and no agent was asked for a fix |
 | `WARN46_CASE_LOOPING` | `next-case` | the serve count reached the warning threshold (3); emitted as the LOOP WARNING section of the case materials, not as an issue |
 
 **Reserved numbers — never reassign**: ERR03, ERR04, ERR09, ERR10, ERR19, ERR26,

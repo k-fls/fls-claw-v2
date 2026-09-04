@@ -78,6 +78,13 @@ export function splitChecksOutput(output: string, commands: readonly VerifyComma
   return new Map([...blocks].map(([cmd, lines]) => [cmd, lines.join('\n')]));
 }
 
+/** Why a command has no usable pattern — a missing one and a broken one are not the same fact. */
+function patternNote(cmd: VerifyCommand): string {
+  return typeof cmd.missingDeclRe === 'string' && cmd.missingDeclRe !== ''
+    ? `declares a missingDeclRe that does not compile (\`${cmd.missingDeclRe}\`)`
+    : 'declares no missingDeclRe';
+}
+
 /** The command's pattern, compiled; null when it declares none or declares a broken one. */
 export function missingDeclPattern(cmd: VerifyCommand): RegExp | null {
   if (typeof cmd.missingDeclRe !== 'string' || cmd.missingDeclRe === '') return null;
@@ -93,16 +100,27 @@ export function missingDeclPattern(cmd: VerifyCommand): RegExp | null {
 }
 
 /**
- * IS THIS RED A MISSING DECLARATION? Yes only when EVERY failing command that
- * ran has at least one output line matching its own `missingDeclRe`, and no
- * failing command lacks such a match — one ordinary failure alongside them
- * means the tree is broken in a way the advance cannot speak to.
+ * IS THIS RED A MISSING DECLARATION? Yes only when EVERY ERROR EVERY FAILING
+ * COMMAND REPORTS matches that command's own `missingDeclRe` — not merely one
+ * of them. One ordinary failure alongside the missing declarations means the
+ * tree is broken in a way the advance cannot speak to, and it is broken that
+ * way whether the ordinary failure sits in a SECOND command's output or three
+ * lines below the missing declaration in the SAME one. A per-command "at least
+ * one match" test cannot tell those apart: it would let a single unreached
+ * import send a tree full of agent-fixable errors down a ten-commit walk and
+ * then park it on a draft for the owner, with the fixable errors unserved.
+ *
+ * "An error" is what `parseFailureFingerprints` yields, so the comparison is
+ * over the same items the error set below is built from — a line the parser
+ * does not read as a failure is not an error the classification must account
+ * for, and a failure it reads that the pattern does not name sinks the whole
+ * classification.
  *
  * FAIL-CLOSED at every step where the answer would have to be guessed: a
- * command with no pattern, a command whose block cannot be found, matched lines
- * that yield no fingerprints, fingerprints that name no file. Each of those
- * leaves the red on the ordinary gate-fix path, which is where a red the driver
- * cannot characterise belongs.
+ * command with no pattern or a broken one, a command whose block cannot be
+ * found, a block whose output yields no fingerprints at all, fingerprints that
+ * name no file. Each of those leaves the red on the ordinary gate-fix path,
+ * which is where a red the driver cannot characterise belongs.
  *
  * `output` must be the RE-ROOTED output (`rootChecksOutput`), for the same
  * reason blame reads it: a runner printing paths from its own cwd and the
@@ -115,11 +133,29 @@ export function classifyDepsMissing(failed: readonly VerifyCommand[], output: st
   const matched: string[] = [];
   for (const cmd of failed) {
     const re = missingDeclPattern(cmd);
-    if (!re) return { ...empty, reason: `\`${cmd.cmd}\` declares no missingDeclRe` };
+    if (!re) return { ...empty, reason: `\`${cmd.cmd}\` ${patternNote(cmd)}` };
     const block = blocks.get(cmd.cmd);
     if (block === undefined) return { ...empty, reason: `no output block for \`${cmd.cmd}\`` };
     const hits = block.split('\n').filter((l) => re.test(l));
-    if (hits.length === 0) return { ...empty, reason: `\`${cmd.cmd}\` reports failures that are not missing declarations` };
+    // EVERY ERROR THE BLOCK YIELDS, against the errors its matching lines yield.
+    // A block the parser reads nothing out of establishes nothing either way,
+    // and an unreadable block is the fail-closed case, not the permissive one.
+    const errors = parseFailureFingerprints(block);
+    if (errors.length === 0) {
+      return { ...empty, lines: hits, reason: `\`${cmd.cmd}\` reports failures that yield no comparable error signature` };
+    }
+    const matchedKeys = new Set(parseFailureFingerprints(hits.join('\n')).map((f) => f.key));
+    const unnamed = errors.filter((f) => !matchedKeys.has(f.key));
+    if (unnamed.length > 0) {
+      const shown = unnamed.slice(0, 3).map((f) => f.key);
+      return {
+        ...empty,
+        lines: hits,
+        reason:
+          `\`${cmd.cmd}\` reports ${unnamed.length} failure(s) that are not missing declarations: ` +
+          `${shown.join('; ')}${unnamed.length > shown.length ? ', …' : ''}`,
+      };
+    }
     matched.push(...hits);
   }
   const fps = parseFailureFingerprints(matched.join('\n'));
@@ -135,7 +171,7 @@ export function classifyDepsMissing(failed: readonly VerifyCommand[], output: st
     errorKeys: [...new Set(fps.map((f) => f.key))].sort(),
     files,
     lines: matched,
-    reason: `every failing command reports a missing declaration in ${files.join(', ')}`,
+    reason: `every failure every failing command reports is a missing declaration in ${files.join(', ')}`,
   };
 }
 
@@ -154,6 +190,14 @@ export function survivingKeys(originalKeys: readonly string[], output: string): 
 export interface AdvanceStep {
   sha: string;
   verdict: 'original-persists' | 'original-cleared' | 'already-contained' | 'conflict' | 'unmeasured';
+  /**
+   * THIS STEP MOVED THE BRANCH REF. The advance merges outside the plan, so it
+   * writes no `merge` row, and this flag is the only record that the branch was
+   * mutated — what the pass's rollback target and its push set are derived
+   * from. `unmeasured` carries it too: the merge landed, only the check after
+   * it did not.
+   */
+  landed?: boolean;
   /** The branch tip after the step (absent when nothing landed). */
   tip?: string;
   /** Original keys still reported after this step. */
@@ -189,8 +233,19 @@ export type AdvanceOutcome =
 
 /** The git + checks work one advance needs, injected so the algorithm is testable. */
 export interface AdvanceOps {
-  /** Pending commits over the sources that touch `files`, oldest-first. */
-  candidates(files: readonly string[]): Promise<string[]>;
+  /**
+   * Pending commits over the sources that could carry the declaration,
+   * oldest-first.
+   *
+   * BOTH INPUTS ARE NEEDED, and `files` alone is the wrong question. A
+   * missing-declaration diagnostic is reported at the USE site, so `files` is
+   * the set of IMPORTING files; a reconciliation that only adds or re-exports
+   * the symbol in the SOURCE module touches none of them, and a candidate set
+   * built from paths alone comes back empty on exactly the case the advance
+   * exists for. `symbols` is what the diagnostics NAME, and it is how the
+   * declaring paths are found.
+   */
+  candidates(files: readonly string[], symbols: readonly string[]): Promise<string[]>;
   /** Is `sha` already an ancestor of the branch tip? */
   alreadyContained(sha: string): Promise<boolean>;
   /** Merge ONE commit into the branch; the new tip, or why it would not land. */
@@ -206,9 +261,10 @@ export interface AdvanceOps {
  * WALK TOWARD THE DECLARATION, ONE COMMIT AT A TIME, AND STOP THE MOMENT THE
  * QUESTION CHANGES.
  *
- * Candidates are the pending commits that touch the FAILING PATHS, bounded by
- * `limit`. Each step lands one commit and re-runs the failing commands alone —
- * the whole battery would pay for a question nobody asked.
+ * Candidates are the pending commits that could carry the declaration — the
+ * failing paths AND the symbols those diagnostics name (`ops.candidates`) —
+ * bounded by `limit`. Each step lands one commit and re-runs the failing
+ * commands alone — the whole battery would pay for a question nobody asked.
  *
  * A CONFLICT ENDS THE ADVANCE. A resolution cannot be validated while the tree
  * is red: the checks that would judge it are the ones already failing, so any
@@ -223,12 +279,14 @@ export async function advanceThroughDepsMissing(opts: {
   startTip: string;
   originalKeys: readonly string[];
   files: readonly string[];
+  /** The identifiers the diagnostics name — `namedSymbols(verdict.lines)`. */
+  symbols?: readonly string[];
   ops: AdvanceOps;
   limit?: number;
   onStep?: (step: AdvanceStep) => void;
 }): Promise<AdvanceOutcome> {
   const limit = opts.limit ?? DEPS_MISSING_ADVANCE_LIMIT;
-  const all = await opts.ops.candidates(opts.files);
+  const all = await opts.ops.candidates(opts.files, opts.symbols ?? []);
   const candidates = all.slice(0, limit);
   const bounded = all.length > candidates.length;
   const steps: AdvanceStep[] = [];
@@ -274,15 +332,15 @@ export async function advanceThroughDepsMissing(opts: {
     tip = landed.tip;
     const run = await opts.ops.recheck(tip);
     if (run === null) {
-      record({ sha, verdict: 'unmeasured', tip, detail: 'the advanced tip could not be measured' });
+      record({ sha, verdict: 'unmeasured', landed: true, tip, detail: 'the advanced tip could not be measured' });
       return end('unmeasured');
     }
     const surviving = survivingKeys(opts.originalKeys, run.output);
     if (surviving.length > 0) {
-      record({ sha, verdict: 'original-persists', tip, surviving, green: false });
+      record({ sha, verdict: 'original-persists', landed: true, tip, surviving, green: false });
       continue;
     }
-    record({ sha, verdict: 'original-cleared', tip, surviving: [], green: run.ok });
+    record({ sha, verdict: 'original-cleared', landed: true, tip, surviving: [], green: run.ok });
     return { kind: run.ok ? 'repaired' : 'changed', steps, candidates, bounded, tip };
   }
   // Every candidate is spent, and the original errors are still there.
