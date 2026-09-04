@@ -147,4 +147,9 @@ describe('SqliteDriver transactions', () => {
     await driver.close();
     await expect(driver.get('SELECT 1')).rejects.toThrow('driver is closed');
   });
+
+  it('discovers tables that own a column', async () => {
+    await driver.exec('CREATE TABLE other (id TEXT PRIMARY KEY, value TEXT NOT NULL)');
+    await expect(driver.columnOwners('value')).resolves.toEqual(['items', 'other']);
+  });
 });

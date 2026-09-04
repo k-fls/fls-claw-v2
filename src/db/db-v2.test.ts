@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { sqliteRaw } from './drivers/sqlite.js';
 
 import {
-  initTestDb,
+  initSqliteTestDb,
   closeDb,
   runMigrations,
   createAgentGroup,
@@ -41,7 +41,7 @@ function now() {
 }
 
 beforeEach(async () => {
-  const db = await initTestDb();
+  const db = await initSqliteTestDb();
   await runMigrations(db);
 });
 
@@ -53,14 +53,14 @@ afterEach(async () => {
 
 describe('migrations', () => {
   it('should be idempotent', async () => {
-    const db = await initTestDb();
+    const db = await initSqliteTestDb();
     await runMigrations(db);
     // Running again should not throw
     await runMigrations(db);
   });
 
   it('adds messaging_group_agents.threads as a nullable, default-free override column (019)', async () => {
-    const db = await initTestDb();
+    const db = await initSqliteTestDb();
     await runMigrations(db);
     const col = sqliteRaw(db)
       .prepare(
@@ -76,7 +76,7 @@ describe('migrations', () => {
   });
 
   it('persists approval card bodies for terminal rendering (021)', async () => {
-    const db = await initTestDb();
+    const db = await initSqliteTestDb();
     await runMigrations(db);
     for (const table of ['pending_approvals', 'pending_channel_approvals', 'pending_sender_approvals']) {
       const col = sqliteRaw(db)

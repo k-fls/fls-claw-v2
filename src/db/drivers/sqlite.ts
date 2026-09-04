@@ -141,6 +141,18 @@ export class SqliteDriver implements DbDriver {
     return row !== undefined;
   }
 
+  async columnOwners(column: string): Promise<string[]> {
+    const rows = await this.all<{ name: string }>(
+      `SELECT DISTINCT m.name
+         FROM sqlite_master m
+         JOIN pragma_table_info(m.name) p ON p.name = ?
+        WHERE m.type = 'table'
+        ORDER BY m.name`,
+      column,
+    );
+    return rows.map(({ name }) => name);
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     if (this.activeTransaction) await this.activeTransaction;
