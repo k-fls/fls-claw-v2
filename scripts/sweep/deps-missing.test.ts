@@ -143,6 +143,26 @@ describe('namedSymbols', () => {
     expect(namedSymbols([MISSING])).toEqual(['handleAddMcpServer']);
     expect(namedSymbols([`src/a.ts(1,1): error TS2307: Cannot find module './split.js'.`])).toEqual([]);
   });
+
+  it('takes the MISSING symbol and NOT the one the checker offers instead', () => {
+    // A suggestion is by definition a symbol that already exists and was never
+    // missing: searching for it names every file and commit that ever used it,
+    // spends the advance's bound on commits that cannot carry the declaration,
+    // and puts a false claim in the owner's draft.
+    const suggested = tsLine(
+      'src/a.ts',
+      3,
+      'TS2724',
+      `'"../../container-config.js"' has no exported member named 'parseMcpServerConfig'. Did you mean 'McpServerConfig'?`,
+    );
+    expect(namedSymbols([suggested])).toEqual(['parseMcpServerConfig']);
+  });
+
+  it('a diagnostic with no second sentence is unaffected', () => {
+    expect(namedSymbols([tsLine('src/a.ts', 1, 'TS2304', `Cannot find name 'handleAddMcpServer'.`)])).toEqual([
+      'handleAddMcpServer',
+    ]);
+  });
 });
 
 /** An ops stub: a fixed candidate list, a conflict set, and a per-tip verdict. */
@@ -264,6 +284,18 @@ describe('advanceThroughDepsMissing', () => {
 
   it('the bound is a named constant, not a number spelled into the walk', () => {
     expect(DEPS_MISSING_ADVANCE_LIMIT).toBe(10);
+  });
+
+  it('a SPENT budget takes no candidate at all and ends the walk on the bound', async () => {
+    // The advance is re-entered while the red it leaves behind is another
+    // missing declaration, and the step budget it subtracts from is the
+    // BRANCH'S, not the walk's — so a re-entry with nothing left walks nowhere
+    // and the caller gets the owner's draft, never a mint.
+    const { ops, landed } = stubOps({ candidates: ['c1', 'c2'], after: { c1: green, c2: green } });
+    const out = await run(ops, 0);
+    expect(out.kind).toBe('exhausted');
+    if (out.kind === 'exhausted') expect(out.stop).toBe('bound-reached');
+    expect(landed).toEqual([]);
   });
 
   it('the candidate query is asked for the SYMBOLS as well as the paths', async () => {

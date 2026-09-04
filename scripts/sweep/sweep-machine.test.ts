@@ -8583,6 +8583,104 @@ describe('run — the missing-declaration advance', () => {
     return repo;
   }
 
+  /**
+   * UPSTREAM SPLIT THE CHANGE ACROSS SEVERAL COMMITS, so clearing the first
+   * missing declaration uncovers the second. The source module gains one export
+   * per commit; the importing file names both from the start.
+   */
+  const CHAIN_IMPORTER = [
+    "import { handleAddMcpServer, escapeInvisibles } from './split.js';",
+    'export const use = [handleAddMcpServer, escapeInvisibles];',
+    '',
+  ].join('\n');
+  const CHAIN_NONE = ['export const zeta = 0;', ''].join('\n');
+  const CHAIN_ONE = ['export const zeta = 0;', 'export const handleAddMcpServer = 3;', ''].join('\n');
+  const CHAIN_BOTH = [
+    'export const zeta = 0;',
+    'export const handleAddMcpServer = 3;',
+    'export const escapeInvisibles = 2;',
+    '',
+  ].join('\n');
+
+  /** Red on the FIRST of the two symbols the source module still does not export. */
+  function chainRunner(): ChecksRunner {
+    return async (commands, cwd) => {
+      if (!commands.some((c) => c.cmd === 'tsc --noEmit')) return { ok: true, failedNames: [], output: '' };
+      const split = splitModule(cwd);
+      if (!onABranch(cwd) || split === '') return { ok: true, failedNames: [], output: '' };
+      const missing = ['handleAddMcpServer', 'escapeInvisibles'].find((sym) => !split.includes(sym));
+      if (!missing) return { ok: true, failedNames: [], output: '' };
+      return {
+        ok: false,
+        failedNames: ['tsc --noEmit'],
+        output:
+          `$ tsc --noEmit\nsrc/request.ts(1,10): error TS2305: ` +
+          `Module '\"./split.js\"' has no exported member '${missing}'.\n`,
+      };
+    };
+  }
+
+  /** The chained reconciliation, reached through a LANDING gate after a merge lands. */
+  function chainedLandingRepo(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base', { 'src/shared.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: own file + own edit', { 'src/mp.ts': 'fork\n', 'src/shared.ts': 'fork\n' });
+    repo.checkout('main');
+    const u0 = repo.commit('U0: upstream splits the module', {
+      'src/split.ts': CHAIN_NONE,
+      'src/request.ts': CHAIN_IMPORTER,
+    });
+    repo.checkout('upside', { create: true, at: u0 });
+    repo.commit('U2: upstream adds the first export', { 'src/split.ts': CHAIN_ONE });
+    repo.commit('U2b: upstream adds the second export', { 'src/split.ts': CHAIN_BOTH });
+    repo.checkout('main');
+    repo.commit('U1: upstream edits the shared file', { 'src/shared.ts': 'up\n' });
+    repo.merge('upside', 'U3: upstream merges the reconciliation');
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+
+  /** The same chain, on a branch that is RED AT ITS OWN TIP before any merge. */
+  function chainedPreMergeRepo(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base', { 'src/shared.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: own file', { 'src/mp.ts': 'fork\n' });
+    repo.commit('mp: takes upstream half-split', { 'src/split.ts': CHAIN_NONE, 'src/request.ts': CHAIN_IMPORTER });
+    repo.checkout('module/dep', { create: true, at: 'main_patched' });
+    repo.commit('dep: its own edit', { 'src/dep.ts': 'dep\n' });
+    repo.checkout('main_patched');
+    repo.commit('mp: the first export arrives', { 'src/split.ts': CHAIN_ONE });
+    repo.commit('mp: the second export arrives', { 'src/split.ts': CHAIN_BOTH });
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+
+  /**
+   * A conflict stop reached on the PRE-MERGE check, on the first call of a
+   * pass — so the branch has no conflict case of its own and cannot be pointed
+   * at one.
+   */
+  function conflictStopWithNoCaseRepo(): FixtureRepo {
+    const repo = initFixtureRepo();
+    repo.commit('base', { 'src/request.ts': BASE_REQUEST, 'src/shared.ts': 'orig\n' });
+    repo.checkout('main_patched', { create: true, at: 'main' });
+    repo.commit('mp: own file', { 'src/mp.ts': 'fork\n' });
+    repo.checkout('module/dep', { create: true, at: 'main_patched' });
+    repo.commit('dep rests on the half-split state and edits the shared file', {
+      'src/request.ts': SPLIT_REQUEST,
+      'src/shared.ts': 'dep\n',
+    });
+    repo.checkout('main_patched');
+    repo.commit('mp: edits the shared file too', { 'src/shared.ts': 'mp\n' });
+    repo.commit('mp: reconciles the pair', { 'src/request.ts': RECONCILED_REQUEST });
+    repo.checkout('main');
+    cleanups.push(() => repo.destroy());
+    return repo;
+  }
+
   it('advances past the half-split state, lands GREEN, and mints nothing', async () => {
     const repo = reconciliationBesideConflictRepo();
     const ws = mkWorkspace();
@@ -8842,6 +8940,134 @@ describe('run — the missing-declaration advance', () => {
       true,
     );
     expect(mutatedBranches(journal).has('module/dep')).toBe(true);
+  });
+
+  it('a CHANGED red that is ANOTHER missing declaration re-enters the walk — the landing gate mints nothing', async () => {
+    const repo = chainedLandingRepo();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
+    expect(await cmdSweepNextCase(baseCli(repo, ws, inv), chainRunner())).toBe(0);
+
+    const journal = readJournal(dir);
+    // The first walk cleared its own error set and left a DIFFERENT missing
+    // declaration standing. That red is not the agent's to write either.
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    expect(journal.some((e) => e.action === 'held')).toBe(false);
+    expect(journal.find((e) => e.action === 'deps-missing-changed')).toBeTruthy();
+    expect(journal.find((e) => e.action === 'deps-missing-repaired')).toBeTruthy();
+    expect(repo.git('show', 'main_patched:src/split.ts')).toContain('escapeInvisibles');
+    // THE BUDGET IS THE BRANCH'S, NOT THE WALK'S — a bound that reset on every
+    // re-entry would bound nothing.
+    expect(journal.filter((e) => e.action === 'deps-missing-changed' || e.action === 'deps-missing-repaired').map((e) => e.limit)).toEqual([
+      10, 9,
+    ]);
+  });
+
+  it('a CHANGED red that is ANOTHER missing declaration re-enters the walk on the PRE-MERGE path too', async () => {
+    const repo = chainedPreMergeRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'dep', branch: 'module/dep', parents: ['main_patched'] }]);
+    const dir = dirOf(repo, ws);
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv), chainRunner());
+
+    const journal = readJournal(dir);
+    // Nobody was handed a missing symbol to author, on either red.
+    expect(journal.some((e) => e.action === 'gate-fix')).toBe(false);
+    expect(journal.some((e) => e.action === 'held')).toBe(false);
+    expect(journal.find((e) => e.action === 'deps-missing-changed')!.branch).toBe('module/dep');
+    expect(journal.find((e) => e.action === 'deps-missing-repaired')!.branch).toBe('module/dep');
+    expect(repo.git('show', 'module/dep:src/split.ts')).toContain('escapeInvisibles');
+  });
+
+  it('a conflict stop with NO conflict case on the branch does not point the owner at one', async () => {
+    const repo = conflictStopWithNoCaseRepo();
+    const ws = mkWorkspace();
+    const inv = writeInventory([{ id: 'dep', branch: 'module/dep', parents: ['main_patched'] }]);
+    const dir = dirOf(repo, ws);
+    const t = declRunner();
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn);
+
+    const journal = readJournal(dir);
+    expect(journal.find((e) => e.action === 'deps-missing-exhausted')!.stop).toBe('conflict');
+    // The pre-merge check catches this red before `run` mints anything, and
+    // cases do not survive a pass — so there is no case to resolve.
+    expect(openCases(journal).filter((c) => c.branch === 'module/dep')).toHaveLength(0);
+    const held = journal.find((e) => e.action === 'held')!;
+    const body = readFileSync(join(dir, String(held.caseId), 'pr', 'body.md'), 'utf8');
+    expect(body).toContain('behind a MERGE CONFLICT');
+    expect(body).toContain('this pass has no open conflict case on this branch');
+    expect(body).not.toContain("this branch's own conflict case");
+  });
+
+  it('a conflict stop WITH a conflict case names it, so the owner can find the route', async () => {
+    const repo = reconciliationBehindConflictRepo();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    const t = declRunner();
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn);
+
+    const journal = readJournal(dir);
+    const conflictCase = openCases(journal).find((c) => c.branch === 'main_patched')!;
+    const held = journal.find((e) => e.action === 'held')!;
+    const body = readFileSync(join(dir, String(held.caseId), 'pr', 'body.md'), 'utf8');
+    expect(body).toContain(conflictCase.caseId);
+  });
+
+  it('a case served on the same call as a hold is TOLD which red is not its to fix', async () => {
+    const repo = reconciliationBehindConflictRepo();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    const t = declRunner();
+    const out = join(ws, 'nc.json');
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), t.fn);
+
+    // THE CONFLICT STOP DELIBERATELY DOES NOT REOPEN, so the branch's own
+    // conflict case is still open and is served on this very call — on a branch
+    // that is red with a missing declaration outside that case's scope.
+    const res = JSON.parse(readFileSync(out, 'utf8')) as {
+      status: string;
+      materials?: string;
+      issues?: Array<{ id: string }>;
+    };
+    expect(res.status).toBe('case-ready');
+    expect((res.issues ?? []).map((i) => i.id)).toContain('WARN23_DEPS_MISSING_HELD');
+    expect(res.materials).toContain('WARN23_DEPS_MISSING_HELD');
+    expect(res.materials).toContain('do NOT write the');
+  });
+
+  it('a SPENT walk is held, not minted — the ordinary path never attributes that red', async () => {
+    const repo = unreachedRepo();
+    const ws = mkWorkspace();
+    const inv = branchlessInventory();
+    const dir = dirOf(repo, ws);
+    const t = declRunner();
+    const out = join(ws, 'nc2.json');
+
+    expect(await cmdSweepStart(baseCli(repo, ws, inv, { checksFile: checksWithPattern(ws) }))).toBe(0);
+    await cmdSweepNextCase(baseCli(repo, ws, inv), t.fn);
+    await cmdSweepNextCase(baseCli(repo, ws, inv, { out }), t.fn);
+
+    const journal = readJournal(dir);
+    expect(journal.some((e) => e.action === 'deps-missing-walk-spent')).toBe(true);
+    // THE SIDE DOOR (§7.7): the same-branch anti-loop stops a same-key mint, but
+    // a lift onto an in-pass ancestor mints under a FRESH key. Nothing attributes
+    // this red at all, so there is no lift to mint behind.
+    expect(journal.filter((e) => e.action === 'gate-fix-ceiling')).toHaveLength(0);
+    const res = JSON.parse(readFileSync(out, 'utf8')) as { issues?: Array<{ id: string }> };
+    expect((res.issues ?? []).map((i) => i.id)).toContain('WARN23_DEPS_MISSING_HELD');
   });
 
   it('the walk is taken ONCE per branch per pass — a second call re-walks nothing and mints nothing more', async () => {

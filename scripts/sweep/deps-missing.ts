@@ -31,6 +31,11 @@ import type { VerifyCommand } from './verify.js';
  * enough to cross the reconciliation window this exists for (upstream split a
  * function and reconciled it a handful of commits later) and small enough that
  * the worst case is bounded work with a report at the end of it.
+ *
+ * IT IS THE BRANCH'S BUDGET FOR THE PASS, NOT ONE WALK'S. The advance is
+ * re-entered while the red it leaves behind is another missing declaration, so
+ * the caller subtracts the steps already landed before it passes `limit` here —
+ * a bound that reset on every re-entry would bound nothing.
  */
 export const DEPS_MISSING_ADVANCE_LIMIT = 10;
 
@@ -218,7 +223,13 @@ export type AdvanceStop = 'bound-reached' | 'source-exhausted' | 'conflict' | 'u
 export type AdvanceOutcome =
   /** The original set emptied and the tree is green — the propagation repaired it. */
   | { kind: 'repaired'; steps: AdvanceStep[]; candidates: string[]; bounded: boolean; tip: string }
-  /** The original set emptied and something else is red — an ordinary red now. */
+  /**
+   * The original set emptied and something else is red. A DIFFERENT QUESTION,
+   * which this walk has no standing to answer — and which the caller CLASSIFIES
+   * before it mints anything, because clearing one missing declaration routinely
+   * uncovers the next and that red is no more the agent's to write than the
+   * first one was. The caller re-enters the advance when it is one.
+   */
   | { kind: 'changed'; steps: AdvanceStep[]; candidates: string[]; bounded: boolean; tip: string }
   /** The walk ended with the original errors still present. */
   | {
@@ -273,7 +284,10 @@ export interface AdvanceOps {
  * THE ORIGINAL ERROR SET IS THE TERMINATION CONDITION. While it survives, the
  * walk is still answering the question it started on. The moment it is empty
  * the question has changed — a red that has changed identity is a different
- * question, and this walk has no standing to keep answering it.
+ * question, and this walk has no standing to keep answering it. It is the
+ * CALLER that decides what the new question is, and a new question that is
+ * another missing declaration comes back here as a new walk, against a step
+ * budget this one has already spent from.
  */
 export async function advanceThroughDepsMissing(opts: {
   startTip: string;
@@ -348,17 +362,47 @@ export async function advanceThroughDepsMissing(opts: {
 }
 
 /**
- * The identifiers a diagnostic names, best-effort: single-quoted words that
- * look like identifiers. Module specifiers (`'./request.js'`, `'"./x.js"'`) do
- * not match, which is the point — the question below is about a SYMBOL.
+ * THE MISSING SYMBOL, NOT THE ONE THE CHECKER OFFERS INSTEAD.
  *
- * Best-effort is enough because every caller omits its claim when this yields
- * nothing. A guess in a PR body an owner reads is worse than a shorter body.
+ * A diagnostic states its problem in its FIRST SENTENCE and appends whatever
+ * else it has to say after it — most often an alternative it thinks was meant.
+ * An alternative is BY DEFINITION a symbol that already exists and was never
+ * missing, and searching for one is worse than searching for nothing: it is
+ * named in every file and every commit that ever used it, so it floods the
+ * candidate set with commits that cannot possibly carry the declaration, spends
+ * the advance's bound on them, lands merges that raise the odds of a conflict
+ * stop, and puts a claim in the owner's draft that those commits "declare" a
+ * symbol nothing was missing.
+ *
+ * So only the first sentence is read. That is a fact about DIAGNOSTIC PROSE,
+ * not about any one compiler — no message text, no error code and no product
+ * name appears here — and it is the narrowest rule that separates the two: the
+ * problem comes first, the commentary comes after.
+ *
+ * LIMITATION, stated where it bites: a checker that names the missing symbol
+ * only in a LATER sentence yields nothing here. That direction is safe — every
+ * caller omits its claim when this is empty, and the pathspec search stands on
+ * its own — where taking the suggestion is not.
+ *
+ * Within that sentence the identifiers are single-quoted words that look like
+ * identifiers. Module specifiers (`'./request.js'`, `'"./x.js"'`) do not match,
+ * which is the point — the question is about a SYMBOL.
  */
 export function namedSymbols(lines: readonly string[]): string[] {
   const out = new Set<string>();
   for (const line of lines) {
-    for (const m of line.matchAll(/'([A-Za-z_$][A-Za-z0-9_$]*)'/g)) out.add(m[1]);
+    for (const m of firstSentence(line).matchAll(/'([A-Za-z_$][A-Za-z0-9_$]*)'/g)) out.add(m[1]);
   }
   return [...out].sort();
+}
+
+/**
+ * A line up to its first sentence end — a `.`, `?` or `!` followed by
+ * whitespace. A path (`src/request.ts(2,14):`) and a module specifier
+ * (`'./split.js'`) carry dots that no space follows, so neither ends a
+ * sentence; a line with no sentence end is one sentence.
+ */
+function firstSentence(line: string): string {
+  const end = line.search(/[.?!]\s/);
+  return end === -1 ? line : line.slice(0, end + 1);
 }

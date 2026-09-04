@@ -2125,15 +2125,35 @@ on exactly the case this exists for, and the driver publishes an owner draft one
 step short of green. So the SYMBOLS the diagnostics name widen the search, with
 NO module-specifier resolution of any kind: the paths that contain the symbol at
 each source tip join the pathspec, and a pickaxe over the same range catches a
-commit that touched the symbol in a file no longer at the tip. The union is
+commit that touched the symbol in a file no longer at the tip.
+
+The union is
 ordered ONCE, by a single topological walk over the same range, so oldest-first
 still means oldest-first across both searches. With no symbol to search on there
 is nothing to widen with, and the pathspec answer stands rather than the whole
 pending set.
 
+THE MISSING SYMBOL, NOT THE ONE THE CHECKER OFFERS INSTEAD. A diagnostic states
+its problem in its FIRST SENTENCE and appends whatever else it has to say after
+it, most often an alternative it thinks was meant; an alternative is by
+definition a symbol that already exists and was never missing. Searching for one
+names every file and every commit that ever used it, so it floods the candidate
+set with commits that cannot carry the declaration, spends the bound on them,
+lands merges that raise the odds of a conflict stop, and claims in the owner's
+draft that those commits declare a symbol nothing was missing. Only the first
+sentence is read — a fact about diagnostic prose, with no message text, error
+code or product name in the driver. The limitation is stated where it bites: a
+checker that names the missing symbol only in a LATER sentence yields no symbol
+here, and the pathspec search stands alone. That direction is safe; taking the
+suggestion is not.
+
 Oldest-first, and bounded by `DEPS_MISSING_ADVANCE_LIMIT` — an unbounded advance
 lets a single compile error consume a pass, since every step is a merge plus a
-fresh worktree plus an install plus a check run.
+fresh worktree plus an install plus a check run. THE BOUND IS THE BRANCH'S STEP
+BUDGET FOR THE PASS, NOT ONE WALK'S: every landed step this pass already spent is
+subtracted before the next walk starts, because the advance is re-entered below
+and a bound that reset on every re-entry would bound nothing. A branch at zero
+budget takes no candidate, ends its walk exhausted, and is held.
 
 **One commit at a time, re-running ONLY the failing commands.** The whole battery
 would re-answer questions nobody asked, once per step; the advance's only
@@ -2152,8 +2172,24 @@ question this walk has no standing to keep answering. Three outcomes:
 - **Empty and green** ⇒ the propagation repaired it. The advance lands, the
   landing gate re-measures the branch where it now stands, and the pass continues
   normally. No case, no PR, no agent.
-- **Empty with NEW errors** ⇒ an ordinary red. The landing gate re-measures and
-  the §7.6 path takes it from there, on evidence measured where the branch is now.
+- **Empty with NEW errors** ⇒ THE NEW RED IS CLASSIFIED BEFORE ANYTHING IS
+  MINTED, and if it is itself a missing declaration THE ADVANCE IS ENTERED AGAIN.
+  Clearing one missing declaration routinely uncovers the next — that is the
+  natural shape of the case this rule exists for, upstream splitting one change
+  across several commits — and minting on the re-measured red hands an agent a
+  missing symbol to author after all, now with the walk's own merges on the
+  branch. Only a red that classifies as something else takes the §7.6 path, on
+  evidence measured where the branch is now. THIS IS TRUE ON BOTH ENTRY POINTS
+  and it holds on every path: no red the driver classifies as `deps-missing`
+  reaches ceiling attribution or a gate-fix mint, ever.
+
+  IT TERMINATES, AND THE BOUND IS EXPLICIT. Every re-entry follows a walk that
+  landed at least one commit, so every re-entry spends at least one unit of that
+  branch's per-pass step budget, which is never reset; a branch at zero budget
+  walks nowhere, ends exhausted and is held. A separate re-entry cap bounds the loop
+  independently of that argument, and AT THE CAP THE STANDING RED IS STILL
+  CLASSIFIED, not walked: still a missing declaration ⇒ held with nothing minted,
+  anything else ⇒ the ordinary path, exactly as it would have been.
 - **Still present when the walk ends** (bound reached, source exhausted, conflict,
   unmeasured) ⇒ the branch is ROLLED BACK to THE COMMIT THE WALK STARTED ON and a
   DRAFT gate-fix PR is prepared for the owner, with NO agent involved; `finish`
@@ -2176,11 +2212,18 @@ The case is frozen HELD at the mint, so `next-case` never offers it.
 exhausted walk the declaration is out of reach from here, and the options are to
 wait for the walk or to cut the branch. ON A CONFLICT STOP IT IS NOT OUT OF
 REACH: the reconciliation is in this repository, behind a conflict a person can
-resolve, and the branch's own open conflict case is the route THROUGH it. So the
-conflict stop names the conflicting commit and offers that third option, and it
-is the one stop that does NOT reopen the branch — superseding that case would
-destroy the only move that reaches the declaration, in the name of not judging
-it on a red tree. Every other stop reopens as the ordinary red path does.
+resolve. So the conflict stop names the conflicting commit and offers that third
+option, and it is the one stop that does NOT reopen the branch — superseding an
+open conflict case there would destroy the move that reaches the declaration, in
+the name of not judging it on a red tree. Every other stop reopens as the
+ordinary red path does.
+
+WHETHER THE BRANCH HAS SUCH A CASE IS ASKED, NOT ASSUMED. The pre-merge check
+can stop on a conflict on the first `next-case` call of a pass, before anything
+has been minted, and cases do not survive a pass — so the body names the open
+conflict case only when the branch has one, and otherwise says there is none and
+the conflict is resolved by hand. Pointing an owner at a case that does not exist
+makes the one move that reaches the declaration read as already available.
 
 **A LANDED STEP IS A MUTATION, and is journaled as one.** The advance merges
 git-only and writes no `merge` row — the pass's merge rows are the plan's parent
@@ -2205,13 +2248,34 @@ is worse than a shorter body.
 re-walk the same commits on every call — paying for an answer already journaled
 and re-landing merges it just rolled back.
 
+A SPENT WALK IS A HOLD, NOT A FALL-THROUGH. The question is asked AFTER the
+classification, so a red that has become an ordinary defect is served as one; a
+red that is STILL a missing declaration is still not the agent's to write, and it
+is held with nothing minted and nothing attributed. Falling through would hand it
+to the ordinary mint, where the same-branch anti-loop stops a same-key duplicate
+but a lift onto an in-pass ancestor mints under a FRESH key — the same breach
+through a side door.
+
 **The evidence is the journal**, in rows that read as facts:
 `deps-missing-classified` (the verdict, the commands, the files, the error keys
 and the matched lines), `deps-missing-step` (one per step, with its verdict and
 the surviving keys), `deps-missing-repaired` / `deps-missing-changed` /
-`deps-missing-exhausted` (the candidate set, the bound, every step and how it
-ended), `deps-missing-rolled-back`, and `deps-missing-walk-spent` for a branch
-whose walk this pass already took.
+`deps-missing-exhausted` (the candidate set, the effective bound, every step and
+how it ended), `deps-missing-rolled-back`, `deps-missing-walk-spent` for a branch
+whose walk this pass already took, and `deps-missing-reentry-capped` for a
+re-entry loop that stopped at its cap. A hold also writes a `warning` row
+carrying `WARN23_DEPS_MISSING_HELD`, on both entry points, because `run`'s own
+issues are suppressed when it runs as an internal stage.
+
+**A CASE SERVED ALONGSIDE A HOLD CARRIES THE NOTICE.** A hold leaves its branch
+red on an error that is nobody's to fix, and the same call can still serve a
+case: the conflict stop deliberately does not reopen, so the branch's own
+conflict case is offered on that very call. Every `next-case` result that can end
+a call carrying a hold — a served case included — carries the
+`WARN23_DEPS_MISSING_HELD` issue, and a served case carries it in its materials
+as well. Without it the agent meets that red inside its case worktree, reads it
+as its own resolution's, and starts fixing an error outside its case's scope —
+which for a missing declaration means authoring the symbol.
 
 **And the agent is told the rule too**, as a backstop for whatever the classifier
 misses: the gate-fix SCOPE block states that a symbol the checker says does not
@@ -3193,7 +3257,7 @@ escalation's publish issues are written to `publish-<case>.json` and quoted into
 | `WARN19_GATE_COVERS_OTHER_DEFECT` | gate-fix minting | an active gate ref on the branch has a different failing-file digest |
 | `WARN20_ANCESTOR_GATED` | gate-fix minting | the branch descends from an ancestor that took a gate fix this pass and is still red |
 | `WARN21_CHECKS_FLAKY` | `report-case`, `run`, `next-case`, gate-fix minting | a check gave BOTH answers on the same tree: passed after a prior failure and failed again on the confirming re-run, or failed and then passed on the confirming re-run of an accusing path (landing gate, pre-merge check, ownership probe). Nothing is minted and no branch is blamed |
-| `WARN23_DEPS_MISSING_HELD` | `next-case`, `run` | the missing-declaration walk ended with the original errors still present (§7.7): the branch is rolled back to the commit the walk started on and a DRAFT PR is prepared for the owner, which `finish` publishes. No case was served and no agent was asked for a fix |
+| `WARN23_DEPS_MISSING_HELD` | `next-case`, `run` | a missing-declaration red is HELD for the owner (§7.7): the walk ended with the original errors still present, or the branch's walk this pass was already spent. Where a walk ran, the branch is rolled back to the commit it started on and a DRAFT PR is prepared, which `finish` publishes. No agent was asked to fix that red — and where a case IS served on the same call, this issue says which part of the red is not that case's |
 | `WARN46_CASE_LOOPING` | `next-case` | the serve count reached the warning threshold (3); emitted as the LOOP WARNING section of the case materials, not as an issue |
 
 **Reserved numbers — never reassign**: ERR03, ERR04, ERR09, ERR10, ERR19, ERR26,

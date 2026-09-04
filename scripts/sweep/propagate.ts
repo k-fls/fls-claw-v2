@@ -4811,6 +4811,19 @@ async function journaledRollback(
 }
 
 /**
+ * What the advance concluded about ONE red. Three answers, and only one of them
+ * lets the ordinary gate-fix path have the red: a red that says a declaration is
+ * missing is never handed to an agent, whatever else is true of it.
+ */
+type DepsMissingAdvance =
+  /** Not this shape — the ordinary gate-fix path takes it, unchanged. */
+  | { kind: 'not-deps-missing' }
+  /** This shape, on a branch whose walk this pass already took: a hold, never a mint. */
+  | { kind: 'spent'; verdict: DepsMissingVerdict }
+  /** The walk ran, and its outcome says what happens next. */
+  | { kind: 'walked'; verdict: DepsMissingVerdict; outcome: AdvanceOutcome };
+
+/**
  * A RED THAT SAYS A DECLARATION IS MISSING IS NOT A FIX-SHAPED PROBLEM
  * (DRIVER.md §7.7).
  *
@@ -4829,8 +4842,10 @@ async function journaledRollback(
  * differ only in what they hand in — a landing verdict, or a pre-merge red — so
  * they hand in the same three facts and share one algorithm.
  *
- * Returns null when the red is NOT this shape — every other red keeps the
- * ordinary gate-fix path exactly as it was.
+ * Returns `not-deps-missing` when the red is NOT this shape — every other red
+ * keeps the ordinary gate-fix path exactly as it was — and `spent` when it IS
+ * this shape on a branch whose walk this pass already took, which is a HOLD and
+ * never a mint.
  */
 async function depsMissingAdvance(
   cli: Cli,
@@ -4845,15 +4860,7 @@ async function depsMissingAdvance(
   preReffed: Set<string>,
   runChecks: ChecksRunner,
   runInstall?: InstallRunner,
-): Promise<{ verdict: DepsMissingVerdict; outcome: AdvanceOutcome } | null> {
-  // ONE WALK PER BRANCH PER PASS. The walk is bounded, but the pass re-enters
-  // `run` after every gate, and a branch left standing on the red it reported
-  // would re-walk the same ten commits on every call — paying for an answer
-  // already journaled, and re-landing merges it just rolled back.
-  if (readJournal(dir).some((e) => e.action === 'deps-missing-exhausted' && e.branch === branch)) {
-    appendJournal(dir, { action: 'deps-missing-walk-spent', branch, sha: red.sha });
-    return null;
-  }
+): Promise<DepsMissingAdvance> {
   const rooted = rootChecksOutput(red.output, red.failed);
   const verdict = classifyDepsMissing(red.failed, rooted);
   appendJournal(dir, {
@@ -4867,7 +4874,36 @@ async function depsMissingAdvance(
     lines: verdict.lines.slice(0, DEPS_MISSING_JOURNALED_LINES),
     reason: verdict.reason,
   });
-  if (!verdict.depsMissing) return null;
+  if (!verdict.depsMissing) return { kind: 'not-deps-missing' };
+  // ONE WALK PER BRANCH PER PASS. The walk is bounded, but the pass re-enters
+  // `run` after every gate, and a branch left standing on the red it reported
+  // would re-walk the same ten commits on every call — paying for an answer
+  // already journaled, and re-landing merges it just rolled back.
+  //
+  // ASKED AFTER THE CLASSIFICATION, and the answer is a HOLD, not a fall-through
+  // to the ordinary path. A spent walk says nothing about what the branch is red
+  // on NOW: a red that has become an ordinary defect is classified as one here
+  // and served as one, while a red that is STILL a missing declaration is still
+  // not the agent's to write. Falling through would hand that second red to the
+  // ordinary mint — where a lift onto an in-pass ancestor mints under a fresh
+  // `gateFixKey`, past the same-branch anti-loop, and an agent is asked to author
+  // the symbol after all.
+  const journal = readJournal(dir);
+  if (journal.some((e) => e.action === 'deps-missing-exhausted' && e.branch === branch)) {
+    appendJournal(dir, { action: 'deps-missing-walk-spent', branch, sha: red.sha });
+    return { kind: 'spent', verdict };
+  }
+  // THE STEP BUDGET IS PER BRANCH PER PASS, NOT PER WALK. The advance is
+  // re-entered while the red it leaves behind is another missing declaration
+  // (§7.7), and a bound that reset on every re-entry would bound nothing. Every
+  // landed step this pass has already spent is subtracted here, so the whole
+  // chain of walks on one branch costs at most `DEPS_MISSING_ADVANCE_LIMIT`
+  // merges — and a budget at zero yields an exhausted walk, which is the
+  // owner's draft, not a mint.
+  const landedSoFar = journal.filter(
+    (e) => e.action === 'deps-missing-step' && e.branch === branch && e.landed === true,
+  ).length;
+  const limit = Math.max(0, DEPS_MISSING_ADVANCE_LIMIT - landedSoFar);
   const sources: string[] = [];
   for (const ref of advanceRefs) if (await refExists(cli.repo, ref)) sources.push(ref);
   /** The pending range, `<sources> ^branch`, under whichever walker the query needs. */
@@ -4963,6 +4999,7 @@ async function depsMissingAdvance(
     files: verdict.files,
     symbols: namedSymbols(verdict.lines),
     ops,
+    limit,
     onStep: (step) => appendJournal(dir, { action: 'deps-missing-step', branch, ...step }),
   });
   const shape = { repaired: 'deps-missing-repaired', changed: 'deps-missing-changed', exhausted: 'deps-missing-exhausted' } as const;
@@ -4974,14 +5011,14 @@ async function depsMissingAdvance(
     files: verdict.files,
     errorKeys: verdict.errorKeys,
     candidates: outcome.candidates,
-    limit: DEPS_MISSING_ADVANCE_LIMIT,
+    limit,
     bounded: outcome.bounded,
     steps: outcome.steps.map((s) => `${s.sha.slice(0, 12)} ${s.verdict}`),
     ...(outcome.kind === 'exhausted'
       ? { stop: outcome.stop, firstErrored: outcome.firstErrored }
       : { tip: outcome.tip }),
   });
-  return { verdict, outcome };
+  return { kind: 'walked', verdict, outcome };
 }
 
 /**
@@ -5051,6 +5088,24 @@ async function holdDepsMissingDraft(
     unmeasured: 'a step could not be measured, so the walk established nothing beyond it',
   };
   const blocked = outcome.steps.find((s) => s.verdict === 'conflict');
+  const journal = readJournal(dir);
+  /**
+   * THE BRANCH'S OWN OPEN CONFLICT CASE, IF IT HAS ONE — asked, not assumed.
+   *
+   * The conflict stop's decision offers resolving that case as the route to the
+   * declaration, and on the pre-merge entry point there may be no such case: the
+   * walk can stop on the first `next-case` call of a pass, before `cmdRun` has
+   * minted anything, and cases do not survive a pass. Pointing an owner at a
+   * case that does not exist is worse than not naming one — the one move that
+   * reaches the declaration reads as already available, and it is not.
+   *
+   * A GATE-FIX CASE IS NOT ONE. The frozen case this hold has just minted is on
+   * the same branch and is not a conflict anybody can resolve.
+   */
+  const gateFixCaseIds = new Set(
+    journal.filter((e) => e.action === 'case' && e.gateFix === true).map((e) => String(e.caseId)),
+  );
+  const conflictCase = openCases(journal).find((c) => c.branch === branch && !gateFixCaseIds.has(c.caseId));
   /**
    * WHAT THE OWNER IS ACTUALLY CHOOSING BETWEEN, which the stop decides.
    *
@@ -5077,9 +5132,18 @@ async function holdDepsMissingDraft(
         `${blocked?.conflictedPaths?.length ? ` (${blocked.conflictedPaths.join(', ')})` : ''}, which cannot be`,
       'resolved here: the checks that would judge a resolution are the ones already failing, so any',
       'resolution at this height is unfalsifiable. It IS in this repository. Three options: resolve',
-      "that conflict (this branch's own conflict case is still open, and it is the route to the",
-      'declaration), wait for a pass that reaches the reconciliation without the conflict, or cut',
-      'this branch below the state it came to rest on.',
+      ...(conflictCase
+        ? [
+            `that conflict (this branch's own conflict case \`${conflictCase.caseId}\` is open, and it is the`,
+            'route to the declaration), wait for a pass that reaches the reconciliation without the conflict,',
+            'or cut this branch below the state it came to rest on.',
+          ]
+        : [
+            'that conflict by hand — this pass has no open conflict case on this branch, so there is no case',
+            'to work and the reconciliation is reached by resolving the conflict directly — wait for a pass',
+            'that reaches the reconciliation without the conflict, or cut this branch below the state it came',
+            'to rest on.',
+          ]),
     ],
     unmeasured: [
       'The walk could not measure the tree past its last step, so whether the declaration lies beyond',
@@ -5087,7 +5151,6 @@ async function holdDepsMissingDraft(
       'is cut below the state it came to rest on.',
     ],
   };
-  const journal = readJournal(dir);
   for (const c of cases) {
     const prDir = join(dir, c.caseId, 'pr');
     mkdirSync(prDir, { recursive: true });
@@ -5214,6 +5277,105 @@ async function holdDepsMissingWalk(
       ? `rolled back to ${outcome.firstErrored.slice(0, 12)}; DRAFT PR(s) for the owner: ${gate.cases.map((c) => c.caseId).join(', ')}`
       : gate.reason)
   );
+}
+
+/** How a deps-missing red ended, once the advance had finished with it. */
+type DepsMissingSettled<R> =
+  /**
+   * NOT (or NO LONGER) A MISSING DECLARATION. `red` is the ordinary red the
+   * caller serves by its ordinary path, or null when nothing is red any more.
+   */
+  | { kind: 'ordinary'; red: R | null }
+  /** HELD FOR THE OWNER. Nothing is served, nothing is merged, WARN23 is raised. */
+  | { kind: 'held'; branch: string; detail: string };
+
+/**
+ * THE ADVANCE, RE-ENTERED WHILE THE RED IT LEAVES BEHIND IS ANOTHER MISSING
+ * DECLARATION (DRIVER.md §7.7).
+ *
+ * The walk stops the moment the ORIGINAL error keys clear, because a red that
+ * has changed identity is a different question. But the natural shape of the
+ * case this whole rule exists for is upstream splitting one change across
+ * SEVERAL commits: clearing the first missing declaration uncovers the second.
+ * Re-measuring and minting on that red hands an agent a missing symbol to
+ * author — the exact defect this forecloses — now with the walk's own merges
+ * already on the branch. So the re-measured red is CLASSIFIED before anything
+ * is minted, and when it classifies as a missing declaration the advance is
+ * entered again.
+ *
+ * IT TERMINATES, AND THE BOUND IS EXPLICIT. Every round that continues the loop
+ * ended `repaired` or `changed`, and both of those land at least one commit on
+ * the branch — so every round spends at least one unit of that branch's
+ * `DEPS_MISSING_ADVANCE_LIMIT` per-pass step budget, which `depsMissingAdvance`
+ * subtracts from and never resets. A branch at zero budget walks no candidates,
+ * ends `exhausted`, and is held. `cap` bounds the loop independently of that
+ * argument, and at the cap the standing red is CLASSIFIED but not walked: a red
+ * that is still a missing declaration is held, and only a red that is not one
+ * goes to the ordinary path. No exit from here hands a deps-missing red to a
+ * mint.
+ *
+ * Both red entry points come through here, so the landing gate and the
+ * pre-merge check settle a missing declaration the same way or the difference
+ * is a defect nobody chose.
+ */
+async function settleDepsMissing<R extends { output: string; failed: VerifyCommand[]; sha: string }>(opts: {
+  dir: string;
+  /** The confirmed red the first round starts on. */
+  red: R;
+  /** Which branch a red belongs to. */
+  branchOf: (red: R) => string;
+  /** One round of the advance. */
+  advance: (red: R) => Promise<DepsMissingAdvance>;
+  /** What is red now, after the walk moved the branch; null when nothing is. */
+  remeasure: (previous: R) => Promise<R | null>;
+  /** The terminal hold for an exhausted walk — rollback, frozen case, owner draft. */
+  hold: (red: R, found: { verdict: DepsMissingVerdict; outcome: AdvanceOutcome }) => Promise<string>;
+  /** Rounds allowed before the loop stops re-entering. */
+  cap: number;
+}): Promise<DepsMissingSettled<R>> {
+  let red: R | null = opts.red;
+  for (let round = 0; red !== null; round++) {
+    const branch = opts.branchOf(red);
+    if (round >= opts.cap) {
+      // AT THE CAP, CLASSIFY BUT DO NOT WALK. The cheap half of the question is
+      // the half that protects the invariant: a red that still says a
+      // declaration is missing is held with nothing minted, and a red that says
+      // anything else is the ordinary path's, exactly as it would have been.
+      const capped = classifyDepsMissing(red.failed, rootChecksOutput(red.output, red.failed));
+      appendJournal(opts.dir, {
+        action: 'deps-missing-reentry-capped',
+        branch,
+        sha: red.sha,
+        rounds: round,
+        depsMissing: capped.depsMissing,
+        reason: capped.reason,
+      });
+      if (!capped.depsMissing) return { kind: 'ordinary', red };
+      return {
+        kind: 'held',
+        branch,
+        detail:
+          `${branch} is STILL red on declarations it has not reached (${capped.files.join(', ')}) after ${round} ` +
+          `advance(s) on this call — the walk is not re-entered again, and nothing is served for this red`,
+      };
+    }
+    const found = await opts.advance(red);
+    if (found.kind === 'not-deps-missing') return { kind: 'ordinary', red };
+    if (found.kind === 'spent') {
+      return {
+        kind: 'held',
+        branch,
+        detail:
+          `${branch} rests on declarations it has not reached (${found.verdict.files.join(', ')}) and its walk ` +
+          `this pass is already spent — nothing is served for this red`,
+      };
+    }
+    if (found.outcome.kind === 'exhausted') {
+      return { kind: 'held', branch, detail: await opts.hold(red, found) };
+    }
+    red = await opts.remeasure(red);
+  }
+  return { kind: 'ordinary', red: null };
 }
 
 export async function cmdRun(
@@ -5855,30 +6017,56 @@ export async function cmdRun(
         // Asked BEFORE the lift and the reopen below, because both are
         // destructive and neither is wanted when the propagation itself
         // repairs the red.
-        const found = await depsMissingAdvance(
-          cli,
+        //
+        // AND ASKED AGAIN OF WHATEVER THE WALK LEAVES BEHIND. Clearing one
+        // missing declaration routinely uncovers the next one — upstream split
+        // the change across several commits — and the re-measured red goes to
+        // the ordinary mint below only once it has been classified and is not
+        // one of these.
+        /** The latest verdict the loop measured — `landing` takes it when it ends. */
+        let latest: LandingVerdict = landing;
+        const settled = await settleDepsMissing<Extract<LandingVerdict, { kind: 'red' }>>({
           dir,
-          bp.branch,
-          advanceSources(bp, ctx.chain),
-          landing,
-          scope,
-          preReffed,
-          runChecks,
-          runInstall,
-        );
-        if (found && found.outcome.kind === 'exhausted') {
-          const detail = await holdDepsMissingWalk(cli, dir, ctx.chain, bp.branch, landing, found, scope);
-          gated = true;
-          issues.push({ id: 'WARN23_DEPS_MISSING_HELD', detail });
-          console.error(`run [WARN23_DEPS_MISSING_HELD]: ${detail}`);
-          break;
-        }
-        if (found) {
+          red: landing,
+          branchOf: () => bp.branch,
+          cap: DEPS_MISSING_ADVANCE_LIMIT,
+          advance: (red) =>
+            depsMissingAdvance(
+              cli,
+              dir,
+              bp.branch,
+              advanceSources(bp, ctx.chain),
+              red,
+              scope,
+              preReffed,
+              runChecks,
+              runInstall,
+            ),
+          hold: (red, found) => holdDepsMissingWalk(cli, dir, ctx.chain, bp.branch, red, found, scope),
           // The walk moved the branch, so the verdict that stands is the one
-          // this tip earns. A repair lands and the pass continues; a red that
-          // has changed identity is an ordinary red and takes the ordinary path
-          // below, on evidence measured where the branch now is.
-          landing = await landingCheck(cli, dir, bp.branch, landing.tree, runChecks, runInstall);
+          // this tip earns. A repair lands and the pass continues; anything
+          // still red is asked the same question again.
+          remeasure: async (previous) => {
+            latest = await landingCheck(cli, dir, bp.branch, previous.tree, runChecks, runInstall);
+            return latest.kind === 'red' ? latest : null;
+          },
+        });
+        landing = latest;
+        if (settled.kind === 'held') {
+          gated = true;
+          // JOURNALED WHERE `next-case` CAN READ IT. `run`'s own issues are
+          // suppressed when it runs as an internal stage, so without this row the
+          // agent is served a case on this same call with no word that part of
+          // the red it will meet is held and is not its to fix.
+          appendJournal(dir, {
+            action: 'warning',
+            id: 'WARN23_DEPS_MISSING_HELD',
+            branch: settled.branch,
+            message: settled.detail,
+          });
+          issues.push({ id: 'WARN23_DEPS_MISSING_HELD', detail: settled.detail });
+          console.error(`run [WARN23_DEPS_MISSING_HELD]: ${settled.detail}`);
+          break;
         }
       }
       if (landing.kind === 'flaky') {
@@ -11524,6 +11712,15 @@ export async function cmdSweepNextCase(
     return 1;
   }
 
+  /**
+   * WHERE THIS CALL'S OWN JOURNAL STARTS. A missing-declaration hold can be
+   * made by the pre-merge check below OR by the landing gate inside `cmdRun`,
+   * whose issues are suppressed when it runs as an internal stage — so the
+   * notice the agent needs is read back off the journal rows this call wrote,
+   * and no result arm depends on which stage made the hold.
+   */
+  const journalStart = readJournal(dir).length;
+
   // PRE-MERGE BRANCH CHECK — BEFORE cmdRun, which is where the merging happens.
   // A branch that is already red must not have content merged into it and must
   // not be propagated FROM: either spreads the defect to every descendant, and
@@ -11547,7 +11744,7 @@ export async function cmdSweepNextCase(
   })();
   let redBranch = openGateFixCase ? null : await firstRedParticipant(cli, dir, passChecksFile, runChecks, runInstall);
   let redGate: { reason: string; gated: string[] } | null = null;
-  /** The branch and WARN23 detail, when the pre-merge red turned out to be a spent walk. */
+  /** The branch and WARN23 detail, when the pre-merge red was held for the owner. */
   let depsMissingHeld: { branch: string; detail: string } | null = null;
   if (redBranch) {
     // A MISSING DECLARATION IS NOT A DEFECT TO HAND OUT (§7.7), and THIS is the
@@ -11558,17 +11755,34 @@ export async function cmdSweepNextCase(
     //
     // Asked BEFORE the lift below, for the reason the landing gate asks before
     // its own lift and reopen: ceiling attribution is the first step of handing
-    // a red to somebody, and this red is handed to nobody.
+    // a red to somebody, and this red is handed to nobody. AND ASKED AGAIN of
+    // whatever the walk leaves behind, for the reason the landing gate asks
+    // again: clearing one missing declaration routinely uncovers the next.
     //
     // A BRANCH OUTSIDE THE PASS'S SCOPE KEEPS THE ORDINARY PATH. The advance
     // merges and rolls back through the ref-scope guard (N1), which refuses a
     // branch the plan does not name — an upstream ref this pass only READS
     // from is one of those, and moving it was never the sweep's to do.
-    const red = redBranch;
     const scope = passScope(dir);
-    const bp = planBranchOf(dir, red.branch);
-    const found = scope.has(red.branch)
-      ? await depsMissingAdvance(
+    type PreMergeRed = NonNullable<Awaited<ReturnType<typeof firstRedParticipant>>>;
+    /**
+     * THE RE-ENTRY CAP, derived rather than picked. Every round that continues
+     * lands at least one commit against ITS branch's `DEPS_MISSING_ADVANCE_LIMIT`
+     * per-pass step budget, and a branch the walk repaired is green and cannot
+     * come back — so no run of rounds can exceed the budget times the number of
+     * branches that could ever be measured. At the cap the standing red is still
+     * classified, and a red that is still a missing declaration is still held.
+     */
+    const cap = DEPS_MISSING_ADVANCE_LIMIT * Math.max(1, participatingBranches(dir).length);
+    const settled = await settleDepsMissing<PreMergeRed>({
+      dir,
+      red: redBranch,
+      cap,
+      branchOf: (red) => red.branch,
+      advance: async (red) => {
+        if (!scope.has(red.branch)) return { kind: 'not-deps-missing' };
+        const bp = planBranchOf(dir, red.branch);
+        return depsMissingAdvance(
           cli,
           dir,
           red.branch,
@@ -11578,20 +11792,25 @@ export async function cmdSweepNextCase(
           preReffedSet(readJournal(dir)),
           runChecks,
           runInstall,
-        )
-      : null;
-    if (found && found.outcome.kind === 'exhausted') {
-      const detail = await holdDepsMissingWalk(cli, dir, ctx.chain, red.branch, red, found, scope);
-      depsMissingHeld = { branch: red.branch, detail };
-      appendJournal(dir, { action: 'warning', id: 'WARN23_DEPS_MISSING_HELD', branch: red.branch, message: detail });
-      console.error(`next-case [WARN23_DEPS_MISSING_HELD]: ${detail}`);
-    } else if (found) {
+        );
+      },
+      hold: (red, found) => holdDepsMissingWalk(cli, dir, ctx.chain, red.branch, red, found, scope),
       // THE WALK MOVED THE BRANCH, so the verdict that stands is the one its new
       // tip earns — the same re-measure the landing gate takes. A repair leaves
-      // this branch green and the check moves on to the next participant; a red
-      // that has changed identity is an ordinary red, minted below on evidence
-      // measured where the branch now is.
-      redBranch = await firstRedParticipant(cli, dir, passChecksFile, runChecks, runInstall);
+      // this branch green and the check moves on to the next participant.
+      remeasure: () => firstRedParticipant(cli, dir, passChecksFile, runChecks, runInstall),
+    });
+    if (settled.kind === 'held') {
+      depsMissingHeld = { branch: settled.branch, detail: settled.detail };
+      appendJournal(dir, {
+        action: 'warning',
+        id: 'WARN23_DEPS_MISSING_HELD',
+        branch: settled.branch,
+        message: settled.detail,
+      });
+      console.error(`next-case [WARN23_DEPS_MISSING_HELD]: ${settled.detail}`);
+    } else {
+      redBranch = settled.red;
     }
   }
   if (openGateFixCase) {
@@ -11707,6 +11926,30 @@ export async function cmdSweepNextCase(
   }
 
   const journal = readJournal(dir);
+  /**
+   * EVERY MISSING-DECLARATION HOLD THIS CALL MADE — the pre-merge check's and
+   * the landing gate's alike.
+   *
+   * A hold leaves its branch red on an error that is nobody's to fix, and this
+   * call can serve a case ANYWAY: the conflict stop deliberately does not reopen
+   * the branch, so the branch's own conflict case is still open and is offered
+   * on this same call. Without this the agent meets that red inside its case
+   * worktree, reads it as its own resolution's, and starts fixing an error
+   * outside its case's scope — which for a missing declaration means authoring
+   * the symbol. So every result arm that can end a call carrying a hold says so.
+   */
+  const depsMissingNotices = readJournal(dir)
+    .slice(journalStart)
+    .filter((e) => e.action === 'warning' && e.id === 'WARN23_DEPS_MISSING_HELD')
+    .map((e) => ({ id: 'WARN23_DEPS_MISSING_HELD', detail: String(e.message ?? '') }));
+  /** The same fact in the agent's materials, where the case it is about to work is described. */
+  const depsMissingNote = depsMissingNotices.length
+    ? `\n\n## NOT YOURS TO FIX (WARN23_DEPS_MISSING_HELD)\n` +
+      depsMissingNotices.map((n) => `- ${n.detail}`).join('\n') +
+      `\nA missing-declaration red on this pass is HELD for the owner and is NOT part of this case. If the ` +
+      `checks in your worktree report a symbol that does not exist, that is the held red: do NOT write the ` +
+      `symbol and do NOT widen this case to cover it. Fix only what your own resolution broke.\n`
+    : '';
   // ACTIVE GATES, read from ORIGIN at the moment of asking. A branch whose gate
   // fix is already written and waiting on the owner is SKIPPED, not re-served —
   // and the agent is told, so "nothing to serve" is never mistaken for "nothing
@@ -11792,7 +12035,7 @@ export async function cmdSweepNextCase(
       console.error(`next-case: ${redBranch.branch} red; ${unpublishedHeld.length} held fix(es) not yet published — finish`);
       result(cli, {
         status: 'finalize',
-        ...(depsMissingHeld ? { issues: [{ id: 'WARN23_DEPS_MISSING_HELD', detail: depsMissingHeld.detail }] } : {}),
+        ...(depsMissingNotices.length ? { issues: depsMissingNotices } : {}),
         heldAwaitingPublish: unpublishedHeld.map((jc) => ({ caseId: jc.caseId, branch: jc.branch })),
         instruction:
           `run \`finish\` — ${redBranch.branch} is still RED (${redBranch.failedNames.join(', ')}) and the fix for it ` +
@@ -11805,7 +12048,7 @@ export async function cmdSweepNextCase(
     result(cli, {
       ok: false,
       status: 'stopped',
-      ...(depsMissingHeld ? { issues: [{ id: 'WARN23_DEPS_MISSING_HELD', detail: depsMissingHeld.detail }] } : {}),
+      ...(depsMissingNotices.length ? { issues: depsMissingNotices } : {}),
       ...(redGate?.gated.length ? { gatedBranches: redGate.gated } : {}),
       instruction:
         `REPORT to the owner: ${redBranch.branch} is RED before this pass merges anything ` +
@@ -11834,6 +12077,7 @@ export async function cmdSweepNextCase(
       : '';
     result(cli, {
       status: 'finalize',
+      ...(depsMissingNotices.length ? { issues: depsMissingNotices } : {}),
       ...(activeGates.length ? { activeGates } : {}),
       ...(refusedReds.length ? { unmintableReds: refusedReds } : {}),
       instruction: `no case is open — run \`finish\`.${gateNote}${refusedNote}`,
@@ -11912,6 +12156,7 @@ export async function cmdSweepNextCase(
         ? await reissueCaseMaterials(cli, dir, jc, caseRow!)
         : await machineCaseMaterials(cli, dir, jc)) +
     (loopWarning ? `\n\n## LOOP WARNING\n${loopWarning}\n` : '') +
+    depsMissingNote +
     `\n\n${CHECKS_HANDOFF_LINE}`;
   writeFileSync(join(dir, jc.caseId, 'materials.md'), materials + '\n');
   st = { ...st, phase: 'case-ready', currentCase: { caseId: jc.caseId, branch: jc.branch } };
@@ -11923,6 +12168,10 @@ export async function cmdSweepNextCase(
     branch: jc.branch,
     caseId: jc.caseId,
     conflictedPaths: caseFile.conflictedPaths,
+    // A CASE SERVED ALONGSIDE A HOLD SAYS SO, in the machine-readable place the
+    // agent already reads: part of the red it will meet is held for the owner
+    // and is not this case's to fix.
+    ...(depsMissingNotices.length ? { issues: depsMissingNotices } : {}),
     // Pending too, and in scope — the agent's report should not read them as
     // files it wandered into.
     ...(caseFile.carriedPaths?.length ? { carriedPaths: caseFile.carriedPaths } : {}),
