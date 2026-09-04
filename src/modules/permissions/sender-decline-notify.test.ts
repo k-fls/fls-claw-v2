@@ -15,6 +15,7 @@ import fs from 'fs';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
 import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
+import { sqliteRaw } from '../../db/drivers/sqlite.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup, createMessagingGroupAgent, updateMessagingGroup } from '../../db/messaging-groups.js';
 import { upsertUser } from './db/users.js';
@@ -41,7 +42,8 @@ vi.mock('../../delivery.js', () => ({
 vi.mock('./user-dm.js', () => ({
   ensureUserDm: vi.fn(async (userId: string) => {
     const { getDb } = await import('../../db/connection.js');
-    const row = getDb()
+    const { sqliteRaw } = await import('../../db/drivers/sqlite.js');
+    const row = sqliteRaw(getDb())
       .prepare(
         `SELECT mg.* FROM messaging_groups mg
            JOIN user_dms ud ON ud.messaging_group_id = mg.id
@@ -66,8 +68,8 @@ function now() {
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  const db = initTestDb();
-  runMigrations(db);
+  const db = await initTestDb();
+  await runMigrations(db);
 
   // Side-effect imports: register hooks (permissions module) AFTER the
   // mocks are in place.
@@ -75,9 +77,9 @@ beforeEach(async () => {
 
   // Fixtures: agent group, a wired 1:1 DM messaging group with
   // decline_notify (a DM-shaped channel), owner + owner DM.
-  createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
+  await createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
 
-  createMessagingGroup({
+  await createMessagingGroup({
     id: 'mg-dm-stranger',
     channel_type: 'telegram',
     platform_id: 'dm-stranger',
@@ -86,7 +88,7 @@ beforeEach(async () => {
     unknown_sender_policy: 'decline_notify',
     created_at: now(),
   });
-  createMessagingGroupAgent({
+  await createMessagingGroupAgent({
     id: 'mga-1',
     messaging_group_id: 'mg-dm-stranger',
     agent_group_id: 'ag-1',
@@ -100,15 +102,15 @@ beforeEach(async () => {
   });
 
   // Owner user (with display name — feeds the decline copy) + their DM.
-  upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Gavriel', created_at: now() });
-  grantRole({
+  await upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Gavriel', created_at: now() });
+  await grantRole({
     user_id: 'telegram:owner',
     role: 'owner',
     agent_group_id: null,
     granted_by: null,
     granted_at: now(),
   });
-  createMessagingGroup({
+  await createMessagingGroup({
     id: 'mg-dm-owner',
     channel_type: 'telegram',
     platform_id: 'dm-owner',
@@ -118,7 +120,7 @@ beforeEach(async () => {
     created_at: now(),
   });
   const { getDb } = await import('../../db/connection.js');
-  getDb()
+  sqliteRaw(getDb())
     .prepare(
       `INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
        VALUES (?, ?, ?, ?)`,
@@ -128,8 +130,8 @@ beforeEach(async () => {
   deliverMock.mockClear();
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
@@ -192,16 +194,18 @@ describe('unknown-sender decline_notify flow', () => {
     // Drop recorded. (The gate writes reason 'unknown_sender_decline_notify';
     // core's structural no_agent_engaged record then upserts the same row —
     // pre-existing behavior shared with every refusal path.)
-    const drop = getDb()
+    const drop = sqliteRaw(getDb())
       .prepare('SELECT user_id FROM unregistered_senders WHERE platform_id = ?')
       .get('dm-stranger') as { user_id: string };
     expect(drop.user_id).toBe('tg:stranger');
 
     // No card rows anywhere — only the decline stamp.
-    const rows = getDb().prepare('SELECT id FROM pending_sender_approvals').all() as Array<{ id: string }>;
+    const rows = sqliteRaw(getDb()).prepare('SELECT id FROM pending_sender_approvals').all() as Array<{ id: string }>;
     expect(rows).toHaveLength(1);
     expect(rows[0].id).toMatch(/^decline:/);
-    const channelRows = getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number };
+    const channelRows = sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as {
+      c: number;
+    };
     expect(channelRows.c).toBe(0);
   });
 
@@ -219,7 +223,7 @@ describe('unknown-sender decline_notify flow', () => {
     // no_agent_engaged record — pre-existing double-count on refusals).
     expect(deliverMock).toHaveBeenCalledTimes(2);
     const { getDb } = await import('../../db/connection.js');
-    const drop = getDb()
+    const drop = sqliteRaw(getDb())
       .prepare('SELECT message_count FROM unregistered_senders WHERE platform_id = ?')
       .get('dm-stranger') as { message_count: number };
     expect(drop.message_count).toBe(4);
@@ -234,13 +238,13 @@ describe('unknown-sender decline_notify flow', () => {
     // Age the stamp past the window.
     const { getDb } = await import('../../db/connection.js');
     const old = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
-    getDb().prepare(`UPDATE pending_sender_approvals SET created_at = ? WHERE id LIKE 'decline:%'`).run(old);
+    sqliteRaw(getDb()).prepare(`UPDATE pending_sender_approvals SET created_at = ? WHERE id LIKE 'decline:%'`).run(old);
 
     await routeInbound(strangerDm('hello again'));
     await settle();
 
     expect(deliverMock).toHaveBeenCalledTimes(4); // second decline + FYI pair
-    const stamp = getDb()
+    const stamp = sqliteRaw(getDb())
       .prepare(`SELECT created_at FROM pending_sender_approvals WHERE id LIKE 'decline:%'`)
       .get() as {
       created_at: string;
@@ -250,19 +254,19 @@ describe('unknown-sender decline_notify flow', () => {
 
   it('flip request_approval→decline_notify with a card pending: card row converts to a stamp, dedupe holds', async () => {
     // Start on request_approval — the stranger's first message cards.
-    updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'request_approval' });
+    await updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'request_approval' });
     const { routeInbound } = await import('../../router.js');
     await routeInbound(strangerDm('hello'));
     await settle();
     expect(deliverMock).toHaveBeenCalledTimes(1); // the approval card
 
     const { getDb } = await import('../../db/connection.js');
-    let rows = getDb().prepare('SELECT id FROM pending_sender_approvals').all() as Array<{ id: string }>;
+    let rows = sqliteRaw(getDb()).prepare('SELECT id FROM pending_sender_approvals').all() as Array<{ id: string }>;
     expect(rows).toHaveLength(1);
     expect(rows[0].id).toMatch(/^nsa-/);
 
     // Operator flips the policy while the card is still pending.
-    updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'decline_notify' });
+    await updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'decline_notify' });
     deliverMock.mockClear();
 
     await routeInbound(strangerDm('are you there?'));
@@ -271,7 +275,7 @@ describe('unknown-sender decline_notify flow', () => {
     // Decline + FYI went out; the pending card row became the stamp (the
     // UNIQUE(messaging_group_id, sender_identity) collision converts it).
     expect(deliverMock).toHaveBeenCalledTimes(2);
-    rows = getDb().prepare('SELECT id FROM pending_sender_approvals').all() as Array<{ id: string }>;
+    rows = sqliteRaw(getDb()).prepare('SELECT id FROM pending_sender_approvals').all() as Array<{ id: string }>;
     expect(rows).toHaveLength(1);
     expect(rows[0].id).toMatch(/^decline:/);
 
@@ -282,7 +286,7 @@ describe('unknown-sender decline_notify flow', () => {
   });
 
   it('decline_notify on a group messaging group: silent drop — no public decline, no FYI', async () => {
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-team',
       channel_type: 'telegram',
       platform_id: 'group-team',
@@ -291,7 +295,7 @@ describe('unknown-sender decline_notify flow', () => {
       unknown_sender_policy: 'decline_notify',
       created_at: now(),
     });
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: 'mga-team',
       messaging_group_id: 'mg-team',
       agent_group_id: 'ag-1',
@@ -312,11 +316,13 @@ describe('unknown-sender decline_notify flow', () => {
     // posted publicly into the group channel; no stamp either.
     expect(deliverMock).not.toHaveBeenCalled();
     const { getDb } = await import('../../db/connection.js');
-    const drop = getDb()
+    const drop = sqliteRaw(getDb())
       .prepare('SELECT user_id FROM unregistered_senders WHERE platform_id = ?')
       .get('group-team') as { user_id: string };
     expect(drop.user_id).toBe('tg:stranger');
-    const stamps = getDb().prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as { c: number };
+    const stamps = sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as {
+      c: number;
+    };
     expect(stamps.c).toBe(0);
   });
 
@@ -326,7 +332,7 @@ describe('unknown-sender decline_notify flow', () => {
     await settle();
     expect(deliverMock).toHaveBeenCalledTimes(2);
 
-    updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'request_approval' });
+    await updateMessagingGroup('mg-dm-stranger', { unknown_sender_policy: 'request_approval' });
     deliverMock.mockClear();
 
     await routeInbound(strangerDm('let me in'));
@@ -340,7 +346,7 @@ describe('unknown-sender decline_notify flow', () => {
     expect(payload.type).toBe('ask_question');
 
     const { getDb } = await import('../../db/connection.js');
-    const rows = getDb().prepare('SELECT id FROM pending_sender_approvals').all() as Array<{ id: string }>;
+    const rows = sqliteRaw(getDb()).prepare('SELECT id FROM pending_sender_approvals').all() as Array<{ id: string }>;
     expect(rows).toHaveLength(1);
     expect(rows[0].id).toMatch(/^nsa-/); // real card row; stamp gone
   });

@@ -215,9 +215,7 @@ export function readRegistryHost(): string | undefined {
   const ref = readAgentImagePin();
   if (!ref || !ref.includes('/')) return undefined;
   const first = ref.slice(0, ref.indexOf('/'));
-  return first.includes('.') || first.includes(':') || first === 'localhost'
-    ? first
-    : undefined;
+  return first.includes('.') || first.includes(':') || first === 'localhost' ? first : undefined;
 }
 
 export interface AgentImageInspection {
@@ -284,10 +282,7 @@ interface DockerInspectEntry {
  * leaves it empty, a registry populates it. Only a fallback because a
  * `docker save`/`load` sneakernet image has none and would read as local.
  */
-function resolveActualSource(
-  labels: Record<string, string>,
-  registryDigest: string | undefined,
-): ActualImageSource {
+function resolveActualSource(labels: Record<string, string>, registryDigest: string | undefined): ActualImageSource {
   const declared = labels[IMAGE_SOURCE_LABEL];
   // `derived` is a per-group image built on top of one of the other two. It has
   // to be its own answer: it inherits the base's RepoDigest-derived provenance

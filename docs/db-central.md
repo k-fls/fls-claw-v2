@@ -434,7 +434,21 @@ Several early migrations were later renamed/retired and replaced by "module" fil
 | 19 | `wiring-threads-override` | `019-wiring-threads.ts` | `messaging_group_agents.threads` — per-wiring thread-policy override (NULL = adapter default) |
 | 20 | `container-config-timezone` | `020-container-config-timezone.ts` | `container_configs.timezone` — per-agent-group timezone override (NULL = install-global) |
 | 21 | `approval-question-render-metadata` | `021-approval-question.ts` | `question` card-body column on all three approval tables so terminal edits retain the original request |
+| 22 | `messaging-group-detached-at` | `022-messaging-group-detached.ts` | `messaging_groups.detached_at` — records when the bot left a channel without deleting its wiring |
 
 Numbers 5 and 6 are intentionally absent — migrations were renumbered during early development.
 
 Session DB schemas (`INBOUND_SCHEMA`, `OUTBOUND_SCHEMA`) are **not** versioned here. They're `CREATE TABLE IF NOT EXISTS` so new columns land via the session-DB lazy migration helpers (`migrateDeliveredTable()` etc.) when a session file from an older build is reopened. See [db-session.md](db-session.md).
+
+## 3. Portable SQL rules
+
+Central-DB runtime SQL must work on both SQLite and PostgreSQL. Session mailbox SQL is outside this rule because `inbound.db` and `outbound.db` remain backend-specific.
+
+- Use `INSERT ... ON CONFLICT (...) DO NOTHING` instead of `INSERT OR IGNORE`.
+- Use `INSERT ... ON CONFLICT (...) DO UPDATE SET ... = excluded....` instead of `INSERT OR REPLACE`; replacement deletes and recreates a row on SQLite and has no PostgreSQL equivalent.
+- Never use `rowid` for runtime ordering. Declare a stable domain-column order, with a deterministic key as the final tie-breaker.
+- Use snake_case aliases. PostgreSQL folds unquoted identifiers to lowercase, so camelCase aliases do not round-trip reliably.
+- Use `IS NOT DISTINCT FROM ?` when nullable equality is required. `IS ?` is SQLite-only, while `=` does not match two NULL values.
+- Keep named parameters in the existing `@name` form. The backend driver owns placeholder rewriting.
+- Store timestamps as ISO-8601 UTC text produced by `new Date().toISOString()`. Portable central-DB SQL compares the consistently shaped text directly; SQLite-only operational snippets may use `datetime()` around both sides.
+- Central migrations added after the async DB boundary must use the backend-neutral driver API and portable SQL. Backend-specific schema work belongs in a named migration override.

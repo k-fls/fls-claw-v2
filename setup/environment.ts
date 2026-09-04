@@ -65,9 +65,9 @@ export function detectExistingDisplayName(projectRoot: string): string | null {
   let db: Database.Database | null = null;
   try {
     db = new Database(dbPath, { readonly: true });
-    const row = db
-      .prepare(`SELECT display_name FROM users WHERE id = 'cli:local'`)
-      .get() as { display_name: string } | undefined;
+    const row = db.prepare(`SELECT display_name FROM users WHERE id = 'cli:local'`).get() as
+      | { display_name: string }
+      | undefined;
     return row?.display_name?.trim() || null;
   } catch {
     return null;
@@ -132,23 +132,21 @@ export async function run(_args: string[]): Promise<void> {
 
   // Check for existing OpenClaw installation
   const homedir = (await import('os')).homedir();
-  const openClawPath =
-    fs.existsSync(path.join(homedir, '.openclaw')) ? path.join(homedir, '.openclaw') :
-    fs.existsSync(path.join(homedir, '.clawdbot')) ? path.join(homedir, '.clawdbot') :
-    null;
+  const openClawPath = fs.existsSync(path.join(homedir, '.openclaw'))
+    ? path.join(homedir, '.openclaw')
+    : fs.existsSync(path.join(homedir, '.clawdbot'))
+      ? path.join(homedir, '.clawdbot')
+      : null;
 
-  log.info(
-    'Environment check complete',
-    {
-      platform,
-      wsl,
-      docker,
-      hasEnv,
-      hasAuth,
-      hasRegisteredGroups,
-      openClawPath,
-    },
-  );
+  log.info('Environment check complete', {
+    platform,
+    wsl,
+    docker,
+    hasEnv,
+    hasAuth,
+    hasRegisteredGroups,
+    openClawPath,
+  });
 
   emitStatus('CHECK_ENVIRONMENT', {
     PLATFORM: platform,

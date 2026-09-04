@@ -15,6 +15,7 @@ import fs from 'fs';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
 import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
+import { sqliteRaw } from '../../db/drivers/sqlite.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup, createMessagingGroupAgent } from '../../db/messaging-groups.js';
 import { upsertUser } from './db/users.js';
@@ -41,7 +42,7 @@ vi.mock('../../delivery.js', () => ({
 vi.mock('./user-dm.js', () => ({
   ensureUserDm: vi.fn(async (userId: string) => {
     const { getDb } = await import('../../db/connection.js');
-    const row = getDb()
+    const row = sqliteRaw(getDb())
       .prepare(
         `SELECT mg.* FROM messaging_groups mg
            JOIN user_dms ud ON ud.messaging_group_id = mg.id
@@ -66,8 +67,8 @@ function now() {
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  const db = initTestDb();
-  runMigrations(db);
+  const db = await initTestDb();
+  await runMigrations(db);
 
   // Side-effect imports: register hooks (permissions module) AFTER the
   // mocks are in place so the access gate / response handler pick up the
@@ -76,9 +77,9 @@ beforeEach(async () => {
 
   // Fixtures: agent group, messaging group with request_approval, wiring,
   // owner + DM messaging group for approver delivery.
-  createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
+  await createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
 
-  createMessagingGroup({
+  await createMessagingGroup({
     id: 'mg-chat',
     channel_type: 'telegram',
     platform_id: 'chat-123',
@@ -87,7 +88,7 @@ beforeEach(async () => {
     unknown_sender_policy: 'request_approval',
     created_at: now(),
   });
-  createMessagingGroupAgent({
+  await createMessagingGroupAgent({
     id: 'mga-1',
     messaging_group_id: 'mg-chat',
     agent_group_id: 'ag-1',
@@ -101,15 +102,15 @@ beforeEach(async () => {
   });
 
   // Owner user + their DM messaging group (pickApprover + ensureUserDm target).
-  upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Owner', created_at: now() });
-  grantRole({
+  await upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Owner', created_at: now() });
+  await grantRole({
     user_id: 'telegram:owner',
     role: 'owner',
     agent_group_id: null,
     granted_by: null,
     granted_at: now(),
   });
-  createMessagingGroup({
+  await createMessagingGroup({
     id: 'mg-dm-owner',
     channel_type: 'telegram',
     platform_id: 'dm-owner',
@@ -119,7 +120,7 @@ beforeEach(async () => {
     created_at: now(),
   });
   const { getDb } = await import('../../db/connection.js');
-  getDb()
+  sqliteRaw(getDb())
     .prepare(
       `INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
        VALUES (?, ?, ?, ?)`,
@@ -129,8 +130,8 @@ beforeEach(async () => {
   deliverMock.mockClear();
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
@@ -171,7 +172,7 @@ describe('unknown-sender request_approval flow', () => {
     expect(payload.questionId).toMatch(/^nsa-/);
 
     const { getDb } = await import('../../db/connection.js');
-    const rows = getDb().prepare('SELECT * FROM pending_sender_approvals').all();
+    const rows = sqliteRaw(getDb()).prepare('SELECT * FROM pending_sender_approvals').all();
     expect(rows).toHaveLength(1);
   });
 
@@ -184,7 +185,9 @@ describe('unknown-sender request_approval flow', () => {
 
     expect(deliverMock).toHaveBeenCalledTimes(1);
     const { getDb } = await import('../../db/connection.js');
-    const count = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as { c: number }).c;
+    const count = (
+      sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as { c: number }
+    ).c;
     expect(count).toBe(1);
   });
 
@@ -198,7 +201,7 @@ describe('unknown-sender request_approval flow', () => {
     await new Promise((r) => setTimeout(r, 10));
 
     const { getDb } = await import('../../db/connection.js');
-    const pending = getDb().prepare('SELECT id FROM pending_sender_approvals').get() as { id: string };
+    const pending = sqliteRaw(getDb()).prepare('SELECT id FROM pending_sender_approvals').get() as { id: string };
     expect(pending).toBeDefined();
 
     // Fire the approve click through the response-handler chain.
@@ -218,13 +221,15 @@ describe('unknown-sender request_approval flow', () => {
     }
 
     // Member row added for the stranger against the wired agent group.
-    const member = getDb()
+    const member = sqliteRaw(getDb())
       .prepare('SELECT 1 AS x FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?')
       .get('tg:stranger', 'ag-1');
     expect(member).toBeDefined();
 
     // Pending row cleared.
-    const stillPending = getDb().prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as { c: number };
+    const stillPending = sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as {
+      c: number;
+    };
     expect(stillPending.c).toBe(0);
 
     // Message replayed + container woken.
@@ -239,7 +244,7 @@ describe('unknown-sender request_approval flow', () => {
     await new Promise((r) => setTimeout(r, 10));
 
     const { getDb } = await import('../../db/connection.js');
-    const pending = getDb().prepare('SELECT id FROM pending_sender_approvals').get() as { id: string };
+    const pending = sqliteRaw(getDb()).prepare('SELECT id FROM pending_sender_approvals').get() as { id: string };
     expect(pending).toBeDefined();
 
     for (const handler of getResponseHandlers()) {
@@ -254,9 +259,11 @@ describe('unknown-sender request_approval flow', () => {
       if (claimed) break;
     }
 
-    const count = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as { c: number }).c;
+    const count = (
+      sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as { c: number }
+    ).c;
     expect(count).toBe(0);
-    const member = getDb()
+    const member = sqliteRaw(getDb())
       .prepare('SELECT 1 AS x FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?')
       .get('tg:stranger', 'ag-1');
     expect(member).toBeUndefined();
@@ -271,7 +278,7 @@ describe('unknown-sender request_approval flow', () => {
     await new Promise((r) => setTimeout(r, 10));
 
     const { getDb } = await import('../../db/connection.js');
-    const pending = getDb().prepare('SELECT id FROM pending_sender_approvals').get() as { id: string };
+    const pending = sqliteRaw(getDb()).prepare('SELECT id FROM pending_sender_approvals').get() as { id: string };
     expect(pending).toBeDefined();
 
     // A random user (not the stranger, not the owner, not an admin) tries to
@@ -290,21 +297,22 @@ describe('unknown-sender request_approval flow', () => {
     }
 
     // No member added for the stranger.
-    const member = getDb()
+    const member = sqliteRaw(getDb())
       .prepare('SELECT 1 AS x FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?')
       .get('tg:stranger', 'ag-1');
     expect(member).toBeUndefined();
 
     // Pending row is still there — a legitimate approver can still act on it.
-    const stillPending = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as { c: number })
-      .c;
+    const stillPending = (
+      sqliteRaw(getDb()).prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as { c: number }
+    ).c;
     expect(stillPending).toBe(1);
   });
 
   it('accepts a click from a global admin even if they are not the designated approver', async () => {
     // Pre-seed a separate admin user so we can click as them.
-    upsertUser({ id: 'telegram:admin-bob', kind: 'telegram', display_name: 'Bob', created_at: now() });
-    grantRole({
+    await upsertUser({ id: 'telegram:admin-bob', kind: 'telegram', display_name: 'Bob', created_at: now() });
+    await grantRole({
       user_id: 'telegram:admin-bob',
       role: 'admin',
       agent_group_id: null,
@@ -319,7 +327,7 @@ describe('unknown-sender request_approval flow', () => {
     await new Promise((r) => setTimeout(r, 10));
 
     const { getDb } = await import('../../db/connection.js');
-    const pending = getDb().prepare('SELECT id FROM pending_sender_approvals').get() as { id: string };
+    const pending = sqliteRaw(getDb()).prepare('SELECT id FROM pending_sender_approvals').get() as { id: string };
     expect(pending).toBeDefined();
 
     // Admin clicks approve (not the designated approver, which was owner).
@@ -336,7 +344,7 @@ describe('unknown-sender request_approval flow', () => {
     }
 
     // Stranger admitted thanks to the admin's authority.
-    const member = getDb()
+    const member = sqliteRaw(getDb())
       .prepare('SELECT 1 AS x FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?')
       .get('tg:stranger', 'ag-1');
     expect(member).toBeDefined();

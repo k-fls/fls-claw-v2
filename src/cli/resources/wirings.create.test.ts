@@ -29,6 +29,7 @@ vi.mock('../../config.js', async () => {
 const TEST_DIR = '/tmp/nanoclaw-test-cli-wirings-dest';
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
+import { sqliteRaw } from '../../db/drivers/sqlite.js';
 import { dispatch } from '../dispatch.js';
 // Side-effect import: registers the `wirings-*` commands (including create).
 import './wirings.js';
@@ -39,7 +40,7 @@ function now(): string {
 
 function count(sql: string, ...params: unknown[]): number {
   return (
-    getDb()
+    sqliteRaw(getDb())
       .prepare(sql)
       .get(...params) as { c: number }
   ).c;
@@ -49,22 +50,22 @@ describe('wirings CLI create auto-creates agent_destinations row (#5)', () => {
   const GID = 'ag-handler';
   const MGID = 'mg-chat-1';
 
-  beforeEach(() => {
+  beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
 
-    const db = initTestDb();
-    runMigrations(db);
+    const db = await initTestDb();
+    await runMigrations(db);
 
-    createAgentGroup({ id: GID, name: 'handler', folder: 'handler', agent_provider: null, created_at: now() });
-    db.prepare(
+    await createAgentGroup({ id: GID, name: 'handler', folder: 'handler', agent_provider: null, created_at: now() });
+    sqliteRaw(db).prepare(
       `INSERT INTO messaging_groups (id, channel_type, platform_id, instance, name, is_group, unknown_sender_policy, created_at)
        VALUES (?, 'telegram', 'tg-1', 'telegram', 'chat', 1, 'strict', ?)`,
     ).run(MGID, now());
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 
@@ -84,7 +85,7 @@ describe('wirings CLI create auto-creates agent_destinations row (#5)', () => {
     expect(count('SELECT COUNT(*) AS c FROM messaging_group_agents WHERE messaging_group_id = ? AND agent_group_id = ?', MGID, GID)).toBe(1);
 
     // …and the matching channel destination was auto-created.
-    const dest = getDb()
+    const dest = sqliteRaw(getDb())
       .prepare(
         'SELECT target_type, target_id FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ?',
       )

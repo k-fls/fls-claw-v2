@@ -29,6 +29,7 @@ vi.mock('../config.js', async () => {
 const TEST_DIR = '/tmp/nanoclaw-test-cli-crud-update';
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../db/index.js';
+import { sqliteRaw } from '../db/drivers/sqlite.js';
 import { dispatch } from './dispatch.js';
 // Side-effect import: registers the `wirings-*` commands.
 import './resources/wirings.js';
@@ -42,15 +43,15 @@ const GID_B = 'ag-b';
 const MGID = 'mg-1';
 const WID = 'wiring-1';
 
-function seed(): void {
-  createAgentGroup({ id: GID_A, name: 'a', folder: 'a', agent_provider: null, created_at: now() });
-  createAgentGroup({ id: GID_B, name: 'b', folder: 'b', agent_provider: null, created_at: now() });
-  const db = getDb();
-  db.prepare(
+async function seed(): Promise<void> {
+  await createAgentGroup({ id: GID_A, name: 'a', folder: 'a', agent_provider: null, created_at: now() });
+  await createAgentGroup({ id: GID_B, name: 'b', folder: 'b', agent_provider: null, created_at: now() });
+  const raw = sqliteRaw(getDb());
+  raw.prepare(
     `INSERT INTO messaging_groups (id, channel_type, platform_id, instance, name, is_group, unknown_sender_policy, created_at)
      VALUES (?, 'telegram', 'tg-1', 'telegram', 'chat', 1, 'strict', ?)`,
   ).run(MGID, now());
-  db.prepare(
+  raw.prepare(
     `INSERT INTO messaging_group_agents
        (id, messaging_group_id, agent_group_id, engage_mode, engage_pattern, sender_scope, ignored_message_policy, session_mode, priority, created_at)
      VALUES (?, ?, ?, 'mention', NULL, 'all', 'drop', 'shared', 0, ?)`,
@@ -58,16 +59,16 @@ function seed(): void {
 }
 
 describe('genericUpdate flag validation (#6)', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    const db = initTestDb();
-    runMigrations(db);
-    seed();
+    const db = await initTestDb();
+    await runMigrations(db);
+    await seed();
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 
@@ -81,7 +82,7 @@ describe('genericUpdate flag validation (#6)', () => {
     expect((resp as { ok: false; error: { message: string } }).error.message).toMatch(/not updatable/i);
 
     // The row must be unchanged.
-    const row = getDb().prepare('SELECT agent_group_id FROM messaging_group_agents WHERE id = ?').get(WID) as {
+    const row = sqliteRaw(getDb()).prepare('SELECT agent_group_id FROM messaging_group_agents WHERE id = ?').get(WID) as {
       agent_group_id: string;
     };
     expect(row.agent_group_id).toBe(GID_A);
@@ -104,7 +105,7 @@ describe('genericUpdate flag validation (#6)', () => {
     );
 
     expect(resp.ok).toBe(true);
-    const row = getDb()
+    const row = sqliteRaw(getDb())
       .prepare('SELECT engage_mode, engage_pattern FROM messaging_group_agents WHERE id = ?')
       .get(WID) as { engage_mode: string; engage_pattern: string };
     expect(row.engage_mode).toBe('pattern');
