@@ -221,7 +221,27 @@ export class TokenSubstituteEngine {
     if (!nested) return undefined;
     const ps = this.scopes.get(groupScope)?.get(providerId);
     if (!ps) return undefined;
-    return this.findEntryByPath(ps, id)?.sourceScope;
+    // An own parent entry (no sourceScope) wins over a borrowed one, matching
+    // `getSubstitute`: the nested token belongs to the credential in use.
+    let source: CredentialScope | undefined;
+    for (const entry of ps.substitutes.values()) {
+      if (entry.credentialPath !== id) continue;
+      if (!entry.sourceScope) return undefined;
+      source ??= entry.sourceScope;
+    }
+    return source;
+  }
+
+  /** Does the group's OWN scope hold a credential at this path? */
+  private ownScopeHolds(groupScope: GroupScope, providerId: string, credentialPath: string): boolean {
+    return (
+      resolveCredentialPathToRealToken(
+        this.resolverFor(groupScope),
+        toCredentialScope(groupScope),
+        providerId,
+        credentialPath,
+      ) !== null
+    );
   }
 
   // ── Credential scope resolution ─────────────────────────────────────
@@ -288,6 +308,13 @@ export class TokenSubstituteEngine {
     for (const [sub, entry] of ps.substitutes) {
       if (entry.credentialPath !== credentialPath) continue;
       (entry.sourceScope ? borrowed : own).push(sub);
+    }
+
+    // The own scope holds a credential but only borrowed substitutes exist
+    // (the group authenticated while borrowing): the borrowed ones are
+    // shadowed. Report none, so `getOrCreateSubstitute` mints an own one.
+    if (own.length === 0 && borrowed.length > 0 && this.ownScopeHolds(groupScope, providerId, credentialPath)) {
+      return null;
     }
 
     for (const sub of [...own.sort(), ...borrowed.sort()]) {
