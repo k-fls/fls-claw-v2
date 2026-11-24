@@ -472,6 +472,53 @@ describe('TokenSubstituteEngine — getSubstitute name-based resolution', () => 
     expect(engine.getSubstitute('gh', group, CRED_OAUTH)).toBe('SUB_OWN');
   });
 
+  it('mints an OWN substitute when the group gains its own credential while only a borrowed one exists', () => {
+    registerDefaultProvider('gh');
+    const resolver = new MockResolver();
+    const sourceScope = asCredentialScope('source-group');
+    resolver.putWithRefresh(
+      sourceScope,
+      'gh',
+      CRED_OAUTH,
+      'ghp_grantor_1234567890abcdef1234567890',
+      'ghr_grantor_1234567890abcdef1234567890',
+    );
+
+    const engine = new TokenSubstituteEngine(() => resolver);
+    engine.setBorrowSourceResolver(() => 'source-group');
+    const borrowedAccess = engine.getOrCreateSubstitute('gh', {}, group, CRED_OAUTH)!;
+    const borrowedRefresh = engine.getOrCreateSubstitute('gh', {}, group, 'oauth/refresh')!;
+    expect(engine.resolveSubstitute(borrowedAccess, group)?.mapping.credentialScope).toBe(sourceScope);
+    expect(engine.resolveSubstitute(borrowedRefresh, group)?.mapping.credentialScope).toBe(sourceScope);
+
+    // The group authenticates: its own scope now holds a credential, while the
+    // grantor's record (and the borrowed substitutes) still exist.
+    resolver.putWithRefresh(
+      groupScope,
+      'gh',
+      CRED_OAUTH,
+      'ghp_own_1234567890abcdef1234567890abcd',
+      'ghr_own_1234567890abcdef1234567890abcd',
+    );
+
+    expect(engine.borrowedFrom('gh', group, CRED_OAUTH)).toBeNull();
+    const ownAccess = engine.getOrCreateSubstitute('gh', {}, group, CRED_OAUTH)!;
+    const ownRefresh = engine.getOrCreateSubstitute('gh', {}, group, 'oauth/refresh')!;
+    expect(ownAccess).not.toBe(borrowedAccess);
+    expect(ownRefresh).not.toBe(borrowedRefresh);
+    expect(engine.resolveSubstitute(ownAccess, group)?.realToken).toBe('ghp_own_1234567890abcdef1234567890abcd');
+    expect(engine.resolveSubstitute(ownAccess, group)?.mapping.credentialScope).toBe(groupScope);
+    expect(engine.resolveSubstitute(ownRefresh, group)?.realToken).toBe('ghr_own_1234567890abcdef1234567890abcd');
+    expect(engine.resolveSubstitute(ownRefresh, group)?.mapping.credentialScope).toBe(groupScope);
+    // Stable on the next lookup.
+    expect(engine.getOrCreateSubstitute('gh', {}, group, CRED_OAUTH)).toBe(ownAccess);
+
+    // Own credential removed again → the borrow resumes.
+    resolver.remove(groupScope, 'gh', CRED_OAUTH);
+    expect(engine.getSubstitute('gh', group, CRED_OAUTH)).toBe(borrowedAccess);
+    expect(engine.borrowedFrom('gh', group, CRED_OAUTH)).toBe(sourceScope);
+  });
+
   it('borrowedFrom reports the grantor scope while borrowing, and null once an own cred shadows it', () => {
     const resolver = new MockResolver();
     const sourceScope = asCredentialScope('source-group');
